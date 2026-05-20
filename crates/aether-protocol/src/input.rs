@@ -95,6 +95,18 @@ impl RpcMethod for InputRedo {
     type Result = UndoResult;
 }
 
+// ---- input/join_lines ---------------------------------------------------------------------------
+
+/// Join the current line with the next: drop the line's trailing whitespace + the newline + the
+/// next line's leading whitespace, replace with a single space. If a selection spans multiple
+/// lines, join all of them.
+pub struct InputJoinLines;
+impl RpcMethod for InputJoinLines {
+    const NAME: &'static str = "input/join_lines";
+    type Params = BufferOnlyParams;
+    type Result = EditResult;
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UndoResult {
     pub revision: Revision,

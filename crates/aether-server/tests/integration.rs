@@ -7,14 +7,15 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Motion,
+    WordBoundary,
 };
 use aether_protocol::envelope::{
     ClientInbound, JsonRpc, Notification, NotificationMethod, Request, Response, RpcMethod,
 };
 use aether_protocol::handshake::{ClientHello, ClientHelloParams, ClientHelloResult};
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDelete, InputDeleteParams, InputRedo, InputText,
-    InputTextParams, InputUndo, UndoResult,
+    BufferOnlyParams, EditResult, InputDelete, InputDeleteParams, InputJoinLines, InputRedo,
+    InputText, InputTextParams, InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportScroll,
@@ -471,18 +472,19 @@ async fn cursor_set_and_extend_selection() {
     )
     .await;
 
-    // Extend selection 4 chars right (cover "beta").
+    // Extend selection 3 chars right; block cursor lands on the 'a' of "beta" and the selection
+    // operationally covers "beta" (position char is included in the selection's range).
     let st: CursorState = send_request::<CursorMove>(
         &mut ws,
         11,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Char { direction: Direction::Forward, count: 4 },
+            motion: Motion::Char { direction: Direction::Forward, count: 3 },
             extend_selection: true,
         },
     )
     .await;
-    assert_eq!(st.position, LogicalPosition { line: 0, col: 10 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 9 });
     assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 6 }));
 
     drop(server);
@@ -954,6 +956,129 @@ async fn dirty_clears_when_undoing_back_past_save() {
 }
 
 #[tokio::test]
+async fn word_motion_forward_and_back() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello world-foo bar\n").await;
+
+    // `w` forward: hello → world (col 6)
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        10,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word },
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 6 });
+
+    // `w` again: world → '-' (col 11) — the hyphen starts a new word category
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        11,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word },
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 11 });
+
+    // `Alt-w` (WORD): from col 0, skip "hello" → " " then to "world-foo" (col 6)
+    send_request::<CursorSet>(&mut ws, 12, &CursorSetParams {
+        buffer_id,
+        position: LogicalPosition { line: 0, col: 0 },
+        anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        13,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::BigWord },
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 6 });
+    // Another WORD forward: "world-foo" → "bar" (col 16)
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        14,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::BigWord },
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 16 });
+
+    // `b` backward from col 16: → col 12 (start of "foo")
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        15,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Word { direction: Direction::Backward, count: 1, boundary: WordBoundary::Word },
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 12 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn word_end_motion_lands_on_last_char() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello world\n").await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        10,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::WordEnd { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word },
+            extend_selection: false,
+        },
+    )
+    .await;
+    // From col 0 (on 'h'), `e` lands on the 'o' of "hello" → col 4.
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 4 });
+    drop(server);
+}
+
+#[tokio::test]
+async fn join_lines_collapses_lines_with_single_space() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello \n  world\n").await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::Soft,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputJoinLines>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+    assert!(r.dirty);
+    let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+    // After join: "hello world\n" — trailing whitespace of line 0 removed, leading whitespace of
+    // line 1 removed, single space inserted.
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "hello world"
+    );
+    drop(server);
+}
+
+#[tokio::test]
 async fn input_text_with_selection_replaces_it() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta gamma\n").await;
 
@@ -973,7 +1098,9 @@ async fn input_text_with_selection_replaces_it() {
         11,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Char { direction: Direction::Forward, count: 4 },
+            // Forward 3 from col 6 puts the block cursor on the 'a' of "beta"; with the cursor
+            // char in the selection, the operational range covers all of "beta".
+            motion: Motion::Char { direction: Direction::Forward, count: 3 },
             extend_selection: true,
         },
     )

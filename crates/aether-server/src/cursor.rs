@@ -5,7 +5,7 @@
 //! grapheme-aware revision can come later.
 
 use crate::state::Buffer;
-use aether_protocol::cursor::{Direction, Motion};
+use aether_protocol::cursor::{Direction, Motion, WordBoundary};
 use aether_protocol::LogicalPosition;
 
 /// Convert a (line, byte-col) position to an absolute char index in the rope. Clamped to valid
@@ -106,7 +106,133 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         Motion::BufferStart => LogicalPosition { line: 0, col: 0 },
         Motion::BufferEnd => char_to_pos(buf, buf.text.len_chars()),
         Motion::Goto { position } => clamp_position(buf, *position),
-        // Word and Visual* motions are not implemented in phase 1; cursor stays put.
+        Motion::Word { direction, count, boundary } => {
+            let start = pos_to_char(buf, current);
+            let end = match direction {
+                Direction::Forward => word_forward_start(&buf.text, start, *boundary, *count),
+                Direction::Backward => word_backward_start(&buf.text, start, *boundary, *count),
+            };
+            char_to_pos(buf, end)
+        }
+        Motion::WordEnd { direction, count, boundary } => {
+            let start = pos_to_char(buf, current);
+            let end = match direction {
+                Direction::Forward => word_forward_end(&buf.text, start, *boundary, *count),
+                Direction::Backward => word_backward_end(&buf.text, start, *boundary, *count),
+            };
+            char_to_pos(buf, end)
+        }
+        // Visual* motions are not implemented in phase 1; cursor stays put.
         _ => current,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharCat {
+    Whitespace,
+    Word,
+    Symbol,
+}
+
+fn char_cat(c: char, boundary: WordBoundary) -> CharCat {
+    if c.is_whitespace() {
+        return CharCat::Whitespace;
+    }
+    match boundary {
+        WordBoundary::BigWord => CharCat::Word, // any non-whitespace is a "WORD" char
+        WordBoundary::Word | WordBoundary::Subword => {
+            // Subword grouping (camelCase / snake_case splits) — phase 1 treats same as Word.
+            if c.is_alphanumeric() || c == '_' {
+                CharCat::Word
+            } else {
+                CharCat::Symbol
+            }
+        }
+    }
+}
+
+fn word_forward_start(rope: &ropey::Rope, start: usize, boundary: WordBoundary, count: u32) -> usize {
+    let total = rope.len_chars();
+    let mut i = start;
+    for _ in 0..count {
+        if i >= total {
+            return total;
+        }
+        // Skip the current run of same-category (non-whitespace) chars.
+        let cat = char_cat(rope.char(i), boundary);
+        if cat != CharCat::Whitespace {
+            while i < total && char_cat(rope.char(i), boundary) == cat {
+                i += 1;
+            }
+        }
+        // Skip whitespace to reach the next word start.
+        while i < total && char_cat(rope.char(i), boundary) == CharCat::Whitespace {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn word_backward_start(rope: &ropey::Rope, start: usize, boundary: WordBoundary, count: u32) -> usize {
+    let mut i = start;
+    for _ in 0..count {
+        if i == 0 {
+            return 0;
+        }
+        i -= 1;
+        // Skip whitespace backward.
+        while i > 0 && char_cat(rope.char(i), boundary) == CharCat::Whitespace {
+            i -= 1;
+        }
+        if char_cat(rope.char(i), boundary) == CharCat::Whitespace {
+            // Reached start; the buffer begins with whitespace.
+            return 0;
+        }
+        // Step back through the current run to its first char.
+        let cat = char_cat(rope.char(i), boundary);
+        while i > 0 && char_cat(rope.char(i - 1), boundary) == cat {
+            i -= 1;
+        }
+    }
+    i
+}
+
+fn word_forward_end(rope: &ropey::Rope, start: usize, boundary: WordBoundary, count: u32) -> usize {
+    let total = rope.len_chars();
+    let mut i = start;
+    for _ in 0..count {
+        if i >= total {
+            return total;
+        }
+        // Move at least one char so successive `e` makes progress.
+        i += 1;
+        // Skip whitespace.
+        while i < total && char_cat(rope.char(i), boundary) == CharCat::Whitespace {
+            i += 1;
+        }
+        if i >= total {
+            return total;
+        }
+        // Advance to the last char of the current run.
+        let cat = char_cat(rope.char(i), boundary);
+        while i + 1 < total && char_cat(rope.char(i + 1), boundary) == cat {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn word_backward_end(rope: &ropey::Rope, start: usize, boundary: WordBoundary, count: u32) -> usize {
+    // Vim's `ge` — back to end of previous word.
+    let mut i = start;
+    for _ in 0..count {
+        if i == 0 {
+            return 0;
+        }
+        i -= 1;
+        while i > 0 && char_cat(rope.char(i), boundary) == CharCat::Whitespace {
+            i -= 1;
+        }
+    }
+    i
 }

@@ -44,6 +44,12 @@ pub enum Motion {
         count: u32,
         boundary: WordBoundary,
     },
+    /// Word *end* — moves to the last char of the word (vim's `e`).
+    WordEnd {
+        direction: Direction,
+        count: u32,
+        boundary: WordBoundary,
+    },
     LogicalLine {
         direction: Direction,
         count: u32,
@@ -99,7 +105,7 @@ pub struct CursorSet;
 impl RpcMethod for CursorSet {
     const NAME: &'static str = "cursor/set";
     type Params = CursorSetParams;
-    type Result = ();
+    type Result = CursorState;
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -181,8 +181,7 @@ fn buffer_open_scratch_form() {
 
 #[test]
 fn unit_result_round_trips() {
-    // BufferClose, CursorSet, ViewportUnsubscribe all have Result = ().
-    // The JSON unit value is `null`.
+    // BufferClose and ViewportUnsubscribe have Result = (). The JSON unit value is `null`.
     let unit: () = ();
     let s = serde_json::to_string(&unit).unwrap();
     assert_eq!(s, "null");

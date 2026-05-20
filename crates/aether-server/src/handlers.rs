@@ -16,7 +16,7 @@ use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::handshake::{ClientHelloParams, ClientHelloResult, ProjectInfo};
 use aether_protocol::input::{
-    EditResult, InputDeleteParams, InputTextParams, UndoResult,
+    BufferOnlyParams, EditResult, InputDeleteParams, InputTextParams, UndoResult,
 };
 use aether_protocol::viewport::{
     LogicalLineRange, LogicalLineRender, ViewportLinesChanged, ViewportLinesChangedParams,
@@ -504,7 +504,7 @@ pub async fn cursor_set(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: CursorSetParams,
-) -> Result<(), RpcError> {
+) -> Result<CursorState, RpcError> {
     let client_id = ctx.require_hello()?;
     let mut s = state.lock().await;
     let buf = s
@@ -517,9 +517,9 @@ pub async fn cursor_set(
         Some(a) if a == position => None,
         x => x,
     };
-    s.cursors
-        .insert((client_id, params.buffer_id), CursorState { position, anchor });
-    Ok(())
+    let result = CursorState { position, anchor };
+    s.cursors.insert((client_id, params.buffer_id), result);
+    Ok(result)
 }
 
 // ---- input handlers ----------------------------------------------------------------------------
@@ -545,7 +545,7 @@ pub async fn input_delete(
 pub async fn input_undo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: aether_protocol::input::BufferOnlyParams,
+    params: BufferOnlyParams,
 ) -> Result<UndoResult, RpcError> {
     apply_undo_or_redo(state, ctx, params.buffer_id, UndoDirection::Undo).await
 }
@@ -553,9 +553,159 @@ pub async fn input_undo(
 pub async fn input_redo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: aether_protocol::input::BufferOnlyParams,
+    params: BufferOnlyParams,
 ) -> Result<UndoResult, RpcError> {
     apply_undo_or_redo(state, ctx, params.buffer_id, UndoDirection::Redo).await
+}
+
+pub async fn input_join_lines(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let buffer_id = params.buffer_id;
+
+    // Figure out which line(s) we're joining. If the cursor has a selection that spans multiple
+    // lines, join all of them. Otherwise, join the cursor's line with the one below.
+    let (first_line, last_line) = {
+        let s = state.lock().await;
+        let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+        let (a, b) = match cursor.anchor {
+            Some(anchor) => motion::ordered(cursor.position, anchor),
+            None => (cursor.position, cursor.position),
+        };
+        let buf = s
+            .buffers
+            .get(&buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+        let line_count = buf.line_count();
+        let first = a.line;
+        // If single line, join with the line below it. If multi-line selection, join through
+        // last selected line.
+        let last = if a.line == b.line { a.line.saturating_add(1) } else { b.line };
+        let last = last.min(line_count.saturating_sub(1));
+        (first, last)
+    };
+
+    if first_line >= last_line {
+        // Nothing to join (we're on the last line).
+        let s = state.lock().await;
+        let buf = &s.buffers[&buffer_id];
+        return Ok(EditResult {
+            revision: buf.revision,
+            cursor: s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default(),
+            dirty: buf.dirty,
+        });
+    }
+
+    // Compute the joined range, in char offsets. For each pair of consecutive lines, the range
+    // to replace is `[end_of_trailing_ws_on_line_i, first_non_ws_on_line_i+1)` — replaced with
+    // a single space. We do them in a single sweep on the rope.
+    let s = state.lock().await;
+    let buf = &s.buffers[&buffer_id];
+
+    // Build the full replacement: walk the lines from `first_line` to `last_line`, concatenating
+    // each line's content (stripped of trailing whitespace) plus a single space between.
+    let mut joined = String::new();
+    for line_idx in first_line..=last_line {
+        let line_slice = buf.text.line(line_idx as usize);
+        let mut text: String = line_slice.chunks().collect();
+        if text.ends_with('\n') {
+            text.pop();
+        }
+        if line_idx == first_line {
+            // Keep first line's content, drop trailing whitespace.
+            joined.push_str(text.trim_end());
+        } else {
+            joined.push(' ');
+            // Drop leading whitespace on continuation lines; keep trailing untouched until
+            // the next loop iteration trims it.
+            let trimmed_start = text.trim_start();
+            // For the last line, keep trailing whitespace as it normally appears.
+            if line_idx == last_line {
+                joined.push_str(trimmed_start);
+            } else {
+                joined.push_str(trimmed_start.trim_end());
+            }
+        }
+    }
+
+    // Determine the range to replace (full first..=last lines).
+    let first_char = buf.text.line_to_char(first_line as usize);
+    let last_line_end_char = if (last_line as usize + 1) < buf.text.len_lines() {
+        // Up to (but not including) the \n at the end of `last_line`.
+        let next_start = buf.text.line_to_char(last_line as usize + 1);
+        next_start - 1
+    } else {
+        buf.text.len_chars()
+    };
+    drop(s);
+
+    let cursors_before: HashMap<ClientId, CursorState> = {
+        let s = state.lock().await;
+        s.cursors
+            .iter()
+            .filter_map(|((c, b), cs)| if *b == buffer_id { Some((*c, *cs)) } else { None })
+            .collect()
+    };
+
+    let (revision, dirty, new_cursor) = {
+        let mut s = state.lock().await;
+        let buf = s.buffers.get_mut(&buffer_id).expect("just checked");
+        let revision = buf.apply_edit(
+            first_char,
+            last_line_end_char,
+            &joined,
+            EditKindTag::Text,
+            cursors_before,
+        );
+        let new_cursor_char = first_char + joined.chars().count();
+        let new_cursor = CursorState {
+            position: motion::char_to_pos(buf, new_cursor_char),
+            anchor: None,
+        };
+        let dirty = buf.dirty;
+        s.cursors.insert((client_id, buffer_id), new_cursor);
+        (revision, dirty, new_cursor)
+    };
+
+    // Push viewport/lines_changed for affected viewports (we changed multiple lines).
+    let pushes: Vec<(mpsc::Sender<Notification>, Notification)> = {
+        let s = state.lock().await;
+        let buf = &s.buffers[&buffer_id];
+        let mut pushes = Vec::new();
+        let new_line_count = buf.line_count();
+        for vp in s.viewports.values() {
+            if vp.buffer_id != buffer_id {
+                continue;
+            }
+            let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+                continue;
+            };
+            pushes.push((sender, build_lines_changed_notif(buf, vp, revision)));
+            let _ = new_line_count; // viewport range clamp not needed here; render handles it
+        }
+        pushes
+    };
+    // Clamp viewport ranges to new line count.
+    {
+        let mut s = state.lock().await;
+        let new_line_count = s.buffers[&buffer_id].line_count();
+        for vp in s.viewports.values_mut() {
+            if vp.buffer_id != buffer_id {
+                continue;
+            }
+            vp.first_logical_line = vp.first_logical_line.min(new_line_count);
+            vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
+        }
+    }
+
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    Ok(EditResult { revision, cursor: new_cursor, dirty })
 }
 
 enum UndoDirection {
@@ -712,7 +862,15 @@ async fn apply_edit(
     };
 
     let start_char = motion::pos_to_char(buf, start_pos);
-    let end_char = motion::pos_to_char(buf, end_pos);
+    let end_char_base = motion::pos_to_char(buf, end_pos);
+    // When an anchor exists, the selection conceptually includes the position char (the one
+    // under the block cursor). Operationally extend the half-open range by one char so the
+    // visible block cursor's char is part of the affected range.
+    let end_char = if cursor.anchor.is_some() {
+        end_char_base.saturating_add(1).min(buf.text.len_chars())
+    } else {
+        end_char_base
+    };
     let old_first_line = start_pos.line;
     let old_last_line = end_pos.line;
     let kind_tag = match &edit {

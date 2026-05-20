@@ -1,6 +1,6 @@
 //! Ratatui rendering. The buffer fills the screen except for the bottom status row.
 
-use crate::app::AppState;
+use crate::app::{AppState, Mode};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::viewport::Highlight;
 use aether_protocol::LogicalPosition;
@@ -184,12 +184,11 @@ fn lookup_exact(name: &str) -> Option<Style> {
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     let dirty_marker = if state.dirty { "[+]" } else { "" };
     let main = format!(
-        " {project}  {file} {dirty}  L{line} C{col}  rev {rev}",
+        " [{project}] {file} {dirty}  {pos}  ({rev})",
         project = state.project_name,
         file = state.file_label,
         dirty = dirty_marker,
-        line = state.cursor.position.line + 1,
-        col = state.cursor.position.col + 1,
+        pos = format_position(state),
         rev = state.revision,
     );
     let status_span = if state.status.is_empty() {
@@ -200,6 +199,39 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     let p = Paragraph::new(Line::from(vec![status_span]))
         .style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD));
     f.render_widget(p, area);
+}
+
+/// In insert mode: `A:B` (just the cursor). In normal mode: `A:B-C:D` (half-open) — A:B is the
+/// first byte of the selection, C:D is one byte past the last char (the byte just after the
+/// block cursor). With no explicit anchor the selection is the implicit 1-char range at the
+/// cursor.
+fn format_position(state: &AppState) -> String {
+    let pos = state.cursor.position;
+    match state.mode {
+        Mode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
+        Mode::Normal => {
+            let (start, end_inclusive) = match state.cursor.anchor {
+                None => (pos, pos),
+                Some(anchor) => {
+                    if (pos.line, pos.col) <= (anchor.line, anchor.col) {
+                        (pos, anchor)
+                    } else {
+                        (anchor, pos)
+                    }
+                }
+            };
+            // The half-open exclusive end is one byte past the block cursor's char. For phase 1
+            // we approximate by incrementing the column; multi-byte chars and line-end overflow
+            // would need server help to compute exactly.
+            format!(
+                "{}:{}-{}:{}",
+                start.line + 1,
+                start.col + 1,
+                end_inclusive.line + 1,
+                end_inclusive.col + 2,
+            )
+        }
+    }
 }
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect) {

@@ -1,29 +1,41 @@
-//! Application state and event loop.
+//! Application state and event loop. Modal editing (Normal vs Insert) lives entirely here; the
+//! server has no notion of mode.
 
 use crate::client::Client;
 use crate::ui;
 use aether_protocol::buffer::{
     BufferOpenResult, BufferSave, BufferSaveParams, BufferState, BufferStateParams,
 };
-use aether_protocol::cursor::{CursorMove, CursorMoveParams, CursorState, Direction, Motion};
+use aether_protocol::cursor::{
+    CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Motion,
+    WordBoundary,
+};
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
 use aether_protocol::input::{
-    BufferOnlyParams, InputDelete, InputDeleteParams, InputRedo, InputText, InputTextParams,
-    InputUndo, UndoResult,
+    BufferOnlyParams, EditResult, InputDelete, InputDeleteParams, InputJoinLines, InputRedo,
+    InputText, InputTextParams, InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSubscribe,
     ViewportSubscribeParams, ViewportSubscribeResult, WrapMode,
 };
-use aether_protocol::{BufferId, ViewportId};
+use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::cursor::SetCursorStyle;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io::Stdout;
+use std::io::{stdout, Stdout};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Insert,
+}
 
 pub struct AppState {
     pub project_name: String,
@@ -40,6 +52,9 @@ pub struct AppState {
     pub dirty: bool,
     pub should_quit: bool,
     pub status: String,
+    pub mode: Mode,
+    /// Digit-prefix count for the next motion. Reset after consumption.
+    pub pending_count: u32,
 }
 
 pub async fn bootstrap(
@@ -49,7 +64,6 @@ pub async fn bootstrap(
     cols: u16,
     rows: u16,
 ) -> Result<AppState> {
-    // Reserve one row for the status bar.
     let viewport_rows = rows.saturating_sub(1) as u32;
     let viewport_cols = cols as u32;
 
@@ -89,7 +103,7 @@ pub async fn bootstrap(
             buffer_id: open.buffer_id,
             cols: viewport_cols,
             rows: viewport_rows,
-            overscan_rows: viewport_rows, // simple: equal overscan
+            overscan_rows: viewport_rows,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::None,
         })
@@ -110,6 +124,8 @@ pub async fn bootstrap(
         dirty: open.dirty,
         should_quit: false,
         status: String::new(),
+        mode: Mode::Normal,
+        pending_count: 0,
     })
 }
 
@@ -119,6 +135,7 @@ pub async fn run(
     state: &mut AppState,
 ) -> Result<()> {
     let mut events = EventStream::new();
+    apply_cursor_style(state.mode);
     terminal.draw(|f| ui::draw(f, state))?;
     while !state.should_quit {
         tokio::select! {
@@ -144,14 +161,17 @@ pub async fn run(
     Ok(())
 }
 
+fn apply_cursor_style(mode: Mode) {
+    let style = match mode {
+        Mode::Normal => SetCursorStyle::SteadyBlock,
+        Mode::Insert => SetCursorStyle::SteadyBar,
+    };
+    let _ = execute!(stdout(), style);
+}
+
 fn apply_pending_notifications(state: &mut AppState, client: &mut Client) {
     for n in client.drain_notifications() {
-        let notif = aether_protocol::envelope::Notification {
-            jsonrpc: aether_protocol::envelope::JsonRpc,
-            method: n.method.clone(),
-            params: n.params.clone(),
-        };
-        apply_notification(state, notif);
+        apply_notification(state, n);
     }
 }
 
@@ -181,12 +201,9 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
 
 fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
     state.revision = p.revision;
-    // Compute splice indices relative to the local `lines` buffer.
     let local_start = (p.range.start_logical_line as i64) - (state.window_first_logical_line as i64);
     let local_end = (p.range.end_logical_line_exclusive as i64) - (state.window_first_logical_line as i64);
     if local_end < 0 || local_start > state.lines.len() as i64 {
-        // Affected range falls outside our window — request fresh state.
-        // For phase 1 we just no-op; a fuller implementation would re-subscribe.
         return;
     }
     let lo = local_start.max(0) as usize;
@@ -199,18 +216,77 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
     if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
         return Ok(());
     }
-    match (k.code, k.modifiers) {
-        (KeyCode::Char('q' | 'c'), KeyModifiers::CONTROL) => state.should_quit = true,
-        (KeyCode::Char('s'), KeyModifiers::CONTROL) => save_buffer(client, state).await?,
-        (KeyCode::Char('z'), KeyModifiers::CONTROL) => undo(client, state).await?,
-        (KeyCode::Char('y'), KeyModifiers::CONTROL) => redo(client, state).await?,
+    match state.mode {
+        Mode::Normal => handle_normal_key(client, state, k).await?,
+        Mode::Insert => handle_insert_key(client, state, k).await?,
+    }
+    ensure_cursor_in_window(client, state).await?;
+    Ok(())
+}
 
-        (KeyCode::Left, m) => move_cursor(client, state, Motion::Char { direction: Direction::Backward, count: 1 }, m.contains(KeyModifiers::SHIFT)).await?,
-        (KeyCode::Right, m) => move_cursor(client, state, Motion::Char { direction: Direction::Forward, count: 1 }, m.contains(KeyModifiers::SHIFT)).await?,
-        (KeyCode::Up, m) => move_cursor(client, state, Motion::LogicalLine { direction: Direction::Backward, count: 1, preserve_col: true }, m.contains(KeyModifiers::SHIFT)).await?,
-        (KeyCode::Down, m) => move_cursor(client, state, Motion::LogicalLine { direction: Direction::Forward, count: 1, preserve_col: true }, m.contains(KeyModifiers::SHIFT)).await?,
-        (KeyCode::Home, m) => move_cursor(client, state, Motion::LineStart, m.contains(KeyModifiers::SHIFT)).await?,
-        (KeyCode::End, m) => move_cursor(client, state, Motion::LineEnd, m.contains(KeyModifiers::SHIFT)).await?,
+/// Normalize a `KeyEvent`'s `(code, modifiers)` so a `Shift-x` key reports as `('x', SHIFT)`
+/// regardless of whether the terminal sent it as uppercase + no-shift or lowercase + shift.
+fn normalize_key(k: KeyEvent) -> (KeyCode, KeyModifiers) {
+    let mut mods = k.modifiers;
+    let code = match k.code {
+        KeyCode::Char(c) if c.is_ascii_uppercase() => {
+            mods |= KeyModifiers::SHIFT;
+            KeyCode::Char(c.to_ascii_lowercase())
+        }
+        other => other,
+    };
+    (code, mods)
+}
+
+const SHIFT_ONLY: KeyModifiers = KeyModifiers::SHIFT;
+const ALT_ONLY: KeyModifiers = KeyModifiers::ALT;
+const CTRL_ONLY: KeyModifiers = KeyModifiers::CONTROL;
+
+async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
+    let (code, mods) = normalize_key(k);
+
+    // Digit accumulation for counts. `0` is the line-start motion unless we're already mid-count.
+    if let KeyCode::Char(c @ '1'..='9') = code {
+        if mods == KeyModifiers::NONE {
+            state.pending_count = state
+                .pending_count
+                .saturating_mul(10)
+                .saturating_add(c.to_digit(10).unwrap_or(0));
+            return Ok(());
+        }
+    }
+    if let KeyCode::Char('0') = code {
+        if mods == KeyModifiers::NONE && state.pending_count > 0 {
+            state.pending_count = state.pending_count.saturating_mul(10);
+            return Ok(());
+        }
+    }
+
+    // Whatever this command consumes for `count`, reset after.
+    let count = if state.pending_count == 0 { 1 } else { state.pending_count };
+    state.pending_count = 0;
+
+    let extend = mods.contains(KeyModifiers::SHIFT);
+
+    match (code, mods) {
+        // ---- meta ----
+        (KeyCode::Char('q'), CTRL_ONLY) => {
+            state.should_quit = true;
+        }
+        (KeyCode::Esc, _) => {
+            // Collapse any selection by re-setting the cursor to its current position.
+            if state.cursor.anchor.is_some() {
+                clear_selection(client, state).await?;
+            }
+        }
+
+        // ---- motions: arrows kept alive ----
+        (KeyCode::Left, _) => move_motion(client, state, Motion::Char { direction: Direction::Backward, count }, extend).await?,
+        (KeyCode::Right, _) => move_motion(client, state, Motion::Char { direction: Direction::Forward, count }, extend).await?,
+        (KeyCode::Up, _) => move_motion(client, state, Motion::LogicalLine { direction: Direction::Backward, count, preserve_col: true }, extend).await?,
+        (KeyCode::Down, _) => move_motion(client, state, Motion::LogicalLine { direction: Direction::Forward, count, preserve_col: true }, extend).await?,
+        (KeyCode::Home, _) => move_motion(client, state, Motion::LineStart, extend).await?,
+        (KeyCode::End, _) => move_motion(client, state, Motion::LineEnd, extend).await?,
         (KeyCode::PageDown, _) => {
             let target = state.scroll_logical_line.saturating_add(state.viewport_rows);
             scroll_to(client, state, target).await?;
@@ -220,17 +296,82 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
             scroll_to(client, state, target).await?;
         }
 
+        // ---- motions: hjkl ----
+        (KeyCode::Char('h'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            move_motion(client, state, Motion::Char { direction: Direction::Backward, count }, extend).await?,
+        (KeyCode::Char('l'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            move_motion(client, state, Motion::Char { direction: Direction::Forward, count }, extend).await?,
+        (KeyCode::Char('k'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            move_motion(client, state, Motion::LogicalLine { direction: Direction::Backward, count, preserve_col: true }, extend).await?,
+        (KeyCode::Char('j'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            move_motion(client, state, Motion::LogicalLine { direction: Direction::Forward, count, preserve_col: true }, extend).await?,
+
+        // ---- motions: word (w/b/e) and Alt for WORD ----
+        (KeyCode::Char('w'), m) if m.contains(KeyModifiers::ALT) =>
+            move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::BigWord }, extend).await?,
+        (KeyCode::Char('w'), _) =>
+            move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::Word }, extend).await?,
+        (KeyCode::Char('b'), m) if m.contains(KeyModifiers::ALT) =>
+            move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::BigWord }, extend).await?,
+        (KeyCode::Char('b'), _) =>
+            move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::Word }, extend).await?,
+        (KeyCode::Char('e'), m) if m.contains(KeyModifiers::ALT) =>
+            move_motion(client, state, Motion::WordEnd { direction: Direction::Forward, count, boundary: WordBoundary::BigWord }, extend).await?,
+        (KeyCode::Char('e'), _) =>
+            move_motion(client, state, Motion::WordEnd { direction: Direction::Forward, count, boundary: WordBoundary::Word }, extend).await?,
+
+        // ---- motions: line start ----
+        (KeyCode::Char('0'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            move_motion(client, state, Motion::LineStart, extend).await?,
+
+        // ---- mode transitions ----
+        (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionStart).await?,
+        (KeyCode::Char('a'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionEnd).await?,
+        (KeyCode::Char('i'), m) if m == ALT_ONLY => enter_insert_at(client, state, InsertWhere::FirstLineStart).await?,
+        (KeyCode::Char('a'), m) if m == ALT_ONLY => enter_insert_at(client, state, InsertWhere::LastLineEnd).await?,
+
+        // ---- edits ----
+        (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
+        (KeyCode::Char('z'), CTRL_ONLY) => undo(client, state).await?,
+        (KeyCode::Char('r'), CTRL_ONLY) => redo(client, state).await?,
+        (KeyCode::Char('j'), CTRL_ONLY) => join_lines(client, state).await?,
+        (KeyCode::Char('d'), CTRL_ONLY) | (KeyCode::Delete, _) => {
+            delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count }).await?
+        }
+        (KeyCode::Backspace, _) => {
+            delete_with_motion(client, state, Motion::Char { direction: Direction::Backward, count }).await?
+        }
+
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
+    let (code, mods) = normalize_key(k);
+    match (code, mods) {
+        (KeyCode::Esc, _) => leave_insert(state),
+
+        // Allow Ctrl-S/Z/R to work in insert mode too — handy.
+        (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
+        (KeyCode::Char('z'), CTRL_ONLY) => undo(client, state).await?,
+        (KeyCode::Char('r'), CTRL_ONLY) => redo(client, state).await?,
+
         (KeyCode::Backspace, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Backward, count: 1 }).await?,
         (KeyCode::Delete, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count: 1 }).await?,
         (KeyCode::Enter, _) => insert_text(client, state, "\n").await?,
         (KeyCode::Tab, _) => insert_text(client, state, "\t").await?,
+        (KeyCode::Left, _) => move_motion(client, state, Motion::Char { direction: Direction::Backward, count: 1 }, false).await?,
+        (KeyCode::Right, _) => move_motion(client, state, Motion::Char { direction: Direction::Forward, count: 1 }, false).await?,
+        (KeyCode::Up, _) => move_motion(client, state, Motion::LogicalLine { direction: Direction::Backward, count: 1, preserve_col: true }, false).await?,
+        (KeyCode::Down, _) => move_motion(client, state, Motion::LogicalLine { direction: Direction::Forward, count: 1, preserve_col: true }, false).await?,
+
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
             insert_text(client, state, &c.to_string()).await?;
         }
 
         _ => {}
     }
-    ensure_cursor_in_window(client, state).await?;
     Ok(())
 }
 
@@ -250,7 +391,7 @@ async fn handle_resize(client: &mut Client, state: &mut AppState, cols: u16, row
     Ok(())
 }
 
-async fn move_cursor(client: &mut Client, state: &mut AppState, motion: Motion, extend: bool) -> Result<()> {
+async fn move_motion(client: &mut Client, state: &mut AppState, motion: Motion, extend: bool) -> Result<()> {
     let new: CursorState = client
         .rpc::<CursorMove>(CursorMoveParams {
             buffer_id: state.buffer_id,
@@ -262,12 +403,131 @@ async fn move_cursor(client: &mut Client, state: &mut AppState, motion: Motion, 
     Ok(())
 }
 
-async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> Result<()> {
-    let r = client
-        .rpc::<InputText>(InputTextParams {
+async fn clear_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let new = client
+        .rpc::<CursorSet>(CursorSetParams {
             buffer_id: state.buffer_id,
-            text: text.into(),
+            position: state.cursor.position,
+            anchor: None,
         })
+        .await?;
+    state.cursor = new;
+    Ok(())
+}
+
+enum InsertWhere {
+    /// `i` — at the cursor (or at the lower end of the selection).
+    SelectionStart,
+    /// `a` — after the cursor (or at the upper end of the selection).
+    SelectionEnd,
+    /// `Alt-i` — column 0 of the first line of the selection (or the cursor's line).
+    FirstLineStart,
+    /// `Alt-a` — end of the last line of the selection (or the cursor's line).
+    LastLineEnd,
+}
+
+async fn enter_insert_at(client: &mut Client, state: &mut AppState, where_: InsertWhere) -> Result<()> {
+    match (where_, state.cursor.anchor) {
+        // `i` — start of selection (or cursor if collapsed).
+        (InsertWhere::SelectionStart, Some(anchor)) => {
+            let target = min_pos(state.cursor.position, anchor);
+            let new = client
+                .rpc::<CursorSet>(CursorSetParams {
+                    buffer_id: state.buffer_id,
+                    position: target,
+                    anchor: None,
+                })
+                .await?;
+            state.cursor = new;
+        }
+        (InsertWhere::SelectionStart, None) => {
+            // Already at the right place; nothing to do.
+        }
+
+        // `a` — just *past* the selection (or one char after the cursor if collapsed). Selection
+        // is inclusive, so for a forward selection the cursor char IS the last selected char;
+        // "after the selection" is one char past the max position.
+        (InsertWhere::SelectionEnd, anchor_opt) => {
+            let max = match anchor_opt {
+                Some(anchor) => max_pos(state.cursor.position, anchor),
+                None => state.cursor.position,
+            };
+            // Park the cursor at the last-selected position (with no anchor), then step one char
+            // forward — handles multi-byte chars and end-of-line transitions correctly.
+            client
+                .rpc::<CursorSet>(CursorSetParams {
+                    buffer_id: state.buffer_id,
+                    position: max,
+                    anchor: None,
+                })
+                .await?;
+            let new = client
+                .rpc::<CursorMove>(CursorMoveParams {
+                    buffer_id: state.buffer_id,
+                    motion: Motion::Char { direction: Direction::Forward, count: 1 },
+                    extend_selection: false,
+                })
+                .await?;
+            state.cursor = new;
+        }
+
+        // `Alt-i` — start of the first line in the selection (or the cursor's line).
+        (InsertWhere::FirstLineStart, anchor_opt) => {
+            let first_line = match anchor_opt {
+                Some(anchor) => state.cursor.position.line.min(anchor.line),
+                None => state.cursor.position.line,
+            };
+            let new = client
+                .rpc::<CursorSet>(CursorSetParams {
+                    buffer_id: state.buffer_id,
+                    position: LogicalPosition { line: first_line, col: 0 },
+                    anchor: None,
+                })
+                .await?;
+            state.cursor = new;
+        }
+
+        // `Alt-a` — end of the last line in the selection (server clamps the huge col).
+        (InsertWhere::LastLineEnd, anchor_opt) => {
+            let last_line = match anchor_opt {
+                Some(anchor) => state.cursor.position.line.max(anchor.line),
+                None => state.cursor.position.line,
+            };
+            let new = client
+                .rpc::<CursorSet>(CursorSetParams {
+                    buffer_id: state.buffer_id,
+                    position: LogicalPosition { line: last_line, col: u32::MAX },
+                    anchor: None,
+                })
+                .await?;
+            state.cursor = new;
+        }
+    }
+    enter_insert_mode(state);
+    Ok(())
+}
+
+fn enter_insert_mode(state: &mut AppState) {
+    state.mode = Mode::Insert;
+    apply_cursor_style(state.mode);
+}
+
+fn leave_insert(state: &mut AppState) {
+    state.mode = Mode::Normal;
+    apply_cursor_style(state.mode);
+}
+
+fn min_pos(a: LogicalPosition, b: LogicalPosition) -> LogicalPosition {
+    if (a.line, a.col) <= (b.line, b.col) { a } else { b }
+}
+
+fn max_pos(a: LogicalPosition, b: LogicalPosition) -> LogicalPosition {
+    if (a.line, a.col) >= (b.line, b.col) { a } else { b }
+}
+
+async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<InputText>(InputTextParams { buffer_id: state.buffer_id, text: text.into() })
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
@@ -276,8 +536,18 @@ async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> R
 }
 
 async fn delete_with_motion(client: &mut Client, state: &mut AppState, motion: Motion) -> Result<()> {
-    let r = client
+    let r: EditResult = client
         .rpc::<InputDelete>(InputDeleteParams { buffer_id: state.buffer_id, motion })
+        .await?;
+    state.revision = r.revision;
+    state.cursor = r.cursor;
+    state.dirty = r.dirty;
+    Ok(())
+}
+
+async fn join_lines(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<InputJoinLines>(BufferOnlyParams { buffer_id: state.buffer_id })
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
@@ -333,7 +603,6 @@ async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
     Ok(())
 }
 
-/// If the cursor has scrolled out of the viewport, send a `viewport/scroll` to bring it back in.
 async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> Result<()> {
     let cursor_line = state.cursor.position.line;
     let top = state.scroll_logical_line;
