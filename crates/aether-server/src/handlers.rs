@@ -430,14 +430,36 @@ fn render_window(
     wrap: aether_protocol::viewport::WrapMode,
 ) -> Window {
     let mut lines: Vec<LogicalLineRender> = Vec::with_capacity((last_excl - first) as usize);
+
+    // For highlighting we need the whole source as bytes. Computed once per render rather than
+    // per line. Skipped entirely when no syntax is attached.
+    let source: Option<String> =
+        buf.syntax.as_ref().map(|_| buf.text.chunks().collect::<String>());
+
     for i in first..last_excl {
         let line_slice = buf.text.line(i as usize);
         let mut text: String = line_slice.chunks().collect();
-        // ropey includes the trailing \n in the line slice (except possibly the last "line").
         if text.ends_with('\n') {
             text.pop();
         }
-        lines.push(wrap::render_line(&text, i, cols, wrap));
+
+        let highlights = match (&buf.syntax, source.as_deref()) {
+            (Some(syntax), Some(source)) => {
+                let line_char_start = buf.text.line_to_char(i as usize);
+                let line_byte_start = buf.text.char_to_byte(line_char_start);
+                let line_byte_end = line_byte_start + text.len();
+                crate::syntax::highlights_for_range(
+                    syntax.config,
+                    &syntax.tree,
+                    source,
+                    line_byte_start,
+                    line_byte_end,
+                )
+            }
+            _ => Vec::new(),
+        };
+
+        lines.push(wrap::render_line(&text, i, cols, wrap, highlights));
     }
     Window { first_logical_line: first, last_logical_line_exclusive: last_excl, lines }
 }
@@ -561,17 +583,9 @@ async fn apply_edit(
     let old_first_line = start_pos.line;
     let old_last_line = end_pos.line;
 
-    // Mutate the buffer.
+    // Mutate the buffer (rope edit + incremental reparse if syntax is attached).
     let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
-    if start_char < end_char {
-        buf_mut.text.remove(start_char..end_char);
-    }
-    if !insert_text.is_empty() {
-        buf_mut.text.insert(start_char, insert_text);
-    }
-    buf_mut.revision += 1;
-    buf_mut.dirty = true;
-    let revision = buf_mut.revision;
+    let revision = buf_mut.apply_edit(start_char, end_char, insert_text);
 
     // Compute the cursor's new position: just past the inserted text.
     let inserted_char_count = insert_text.chars().count();

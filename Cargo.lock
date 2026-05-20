@@ -24,6 +24,7 @@ dependencies = [
  "ropey",
  "serde",
  "serde_json",
+ "streaming-iterator",
  "tempfile",
  "thiserror",
  "tokio",
@@ -32,6 +33,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tree-sitter",
+ "tree-sitter-md",
+ "tree-sitter-rust",
+ "tree-sitter-toml-ng",
  "uuid",
 ]
 
@@ -1455,6 +1459,36 @@ name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-md"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17f968c22a01010b83fc960455ae729db08dbeb6388617d9113897cb9204b030"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.23.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca8ccb3e3a3495c8a943f6c3fd24c3804c471fd7f4f16087623c7fa4c0068e8a"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-toml-ng"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9adc2c898ae49730e857d75be403da3f92bb81d8e37a2f918a08dd10de5ebb1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "tungstenite"

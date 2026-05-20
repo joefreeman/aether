@@ -612,6 +612,60 @@ async fn input_delete_backspace_removes_char_before_cursor() {
 }
 
 #[tokio::test]
+async fn viewport_includes_treesitter_highlights_for_rust() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn main() { let s = \"hi\"; }\n").unwrap();
+
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams { path_index: Some(0), relative_path: Some("a.rs".into()), language: None },
+    )
+    .await;
+    assert_eq!(open.language.as_deref(), Some("rust"));
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::None,
+        },
+    )
+    .await;
+
+    let line0 = &sub.window.lines[0];
+    let segs = &line0.visual_rows[0].segments;
+    let highlights = &segs[0].highlights;
+    assert!(!highlights.is_empty(), "expected highlight spans on a Rust line");
+
+    // First two bytes should be the keyword 'fn'.
+    let fn_kw = highlights.iter().find(|h| h.start == 0 && h.end == 2);
+    assert!(
+        fn_kw.is_some_and(|h| h.kind.contains("keyword")),
+        "expected 'fn' to be tagged keyword, got {:?}",
+        fn_kw
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn save_in_place_writes_file_and_clears_dirty() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("greet.txt");

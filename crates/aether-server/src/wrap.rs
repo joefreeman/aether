@@ -5,14 +5,29 @@
 //! but does not yet handle East-Asian wide characters or grapheme clusters spanning multiple
 //! scalars. Refinement deferred.
 
-use aether_protocol::viewport::{LogicalLineRender, Segment, VisualRow, WrapMode};
+use aether_protocol::viewport::{Highlight, LogicalLineRender, Segment, VisualRow, WrapMode};
 
-pub fn render_line(line_text: &str, logical_line: u32, cols: u32, wrap: WrapMode) -> LogicalLineRender {
+pub fn render_line(
+    line_text: &str,
+    logical_line: u32,
+    cols: u32,
+    wrap: WrapMode,
+    highlights: Vec<Highlight>,
+) -> LogicalLineRender {
     let visual_rows = match wrap {
-        WrapMode::None => vec![visual_row(line_text, 0)],
+        WrapMode::None => vec![visual_row_with_highlights(line_text, 0, highlights)],
+        // TODO: distribute highlights across wrapped visual rows. The TUI uses WrapMode::None for
+        // now, so highlights are dropped on the floor when wrapping is on.
         WrapMode::Soft => wrap_line(line_text, cols),
     };
     LogicalLineRender { logical_line, visual_rows }
+}
+
+fn visual_row_with_highlights(text: &str, continuation_indent: u32, highlights: Vec<Highlight>) -> VisualRow {
+    VisualRow {
+        continuation_indent,
+        segments: vec![Segment { text: text.to_string(), highlights }],
+    }
 }
 
 fn wrap_line(line: &str, cols: u32) -> Vec<VisualRow> {
@@ -150,7 +165,7 @@ mod tests {
 
     #[test]
     fn render_line_no_wrap_returns_single_row() {
-        let r = render_line("anything goes here at all", 0, 5, WrapMode::None);
+        let r = render_line("anything goes here at all", 0, 5, WrapMode::None, vec![]);
         assert_eq!(r.visual_rows.len(), 1);
         assert_eq!(row_text(&r.visual_rows[0]), "anything goes here at all");
     }

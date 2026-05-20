@@ -7,6 +7,7 @@ mod error;
 mod handlers;
 mod server;
 mod state;
+mod syntax;
 mod wrap;
 
 pub use config::ProjectConfig;

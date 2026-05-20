@@ -1,9 +1,11 @@
 //! Authoritative in-memory state owned by the server.
 
+use crate::syntax::{self, LanguageConfig};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
 use aether_protocol::viewport::WrapMode;
 use aether_protocol::{BufferId, ClientId, Revision, ViewportId};
+use tree_sitter::{InputEdit, Parser, Point, Tree};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,6 +86,13 @@ pub struct Buffer {
     pub dirty: bool,
     pub line_ending: LineEnding,
     pub last_modified_unix_ms: Option<u64>,
+    pub syntax: Option<BufferSyntax>,
+}
+
+pub struct BufferSyntax {
+    pub config: &'static LanguageConfig,
+    pub parser: Parser,
+    pub tree: Tree,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +120,7 @@ impl Buffer {
                 .map(|d| d.as_millis() as u64)
         });
         let language = detect_language(&canonical);
+        let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));
         Ok(Buffer {
             id,
             canonical_path: Some(canonical),
@@ -120,19 +130,23 @@ impl Buffer {
             dirty: false,
             line_ending,
             last_modified_unix_ms,
+            syntax,
         })
     }
 
     pub fn scratch(id: BufferId, language: Option<String>) -> Self {
+        let text = ropey::Rope::new();
+        let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));
         Buffer {
             id,
             canonical_path: None,
-            text: ropey::Rope::new(),
+            text,
             revision: 0,
             language,
             dirty: false,
             line_ending: LineEnding::Lf,
             last_modified_unix_ms: None,
+            syntax,
         }
     }
 
@@ -145,6 +159,65 @@ impl Buffer {
 
     pub fn byte_count(&self) -> u64 {
         self.text.len_bytes() as u64
+    }
+
+    /// Apply a text replacement: remove `start_char..end_char`, insert `insert_text` at
+    /// `start_char`. Bumps `revision`, marks dirty, and updates the parse tree incrementally
+    /// (if a `syntax` is attached). Returns the new revision.
+    pub fn apply_edit(&mut self, start_char: usize, end_char: usize, insert_text: &str) -> Revision {
+        // Capture old byte positions for tree-sitter's InputEdit *before* mutating the rope.
+        let edit_info = if self.syntax.is_some() {
+            let start_byte = self.text.char_to_byte(start_char);
+            let old_end_byte = self.text.char_to_byte(end_char);
+            let start_position = rope_byte_to_point(&self.text, start_byte);
+            let old_end_position = rope_byte_to_point(&self.text, old_end_byte);
+            Some((start_byte, old_end_byte, start_position, old_end_position))
+        } else {
+            None
+        };
+
+        if start_char < end_char {
+            self.text.remove(start_char..end_char);
+        }
+        if !insert_text.is_empty() {
+            self.text.insert(start_char, insert_text);
+        }
+        self.revision += 1;
+        self.dirty = true;
+
+        if let Some((start_byte, old_end_byte, start_position, old_end_position)) = edit_info {
+            let new_end_byte = start_byte + insert_text.len();
+            let new_end_position = rope_byte_to_point(&self.text, new_end_byte);
+
+            let text = &self.text;
+            let syntax = self.syntax.as_mut().expect("just checked");
+            syntax.tree.edit(&InputEdit {
+                start_byte,
+                old_end_byte,
+                new_end_byte,
+                start_position,
+                old_end_position,
+                new_end_position,
+            });
+            let parser = &mut syntax.parser;
+            let tree = &mut syntax.tree;
+            let new_tree = parser.parse_with(
+                &mut |byte_idx: usize, _: Point| -> &[u8] {
+                    if byte_idx >= text.len_bytes() {
+                        return &[];
+                    }
+                    let (chunk, chunk_byte_start, _, _) = text.chunk_at_byte(byte_idx);
+                    let bytes = chunk.as_bytes();
+                    &bytes[byte_idx - chunk_byte_start..]
+                },
+                Some(&*tree),
+            );
+            if let Some(t) = new_tree {
+                *tree = t;
+            }
+        }
+
+        self.revision
     }
 
     /// Write the buffer to disk atomically: write to `<dir>/.aether-tmp-<pid>-<name>`,
@@ -216,6 +289,24 @@ fn detect_language(path: &Path) -> Option<String> {
         _ => return None,
     }
     .to_string())
+}
+
+fn make_syntax(text: &ropey::Rope, language: &str) -> Option<BufferSyntax> {
+    let config = syntax::get_config(language)?;
+    let mut parser = syntax::make_parser(config);
+    let source: String = text.chunks().collect();
+    let tree = parser.parse(&source, None)?;
+    Some(BufferSyntax { config, parser, tree })
+}
+
+fn rope_byte_to_point(rope: &ropey::Rope, byte_idx: usize) -> Point {
+    let char_idx = rope.byte_to_char(byte_idx);
+    let line = rope.char_to_line(char_idx);
+    let line_start_char = rope.line_to_char(line);
+    let col_chars = char_idx - line_start_char;
+    let line_slice = rope.line(line);
+    let col_bytes = line_slice.char_to_byte(col_chars);
+    Point { row: line, column: col_bytes }
 }
 
 pub struct ClientSession {

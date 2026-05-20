@@ -2,6 +2,7 @@
 
 use crate::app::AppState;
 use aether_protocol::cursor::CursorState;
+use aether_protocol::viewport::Highlight;
 use aether_protocol::LogicalPosition;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -32,14 +33,17 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             continue;
         }
         let render = &state.lines[local_idx as usize];
-        let text = render
-            .visual_rows
-            .first()
-            .map(|r| r.segments.iter().map(|s| s.text.as_str()).collect::<String>())
-            .unwrap_or_default();
+        // Phase-1 wrap=none invariant: one visual row per logical line, one segment per row.
+        let (text, highlights): (String, &[Highlight]) = match render.visual_rows.first() {
+            Some(vr) => match vr.segments.first() {
+                Some(seg) => (seg.text.clone(), seg.highlights.as_slice()),
+                None => (String::new(), &[]),
+            },
+            None => (String::new(), &[]),
+        };
         let sel_on_line = selection
             .and_then(|(s, e)| selection_range_on_line(logical_line, text.len() as u32, s, e));
-        lines.push(Line::from(build_spans(&text, sel_on_line, area.width)));
+        lines.push(Line::from(build_spans(&text, highlights, sel_on_line, area.width)));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -71,48 +75,111 @@ fn selection_range_on_line(
     Some((start, end))
 }
 
-/// Truncate `text` to fit `max_chars` columns, splitting into spans on the selection boundary.
-/// Reversed style highlights the selection.
-fn build_spans(text: &str, sel: Option<(u32, u32)>, max_chars: u16) -> Vec<Span<'static>> {
+/// Truncate `text` to fit `max_chars` columns and emit styled spans. Style at each byte is the
+/// combination of the syntax-highlight color (per `highlights`) and, if that byte falls in `sel`,
+/// the `REVERSED` modifier.
+fn build_spans(
+    text: &str,
+    highlights: &[Highlight],
+    sel: Option<(u32, u32)>,
+    max_chars: u16,
+) -> Vec<Span<'static>> {
     let truncated: String = text.chars().take(max_chars as usize).collect();
+    let trunc_len = truncated.len();
+    if trunc_len == 0 {
+        return Vec::new();
+    }
 
-    let Some((sel_start, sel_end)) = sel else {
-        return vec![Span::raw(truncated)];
+    // Build a per-byte highlight-kind table. Highlights from the server are non-overlapping.
+    let mut byte_kind: Vec<Option<&str>> = vec![None; trunc_len];
+    for h in highlights {
+        let s = (h.start as usize).min(trunc_len);
+        let e = (h.end as usize).min(trunc_len);
+        for i in s..e {
+            byte_kind[i] = Some(h.kind.as_str());
+        }
+    }
+
+    let style_at = |byte_idx: usize| -> Style {
+        let mut style = byte_kind[byte_idx].map(theme_for).unwrap_or_default();
+        if let Some((s, e)) = sel {
+            if byte_idx >= s as usize && byte_idx < e as usize {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+        }
+        style
     };
 
-    let len = truncated.len();
-    let s = floor_char_boundary(&truncated, (sel_start as usize).min(len));
-    let e = floor_char_boundary(&truncated, (sel_end as usize).min(len));
-
-    let normal = Style::default();
-    let selected = Style::default().add_modifier(Modifier::REVERSED);
-
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
-    if s > 0 {
-        spans.push(Span::styled(truncated[..s].to_string(), normal));
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current_start = 0usize;
+    let mut current_style: Option<Style> = None;
+    for (byte_idx, _) in truncated.char_indices() {
+        let style = style_at(byte_idx);
+        match current_style {
+            None => {
+                current_style = Some(style);
+                current_start = byte_idx;
+            }
+            Some(s) if s != style => {
+                spans.push(Span::styled(truncated[current_start..byte_idx].to_string(), s));
+                current_style = Some(style);
+                current_start = byte_idx;
+            }
+            _ => {}
+        }
     }
-    if s < e {
-        spans.push(Span::styled(truncated[s..e].to_string(), selected));
-    }
-    if e < truncated.len() {
-        spans.push(Span::styled(truncated[e..].to_string(), normal));
+    if let Some(s) = current_style {
+        spans.push(Span::styled(truncated[current_start..].to_string(), s));
     }
     spans
 }
 
-fn floor_char_boundary(s: &str, target: usize) -> usize {
-    if target >= s.len() {
-        return s.len();
-    }
-    let mut last = 0;
-    for (i, _) in s.char_indices() {
-        if i > target {
-            return last;
+/// Map a tree-sitter highlight name to a `Style`. Falls back along dotted prefixes
+/// (e.g. `function.macro` → `function`) before defaulting.
+fn theme_for(kind: &str) -> Style {
+    let mut current = kind;
+    loop {
+        if let Some(style) = lookup_exact(current) {
+            return style;
         }
-        last = i;
+        match current.rfind('.') {
+            Some(idx) => current = &current[..idx],
+            None => return Style::default(),
+        }
     }
-    last
 }
+
+fn lookup_exact(name: &str) -> Option<Style> {
+    let s = Style::default();
+    Some(match name {
+        "keyword" => s.fg(Color::Yellow),
+        "string" => s.fg(Color::Green),
+        "string.escape" | "string.special" => s.fg(Color::LightGreen),
+        "comment" => s.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        "number" | "boolean" | "constant" | "constant.builtin" => s.fg(Color::Magenta),
+        "function" | "function.call" => s.fg(Color::Cyan),
+        "function.macro" => s.fg(Color::LightCyan),
+        "type" | "type.builtin" => s.fg(Color::Blue),
+        "variable" => s,
+        "variable.parameter" => s.fg(Color::LightYellow),
+        "variable.builtin" => s.fg(Color::Magenta),
+        "operator" => s.fg(Color::LightYellow),
+        "punctuation.bracket" | "punctuation.delimiter" => s.fg(Color::Gray),
+        "punctuation.special" => s.fg(Color::Magenta),
+        "attribute" | "label" => s.fg(Color::LightCyan),
+        "tag" => s.fg(Color::Magenta),
+        "property" => s.fg(Color::LightBlue),
+        // Markdown (tree-sitter-md uses these "text.*" capture names).
+        "text.title" => s.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        "text.literal" => s.fg(Color::Green),
+        "text.uri" => s.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
+        "text.reference" => s.fg(Color::Cyan),
+        "text.emphasis" => s.add_modifier(Modifier::ITALIC),
+        "text.strong" => s.add_modifier(Modifier::BOLD),
+        _ => return None,
+    })
+}
+
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     let dirty_marker = if state.dirty { "[+]" } else { "" };
