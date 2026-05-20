@@ -2,8 +2,9 @@
 
 use crate::cursor as motion;
 use crate::error::RpcError;
-use crate::state::{Buffer, ClientSession, ServerState, SharedState, Viewport};
+use crate::state::{Buffer, ClientSession, EditKindTag, ServerState, SharedState, Viewport};
 use crate::wrap;
+use std::collections::HashMap;
 use aether_protocol::buffer::{
     BufferOpenParams, BufferOpenResult, BufferSaveParams, BufferSaveResult, BufferState,
     BufferStateParams,
@@ -14,7 +15,9 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::handshake::{ClientHelloParams, ClientHelloResult, ProjectInfo};
-use aether_protocol::input::{EditResult, InputDeleteParams, InputTextParams};
+use aether_protocol::input::{
+    EditResult, InputDeleteParams, InputTextParams, UndoResult,
+};
 use aether_protocol::viewport::{
     LogicalLineRange, LogicalLineRender, ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportResizeParams, ViewportScrollParams, ViewportSubscribeParams, ViewportSubscribeResult,
@@ -539,6 +542,136 @@ pub async fn input_delete(
     apply_edit(state, client_id, params.buffer_id, EditKind::DeleteMotion(params.motion)).await
 }
 
+pub async fn input_undo(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::input::BufferOnlyParams,
+) -> Result<UndoResult, RpcError> {
+    apply_undo_or_redo(state, ctx, params.buffer_id, UndoDirection::Undo).await
+}
+
+pub async fn input_redo(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::input::BufferOnlyParams,
+) -> Result<UndoResult, RpcError> {
+    apply_undo_or_redo(state, ctx, params.buffer_id, UndoDirection::Redo).await
+}
+
+enum UndoDirection {
+    Undo,
+    Redo,
+}
+
+async fn apply_undo_or_redo(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    buffer_id: BufferId,
+    direction: UndoDirection,
+) -> Result<UndoResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+
+    // Snapshot current cursors so the *other* direction's stack can restore them later.
+    let current_cursors: HashMap<ClientId, CursorState> = s
+        .cursors
+        .iter()
+        .filter_map(|((c, b), cs)| if *b == buffer_id { Some((*c, *cs)) } else { None })
+        .collect();
+
+    let outcome = {
+        let buf = s
+            .buffers
+            .get_mut(&buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+        match direction {
+            UndoDirection::Undo => buf.undo(current_cursors),
+            UndoDirection::Redo => buf.redo(current_cursors),
+        }
+    };
+
+    let Some(outcome) = outcome else {
+        // Nothing to undo/redo. Echo current cursor and revision back.
+        let buf = s.buffers.get(&buffer_id).expect("just checked");
+        let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+        return Ok(UndoResult {
+            revision: buf.revision,
+            applied: false,
+            cursor,
+            dirty: buf.dirty,
+        });
+    };
+
+    let buf = s.buffers.get(&buffer_id).expect("just modified");
+    let revision = buf.revision;
+    let dirty = buf.dirty;
+
+    // Restore cursors from the snapshot, clamped to valid positions in the restored rope.
+    let mut new_cursors: HashMap<ClientId, CursorState> = HashMap::new();
+    for (cid, cursor) in &outcome.restored_cursors {
+        new_cursors.insert(*cid, clamp_cursor(buf, *cursor));
+    }
+    // Clients with cursors on this buffer that weren't in the snapshot: just clamp their current
+    // cursor to the new buffer bounds.
+    let existing_cursor_ids: Vec<ClientId> = s
+        .cursors
+        .keys()
+        .filter_map(|(c, b)| if *b == buffer_id { Some(*c) } else { None })
+        .collect();
+    for cid in existing_cursor_ids {
+        if !new_cursors.contains_key(&cid) {
+            if let Some(cursor) = s.cursors.get(&(cid, buffer_id)).copied() {
+                new_cursors.insert(cid, clamp_cursor(buf, cursor));
+            }
+        }
+    }
+    for (cid, cursor) in &new_cursors {
+        s.cursors.insert((*cid, buffer_id), *cursor);
+    }
+    let undoing_cursor =
+        new_cursors.get(&client_id).copied().unwrap_or_else(CursorState::default);
+
+    // Push the full visible window to every viewport on this buffer — the rope was swapped
+    // wholesale, so we can't be surgical about it.
+    let buf_ref = &s.buffers[&buffer_id];
+    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let new_line_count = buf_ref.line_count();
+    for vp in s.viewports.values() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision)));
+    }
+    // Clamp viewport pushed ranges to the new line count.
+    for vp in s.viewports.values_mut() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        vp.first_logical_line = vp.first_logical_line.min(new_line_count);
+        vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
+    }
+
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    Ok(UndoResult { revision, applied: true, cursor: undoing_cursor, dirty })
+}
+
+fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
+    let position = motion::clamp_position(buf, cursor.position);
+    let anchor = cursor.anchor.map(|a| motion::clamp_position(buf, a));
+    let anchor = match anchor {
+        Some(a) if a == position => None,
+        x => x,
+    };
+    CursorState { position, anchor }
+}
+
 enum EditKind {
     /// Replace the selection with `text` (insert at cursor if no selection).
     ReplaceWith(String),
@@ -582,10 +715,21 @@ async fn apply_edit(
     let end_char = motion::pos_to_char(buf, end_pos);
     let old_first_line = start_pos.line;
     let old_last_line = end_pos.line;
+    let kind_tag = match &edit {
+        EditKind::ReplaceWith(_) => EditKindTag::Text,
+        EditKind::DeleteMotion(_) => EditKindTag::Delete,
+    };
 
-    // Mutate the buffer (rope edit + incremental reparse if syntax is attached).
+    // Snapshot all per-client cursors on this buffer so the undo entry can restore them.
+    let cursors_before: HashMap<ClientId, CursorState> = s
+        .cursors
+        .iter()
+        .filter_map(|((c, b), cs)| if *b == buffer_id { Some((*c, *cs)) } else { None })
+        .collect();
+
+    // Mutate the buffer (rope edit + incremental reparse + undo-group bookkeeping).
     let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
-    let revision = buf_mut.apply_edit(start_char, end_char, insert_text);
+    let revision = buf_mut.apply_edit(start_char, end_char, insert_text, kind_tag, cursors_before);
 
     // Compute the cursor's new position: just past the inserted text.
     let inserted_char_count = insert_text.chars().count();
@@ -623,6 +767,7 @@ async fn apply_edit(
         vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
     }
 
+    let dirty = s.buffers[&buffer_id].dirty;
     drop(s);
 
     for (sender, notif) in pushes {
@@ -633,6 +778,7 @@ async fn apply_edit(
     Ok(EditResult {
         revision,
         cursor: CursorState { position: new_cursor_pos, anchor: None },
+        dirty,
     })
 }
 

@@ -5,7 +5,11 @@ use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
 use aether_protocol::viewport::WrapMode;
 use aether_protocol::{BufferId, ClientId, Revision, ViewportId};
+use std::time::{Duration, Instant};
 use tree_sitter::{InputEdit, Parser, Point, Tree};
+
+/// Edits within this window join the active undo group.
+const GROUP_TIME_WINDOW: Duration = Duration::from_millis(500);
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,16 +87,52 @@ pub struct Buffer {
     pub text: ropey::Rope,
     pub revision: Revision,
     pub language: Option<String>,
+    /// Derived: `revision != saved_revision`. Kept as a field for cheap reads.
     pub dirty: bool,
     pub line_ending: LineEnding,
     pub last_modified_unix_ms: Option<u64>,
     pub syntax: Option<BufferSyntax>,
+
+    /// Revision at the most recent successful save. `None` only for a never-saved scratch
+    /// buffer in its initial empty state — see `Buffer::scratch`.
+    saved_revision: Option<Revision>,
+    /// Source of fresh revision ids. Always strictly greater than any revision ever assigned.
+    next_revision_id: u64,
+
+    undo_stack: Vec<UndoEntry>,
+    redo_stack: Vec<UndoEntry>,
+    active_group: Option<ActiveGroup>,
 }
 
 pub struct BufferSyntax {
     pub config: &'static LanguageConfig,
     pub parser: Parser,
     pub tree: Tree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKindTag {
+    Text,
+    Delete,
+}
+
+struct UndoEntry {
+    rope: ropey::Rope,
+    revision: Revision,
+    cursors: std::collections::HashMap<ClientId, CursorState>,
+}
+
+struct ActiveGroup {
+    last_edit_at: Instant,
+    kind: EditKindTag,
+}
+
+pub struct UndoOutcome {
+    pub new_revision: Revision,
+    /// Cursor positions captured at the start of the rewound group. The undoing client uses
+    /// theirs as the post-undo cursor; other clients clamp these or their existing positions
+    /// to valid buffer offsets.
+    pub restored_cursors: std::collections::HashMap<ClientId, CursorState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +171,11 @@ impl Buffer {
             line_ending,
             last_modified_unix_ms,
             syntax,
+            saved_revision: Some(0),
+            next_revision_id: 1,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            active_group: None,
         })
     }
 
@@ -147,6 +192,12 @@ impl Buffer {
             line_ending: LineEnding::Lf,
             last_modified_unix_ms: None,
             syntax,
+            // Treat empty scratch as "clean"; first edit makes it dirty.
+            saved_revision: Some(0),
+            next_revision_id: 1,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            active_group: None,
         }
     }
 
@@ -162,9 +213,35 @@ impl Buffer {
     }
 
     /// Apply a text replacement: remove `start_char..end_char`, insert `insert_text` at
-    /// `start_char`. Bumps `revision`, marks dirty, and updates the parse tree incrementally
-    /// (if a `syntax` is attached). Returns the new revision.
-    pub fn apply_edit(&mut self, start_char: usize, end_char: usize, insert_text: &str) -> Revision {
+    /// `start_char`. Bumps `revision`, marks dirty, updates the parse tree incrementally, and
+    /// manages the undo group (opening a new entry if grouping conditions broke).
+    ///
+    /// `cursors_before_edit` is the per-client cursor map captured before this edit; it's
+    /// stored in the undo entry when a new group opens, so `Buffer::undo` can restore cursors.
+    pub fn apply_edit(
+        &mut self,
+        start_char: usize,
+        end_char: usize,
+        insert_text: &str,
+        kind: EditKindTag,
+        cursors_before_edit: std::collections::HashMap<ClientId, CursorState>,
+    ) -> Revision {
+        let now = Instant::now();
+
+        // Decide whether to start a new undo group.
+        let start_new_group = match &self.active_group {
+            None => true,
+            Some(g) => now.duration_since(g.last_edit_at) > GROUP_TIME_WINDOW || g.kind != kind,
+        };
+        if start_new_group {
+            self.undo_stack.push(UndoEntry {
+                rope: self.text.clone(),
+                revision: self.revision,
+                cursors: cursors_before_edit,
+            });
+            self.redo_stack.clear();
+        }
+
         // Capture old byte positions for tree-sitter's InputEdit *before* mutating the rope.
         let edit_info = if self.syntax.is_some() {
             let start_byte = self.text.char_to_byte(start_char);
@@ -182,8 +259,10 @@ impl Buffer {
         if !insert_text.is_empty() {
             self.text.insert(start_char, insert_text);
         }
-        self.revision += 1;
-        self.dirty = true;
+        self.revision = self.next_revision_id;
+        self.next_revision_id += 1;
+        self.active_group = Some(ActiveGroup { last_edit_at: now, kind });
+        self.recompute_dirty();
 
         if let Some((start_byte, old_end_byte, start_position, old_end_position)) = edit_info {
             let new_end_byte = start_byte + insert_text.len();
@@ -271,8 +350,61 @@ impl Buffer {
 
         self.canonical_path = Some(canonical);
         self.last_modified_unix_ms = Some(mtime_ms);
-        self.dirty = false;
+        self.saved_revision = Some(self.revision);
+        self.active_group = None;
+        self.recompute_dirty();
         Ok(mtime_ms)
+    }
+
+    pub fn undo(
+        &mut self,
+        current_cursors: std::collections::HashMap<ClientId, CursorState>,
+    ) -> Option<UndoOutcome> {
+        let entry = self.undo_stack.pop()?;
+        self.redo_stack.push(UndoEntry {
+            rope: self.text.clone(),
+            revision: self.revision,
+            cursors: current_cursors,
+        });
+        self.text = entry.rope;
+        self.revision = entry.revision;
+        self.active_group = None;
+        self.recompute_dirty();
+        self.reparse_full();
+        Some(UndoOutcome { new_revision: self.revision, restored_cursors: entry.cursors })
+    }
+
+    pub fn redo(
+        &mut self,
+        current_cursors: std::collections::HashMap<ClientId, CursorState>,
+    ) -> Option<UndoOutcome> {
+        let entry = self.redo_stack.pop()?;
+        self.undo_stack.push(UndoEntry {
+            rope: self.text.clone(),
+            revision: self.revision,
+            cursors: current_cursors,
+        });
+        self.text = entry.rope;
+        self.revision = entry.revision;
+        self.active_group = None;
+        self.recompute_dirty();
+        self.reparse_full();
+        Some(UndoOutcome { new_revision: self.revision, restored_cursors: entry.cursors })
+    }
+
+    fn recompute_dirty(&mut self) {
+        self.dirty = self.saved_revision != Some(self.revision);
+    }
+
+    /// Re-parse the entire buffer from scratch. Used after operations (undo/redo) that swap the
+    /// whole rope — the incremental InputEdit pathway can't help when the buffer is replaced.
+    fn reparse_full(&mut self) {
+        if let Some(syntax) = self.syntax.as_mut() {
+            let source: String = self.text.chunks().collect();
+            if let Some(tree) = syntax.parser.parse(&source, None) {
+                syntax.tree = tree;
+            }
+        }
     }
 }
 

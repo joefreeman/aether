@@ -9,7 +9,7 @@ use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
 use aether_protocol::handshake::ClientHello;
-use aether_protocol::input::{InputDelete, InputText};
+use aether_protocol::input::{InputDelete, InputRedo, InputText, InputUndo};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportSubscribe, ViewportUnsubscribe,
 };
@@ -142,6 +142,8 @@ async fn dispatch(
         CursorSet::NAME => run!(CursorSet, handlers::cursor_set),
         InputText::NAME => run!(InputText, handlers::input_text),
         InputDelete::NAME => run!(InputDelete, handlers::input_delete),
+        InputUndo::NAME => run!(InputUndo, handlers::input_undo),
+        InputRedo::NAME => run!(InputRedo, handlers::input_redo),
         other => Err(RpcError::method_not_found(other)),
     }
 }

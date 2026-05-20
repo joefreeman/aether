@@ -13,7 +13,8 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::handshake::{ClientHello, ClientHelloParams, ClientHelloResult};
 use aether_protocol::input::{
-    EditResult, InputDelete, InputDeleteParams, InputText, InputTextParams,
+    BufferOnlyParams, EditResult, InputDelete, InputDeleteParams, InputRedo, InputText,
+    InputTextParams, InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportScroll,
@@ -825,6 +826,129 @@ async fn save_scratch_returns_buffer_has_no_path() {
     let text = next_text(&mut ws).await;
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["error"]["code"], -32015, "expected BUFFER_HAS_NO_PATH");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn undo_reverts_recent_edit_and_redo_reapplies() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+
+    // Set cursor to end of "abc" and insert "XY".
+    send_request::<aether_protocol::cursor::CursorSet>(
+        &mut ws,
+        10,
+        &aether_protocol::cursor::CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        11,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::Soft,
+        },
+    )
+    .await;
+    let edit: EditResult =
+        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "XY".into() }).await;
+    assert!(edit.dirty);
+    let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+
+    // Undo: should revert "XY", cursor back to col 3, and dirty cleared (we're back at saved rev).
+    let undo: UndoResult = send_request::<InputUndo>(&mut ws, 13, &BufferOnlyParams { buffer_id }).await;
+    assert!(undo.applied);
+    assert_eq!(undo.cursor.position, LogicalPosition { line: 0, col: 3 });
+    assert!(!undo.dirty, "undo back to saved should clear dirty");
+    let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "abc");
+
+    // Redo: re-applies "XY", dirty true again.
+    let redo: UndoResult = send_request::<InputRedo>(&mut ws, 14, &BufferOnlyParams { buffer_id }).await;
+    assert!(redo.applied);
+    assert!(redo.dirty);
+    let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "abcXY");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn undo_on_empty_stack_returns_applied_false() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hi\n").await;
+    let r: UndoResult =
+        send_request::<InputUndo>(&mut ws, 10, &BufferOnlyParams { buffer_id }).await;
+    assert!(!r.applied);
+    assert!(!r.dirty);
+    drop(server);
+}
+
+#[tokio::test]
+async fn dirty_clears_when_undoing_back_past_save() {
+    // Make two edits in distinct groups, save in the middle, then undo back.
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+    send_request::<aether_protocol::cursor::CursorSet>(
+        &mut ws,
+        10,
+        &aether_protocol::cursor::CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        11,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::Soft,
+        },
+    )
+    .await;
+    // Edit #1: insert "X"
+    let _e1: EditResult =
+        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "X".into() }).await;
+    let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+
+    // Save.
+    let _save: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        13,
+        &BufferSaveParams { buffer_id, path_index: None, relative_path: None },
+    )
+    .await;
+    let _ = expect_notification::<BufferState>(&mut ws).await;
+
+    // Edit #2: delete (different kind, so a new group). Backspace removes the "X".
+    let _e2: EditResult = send_request::<InputDelete>(
+        &mut ws,
+        14,
+        &InputDeleteParams {
+            buffer_id,
+            motion: Motion::Char { direction: Direction::Backward, count: 1 },
+        },
+    )
+    .await;
+    let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+
+    // Undo: should put "X" back, taking us back to the saved revision → dirty cleared.
+    let undo: UndoResult = send_request::<InputUndo>(&mut ws, 15, &BufferOnlyParams { buffer_id }).await;
+    assert!(undo.applied);
+    assert!(!undo.dirty, "undo back to saved revision should clear dirty");
+    let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     drop(server);
 }

@@ -8,7 +8,10 @@ use aether_protocol::buffer::{
 use aether_protocol::cursor::{CursorMove, CursorMoveParams, CursorState, Direction, Motion};
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
-use aether_protocol::input::{InputDelete, InputDeleteParams, InputText, InputTextParams};
+use aether_protocol::input::{
+    BufferOnlyParams, InputDelete, InputDeleteParams, InputRedo, InputText, InputTextParams,
+    InputUndo, UndoResult,
+};
 use aether_protocol::viewport::{
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSubscribe,
@@ -199,6 +202,8 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
     match (k.code, k.modifiers) {
         (KeyCode::Char('q' | 'c'), KeyModifiers::CONTROL) => state.should_quit = true,
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => save_buffer(client, state).await?,
+        (KeyCode::Char('z'), KeyModifiers::CONTROL) => undo(client, state).await?,
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => redo(client, state).await?,
 
         (KeyCode::Left, m) => move_cursor(client, state, Motion::Char { direction: Direction::Backward, count: 1 }, m.contains(KeyModifiers::SHIFT)).await?,
         (KeyCode::Right, m) => move_cursor(client, state, Motion::Char { direction: Direction::Forward, count: 1 }, m.contains(KeyModifiers::SHIFT)).await?,
@@ -266,7 +271,7 @@ async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> R
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = true;
+    state.dirty = r.dirty;
     Ok(())
 }
 
@@ -276,8 +281,35 @@ async fn delete_with_motion(client: &mut Client, state: &mut AppState, motion: M
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = true;
+    state.dirty = r.dirty;
     Ok(())
+}
+
+async fn undo(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: UndoResult = client
+        .rpc::<InputUndo>(BufferOnlyParams { buffer_id: state.buffer_id })
+        .await?;
+    apply_undo_result(state, r, "undo");
+    Ok(())
+}
+
+async fn redo(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: UndoResult = client
+        .rpc::<InputRedo>(BufferOnlyParams { buffer_id: state.buffer_id })
+        .await?;
+    apply_undo_result(state, r, "redo");
+    Ok(())
+}
+
+fn apply_undo_result(state: &mut AppState, r: UndoResult, label: &str) {
+    if !r.applied {
+        state.status = format!("nothing to {label}");
+        return;
+    }
+    state.revision = r.revision;
+    state.cursor = r.cursor;
+    state.dirty = r.dirty;
+    state.status = format!("{label} (rev {})", r.revision);
 }
 
 async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
