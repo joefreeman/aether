@@ -146,6 +146,61 @@ impl Buffer {
     pub fn byte_count(&self) -> u64 {
         self.text.len_bytes() as u64
     }
+
+    /// Write the buffer to disk atomically: write to `<dir>/.aether-tmp-<pid>-<name>`,
+    /// fsync, rename onto `target`, fsync the parent directory. Restores CRLF if the buffer
+    /// was loaded with CRLF endings. Updates `canonical_path`, `dirty`, `last_modified_unix_ms`.
+    ///
+    /// Returns the post-save mtime in unix milliseconds.
+    pub fn save_to_disk(&mut self, target: PathBuf) -> std::io::Result<u64> {
+        use std::io::Write;
+
+        let mut text: String = self.text.chunks().collect();
+        if self.line_ending == LineEnding::Crlf {
+            text = text.replace('\n', "\r\n");
+        }
+
+        let parent = target.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "save target has no parent dir")
+        })?;
+        let file_name = target.file_name().and_then(|s| s.to_str()).unwrap_or("aether");
+        let tmp_path = parent.join(format!(".aether-tmp-{}-{file_name}", std::process::id()));
+
+        // Write to tmp.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        // Atomic rename.
+        if let Err(e) = std::fs::rename(&tmp_path, &target) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        // Best-effort: fsync the parent directory so the rename is durable.
+        #[cfg(unix)]
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+
+        let canonical = std::fs::canonicalize(&target).unwrap_or(target);
+        let mtime_ms = std::fs::metadata(&canonical)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        self.canonical_path = Some(canonical);
+        self.last_modified_unix_ms = Some(mtime_ms);
+        self.dirty = false;
+        Ok(mtime_ms)
+    }
 }
 
 fn detect_language(path: &Path) -> Option<String> {

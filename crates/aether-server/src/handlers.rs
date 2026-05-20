@@ -4,7 +4,10 @@ use crate::cursor as motion;
 use crate::error::RpcError;
 use crate::state::{Buffer, ClientSession, ServerState, SharedState, Viewport};
 use crate::wrap;
-use aether_protocol::buffer::{BufferOpenParams, BufferOpenResult};
+use aether_protocol::buffer::{
+    BufferOpenParams, BufferOpenResult, BufferSaveParams, BufferSaveResult, BufferState,
+    BufferStateParams,
+};
 use aether_protocol::cursor::{
     CursorMoveParams, CursorSetParams, CursorState, Motion,
 };
@@ -161,6 +164,115 @@ pub async fn buffer_open(
     s.buffers.insert(id, buf);
     tracing::info!(buffer_id = id, path = %canonical.display(), "buffer opened");
     Ok(result)
+}
+
+// ---- buffer/save --------------------------------------------------------------------------------
+
+pub async fn buffer_save(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferSaveParams,
+) -> Result<BufferSaveResult, RpcError> {
+    let _client_id = ctx.require_hello()?;
+
+    // Resolve the target absolute path.
+    let target: std::path::PathBuf = match (params.path_index, params.relative_path.as_deref()) {
+        (None, None) => {
+            let s = state.lock().await;
+            let buf = s
+                .buffers
+                .get(&params.buffer_id)
+                .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+            buf.canonical_path
+                .clone()
+                .ok_or_else(RpcError::buffer_has_no_path)?
+        }
+        (Some(idx), rel) => {
+            let s = state.lock().await;
+            let base = s
+                .project_paths
+                .get(idx as usize)
+                .ok_or_else(|| RpcError::invalid_path(format!("path_index {idx} out of range")))?
+                .clone();
+            drop(s);
+
+            let target = match rel {
+                None | Some("") => base,
+                Some(r) => base.join(r),
+            };
+
+            // The target file may not exist yet (creating); canonicalize the parent and join
+            // the file name so the access-boundary check is meaningful.
+            let parent = target.parent().ok_or_else(|| {
+                RpcError::invalid_path(format!("{} has no parent directory", target.display()))
+            })?;
+            let parent_canonical = std::fs::canonicalize(parent).map_err(|e| {
+                RpcError::invalid_path(format!("canonicalizing {}: {e}", parent.display()))
+            })?;
+            let file_name = target
+                .file_name()
+                .ok_or_else(|| RpcError::invalid_path("save target has no file name"))?;
+            let resolved = parent_canonical.join(file_name);
+
+            let s = state.lock().await;
+            if !s.path_is_in_project(&resolved) {
+                return Err(RpcError::invalid_path(format!(
+                    "{} is outside the project's access boundary",
+                    resolved.display()
+                )));
+            }
+            resolved
+        }
+        (None, Some(_)) => {
+            return Err(RpcError::invalid_params("relative_path provided without path_index"));
+        }
+    };
+
+    // Perform the write. I/O happens under the lock; in v1 that's acceptable (single client).
+    // For multi-client we'd clone the rope, drop the lock, write, then re-lock to update state.
+    let (saved_at_unix_ms, revision) = {
+        let mut s = state.lock().await;
+        let buf = s
+            .buffers
+            .get_mut(&params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let saved_at = buf.save_to_disk(target).map_err(RpcError::file_io)?;
+        (saved_at, buf.revision)
+    };
+
+    // Broadcast buffer/state to all clients with viewports on this buffer.
+    let pushes: Vec<(mpsc::Sender<Notification>, Notification)> = {
+        let s = state.lock().await;
+        let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
+        for vp in s.viewports.values() {
+            if vp.buffer_id == params.buffer_id {
+                clients.insert(vp.client_id);
+            }
+        }
+        clients
+            .into_iter()
+            .filter_map(|cid| {
+                let session = s.clients.get(&cid)?;
+                let state_params = BufferStateParams {
+                    buffer_id: params.buffer_id,
+                    dirty: false,
+                    revision,
+                    saved_at_unix_ms: Some(saved_at_unix_ms),
+                };
+                let notif = Notification {
+                    jsonrpc: JsonRpc,
+                    method: BufferState::NAME.into(),
+                    params: serde_json::to_value(state_params).expect("infallible"),
+                };
+                Some((session.outbound.clone(), notif))
+            })
+            .collect()
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    Ok(BufferSaveResult { saved_at_unix_ms, revision })
 }
 
 // ---- viewport handlers -------------------------------------------------------------------------

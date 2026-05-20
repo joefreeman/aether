@@ -2,7 +2,9 @@
 
 use crate::client::Client;
 use crate::ui;
-use aether_protocol::buffer::BufferOpenResult;
+use aether_protocol::buffer::{
+    BufferOpenResult, BufferSave, BufferSaveParams, BufferState, BufferStateParams,
+};
 use aether_protocol::cursor::{CursorMove, CursorMoveParams, CursorState, Direction, Motion};
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
@@ -159,6 +161,18 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
             Ok(_) => {}
             Err(e) => state.status = format!("bad notif params: {e}"),
         }
+    } else if n.method == BufferState::NAME {
+        match serde_json::from_value::<BufferStateParams>(n.params) {
+            Ok(p) if p.buffer_id == state.buffer_id => {
+                state.dirty = p.dirty;
+                state.revision = p.revision;
+                if !p.dirty {
+                    state.status = format!("saved (rev {})", p.revision);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => state.status = format!("bad buffer/state params: {e}"),
+        }
     }
 }
 
@@ -184,6 +198,7 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
     }
     match (k.code, k.modifiers) {
         (KeyCode::Char('q' | 'c'), KeyModifiers::CONTROL) => state.should_quit = true,
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => save_buffer(client, state).await?,
 
         (KeyCode::Left, m) => move_cursor(client, state, Motion::Char { direction: Direction::Backward, count: 1 }, m.contains(KeyModifiers::SHIFT)).await?,
         (KeyCode::Right, m) => move_cursor(client, state, Motion::Char { direction: Direction::Forward, count: 1 }, m.contains(KeyModifiers::SHIFT)).await?,
@@ -262,6 +277,27 @@ async fn delete_with_motion(client: &mut Client, state: &mut AppState, motion: M
     state.revision = r.revision;
     state.cursor = r.cursor;
     state.dirty = true;
+    Ok(())
+}
+
+async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let result = client
+        .rpc::<BufferSave>(BufferSaveParams {
+            buffer_id: state.buffer_id,
+            path_index: None,
+            relative_path: None,
+        })
+        .await;
+    match result {
+        Ok(r) => {
+            state.dirty = false;
+            state.revision = r.revision;
+            state.status = format!("saved (rev {})", r.revision);
+        }
+        Err(e) => {
+            state.status = format!("save failed: {e}");
+        }
+    }
     Ok(())
 }
 

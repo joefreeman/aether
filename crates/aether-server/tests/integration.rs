@@ -1,7 +1,10 @@
 //! End-to-end test: spawn the server in-process, talk to it via WebSocket, exercise the
 //! handshake and `buffer/open`.
 
-use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
+use aether_protocol::buffer::{
+    BufferOpen, BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams,
+    BufferSaveResult, BufferState, BufferStateParams,
+};
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Motion,
 };
@@ -604,6 +607,170 @@ async fn input_delete_backspace_removes_char_before_cursor() {
 
     let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "hell");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn save_in_place_writes_file_and_clears_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("greet.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams { path_index: Some(0), relative_path: Some("greet.txt".into()), language: None },
+    )
+    .await;
+
+    // Subscribe a viewport so we receive the buffer/state push.
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::Soft,
+        },
+    )
+    .await;
+
+    // Edit: append "!" at end. Move cursor to end then insert.
+    let _ = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams { buffer_id: open.buffer_id, motion: Motion::BufferEnd, extend_selection: false },
+    )
+    .await;
+    // BufferEnd puts cursor on the trailing empty line; move it to end of first line instead.
+    send_request::<aether_protocol::cursor::CursorSet>(
+        &mut ws,
+        5,
+        &aether_protocol::cursor::CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 5 },
+            anchor: None,
+        },
+    )
+    .await;
+    let _edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        6,
+        &InputTextParams { buffer_id: open.buffer_id, text: "!".into() },
+    )
+    .await;
+    // Drain the viewport/lines_changed pushed by the edit so it doesn't leak into the next test step.
+    let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+
+    let save: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        7,
+        &BufferSaveParams { buffer_id: open.buffer_id, path_index: None, relative_path: None },
+    )
+    .await;
+    assert!(save.saved_at_unix_ms > 0);
+
+    let disk = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(disk, "hello!\n");
+
+    // The server pushes buffer/state to clear dirty.
+    let state_push: BufferStateParams = expect_notification::<BufferState>(&mut ws).await;
+    assert_eq!(state_push.dirty, false);
+    assert_eq!(state_push.buffer_id, open.buffer_id);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn save_preserves_crlf_endings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("windows.txt");
+    std::fs::write(&path, "one\r\ntwo\r\nthree\r\n").unwrap();
+
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams { path_index: Some(0), relative_path: Some("windows.txt".into()), language: None },
+    )
+    .await;
+
+    // Save without changes — line endings should round-trip as CRLF.
+    let _save: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        3,
+        &BufferSaveParams { buffer_id: open.buffer_id, path_index: None, relative_path: None },
+    )
+    .await;
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.windows(2).any(|w| w == b"\r\n"), "expected CRLF after save, got {bytes:?}");
+    assert!(!bytes.windows(2).any(|w| w[0] != b'\r' && w[1] == b'\n'),
+        "expected no bare LF after save");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn save_scratch_returns_buffer_has_no_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams { path_index: None, relative_path: None, language: None },
+    )
+    .await;
+
+    // Save-in-place on a scratch buffer must return BUFFER_HAS_NO_PATH.
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id: 3,
+        method: BufferSave::NAME.into(),
+        params: Some(
+            serde_json::to_value(BufferSaveParams {
+                buffer_id: open.buffer_id,
+                path_index: None,
+                relative_path: None,
+            })
+            .unwrap(),
+        ),
+    };
+    ws.send(Message::text(serde_json::to_string(&req).unwrap())).await.unwrap();
+    let text = next_text(&mut ws).await;
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["error"]["code"], -32015, "expected BUFFER_HAS_NO_PATH");
 
     drop(server);
 }

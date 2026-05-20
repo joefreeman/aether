@@ -3,7 +3,7 @@
 use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::SharedState;
-use aether_protocol::buffer::BufferOpen;
+use aether_protocol::buffer::{BufferOpen, BufferSave};
 use aether_protocol::cursor::{CursorMove, CursorSet};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
@@ -133,6 +133,7 @@ async fn dispatch(
     match method {
         ClientHello::NAME => run!(ClientHello, handlers::client_hello),
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
+        BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         ViewportSubscribe::NAME => run!(ViewportSubscribe, handlers::viewport_subscribe),
         ViewportResize::NAME => run!(ViewportResize, handlers::viewport_resize),
         ViewportScroll::NAME => run!(ViewportScroll, handlers::viewport_scroll),

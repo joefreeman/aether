@@ -1,6 +1,8 @@
 //! Ratatui rendering. The buffer fills the screen except for the bottom status row.
 
 use crate::app::AppState;
+use aether_protocol::cursor::CursorState;
+use aether_protocol::LogicalPosition;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -19,8 +21,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let top = state.scroll_logical_line;
-    // Render the slice of the local window that's visible. Each logical line is one visual row
-    // for now (wrap = none).
+    let selection = ordered_selection(&state.cursor);
+
     let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
     for row in 0..area.height as u32 {
         let logical_line = top + row;
@@ -35,11 +37,81 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             .first()
             .map(|r| r.segments.iter().map(|s| s.text.as_str()).collect::<String>())
             .unwrap_or_default();
-        // Truncate to viewport width.
-        let truncated: String = text.chars().take(area.width as usize).collect();
-        lines.push(Line::from(Span::raw(truncated)));
+        let sel_on_line = selection
+            .and_then(|(s, e)| selection_range_on_line(logical_line, text.len() as u32, s, e));
+        lines.push(Line::from(build_spans(&text, sel_on_line, area.width)));
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn ordered_selection(cursor: &CursorState) -> Option<(LogicalPosition, LogicalPosition)> {
+    let anchor = cursor.anchor?;
+    let p = cursor.position;
+    if (p.line, p.col) <= (anchor.line, anchor.col) {
+        Some((p, anchor))
+    } else {
+        Some((anchor, p))
+    }
+}
+
+fn selection_range_on_line(
+    line: u32,
+    line_byte_len: u32,
+    sel_start: LogicalPosition,
+    sel_end: LogicalPosition,
+) -> Option<(u32, u32)> {
+    if line < sel_start.line || line > sel_end.line {
+        return None;
+    }
+    let start = if line == sel_start.line { sel_start.col } else { 0 };
+    let end = if line == sel_end.line { sel_end.col } else { line_byte_len };
+    if start >= end {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Truncate `text` to fit `max_chars` columns, splitting into spans on the selection boundary.
+/// Reversed style highlights the selection.
+fn build_spans(text: &str, sel: Option<(u32, u32)>, max_chars: u16) -> Vec<Span<'static>> {
+    let truncated: String = text.chars().take(max_chars as usize).collect();
+
+    let Some((sel_start, sel_end)) = sel else {
+        return vec![Span::raw(truncated)];
+    };
+
+    let len = truncated.len();
+    let s = floor_char_boundary(&truncated, (sel_start as usize).min(len));
+    let e = floor_char_boundary(&truncated, (sel_end as usize).min(len));
+
+    let normal = Style::default();
+    let selected = Style::default().add_modifier(Modifier::REVERSED);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
+    if s > 0 {
+        spans.push(Span::styled(truncated[..s].to_string(), normal));
+    }
+    if s < e {
+        spans.push(Span::styled(truncated[s..e].to_string(), selected));
+    }
+    if e < truncated.len() {
+        spans.push(Span::styled(truncated[e..].to_string(), normal));
+    }
+    spans
+}
+
+fn floor_char_boundary(s: &str, target: usize) -> usize {
+    if target >= s.len() {
+        return s.len();
+    }
+    let mut last = 0;
+    for (i, _) in s.char_indices() {
+        if i > target {
+            return last;
+        }
+        last = i;
+    }
+    last
 }
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
