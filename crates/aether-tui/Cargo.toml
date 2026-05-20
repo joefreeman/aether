@@ -1,0 +1,30 @@
+[package]
+name = "aether-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Aether editor — terminal client."
+
+[[bin]]
+name = "ae"
+path = "src/main.rs"
+
+[dependencies]
+aether-protocol.workspace = true
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+clap = { workspace = true, features = ["derive"] }
+anyhow.workspace = true
+
+ratatui.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
+directories = "5"
