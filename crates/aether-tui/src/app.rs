@@ -309,16 +309,17 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             scroll_to(client, state, target).await?;
         }
 
-        // ---- motions: hjkl (logical) and Alt-hjkl (visual) ----
-        // `h/l/j/k` move by char and logical line; `Alt-h/l/j/k` move by visual row — start/end of
-        // the current visual row, and up/down by one visual row. The Alt variants are how you
-        // navigate inside wrapped lines.
+        // ---- motions: hjkl (logical) and Alt-hjkl (line jumps + visual rows) ----
+        // `h/l` move by char; `Alt-h/l` jump to the first non-whitespace / end of the logical
+        // line. `j/k` move by logical line; `Alt-j/k` move by one visual row (the only "visual"
+        // motion now — used to step inside wrapped content). `0` (below) goes to literal col 0
+        // for cases where you want column zero, not first non-blank.
         (KeyCode::Char('h'), m) if m.contains(KeyModifiers::ALT) =>
-            move_motion(client, state, Motion::VisualLineStart { viewport_id: state.viewport_id }, extend).await?,
+            move_motion(client, state, Motion::LineFirstNonblank, extend).await?,
         (KeyCode::Char('h'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::Char { direction: Direction::Backward, count }, extend).await?,
         (KeyCode::Char('l'), m) if m.contains(KeyModifiers::ALT) =>
-            move_motion(client, state, Motion::VisualLineEnd { viewport_id: state.viewport_id }, extend).await?,
+            move_motion(client, state, Motion::LineEnd, extend).await?,
         (KeyCode::Char('l'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::Char { direction: Direction::Forward, count }, extend).await?,
         (KeyCode::Char('k'), m) if m.contains(KeyModifiers::ALT) =>
