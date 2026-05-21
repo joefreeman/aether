@@ -4,7 +4,7 @@ use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::SharedState;
 use aether_protocol::buffer::{BufferCopy, BufferCut, BufferOpen, BufferSave};
-use aether_protocol::cursor::{CursorMove, CursorSelectLine, CursorSet};
+use aether_protocol::cursor::{CursorMove, CursorSelectLine, CursorSet, CursorSwapAnchor};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
@@ -143,6 +143,7 @@ async fn dispatch(
         CursorMove::NAME => run!(CursorMove, handlers::cursor_move),
         CursorSet::NAME => run!(CursorSet, handlers::cursor_set),
         CursorSelectLine::NAME => run!(CursorSelectLine, handlers::cursor_select_line),
+        CursorSwapAnchor::NAME => run!(CursorSwapAnchor, handlers::cursor_swap_anchor),
         InputText::NAME => run!(InputText, handlers::input_text),
         InputDelete::NAME => run!(InputDelete, handlers::input_delete),
         InputUndo::NAME => run!(InputUndo, handlers::input_undo),

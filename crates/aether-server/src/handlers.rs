@@ -10,7 +10,8 @@ use aether_protocol::buffer::{
     BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
-    CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState, Direction, Motion,
+    CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState, CursorSwapAnchorParams,
+    Direction, Motion,
 };
 use aether_protocol::LogicalPosition;
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
@@ -671,6 +672,26 @@ pub async fn cursor_select_line(
     };
     let anchor = if anchor_pos == cursor_pos { None } else { Some(anchor_pos) };
     let new_state = CursorState { position: cursor_pos, anchor };
+    s.cursors.insert(key, new_state);
+    Ok(new_state)
+}
+
+pub async fn cursor_swap_anchor(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CursorSwapAnchorParams,
+) -> Result<CursorState, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    if !s.buffers.contains_key(&params.buffer_id) {
+        return Err(RpcError::buffer_not_found(params.buffer_id));
+    }
+    let key = (client_id, params.buffer_id);
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
+    let new_state = match current.anchor {
+        Some(a) => CursorState { position: a, anchor: Some(current.position) },
+        None => current,
+    };
     s.cursors.insert(key, new_state);
     Ok(new_state)
 }

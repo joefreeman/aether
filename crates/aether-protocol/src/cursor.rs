@@ -131,6 +131,20 @@ pub struct CursorSelectLineParams {
     pub extend: bool,
 }
 
+// ---- cursor/swap_anchor -------------------------------------------------------------------------
+
+pub struct CursorSwapAnchor;
+impl RpcMethod for CursorSwapAnchor {
+    const NAME: &'static str = "cursor/swap_anchor";
+    type Params = CursorSwapAnchorParams;
+    type Result = CursorState;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CursorSwapAnchorParams {
+    pub buffer_id: BufferId,
+}
+
 // ---- cursor/update (notification) ---------------------------------------------------------------
 
 pub struct CursorUpdate;

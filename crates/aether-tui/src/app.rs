@@ -10,7 +10,8 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSelectLine, CursorSelectLineParams, CursorSet,
-    CursorSetParams, CursorState, Direction, Motion, WordBoundary,
+    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, Direction, Motion,
+    WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
@@ -341,6 +342,11 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('x'), m) if m.contains(KeyModifiers::ALT) =>
             select_line(client, state, Direction::Backward, extend).await?,
 
+        // ---- selection manipulation ----
+        // Swap the cursor and anchor — flips which end of the selection is the "leading" edge,
+        // so a subsequent `Shift-*` motion extends from the other side.
+        (KeyCode::Char('s'), m) if m == KeyModifiers::NONE => swap_anchor(client, state).await?,
+
         // ---- mode transitions ----
         (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionStart).await?,
         (KeyCode::Char('a'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionEnd).await?,
@@ -443,6 +449,14 @@ async fn select_line(
             direction,
             extend,
         })
+        .await?;
+    state.cursor = new;
+    Ok(())
+}
+
+async fn swap_anchor(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let new = client
+        .rpc::<CursorSwapAnchor>(CursorSwapAnchorParams { buffer_id: state.buffer_id })
         .await?;
     state.cursor = new;
     Ok(())
