@@ -12,7 +12,8 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::handshake::ClientHello;
 use aether_protocol::input::{
-    InputDelete, InputJoinLines, InputMoveLines, InputRedo, InputText, InputUndo,
+    InputDedent, InputDelete, InputIndent, InputJoinLines, InputMoveLines, InputRedo, InputText,
+    InputUndo,
 };
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportSetWrap, ViewportSubscribe, ViewportUnsubscribe,
@@ -159,6 +160,8 @@ async fn dispatch(
         InputRedo::NAME => run!(InputRedo, handlers::input_redo),
         InputJoinLines::NAME => run!(InputJoinLines, handlers::input_join_lines),
         InputMoveLines::NAME => run!(InputMoveLines, handlers::input_move_lines),
+        InputIndent::NAME => run!(InputIndent, handlers::input_indent),
+        InputDedent::NAME => run!(InputDedent, handlers::input_dedent),
         other => Err(RpcError::method_not_found(other)),
     }
 }

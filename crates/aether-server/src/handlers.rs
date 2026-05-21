@@ -999,6 +999,179 @@ pub async fn input_redo(
     apply_undo_or_redo(state, ctx, params.buffer_id, UndoDirection::Redo).await
 }
 
+pub async fn input_indent(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<EditResult, RpcError> {
+    apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Indent).await
+}
+
+pub async fn input_dedent(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<EditResult, RpcError> {
+    apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Dedent).await
+}
+
+#[derive(Clone, Copy)]
+enum IndentKind {
+    Indent,
+    Dedent,
+}
+
+/// Two-space soft indent. Selection's line range gets the prefix added (or stripped, on dedent).
+/// Cursor and anchor are shifted by the per-line delta — on indent that's always +2, on dedent
+/// it's 0/-1/-2 depending on what was actually there to strip.
+async fn apply_indent_or_dedent(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    buffer_id: BufferId,
+    kind: IndentKind,
+) -> Result<EditResult, RpcError> {
+    const INDENT: &str = "  ";
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+
+    let (a, b) = match cursor.anchor {
+        Some(anchor) => {
+            let (start, end) = motion::ordered(cursor.position, anchor);
+            (start.line, end.line)
+        }
+        None => (cursor.position.line, cursor.position.line),
+    };
+
+    let len_lines = buf.text.len_lines() as u32;
+    let len_chars = buf.text.len_chars();
+    let start_char = buf.text.line_to_char(a as usize);
+    let end_char = if (b + 1) < len_lines {
+        buf.text.line_to_char((b + 1) as usize)
+    } else {
+        len_chars
+    };
+
+    // Build the replacement text and a per-line column shift map.
+    let mut new_text = String::new();
+    let mut shifts: HashMap<u32, i32> = HashMap::new();
+    let mut any_changed = false;
+    for line_idx in a..=b {
+        let line_str: String = buf.text.line(line_idx as usize).chunks().collect();
+        let (content, newline) = match line_str.strip_suffix('\n') {
+            Some(s) => (s, "\n"),
+            None => (line_str.as_str(), ""),
+        };
+        let (modified, shift): (String, i32) = match kind {
+            IndentKind::Indent => (format!("{INDENT}{content}"), INDENT.len() as i32),
+            IndentKind::Dedent => {
+                if let Some(s) = content.strip_prefix(INDENT) {
+                    (s.to_string(), -(INDENT.len() as i32))
+                } else if let Some(s) = content.strip_prefix(' ') {
+                    (s.to_string(), -1)
+                } else {
+                    (content.to_string(), 0)
+                }
+            }
+        };
+        if shift != 0 {
+            any_changed = true;
+        }
+        shifts.insert(line_idx, shift);
+        new_text.push_str(&modified);
+        new_text.push_str(newline);
+    }
+
+    if !any_changed {
+        return Ok(EditResult {
+            revision: buf.revision,
+            cursor,
+            dirty: buf.dirty,
+        });
+    }
+
+    let cursors_before: HashMap<ClientId, CursorState> = s
+        .cursors
+        .iter()
+        .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
+        .collect();
+
+    let (revision, dirty, new_cursor) = {
+        let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+        let revision = buf_mut.apply_edit(
+            start_char,
+            end_char,
+            &new_text,
+            EditKindTag::Text,
+            cursors_before,
+        );
+
+        let shift_pos = |p: aether_protocol::LogicalPosition| {
+            let shift = shifts.get(&p.line).copied().unwrap_or(0);
+            let col = if shift >= 0 {
+                p.col.saturating_add(shift as u32)
+            } else {
+                p.col.saturating_sub((-shift) as u32)
+            };
+            aether_protocol::LogicalPosition { line: p.line, col }
+        };
+        let new_cursor = CursorState {
+            position: motion::clamp_position(buf_mut, shift_pos(cursor.position)),
+            anchor: cursor.anchor.map(|a| motion::clamp_position(buf_mut, shift_pos(a))),
+        };
+        let new_cursor = match new_cursor.anchor {
+            Some(a) if a == new_cursor.position => CursorState {
+                position: new_cursor.position,
+                anchor: None,
+            },
+            _ => new_cursor,
+        };
+        let dirty = buf_mut.dirty;
+        (revision, dirty, new_cursor)
+    };
+    s.cursors.insert((client_id, buffer_id), new_cursor);
+    s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_virtual_col_for_buffer(buffer_id);
+
+    let edit_first = a;
+    let edit_last_excl = b + 1;
+    let buf_ref = &s.buffers[&buffer_id];
+    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    for vp in s.viewports.values() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        if !ranges_overlap(
+            vp.first_logical_line,
+            vp.last_logical_line_exclusive,
+            edit_first,
+            edit_last_excl,
+        ) {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision)));
+    }
+    let new_line_count = buf_ref.line_count();
+    for vp in s.viewports.values_mut() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        vp.first_logical_line = vp.first_logical_line.min(new_line_count);
+        vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
+    }
+
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(EditResult { revision, cursor: new_cursor, dirty })
+}
+
 pub async fn input_move_lines(
     state: &SharedState,
     ctx: &mut ConnectionCtx,

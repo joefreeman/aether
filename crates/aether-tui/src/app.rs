@@ -16,8 +16,9 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDelete, InputDeleteParams, InputJoinLines, InputMoveLines,
-    InputMoveLinesParams, InputRedo, InputText, InputTextParams, InputUndo, UndoResult,
+    BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
+    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputRedo, InputText, InputTextParams,
+    InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
@@ -452,6 +453,8 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('j'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Down).await?,
         (KeyCode::Char('k'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Up).await?,
         (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state).await?,
+        (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state).await?,
+        (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state).await?,
         (KeyCode::Char('d'), CTRL_ONLY) | (KeyCode::Delete, _) => {
             delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count }).await?
         }
@@ -740,6 +743,26 @@ async fn delete_with_motion(client: &mut Client, state: &mut AppState, motion: M
 async fn join_lines(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
         .rpc::<InputJoinLines>(BufferOnlyParams { buffer_id: state.buffer_id })
+        .await?;
+    state.revision = r.revision;
+    state.cursor = r.cursor;
+    state.dirty = r.dirty;
+    Ok(())
+}
+
+async fn indent(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<InputIndent>(BufferOnlyParams { buffer_id: state.buffer_id })
+        .await?;
+    state.revision = r.revision;
+    state.cursor = r.cursor;
+    state.dirty = r.dirty;
+    Ok(())
+}
+
+async fn dedent(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<InputDedent>(BufferOnlyParams { buffer_id: state.buffer_id })
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;

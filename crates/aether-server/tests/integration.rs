@@ -16,8 +16,9 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::handshake::{ClientHello, ClientHelloParams, ClientHelloResult};
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDelete, InputDeleteParams, InputJoinLines, InputMoveLines,
-    InputMoveLinesParams, InputRedo, InputText, InputTextParams, InputUndo, UndoResult,
+    BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
+    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputRedo, InputText, InputTextParams,
+    InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportScroll,
@@ -2194,6 +2195,96 @@ async fn move_lines_preserves_missing_trailing_newline() {
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "beta\nalpha");
+
+    drop(server);
+}
+
+// ---- input/indent and input/dedent --------------------------------------------------------------
+
+#[tokio::test]
+async fn indent_single_line_adds_two_spaces() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 3 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputIndent>(&mut ws, 11, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    // Cursor follows the inserted indent.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 5 });
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text, "  alpha\nbeta\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn dedent_strips_two_spaces() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("  alpha\nbeta\n").await;
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 4 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputDedent>(&mut ws, 11, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text, "alpha\nbeta\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn indent_multi_line_selection() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\n").await;
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id,
+        position: LogicalPosition { line: 2, col: 0 },
+        anchor: Some(LogicalPosition { line: 0, col: 0 }),
+    }).await;
+    let r: EditResult = send_request::<InputIndent>(&mut ws, 11, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    // Anchor and cursor both shift +2 since both lines were indented.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 2, col: 2 });
+    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 2 }));
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text, "  a\n  b\n  c\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn dedent_line_without_indent_is_noop_for_that_line() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("  alpha\nbeta\n").await;
+    // Multi-line selection covering both lines.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id,
+        position: LogicalPosition { line: 1, col: 1 },
+        anchor: Some(LogicalPosition { line: 0, col: 4 }),
+    }).await;
+    let r: EditResult = send_request::<InputDedent>(&mut ws, 11, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    // Line 0 lost 2 chars, line 1 unchanged.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 1 });
+    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 2 }));
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text, "alpha\nbeta\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn dedent_with_single_leading_space_strips_one() {
+    let (server, mut ws, buffer_id) = setup_with_buffer(" alpha\n").await;
+    let r: EditResult = send_request::<InputDedent>(&mut ws, 10, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 11, buffer_id).await;
+    assert_eq!(text, "alpha\n");
+    // Cursor was at (0, 0); dedent removes 1 char, cursor stays at 0 (saturated).
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
 
     drop(server);
 }
