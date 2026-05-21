@@ -148,6 +148,72 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         Motion::VisualLine { .. } | Motion::VisualLineStart { .. } | Motion::VisualLineEnd { .. } => {
             current
         }
+        Motion::FindChar { ch, direction, count, till } => {
+            let cur_idx = pos_to_char(buf, current);
+            let total = buf.text.len_chars();
+            let target_idx = find_char(&buf.text, cur_idx, total, *ch, *direction, *count);
+            match target_idx {
+                Some(idx) => {
+                    let final_idx = if *till {
+                        match direction {
+                            Direction::Forward => idx.saturating_sub(1),
+                            Direction::Backward => (idx + 1).min(total),
+                        }
+                    } else {
+                        idx
+                    };
+                    char_to_pos(buf, final_idx)
+                }
+                None => current,
+            }
+        }
+    }
+}
+
+/// Find the `count`-th occurrence of `ch` from `cur_idx` in `direction`. Returns the absolute
+/// char index of the match, or `None` if not found within the buffer bounds.
+fn find_char(
+    text: &ropey::Rope,
+    cur_idx: usize,
+    total: usize,
+    ch: char,
+    direction: Direction,
+    count: u32,
+) -> Option<usize> {
+    let count = count.max(1) as usize;
+    match direction {
+        Direction::Forward => {
+            // Start one char past the cursor so `f x` from an existing 'x' lands on the *next*.
+            let start = (cur_idx + 1).min(total);
+            let mut iter = text.chars_at(start);
+            let mut at = start;
+            let mut found = 0usize;
+            while let Some(c) = iter.next() {
+                if c == ch {
+                    found += 1;
+                    if found == count {
+                        return Some(at);
+                    }
+                }
+                at += 1;
+            }
+            None
+        }
+        Direction::Backward => {
+            // Scan backward starting one char before the cursor.
+            let mut at = cur_idx;
+            let mut found = 0usize;
+            while at > 0 {
+                at -= 1;
+                if text.char(at) == ch {
+                    found += 1;
+                    if found == count {
+                        return Some(at);
+                    }
+                }
+            }
+            None
+        }
     }
 }
 

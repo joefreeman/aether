@@ -51,6 +51,16 @@ pub enum Mode {
     Search,
 }
 
+/// Captured state for a pending `f`/`t` keystroke — the next char the user types becomes the
+/// target of a `Motion::FindChar`.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingFind {
+    pub direction: Direction,
+    pub till: bool,
+    pub extend: bool,
+    pub count: u32,
+}
+
 /// Client-side mirror of the server's search state. The server owns the match list (and pushes
 /// per-line highlights via viewport line renders); the client just tracks the query, the latest
 /// summary, the history list, and the snapshot used to revert from Mode::Search via Esc.
@@ -122,6 +132,9 @@ pub struct AppState {
     pub mode: Mode,
     /// Digit-prefix count for the next motion. Reset after consumption.
     pub pending_count: u32,
+    /// Set after `f`/`t`/`F`/`T` (and their Alt variants); the next keystroke is interpreted as
+    /// the target character rather than a normal-mode binding.
+    pub pending_find: Option<PendingFind>,
     /// System clipboard handle. Held for the app's lifetime so the X11 selection isn't
     /// abandoned every operation. `None` if the clipboard couldn't be initialised (e.g. headless).
     pub clipboard: Option<arboard::Clipboard>,
@@ -210,6 +223,7 @@ pub async fn bootstrap(
         status: String::new(),
         mode: Mode::Normal,
         pending_count: 0,
+        pending_find: None,
         clipboard: clipboard::new_handle(),
         search: SearchState::default(),
     })
@@ -432,6 +446,26 @@ const ALT_ONLY: KeyModifiers = KeyModifiers::ALT;
 const CTRL_ONLY: KeyModifiers = KeyModifiers::CONTROL;
 
 async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
+    // Pending `f`/`t`: the next keystroke names the target character. Use the raw key (skipping
+    // `normalize_key`) so `f X` is case-sensitive. Any non-`Char` key (Esc, arrow, etc.) cancels.
+    if let Some(pending) = state.pending_find.take() {
+        if let KeyCode::Char(ch) = k.code {
+            move_motion(
+                client,
+                state,
+                Motion::FindChar {
+                    ch,
+                    direction: pending.direction,
+                    count: pending.count,
+                    till: pending.till,
+                },
+                pending.extend,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
     let (code, mods) = normalize_key(k);
 
     // Digit accumulation for counts. `0` is the line-start motion unless we're already mid-count.
@@ -543,6 +577,18 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // ---- motions: line start ----
         (KeyCode::Char('0'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::LineStart, extend).await?,
+
+        // ---- motions: find char (`f`/`t` + Alt for backward, Shift to extend) ----
+        // After pressing one of these, the *next* keystroke is interpreted as the target
+        // character (see the `pending_find` block at the top of this handler).
+        (KeyCode::Char('f'), m) if m.contains(KeyModifiers::ALT) =>
+            state.pending_find = Some(PendingFind { direction: Direction::Backward, till: false, extend, count }),
+        (KeyCode::Char('f'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            state.pending_find = Some(PendingFind { direction: Direction::Forward, till: false, extend, count }),
+        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::ALT) =>
+            state.pending_find = Some(PendingFind { direction: Direction::Backward, till: true, extend, count }),
+        (KeyCode::Char('t'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            state.pending_find = Some(PendingFind { direction: Direction::Forward, till: true, extend, count }),
 
         // ---- motions: goto line ----
         // `g` jumps to line N (1-indexed; no prefix = line 1). `Alt-g` jumps to the last line.

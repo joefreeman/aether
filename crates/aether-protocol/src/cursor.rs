@@ -79,6 +79,15 @@ pub enum Motion {
     VisualLineEnd {
         viewport_id: ViewportId,
     },
+    /// `f`/`t`/`F`/`T` — move to the `count`-th occurrence of `ch` in the given direction,
+    /// scanning across line boundaries. When `till` is `true` the cursor stops one char *before*
+    /// the match (for forward) or one *after* (for backward) — the Helix `t`/`T` semantics.
+    FindChar {
+        ch: char,
+        direction: Direction,
+        count: u32,
+        till: bool,
+    },
     // Tree-sitter motions are added when phase 2 lands.
 }
 
