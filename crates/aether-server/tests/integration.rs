@@ -4,7 +4,8 @@
 use aether_protocol::buffer::{
     BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
     BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferSaveResult,
-    BufferState, BufferStateParams, CopyScope,
+    BufferState, BufferStateParams,
+    CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
@@ -15,6 +16,10 @@ use aether_protocol::envelope::{
     ClientInbound, JsonRpc, Notification, NotificationMethod, Request, Response, RpcMethod,
 };
 use aether_protocol::handshake::{ClientHello, ClientHelloParams, ClientHelloResult};
+use aether_protocol::search::{
+    SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
+    SearchSet, SearchSetParams, SearchSetResult,
+};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputRedo, InputText, InputTextParams,
@@ -2285,6 +2290,130 @@ async fn dedent_with_single_leading_space_strips_one() {
     assert_eq!(text, "alpha\n");
     // Cursor was at (0, 0); dedent removes 1 char, cursor stays at 0 (saturated).
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
+
+    drop(server);
+}
+
+// ---- search/* -----------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_set_returns_summary_and_jumps_to_first_match() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
+        buffer_id,
+        query: "foo".into(),
+        anchor: Some(LogicalPosition { line: 0, col: 0 }),
+    }).await;
+    assert_eq!(r.summary.total, 3);
+    assert!(!r.summary.truncated);
+    assert_eq!(r.summary.current_index, 1);
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_smartcase_lowercase_is_case_insensitive() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("Foo foo FOO\n").await;
+    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
+        buffer_id, query: "foo".into(), anchor: None,
+    }).await;
+    assert_eq!(r.summary.total, 3); // matches all three regardless of case
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_smartcase_uppercase_is_case_sensitive() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("Foo foo FOO\n").await;
+    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
+        buffer_id, query: "Foo".into(), anchor: None,
+    }).await;
+    assert_eq!(r.summary.total, 1);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_regex_metacharacters() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc 123 def 4567\n").await;
+    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
+        buffer_id, query: r"\d+".into(), anchor: None,
+    }).await;
+    assert_eq!(r.summary.total, 2);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_no_matches_returns_zero_summary() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
+        buffer_id, query: "zzz".into(), anchor: None,
+    }).await;
+    assert_eq!(r.summary.total, 0);
+    assert_eq!(r.summary.current_index, 0);
+    assert!(!r.summary.truncated);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_empty_query_clears_active_search() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n").await;
+    let _: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
+        buffer_id, query: "alpha".into(), anchor: None,
+    }).await;
+    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 11, &SearchSetParams {
+        buffer_id, query: String::new(), anchor: None,
+    }).await;
+    assert_eq!(r.summary.total, 0);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_next_cycles_forward_and_wraps() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
+        buffer_id, query: "foo".into(), anchor: Some(LogicalPosition { line: 0, col: 0 }),
+    }).await;
+    let r1: SearchNavResult = send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id }).await;
+    assert_eq!(r1.summary.current_index, 2);
+    assert_eq!(r1.cursor.anchor, Some(LogicalPosition { line: 0, col: 8 }));
+    let r2: SearchNavResult = send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
+    assert_eq!(r2.summary.current_index, 3);
+    // Wrap.
+    let r3: SearchNavResult = send_request::<SearchNext>(&mut ws, 13, &SearchNavParams { buffer_id }).await;
+    assert_eq!(r3.summary.current_index, 1);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_prev_cycles_backward_with_wrap() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
+        buffer_id, query: "foo".into(), anchor: Some(LogicalPosition { line: 0, col: 0 }),
+    }).await;
+    // From the first match, prev wraps to the last.
+    let r: SearchNavResult = send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id }).await;
+    assert_eq!(r.summary.current_index, 3);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_clear_removes_active_search() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo\n").await;
+    let _ = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
+        buffer_id, query: "foo".into(), anchor: None,
+    }).await;
+    let _: () = send_request::<SearchClear>(&mut ws, 11, &SearchClearParams { buffer_id }).await;
+    // After clear, n/prev should report no matches.
+    let r: SearchNavResult = send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
+    assert_eq!(r.summary.total, 0);
 
     drop(server);
 }

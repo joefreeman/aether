@@ -27,6 +27,7 @@ dependencies = [
  "directories",
  "futures-util",
  "notify",
+ "regex",
  "ropey",
  "serde",
  "serde_json",

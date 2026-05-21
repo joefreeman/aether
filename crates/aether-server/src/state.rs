@@ -4,7 +4,7 @@ use crate::syntax::{self, LanguageConfig};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
 use aether_protocol::viewport::WrapMode;
-use aether_protocol::{BufferId, ClientId, Revision, ViewportId};
+use aether_protocol::{BufferId, ClientId, LogicalPosition, Revision, ViewportId};
 use std::time::{Duration, Instant};
 use tree_sitter::{InputEdit, Parser, Point, Tree};
 
@@ -36,8 +36,23 @@ pub struct ServerState {
     /// motion, explicit cursor set, or buffer mutation. Only meaningful for `VisualLine`; logical
     /// `j/k` clears it (mixing motion kinds resets intent).
     pub virtual_col: HashMap<(ClientId, BufferId), u32>,
+    /// Per-`(client, buffer)` active search. Set by `search/set`, cleared by `search/clear` or
+    /// when the client disconnects / the buffer closes. Re-run whenever the buffer mutates.
+    pub searches: HashMap<(ClientId, BufferId), SearchEntry>,
     next_buffer_id: u64,
     next_viewport_id: u64,
+}
+
+/// Server-side state for one client's active search on a specific buffer.
+#[derive(Debug, Clone)]
+pub struct SearchEntry {
+    pub query: String,
+    /// Sorted by start position. Each match is `(start_inclusive, end_exclusive)` in
+    /// buffer-line / byte-col coords.
+    pub matches: Vec<(LogicalPosition, LogicalPosition)>,
+    /// `true` when the server hit its match cap (`SEARCH_MAX_MATCHES`) and the real count is
+    /// higher. `matches.len()` is then a prefix.
+    pub truncated: bool,
 }
 
 /// Cap on each direction's stack. Bounds memory in pathological cases (e.g. holding down a
@@ -70,6 +85,7 @@ impl ServerState {
             cursors: HashMap::new(),
             motion_history: HashMap::new(),
             virtual_col: HashMap::new(),
+            searches: HashMap::new(),
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
@@ -139,6 +155,11 @@ impl ServerState {
 
     pub fn drop_virtual_col_for_client(&mut self, client_id: ClientId) {
         self.virtual_col.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Remove all search records for the given client. Used on disconnect.
+    pub fn drop_searches_for_client(&mut self, client_id: ClientId) {
+        self.searches.retain(|(c, _), _| *c != client_id);
     }
 
     /// Clear virtual column for every client on the given buffer. Called on any buffer mutation.

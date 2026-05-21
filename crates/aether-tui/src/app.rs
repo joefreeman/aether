@@ -8,6 +8,10 @@ use aether_protocol::buffer::{
     BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpenResult,
     BufferSave, BufferSaveParams, BufferState, BufferStateParams, CopyScope,
 };
+use aether_protocol::search::{
+    SearchClear, SearchClearParams, SearchNavParams, SearchNext, SearchPrev, SearchSet,
+    SearchSetParams, SearchStateChanged, SearchSummary,
+};
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
     CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
@@ -44,6 +48,40 @@ use std::io::{stdout, Stdout};
 pub enum Mode {
     Normal,
     Insert,
+    Search,
+}
+
+/// Client-side mirror of the server's search state. The server owns the match list (and pushes
+/// per-line highlights via viewport line renders); the client just tracks the query, the latest
+/// summary, the history list, and the snapshot used to revert from Mode::Search via Esc.
+#[derive(Debug, Default)]
+pub struct SearchState {
+    /// The current query — live while in Mode::Search, the committed query otherwise.
+    pub query: String,
+    /// True when there is a committed search on the server (set via `search/set` with a non-empty
+    /// query and not later cleared). Used to gate highlighting and the `n`/`Alt-n` bindings.
+    pub active: bool,
+    /// Server-pushed summary (total, truncated, current_index). `None` before any search runs.
+    pub summary: Option<SearchSummary>,
+    /// Snapshot of pre-search-mode state, used by Esc to revert.
+    pub snapshot: Option<SearchSnapshot>,
+    /// Committed queries, oldest first. Up/Down in Mode::Search browses this; `n`/`Alt-n` with
+    /// no active search re-activates the most recent entry.
+    pub history: Vec<String>,
+    /// `None` while the user is typing a fresh query; `Some(i)` while they're browsing the entry
+    /// at `history[i]`. Any edit (typing/backspace) snaps back to `None`.
+    pub history_cursor: Option<usize>,
+    /// The live-typed query, stashed when the user steps into history with Up so that Down can
+    /// restore it on the way back out.
+    pub history_draft: String,
+}
+
+#[derive(Debug)]
+pub struct SearchSnapshot {
+    pub cursor: CursorState,
+    pub scroll_logical_line: u32,
+    pub query: String,
+    pub active: bool,
 }
 
 pub struct AppState {
@@ -85,6 +123,7 @@ pub struct AppState {
     /// System clipboard handle. Held for the app's lifetime so the X11 selection isn't
     /// abandoned every operation. `None` if the clipboard couldn't be initialised (e.g. headless).
     pub clipboard: Option<arboard::Clipboard>,
+    pub search: SearchState,
 }
 
 pub async fn bootstrap(
@@ -164,6 +203,7 @@ pub async fn bootstrap(
         mode: Mode::Normal,
         pending_count: 0,
         clipboard: clipboard::new_handle(),
+        search: SearchState::default(),
     })
 }
 
@@ -223,6 +263,10 @@ async fn dispatch_terminal_event(
     state: &mut AppState,
     ev: Event,
 ) -> Result<()> {
+    // Each user-driven event clears the ephemeral status line before being processed. Anything
+    // the event itself sets (save/copy feedback, search truncation, etc.) stays visible until
+    // the *next* event.
+    state.status.clear();
     if let Event::Resize(cols, rows) = &ev {
         handle_resize(client, state, *cols, *rows).await
     } else {
@@ -233,7 +277,7 @@ async fn dispatch_terminal_event(
 fn apply_cursor_style(mode: Mode) {
     let style = match mode {
         Mode::Normal => SetCursorStyle::SteadyBlock,
-        Mode::Insert => SetCursorStyle::SteadyBar,
+        Mode::Insert | Mode::Search => SetCursorStyle::SteadyBar,
     };
     let _ = execute!(stdout(), style);
 }
@@ -265,6 +309,14 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
             Ok(_) => {}
             Err(e) => state.status = format!("bad buffer/state params: {e}"),
         }
+    } else if n.method == SearchStateChanged::NAME {
+        match serde_json::from_value::<SearchSummary>(n.params) {
+            Ok(s) if s.buffer_id == state.buffer_id => {
+                state.search.summary = Some(s);
+            }
+            Ok(_) => {}
+            Err(e) => state.status = format!("bad search/state_changed params: {e}"),
+        }
     }
 }
 
@@ -295,6 +347,7 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
             match state.mode {
                 Mode::Normal => handle_normal_key(client, state, k).await?,
                 Mode::Insert => handle_insert_key(client, state, k).await?,
+                Mode::Search => handle_search_key(client, state, k).await?,
             }
         }
         Event::Mouse(m) => handle_mouse_event(client, state, m).await?,
@@ -403,7 +456,17 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             state.should_quit = true;
         }
         (KeyCode::Esc, _) => {
-            // Collapse any selection by re-setting the cursor to its current position.
+            // Drop the active search (clears highlights, disables n/Alt-n). Use `;` to drop the
+            // current selection instead.
+            if state.search.active || state.search.summary.is_some() {
+                let _ = client
+                    .rpc::<SearchClear>(SearchClearParams { buffer_id: state.buffer_id })
+                    .await;
+            }
+            state.search.active = false;
+            state.search.summary = None;
+        }
+        (KeyCode::Char(';'), m) if m == KeyModifiers::NONE => {
             if state.cursor.anchor.is_some() {
                 clear_selection(client, state).await?;
             }
@@ -527,6 +590,16 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('v'), CTRL_ONLY) => paste_before(client, state).await?,
         (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state).await?,
 
+        // ---- search ----
+        (KeyCode::Char('/'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            enter_search_mode(client, state).await?,
+        (KeyCode::Char('/'), m) if m == ALT_ONLY =>
+            search_from_selection(client, state).await?,
+        (KeyCode::Char('n'), m) if m.contains(KeyModifiers::ALT) =>
+            search_cycle(client, state, Direction::Backward).await?,
+        (KeyCode::Char('n'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            search_cycle(client, state, Direction::Forward).await?,
+
         _ => {}
     }
     Ok(())
@@ -562,6 +635,334 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         _ => {}
     }
+    Ok(())
+}
+
+async fn handle_search_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
+    // Don't `normalize_key` here — that lowercases uppercase chars and synthesises SHIFT, which
+    // is what Normal-mode keymaps want but would strip case from the literal search query.
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => abort_search(client, state).await?,
+        (KeyCode::Enter, _) => commit_search(state),
+        (KeyCode::Up, _) => {
+            history_up(state);
+            run_incremental_search(client, state).await?;
+        }
+        (KeyCode::Down, _) => {
+            history_down(state);
+            run_incremental_search(client, state).await?;
+        }
+        (KeyCode::Backspace, _) => {
+            state.search.query.pop();
+            state.search.history_cursor = None;
+            run_incremental_search(client, state).await?;
+        }
+        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+            state.search.query.push(c);
+            state.search.history_cursor = None;
+            run_incremental_search(client, state).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn enter_search_mode(client: &mut Client, state: &mut AppState) -> Result<()> {
+    state.search.snapshot = Some(SearchSnapshot {
+        cursor: state.cursor,
+        scroll_logical_line: state.scroll_logical_line,
+        query: std::mem::take(&mut state.search.query),
+        active: state.search.active,
+    });
+    state.search.active = false;
+    state.search.summary = None;
+    state.search.history_cursor = None;
+    state.search.history_draft.clear();
+    state.mode = Mode::Search;
+    apply_cursor_style(state.mode);
+    // Clear the server-side search so highlights disappear immediately. Restored on Esc.
+    let _ = client
+        .rpc::<SearchClear>(SearchClearParams { buffer_id: state.buffer_id })
+        .await;
+    Ok(())
+}
+
+fn commit_search(state: &mut AppState) {
+    state.search.snapshot = None;
+    if !state.search.query.is_empty() {
+        state.search.active = true;
+        push_history(state, state.search.query.clone());
+    } else {
+        state.search.active = false;
+        state.search.summary = None;
+    }
+    state.search.history_cursor = None;
+    state.search.history_draft.clear();
+    state.mode = Mode::Normal;
+    apply_cursor_style(state.mode);
+}
+
+const SEARCH_HISTORY_MAX: usize = 100;
+
+fn push_history(state: &mut AppState, query: String) {
+    if query.is_empty() {
+        return;
+    }
+    if state.search.history.last() == Some(&query) {
+        return; // dedup consecutive duplicates
+    }
+    state.search.history.push(query);
+    let overflow = state.search.history.len().saturating_sub(SEARCH_HISTORY_MAX);
+    if overflow > 0 {
+        state.search.history.drain(..overflow);
+    }
+}
+
+fn history_up(state: &mut AppState) {
+    if state.search.history.is_empty() {
+        return;
+    }
+    let new_idx = match state.search.history_cursor {
+        None => {
+            state.search.history_draft = state.search.query.clone();
+            state.search.history.len() - 1
+        }
+        Some(0) => 0,
+        Some(i) => i - 1,
+    };
+    state.search.history_cursor = Some(new_idx);
+    state.search.query = state.search.history[new_idx].clone();
+}
+
+fn history_down(state: &mut AppState) {
+    match state.search.history_cursor {
+        None => {} // already past the newest entry
+        Some(i) if i + 1 < state.search.history.len() => {
+            state.search.history_cursor = Some(i + 1);
+            state.search.query = state.search.history[i + 1].clone();
+        }
+        Some(_) => {
+            state.search.history_cursor = None;
+            state.search.query = std::mem::take(&mut state.search.history_draft);
+        }
+    }
+}
+
+async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(snap) = state.search.snapshot.take() else {
+        state.mode = Mode::Normal;
+        apply_cursor_style(state.mode);
+        return Ok(());
+    };
+    // Restore the prior server-side search query (if any). Done before cursor restoration so the
+    // server's view of "current_index" matches once we move the cursor back.
+    if snap.active && !snap.query.is_empty() {
+        let r = client
+            .rpc::<SearchSet>(SearchSetParams {
+                buffer_id: state.buffer_id,
+                query: snap.query.clone(),
+                anchor: None,
+            })
+            .await?;
+        state.search.summary = Some(r.summary);
+    } else {
+        let _ = client
+            .rpc::<SearchClear>(SearchClearParams { buffer_id: state.buffer_id })
+            .await;
+        state.search.summary = None;
+    }
+    state.search.query = snap.query;
+    state.search.active = snap.active;
+    // Restore cursor + selection.
+    let new = client
+        .rpc::<CursorSet>(CursorSetParams {
+            buffer_id: state.buffer_id,
+            position: snap.cursor.position,
+            anchor: snap.cursor.anchor,
+        })
+        .await?;
+    state.cursor = new;
+    // Restore scroll if it moved during incremental search.
+    if snap.scroll_logical_line != state.scroll_logical_line {
+        scroll_to(client, state, snap.scroll_logical_line).await?;
+    }
+    state.mode = Mode::Normal;
+    apply_cursor_style(state.mode);
+    Ok(())
+}
+
+/// Incremental-search step: tell the server the latest query and let it jump the cursor onto
+/// the first match at-or-after where `/` was pressed. The server's response carries the new
+/// cursor + summary; per-viewport highlight notifications follow asynchronously.
+async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Result<()> {
+    if state.search.query.is_empty() {
+        let _ = client
+            .rpc::<SearchClear>(SearchClearParams { buffer_id: state.buffer_id })
+            .await;
+        state.search.summary = None;
+        // No matches — revert the cursor to the pre-search position so the user sees where
+        // they started rather than wherever the previous query stranded them.
+        if let Some(snap_cursor) = state.search.snapshot.as_ref().map(|s| s.cursor) {
+            if state.cursor.position != snap_cursor.position
+                || state.cursor.anchor != snap_cursor.anchor
+            {
+                let new = client
+                    .rpc::<CursorSet>(CursorSetParams {
+                        buffer_id: state.buffer_id,
+                        position: snap_cursor.position,
+                        anchor: snap_cursor.anchor,
+                    })
+                    .await?;
+                state.cursor = new;
+            }
+        }
+        return Ok(());
+    }
+    let anchor = state
+        .search
+        .snapshot
+        .as_ref()
+        .map(|s| selection_start(&s.cursor));
+    let r = client
+        .rpc::<SearchSet>(SearchSetParams {
+            buffer_id: state.buffer_id,
+            query: state.search.query.clone(),
+            anchor,
+        })
+        .await?;
+    state.cursor = r.cursor;
+    state.search.summary = Some(r.summary.clone());
+    // If the search came back with zero matches and the server didn't move the cursor, revert
+    // to the snapshot so a failed keystroke doesn't strand the user.
+    if r.summary.total == 0 {
+        if let Some(snap_cursor) = state.search.snapshot.as_ref().map(|s| s.cursor) {
+            if state.cursor.position != snap_cursor.position
+                || state.cursor.anchor != snap_cursor.anchor
+            {
+                let new = client
+                    .rpc::<CursorSet>(CursorSetParams {
+                        buffer_id: state.buffer_id,
+                        position: snap_cursor.position,
+                        anchor: snap_cursor.anchor,
+                    })
+                    .await?;
+                state.cursor = new;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn selection_start(c: &CursorState) -> LogicalPosition {
+    match c.anchor {
+        Some(a) if pos_tuple(a) < pos_tuple(c.position) => a,
+        _ => c.position,
+    }
+}
+
+fn pos_tuple(p: LogicalPosition) -> (u32, u32) { (p.line, p.col) }
+
+/// `Some("3/47")` when a search is active and the server says the cursor is currently on a match
+/// (i.e., `current_index != 0`). The status bar only shows the counter when the cursor is
+/// meaningfully "on" a result. The total gets a trailing `+` if the server truncated.
+pub fn search_counter_label(state: &AppState) -> Option<String> {
+    if !state.search.active {
+        return None;
+    }
+    let summary = state.search.summary.as_ref()?;
+    if summary.current_index == 0 || summary.total == 0 {
+        return None;
+    }
+    Some(format!("{}/{}", summary.current_index, format_total(summary)))
+}
+
+fn format_total(s: &SearchSummary) -> String {
+    if s.truncated { format!("{}+", s.total) } else { s.total.to_string() }
+}
+
+/// Summary line for the search prompt: "3/47", "3/10000+", or "no matches". `None` when the
+/// query is empty (the bare `/` already conveys "no search yet").
+pub fn search_match_count_label(state: &AppState) -> Option<String> {
+    if state.search.query.is_empty() {
+        return None;
+    }
+    let summary = state.search.summary.as_ref()?;
+    if summary.total == 0 {
+        return Some(String::from("no matches"));
+    }
+    let total = format_total(summary);
+    Some(if summary.current_index == 0 {
+        total
+    } else {
+        format!("{}/{total}", summary.current_index)
+    })
+}
+
+/// Take the current selection's text, escape its regex metacharacters, and use it as the active
+/// search term. The cursor stays on the original selection — `n` / `Alt-n` then cycle from there.
+async fn search_from_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: BufferCopyResult = client
+        .rpc::<BufferCopy>(BufferCopyParams { buffer_id: state.buffer_id, scope: CopyScope::Selection })
+        .await?;
+    if r.text.is_empty() {
+        return Ok(());
+    }
+    state.search.query = regex_escape(&r.text);
+    state.search.active = true;
+    push_history(state, state.search.query.clone());
+    let result = client
+        .rpc::<SearchSet>(SearchSetParams {
+            buffer_id: state.buffer_id,
+            query: state.search.query.clone(),
+            anchor: None,
+        })
+        .await?;
+    state.search.summary = Some(result.summary);
+    // search/set with anchor=None doesn't move the cursor server-side, so state.cursor is still
+    // valid (mirrors the selection that prompted the search).
+    Ok(())
+}
+
+/// Escape regex metacharacters so a literal string can be embedded in the search regex. Mirrors
+/// `regex::escape` (we don't pull `regex` into the TUI just for this one call).
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '#' | '&' | '-' | '~') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+async fn search_cycle(client: &mut Client, state: &mut AppState, direction: Direction) -> Result<()> {
+    if !state.search.active {
+        // No active search: revive the most recent history entry server-side, then cycle.
+        let Some(last) = state.search.history.last().cloned() else { return Ok(()) };
+        state.search.query = last.clone();
+        let r = client
+            .rpc::<SearchSet>(SearchSetParams {
+                buffer_id: state.buffer_id,
+                query: last,
+                anchor: None,
+            })
+            .await?;
+        state.cursor = r.cursor;
+        state.search.summary = Some(r.summary);
+        state.search.active = true;
+    }
+    let summary_total = state.search.summary.as_ref().map(|s| s.total).unwrap_or(0);
+    if summary_total == 0 {
+        return Ok(());
+    }
+    let params = SearchNavParams { buffer_id: state.buffer_id };
+    let result = match direction {
+        Direction::Forward => client.rpc::<SearchNext>(params).await?,
+        Direction::Backward => client.rpc::<SearchPrev>(params).await?,
+    };
+    state.cursor = result.cursor;
+    state.search.summary = Some(result.summary);
     Ok(())
 }
 

@@ -1,7 +1,8 @@
 //! Ratatui rendering. The buffer fills the screen except for the bottom status row.
 
-use crate::app::{AppState, Mode};
+use crate::app::{search_counter_label, search_match_count_label, AppState, Mode};
 use aether_protocol::cursor::CursorState;
+use aether_protocol::search::SearchMatchRange;
 use aether_protocol::viewport::{Highlight, VisualRow, WrapMode};
 use aether_protocol::LogicalPosition;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -9,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Glyph rendered at the start of each *continuation* row (rows after the first row of a
 /// wrapped logical line) under `WrapMode::Soft`. The width (2 cols: "↪" + space) is what the
@@ -30,6 +31,7 @@ const NORD4: Color = Color::Rgb(216, 222, 233); // Snow Storm — main foregroun
 const NORD7: Color = Color::Rgb(143, 188, 187); // Frost — types
 const NORD8: Color = Color::Rgb(136, 192, 208); // Frost — functions, accents
 const NORD9: Color = Color::Rgb(129, 161, 193); // Frost — keywords, operators
+const NORD10: Color = Color::Rgb(94, 129, 172); // Frost — deep blue (active selection bg)
 const NORD12: Color = Color::Rgb(208, 135, 112);// Aurora orange — attributes, macros
 const NORD13: Color = Color::Rgb(235, 203, 139);// Aurora yellow — string escapes
 const NORD14: Color = Color::Rgb(163, 190, 140);// Aurora green — strings
@@ -42,7 +44,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .split(f.area());
     draw_buffer(f, state, chunks[0]);
     draw_status(f, state, chunks[1]);
-    place_terminal_cursor(f, state, chunks[0]);
+    place_terminal_cursor(f, state, chunks[0], chunks[1]);
 }
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
@@ -52,6 +54,10 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let viewport_cols = area.width;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
     let scroll_col = if matches!(state.wrap, WrapMode::None) { state.scroll_col } else { 0 };
+    // In Search mode the hardware cursor is on the status row, so the selection paint must cover
+    // its own trailing char (which `selection_on_visual_row` normally omits, expecting the block
+    // cursor to draw it). In all other modes the cursor sits in the buffer and does that job.
+    let extend_sel_to_cursor = matches!(state.mode, Mode::Search);
 
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
     let mut logical_line = top;
@@ -81,11 +87,13 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             let sel_on_row = selection.and_then(|(s, e)| {
                 selection_on_visual_row(logical_line, vrow.byte_offset, row_text_len, s, e)
             });
+            let matches_on_row =
+                matches_on_visual_row(vrow.byte_offset, row_text_len, &render.search_matches);
 
             // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
             // bytes when scroll_col == 0 (the common case), so this is a no-op under soft wrap.
-            let (clipped_text, clipped_highlights, clipped_sel) =
-                clip_horizontal(&segment.text, &segment.highlights, sel_on_row, scroll_col);
+            let (clipped_text, clipped_highlights, clipped_sel, clipped_matches) =
+                clip_horizontal(&segment.text, &segment.highlights, sel_on_row, &matches_on_row, scroll_col);
 
             // Continuation row when byte_offset > 0. Prepend the marker; the server already
             // reserved this width when wrapping.
@@ -105,7 +113,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if indent > 0 {
                 spans.push(Span::raw(" ".repeat(indent as usize)));
             }
-            spans.extend(build_spans(&clipped_text, &clipped_highlights, clipped_sel, body_width));
+            spans.extend(build_spans(&clipped_text, &clipped_highlights, clipped_sel, &clipped_matches, body_width, extend_sel_to_cursor));
             lines.push(Line::from(spans));
         }
         logical_line = match logical_line.checked_add(1) {
@@ -122,16 +130,17 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
-/// Drop the first `scroll_col` bytes of the row's text, then shift highlight + selection ranges
-/// to match the new origin. Anything fully scrolled off the left is filtered out.
+/// Drop the first `scroll_col` bytes of the row's text, then shift highlight + selection + match
+/// ranges to match the new origin. Anything fully scrolled off the left is filtered out.
 fn clip_horizontal(
     text: &str,
     highlights: &[Highlight],
     sel: Option<(u32, u32)>,
+    matches: &[(u32, u32)],
     scroll_col: u32,
-) -> (String, Vec<Highlight>, Option<(u32, u32)>) {
+) -> (String, Vec<Highlight>, Option<(u32, u32)>, Vec<(u32, u32)>) {
     if scroll_col == 0 {
-        return (text.to_string(), highlights.to_vec(), sel);
+        return (text.to_string(), highlights.to_vec(), sel, matches.to_vec());
     }
     let skip = scroll_col as usize;
     let clipped_text = if skip >= text.len() {
@@ -150,15 +159,42 @@ fn clip_horizontal(
             Some(Highlight { start: start as u32, end: end as u32, kind: h.kind.clone() })
         })
         .collect();
-    let new_sel = sel.and_then(|(s, e)| {
+    let shift_range = |(s, e): (u32, u32)| -> Option<(u32, u32)> {
         let e2 = (e as usize).saturating_sub(skip);
         if e2 == 0 {
             return None;
         }
         let s2 = (s as usize).saturating_sub(skip);
         Some((s2 as u32, e2 as u32))
-    });
-    (clipped_text, new_highlights, new_sel)
+    };
+    let new_sel = sel.and_then(shift_range);
+    let new_matches = matches.iter().copied().filter_map(shift_range).collect();
+    (clipped_text, new_highlights, new_sel, new_matches)
+}
+
+/// Clip per-logical-line search match ranges (delivered by the server in `LogicalLineRender`) to
+/// this visual row's byte range, returning row-relative offsets.
+fn matches_on_visual_row(
+    row_byte_offset: u32,
+    row_text_len: u32,
+    matches: &[SearchMatchRange],
+) -> Vec<(u32, u32)> {
+    if row_text_len == 0 {
+        return Vec::new();
+    }
+    let row_end = row_byte_offset + row_text_len;
+    matches
+        .iter()
+        .filter_map(|m| {
+            let s = m.start.max(row_byte_offset);
+            let e = m.end.min(row_end);
+            if s < e {
+                Some((s - row_byte_offset, e - row_byte_offset))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn ordered_selection(cursor: &CursorState) -> Option<(LogicalPosition, LogicalPosition)> {
@@ -207,13 +243,30 @@ fn build_spans(
     text: &str,
     highlights: &[Highlight],
     sel: Option<(u32, u32)>,
+    matches: &[(u32, u32)],
     max_chars: u16,
+    extend_sel_to_cursor: bool,
 ) -> Vec<Span<'static>> {
     let truncated: String = text.chars().take(max_chars as usize).collect();
     let trunc_len = truncated.len();
     if trunc_len == 0 {
         return Vec::new();
     }
+    // When asked, grow the selection to include the cursor's own char so the paint reaches the
+    // end of the match — used in Search mode where the hardware cursor lives on the status row.
+    let sel = if extend_sel_to_cursor {
+        sel.map(|(s, e)| {
+            let e_usize = e as usize;
+            let extra = truncated
+                .get(e_usize..)
+                .and_then(|tail| tail.chars().next())
+                .map(|c| c.len_utf8())
+                .unwrap_or(0);
+            (s, ((e_usize + extra).min(trunc_len)) as u32)
+        })
+    } else {
+        sel
+    };
 
     // Build a per-byte highlight-kind table. Highlights from the server are non-overlapping.
     let mut byte_kind: Vec<Option<&str>> = vec![None; trunc_len];
@@ -225,13 +278,25 @@ fn build_spans(
         }
     }
 
+    let mut byte_in_match: Vec<bool> = vec![false; trunc_len];
+    for (s, e) in matches {
+        let s = (*s as usize).min(trunc_len);
+        let e = (*e as usize).min(trunc_len);
+        for i in s..e {
+            byte_in_match[i] = true;
+        }
+    }
+
     let style_at = |byte_idx: usize| -> Style {
         let mut style = byte_kind[byte_idx].map(theme_for).unwrap_or_default();
+        // Match bg first; the active selection paints over it with a more saturated blue so the
+        // selection stands out from the surrounding match highlights.
+        if byte_in_match[byte_idx] {
+            style = style.bg(NORD2);
+        }
         if let Some((s, e)) = sel {
             if byte_idx >= s as usize && byte_idx < e as usize {
-                // Selection: explicit bg keeps foreground colors readable (REVERSED would
-                // swap fg/bg per span, which looks awful on comments — NORD3 fg + NORD3 bg).
-                style = style.bg(NORD2);
+                style = style.bg(NORD10);
             }
         }
         style
@@ -309,22 +374,35 @@ fn lookup_exact(name: &str) -> Option<Style> {
 
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let dirty_marker = if state.dirty { "[+]" } else { "" };
-    let main = format!(
-        " [{project}] {file} {dirty}  {pos}  ({rev})",
-        project = state.project_name,
-        file = state.file_label,
-        dirty = dirty_marker,
-        pos = format_position(state),
-        rev = state.revision,
-    );
-    let status_span = if state.status.is_empty() {
-        Span::raw(main)
+    let line = if matches!(state.mode, Mode::Search) {
+        // Search-mode prompt takes over the status row. Append the live match-count summary
+        // (derived from the search state at render time, not from `state.status`).
+        let prompt = format!("/{}", state.search.query);
+        let text = match search_match_count_label(state) {
+            Some(count) => format!("{prompt}    {count}"),
+            None => prompt,
+        };
+        Line::from(vec![Span::raw(text)])
     } else {
-        Span::raw(format!("{main}    {}", state.status))
+        let dirty_marker = if state.dirty { "[+]" } else { "" };
+        let counter = search_counter_label(state)
+            .map(|c| format!("  {c}"))
+            .unwrap_or_default();
+        let main = format!(
+            " [{project}] {file} {dirty}  {pos}{counter}",
+            project = state.project_name,
+            file = state.file_label,
+            dirty = dirty_marker,
+            pos = format_position(state),
+        );
+        let status_span = if state.status.is_empty() {
+            Span::raw(main)
+        } else {
+            Span::raw(format!("{main}    {}", state.status))
+        };
+        Line::from(vec![status_span])
     };
-    let p = Paragraph::new(Line::from(vec![status_span]))
-        .style(Style::default().bg(NORD1).fg(NORD4));
+    let p = Paragraph::new(line).style(Style::default().bg(NORD1).fg(NORD4));
     f.render_widget(p, area);
 }
 
@@ -336,7 +414,7 @@ fn format_position(state: &AppState) -> String {
     let pos = state.cursor.position;
     match state.mode {
         Mode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
-        Mode::Normal => {
+        Mode::Normal | Mode::Search => {
             let (start, end_inclusive) = match state.cursor.anchor {
                 None => (pos, pos),
                 Some(anchor) => {
@@ -350,18 +428,34 @@ fn format_position(state: &AppState) -> String {
             // The half-open exclusive end is one byte past the block cursor's char. For phase 1
             // we approximate by incrementing the column; multi-byte chars and line-end overflow
             // would need server help to compute exactly.
-            format!(
-                "{}:{}-{}:{}",
-                start.line + 1,
-                start.col + 1,
-                end_inclusive.line + 1,
-                end_inclusive.col + 2,
-            )
+            if start.line == end_inclusive.line {
+                format!(
+                    "{}:{}-{}",
+                    start.line + 1,
+                    start.col + 1,
+                    end_inclusive.col + 2,
+                )
+            } else {
+                format!(
+                    "{}:{}-{}:{}",
+                    start.line + 1,
+                    start.col + 1,
+                    end_inclusive.line + 1,
+                    end_inclusive.col + 2,
+                )
+            }
         }
     }
 }
 
-fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect) {
+fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
+    if matches!(state.mode, Mode::Search) {
+        // Park the terminal cursor on the status row, just past `/` + the typed query.
+        let prompt_width = 1 + state.search.query.width() as u16;
+        let col = status_area.x.saturating_add(prompt_width.min(status_area.width.saturating_sub(1)));
+        f.set_cursor_position((col, status_area.y));
+        return;
+    }
     let Some((visual_row, visual_col)) = cursor_visual_position(state, buffer_area.height as u32)
     else {
         return; // cursor off-screen

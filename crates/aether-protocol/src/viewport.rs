@@ -1,6 +1,7 @@
 //! Viewport messages — §7 of the protocol doc.
 
 use crate::envelope::{NotificationMethod, RpcMethod};
+use crate::search::SearchMatchRange;
 use crate::{BufferId, Revision, ViewportId};
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,11 @@ pub struct ScrollPosition {
 pub struct LogicalLineRender {
     pub logical_line: u32,
     pub visual_rows: Vec<VisualRow>,
+    /// Per-line byte ranges where the current server-side search query matches. Empty when no
+    /// search is active on this buffer for this client. Multi-line matches contribute one entry
+    /// to each line they touch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search_matches: Vec<SearchMatchRange>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

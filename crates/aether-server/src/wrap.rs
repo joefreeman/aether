@@ -23,7 +23,7 @@ pub fn render_line(
         }],
         WrapMode::Soft => wrap_line(line_text, cols, marker_width, &highlights),
     };
-    LogicalLineRender { logical_line, visual_rows }
+    LogicalLineRender { logical_line, visual_rows, search_matches: Vec::new() }
 }
 
 /// One physical row of wrapped output along with the byte range of the logical line it covers.

@@ -2,12 +2,16 @@
 
 use crate::cursor as motion;
 use crate::error::RpcError;
-use crate::state::{Buffer, ClientSession, EditKindTag, ServerState, SharedState, Viewport};
+use crate::state::{Buffer, ClientSession, EditKindTag, SearchEntry, ServerState, SharedState, Viewport};
 use crate::wrap;
 use std::collections::HashMap;
 use aether_protocol::buffer::{
     BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams, BufferOpenResult,
     BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
+};
+use aether_protocol::search::{
+    SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
+    SearchSetResult, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::cursor::{
     CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState, CursorSwapAnchorParams,
@@ -173,6 +177,366 @@ pub async fn buffer_open(
     Ok(result)
 }
 
+// ---- buffer/search ------------------------------------------------------------------------------
+
+/// Stateless regex search. Returns up to `MAX_MATCHES` matches; the client is responsible for
+/// stashing them and re-issuing the RPC after edits. Smartcase: case-insensitive unless the
+/// query has any uppercase character. An empty query returns an empty list.
+// ---- search/* ----------------------------------------------------------------------------------
+
+pub const SEARCH_MAX_MATCHES: usize = 10_000;
+
+/// Run `query` against the buffer and produce a fresh `SearchEntry`. Smartcase (case-insensitive
+/// unless the query has any uppercase) and `multi_line: true`. Zero-width matches are skipped so
+/// patterns like `^` don't pin the cursor.
+pub fn compute_search_entry(buf: &Buffer, query: &str) -> Result<SearchEntry, RpcError> {
+    if query.is_empty() {
+        return Ok(SearchEntry { query: String::new(), matches: Vec::new(), truncated: false });
+    }
+    let regex = {
+        let has_upper = query.chars().any(|c| c.is_uppercase());
+        regex::RegexBuilder::new(query)
+            .case_insensitive(!has_upper)
+            .multi_line(true)
+            .build()
+            .map_err(|e| RpcError::new(ErrorCode::INVALID_PARAMS, format!("invalid regex: {e}")))?
+    };
+    let mut matches: Vec<(LogicalPosition, LogicalPosition)> = Vec::new();
+    let mut truncated = false;
+    let len_bytes = buf.text.len_bytes();
+    if len_bytes == 0 {
+        return Ok(SearchEntry { query: query.to_string(), matches, truncated });
+    }
+    let source: String = buf.text.chunks().collect();
+    for m in regex.find_iter(&source) {
+        if matches.len() >= SEARCH_MAX_MATCHES {
+            truncated = true;
+            break;
+        }
+        if m.start() == m.end() {
+            continue;
+        }
+        matches.push((byte_to_logical(buf, m.start()), byte_to_logical(buf, m.end())));
+    }
+    Ok(SearchEntry { query: query.to_string(), matches, truncated })
+}
+
+pub async fn search_set(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: SearchSetParams,
+) -> Result<SearchSetResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let key = (client_id, params.buffer_id);
+
+    let mut cursor = s.cursors.get(&key).copied().unwrap_or_default();
+    let (summary, pushes) = if params.query.is_empty() {
+        s.searches.remove(&key);
+        let summary = SearchSummary {
+            buffer_id: params.buffer_id,
+            total: 0,
+            truncated: false,
+            current_index: 0,
+        };
+        let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
+        (summary, pushes)
+    } else {
+        let entry = compute_search_entry(buf, &params.query)?;
+        // If the caller passed an anchor, jump the cursor to the first match at-or-after it
+        // (wrapping to the first match if none). This is how incremental search keeps the cursor
+        // anchored at `/`-press time across keystrokes.
+        if let Some(anchor_pos) = params.anchor {
+            if let Some((start, end_excl)) = first_match_at_or_after_with_wrap(&entry, anchor_pos) {
+                let start_char = motion::pos_to_char(buf, start);
+                let end_char_excl = motion::pos_to_char(buf, end_excl);
+                let last_char = end_char_excl.saturating_sub(1).max(start_char);
+                let position = motion::char_to_pos(buf, last_char);
+                let anchor_p = motion::char_to_pos(buf, start_char);
+                let new_cursor = if anchor_p == position {
+                    CursorState { position, anchor: None }
+                } else {
+                    CursorState { position, anchor: Some(anchor_p) }
+                };
+                let prev_cursor = cursor;
+                s.cursors.insert(key, new_cursor);
+                s.record_motion(key, prev_cursor, new_cursor);
+                s.virtual_col.remove(&key);
+                cursor = new_cursor;
+            }
+        }
+        let summary = summary_for(&entry, params.buffer_id, &cursor);
+        s.searches.insert(key, entry);
+        let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
+        (summary, pushes)
+    };
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(SearchSetResult { cursor, summary })
+}
+
+fn first_match_at_or_after_with_wrap(
+    entry: &SearchEntry,
+    pos: LogicalPosition,
+) -> Option<(LogicalPosition, LogicalPosition)> {
+    entry
+        .matches
+        .iter()
+        .copied()
+        .find(|(start, _)| pos_tuple(*start) >= pos_tuple(pos))
+        .or_else(|| entry.matches.first().copied())
+}
+
+pub async fn search_clear(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: SearchClearParams,
+) -> Result<(), RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    if !s.buffers.contains_key(&params.buffer_id) {
+        return Err(RpcError::buffer_not_found(params.buffer_id));
+    }
+    s.searches.remove(&(client_id, params.buffer_id));
+    let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(())
+}
+
+pub async fn search_next(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: SearchNavParams,
+) -> Result<SearchNavResult, RpcError> {
+    search_navigate(state, ctx, params.buffer_id, Direction::Forward).await
+}
+
+pub async fn search_prev(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: SearchNavParams,
+) -> Result<SearchNavResult, RpcError> {
+    search_navigate(state, ctx, params.buffer_id, Direction::Backward).await
+}
+
+async fn search_navigate(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    buffer_id: BufferId,
+    direction: Direction,
+) -> Result<SearchNavResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    let key = (client_id, buffer_id);
+    let buf = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let Some(entry) = s.searches.get(&key) else {
+        // No active search — return a zero-summary with the current cursor untouched.
+        let cursor = s.cursors.get(&key).copied().unwrap_or_default();
+        return Ok(SearchNavResult {
+            cursor,
+            summary: SearchSummary { buffer_id, total: 0, truncated: false, current_index: 0 },
+        });
+    };
+    if entry.matches.is_empty() {
+        let cursor = s.cursors.get(&key).copied().unwrap_or_default();
+        return Ok(SearchNavResult {
+            cursor,
+            summary: summary_for(entry, buffer_id, &cursor),
+        });
+    }
+
+    // Use the leftmost end of the current selection as the reference, so a `prev` from a match
+    // doesn't re-select the current match. If the cursor isn't on a match, pick the natural
+    // direction from the cursor's position.
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
+    let reference = selection_start(&current);
+    let target = match direction {
+        Direction::Forward => entry
+            .matches
+            .iter()
+            .copied()
+            .find(|(start, _)| pos_tuple(*start) > pos_tuple(reference))
+            .or_else(|| entry.matches.first().copied()),
+        Direction::Backward => entry
+            .matches
+            .iter()
+            .rev()
+            .copied()
+            .find(|(start, _)| pos_tuple(*start) < pos_tuple(reference))
+            .or_else(|| entry.matches.last().copied()),
+    };
+    let Some((start, end_excl)) = target else {
+        return Ok(SearchNavResult {
+            cursor: current,
+            summary: summary_for(entry, buffer_id, &current),
+        });
+    };
+
+    // Place anchor at start, cursor at the last char of the match. We compute the inclusive end
+    // here (one char before the exclusive end) using char-index arithmetic, mirroring how
+    // `Char` motion does it — that way multi-byte matches stay on char boundaries.
+    let start_char = motion::pos_to_char(buf, start);
+    let end_char_excl = motion::pos_to_char(buf, end_excl);
+    let last_char = end_char_excl.saturating_sub(1).max(start_char);
+    let position = motion::char_to_pos(buf, last_char);
+    let anchor_pos = motion::char_to_pos(buf, start_char);
+    let new_cursor = if anchor_pos == position {
+        CursorState { position, anchor: None }
+    } else {
+        CursorState { position, anchor: Some(anchor_pos) }
+    };
+    let prev_cursor = s.cursors.get(&key).copied().unwrap_or_default();
+    s.cursors.insert(key, new_cursor);
+    s.record_motion(key, prev_cursor, new_cursor);
+    s.virtual_col.remove(&key);
+    let entry = &s.searches[&key];
+    let summary = summary_for(entry, buffer_id, &new_cursor);
+    Ok(SearchNavResult { cursor: new_cursor, summary })
+}
+
+/// Compute the `SearchSummary` for the given entry and cursor.
+fn summary_for(entry: &SearchEntry, buffer_id: BufferId, cursor: &CursorState) -> SearchSummary {
+    let start = selection_start(cursor);
+    let current_index = entry
+        .matches
+        .iter()
+        .position(|(s, _)| *s == start)
+        .map(|i| (i as u32).saturating_add(1))
+        .unwrap_or(0);
+    SearchSummary {
+        buffer_id,
+        total: entry.matches.len() as u32,
+        truncated: entry.truncated,
+        current_index,
+    }
+}
+
+fn selection_start(c: &CursorState) -> LogicalPosition {
+    match c.anchor {
+        Some(a) if pos_tuple(a) < pos_tuple(c.position) => a,
+        _ => c.position,
+    }
+}
+
+fn pos_tuple(p: LogicalPosition) -> (u32, u32) { (p.line, p.col) }
+
+/// Build one `viewport/lines_changed` notification per viewport owned by `client_id` that's
+/// subscribed to `buffer_id`. Used to refresh highlights when a search is set or cleared.
+fn collect_viewport_refresh(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    let mut pushes = Vec::new();
+    let buf = match s.buffers.get(&buffer_id) {
+        Some(b) => b,
+        None => return pushes,
+    };
+    let revision = buf.revision;
+    let search_entry = s.searches.get(&(client_id, buffer_id));
+    for vp in s.viewports.values() {
+        if vp.client_id != client_id || vp.buffer_id != buffer_id {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        let line_count = buf.line_count();
+        let new_first = vp.first_logical_line.min(line_count);
+        let new_last_excl = vp.last_logical_line_exclusive.min(line_count).max(new_first);
+        let window = render_window(
+            buf,
+            new_first,
+            new_last_excl,
+            vp.cols,
+            vp.wrap,
+            vp.continuation_marker_width,
+            vp.rows,
+            search_entry,
+        );
+        let params = ViewportLinesChangedParams {
+            viewport_id: vp.id,
+            revision,
+            range: LogicalLineRange {
+                start_logical_line: vp.first_logical_line,
+                end_logical_line_exclusive: vp.last_logical_line_exclusive,
+            },
+            replacement_lines: window.lines,
+            line_count,
+            max_scroll_logical_line: window.max_scroll_logical_line,
+        };
+        pushes.push((sender, Notification {
+            jsonrpc: JsonRpc,
+            method: ViewportLinesChanged::NAME.into(),
+            params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
+        }));
+    }
+    pushes
+}
+
+/// Recompute every active search on this buffer after a mutation. Returns the pushes (search
+/// summary notifications) to be sent after dropping the lock. The line-level highlight refresh
+/// happens via the existing `viewport/lines_changed` flow (since `render_window` reads the
+/// freshly-recomputed entries).
+fn refresh_searches_for_buffer(
+    s: &mut ServerState,
+    buffer_id: BufferId,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    let mut pushes = Vec::new();
+    if !s.buffers.contains_key(&buffer_id) {
+        return pushes;
+    }
+    let keys: Vec<(ClientId, BufferId)> = s
+        .searches
+        .keys()
+        .filter(|(_, b)| *b == buffer_id)
+        .copied()
+        .collect();
+    for key in keys {
+        let query = s.searches[&key].query.clone();
+        let buf = &s.buffers[&buffer_id];
+        let entry = match compute_search_entry(buf, &query) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let cursor = s.cursors.get(&key).copied().unwrap_or_default();
+        let summary = summary_for(&entry, buffer_id, &cursor);
+        s.searches.insert(key, entry);
+        if let Some(sender) = s.clients.get(&key.0).map(|c| c.outbound.clone()) {
+            pushes.push((sender, Notification {
+                jsonrpc: JsonRpc,
+                method: SearchStateChanged::NAME.into(),
+                params: serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null),
+            }));
+        }
+    }
+    pushes
+}
+
+/// Convert a buffer-wide byte offset to a `(line, col_bytes)` position.
+fn byte_to_logical(buf: &Buffer, byte_idx: usize) -> aether_protocol::LogicalPosition {
+    let char_idx = buf.text.byte_to_char(byte_idx);
+    let line_idx = buf.text.char_to_line(char_idx);
+    let line_start_char = buf.text.line_to_char(line_idx);
+    let char_offset = char_idx - line_start_char;
+    let line_slice = buf.text.line(line_idx);
+    let col_bytes = line_slice.char_to_byte(char_offset);
+    aether_protocol::LogicalPosition {
+        line: line_idx as u32,
+        col: col_bytes as u32,
+    }
+}
+
 // ---- buffer/save --------------------------------------------------------------------------------
 
 pub async fn buffer_copy(
@@ -228,6 +592,7 @@ pub async fn buffer_cut(
     s.clear_virtual_col_for_buffer(params.buffer_id);
 
     let dirty = s.buffers[&params.buffer_id].dirty;
+    let search_summary_pushes = refresh_searches_for_buffer(&mut s, params.buffer_id);
     let buf_ref = &s.buffers[&params.buffer_id];
 
     let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
@@ -239,7 +604,8 @@ pub async fn buffer_cut(
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
-        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision)));
+        let search = s.searches.get(&(vp.client_id, params.buffer_id));
+        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
     let new_line_count = buf_ref.line_count();
     for vp in s.viewports.values_mut() {
@@ -252,6 +618,9 @@ pub async fn buffer_cut(
 
     drop(s);
     for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in search_summary_pushes {
         let _ = sender.send(notif).await;
     }
 
@@ -410,7 +779,9 @@ pub async fn viewport_subscribe(
     let buffer_id = buf.id;
 
     let (first, last_excl) = pushed_range(params.scroll.logical_line, params.rows, params.overscan_rows, line_count);
-    let window = render_window(buf, first, last_excl, params.cols, params.wrap, params.continuation_marker_width, params.rows);
+    let search = s.searches.get(&(client_id, params.buffer_id));
+    let buf = &s.buffers[&params.buffer_id];
+    let window = render_window(buf, first, last_excl, params.cols, params.wrap, params.continuation_marker_width, params.rows, search);
 
     let viewport_id = s.allocate_viewport_id();
     let viewport = Viewport {
@@ -452,7 +823,9 @@ pub async fn viewport_resize(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows);
+    let search = s.searches.get(&(client_id, buffer_id));
+    let buf = &s.buffers[&buffer_id];
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows, search);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -478,7 +851,9 @@ pub async fn viewport_set_wrap(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows);
+    let search = s.searches.get(&(client_id, buffer_id));
+    let buf = &s.buffers[&buffer_id];
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows, search);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -505,7 +880,9 @@ pub async fn viewport_scroll(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows);
+    let search = s.searches.get(&(client_id, buffer_id));
+    let buf = &s.buffers[&buffer_id];
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows, search);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -607,6 +984,7 @@ fn render_window(
     wrap: aether_protocol::viewport::WrapMode,
     marker_width: u32,
     viewport_rows: u32,
+    search: Option<&SearchEntry>,
 ) -> Window {
     let mut lines: Vec<LogicalLineRender> = Vec::with_capacity((last_excl - first) as usize);
 
@@ -638,7 +1016,11 @@ fn render_window(
             _ => Vec::new(),
         };
 
-        lines.push(wrap::render_line(&text, i, cols, wrap, marker_width, highlights));
+        let mut render = wrap::render_line(&text, i, cols, wrap, marker_width, highlights);
+        if let Some(entry) = search {
+            render.search_matches = matches_on_line(entry, i, text.len() as u32);
+        }
+        lines.push(render);
     }
     Window {
         first_logical_line: first,
@@ -647,6 +1029,25 @@ fn render_window(
         max_scroll_logical_line: compute_max_scroll(buf, viewport_rows, cols, wrap, marker_width),
         lines,
     }
+}
+
+/// Per-line byte ranges from `entry.matches` clipped to `[0, line_len)` for `line_idx`. Matches
+/// that span multiple lines contribute one range per line they touch.
+fn matches_on_line(entry: &SearchEntry, line_idx: u32, line_len: u32) -> Vec<SearchMatchRange> {
+    let mut out = Vec::new();
+    for (start, end_excl) in &entry.matches {
+        if line_idx < start.line || line_idx > end_excl.line {
+            continue;
+        }
+        let s = if line_idx == start.line { start.col } else { 0 };
+        let e = if line_idx == end_excl.line { end_excl.col } else { line_len };
+        let s = s.min(line_len);
+        let e = e.min(line_len);
+        if s < e {
+            out.push(SearchMatchRange { start: s, end: e });
+        }
+    }
+    out
 }
 
 // ---- cursor handlers ---------------------------------------------------------------------------
@@ -1139,6 +1540,7 @@ async fn apply_indent_or_dedent(
 
     let edit_first = a;
     let edit_last_excl = b + 1;
+    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
     let buf_ref = &s.buffers[&buffer_id];
     let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
     for vp in s.viewports.values() {
@@ -1154,7 +1556,8 @@ async fn apply_indent_or_dedent(
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
-        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision)));
+        let search = s.searches.get(&(vp.client_id, buffer_id));
+        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
     let new_line_count = buf_ref.line_count();
     for vp in s.viewports.values_mut() {
@@ -1167,6 +1570,9 @@ async fn apply_indent_or_dedent(
 
     drop(s);
     for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in search_summary_pushes {
         let _ = sender.send(notif).await;
     }
     Ok(EditResult { revision, cursor: new_cursor, dirty })
@@ -1306,6 +1712,7 @@ pub async fn input_move_lines(
         VerticalDirection::Up => (a - 1, b + 1),
     };
 
+    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
     let buf_ref = &s.buffers[&buffer_id];
     let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
     for vp in s.viewports.values() {
@@ -1321,7 +1728,8 @@ pub async fn input_move_lines(
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
-        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision)));
+        let search = s.searches.get(&(vp.client_id, buffer_id));
+        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
     let new_line_count = buf_ref.line_count();
     for vp in s.viewports.values_mut() {
@@ -1334,6 +1742,9 @@ pub async fn input_move_lines(
 
     drop(s);
     for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in search_summary_pushes {
         let _ = sender.send(notif).await;
     }
     Ok(EditResult { revision, cursor: new_cursor, dirty })
@@ -1475,8 +1886,9 @@ pub async fn input_join_lines(
     };
 
     // Push viewport/lines_changed for affected viewports (we changed multiple lines).
-    let pushes: Vec<(mpsc::Sender<Notification>, Notification)> = {
-        let s = state.lock().await;
+    let (pushes, search_summary_pushes): (Vec<_>, Vec<_>) = {
+        let mut s = state.lock().await;
+        let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
         let buf = &s.buffers[&buffer_id];
         let mut pushes = Vec::new();
         let new_line_count = buf.line_count();
@@ -1487,10 +1899,11 @@ pub async fn input_join_lines(
             let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
                 continue;
             };
-            pushes.push((sender, build_lines_changed_notif(buf, vp, revision)));
+            let search = s.searches.get(&(vp.client_id, buffer_id));
+            pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search)));
             let _ = new_line_count; // viewport range clamp not needed here; render handles it
         }
-        pushes
+        (pushes, search_summary_pushes)
     };
     // Clamp viewport ranges to new line count.
     {
@@ -1506,6 +1919,9 @@ pub async fn input_join_lines(
     }
 
     for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in search_summary_pushes {
         let _ = sender.send(notif).await;
     }
 
@@ -1589,6 +2005,7 @@ async fn apply_undo_or_redo(
 
     // Push the full visible window to every viewport on this buffer — the rope was swapped
     // wholesale, so we can't be surgical about it.
+    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
     let buf_ref = &s.buffers[&buffer_id];
     let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
     let new_line_count = buf_ref.line_count();
@@ -1599,7 +2016,8 @@ async fn apply_undo_or_redo(
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
             continue;
         };
-        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision)));
+        let search = s.searches.get(&(vp.client_id, buffer_id));
+        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
     // Clamp viewport pushed ranges to the new line count.
     for vp in s.viewports.values_mut() {
@@ -1612,6 +2030,9 @@ async fn apply_undo_or_redo(
 
     drop(s);
     for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in search_summary_pushes {
         let _ = sender.send(notif).await;
     }
 
@@ -1718,6 +2139,10 @@ async fn apply_edit(
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
 
+    // Recompute every active search on this buffer so the embedded `search_matches` in the
+    // line-render data we're about to send out reflects the post-edit text.
+    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+
     // Collect notifications for all viewports whose pushed range intersects the edit.
     let edit_first = old_first_line;
     let edit_last_excl = old_last_line.saturating_add(1);
@@ -1731,7 +2156,8 @@ async fn apply_edit(
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
-        let notif = build_lines_changed_notif(buf_ref, vp, revision);
+        let search = s.searches.get(&(vp.client_id, buffer_id));
+        let notif = build_lines_changed_notif(buf_ref, vp, revision, search);
         pushes.push((sender, notif));
     }
 
@@ -1753,6 +2179,9 @@ async fn apply_edit(
         // If the receiver's gone, the client's connection has dropped; not our problem.
         let _ = sender.send(notif).await;
     }
+    for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
 
     Ok(EditResult { revision, cursor: new_cursor_state, dirty })
 }
@@ -1761,11 +2190,16 @@ fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) 
     a_start < b_end_excl && b_start < a_end_excl
 }
 
-fn build_lines_changed_notif(buffer: &Buffer, vp: &Viewport, revision: Revision) -> Notification {
+fn build_lines_changed_notif(
+    buffer: &Buffer,
+    vp: &Viewport,
+    revision: Revision,
+    search: Option<&SearchEntry>,
+) -> Notification {
     let line_count = buffer.line_count();
     let new_first = vp.first_logical_line.min(line_count);
     let new_last_excl = vp.last_logical_line_exclusive.min(line_count).max(new_first);
-    let window = render_window(buffer, new_first, new_last_excl, vp.cols, vp.wrap, vp.continuation_marker_width, vp.rows);
+    let window = render_window(buffer, new_first, new_last_excl, vp.cols, vp.wrap, vp.continuation_marker_width, vp.rows, search);
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
         revision,

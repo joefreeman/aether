@@ -4,6 +4,7 @@ use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::SharedState;
 use aether_protocol::buffer::{BufferCopy, BufferCut, BufferOpen, BufferSave};
+use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::cursor::{
     CursorMove, CursorRedo, CursorSelectLine, CursorSet, CursorSwapAnchor, CursorUndo,
 };
@@ -72,6 +73,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_cursors_for_client(client_id);
         s.drop_motion_history_for_client(client_id);
         s.drop_virtual_col_for_client(client_id);
+        s.drop_searches_for_client(client_id);
         tracing::debug!(%client_id, "client session removed");
     }
     Ok(())
@@ -141,6 +143,10 @@ async fn dispatch(
         ClientHello::NAME => run!(ClientHello, handlers::client_hello),
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
+        SearchSet::NAME => run!(SearchSet, handlers::search_set),
+        SearchClear::NAME => run!(SearchClear, handlers::search_clear),
+        SearchNext::NAME => run!(SearchNext, handlers::search_next),
+        SearchPrev::NAME => run!(SearchPrev, handlers::search_prev),
         BufferCopy::NAME => run!(BufferCopy, handlers::buffer_copy),
         BufferCut::NAME => run!(BufferCut, handlers::buffer_cut),
         ViewportSubscribe::NAME => run!(ViewportSubscribe, handlers::viewport_subscribe),

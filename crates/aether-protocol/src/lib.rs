@@ -10,6 +10,7 @@ pub mod envelope;
 pub mod error;
 pub mod handshake;
 pub mod input;
+pub mod search;
 pub mod viewport;
 
 pub type BufferId = u64;
