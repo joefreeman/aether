@@ -544,6 +544,18 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('0'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::LineStart, extend).await?,
 
+        // ---- motions: goto line ----
+        // `g` jumps to line N (1-indexed; no prefix = line 1). `Alt-g` jumps to the last line.
+        // Shift extends the selection. The server clamps line numbers past EOF.
+        (KeyCode::Char('g'), m) if m.contains(KeyModifiers::ALT) => {
+            let target = LogicalPosition { line: state.line_count.saturating_sub(1), col: 0 };
+            move_motion(client, state, Motion::Goto { position: target }, extend).await?
+        }
+        (KeyCode::Char('g'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            let target = LogicalPosition { line: count.saturating_sub(1), col: 0 };
+            move_motion(client, state, Motion::Goto { position: target }, extend).await?
+        }
+
         // ---- line selection ----
         // `x` always grows the selection's bottom edge downward; `Alt-x` always grows the top
         // edge upward. With no selection: `x` picks the current line (or the next at end-of-line)
@@ -1415,14 +1427,14 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
     }
 
     // Below the bottom (counting *visual* rows, not logical lines): scroll the cursor's line to
-    // the top. This is a conservative heuristic — a wrapped line that's tall could push the
-    // cursor's visual row past the bottom but accurate "scroll just enough to fit" would need
-    // walking backward from the cursor counting visual rows, which we'd rather hand off to a
-    // future refinement. Putting cursor.line at top keeps the cursor visible in all cases.
+    // the top. Clamp the target to `max_scroll_logical_line` so a jump to (or near) the last
+    // line doesn't overscroll — `Alt-g` would otherwise put the last line at the very top of
+    // an otherwise-empty viewport.
     let cursor_visible =
         ui::cursor_visual_position(state, state.viewport_rows).is_some();
     if !cursor_visible {
-        scroll_to(client, state, cursor_line).await?;
+        let target = cursor_line.min(state.max_scroll_logical_line);
+        scroll_to(client, state, target).await?;
     }
     Ok(())
 }
