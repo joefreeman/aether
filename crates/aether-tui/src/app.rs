@@ -596,6 +596,9 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state).await?,
         (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state).await?,
         (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state).await?,
+        (KeyCode::Char('o'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
+            open_line_above(client, state).await?,
+        (KeyCode::Char('o'), CTRL_ONLY) => open_line_below(client, state).await?,
         (KeyCode::Char('d'), CTRL_ONLY) | (KeyCode::Delete, _) => {
             delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count }).await?
         }
@@ -1258,6 +1261,49 @@ async fn dedent(client: &mut Client, state: &mut AppState) -> Result<()> {
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
+    Ok(())
+}
+
+/// Add a blank line after the cursor's current line and drop into Insert mode at its start.
+/// Implemented as: park cursor at end of current line, insert "\n", enter Insert. The newline
+/// pushes the cursor onto the (now empty) line below.
+async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let line = state.cursor.position.line;
+    let new = client
+        .rpc::<CursorSet>(CursorSetParams {
+            buffer_id: state.buffer_id,
+            position: LogicalPosition { line, col: u32::MAX },
+            anchor: None,
+        })
+        .await?;
+    state.cursor = new;
+    insert_text(client, state, "\n").await?;
+    enter_insert_mode(state);
+    Ok(())
+}
+
+/// Insert a blank line *above* the cursor's current line and drop into Insert mode on it.
+/// Park at col 0 of the current line, insert "\n" (which pushes the original line down a row
+/// and lands the cursor at its new start), then step back up onto the freshly-blank line.
+async fn open_line_above(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let line = state.cursor.position.line;
+    let new = client
+        .rpc::<CursorSet>(CursorSetParams {
+            buffer_id: state.buffer_id,
+            position: LogicalPosition { line, col: 0 },
+            anchor: None,
+        })
+        .await?;
+    state.cursor = new;
+    insert_text(client, state, "\n").await?;
+    move_motion(
+        client,
+        state,
+        Motion::LogicalLine { direction: Direction::Backward, count: 1, preserve_col: false },
+        false,
+    )
+    .await?;
+    enter_insert_mode(state);
     Ok(())
 }
 
