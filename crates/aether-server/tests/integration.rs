@@ -130,7 +130,7 @@ async fn hello_then_open_file() {
     .await;
     assert!(open.buffer_id > 0);
     assert_eq!(open.language.as_deref(), Some("rust"));
-    assert_eq!(open.dirty, false);
+    assert_eq!(open.saved_revision, open.revision);
     assert_eq!(open.revision, 0);
     assert!(open.line_count >= 3);
     assert!(open.byte_count > 0);
@@ -766,10 +766,10 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let disk = std::fs::read_to_string(&path).unwrap();
     assert_eq!(disk, "hello!\n");
 
-    // The server pushes buffer/state to clear dirty.
+    // The server pushes buffer/state with the new saved_revision.
     let state_push: BufferStateParams = expect_notification::<BufferState>(&mut ws).await;
-    assert_eq!(state_push.dirty, false);
     assert_eq!(state_push.buffer_id, open.buffer_id);
+    assert_eq!(state_push.saved_revision, save.revision);
 
     drop(server);
 }
@@ -944,7 +944,9 @@ async fn cut_selection_deletes_and_returns_text() {
     )
     .await;
     assert_eq!(r.text, "beta");
-    assert!(r.dirty);
+    // dirty is now derived client-side from revision vs saved_revision; just confirm the
+    // revision advanced.
+    assert!(r.revision > 0);
     let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
     assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "alpha  gamma");
     drop(server);
@@ -1018,21 +1020,22 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     .await;
     let edit: EditResult =
         send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "XY".into(), select_pasted: false }).await;
-    assert!(edit.dirty);
+    assert!(edit.revision > 0);
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
-    // Undo: should revert "XY", cursor back to col 3, and dirty cleared (we're back at saved rev).
+    // Undo: should revert "XY", cursor back to col 3, and (since saved_revision is 0) the
+    // revision drops to 0 — client derives `dirty == false` from that.
     let undo: UndoResult = send_request::<InputUndo>(&mut ws, 13, &BufferOnlyParams { buffer_id }).await;
     assert!(undo.applied);
     assert_eq!(undo.cursor.position, LogicalPosition { line: 0, col: 3 });
-    assert!(!undo.dirty, "undo back to saved should clear dirty");
+    assert_eq!(undo.revision, 0, "undo back to saved revision");
     let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
     assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "abc");
 
-    // Redo: re-applies "XY", dirty true again.
+    // Redo: re-applies "XY", revision advances past saved.
     let redo: UndoResult = send_request::<InputRedo>(&mut ws, 14, &BufferOnlyParams { buffer_id }).await;
     assert!(redo.applied);
-    assert!(redo.dirty);
+    assert!(redo.revision > 0);
     let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
     assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "abcXY");
 
@@ -1045,7 +1048,6 @@ async fn undo_on_empty_stack_returns_applied_false() {
     let r: UndoResult =
         send_request::<InputUndo>(&mut ws, 10, &BufferOnlyParams { buffer_id }).await;
     assert!(!r.applied);
-    assert!(!r.dirty);
     drop(server);
 }
 
@@ -1084,13 +1086,14 @@ async fn dirty_clears_when_undoing_back_past_save() {
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     // Save.
-    let _save: BufferSaveResult = send_request::<BufferSave>(
+    let save: BufferSaveResult = send_request::<BufferSave>(
         &mut ws,
         13,
         &BufferSaveParams { buffer_id, path_index: None, relative_path: None },
     )
     .await;
-    let _ = expect_notification::<BufferState>(&mut ws).await;
+    let saved_state = expect_notification::<BufferState>(&mut ws).await;
+    assert_eq!(saved_state.saved_revision, save.revision);
 
     // Edit #2: delete (different kind, so a new group). Backspace removes the "X".
     let _e2: EditResult = send_request::<InputDelete>(
@@ -1104,10 +1107,10 @@ async fn dirty_clears_when_undoing_back_past_save() {
     .await;
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
-    // Undo: should put "X" back, taking us back to the saved revision → dirty cleared.
+    // Undo: should put "X" back, taking us back to the saved revision → derived dirty == false.
     let undo: UndoResult = send_request::<InputUndo>(&mut ws, 15, &BufferOnlyParams { buffer_id }).await;
     assert!(undo.applied);
-    assert!(!undo.dirty, "undo back to saved revision should clear dirty");
+    assert_eq!(undo.revision, save.revision, "undo should return to the saved revision");
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     drop(server);
@@ -1227,7 +1230,7 @@ async fn join_lines_collapses_lines_with_single_space() {
     .await;
     let r: EditResult =
         send_request::<InputJoinLines>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
-    assert!(r.dirty);
+    assert!(r.revision > 0);
     let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
     // After join: "hello world\n" — trailing whitespace of line 0 removed, leading whitespace of
     // line 1 removed, single space inserted.

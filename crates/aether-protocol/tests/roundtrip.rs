@@ -114,12 +114,12 @@ fn buffer_open_result_shape() {
         line_count: 100,
         byte_count: 1234,
         revision: 0,
-        dirty: false,
+        saved_revision: 0,
     })
     .unwrap();
     assert_eq!(v["buffer_id"], 42);
     assert_eq!(v["language"], "rust");
-    assert_eq!(v["dirty"], false);
+    assert_eq!(v["saved_revision"], 0);
 }
 
 #[test]

@@ -107,7 +107,7 @@ pub async fn buffer_open(
                 line_count: buf.line_count(),
                 byte_count: buf.byte_count(),
                 revision: 0,
-                dirty: false,
+                saved_revision: buf.saved_revision(),
             };
             s.buffers.insert(id, buf);
             return Ok(result);
@@ -156,7 +156,7 @@ pub async fn buffer_open(
                 line_count: buf.line_count(),
                 byte_count: buf.byte_count(),
                 revision: buf.revision,
-                dirty: buf.dirty,
+                saved_revision: buf.saved_revision(),
             });
         }
     }
@@ -170,7 +170,7 @@ pub async fn buffer_open(
         line_count: buf.line_count(),
         byte_count: buf.byte_count(),
         revision: buf.revision,
-        dirty: buf.dirty,
+        saved_revision: buf.saved_revision(),
     };
     s.buffers.insert(id, buf);
     tracing::info!(buffer_id = id, path = %canonical.display(), "buffer opened");
@@ -484,6 +484,44 @@ fn collect_viewport_refresh(
     pushes
 }
 
+/// Build the `buffer/state` notification pushes for every client that has a viewport on this
+/// buffer. Only used by the save handler — mutations bump the buffer's `revision` (which clients
+/// already learn from `viewport/lines_changed`) and the client derives `dirty` as
+/// `revision != saved_revision`, so this notification is only needed when `saved_revision`
+/// itself changes.
+fn collect_buffer_state_pushes(
+    s: &ServerState,
+    buffer_id: BufferId,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    let Some(buf) = s.buffers.get(&buffer_id) else { return Vec::new() };
+    let params = BufferStateParams {
+        buffer_id,
+        saved_revision: buf.saved_revision(),
+        saved_at_unix_ms: buf.last_modified_unix_ms,
+    };
+    let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
+    let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
+    for vp in s.viewports.values() {
+        if vp.buffer_id == buffer_id {
+            clients.insert(vp.client_id);
+        }
+    }
+    clients
+        .into_iter()
+        .filter_map(|cid| {
+            let session = s.clients.get(&cid)?;
+            Some((
+                session.outbound.clone(),
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: BufferState::NAME.into(),
+                    params: json.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Recompute every active search on this buffer after a mutation. Returns the pushes (search
 /// summary notifications) to be sent after dropping the lock. The line-level highlight refresh
 /// happens via the existing `viewport/lines_changed` flow (since `render_window` reads the
@@ -591,7 +629,6 @@ pub async fn buffer_cut(
     s.clear_motion_history_for_buffer(params.buffer_id);
     s.clear_virtual_col_for_buffer(params.buffer_id);
 
-    let dirty = s.buffers[&params.buffer_id].dirty;
     let search_summary_pushes = refresh_searches_for_buffer(&mut s, params.buffer_id);
     let buf_ref = &s.buffers[&params.buffer_id];
 
@@ -624,7 +661,7 @@ pub async fn buffer_cut(
         let _ = sender.send(notif).await;
     }
 
-    Ok(BufferCutResult { text, revision, cursor: new_cursor, dirty })
+    Ok(BufferCutResult { text, revision, cursor: new_cursor })
 }
 
 /// Compute the `[start_char, end_char)` range for a copy/cut scope.
@@ -727,33 +764,11 @@ pub async fn buffer_save(
     };
 
     // Broadcast buffer/state to all clients with viewports on this buffer.
-    let pushes: Vec<(mpsc::Sender<Notification>, Notification)> = {
+    let pushes = {
         let s = state.lock().await;
-        let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
-        for vp in s.viewports.values() {
-            if vp.buffer_id == params.buffer_id {
-                clients.insert(vp.client_id);
-            }
-        }
-        clients
-            .into_iter()
-            .filter_map(|cid| {
-                let session = s.clients.get(&cid)?;
-                let state_params = BufferStateParams {
-                    buffer_id: params.buffer_id,
-                    dirty: false,
-                    revision,
-                    saved_at_unix_ms: Some(saved_at_unix_ms),
-                };
-                let notif = Notification {
-                    jsonrpc: JsonRpc,
-                    method: BufferState::NAME.into(),
-                    params: serde_json::to_value(state_params).expect("infallible"),
-                };
-                Some((session.outbound.clone(), notif))
-            })
-            .collect()
+        collect_buffer_state_pushes(&s, params.buffer_id)
     };
+    let _ = saved_at_unix_ms; // saved_at is captured inside the helper via Buffer::last_modified.
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
@@ -1491,7 +1506,6 @@ async fn apply_indent_or_dedent(
         return Ok(EditResult {
             revision: buf.revision,
             cursor,
-            dirty: buf.dirty,
         });
     }
 
@@ -1501,7 +1515,7 @@ async fn apply_indent_or_dedent(
         .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
         .collect();
 
-    let (revision, dirty, new_cursor) = {
+    let (revision, new_cursor) = {
         let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
         let revision = buf_mut.apply_edit(
             start_char,
@@ -1531,8 +1545,7 @@ async fn apply_indent_or_dedent(
             },
             _ => new_cursor,
         };
-        let dirty = buf_mut.dirty;
-        (revision, dirty, new_cursor)
+        (revision, new_cursor)
     };
     s.cursors.insert((client_id, buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(buffer_id);
@@ -1575,7 +1588,7 @@ async fn apply_indent_or_dedent(
     for (sender, notif) in search_summary_pushes {
         let _ = sender.send(notif).await;
     }
-    Ok(EditResult { revision, cursor: new_cursor, dirty })
+    Ok(EditResult { revision, cursor: new_cursor })
 }
 
 pub async fn input_move_lines(
@@ -1624,7 +1637,6 @@ pub async fn input_move_lines(
         return Ok(EditResult {
             revision: buf.revision,
             cursor,
-            dirty: buf.dirty,
         });
     }
 
@@ -1670,7 +1682,7 @@ pub async fn input_move_lines(
         .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
         .collect();
 
-    let (revision, dirty, new_cursor) = {
+    let (revision, new_cursor) = {
         let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
         let revision = buf_mut.apply_edit(
             edit_start,
@@ -1699,8 +1711,7 @@ pub async fn input_move_lines(
             },
             _ => new_cursor,
         };
-        let dirty = buf_mut.dirty;
-        (revision, dirty, new_cursor)
+        (revision, new_cursor)
     };
     s.cursors.insert((client_id, buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(buffer_id);
@@ -1747,7 +1758,7 @@ pub async fn input_move_lines(
     for (sender, notif) in search_summary_pushes {
         let _ = sender.send(notif).await;
     }
-    Ok(EditResult { revision, cursor: new_cursor, dirty })
+    Ok(EditResult { revision, cursor: new_cursor })
 }
 
 /// Build a new string with `bottom` first, then `top`, preserving "this is the last line of the
@@ -1807,7 +1818,6 @@ pub async fn input_join_lines(
         return Ok(EditResult {
             revision: buf.revision,
             cursor: s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default(),
-            dirty: buf.dirty,
         });
     }
 
@@ -1862,7 +1872,7 @@ pub async fn input_join_lines(
             .collect()
     };
 
-    let (revision, dirty, new_cursor) = {
+    let (revision, new_cursor) = {
         let mut s = state.lock().await;
         let buf = s.buffers.get_mut(&buffer_id).expect("just checked");
         let revision = buf.apply_edit(
@@ -1877,12 +1887,10 @@ pub async fn input_join_lines(
             position: motion::char_to_pos(buf, new_cursor_char),
             anchor: None,
         };
-        let dirty = buf.dirty;
         s.cursors.insert((client_id, buffer_id), new_cursor);
         s.clear_motion_history_for_buffer(buffer_id);
-    s.clear_virtual_col_for_buffer(buffer_id);
         s.clear_virtual_col_for_buffer(buffer_id);
-        (revision, dirty, new_cursor)
+        (revision, new_cursor)
     };
 
     // Push viewport/lines_changed for affected viewports (we changed multiple lines).
@@ -1925,7 +1933,7 @@ pub async fn input_join_lines(
         let _ = sender.send(notif).await;
     }
 
-    Ok(EditResult { revision, cursor: new_cursor, dirty })
+    Ok(EditResult { revision, cursor: new_cursor })
 }
 
 enum UndoDirection {
@@ -1968,13 +1976,11 @@ async fn apply_undo_or_redo(
             revision: buf.revision,
             applied: false,
             cursor,
-            dirty: buf.dirty,
         });
     };
 
     let buf = s.buffers.get(&buffer_id).expect("just modified");
     let revision = buf.revision;
-    let dirty = buf.dirty;
 
     // Restore cursors from the snapshot, clamped to valid positions in the restored rope.
     let mut new_cursors: HashMap<ClientId, CursorState> = HashMap::new();
@@ -2036,7 +2042,7 @@ async fn apply_undo_or_redo(
         let _ = sender.send(notif).await;
     }
 
-    Ok(UndoResult { revision, applied: true, cursor: undoing_cursor, dirty })
+    Ok(UndoResult { revision, applied: true, cursor: undoing_cursor })
 }
 
 fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
@@ -2172,7 +2178,6 @@ async fn apply_edit(
         vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
     }
 
-    let dirty = s.buffers[&buffer_id].dirty;
     drop(s);
 
     for (sender, notif) in pushes {
@@ -2183,7 +2188,7 @@ async fn apply_edit(
         let _ = sender.send(notif).await;
     }
 
-    Ok(EditResult { revision, cursor: new_cursor_state, dirty })
+    Ok(EditResult { revision, cursor: new_cursor_state })
 }
 
 fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) -> bool {

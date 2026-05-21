@@ -308,6 +308,12 @@ impl Buffer {
         self.text.len_lines() as u32
     }
 
+    /// Revision at the last successful save (or `0` for a fresh scratch buffer that's never been
+    /// saved). The client uses this together with `revision` to derive `dirty`.
+    pub fn saved_revision(&self) -> Revision {
+        self.saved_revision.unwrap_or(0)
+    }
+
     pub fn byte_count(&self) -> u64 {
         self.text.len_bytes() as u64
     }

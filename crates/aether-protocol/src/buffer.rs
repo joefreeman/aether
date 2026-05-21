@@ -28,7 +28,9 @@ pub struct BufferOpenResult {
     pub line_count: u32,
     pub byte_count: u64,
     pub revision: Revision,
-    pub dirty: bool,
+    /// The revision at which this buffer was last persisted to disk (or `0` for a fresh scratch
+    /// buffer). The client derives `dirty` as `revision != saved_revision`.
+    pub saved_revision: Revision,
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------
@@ -109,7 +111,6 @@ pub struct BufferCutResult {
     pub text: String,
     pub revision: Revision,
     pub cursor: CursorState,
-    pub dirty: bool,
 }
 
 // ---- buffer/state (notification) ----------------------------------------------------------------
@@ -123,8 +124,10 @@ impl NotificationMethod for BufferState {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BufferStateParams {
     pub buffer_id: BufferId,
-    pub dirty: bool,
-    pub revision: Revision,
+    /// Revision at the most recent successful save. The client derives `dirty` as `revision !=
+    /// saved_revision`, so this notification only needs to fire when the saved point changes
+    /// (i.e. on save / load), not on every mutation.
+    pub saved_revision: Revision,
     pub saved_at_unix_ms: Option<u64>,
 }
 

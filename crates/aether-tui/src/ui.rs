@@ -384,7 +384,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         };
         Line::from(vec![Span::raw(text)])
     } else {
-        let dirty_marker = if state.dirty { "[+]" } else { "" };
+        let dirty_marker = if state.dirty() { "[+]" } else { "" };
         let counter = search_counter_label(state)
             .map(|c| format!("  {c}"))
             .unwrap_or_default();

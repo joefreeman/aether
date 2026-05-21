@@ -114,7 +114,9 @@ pub struct AppState {
     /// anchor; cleared on mouse-up.
     pub drag_anchor: Option<LogicalPosition>,
     pub revision: u64,
-    pub dirty: bool,
+    /// Revision at the most recent successful save. `dirty` is derived as
+    /// `revision != saved_revision` — no separate flag to keep in sync.
+    pub saved_revision: u64,
     pub should_quit: bool,
     pub status: String,
     pub mode: Mode,
@@ -124,6 +126,12 @@ pub struct AppState {
     /// abandoned every operation. `None` if the clipboard couldn't be initialised (e.g. headless).
     pub clipboard: Option<arboard::Clipboard>,
     pub search: SearchState,
+}
+
+impl AppState {
+    pub fn dirty(&self) -> bool {
+        self.revision != self.saved_revision
+    }
 }
 
 pub async fn bootstrap(
@@ -197,7 +205,7 @@ pub async fn bootstrap(
         pending_scroll_lines: 0,
         drag_anchor: None,
         revision: open.revision,
-        dirty: open.dirty,
+        saved_revision: open.saved_revision,
         should_quit: false,
         status: String::new(),
         mode: Mode::Normal,
@@ -300,10 +308,9 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
     } else if n.method == BufferState::NAME {
         match serde_json::from_value::<BufferStateParams>(n.params) {
             Ok(p) if p.buffer_id == state.buffer_id => {
-                state.dirty = p.dirty;
-                state.revision = p.revision;
-                if !p.dirty {
-                    state.status = format!("saved (rev {})", p.revision);
+                state.saved_revision = p.saved_revision;
+                if state.revision == state.saved_revision {
+                    state.status = format!("saved (rev {})", state.saved_revision);
                 }
             }
             Ok(_) => {}
@@ -1186,7 +1193,6 @@ async fn insert_text_inner(
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = r.dirty;
     Ok(())
 }
 
@@ -1196,7 +1202,6 @@ async fn delete_with_motion(client: &mut Client, state: &mut AppState, motion: M
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = r.dirty;
     Ok(())
 }
 
@@ -1206,7 +1211,6 @@ async fn join_lines(client: &mut Client, state: &mut AppState) -> Result<()> {
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = r.dirty;
     Ok(())
 }
 
@@ -1216,7 +1220,6 @@ async fn indent(client: &mut Client, state: &mut AppState) -> Result<()> {
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = r.dirty;
     Ok(())
 }
 
@@ -1226,7 +1229,6 @@ async fn dedent(client: &mut Client, state: &mut AppState) -> Result<()> {
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = r.dirty;
     Ok(())
 }
 
@@ -1243,7 +1245,6 @@ async fn move_lines(
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = r.dirty;
     Ok(())
 }
 
@@ -1265,7 +1266,6 @@ async fn cut_to_clipboard(client: &mut Client, state: &mut AppState, scope: Copy
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = r.dirty;
     let len = r.text.len();
     match clipboard::copy(&mut state.clipboard, r.text) {
         Ok(()) => state.status = format!("cut {len} bytes"),
@@ -1348,7 +1348,6 @@ fn apply_undo_result(state: &mut AppState, r: UndoResult, label: &str) {
     }
     state.revision = r.revision;
     state.cursor = r.cursor;
-    state.dirty = r.dirty;
     state.status = format!("{label} (rev {})", r.revision);
 }
 
@@ -1362,8 +1361,8 @@ async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
         .await;
     match result {
         Ok(r) => {
-            state.dirty = false;
             state.revision = r.revision;
+            state.saved_revision = r.revision;
             state.status = format!("saved (rev {})", r.revision);
         }
         Err(e) => {

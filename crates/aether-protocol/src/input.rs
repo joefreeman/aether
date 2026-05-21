@@ -14,9 +14,6 @@ pub struct EditResult {
     /// Cursor position immediately after the edit. Saves the client a round-trip to learn where
     /// the cursor landed.
     pub cursor: CursorState,
-    /// Whether the buffer is dirty after this edit. Reflects revision-vs-saved-revision; undo
-    /// back to a saved state can clear this.
-    pub dirty: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,5 +133,4 @@ pub struct UndoResult {
     /// Cursor position for the requesting client after the operation. When `applied` is `false`
     /// (stack empty), the cursor is unchanged but echoed back for consistency.
     pub cursor: CursorState,
-    pub dirty: bool,
 }
