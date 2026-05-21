@@ -4,7 +4,9 @@ use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::SharedState;
 use aether_protocol::buffer::{BufferCopy, BufferCut, BufferOpen, BufferSave};
-use aether_protocol::cursor::{CursorMove, CursorSelectLine, CursorSet, CursorSwapAnchor};
+use aether_protocol::cursor::{
+    CursorMove, CursorRedo, CursorSelectLine, CursorSet, CursorSwapAnchor, CursorUndo,
+};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
@@ -65,6 +67,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.clients.remove(&client_id);
         s.drop_viewports_for_client(client_id);
         s.drop_cursors_for_client(client_id);
+        s.drop_motion_history_for_client(client_id);
         tracing::debug!(%client_id, "client session removed");
     }
     Ok(())
@@ -144,6 +147,8 @@ async fn dispatch(
         CursorSet::NAME => run!(CursorSet, handlers::cursor_set),
         CursorSelectLine::NAME => run!(CursorSelectLine, handlers::cursor_select_line),
         CursorSwapAnchor::NAME => run!(CursorSwapAnchor, handlers::cursor_swap_anchor),
+        CursorUndo::NAME => run!(CursorUndo, handlers::cursor_undo),
+        CursorRedo::NAME => run!(CursorRedo, handlers::cursor_redo),
         InputText::NAME => run!(InputText, handlers::input_text),
         InputDelete::NAME => run!(InputDelete, handlers::input_delete),
         InputUndo::NAME => run!(InputUndo, handlers::input_undo),

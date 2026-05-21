@@ -136,6 +136,36 @@ pub struct CursorSelectLineParams {
     pub extend: bool,
 }
 
+// ---- cursor/undo and cursor/redo ----------------------------------------------------------------
+//
+// Per-client motion history: rewinds only this client's cursor/selection changes, capped at the
+// last buffer mutation. Independent of `input/undo` (which rewinds buffer state).
+
+pub struct CursorUndo;
+impl RpcMethod for CursorUndo {
+    const NAME: &'static str = "cursor/undo";
+    type Params = CursorUndoParams;
+    type Result = CursorUndoResult;
+}
+
+pub struct CursorRedo;
+impl RpcMethod for CursorRedo {
+    const NAME: &'static str = "cursor/redo";
+    type Params = CursorUndoParams;
+    type Result = CursorUndoResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CursorUndoParams {
+    pub buffer_id: BufferId,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CursorUndoResult {
+    pub applied: bool,
+    pub cursor: CursorState,
+}
+
 // ---- cursor/swap_anchor -------------------------------------------------------------------------
 
 pub struct CursorSwapAnchor;

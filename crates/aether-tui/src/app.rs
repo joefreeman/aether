@@ -9,9 +9,9 @@ use aether_protocol::buffer::{
     BufferSave, BufferSaveParams, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
-    CursorMove, CursorMoveParams, CursorSelectLine, CursorSelectLineParams, CursorSet,
-    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, Direction, Motion,
-    WordBoundary,
+    CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
+    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
+    CursorUndoParams, CursorUndoResult, Direction, Motion, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
@@ -351,6 +351,11 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // so a subsequent `Shift-*` motion extends from the other side.
         (KeyCode::Char('s'), m) if m == KeyModifiers::NONE => swap_anchor(client, state).await?,
 
+        // Motion undo / redo — per-client history of cursor/selection changes, capped at the
+        // last buffer mutation. Distinct from `Ctrl-z`/`Ctrl-y` which rewind buffer edits.
+        (KeyCode::Char('z'), m) if m == KeyModifiers::NONE => motion_undo(client, state).await?,
+        (KeyCode::Char('y'), m) if m == KeyModifiers::NONE => motion_redo(client, state).await?,
+
         // ---- mode transitions ----
         (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionStart).await?,
         (KeyCode::Char('a'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionEnd).await?,
@@ -464,6 +469,30 @@ async fn swap_anchor(client: &mut Client, state: &mut AppState) -> Result<()> {
         .await?;
     state.cursor = new;
     Ok(())
+}
+
+async fn motion_undo(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: CursorUndoResult = client
+        .rpc::<CursorUndo>(CursorUndoParams { buffer_id: state.buffer_id })
+        .await?;
+    apply_motion_undo_result(state, r, "motion undo");
+    Ok(())
+}
+
+async fn motion_redo(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: CursorUndoResult = client
+        .rpc::<CursorRedo>(CursorUndoParams { buffer_id: state.buffer_id })
+        .await?;
+    apply_motion_undo_result(state, r, "motion redo");
+    Ok(())
+}
+
+fn apply_motion_undo_result(state: &mut AppState, r: CursorUndoResult, label: &str) {
+    if r.applied {
+        state.cursor = r.cursor;
+    } else {
+        state.status = format!("nothing to {label}");
+    }
 }
 
 async fn clear_selection(client: &mut Client, state: &mut AppState) -> Result<()> {

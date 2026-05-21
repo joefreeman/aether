@@ -10,7 +10,7 @@ use tree_sitter::{InputEdit, Parser, Point, Tree};
 
 /// Edits within this window join the active undo group.
 const GROUP_TIME_WINDOW: Duration = Duration::from_millis(500);
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -26,8 +26,30 @@ pub struct ServerState {
     pub clients: HashMap<ClientId, ClientSession>,
     pub viewports: HashMap<ViewportId, Viewport>,
     pub cursors: HashMap<(ClientId, BufferId), CursorState>,
+    /// Per-`(client, buffer)` history of cursor states for motion undo/redo. Distinct from the
+    /// buffer's own undo stack: this rewinds *only* the client's own cursor moves and is cleared
+    /// by any buffer mutation (since prior positions may no longer be valid).
+    pub motion_history: HashMap<(ClientId, BufferId), MotionHistory>,
     next_buffer_id: u64,
     next_viewport_id: u64,
+}
+
+/// Cap on each direction's stack. Bounds memory in pathological cases (e.g. holding down a
+/// motion key), and matches the "cursor undo is per-client transient state, not an audit log"
+/// framing.
+pub const MOTION_HISTORY_CAP: usize = 100;
+
+#[derive(Default)]
+pub struct MotionHistory {
+    pub undo: VecDeque<CursorState>,
+    pub redo: Vec<CursorState>,
+}
+
+impl MotionHistory {
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
 }
 
 impl ServerState {
@@ -40,6 +62,7 @@ impl ServerState {
             clients: HashMap::new(),
             viewports: HashMap::new(),
             cursors: HashMap::new(),
+            motion_history: HashMap::new(),
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
@@ -65,6 +88,46 @@ impl ServerState {
     /// Remove all cursor records for the given client. Used on disconnect.
     pub fn drop_cursors_for_client(&mut self, client_id: ClientId) {
         self.cursors.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Remove all motion-history records for the given client. Used on disconnect.
+    pub fn drop_motion_history_for_client(&mut self, client_id: ClientId) {
+        self.motion_history.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Record a user-initiated cursor state transition. The previous state goes on the undo
+    /// stack and the redo stack is cleared. No-op if the state didn't change. Called by every
+    /// `cursor/*` handler.
+    pub fn record_motion(
+        &mut self,
+        key: (ClientId, BufferId),
+        prev: CursorState,
+        next: CursorState,
+    ) {
+        if prev == next {
+            return;
+        }
+        let history = self.motion_history.entry(key).or_default();
+        // Skip duplicate top — defensive against compound client ops that touch the cursor more
+        // than once via the same intermediate state.
+        if history.undo.back() != Some(&prev) {
+            history.undo.push_back(prev);
+            while history.undo.len() > MOTION_HISTORY_CAP {
+                history.undo.pop_front();
+            }
+        }
+        history.redo.clear();
+    }
+
+    /// Clear motion history for every client on the given buffer. Called on any buffer mutation
+    /// (text, delete, cut, join, undo, redo) — remembered positions could be invalid after the
+    /// buffer changes, and the user contract is "motion undo only goes back to the last edit".
+    pub fn clear_motion_history_for_buffer(&mut self, buffer_id: BufferId) {
+        for ((_, b), h) in self.motion_history.iter_mut() {
+            if *b == buffer_id {
+                h.clear();
+            }
+        }
     }
 
     /// Locate an already-open buffer for the given canonical path, if any.

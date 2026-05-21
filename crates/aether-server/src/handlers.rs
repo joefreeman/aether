@@ -11,8 +11,9 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState, CursorSwapAnchorParams,
-    Direction, Motion,
+    CursorUndoParams, CursorUndoResult, Direction, Motion,
 };
+use crate::state::MOTION_HISTORY_CAP;
 use aether_protocol::LogicalPosition;
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
@@ -222,6 +223,7 @@ pub async fn buffer_cut(
     let revision = buf_mut.apply_edit(start_char, end_char, "", EditKindTag::Delete, cursors_before);
     let new_cursor = CursorState { position: motion::char_to_pos(buf_mut, start_char), anchor: None };
     s.cursors.insert((client_id, params.buffer_id), new_cursor);
+    s.clear_motion_history_for_buffer(params.buffer_id);
 
     let dirty = s.buffers[&params.buffer_id].dirty;
     let buf_ref = &s.buffers[&params.buffer_id];
@@ -607,6 +609,7 @@ pub async fn cursor_move(
 
     let new_state = CursorState { position: new_pos, anchor: new_anchor };
     s.cursors.insert(key, new_state);
+    s.record_motion(key, current, new_state);
     Ok(new_state)
 }
 
@@ -708,6 +711,7 @@ pub async fn cursor_select_line(
     let anchor = if anchor_pos == cursor_pos { None } else { Some(anchor_pos) };
     let new_state = CursorState { position: cursor_pos, anchor };
     s.cursors.insert(key, new_state);
+    s.record_motion(key, current, new_state);
     Ok(new_state)
 }
 
@@ -728,6 +732,7 @@ pub async fn cursor_swap_anchor(
         None => current,
     };
     s.cursors.insert(key, new_state);
+    s.record_motion(key, current, new_state);
     Ok(new_state)
 }
 
@@ -742,6 +747,8 @@ pub async fn cursor_set(
         .buffers
         .get(&params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let key = (client_id, params.buffer_id);
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
     let position = motion::clamp_position(buf, params.position);
     let anchor = params.anchor.map(|a| motion::clamp_position(buf, a));
     let anchor = match anchor {
@@ -749,8 +756,64 @@ pub async fn cursor_set(
         x => x,
     };
     let result = CursorState { position, anchor };
-    s.cursors.insert((client_id, params.buffer_id), result);
+    s.cursors.insert(key, result);
+    s.record_motion(key, current, result);
     Ok(result)
+}
+
+/// Rewind one step on this client's per-buffer motion history. Independent of `input/undo`.
+pub async fn cursor_undo(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CursorUndoParams,
+) -> Result<CursorUndoResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    if !s.buffers.contains_key(&params.buffer_id) {
+        return Err(RpcError::buffer_not_found(params.buffer_id));
+    }
+    let key = (client_id, params.buffer_id);
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
+
+    let history = s.motion_history.entry(key).or_default();
+    if history.undo.is_empty() {
+        return Ok(CursorUndoResult { applied: false, cursor: current });
+    }
+    let prev = history.undo.pop_back().expect("just checked non-empty");
+    history.redo.push(current);
+    while history.redo.len() > MOTION_HISTORY_CAP {
+        history.redo.remove(0);
+    }
+
+    s.cursors.insert(key, prev);
+    Ok(CursorUndoResult { applied: true, cursor: prev })
+}
+
+pub async fn cursor_redo(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CursorUndoParams,
+) -> Result<CursorUndoResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    if !s.buffers.contains_key(&params.buffer_id) {
+        return Err(RpcError::buffer_not_found(params.buffer_id));
+    }
+    let key = (client_id, params.buffer_id);
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
+
+    let history = s.motion_history.entry(key).or_default();
+    if history.redo.is_empty() {
+        return Ok(CursorUndoResult { applied: false, cursor: current });
+    }
+    let next = history.redo.pop().expect("just checked non-empty");
+    history.undo.push_back(current);
+    while history.undo.len() > MOTION_HISTORY_CAP {
+        history.undo.pop_front();
+    }
+
+    s.cursors.insert(key, next);
+    Ok(CursorUndoResult { applied: true, cursor: next })
 }
 
 // ---- input handlers ----------------------------------------------------------------------------
@@ -904,6 +967,7 @@ pub async fn input_join_lines(
         };
         let dirty = buf.dirty;
         s.cursors.insert((client_id, buffer_id), new_cursor);
+        s.clear_motion_history_for_buffer(buffer_id);
         (revision, dirty, new_cursor)
     };
 
@@ -1015,6 +1079,7 @@ async fn apply_undo_or_redo(
     for (cid, cursor) in &new_cursors {
         s.cursors.insert((*cid, buffer_id), *cursor);
     }
+    s.clear_motion_history_for_buffer(buffer_id);
     let undoing_cursor =
         new_cursors.get(&client_id).copied().unwrap_or_else(CursorState::default);
 
@@ -1146,6 +1211,7 @@ async fn apply_edit(
         }
     };
     s.cursors.insert((client_id, buffer_id), new_cursor_state);
+    s.clear_motion_history_for_buffer(buffer_id);
 
     // Collect notifications for all viewports whose pushed range intersects the edit.
     let edit_first = old_first_line;

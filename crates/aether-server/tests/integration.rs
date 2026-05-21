@@ -7,9 +7,9 @@ use aether_protocol::buffer::{
     BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
-    CursorMove, CursorMoveParams, CursorSelectLine, CursorSelectLineParams, CursorSet,
-    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, Direction, Motion,
-    WordBoundary,
+    CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
+    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
+    CursorUndoParams, CursorUndoResult, Direction, Motion, WordBoundary,
 };
 use aether_protocol::envelope::{
     ClientInbound, JsonRpc, Notification, NotificationMethod, Request, Response, RpcMethod,
@@ -1534,6 +1534,156 @@ async fn word_motion_exclusive_progresses_across_boundaries() {
         extend_selection: true,
     }).await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 11 });
+
+    drop(server);
+}
+
+// ---- cursor/undo and cursor/redo --------------------------------------------------------------
+
+#[tokio::test]
+async fn motion_undo_restores_previous_cursor() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
+
+    // Two cursor moves: (0,0) → (1,2) → (2,3).
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None,
+    }).await;
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 2, col: 3 }, anchor: None,
+    }).await;
+
+    // Undo: back to (1,2).
+    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 12, &CursorUndoParams {
+        buffer_id,
+    }).await;
+    assert!(r.applied);
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
+
+    // Undo again: back to the initial (0, 0).
+    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams {
+        buffer_id,
+    }).await;
+    assert!(r.applied);
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn motion_undo_then_redo_round_trips() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 3 }, anchor: None,
+    }).await;
+
+    // Undo → back to (0, 0).
+    send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id }).await;
+
+    // Redo → forward to (1, 3).
+    let r: CursorUndoResult = send_request::<CursorRedo>(&mut ws, 12, &CursorUndoParams {
+        buffer_id,
+    }).await;
+    assert!(r.applied);
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 3 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn motion_undo_returns_not_applied_when_stack_empty() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n").await;
+
+    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 10, &CursorUndoParams {
+        buffer_id,
+    }).await;
+    assert!(!r.applied);
+    // Cursor unchanged.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn motion_undo_stack_cleared_by_mutation() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+
+    // Build up some motion history.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None,
+    }).await;
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 4 }, anchor: None,
+    }).await;
+
+    // Mutation clears the motion stack.
+    send_request::<InputText>(&mut ws, 12, &InputTextParams {
+        buffer_id, text: "X".into(), select_pasted: false,
+    }).await;
+
+    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams {
+        buffer_id,
+    }).await;
+    assert!(!r.applied, "motion stack should be empty after a mutation");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn motion_redo_cleared_by_new_motion() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 3 }, anchor: None,
+    }).await;
+    // Undo populates redo.
+    send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id }).await;
+    // New motion should clear the redo stack.
+    send_request::<CursorSet>(&mut ws, 12, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 2 }, anchor: None,
+    }).await;
+
+    let r: CursorUndoResult = send_request::<CursorRedo>(&mut ws, 13, &CursorUndoParams {
+        buffer_id,
+    }).await;
+    assert!(!r.applied, "redo stack should be empty after a fresh motion");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn motion_undo_records_select_line_and_swap() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+
+    // Position at line 1 mid.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None,
+    }).await;
+    // x → selects line 1.
+    send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: false,
+    }).await;
+    // s → swap.
+    let after_swap: CursorState = send_request::<CursorSwapAnchor>(&mut ws, 12, &CursorSwapAnchorParams {
+        buffer_id,
+    }).await;
+    assert_eq!(after_swap.position, LogicalPosition { line: 1, col: 0 });
+
+    // Undo the swap.
+    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams {
+        buffer_id,
+    }).await;
+    assert!(r.applied);
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
+    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+
+    // Undo the select_line.
+    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 14, &CursorUndoParams {
+        buffer_id,
+    }).await;
+    assert!(r.applied);
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
+    assert_eq!(r.cursor.anchor, None);
 
     drop(server);
 }
