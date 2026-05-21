@@ -870,6 +870,8 @@ pub async fn buffer_cut(
     s.clear_virtual_col_for_buffer(params.buffer_id);
 
     let search_summary_pushes = refresh_searches_for_buffer(&mut s, params.buffer_id);
+    let new_line_count = s.buffers[&params.buffer_id].line_count();
+    refresh_viewport_ranges_for_buffer(&mut s, params.buffer_id, new_line_count);
     let buf_ref = &s.buffers[&params.buffer_id];
 
     let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
@@ -883,14 +885,6 @@ pub async fn buffer_cut(
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
         let search = s.searches.get(&(vp.client_id, params.buffer_id));
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
-    }
-    let new_line_count = buf_ref.line_count();
-    for vp in s.viewports.values_mut() {
-        if vp.buffer_id != params.buffer_id {
-            continue;
-        }
-        vp.first_logical_line = vp.first_logical_line.min(new_line_count);
-        vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
     }
 
     drop(s);
@@ -1196,6 +1190,22 @@ fn pushed_range(scroll_line: u32, rows: u32, overscan: u32, line_count: u32) -> 
         .saturating_add(overscan)
         .min(line_count);
     (first, last_excl.max(first))
+}
+
+/// Recompute every viewport's pushed range for this buffer from `pushed_range` against the new
+/// line count. Call **before** building `viewport/lines_changed` notifications after any
+/// mutation that may grow or shrink the buffer — otherwise a growth (e.g. undoing a join)
+/// leaves the viewport's range clamped to the smaller post-mutation size and the freshly
+/// restored lines never reach the client.
+fn refresh_viewport_ranges_for_buffer(s: &mut ServerState, buffer_id: BufferId, line_count: u32) {
+    for vp in s.viewports.values_mut() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        let (first, last_excl) = pushed_range(vp.scroll_logical_line, vp.rows, vp.overscan_rows, line_count);
+        vp.first_logical_line = first;
+        vp.last_logical_line_exclusive = last_excl;
+    }
 }
 
 /// Find the largest `scroll_logical_line` such that the buffer's last visual row sits at the
@@ -1824,6 +1834,8 @@ async fn apply_indent_or_dedent(
     let edit_first = a;
     let edit_last_excl = b + 1;
     let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let new_line_count = s.buffers[&buffer_id].line_count();
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     let buf_ref = &s.buffers[&buffer_id];
     let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
     for vp in s.viewports.values() {
@@ -1841,14 +1853,6 @@ async fn apply_indent_or_dedent(
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
-    }
-    let new_line_count = buf_ref.line_count();
-    for vp in s.viewports.values_mut() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        vp.first_logical_line = vp.first_logical_line.min(new_line_count);
-        vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
     }
 
     drop(s);
@@ -1994,6 +1998,8 @@ pub async fn input_move_lines(
     };
 
     let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let new_line_count = s.buffers[&buffer_id].line_count();
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     let buf_ref = &s.buffers[&buffer_id];
     let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
     for vp in s.viewports.values() {
@@ -2011,14 +2017,6 @@ pub async fn input_move_lines(
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
-    }
-    let new_line_count = buf_ref.line_count();
-    for vp in s.viewports.values_mut() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        vp.first_logical_line = vp.first_logical_line.min(new_line_count);
-        vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
     }
 
     drop(s);
@@ -2167,9 +2165,10 @@ pub async fn input_join_lines(
     let (pushes, search_summary_pushes): (Vec<_>, Vec<_>) = {
         let mut s = state.lock().await;
         let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+        let new_line_count = s.buffers[&buffer_id].line_count();
+        refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
         let buf = &s.buffers[&buffer_id];
         let mut pushes = Vec::new();
-        let new_line_count = buf.line_count();
         for vp in s.viewports.values() {
             if vp.buffer_id != buffer_id {
                 continue;
@@ -2179,22 +2178,9 @@ pub async fn input_join_lines(
             };
             let search = s.searches.get(&(vp.client_id, buffer_id));
             pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search)));
-            let _ = new_line_count; // viewport range clamp not needed here; render handles it
         }
         (pushes, search_summary_pushes)
     };
-    // Clamp viewport ranges to new line count.
-    {
-        let mut s = state.lock().await;
-        let new_line_count = s.buffers[&buffer_id].line_count();
-        for vp in s.viewports.values_mut() {
-            if vp.buffer_id != buffer_id {
-                continue;
-            }
-            vp.first_logical_line = vp.first_logical_line.min(new_line_count);
-            vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
-        }
-    }
 
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -2282,9 +2268,10 @@ async fn apply_undo_or_redo(
     // Push the full visible window to every viewport on this buffer — the rope was swapped
     // wholesale, so we can't be surgical about it.
     let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let new_line_count = s.buffers[&buffer_id].line_count();
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     let buf_ref = &s.buffers[&buffer_id];
     let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
-    let new_line_count = buf_ref.line_count();
     for vp in s.viewports.values() {
         if vp.buffer_id != buffer_id {
             continue;
@@ -2294,14 +2281,6 @@ async fn apply_undo_or_redo(
         };
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
-    }
-    // Clamp viewport pushed ranges to the new line count.
-    for vp in s.viewports.values_mut() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        vp.first_logical_line = vp.first_logical_line.min(new_line_count);
-        vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
     }
 
     drop(s);
@@ -2419,6 +2398,11 @@ async fn apply_edit(
     // line-render data we're about to send out reflects the post-edit text.
     let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
 
+    // Recompute every viewport's pushed range against the new line count, so a mutation that
+    // *grew* the buffer (e.g. typing a newline) extends the window to cover the new lines.
+    let new_line_count = s.buffers[&buffer_id].line_count();
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+
     // Collect notifications for all viewports whose pushed range intersects the edit.
     let edit_first = old_first_line;
     let edit_last_excl = old_last_line.saturating_add(1);
@@ -2435,17 +2419,6 @@ async fn apply_edit(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         let notif = build_lines_changed_notif(buf_ref, vp, revision, search);
         pushes.push((sender, notif));
-    }
-
-    // Also: clamp viewports' pushed ranges in case the buffer shrank. (We're re-using values from
-    // before the mutation; refresh from current line count.)
-    let new_line_count = s.buffers[&buffer_id].line_count();
-    for vp in s.viewports.values_mut() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        vp.first_logical_line = vp.first_logical_line.min(new_line_count);
-        vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
     }
 
     drop(s);
