@@ -648,6 +648,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         // ---- viewport ----
         (KeyCode::Char('w'), CTRL_ONLY) => toggle_wrap(client, state).await?,
+        (KeyCode::Char('z'), m) if m == KeyModifiers::NONE => center_cursor(client, state).await?,
 
         // ---- edits ----
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
@@ -1633,6 +1634,19 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
         ui::cursor_visual_position(state, state.viewport_rows).is_some();
     if !cursor_visible {
         let target = cursor_line.min(state.max_scroll_logical_line);
+        scroll_to(client, state, target).await?;
+    }
+    Ok(())
+}
+
+/// Scroll the viewport so the cursor's logical line sits at the vertical center. Clamped to
+/// `max_scroll_logical_line` so jumps near EOF don't overscroll. Approximate under soft wrap —
+/// the line's first visual row lands near center, which is close enough for a quick `zz`.
+async fn center_cursor(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let half = state.viewport_rows / 2;
+    let target = state.cursor.position.line.saturating_sub(half);
+    let target = target.min(state.max_scroll_logical_line);
+    if target != state.scroll_logical_line {
         scroll_to(client, state, target).await?;
     }
     Ok(())
