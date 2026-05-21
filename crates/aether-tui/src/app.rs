@@ -314,14 +314,17 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             move_motion(client, state, Motion::LogicalLine { direction: Direction::Forward, count, preserve_col: true }, extend).await?,
 
         // ---- motions: word (w/b/e) and Alt for WORD ----
+        // Forward `w` is exclusive when extending — Shift-w selects up to (but not including) the
+        // start of the next word, matching the convention from vim/helix that operator-style
+        // selections don't bleed into the next word.
         (KeyCode::Char('w'), m) if m.contains(KeyModifiers::ALT) =>
-            move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::BigWord }, extend).await?,
+            move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::BigWord, exclusive: extend }, extend).await?,
         (KeyCode::Char('w'), _) =>
-            move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::Word }, extend).await?,
+            move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::Word, exclusive: extend }, extend).await?,
         (KeyCode::Char('b'), m) if m.contains(KeyModifiers::ALT) =>
-            move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::BigWord }, extend).await?,
+            move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::BigWord, exclusive: false }, extend).await?,
         (KeyCode::Char('b'), _) =>
-            move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::Word }, extend).await?,
+            move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::Word, exclusive: false }, extend).await?,
         (KeyCode::Char('e'), m) if m.contains(KeyModifiers::ALT) =>
             move_motion(client, state, Motion::WordEnd { direction: Direction::Forward, count, boundary: WordBoundary::BigWord }, extend).await?,
         (KeyCode::Char('e'), _) =>

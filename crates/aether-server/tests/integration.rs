@@ -7,7 +7,8 @@ use aether_protocol::buffer::{
     BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
-    CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Motion,
+    CursorMove, CursorMoveParams, CursorSelectLine, CursorSelectLineParams, CursorSet,
+    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, Direction, Motion,
     WordBoundary,
 };
 use aether_protocol::envelope::{
@@ -1094,7 +1095,7 @@ async fn word_motion_forward_and_back() {
         10,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word },
+            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word, exclusive: false },
             extend_selection: false,
         },
     )
@@ -1107,7 +1108,7 @@ async fn word_motion_forward_and_back() {
         11,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word },
+            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word, exclusive: false },
             extend_selection: false,
         },
     )
@@ -1125,7 +1126,7 @@ async fn word_motion_forward_and_back() {
         13,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::BigWord },
+            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::BigWord, exclusive: false },
             extend_selection: false,
         },
     )
@@ -1137,7 +1138,7 @@ async fn word_motion_forward_and_back() {
         14,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::BigWord },
+            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::BigWord, exclusive: false },
             extend_selection: false,
         },
     )
@@ -1150,7 +1151,7 @@ async fn word_motion_forward_and_back() {
         15,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Backward, count: 1, boundary: WordBoundary::Word },
+            motion: Motion::Word { direction: Direction::Backward, count: 1, boundary: WordBoundary::Word, exclusive: false },
             extend_selection: false,
         },
     )
@@ -1260,6 +1261,302 @@ async fn input_text_with_selection_replaces_it() {
 
     let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "alpha DELTA gamma");
+
+    drop(server);
+}
+
+// ---- cursor/select_line ------------------------------------------------------------------------
+
+/// 4-line buffer ("alpha\nbeta\ngamma\ndelta\n") used by most select_line tests.
+async fn setup_lines() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u64,
+) {
+    setup_with_buffer("alpha\nbeta\ngamma\ndelta\n").await
+}
+
+#[tokio::test]
+async fn select_line_forward_picks_current_then_advances_at_end() {
+    let (server, mut ws, buffer_id) = setup_lines().await;
+
+    // Mid-line: selects current line.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: false,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
+
+    // Now at end-of-line: advances to next line.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: false,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_line_backward_picks_previous_then_stays_at_end() {
+    let (server, mut ws, buffer_id) = setup_lines().await;
+
+    // Mid-line: selects previous line.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 2, col: 2 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Backward, extend: false,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
+
+    // At end-of-line: stays on the current line (selecting it).
+    send_request::<CursorSet>(&mut ws, 12, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 2, col: 5 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Backward, extend: false,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_line_backward_walks_up_via_anchor_on_repeat() {
+    let (server, mut ws, buffer_id) = setup_lines().await;
+
+    // Start at end of "delta" — first press picks current line.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 3, col: 5 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Backward, extend: false,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 3, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
+
+    // Second press: walks up via anchor-at-col-0 → line 2.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Backward, extend: false,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    // Third press: → line 1.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Backward, extend: false,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_line_forward_extend_walks_cursor_down() {
+    let (server, mut ws, buffer_id) = setup_lines().await;
+
+    // x: line 0.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 2 }, anchor: None,
+    }).await;
+    send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: false,
+    }).await;
+
+    // Shift-x: lines 0–1.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: true,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
+
+    // Shift-x again: lines 0–2.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: true,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_line_backward_extend_walks_anchor_up() {
+    let (server, mut ws, buffer_id) = setup_lines().await;
+
+    // x: line 3.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 3, col: 2 }, anchor: None,
+    }).await;
+    send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: false,
+    }).await;
+
+    // Shift-Alt-x: lines 2–3.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Backward, extend: true,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
+
+    // Shift-Alt-x again: lines 1–3.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Backward, extend: true,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_line_after_swap_preserves_backward_orientation() {
+    let (server, mut ws, buffer_id) = setup_lines().await;
+
+    // x at start of line 0, then swap — backward selection of line 0.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None,
+    }).await;
+    send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: false,
+    }).await;
+    let st: CursorState = send_request::<CursorSwapAnchor>(&mut ws, 12, &CursorSwapAnchorParams {
+        buffer_id,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 5 }));
+
+    // Shift-x grows the *bottom* edge down (anchor moves), cursor stays at top.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: true,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 4 }));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_line_snaps_partial_selection_to_whole_lines() {
+    let (server, mut ws, buffer_id) = setup_lines().await;
+
+    // A partial, non-line-aligned selection (e.g. left over from Shift-arrow motion).
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id,
+        position: LogicalPosition { line: 2, col: 3 },
+        anchor: Some(LogicalPosition { line: 0, col: 2 }),
+    }).await;
+
+    // Shift-x snaps both ends to whole-line boundaries: anchor → col 0, cursor → line end.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: true,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    drop(server);
+}
+
+// ---- cursor/swap_anchor ------------------------------------------------------------------------
+
+#[tokio::test]
+async fn swap_anchor_swaps_position_and_anchor() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id,
+        position: LogicalPosition { line: 1, col: 3 },
+        anchor: Some(LogicalPosition { line: 0, col: 1 }),
+    }).await;
+
+    let st: CursorState = send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams {
+        buffer_id,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 1 });
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 3 }));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn swap_anchor_with_no_selection_is_noop() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n").await;
+
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 3 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams {
+        buffer_id,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
+    assert_eq!(st.anchor, None);
+
+    drop(server);
+}
+
+// ---- Motion::Word { exclusive: true } -----------------------------------------------------------
+
+#[tokio::test]
+async fn word_motion_exclusive_progresses_across_boundaries() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello world foo\n").await;
+
+    // From 'h' (col 0), exclusive forward Word — lands on space before "world".
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 10, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::Word {
+            direction: Direction::Forward,
+            count: 1,
+            boundary: WordBoundary::Word,
+            exclusive: true,
+        },
+        extend_selection: true,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+
+    // Repeated press from the space — pre-advance kicks in so we skip "world" entirely and
+    // land on the space before "foo" (col 11), rather than getting stuck.
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 11, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::Word {
+            direction: Direction::Forward,
+            count: 1,
+            boundary: WordBoundary::Word,
+            exclusive: true,
+        },
+        extend_selection: true,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 11 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn word_motion_exclusive_at_buffer_end_does_not_move_past() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello").await;
+
+    // Cursor on last char.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 4 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 11, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::Word {
+            direction: Direction::Forward,
+            count: 1,
+            boundary: WordBoundary::Word,
+            exclusive: true,
+        },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 4 });
 
     drop(server);
 }

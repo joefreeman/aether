@@ -106,12 +106,30 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         Motion::BufferStart => LogicalPosition { line: 0, col: 0 },
         Motion::BufferEnd => char_to_pos(buf, buf.text.len_chars()),
         Motion::Goto { position } => clamp_position(buf, *position),
-        Motion::Word { direction, count, boundary } => {
-            let start = pos_to_char(buf, current);
-            let end = match direction {
-                Direction::Forward => word_forward_start(&buf.text, start, *boundary, *count),
-                Direction::Backward => word_backward_start(&buf.text, start, *boundary, *count),
+        Motion::Word { direction, count, boundary, exclusive } => {
+            let orig_start = pos_to_char(buf, current);
+            let mut end = match direction {
+                Direction::Forward => {
+                    // For exclusive forward, advance start by one char before computing. Without
+                    // this, sitting right before a word boundary (the natural resting place of a
+                    // previous exclusive press) would degenerate to a no-op: the naive
+                    // `word_forward_start` would advance by exactly 1, then the exclusive
+                    // subtraction below would undo it. The pre-advance ensures repeated presses
+                    // keep making progress.
+                    let s = if *exclusive {
+                        (orig_start + 1).min(buf.text.len_chars())
+                    } else {
+                        orig_start
+                    };
+                    word_forward_start(&buf.text, s, *boundary, *count)
+                }
+                Direction::Backward => word_backward_start(&buf.text, orig_start, *boundary, *count),
             };
+            // Exclusive forward stops one char before the destination word boundary, provided
+            // the motion actually advanced.
+            if *exclusive && matches!(direction, Direction::Forward) && end > orig_start {
+                end -= 1;
+            }
             char_to_pos(buf, end)
         }
         Motion::WordEnd { direction, count, boundary } => {

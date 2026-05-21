@@ -69,11 +69,12 @@ fn motion_is_internally_tagged() {
         direction: Direction::Forward,
         count: 2,
         boundary: WordBoundary::BigWord,
+        exclusive: false,
     };
     let v = to_value(&m).unwrap();
     assert_eq!(
         v,
-        json!({"kind": "word", "direction": "forward", "count": 2, "boundary": "WORD"})
+        json!({"kind": "word", "direction": "forward", "count": 2, "boundary": "WORD", "exclusive": false})
     );
 
     let m = Motion::Goto { position: LogicalPosition { line: 17, col: 4 } };

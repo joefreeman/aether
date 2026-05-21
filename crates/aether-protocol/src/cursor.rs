@@ -43,6 +43,11 @@ pub enum Motion {
         direction: Direction,
         count: u32,
         boundary: WordBoundary,
+        /// When `true`, a `Forward` motion stops one character before the start of the next word
+        /// (so a selection built from this motion doesn't include the next word's first char).
+        /// Ignored for `Backward` — the analogous "stop just past the previous word" position is
+        /// already what `WordEnd { Backward }` returns.
+        exclusive: bool,
     },
     /// Word *end* — moves to the last char of the word (vim's `e`).
     WordEnd {
