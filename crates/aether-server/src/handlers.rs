@@ -11,7 +11,7 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState, CursorSwapAnchorParams,
-    CursorUndoParams, CursorUndoResult, Direction, Motion,
+    CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection,
 };
 use crate::state::MOTION_HISTORY_CAP;
 use aether_protocol::LogicalPosition;
@@ -19,7 +19,8 @@ use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::handshake::{ClientHelloParams, ClientHelloResult, ProjectInfo};
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDeleteParams, InputTextParams, UndoResult,
+    BufferOnlyParams, EditResult, InputDeleteParams, InputMoveLinesParams, InputTextParams,
+    UndoResult,
 };
 use aether_protocol::viewport::{
     LogicalLineRange, LogicalLineRender, ViewportLinesChanged, ViewportLinesChangedParams,
@@ -996,6 +997,193 @@ pub async fn input_redo(
     params: BufferOnlyParams,
 ) -> Result<UndoResult, RpcError> {
     apply_undo_or_redo(state, ctx, params.buffer_id, UndoDirection::Redo).await
+}
+
+pub async fn input_move_lines(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: InputMoveLinesParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let buffer_id = params.buffer_id;
+
+    // Phase 1: read state and compute the edit while holding the lock.
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+
+    // Selection's line range: the lines the user wants to move.
+    let (a, b) = match cursor.anchor {
+        Some(anchor) => {
+            let (start_pos, end_pos) = motion::ordered(cursor.position, anchor);
+            (start_pos.line, end_pos.line)
+        }
+        None => (cursor.position.line, cursor.position.line),
+    };
+
+    // The "last real line" — ropey counts a trailing empty line after a final newline that's not
+    // user-visible; treat it as out-of-bounds for move purposes.
+    let line_count = buf.line_count();
+    let len_bytes = buf.text.len_bytes();
+    let trailing_newline = len_bytes > 0 && buf.text.byte(len_bytes - 1) == b'\n';
+    let last_real_line = if len_bytes == 0 {
+        0
+    } else if trailing_newline {
+        line_count.saturating_sub(2)
+    } else {
+        line_count.saturating_sub(1)
+    };
+
+    let can_move = match params.direction {
+        VerticalDirection::Down => b < last_real_line,
+        VerticalDirection::Up => a > 0,
+    };
+    if !can_move {
+        return Ok(EditResult {
+            revision: buf.revision,
+            cursor,
+            dirty: buf.dirty,
+        });
+    }
+
+    // Compute the swap. `slice_top` contains the lines that come first in the original layout,
+    // `slice_bottom` the lines that come second; we emit them in reverse. The only subtlety is
+    // when the trailing slice doesn't end in '\n' (i.e. it's the buffer's final line without a
+    // trailing newline): we have to move that newline-or-its-absence to the new last slice.
+    let len_lines = buf.text.len_lines() as u32;
+    let len_chars = buf.text.len_chars();
+    let (edit_start, edit_end, new_text, line_delta) = match params.direction {
+        VerticalDirection::Down => {
+            let a_start = buf.text.line_to_char(a as usize);
+            let bp1_start = buf.text.line_to_char((b + 1) as usize);
+            let bp2_start = if (b + 2) <= len_lines {
+                buf.text.line_to_char((b + 2) as usize)
+            } else {
+                len_chars
+            };
+            let slice_top: String = buf.text.slice(a_start..bp1_start).to_string();
+            let slice_bottom: String = buf.text.slice(bp1_start..bp2_start).to_string();
+            let new_text = swap_segments(&slice_top, &slice_bottom);
+            (a_start, bp2_start, new_text, 1i32)
+        }
+        VerticalDirection::Up => {
+            let am1_start = buf.text.line_to_char((a - 1) as usize);
+            let a_start = buf.text.line_to_char(a as usize);
+            let bp1_start = if (b + 1) <= len_lines {
+                buf.text.line_to_char((b + 1) as usize)
+            } else {
+                len_chars
+            };
+            let slice_top: String = buf.text.slice(am1_start..a_start).to_string();
+            let slice_bottom: String = buf.text.slice(a_start..bp1_start).to_string();
+            let new_text = swap_segments(&slice_top, &slice_bottom);
+            (am1_start, bp1_start, new_text, -1i32)
+        }
+    };
+
+    // Snapshot per-client cursors so undo can restore them.
+    let cursors_before: HashMap<ClientId, CursorState> = s
+        .cursors
+        .iter()
+        .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
+        .collect();
+
+    let (revision, dirty, new_cursor) = {
+        let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+        let revision = buf_mut.apply_edit(
+            edit_start,
+            edit_end,
+            &new_text,
+            EditKindTag::Text,
+            cursors_before,
+        );
+
+        // Shift the requesting client's cursor (position + anchor) by `line_delta`. Other
+        // clients' cursors are clamped by the standard post-edit clamp below.
+        let shift = |p: aether_protocol::LogicalPosition| aether_protocol::LogicalPosition {
+            line: (p.line as i32 + line_delta).max(0) as u32,
+            col: p.col,
+        };
+        let new_cursor = CursorState {
+            position: motion::clamp_position(buf_mut, shift(cursor.position)),
+            anchor: cursor
+                .anchor
+                .map(|a| motion::clamp_position(buf_mut, shift(a))),
+        };
+        let new_cursor = match new_cursor.anchor {
+            Some(a) if a == new_cursor.position => CursorState {
+                position: new_cursor.position,
+                anchor: None,
+            },
+            _ => new_cursor,
+        };
+        let dirty = buf_mut.dirty;
+        (revision, dirty, new_cursor)
+    };
+    s.cursors.insert((client_id, buffer_id), new_cursor);
+    s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_virtual_col_for_buffer(buffer_id);
+
+    // Affected line range for viewport notifications.
+    let (edit_first, edit_last_excl) = match params.direction {
+        VerticalDirection::Down => (a, b + 2),
+        VerticalDirection::Up => (a - 1, b + 1),
+    };
+
+    let buf_ref = &s.buffers[&buffer_id];
+    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    for vp in s.viewports.values() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        if !ranges_overlap(
+            vp.first_logical_line,
+            vp.last_logical_line_exclusive,
+            edit_first,
+            edit_last_excl,
+        ) {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision)));
+    }
+    let new_line_count = buf_ref.line_count();
+    for vp in s.viewports.values_mut() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        vp.first_logical_line = vp.first_logical_line.min(new_line_count);
+        vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
+    }
+
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(EditResult { revision, cursor: new_cursor, dirty })
+}
+
+/// Build a new string with `bottom` first, then `top`, preserving "this is the last line of the
+/// buffer and has no trailing newline" semantics. `top` is always followed by content so it ends
+/// with '\n'; `bottom` ends with '\n' iff it's not the final segment of the buffer.
+fn swap_segments(top: &str, bottom: &str) -> String {
+    if bottom.ends_with('\n') {
+        let mut s = String::with_capacity(top.len() + bottom.len());
+        s.push_str(bottom);
+        s.push_str(top);
+        s
+    } else {
+        // `bottom` was the last line without a trailing '\n'. After the swap it sits in the
+        // middle and needs a '\n' added; `top` takes the last-line spot and loses its '\n'.
+        let mut s = String::with_capacity(top.len() + bottom.len() + 1);
+        s.push_str(bottom);
+        s.push('\n');
+        s.push_str(top.strip_suffix('\n').unwrap_or(top));
+        s
+    }
 }
 
 pub async fn input_join_lines(

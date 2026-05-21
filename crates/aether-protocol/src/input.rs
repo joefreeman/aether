@@ -3,7 +3,7 @@
 //! All input commands are cursor-relative; none carry positions on the wire. If a selection
 //! exists, the command's implicit range is that selection.
 
-use crate::cursor::{CursorState, Motion};
+use crate::cursor::{CursorState, Motion, VerticalDirection};
 use crate::envelope::RpcMethod;
 use crate::{BufferId, Revision};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,24 @@ impl RpcMethod for InputNewlineAndIndent {
     const NAME: &'static str = "input/newline_and_indent";
     type Params = BufferOnlyParams;
     type Result = EditResult;
+}
+
+// ---- input/move_lines ---------------------------------------------------------------------------
+
+/// Move the cursor's line (or, if a selection is active, all lines covered by it) up or down by
+/// one, swapping with the adjacent line. The cursor moves with the lines. No-op at the buffer
+/// edge.
+pub struct InputMoveLines;
+impl RpcMethod for InputMoveLines {
+    const NAME: &'static str = "input/move_lines";
+    type Params = InputMoveLinesParams;
+    type Result = EditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InputMoveLinesParams {
+    pub buffer_id: BufferId,
+    pub direction: VerticalDirection,
 }
 
 // ---- input/undo, input/redo ---------------------------------------------------------------------

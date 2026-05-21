@@ -16,8 +16,8 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::handshake::{ClientHello, ClientHelloParams, ClientHelloResult};
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDelete, InputDeleteParams, InputJoinLines, InputRedo,
-    InputText, InputTextParams, InputUndo, UndoResult,
+    BufferOnlyParams, EditResult, InputDelete, InputDeleteParams, InputJoinLines, InputMoveLines,
+    InputMoveLinesParams, InputRedo, InputText, InputTextParams, InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportScroll,
@@ -2048,6 +2048,124 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
         .map(|r| r.segments[0].text.as_str())
         .collect();
     assert_eq!(texts, vec!["the quick", "brown", "fox"]);
+
+    drop(server);
+}
+
+// ---- input/move_lines ---------------------------------------------------------------------------
+
+async fn buffer_text(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, id: u64, buffer_id: u64) -> String {
+    // Subscribe to a wide-enough viewport and concatenate the visible-text lines.
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(ws, id, &ViewportSubscribeParams {
+        buffer_id, cols: 200, rows: 100, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::None,
+        continuation_marker_width: 0,
+    }).await;
+    sub.window.lines.iter()
+        .map(|l| l.visual_rows[0].segments[0].text.as_str().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn move_lines_swaps_with_neighbor_below() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
+    // Cursor on line 0 ("alpha").
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 2 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
+        buffer_id, direction: VerticalDirection::Down,
+    }).await;
+    // Cursor follows the line down.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    // The "\n" at the end yields a trailing empty visible row.
+    assert_eq!(text, "beta\nalpha\ngamma\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn move_lines_swaps_with_neighbor_above() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 1 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
+        buffer_id, direction: VerticalDirection::Up,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 1 });
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text, "beta\nalpha\ngamma\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn move_lines_moves_whole_selection() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\nd\ne\n").await;
+    // Selection covers lines 1 and 2 ("b" and "c").
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id,
+        position: LogicalPosition { line: 2, col: 0 },
+        anchor: Some(LogicalPosition { line: 1, col: 0 }),
+    }).await;
+    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
+        buffer_id, direction: VerticalDirection::Down,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 3, col: 0 });
+    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text, "a\nd\nb\nc\ne\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn move_lines_at_top_is_noop_up() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 10, &InputMoveLinesParams {
+        buffer_id, direction: VerticalDirection::Up,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
+    let text = buffer_text(&mut ws, 11, buffer_id).await;
+    assert_eq!(text, "alpha\nbeta\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn move_lines_at_bottom_is_noop_down() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 0 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
+        buffer_id, direction: VerticalDirection::Down,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text, "alpha\nbeta\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn move_lines_preserves_missing_trailing_newline() {
+    // Buffer with no trailing newline: moving the last line up should still produce a buffer
+    // without a trailing newline (whichever line is now the last keeps that property).
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta").await;
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 0 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
+        buffer_id, direction: VerticalDirection::Up,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text, "beta\nalpha");
 
     drop(server);
 }

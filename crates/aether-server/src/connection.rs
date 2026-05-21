@@ -11,7 +11,9 @@ use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
 use aether_protocol::handshake::ClientHello;
-use aether_protocol::input::{InputDelete, InputJoinLines, InputRedo, InputText, InputUndo};
+use aether_protocol::input::{
+    InputDelete, InputJoinLines, InputMoveLines, InputRedo, InputText, InputUndo,
+};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportSetWrap, ViewportSubscribe, ViewportUnsubscribe,
 };
@@ -156,6 +158,7 @@ async fn dispatch(
         InputUndo::NAME => run!(InputUndo, handlers::input_undo),
         InputRedo::NAME => run!(InputRedo, handlers::input_redo),
         InputJoinLines::NAME => run!(InputJoinLines, handlers::input_join_lines),
+        InputMoveLines::NAME => run!(InputMoveLines, handlers::input_move_lines),
         other => Err(RpcError::method_not_found(other)),
     }
 }
