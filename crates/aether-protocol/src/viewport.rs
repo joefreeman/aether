@@ -79,6 +79,10 @@ pub struct ViewportSubscribeParams {
     pub overscan_rows: u32,
     pub scroll: ScrollPosition,
     pub wrap: WrapMode,
+    /// Cols the client reserves at the start of each *continuation* row for a wrap indicator
+    /// glyph (e.g. "↪ "). The server subtracts this from the available width on continuation
+    /// rows so the visible text + marker fit within `cols`. 0 disables.
+    pub continuation_marker_width: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

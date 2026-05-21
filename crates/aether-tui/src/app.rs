@@ -118,6 +118,7 @@ pub async fn bootstrap(
             overscan_rows: viewport_rows,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+            continuation_marker_width: ui::CONTINUATION_MARKER_WIDTH,
         })
         .await?;
 

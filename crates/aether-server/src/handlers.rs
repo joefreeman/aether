@@ -408,7 +408,7 @@ pub async fn viewport_subscribe(
     let buffer_id = buf.id;
 
     let (first, last_excl) = pushed_range(params.scroll.logical_line, params.rows, params.overscan_rows, line_count);
-    let window = render_window(buf, first, last_excl, params.cols, params.wrap);
+    let window = render_window(buf, first, last_excl, params.cols, params.wrap, params.continuation_marker_width);
 
     let viewport_id = s.allocate_viewport_id();
     let viewport = Viewport {
@@ -421,6 +421,7 @@ pub async fn viewport_subscribe(
         scroll_logical_line: params.scroll.logical_line,
         scroll_sub_row: params.scroll.sub_row,
         wrap: params.wrap,
+        continuation_marker_width: params.continuation_marker_width,
         first_logical_line: first,
         last_logical_line_exclusive: last_excl,
     };
@@ -440,8 +441,8 @@ pub async fn viewport_resize(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.cols = params.cols;
     vp.rows = params.rows;
-    let (cols, rows, overscan, wrap, buffer_id, scroll_line) =
-        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.buffer_id, vp.scroll_logical_line);
+    let (cols, rows, overscan, wrap, marker_width, buffer_id, scroll_line) =
+        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.buffer_id, vp.scroll_logical_line);
 
     let buf = s
         .buffers
@@ -449,7 +450,7 @@ pub async fn viewport_resize(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(buf, first, last_excl, cols, wrap);
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -466,8 +467,8 @@ pub async fn viewport_set_wrap(
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.wrap = params.wrap;
-    let (cols, rows, overscan, wrap, buffer_id, scroll_line) =
-        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.buffer_id, vp.scroll_logical_line);
+    let (cols, rows, overscan, wrap, marker_width, buffer_id, scroll_line) =
+        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.buffer_id, vp.scroll_logical_line);
 
     let buf = s
         .buffers
@@ -475,7 +476,7 @@ pub async fn viewport_set_wrap(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(buf, first, last_excl, cols, wrap);
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -493,8 +494,8 @@ pub async fn viewport_scroll(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.scroll_logical_line = params.scroll.logical_line;
     vp.scroll_sub_row = params.scroll.sub_row;
-    let (cols, rows, overscan, wrap, buffer_id, scroll_line) =
-        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.buffer_id, vp.scroll_logical_line);
+    let (cols, rows, overscan, wrap, marker_width, buffer_id, scroll_line) =
+        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.buffer_id, vp.scroll_logical_line);
 
     let buf = s
         .buffers
@@ -502,7 +503,7 @@ pub async fn viewport_scroll(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(buf, first, last_excl, cols, wrap);
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -569,6 +570,7 @@ fn render_window(
     last_excl: u32,
     cols: u32,
     wrap: aether_protocol::viewport::WrapMode,
+    marker_width: u32,
 ) -> Window {
     let mut lines: Vec<LogicalLineRender> = Vec::with_capacity((last_excl - first) as usize);
 
@@ -600,7 +602,7 @@ fn render_window(
             _ => Vec::new(),
         };
 
-        lines.push(wrap::render_line(&text, i, cols, wrap, highlights));
+        lines.push(wrap::render_line(&text, i, cols, wrap, marker_width, highlights));
     }
     Window { first_logical_line: first, last_logical_line_exclusive: last_excl, lines }
 }
@@ -632,7 +634,15 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line(buf, vp.wrap, vp.cols, current.position, *direction, *count)
+            motion::resolve_visual_line(
+                buf,
+                vp.wrap,
+                vp.cols,
+                vp.continuation_marker_width,
+                current.position,
+                *direction,
+                *count,
+            )
         }
         Motion::VisualLineStart { viewport_id } => {
             let vp = s.viewports.get(viewport_id).ok_or_else(|| {
@@ -641,7 +651,7 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_start(buf, vp.wrap, vp.cols, current.position)
+            motion::resolve_visual_line_start(buf, vp.wrap, vp.cols, vp.continuation_marker_width, current.position)
         }
         Motion::VisualLineEnd { viewport_id } => {
             let vp = s.viewports.get(viewport_id).ok_or_else(|| {
@@ -650,7 +660,7 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_end(buf, vp.wrap, vp.cols, current.position)
+            motion::resolve_visual_line_end(buf, vp.wrap, vp.cols, vp.continuation_marker_width, current.position)
         }
         _ => motion::resolve_motion(buf, current.position, &params.motion),
     };
@@ -1318,7 +1328,7 @@ fn build_lines_changed_notif(buffer: &Buffer, vp: &Viewport, revision: Revision)
     let line_count = buffer.line_count();
     let new_first = vp.first_logical_line.min(line_count);
     let new_last_excl = vp.last_logical_line_exclusive.min(line_count).max(new_first);
-    let window = render_window(buffer, new_first, new_last_excl, vp.cols, vp.wrap);
+    let window = render_window(buffer, new_first, new_last_excl, vp.cols, vp.wrap, vp.continuation_marker_width);
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
         revision,

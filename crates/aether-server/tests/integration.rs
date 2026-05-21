@@ -255,6 +255,8 @@ async fn viewport_subscribe_renders_window() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -308,6 +310,8 @@ async fn viewport_subscribe_wraps_long_line() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -371,6 +375,8 @@ async fn viewport_scroll_returns_new_window() {
             overscan_rows: 2,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -539,6 +545,8 @@ async fn input_text_inserts_and_pushes_notification() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -594,6 +602,8 @@ async fn input_delete_backspace_removes_char_before_cursor() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -650,6 +660,8 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::None,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -704,6 +716,8 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -896,6 +910,8 @@ async fn cut_selection_deletes_and_returns_text() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -947,6 +963,8 @@ async fn input_text_with_select_pasted_makes_selection() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -987,6 +1005,8 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -1047,6 +1067,8 @@ async fn dirty_clears_when_undoing_back_past_save() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -1192,6 +1214,8 @@ async fn join_lines_collapses_lines_with_single_space() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -1246,6 +1270,8 @@ async fn input_text_with_selection_replaces_it() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
+
+            continuation_marker_width: 0,
         },
     )
     .await;
@@ -1721,6 +1747,8 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
         buffer_id, cols: 10, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
+
+        continuation_marker_width: 0,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -1742,6 +1770,8 @@ async fn visual_line_preserves_visual_column() {
         buffer_id, cols: 10, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
+
+        continuation_marker_width: 0,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -1775,6 +1805,8 @@ async fn visual_line_crosses_logical_line_boundary() {
         buffer_id, cols: 20, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
+
+        continuation_marker_width: 0,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -1799,6 +1831,8 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
         buffer_id, cols: 10, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::None,
+
+        continuation_marker_width: 0,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -1825,6 +1859,8 @@ async fn viewport_set_wrap_changes_visible_rows() {
         buffer_id, cols: 10, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
+
+        continuation_marker_width: 0,
     }).await;
     // Soft: line 0 wraps to 2 visual rows at cols=10.
     assert_eq!(sub.window.lines[0].visual_rows.len(), 2);
@@ -1836,6 +1872,26 @@ async fn viewport_set_wrap_changes_visible_rows() {
     // None: one row, full line content.
     assert_eq!(r.window.lines[0].visual_rows.len(), 1);
     assert_eq!(r.window.lines[0].visual_rows[0].segments[0].text, "the quick brown fox");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn continuation_marker_width_reduces_continuation_row_width() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\n").await;
+    // With marker_width=2 the continuation rows have 8 cols of content room, so the line wraps
+    // into 3 visual rows instead of 2.
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+        continuation_marker_width: 2,
+    }).await;
+    assert_eq!(sub.window.lines[0].visual_rows.len(), 3);
+    let texts: Vec<&str> = sub.window.lines[0].visual_rows.iter()
+        .map(|r| r.segments[0].text.as_str())
+        .collect();
+    assert_eq!(texts, vec!["the quick", "brown", "fox"]);
 
     drop(server);
 }

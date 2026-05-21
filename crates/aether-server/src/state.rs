@@ -521,6 +521,7 @@ pub struct Viewport {
     pub scroll_logical_line: u32,
     pub scroll_sub_row: f32,
     pub wrap: WrapMode,
+    pub continuation_marker_width: u32,
     /// First logical line currently pushed to the client (inclusive).
     pub first_logical_line: u32,
     /// Last logical line currently pushed to the client (exclusive).

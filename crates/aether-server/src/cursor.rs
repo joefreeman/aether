@@ -157,6 +157,7 @@ pub fn resolve_visual_line(
     buf: &Buffer,
     wrap: WrapMode,
     cols: u32,
+    marker_width: u32,
     current: LogicalPosition,
     direction: VerticalDirection,
     count: u32,
@@ -167,9 +168,10 @@ pub fn resolve_visual_line(
 
     let line_count = buf.text.len_lines() as u32;
     let mut current_line = current.line.min(line_count.saturating_sub(1));
-    let mut rows = wrap::compute_rows(&line_text(buf, current_line), cols);
+    let mut rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width);
     let mut row_idx = find_row_for_col(&rows, current.col as usize);
-    let target_visual_col = visual_col_of_byte(&rows[row_idx], current.col as usize);
+    let target_visual_col =
+        visual_col_of_byte(&rows[row_idx], current.col as usize, marker_width);
 
     let mut remaining = count;
     while remaining > 0 {
@@ -180,7 +182,7 @@ pub fn resolve_visual_line(
                     true
                 } else if current_line + 1 < line_count {
                     current_line += 1;
-                    rows = wrap::compute_rows(&line_text(buf, current_line), cols);
+                    rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width);
                     row_idx = 0;
                     true
                 } else {
@@ -193,7 +195,7 @@ pub fn resolve_visual_line(
                     true
                 } else if current_line > 0 {
                     current_line -= 1;
-                    rows = wrap::compute_rows(&line_text(buf, current_line), cols);
+                    rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width);
                     row_idx = rows.len().saturating_sub(1);
                     true
                 } else {
@@ -208,7 +210,7 @@ pub fn resolve_visual_line(
     }
 
     let row = &rows[row_idx];
-    let new_col_within_text = byte_at_visual_col(row, target_visual_col);
+    let new_col_within_text = byte_at_visual_col(row, target_visual_col, marker_width);
     LogicalPosition {
         line: current_line,
         col: row.byte_offset as u32 + new_col_within_text as u32,
@@ -220,9 +222,10 @@ pub fn resolve_visual_line_start(
     buf: &Buffer,
     wrap: WrapMode,
     cols: u32,
+    marker_width: u32,
     current: LogicalPosition,
 ) -> LogicalPosition {
-    let rows = wrap_rows_for_cursor(buf, wrap, cols, current);
+    let rows = wrap_rows_for_cursor(buf, wrap, cols, marker_width, current);
     let row_idx = find_row_for_col(&rows, current.col as usize);
     LogicalPosition { line: current.line, col: rows[row_idx].byte_offset as u32 }
 }
@@ -232,16 +235,23 @@ pub fn resolve_visual_line_end(
     buf: &Buffer,
     wrap: WrapMode,
     cols: u32,
+    marker_width: u32,
     current: LogicalPosition,
 ) -> LogicalPosition {
-    let rows = wrap_rows_for_cursor(buf, wrap, cols, current);
+    let rows = wrap_rows_for_cursor(buf, wrap, cols, marker_width, current);
     let row_idx = find_row_for_col(&rows, current.col as usize);
     let row = &rows[row_idx];
     let end_byte = row.byte_offset + row.text.len();
     LogicalPosition { line: current.line, col: end_byte as u32 }
 }
 
-fn wrap_rows_for_cursor(buf: &Buffer, wrap: WrapMode, cols: u32, current: LogicalPosition) -> Vec<RowInfo> {
+fn wrap_rows_for_cursor(
+    buf: &Buffer,
+    wrap: WrapMode,
+    cols: u32,
+    marker_width: u32,
+    current: LogicalPosition,
+) -> Vec<RowInfo> {
     let line_count = buf.text.len_lines() as u32;
     let line_idx = current.line.min(line_count.saturating_sub(1));
     if matches!(wrap, WrapMode::None) || cols == 0 {
@@ -252,7 +262,7 @@ fn wrap_rows_for_cursor(buf: &Buffer, wrap: WrapMode, cols: u32, current: Logica
             .map(|mut r| { r.text.truncate(len); r })
             .collect()
     } else {
-        wrap::compute_rows(&line_text(buf, line_idx), cols)
+        wrap::compute_rows(&line_text(buf, line_idx), cols, marker_width)
     }
 }
 
@@ -277,23 +287,31 @@ fn find_row_for_col(rows: &[RowInfo], col: usize) -> usize {
     idx
 }
 
-/// Visual column of a byte position within a row, including the continuation indent that the
-/// renderer prepends. Bytes beyond the row's visible text (e.g. cursor sitting on the trailing
-/// whitespace that the wrap dropped) clamp to the end of the visible text.
-fn visual_col_of_byte(row: &RowInfo, col_in_line: usize) -> u32 {
+/// Visual column of a byte position within a row, including the continuation marker (rendered
+/// by the client on rows where `byte_offset > 0`) and the indent. Bytes beyond the row's
+/// visible text clamp to the end of the visible text.
+fn visual_col_of_byte(row: &RowInfo, col_in_line: usize, marker_width: u32) -> u32 {
     let relative = col_in_line.saturating_sub(row.byte_offset);
     let clamped = relative.min(row.text.len());
-    row.continuation_indent + clamped as u32
+    row_prefix_width(row, marker_width) + clamped as u32
 }
 
 /// Inverse of `visual_col_of_byte`: byte offset *within the row's text* that lands at the
-/// requested visual column.
-fn byte_at_visual_col(row: &RowInfo, visual_col: u32) -> usize {
-    if visual_col <= row.continuation_indent {
+/// requested visual column. Visual columns inside the marker/indent prefix clamp to 0.
+fn byte_at_visual_col(row: &RowInfo, visual_col: u32, marker_width: u32) -> usize {
+    let prefix = row_prefix_width(row, marker_width);
+    if visual_col <= prefix {
         return 0;
     }
-    let target = (visual_col - row.continuation_indent) as usize;
+    let target = (visual_col - prefix) as usize;
     target.min(row.text.len())
+}
+
+/// Total visual width the client prepends to a row before its text: continuation marker (only on
+/// rows where `byte_offset > 0`) plus the row's continuation indent.
+fn row_prefix_width(row: &RowInfo, marker_width: u32) -> u32 {
+    let marker = if row.byte_offset > 0 { marker_width } else { 0 };
+    marker + row.continuation_indent
 }
 
 fn logical_line_step(

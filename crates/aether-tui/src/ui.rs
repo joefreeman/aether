@@ -10,6 +10,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+/// Glyph rendered at the start of each *continuation* row (rows after the first row of a
+/// wrapped logical line) under `WrapMode::Soft`. The width (2 cols: "↪" + space) is what the
+/// client tells the server to reserve in wrap math.
+pub const CONTINUATION_MARKER: &str = "↪ ";
+pub const CONTINUATION_MARKER_WIDTH: u32 = 2;
+
 pub fn draw(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -62,9 +68,21 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             let (clipped_text, clipped_highlights, clipped_sel) =
                 clip_horizontal(&segment.text, &segment.highlights, sel_on_row, scroll_col);
 
-            let indent = vrow.continuation_indent.min(viewport_cols as u32) as u16;
-            let body_width = viewport_cols.saturating_sub(indent);
+            // Continuation row when byte_offset > 0. Prepend the marker; the server already
+            // reserved this width when wrapping.
+            let is_continuation = vrow.byte_offset > 0;
+            let marker_width = if is_continuation { CONTINUATION_MARKER_WIDTH } else { 0 };
+            let indent = vrow.continuation_indent;
+            let prefix_width = marker_width.saturating_add(indent).min(viewport_cols as u32) as u16;
+            let body_width = viewport_cols.saturating_sub(prefix_width);
+
             let mut spans: Vec<Span<'static>> = Vec::new();
+            if is_continuation {
+                spans.push(Span::styled(
+                    CONTINUATION_MARKER.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
             if indent > 0 {
                 spans.push(Span::raw(" ".repeat(indent as usize)));
             }
@@ -354,7 +372,8 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
             let row = &render.visual_rows[row_idx];
             let text_len: u32 = row.segments.iter().map(|s| s.text.len() as u32).sum();
             let col_in_text = cursor.col.saturating_sub(row.byte_offset).min(text_len);
-            let logical_visual_col = row.continuation_indent + col_in_text;
+            let marker = if row.byte_offset > 0 { CONTINUATION_MARKER_WIDTH } else { 0 };
+            let logical_visual_col = marker + row.continuation_indent + col_in_text;
             if logical_visual_col < scroll_col {
                 return None; // scrolled off the left
             }

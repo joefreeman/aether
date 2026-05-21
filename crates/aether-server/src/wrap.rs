@@ -12,6 +12,7 @@ pub fn render_line(
     logical_line: u32,
     cols: u32,
     wrap: WrapMode,
+    marker_width: u32,
     highlights: Vec<Highlight>,
 ) -> LogicalLineRender {
     let visual_rows = match wrap {
@@ -20,7 +21,7 @@ pub fn render_line(
             continuation_indent: 0,
             segments: vec![Segment { text: line_text.to_string(), highlights }],
         }],
-        WrapMode::Soft => wrap_line(line_text, cols, &highlights),
+        WrapMode::Soft => wrap_line(line_text, cols, marker_width, &highlights),
     };
     LogicalLineRender { logical_line, visual_rows }
 }
@@ -35,8 +36,8 @@ pub(crate) struct RowInfo {
     pub continuation_indent: u32,
 }
 
-fn wrap_line(line: &str, cols: u32, highlights: &[Highlight]) -> Vec<VisualRow> {
-    let row_infos = compute_rows(line, cols);
+fn wrap_line(line: &str, cols: u32, marker_width: u32, highlights: &[Highlight]) -> Vec<VisualRow> {
+    let row_infos = compute_rows(line, cols, marker_width);
     row_infos
         .into_iter()
         .map(|info| {
@@ -50,7 +51,7 @@ fn wrap_line(line: &str, cols: u32, highlights: &[Highlight]) -> Vec<VisualRow> 
         .collect()
 }
 
-pub(crate) fn compute_rows(line: &str, cols: u32) -> Vec<RowInfo> {
+pub(crate) fn compute_rows(line: &str, cols: u32, marker_width: u32) -> Vec<RowInfo> {
     if line.is_empty() {
         return vec![RowInfo { byte_offset: 0, text: String::new(), continuation_indent: 0 }];
     }
@@ -59,9 +60,10 @@ pub(crate) fn compute_rows(line: &str, cols: u32) -> Vec<RowInfo> {
     }
 
     let lead: u32 = leading_whitespace_chars(line);
-    // If the indent fills or exceeds the viewport width, continuation rows would have no room
-    // for content — wrapping is meaningless. Emit a single row.
-    if lead > 0 && lead >= cols {
+    // Continuation rows have `cols - lead - marker_width` of usable width. If that's non-positive
+    // there's no room for content on a continuation, so wrapping is meaningless — emit a single
+    // row and let the client draw it (terminal will clip the overflow).
+    if lead.saturating_add(marker_width) >= cols {
         return vec![RowInfo { byte_offset: 0, text: line.to_string(), continuation_indent: 0 }];
     }
 
@@ -74,7 +76,11 @@ pub(crate) fn compute_rows(line: &str, cols: u32) -> Vec<RowInfo> {
 
     while let Some(&(byte_idx, c)) = iter.peek() {
         let is_first = rows.is_empty();
-        let max_chars = if is_first { cols } else { cols.saturating_sub(lead) };
+        let max_chars = if is_first {
+            cols
+        } else {
+            cols.saturating_sub(lead).saturating_sub(marker_width)
+        };
         let max_chars = max_chars.max(1);
 
         if chars_in_row >= max_chars {
@@ -164,7 +170,7 @@ mod tests {
 
     #[test]
     fn empty_line_one_empty_row() {
-        let rows = wrap_line("", 10, &[]);
+        let rows = wrap_line("", 10, 0, &[]);
         assert_eq!(rows.len(), 1);
         assert_eq!(row_text(&rows[0]), "");
         assert_eq!(rows[0].byte_offset, 0);
@@ -172,7 +178,7 @@ mod tests {
 
     #[test]
     fn short_line_no_wrap() {
-        let rows = wrap_line("hello", 10, &[]);
+        let rows = wrap_line("hello", 10, 0, &[]);
         assert_eq!(rows.len(), 1);
         assert_eq!(row_text(&rows[0]), "hello");
         assert_eq!(rows[0].continuation_indent, 0);
@@ -181,7 +187,7 @@ mod tests {
 
     #[test]
     fn wraps_at_whitespace() {
-        let rows = wrap_line("the quick brown fox", 10, &[]);
+        let rows = wrap_line("the quick brown fox", 10, 0, &[]);
         let texts: Vec<_> = rows.iter().map(row_text).collect();
         assert_eq!(texts, vec!["the quick", "brown fox"]);
         assert_eq!(rows[0].continuation_indent, 0);
@@ -195,7 +201,7 @@ mod tests {
     fn continuation_indent_from_leading_whitespace() {
         // Leading 4 spaces, cols=20 — wrapping should happen at whitespace and second row
         // should carry continuation_indent=4.
-        let rows = wrap_line("    println!(\"hello world\");", 20, &[]);
+        let rows = wrap_line("    println!(\"hello world\");", 20, 0, &[]);
         assert!(rows.len() >= 2);
         // First row keeps the original leading whitespace as content.
         assert!(row_text(&rows[0]).starts_with("    "));
@@ -206,7 +212,7 @@ mod tests {
 
     #[test]
     fn hard_breaks_when_no_whitespace() {
-        let rows = wrap_line("abcdefghijklmnop", 5, &[]);
+        let rows = wrap_line("abcdefghijklmnop", 5, 0, &[]);
         let texts: Vec<_> = rows.iter().map(row_text).collect();
         assert_eq!(texts, vec!["abcde", "fghij", "klmno", "p"]);
         // Hard breaks are contiguous — no whitespace dropped.
@@ -219,7 +225,7 @@ mod tests {
     #[test]
     fn drops_break_whitespace() {
         // The space at the wrap point isn't carried into the next row.
-        let rows = wrap_line("aaa bbb", 4, &[]);
+        let rows = wrap_line("aaa bbb", 4, 0, &[]);
         let texts: Vec<_> = rows.iter().map(row_text).collect();
         assert_eq!(texts, vec!["aaa", "bbb"]);
         // Row 0 visible text is "aaa" (bytes 0..3), break whitespace is byte 3, row 1 starts at 4.
@@ -229,7 +235,7 @@ mod tests {
 
     #[test]
     fn render_line_no_wrap_returns_single_row() {
-        let r = render_line("anything goes here at all", 0, 5, WrapMode::None, vec![]);
+        let r = render_line("anything goes here at all", 0, 5, WrapMode::None, 0, vec![]);
         assert_eq!(r.visual_rows.len(), 1);
         assert_eq!(row_text(&r.visual_rows[0]), "anything goes here at all");
         assert_eq!(r.visual_rows[0].byte_offset, 0);
@@ -239,7 +245,7 @@ mod tests {
     fn very_long_indent_falls_back_to_unwrapped() {
         // Indent is wider than cols; we don't try to wrap.
         let line = "                            content";
-        let rows = wrap_line(line, 10, &[]);
+        let rows = wrap_line(line, 10, 0, &[]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].byte_offset, 0);
     }
@@ -250,7 +256,7 @@ mod tests {
         // at byte 10. A highlight on "brown" (bytes 10..15) should land entirely on row 1 with
         // row-relative offsets [0, 5).
         let highlights = vec![Highlight { start: 10, end: 15, kind: "keyword".into() }];
-        let rows = wrap_line("the quick brown fox", 10, &highlights);
+        let rows = wrap_line("the quick brown fox", 10, 0, &highlights);
         let row0_hl = &rows[0].segments[0].highlights;
         let row1_hl = &rows[1].segments[0].highlights;
         assert!(row0_hl.is_empty());
@@ -261,12 +267,24 @@ mod tests {
     }
 
     #[test]
+    fn marker_width_reduces_continuation_row_width() {
+        // With cols=10 and marker_width=2, continuation rows have effective width 8 (10 - 0
+        // leading - 2 marker). "the quick brown fox" wraps into three rows.
+        let rows = wrap_line("the quick brown fox", 10, 2, &[]);
+        let texts: Vec<_> = rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["the quick", "brown", "fox"]);
+        assert_eq!(rows[0].byte_offset, 0);
+        assert_eq!(rows[1].byte_offset, 10);
+        assert_eq!(rows[2].byte_offset, 16);
+    }
+
+    #[test]
     fn highlights_split_across_rows() {
         // Highlight spans the wrap point: bytes 6..14 covers "uick" + " " + "bro".
         // Row 0 visible "the quick" (0..9), row 1 visible "brown fox" (starts at 10).
         // After clipping: row 0 highlight = [6, 9), row 1 highlight = [0, 4).
         let highlights = vec![Highlight { start: 6, end: 14, kind: "string".into() }];
-        let rows = wrap_line("the quick brown fox", 10, &highlights);
+        let rows = wrap_line("the quick brown fox", 10, 0, &highlights);
         let row0_hl = &rows[0].segments[0].highlights;
         let row1_hl = &rows[1].segments[0].highlights;
         assert_eq!(row0_hl.len(), 1);
