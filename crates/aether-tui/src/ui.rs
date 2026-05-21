@@ -17,6 +17,24 @@ use unicode_width::UnicodeWidthChar;
 pub const CONTINUATION_MARKER: &str = "↪ ";
 pub const CONTINUATION_MARKER_WIDTH: u32 = 2;
 
+// ---- Nord palette ------------------------------------------------------------------------------
+// https://www.nordtheme.com/. Used for both the syntax-highlight foreground colors and the
+// painted background/status colors so the editor's appearance is independent of the terminal's
+// own color scheme.
+
+const NORD0: Color = Color::Rgb(46, 52, 64);    // Polar Night — main background
+const NORD1: Color = Color::Rgb(59, 66, 82);    // Polar Night — status line / panel
+const NORD2: Color = Color::Rgb(67, 76, 94);    // Polar Night — selection background
+const NORD3: Color = Color::Rgb(76, 86, 106);   // Polar Night — comments / dim
+const NORD4: Color = Color::Rgb(216, 222, 233); // Snow Storm — main foreground
+const NORD7: Color = Color::Rgb(143, 188, 187); // Frost — types
+const NORD8: Color = Color::Rgb(136, 192, 208); // Frost — functions, accents
+const NORD9: Color = Color::Rgb(129, 161, 193); // Frost — keywords, operators
+const NORD12: Color = Color::Rgb(208, 135, 112);// Aurora orange — attributes, macros
+const NORD13: Color = Color::Rgb(235, 203, 139);// Aurora yellow — string escapes
+const NORD14: Color = Color::Rgb(163, 190, 140);// Aurora green — strings
+const NORD15: Color = Color::Rgb(180, 142, 173);// Aurora purple — numbers, constants
+
 pub fn draw(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -81,7 +99,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if is_continuation {
                 spans.push(Span::styled(
                     CONTINUATION_MARKER.to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(NORD3),
                 ));
             }
             if indent > 0 {
@@ -96,7 +114,12 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         };
     }
 
-    f.render_widget(Paragraph::new(lines), area);
+    // Paint the whole buffer area with the Nord base style: spans without explicit fg/bg
+    // inherit it, and any empty/short visual rows get the background filled too.
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
+        area,
+    );
 }
 
 /// Drop the first `scroll_col` bytes of the row's text, then shift highlight + selection ranges
@@ -206,7 +229,9 @@ fn build_spans(
         let mut style = byte_kind[byte_idx].map(theme_for).unwrap_or_default();
         if let Some((s, e)) = sel {
             if byte_idx >= s as usize && byte_idx < e as usize {
-                style = style.add_modifier(Modifier::REVERSED);
+                // Selection: explicit bg keeps foreground colors readable (REVERSED would
+                // swap fg/bg per span, which looks awful on comments — NORD3 fg + NORD3 bg).
+                style = style.bg(NORD2);
             }
         }
         style
@@ -254,28 +279,28 @@ fn theme_for(kind: &str) -> Style {
 fn lookup_exact(name: &str) -> Option<Style> {
     let s = Style::default();
     Some(match name {
-        "keyword" => s.fg(Color::Yellow),
-        "string" => s.fg(Color::Green),
-        "string.escape" | "string.special" => s.fg(Color::LightGreen),
-        "comment" => s.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        "number" | "boolean" | "constant" | "constant.builtin" => s.fg(Color::Magenta),
-        "function" | "function.call" => s.fg(Color::Cyan),
-        "function.macro" => s.fg(Color::LightCyan),
-        "type" | "type.builtin" => s.fg(Color::Blue),
+        "keyword" => s.fg(NORD9),
+        "string" => s.fg(NORD14),
+        "string.escape" | "string.special" => s.fg(NORD13),
+        "comment" => s.fg(NORD3).add_modifier(Modifier::ITALIC),
+        "number" | "boolean" | "constant" | "constant.builtin" => s.fg(NORD15),
+        "function" | "function.call" => s.fg(NORD8),
+        "function.macro" => s.fg(NORD12),
+        "type" | "type.builtin" => s.fg(NORD7),
         "variable" => s,
-        "variable.parameter" => s.fg(Color::LightYellow),
-        "variable.builtin" => s.fg(Color::Magenta),
-        "operator" => s.fg(Color::LightYellow),
-        "punctuation.bracket" | "punctuation.delimiter" => s.fg(Color::Gray),
-        "punctuation.special" => s.fg(Color::Magenta),
-        "attribute" | "label" => s.fg(Color::LightCyan),
-        "tag" => s.fg(Color::Magenta),
-        "property" => s.fg(Color::LightBlue),
+        "variable.parameter" => s.fg(NORD4),
+        "variable.builtin" => s.fg(NORD9),
+        "operator" => s.fg(NORD9),
+        "punctuation.bracket" | "punctuation.delimiter" => s.fg(NORD4),
+        "punctuation.special" => s.fg(NORD12),
+        "attribute" | "label" => s.fg(NORD12),
+        "tag" => s.fg(NORD9),
+        "property" => s.fg(NORD4),
         // Markdown (tree-sitter-md uses these "text.*" capture names).
-        "text.title" => s.fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        "text.literal" => s.fg(Color::Green),
-        "text.uri" => s.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
-        "text.reference" => s.fg(Color::Cyan),
+        "text.title" => s.fg(NORD8).add_modifier(Modifier::BOLD),
+        "text.literal" => s.fg(NORD14),
+        "text.uri" => s.fg(NORD8).add_modifier(Modifier::UNDERLINED),
+        "text.reference" => s.fg(NORD8),
         "text.emphasis" => s.add_modifier(Modifier::ITALIC),
         "text.strong" => s.add_modifier(Modifier::BOLD),
         _ => return None,
@@ -299,7 +324,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Span::raw(format!("{main}    {}", state.status))
     };
     let p = Paragraph::new(Line::from(vec![status_span]))
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD));
+        .style(Style::default().bg(NORD1).fg(NORD4));
     f.render_widget(p, area);
 }
 
