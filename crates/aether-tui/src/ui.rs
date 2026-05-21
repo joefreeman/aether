@@ -54,10 +54,16 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let viewport_cols = area.width;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
     let scroll_col = if matches!(state.wrap, WrapMode::None) { state.scroll_col } else { 0 };
-    // In Search mode the hardware cursor is on the status row, so the selection paint must cover
-    // its own trailing char (which `selection_on_visual_row` normally omits, expecting the block
-    // cursor to draw it). In all other modes the cursor sits in the buffer and does that job.
-    let extend_sel_to_cursor = matches!(state.mode, Mode::Search);
+    // `selection_on_visual_row` normally omits the trailing char of the selection, expecting the
+    // block cursor to overdraw it. That assumption only holds when the cursor is at the *end* of
+    // the selection (forward selection). Extend the paint range when either:
+    //   - we're in Search mode (the hardware cursor is on the status row, not on the buffer), or
+    //   - the selection is backward (cursor at start, anchor at end — block cursor doesn't reach
+    //     the trailing char, so without the extension the anchor goes unpainted).
+    let backward_selection = state.cursor.anchor.is_some_and(|a| {
+        (a.line, a.col) > (state.cursor.position.line, state.cursor.position.col)
+    });
+    let extend_sel_to_cursor = matches!(state.mode, Mode::Search) || backward_selection;
 
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
     let mut logical_line = top;
