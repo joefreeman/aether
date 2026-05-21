@@ -423,3 +423,69 @@ pub fn find_row_idx_for_col(rows: &[VisualRow], col: u32) -> usize {
     }
     idx
 }
+
+/// Inverse of `cursor_visual_position`: convert a screen `(row, col)` inside the buffer area
+/// (0-indexed from the top of the buffer pane) to a logical `(line, col)`. Returns `None` if the
+/// click is outside the buffer pane (e.g., on the status row).
+///
+/// Clicks past the end of a visual row map to the end of that row's text; clicks below the last
+/// rendered visual row map to the end of the buffer (the server clamps).
+pub fn screen_to_logical(
+    state: &AppState,
+    screen_row: u16,
+    screen_col: u16,
+) -> Option<LogicalPosition> {
+    if (screen_row as u32) >= state.viewport_rows {
+        return None;
+    }
+    let mut rows_remaining = screen_row as u32;
+    let mut logical_line = state.scroll_logical_line;
+    loop {
+        let local_idx = (logical_line as i64) - (state.window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.lines.len() as i64 {
+            // Click is past the last line we have rendered — clamp to the end of the buffer.
+            let last_line = state.line_count.saturating_sub(1);
+            return Some(LogicalPosition { line: last_line, col: u32::MAX });
+        }
+        let render = &state.lines[local_idx as usize];
+        let visual_rows_in_line = render.visual_rows.len() as u32;
+        if rows_remaining < visual_rows_in_line {
+            let vrow = &render.visual_rows[rows_remaining as usize];
+            return Some(LogicalPosition {
+                line: logical_line,
+                col: byte_at_screen_col(state, vrow, screen_col),
+            });
+        }
+        rows_remaining -= visual_rows_in_line;
+        logical_line = match logical_line.checked_add(1) {
+            Some(n) => n,
+            None => return None,
+        };
+    }
+}
+
+/// Walk the visual row's text by display width to find the byte offset (within the logical line)
+/// that lines up with `screen_col`. Clicks on the marker / continuation indent map to the start
+/// of the row's text. Clicks past the end of the text map to the end of the text.
+fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u32 {
+    let scroll_col = if matches!(state.wrap, WrapMode::None) { state.scroll_col } else { 0 };
+    let marker = if vrow.byte_offset > 0 { CONTINUATION_MARKER_WIDTH } else { 0 };
+    let prefix = marker + vrow.continuation_indent;
+    let target_display = (screen_col as u32).saturating_add(scroll_col);
+    if target_display < prefix {
+        return vrow.byte_offset;
+    }
+    let target_in_text = target_display - prefix;
+    let text = vrow.segments.first().map(|s| s.text.as_str()).unwrap_or("");
+    let mut display_col: u32 = 0;
+    let mut byte: u32 = 0;
+    for c in text.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0) as u32;
+        if display_col + w > target_in_text {
+            break;
+        }
+        display_col += w;
+        byte += c.len_utf8() as u32;
+    }
+    vrow.byte_offset + byte
+}

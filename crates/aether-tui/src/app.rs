@@ -29,7 +29,10 @@ use aether_protocol::viewport::{
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use tokio::sync::mpsc;
 use crossterm::execute;
 use futures_util::StreamExt;
@@ -69,6 +72,9 @@ pub struct AppState {
     /// `viewport/scroll` RPC is deferred until just before the next draw (or until a motion
     /// triggers `ensure_cursor_in_window`), so a trackpad fling becomes one RPC instead of N.
     pub pending_scroll_lines: i64,
+    /// Anchor position set by a left-mouse-button down. Subsequent drags use it as the selection
+    /// anchor; cleared on mouse-up.
+    pub drag_anchor: Option<LogicalPosition>,
     pub revision: u64,
     pub dirty: bool,
     pub should_quit: bool,
@@ -150,6 +156,7 @@ pub async fn bootstrap(
         wrap: WrapMode::Soft,
         scroll_col: 0,
         pending_scroll_lines: 0,
+        drag_anchor: None,
         revision: open.revision,
         dirty: open.dirty,
         should_quit: false,
@@ -276,20 +283,72 @@ fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
 }
 
 async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> Result<()> {
-    let Event::Key(k) = ev else { return Ok(()) };
-    if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
-        return Ok(());
-    }
     // Track whether the cursor moved during this event. Pure-scroll bindings leave it alone, so
     // the viewport stays where the user scrolled; any binding that actually moves the cursor
     // triggers `ensure_cursor_in_window` to snap the view back to it.
     let cursor_before = state.cursor.position;
-    match state.mode {
-        Mode::Normal => handle_normal_key(client, state, k).await?,
-        Mode::Insert => handle_insert_key(client, state, k).await?,
+    match ev {
+        Event::Key(k) => {
+            if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
+                return Ok(());
+            }
+            match state.mode {
+                Mode::Normal => handle_normal_key(client, state, k).await?,
+                Mode::Insert => handle_insert_key(client, state, k).await?,
+            }
+        }
+        Event::Mouse(m) => handle_mouse_event(client, state, m).await?,
+        _ => return Ok(()),
     }
     if state.cursor.position != cursor_before {
         ensure_cursor_in_window(client, state).await?;
+    }
+    Ok(())
+}
+
+async fn handle_mouse_event(
+    client: &mut Client,
+    state: &mut AppState,
+    m: MouseEvent,
+) -> Result<()> {
+    match m.kind {
+        MouseEventKind::ScrollUp => scroll_lines(state, -3),
+        MouseEventKind::ScrollDown => scroll_lines(state, 3),
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Shift-click is left for the terminal's native text selection (copy-paste).
+            if m.modifiers.contains(KeyModifiers::SHIFT) {
+                return Ok(());
+            }
+            if let Some(pos) = ui::screen_to_logical(state, m.row, m.column) {
+                let new = client
+                    .rpc::<CursorSet>(CursorSetParams {
+                        buffer_id: state.buffer_id,
+                        position: pos,
+                        anchor: None,
+                    })
+                    .await?;
+                state.cursor = new;
+                state.drag_anchor = Some(new.position);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(anchor) = state.drag_anchor {
+                if let Some(pos) = ui::screen_to_logical(state, m.row, m.column) {
+                    let new = client
+                        .rpc::<CursorSet>(CursorSetParams {
+                            buffer_id: state.buffer_id,
+                            position: pos,
+                            anchor: Some(anchor),
+                        })
+                        .await?;
+                    state.cursor = new;
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            state.drag_anchor = None;
+        }
+        _ => {}
     }
     Ok(())
 }

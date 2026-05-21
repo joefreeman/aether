@@ -8,7 +8,8 @@ mod ui;
 use clap::Parser;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -70,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
 fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     // Best-effort: enable the kitty keyboard protocol so the terminal disambiguates things like
     // Ctrl-Shift-Z and Alt-0. Terminals that don't support it ignore the escape sequence.
     let _ = execute!(
@@ -87,6 +88,7 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
     disable_raw_mode()?;
     let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
     execute!(terminal.backend_mut(), SetCursorStyle::DefaultUserShape, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
@@ -99,6 +101,7 @@ fn install_panic_hook() {
         let _ = execute!(
             stdout(),
             PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
             SetCursorStyle::DefaultUserShape,
             LeaveAlternateScreen
         );
