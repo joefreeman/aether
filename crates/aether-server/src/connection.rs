@@ -13,7 +13,7 @@ use aether_protocol::envelope::{
 use aether_protocol::handshake::ClientHello;
 use aether_protocol::input::{InputDelete, InputJoinLines, InputRedo, InputText, InputUndo};
 use aether_protocol::viewport::{
-    ViewportResize, ViewportScroll, ViewportSubscribe, ViewportUnsubscribe,
+    ViewportResize, ViewportScroll, ViewportSetWrap, ViewportSubscribe, ViewportUnsubscribe,
 };
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
@@ -142,6 +142,7 @@ async fn dispatch(
         ViewportSubscribe::NAME => run!(ViewportSubscribe, handlers::viewport_subscribe),
         ViewportResize::NAME => run!(ViewportResize, handlers::viewport_resize),
         ViewportScroll::NAME => run!(ViewportScroll, handlers::viewport_scroll),
+        ViewportSetWrap::NAME => run!(ViewportSetWrap, handlers::viewport_set_wrap),
         ViewportUnsubscribe::NAME => run!(ViewportUnsubscribe, handlers::viewport_unsubscribe),
         CursorMove::NAME => run!(CursorMove, handlers::cursor_move),
         CursorSet::NAME => run!(CursorSet, handlers::cursor_set),

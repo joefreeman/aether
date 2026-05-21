@@ -25,6 +25,11 @@ pub struct LogicalLineRender {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VisualRow {
+    /// Byte offset within the *logical line* where this row's text starts. For the first row
+    /// of a logical line this is always 0; for continuation rows it's the byte right after the
+    /// preceding row's break point. Used by the client to map a cursor's logical column to the
+    /// visual row + column it should render on.
+    pub byte_offset: u32,
     pub continuation_indent: u32,
     pub segments: Vec<Segment>,
 }
@@ -35,7 +40,7 @@ pub struct Segment {
     pub highlights: Vec<Highlight>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Highlight {
     /// Byte offset within the containing `Segment::text`.
     pub start: u32,
@@ -116,6 +121,21 @@ impl RpcMethod for ViewportScroll {
 pub struct ViewportScrollParams {
     pub viewport_id: ViewportId,
     pub scroll: ScrollPosition,
+}
+
+// ---- viewport/set_wrap --------------------------------------------------------------------------
+
+pub struct ViewportSetWrap;
+impl RpcMethod for ViewportSetWrap {
+    const NAME: &'static str = "viewport/set_wrap";
+    type Params = ViewportSetWrapParams;
+    type Result = ViewportWindowResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewportSetWrapParams {
+    pub viewport_id: ViewportId,
+    pub wrap: WrapMode,
 }
 
 // ---- viewport/unsubscribe -----------------------------------------------------------------------

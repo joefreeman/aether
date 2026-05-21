@@ -2,7 +2,7 @@
 
 use crate::app::{AppState, Mode};
 use aether_protocol::cursor::CursorState;
-use aether_protocol::viewport::Highlight;
+use aether_protocol::viewport::{Highlight, VisualRow, WrapMode};
 use aether_protocol::LogicalPosition;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,29 +23,100 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let top = state.scroll_logical_line;
     let selection = ordered_selection(&state.cursor);
+    let viewport_rows = area.height as usize;
+    let viewport_cols = area.width;
+    // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
+    let scroll_col = if matches!(state.wrap, WrapMode::None) { state.scroll_col } else { 0 };
 
-    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
-    for row in 0..area.height as u32 {
-        let logical_line = top + row;
+    let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
+    let mut logical_line = top;
+
+    'outer: loop {
+        if lines.len() >= viewport_rows {
+            break;
+        }
         let local_idx = (logical_line as i64) - (state.window_first_logical_line as i64);
         if local_idx < 0 || local_idx >= state.lines.len() as i64 {
-            lines.push(Line::from(""));
-            continue;
+            break;
         }
         let render = &state.lines[local_idx as usize];
-        // Phase-1 wrap=none invariant: one visual row per logical line, one segment per row.
-        let (text, highlights): (String, &[Highlight]) = match render.visual_rows.first() {
-            Some(vr) => match vr.segments.first() {
-                Some(seg) => (seg.text.clone(), seg.highlights.as_slice()),
-                None => (String::new(), &[]),
-            },
-            None => (String::new(), &[]),
+
+        for vrow in &render.visual_rows {
+            if lines.len() >= viewport_rows {
+                break 'outer;
+            }
+            let segment = match vrow.segments.first() {
+                Some(s) => s,
+                None => {
+                    lines.push(Line::from(""));
+                    continue;
+                }
+            };
+            let row_text_len = segment.text.len() as u32;
+            let sel_on_row = selection.and_then(|(s, e)| {
+                selection_on_visual_row(logical_line, vrow.byte_offset, row_text_len, s, e)
+            });
+
+            // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
+            // bytes when scroll_col == 0 (the common case), so this is a no-op under soft wrap.
+            let (clipped_text, clipped_highlights, clipped_sel) =
+                clip_horizontal(&segment.text, &segment.highlights, sel_on_row, scroll_col);
+
+            let indent = vrow.continuation_indent.min(viewport_cols as u32) as u16;
+            let body_width = viewport_cols.saturating_sub(indent);
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if indent > 0 {
+                spans.push(Span::raw(" ".repeat(indent as usize)));
+            }
+            spans.extend(build_spans(&clipped_text, &clipped_highlights, clipped_sel, body_width));
+            lines.push(Line::from(spans));
+        }
+        logical_line = match logical_line.checked_add(1) {
+            Some(n) => n,
+            None => break,
         };
-        let sel_on_line = selection
-            .and_then(|(s, e)| selection_range_on_line(logical_line, text.len() as u32, s, e));
-        lines.push(Line::from(build_spans(&text, highlights, sel_on_line, area.width)));
     }
+
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Drop the first `scroll_col` bytes of the row's text, then shift highlight + selection ranges
+/// to match the new origin. Anything fully scrolled off the left is filtered out.
+fn clip_horizontal(
+    text: &str,
+    highlights: &[Highlight],
+    sel: Option<(u32, u32)>,
+    scroll_col: u32,
+) -> (String, Vec<Highlight>, Option<(u32, u32)>) {
+    if scroll_col == 0 {
+        return (text.to_string(), highlights.to_vec(), sel);
+    }
+    let skip = scroll_col as usize;
+    let clipped_text = if skip >= text.len() {
+        String::new()
+    } else {
+        text[skip..].to_string()
+    };
+    let new_highlights = highlights
+        .iter()
+        .filter_map(|h| {
+            let end = (h.end as usize).saturating_sub(skip);
+            if end == 0 {
+                return None;
+            }
+            let start = (h.start as usize).saturating_sub(skip);
+            Some(Highlight { start: start as u32, end: end as u32, kind: h.kind.clone() })
+        })
+        .collect();
+    let new_sel = sel.and_then(|(s, e)| {
+        let e2 = (e as usize).saturating_sub(skip);
+        if e2 == 0 {
+            return None;
+        }
+        let s2 = (s as usize).saturating_sub(skip);
+        Some((s2 as u32, e2 as u32))
+    });
+    (clipped_text, new_highlights, new_sel)
 }
 
 fn ordered_selection(cursor: &CursorState) -> Option<(LogicalPosition, LogicalPosition)> {
@@ -58,21 +129,33 @@ fn ordered_selection(cursor: &CursorState) -> Option<(LogicalPosition, LogicalPo
     }
 }
 
-fn selection_range_on_line(
-    line: u32,
-    line_byte_len: u32,
+/// Intersect the selection with the byte range covered by `[row_byte_offset, +row_text_len)` on
+/// `logical_line`. Returns row-relative offsets. The selection is conceptually inclusive on both
+/// endpoints, but the block cursor renders the end char itself, so for the highlight we treat the
+/// range as half-open and let the cursor draw its own char.
+fn selection_on_visual_row(
+    logical_line: u32,
+    row_byte_offset: u32,
+    row_text_len: u32,
     sel_start: LogicalPosition,
     sel_end: LogicalPosition,
 ) -> Option<(u32, u32)> {
-    if line < sel_start.line || line > sel_end.line {
+    if logical_line < sel_start.line || logical_line > sel_end.line {
         return None;
     }
-    let start = if line == sel_start.line { sel_start.col } else { 0 };
-    let end = if line == sel_end.line { sel_end.col } else { line_byte_len };
+    let line_sel_start = if logical_line == sel_start.line { sel_start.col } else { 0 };
+    let line_sel_end_excl = if logical_line == sel_end.line {
+        sel_end.col
+    } else {
+        row_byte_offset + row_text_len
+    };
+    let row_end = row_byte_offset + row_text_len;
+    let start = line_sel_start.max(row_byte_offset);
+    let end = line_sel_end_excl.min(row_end);
     if start >= end {
         return None;
     }
-    Some((start, end))
+    Some((start - row_byte_offset, end - row_byte_offset))
 }
 
 /// Truncate `text` to fit `max_chars` columns and emit styled spans. Style at each byte is the
@@ -235,12 +318,68 @@ fn format_position(state: &AppState) -> String {
 }
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect) {
-    let row_offset = (state.cursor.position.line as i64) - (state.scroll_logical_line as i64);
-    if row_offset < 0 || row_offset >= buffer_area.height as i64 {
+    let Some((visual_row, visual_col)) = cursor_visual_position(state, buffer_area.height as u32)
+    else {
         return; // cursor off-screen
-    }
-    let row = buffer_area.y + row_offset as u16;
-    // col is bytes; for ASCII this equals display cols. Unicode handling deferred.
-    let col = buffer_area.x.saturating_add((state.cursor.position.col as u16).min(buffer_area.width.saturating_sub(1)));
+    };
+    let row = buffer_area.y + visual_row as u16;
+    let col = buffer_area.x.saturating_add(visual_col.min(buffer_area.width.saturating_sub(1)));
     f.set_cursor_position((col, row));
+}
+
+/// Map the cursor's logical (line, col) to (visual_row_offset_from_top_of_viewport, visual_col).
+/// Returns `None` if the cursor is off-screen (above the top, below the bottom, off-screen left
+/// after horizontal scroll, or its logical line hasn't been pushed into the window yet).
+pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u16, u16)> {
+    let top = state.scroll_logical_line;
+    let cursor = state.cursor.position;
+    if cursor.line < top {
+        return None;
+    }
+    let scroll_col = if matches!(state.wrap, WrapMode::None) { state.scroll_col } else { 0 };
+
+    let mut visual_offset: u32 = 0;
+    for line_idx in top..=cursor.line {
+        let local_idx = (line_idx as i64) - (state.window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.lines.len() as i64 {
+            return None;
+        }
+        let render = &state.lines[local_idx as usize];
+        if line_idx == cursor.line {
+            let row_idx = find_row_idx_for_col(&render.visual_rows, cursor.col);
+            visual_offset += row_idx as u32;
+            if visual_offset >= viewport_rows {
+                return None;
+            }
+            let row = &render.visual_rows[row_idx];
+            let text_len: u32 = row.segments.iter().map(|s| s.text.len() as u32).sum();
+            let col_in_text = cursor.col.saturating_sub(row.byte_offset).min(text_len);
+            let logical_visual_col = row.continuation_indent + col_in_text;
+            if logical_visual_col < scroll_col {
+                return None; // scrolled off the left
+            }
+            let visual_col = logical_visual_col - scroll_col;
+            return Some((visual_offset as u16, visual_col as u16));
+        }
+        visual_offset += render.visual_rows.len() as u32;
+        if visual_offset >= viewport_rows {
+            return None;
+        }
+    }
+    None
+}
+
+/// Pick the visual row whose `byte_offset` is the largest value `<= col`. The dropped break
+/// whitespace between rows maps to the end of the *preceding* row (so the cursor appears just
+/// past that row's last visible character rather than at the start of the next row).
+pub fn find_row_idx_for_col(rows: &[VisualRow], col: u32) -> usize {
+    let mut idx = 0;
+    for (i, row) in rows.iter().enumerate() {
+        if row.byte_offset <= col {
+            idx = i;
+        } else {
+            break;
+        }
+    }
+    idx
 }

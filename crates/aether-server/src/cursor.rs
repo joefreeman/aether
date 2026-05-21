@@ -5,7 +5,9 @@
 //! grapheme-aware revision can come later.
 
 use crate::state::Buffer;
-use aether_protocol::cursor::{Direction, Motion, WordBoundary};
+use crate::wrap::{self, RowInfo};
+use aether_protocol::cursor::{Direction, Motion, VerticalDirection, WordBoundary};
+use aether_protocol::viewport::WrapMode;
 use aether_protocol::LogicalPosition;
 
 /// Convert a (line, byte-col) position to an absolute char index in the rope. Clamped to valid
@@ -140,9 +142,174 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             };
             char_to_pos(buf, end)
         }
-        // Visual* motions are not implemented in phase 1; cursor stays put.
-        _ => current,
+        // Visual motions are resolved separately by the cursor/move handler (they need viewport
+        // state for wrap mode + width). resolve_motion is for buffer-only motions.
+        Motion::VisualLine { .. } | Motion::VisualLineStart { .. } | Motion::VisualLineEnd { .. } => {
+            current
+        }
     }
+}
+
+/// Resolve a visual line motion: walk up or down by `count` visual rows under the given wrap
+/// settings, preserving the cursor's visual column where possible. When `wrap` is `None` this
+/// degenerates to a logical line step (each logical line is one visual row).
+pub fn resolve_visual_line(
+    buf: &Buffer,
+    wrap: WrapMode,
+    cols: u32,
+    current: LogicalPosition,
+    direction: VerticalDirection,
+    count: u32,
+) -> LogicalPosition {
+    if matches!(wrap, WrapMode::None) || cols == 0 {
+        return logical_line_step(buf, current, direction, count);
+    }
+
+    let line_count = buf.text.len_lines() as u32;
+    let mut current_line = current.line.min(line_count.saturating_sub(1));
+    let mut rows = wrap::compute_rows(&line_text(buf, current_line), cols);
+    let mut row_idx = find_row_for_col(&rows, current.col as usize);
+    let target_visual_col = visual_col_of_byte(&rows[row_idx], current.col as usize);
+
+    let mut remaining = count;
+    while remaining > 0 {
+        let advanced = match direction {
+            VerticalDirection::Down => {
+                if row_idx + 1 < rows.len() {
+                    row_idx += 1;
+                    true
+                } else if current_line + 1 < line_count {
+                    current_line += 1;
+                    rows = wrap::compute_rows(&line_text(buf, current_line), cols);
+                    row_idx = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            VerticalDirection::Up => {
+                if row_idx > 0 {
+                    row_idx -= 1;
+                    true
+                } else if current_line > 0 {
+                    current_line -= 1;
+                    rows = wrap::compute_rows(&line_text(buf, current_line), cols);
+                    row_idx = rows.len().saturating_sub(1);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if !advanced {
+            break;
+        }
+        remaining -= 1;
+    }
+
+    let row = &rows[row_idx];
+    let new_col_within_text = byte_at_visual_col(row, target_visual_col);
+    LogicalPosition {
+        line: current_line,
+        col: row.byte_offset as u32 + new_col_within_text as u32,
+    }
+}
+
+/// Resolve VisualLineStart: cursor to the first byte of its current visual row.
+pub fn resolve_visual_line_start(
+    buf: &Buffer,
+    wrap: WrapMode,
+    cols: u32,
+    current: LogicalPosition,
+) -> LogicalPosition {
+    let rows = wrap_rows_for_cursor(buf, wrap, cols, current);
+    let row_idx = find_row_for_col(&rows, current.col as usize);
+    LogicalPosition { line: current.line, col: rows[row_idx].byte_offset as u32 }
+}
+
+/// Resolve VisualLineEnd: cursor to the last byte of its current visual row.
+pub fn resolve_visual_line_end(
+    buf: &Buffer,
+    wrap: WrapMode,
+    cols: u32,
+    current: LogicalPosition,
+) -> LogicalPosition {
+    let rows = wrap_rows_for_cursor(buf, wrap, cols, current);
+    let row_idx = find_row_for_col(&rows, current.col as usize);
+    let row = &rows[row_idx];
+    let end_byte = row.byte_offset + row.text.len();
+    LogicalPosition { line: current.line, col: end_byte as u32 }
+}
+
+fn wrap_rows_for_cursor(buf: &Buffer, wrap: WrapMode, cols: u32, current: LogicalPosition) -> Vec<RowInfo> {
+    let line_count = buf.text.len_lines() as u32;
+    let line_idx = current.line.min(line_count.saturating_sub(1));
+    if matches!(wrap, WrapMode::None) || cols == 0 {
+        let text = line_text(buf, line_idx);
+        let len = text.len();
+        vec![RowInfo { byte_offset: 0, text, continuation_indent: 0 }]
+            .into_iter()
+            .map(|mut r| { r.text.truncate(len); r })
+            .collect()
+    } else {
+        wrap::compute_rows(&line_text(buf, line_idx), cols)
+    }
+}
+
+fn line_text(buf: &Buffer, line_idx: u32) -> String {
+    let line = buf.text.line(line_idx as usize);
+    let mut text: String = line.chunks().collect();
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    text
+}
+
+fn find_row_for_col(rows: &[RowInfo], col: usize) -> usize {
+    let mut idx = 0;
+    for (i, row) in rows.iter().enumerate() {
+        if row.byte_offset <= col {
+            idx = i;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
+/// Visual column of a byte position within a row, including the continuation indent that the
+/// renderer prepends. Bytes beyond the row's visible text (e.g. cursor sitting on the trailing
+/// whitespace that the wrap dropped) clamp to the end of the visible text.
+fn visual_col_of_byte(row: &RowInfo, col_in_line: usize) -> u32 {
+    let relative = col_in_line.saturating_sub(row.byte_offset);
+    let clamped = relative.min(row.text.len());
+    row.continuation_indent + clamped as u32
+}
+
+/// Inverse of `visual_col_of_byte`: byte offset *within the row's text* that lands at the
+/// requested visual column.
+fn byte_at_visual_col(row: &RowInfo, visual_col: u32) -> usize {
+    if visual_col <= row.continuation_indent {
+        return 0;
+    }
+    let target = (visual_col - row.continuation_indent) as usize;
+    target.min(row.text.len())
+}
+
+fn logical_line_step(
+    buf: &Buffer,
+    current: LogicalPosition,
+    direction: VerticalDirection,
+    count: u32,
+) -> LogicalPosition {
+    let line_count = buf.text.len_lines() as u32;
+    let new_line = match direction {
+        VerticalDirection::Down => current.line.saturating_add(count),
+        VerticalDirection::Up => current.line.saturating_sub(count),
+    };
+    let new_line = new_line.min(line_count.saturating_sub(1));
+    let new_col = current.col.min(line_byte_len_excl_newline(buf, new_line));
+    LogicalPosition { line: new_line, col: new_col }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

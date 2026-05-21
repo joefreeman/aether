@@ -23,8 +23,8 @@ use aether_protocol::input::{
 };
 use aether_protocol::viewport::{
     LogicalLineRange, LogicalLineRender, ViewportLinesChanged, ViewportLinesChangedParams,
-    ViewportResizeParams, ViewportScrollParams, ViewportSubscribeParams, ViewportSubscribeResult,
-    ViewportUnsubscribeParams, ViewportWindowResult, Window,
+    ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams,
+    ViewportSubscribeResult, ViewportUnsubscribeParams, ViewportWindowResult, Window,
 };
 use aether_protocol::{BufferId, ClientId, Revision};
 use tokio::sync::mpsc;
@@ -457,6 +457,32 @@ pub async fn viewport_resize(
     Ok(ViewportWindowResult { window })
 }
 
+pub async fn viewport_set_wrap(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: ViewportSetWrapParams,
+) -> Result<ViewportWindowResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
+    vp.wrap = params.wrap;
+    let (cols, rows, overscan, wrap, buffer_id, scroll_line) =
+        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.buffer_id, vp.scroll_logical_line);
+
+    let buf = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let line_count = buf.line_count();
+    let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
+    let window = render_window(buf, first, last_excl, cols, wrap);
+
+    let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
+    vp.first_logical_line = first;
+    vp.last_logical_line_exclusive = last_excl;
+    Ok(ViewportWindowResult { window })
+}
+
 pub async fn viewport_scroll(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -595,7 +621,39 @@ pub async fn cursor_move(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
 
-    let new_pos = motion::resolve_motion(buf, current.position, &params.motion);
+    // Visual motions need viewport state (wrap mode + width). Look it up and dispatch to the
+    // dedicated resolver; everything else goes through `resolve_motion` which only needs the
+    // buffer.
+    let new_pos = match &params.motion {
+        Motion::VisualLine { viewport_id, direction, count } => {
+            let vp = s.viewports.get(viewport_id).ok_or_else(|| {
+                RpcError::new(
+                    aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND,
+                    format!("unknown viewport_id: {viewport_id}"),
+                )
+            })?;
+            motion::resolve_visual_line(buf, vp.wrap, vp.cols, current.position, *direction, *count)
+        }
+        Motion::VisualLineStart { viewport_id } => {
+            let vp = s.viewports.get(viewport_id).ok_or_else(|| {
+                RpcError::new(
+                    aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND,
+                    format!("unknown viewport_id: {viewport_id}"),
+                )
+            })?;
+            motion::resolve_visual_line_start(buf, vp.wrap, vp.cols, current.position)
+        }
+        Motion::VisualLineEnd { viewport_id } => {
+            let vp = s.viewports.get(viewport_id).ok_or_else(|| {
+                RpcError::new(
+                    aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND,
+                    format!("unknown viewport_id: {viewport_id}"),
+                )
+            })?;
+            motion::resolve_visual_line_end(buf, vp.wrap, vp.cols, current.position)
+        }
+        _ => motion::resolve_motion(buf, current.position, &params.motion),
+    };
     let new_anchor = if params.extend_selection {
         current.anchor.or(Some(current.position))
     } else {

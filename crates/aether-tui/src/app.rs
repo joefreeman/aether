@@ -11,7 +11,7 @@ use aether_protocol::buffer::{
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
     CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
-    CursorUndoParams, CursorUndoResult, Direction, Motion, WordBoundary,
+    CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
@@ -21,8 +21,9 @@ use aether_protocol::input::{
 };
 use aether_protocol::viewport::{
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
-    ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult, WrapMode,
+    ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSetWrap,
+    ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
+    WrapMode,
 };
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 use anyhow::Result;
@@ -51,6 +52,11 @@ pub struct AppState {
     pub lines: Vec<LogicalLineRender>,
     pub viewport_cols: u32,
     pub viewport_rows: u32,
+    pub wrap: WrapMode,
+    /// Horizontal scroll, in bytes. Only meaningful when `wrap == WrapMode::None`; reset to 0 when
+    /// soft wrap is on (wrapped content never overflows the viewport horizontally). Client-only —
+    /// the server doesn't know about horizontal scroll.
+    pub scroll_col: u32,
     pub revision: u64,
     pub dirty: bool,
     pub should_quit: bool,
@@ -111,7 +117,7 @@ pub async fn bootstrap(
             rows: viewport_rows,
             overscan_rows: viewport_rows,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-            wrap: WrapMode::None,
+            wrap: WrapMode::Soft,
         })
         .await?;
 
@@ -126,6 +132,8 @@ pub async fn bootstrap(
         lines: sub.window.lines,
         viewport_cols,
         viewport_rows,
+        wrap: WrapMode::Soft,
+        scroll_col: 0,
         revision: open.revision,
         dirty: open.dirty,
         should_quit: false,
@@ -290,8 +298,10 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // ---- motions: arrows kept alive ----
         (KeyCode::Left, _) => move_motion(client, state, Motion::Char { direction: Direction::Backward, count }, extend).await?,
         (KeyCode::Right, _) => move_motion(client, state, Motion::Char { direction: Direction::Forward, count }, extend).await?,
-        (KeyCode::Up, _) => move_motion(client, state, Motion::LogicalLine { direction: Direction::Backward, count, preserve_col: true }, extend).await?,
-        (KeyCode::Down, _) => move_motion(client, state, Motion::LogicalLine { direction: Direction::Forward, count, preserve_col: true }, extend).await?,
+        // Arrow up/down are visual-line motions so they walk wrapped rows naturally. Falls back
+        // to logical-line behavior server-side when `WrapMode::None`.
+        (KeyCode::Up, _) => move_motion(client, state, Motion::VisualLine { viewport_id: state.viewport_id, direction: VerticalDirection::Up, count }, extend).await?,
+        (KeyCode::Down, _) => move_motion(client, state, Motion::VisualLine { viewport_id: state.viewport_id, direction: VerticalDirection::Down, count }, extend).await?,
         (KeyCode::Home, _) => move_motion(client, state, Motion::LineStart, extend).await?,
         (KeyCode::End, _) => move_motion(client, state, Motion::LineEnd, extend).await?,
         (KeyCode::PageDown, _) => {
@@ -319,11 +329,11 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // selections don't bleed into the next word.
         (KeyCode::Char('w'), m) if m.contains(KeyModifiers::ALT) =>
             move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::BigWord, exclusive: extend }, extend).await?,
-        (KeyCode::Char('w'), _) =>
+        (KeyCode::Char('w'), m) if !m.contains(KeyModifiers::CONTROL) =>
             move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::Word, exclusive: extend }, extend).await?,
         (KeyCode::Char('b'), m) if m.contains(KeyModifiers::ALT) =>
             move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::BigWord, exclusive: false }, extend).await?,
-        (KeyCode::Char('b'), _) =>
+        (KeyCode::Char('b'), m) if !m.contains(KeyModifiers::CONTROL) =>
             move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::Word, exclusive: false }, extend).await?,
         (KeyCode::Char('e'), m) if m.contains(KeyModifiers::ALT) =>
             move_motion(client, state, Motion::WordEnd { direction: Direction::Forward, count, boundary: WordBoundary::BigWord }, extend).await?,
@@ -361,6 +371,9 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('a'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionEnd).await?,
         (KeyCode::Char('i'), m) if m == ALT_ONLY => enter_insert_at(client, state, InsertWhere::FirstLineStart).await?,
         (KeyCode::Char('a'), m) if m == ALT_ONLY => enter_insert_at(client, state, InsertWhere::LastLineEnd).await?,
+
+        // ---- viewport ----
+        (KeyCode::Char('w'), CTRL_ONLY) => toggle_wrap(client, state).await?,
 
         // ---- edits ----
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
@@ -787,19 +800,58 @@ async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
 }
 
 async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> Result<()> {
+    // Horizontal dimension first — only matters when wrap is off. Adjust `scroll_col` so the
+    // cursor's column is within `[scroll_col, scroll_col + viewport_cols)`. Pure client-side.
+    if matches!(state.wrap, WrapMode::None) && state.viewport_cols > 0 {
+        let col = state.cursor.position.col;
+        if col < state.scroll_col {
+            state.scroll_col = col;
+        } else if col >= state.scroll_col.saturating_add(state.viewport_cols) {
+            state.scroll_col = col.saturating_sub(state.viewport_cols.saturating_sub(1));
+        }
+    }
+
     let cursor_line = state.cursor.position.line;
     let top = state.scroll_logical_line;
-    let bottom = top.saturating_add(state.viewport_rows);
-    let new_top = if cursor_line < top {
-        Some(cursor_line)
-    } else if cursor_line >= bottom {
-        Some(cursor_line.saturating_sub(state.viewport_rows.saturating_sub(1)))
-    } else {
-        None
-    };
-    if let Some(new_top) = new_top {
-        scroll_to(client, state, new_top).await?;
+
+    // Above the top: scroll up so the cursor's line is the new top.
+    if cursor_line < top {
+        scroll_to(client, state, cursor_line).await?;
+        return Ok(());
     }
+
+    // Below the bottom (counting *visual* rows, not logical lines): scroll the cursor's line to
+    // the top. This is a conservative heuristic — a wrapped line that's tall could push the
+    // cursor's visual row past the bottom but accurate "scroll just enough to fit" would need
+    // walking backward from the cursor counting visual rows, which we'd rather hand off to a
+    // future refinement. Putting cursor.line at top keeps the cursor visible in all cases.
+    let cursor_visible =
+        ui::cursor_visual_position(state, state.viewport_rows).is_some();
+    if !cursor_visible {
+        scroll_to(client, state, cursor_line).await?;
+    }
+    Ok(())
+}
+
+async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let new_wrap = match state.wrap {
+        WrapMode::Soft => WrapMode::None,
+        WrapMode::None => WrapMode::Soft,
+    };
+    let r = client
+        .rpc::<ViewportSetWrap>(ViewportSetWrapParams { viewport_id: state.viewport_id, wrap: new_wrap })
+        .await?;
+    state.wrap = new_wrap;
+    state.window_first_logical_line = r.window.first_logical_line;
+    state.lines = r.window.lines;
+    // Horizontal scroll is meaningless under soft wrap — content never overflows right.
+    if matches!(new_wrap, WrapMode::Soft) {
+        state.scroll_col = 0;
+    }
+    state.status = format!("wrap: {}", match new_wrap {
+        WrapMode::Soft => "on",
+        WrapMode::None => "off",
+    });
     Ok(())
 }
 

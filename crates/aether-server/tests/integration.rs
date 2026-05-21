@@ -9,7 +9,7 @@ use aether_protocol::buffer::{
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
     CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
-    CursorUndoParams, CursorUndoResult, Direction, Motion, WordBoundary,
+    CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{
     ClientInbound, JsonRpc, Notification, NotificationMethod, Request, Response, RpcMethod,
@@ -21,8 +21,8 @@ use aether_protocol::input::{
 };
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportScroll,
-    ViewportScrollParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
-    ViewportWindowResult, WrapMode,
+    ViewportScrollParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, WrapMode,
 };
 use aether_protocol::LogicalPosition;
 use aether_server::spawn_for_test;
@@ -1707,6 +1707,135 @@ async fn word_motion_exclusive_at_buffer_end_does_not_move_past() {
         extend_selection: false,
     }).await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 4 });
+
+    drop(server);
+}
+
+// ---- Motion::VisualLine -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\n").await;
+    // Subscribe with WrapMode::Soft at width 10 so the line wraps to ["the quick", "brown fox"].
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+    }).await;
+    let viewport_id = sub.viewport_id;
+
+    // Cursor at start of line — visual col 0 of row 0. Down should land on row 1's col 0 (byte 10).
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 11, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 10 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn visual_line_preserves_visual_column() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\n").await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+    }).await;
+    let viewport_id = sub.viewport_id;
+
+    // Put cursor at byte 5 (visual col 5 of row 0). Down should land at byte 10+5=15 in row 1.
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 5 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 15 });
+
+    // Up: back to visual col 5 of row 0 = byte 5.
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 13, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn visual_line_crosses_logical_line_boundary() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\ndef\n").await;
+    // Width is large enough that no line wraps.
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 20, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+    }).await;
+    let viewport_id = sub.viewport_id;
+
+    // Cursor at (0, 1). Down → (1, 1).
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 1 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 1 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn visual_line_with_wrap_none_falls_back_to_logical() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\nhi\n").await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::None,
+    }).await;
+    let viewport_id = sub.viewport_id;
+
+    // Cursor at (0, 5). With wrap=None, Down → logical line + 1, col clamped to line 1's length.
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 5 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 2 }); // line 1 = "hi", len 2
+
+    drop(server);
+}
+
+// ---- viewport/set_wrap ------------------------------------------------------------------------
+
+#[tokio::test]
+async fn viewport_set_wrap_changes_visible_rows() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\n").await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+    }).await;
+    // Soft: line 0 wraps to 2 visual rows at cols=10.
+    assert_eq!(sub.window.lines[0].visual_rows.len(), 2);
+
+    let r: ViewportWindowResult = send_request::<ViewportSetWrap>(&mut ws, 11, &ViewportSetWrapParams {
+        viewport_id: sub.viewport_id,
+        wrap: WrapMode::None,
+    }).await;
+    // None: one row, full line content.
+    assert_eq!(r.window.lines[0].visual_rows.len(), 1);
+    assert_eq!(r.window.lines[0].visual_rows[0].segments[0].text, "the quick brown fox");
 
     drop(server);
 }
