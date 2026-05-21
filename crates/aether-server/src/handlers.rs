@@ -409,7 +409,7 @@ pub async fn viewport_subscribe(
     let buffer_id = buf.id;
 
     let (first, last_excl) = pushed_range(params.scroll.logical_line, params.rows, params.overscan_rows, line_count);
-    let window = render_window(buf, first, last_excl, params.cols, params.wrap, params.continuation_marker_width);
+    let window = render_window(buf, first, last_excl, params.cols, params.wrap, params.continuation_marker_width, params.rows);
 
     let viewport_id = s.allocate_viewport_id();
     let viewport = Viewport {
@@ -451,7 +451,7 @@ pub async fn viewport_resize(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width);
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -477,7 +477,7 @@ pub async fn viewport_set_wrap(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width);
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -504,7 +504,7 @@ pub async fn viewport_scroll(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width);
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -565,6 +565,39 @@ fn pushed_range(scroll_line: u32, rows: u32, overscan: u32, line_count: u32) -> 
     (first, last_excl.max(first))
 }
 
+/// Find the largest `scroll_logical_line` such that the buffer's last visual row sits at the
+/// bottom of the viewport. Walks logical lines from the end backward, accumulating their visual
+/// row counts under the current wrap settings until we have `viewport_rows` rows.
+fn compute_max_scroll(
+    buf: &Buffer,
+    viewport_rows: u32,
+    cols: u32,
+    wrap: aether_protocol::viewport::WrapMode,
+    marker_width: u32,
+) -> u32 {
+    let line_count = buf.line_count();
+    if viewport_rows == 0 || line_count == 0 {
+        return 0;
+    }
+    if matches!(wrap, aether_protocol::viewport::WrapMode::None) {
+        return line_count.saturating_sub(viewport_rows);
+    }
+    let mut rows_remaining = viewport_rows;
+    for line_idx in (0..line_count).rev() {
+        let line_slice = buf.text.line(line_idx as usize);
+        let mut text: String = line_slice.chunks().collect();
+        if text.ends_with('\n') {
+            text.pop();
+        }
+        let n = wrap::compute_rows(&text, cols, marker_width).len() as u32;
+        if n >= rows_remaining {
+            return line_idx;
+        }
+        rows_remaining -= n;
+    }
+    0
+}
+
 fn render_window(
     buf: &Buffer,
     first: u32,
@@ -572,6 +605,7 @@ fn render_window(
     cols: u32,
     wrap: aether_protocol::viewport::WrapMode,
     marker_width: u32,
+    viewport_rows: u32,
 ) -> Window {
     let mut lines: Vec<LogicalLineRender> = Vec::with_capacity((last_excl - first) as usize);
 
@@ -605,7 +639,13 @@ fn render_window(
 
         lines.push(wrap::render_line(&text, i, cols, wrap, marker_width, highlights));
     }
-    Window { first_logical_line: first, last_logical_line_exclusive: last_excl, lines }
+    Window {
+        first_logical_line: first,
+        last_logical_line_exclusive: last_excl,
+        line_count: buf.line_count(),
+        max_scroll_logical_line: compute_max_scroll(buf, viewport_rows, cols, wrap, marker_width),
+        lines,
+    }
 }
 
 // ---- cursor handlers ---------------------------------------------------------------------------
@@ -1364,7 +1404,7 @@ fn build_lines_changed_notif(buffer: &Buffer, vp: &Viewport, revision: Revision)
     let line_count = buffer.line_count();
     let new_first = vp.first_logical_line.min(line_count);
     let new_last_excl = vp.last_logical_line_exclusive.min(line_count).max(new_first);
-    let window = render_window(buffer, new_first, new_last_excl, vp.cols, vp.wrap, vp.continuation_marker_width);
+    let window = render_window(buffer, new_first, new_last_excl, vp.cols, vp.wrap, vp.continuation_marker_width, vp.rows);
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
         revision,
@@ -1373,6 +1413,8 @@ fn build_lines_changed_notif(buffer: &Buffer, vp: &Viewport, revision: Revision)
             end_logical_line_exclusive: vp.last_logical_line_exclusive,
         },
         replacement_lines: window.lines,
+        line_count,
+        max_scroll_logical_line: window.max_scroll_logical_line,
     };
     Notification {
         jsonrpc: JsonRpc,

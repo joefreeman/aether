@@ -53,6 +53,13 @@ pub struct Highlight {
 pub struct Window {
     pub first_logical_line: u32,
     pub last_logical_line_exclusive: u32,
+    /// Total number of logical lines in the buffer. Lets the client clamp scroll targets
+    /// without round-tripping.
+    pub line_count: u32,
+    /// Highest legal value for `ScrollPosition.logical_line`: the buffer's last visual row sits
+    /// at the bottom of the viewport. Server-computed because under soft wrap each line can
+    /// occupy multiple visual rows.
+    pub max_scroll_logical_line: u32,
     pub lines: Vec<LogicalLineRender>,
 }
 
@@ -170,4 +177,9 @@ pub struct ViewportLinesChangedParams {
     pub revision: Revision,
     pub range: LogicalLineRange,
     pub replacement_lines: Vec<LogicalLineRender>,
+    /// Total line count after the edit. Lets the client keep its `line_count` cache fresh as
+    /// edits add/remove lines, so scroll clamping stays accurate.
+    pub line_count: u32,
+    /// Recomputed maximum legal `scroll_logical_line` after the edit.
+    pub max_scroll_logical_line: u32,
 }

@@ -29,6 +29,7 @@ use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use tokio::sync::mpsc;
 use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -52,11 +53,21 @@ pub struct AppState {
     pub lines: Vec<LogicalLineRender>,
     pub viewport_cols: u32,
     pub viewport_rows: u32,
+    /// Total logical lines in the buffer, kept fresh from every viewport response /
+    /// `viewport/lines_changed` notification.
+    pub line_count: u32,
+    /// Highest legal `scroll_logical_line` — server-computed so it accounts for wrap, putting
+    /// the buffer's last visual row at the bottom of the viewport.
+    pub max_scroll_logical_line: u32,
     pub wrap: WrapMode,
     /// Horizontal scroll, in bytes. Only meaningful when `wrap == WrapMode::None`; reset to 0 when
     /// soft wrap is on (wrapped content never overflows the viewport horizontally). Client-only —
     /// the server doesn't know about horizontal scroll.
     pub scroll_col: u32,
+    /// Accumulated vertical-scroll delta from arrow-key / PageUp-PageDown bursts. The actual
+    /// `viewport/scroll` RPC is deferred until just before the next draw (or until a motion
+    /// triggers `ensure_cursor_in_window`), so a trackpad fling becomes one RPC instead of N.
+    pub pending_scroll_lines: i64,
     pub revision: u64,
     pub dirty: bool,
     pub should_quit: bool,
@@ -133,8 +144,11 @@ pub async fn bootstrap(
         lines: sub.window.lines,
         viewport_cols,
         viewport_rows,
+        line_count: sub.window.line_count,
+        max_scroll_logical_line: sub.window.max_scroll_logical_line,
         wrap: WrapMode::Soft,
         scroll_col: 0,
+        pending_scroll_lines: 0,
         revision: open.revision,
         dirty: open.dirty,
         should_quit: false,
@@ -150,18 +164,36 @@ pub async fn run(
     client: &mut Client,
     state: &mut AppState,
 ) -> Result<()> {
-    let mut events = EventStream::new();
+    // Background task forwards events into a channel. Doing it this way (rather than awaiting
+    // `EventStream::next` directly in the main `select!`) means we can use `try_recv` to drain
+    // backlogged events between draws — `tokio::sync::mpsc` supports non-blocking recv natively,
+    // whereas `now_or_never` on the EventStream future leaves the stream in a state where later
+    // events don't wake the task. A trackpad scroll burst now coalesces into one redraw.
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
+    tokio::spawn(async move {
+        let mut events = EventStream::new();
+        while let Some(ev) = events.next().await {
+            if event_tx.send(ev).is_err() {
+                break; // main loop dropped the receiver; we're shutting down
+            }
+        }
+    });
+
     apply_cursor_style(state.mode);
     terminal.draw(|f| ui::draw(f, state))?;
     while !state.should_quit {
         tokio::select! {
-            ev = events.next() => {
+            ev = event_rx.recv() => {
                 let Some(ev) = ev else { break };
                 let ev = ev?;
-                if let Event::Resize(cols, rows) = &ev {
-                    handle_resize(client, state, *cols, *rows).await?;
-                } else {
-                    handle_event(client, state, ev).await?;
+                dispatch_terminal_event(client, state, ev).await?;
+                // Drain any other events that piled up while we were dispatching. mpsc's
+                // try_recv is non-blocking and safe to call repeatedly.
+                while !state.should_quit {
+                    match event_rx.try_recv() {
+                        Ok(ev) => dispatch_terminal_event(client, state, ev?).await?,
+                        Err(_) => break, // empty or disconnected — either way, we're done draining
+                    }
                 }
             }
             inbound = client.recv() => {
@@ -172,9 +204,22 @@ pub async fn run(
             }
         }
         apply_pending_notifications(state, client);
+        flush_pending_scroll(client, state).await?;
         terminal.draw(|f| ui::draw(f, state))?;
     }
     Ok(())
+}
+
+async fn dispatch_terminal_event(
+    client: &mut Client,
+    state: &mut AppState,
+    ev: Event,
+) -> Result<()> {
+    if let Event::Resize(cols, rows) = &ev {
+        handle_resize(client, state, *cols, *rows).await
+    } else {
+        handle_event(client, state, ev).await
+    }
 }
 
 fn apply_cursor_style(mode: Mode) {
@@ -217,6 +262,8 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
 
 fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
     state.revision = p.revision;
+    state.line_count = p.line_count;
+    state.max_scroll_logical_line = p.max_scroll_logical_line;
     let local_start = (p.range.start_logical_line as i64) - (state.window_first_logical_line as i64);
     let local_end = (p.range.end_logical_line_exclusive as i64) - (state.window_first_logical_line as i64);
     if local_end < 0 || local_start > state.lines.len() as i64 {
@@ -308,28 +355,18 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // scrolls by a half-viewport. PageUp/Down are full-viewport scrolls.
         (KeyCode::Home, _) => move_motion(client, state, Motion::LineStart, extend).await?,
         (KeyCode::End, _) => move_motion(client, state, Motion::LineEnd, extend).await?,
-        (KeyCode::PageDown, _) => {
-            let target = state.scroll_logical_line.saturating_add(state.viewport_rows);
-            scroll_to(client, state, target).await?;
-        }
-        (KeyCode::PageUp, _) => {
-            let target = state.scroll_logical_line.saturating_sub(state.viewport_rows);
-            scroll_to(client, state, target).await?;
-        }
-        (KeyCode::Up, m) if m.contains(KeyModifiers::ALT) => {
-            scroll_lines(client, state, -((state.viewport_rows / 2) as i64)).await?;
-        }
-        (KeyCode::Down, m) if m.contains(KeyModifiers::ALT) => {
-            scroll_lines(client, state, (state.viewport_rows / 2) as i64).await?;
-        }
-        (KeyCode::Up, _) => scroll_lines(client, state, -1).await?,
-        (KeyCode::Down, _) => scroll_lines(client, state, 1).await?,
-        (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => {
-            scroll_cols(state, -((state.viewport_cols / 2) as i64));
-        }
-        (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => {
-            scroll_cols(state, (state.viewport_cols / 2) as i64);
-        }
+        (KeyCode::PageDown, _) => scroll_lines(state, state.viewport_rows as i64),
+        (KeyCode::PageUp, _) => scroll_lines(state, -(state.viewport_rows as i64)),
+        (KeyCode::Up, m) if m.contains(KeyModifiers::ALT) =>
+            scroll_lines(state, -((state.viewport_rows / 2) as i64)),
+        (KeyCode::Down, m) if m.contains(KeyModifiers::ALT) =>
+            scroll_lines(state, (state.viewport_rows / 2) as i64),
+        (KeyCode::Up, _) => scroll_lines(state, -1),
+        (KeyCode::Down, _) => scroll_lines(state, 1),
+        (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) =>
+            scroll_cols(state, -((state.viewport_cols / 2) as i64)),
+        (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) =>
+            scroll_cols(state, (state.viewport_cols / 2) as i64),
         (KeyCode::Left, _) => scroll_cols(state, -1),
         (KeyCode::Right, _) => scroll_cols(state, 1),
 
@@ -475,6 +512,8 @@ async fn handle_resize(client: &mut Client, state: &mut AppState, cols: u16, row
         })
         .await?;
     state.window_first_logical_line = r.window.first_logical_line;
+    state.line_count = r.window.line_count;
+    state.max_scroll_logical_line = r.window.max_scroll_logical_line;
     state.lines = r.window.lines;
     Ok(())
 }
@@ -832,6 +871,10 @@ async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
 }
 
 async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> Result<()> {
+    // Commit any pending scroll first so the visibility check below sees the user's intended
+    // scroll position; otherwise we'd snap against stale state and possibly miss the snap-back.
+    flush_pending_scroll(client, state).await?;
+
     // Horizontal dimension first — only matters when wrap is off. Adjust `scroll_col` so the
     // cursor's column is within `[scroll_col, scroll_col + viewport_cols)`. Pure client-side.
     if matches!(state.wrap, WrapMode::None) && state.viewport_cols > 0 {
@@ -887,14 +930,35 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
     Ok(())
 }
 
-/// Scroll the viewport vertically by `delta` logical lines (positive = down). Doesn't touch the
-/// cursor — pure viewport movement.
-async fn scroll_lines(client: &mut Client, state: &mut AppState, delta: i64) -> Result<()> {
-    let target = if delta >= 0 {
+/// Accumulate a vertical-scroll delta. Doesn't touch the cursor and doesn't issue an RPC — the
+/// actual `viewport/scroll` is sent when `flush_pending_scroll` runs (before the next draw, or
+/// at the start of `ensure_cursor_in_window`). This lets a trackpad burst of N scroll events
+/// collapse into one server round-trip.
+fn scroll_lines(state: &mut AppState, delta: i64) {
+    state.pending_scroll_lines = state.pending_scroll_lines.saturating_add(delta);
+}
+
+/// Apply any accumulated `pending_scroll_lines` to the server via one `viewport/scroll` call.
+/// No-op if zero. Called before every draw and from inside `ensure_cursor_in_window` so the
+/// cursor-visibility check sees the user's intended scroll position.
+async fn flush_pending_scroll(client: &mut Client, state: &mut AppState) -> Result<()> {
+    if state.pending_scroll_lines == 0 {
+        return Ok(());
+    }
+    let delta = state.pending_scroll_lines;
+    state.pending_scroll_lines = 0;
+    let raw = if delta >= 0 {
         state.scroll_logical_line.saturating_add(delta as u32)
     } else {
         state.scroll_logical_line.saturating_sub((-delta) as u32)
     };
+    // Server-computed: highest scroll position that still puts the buffer's last visual row at
+    // the bottom of the viewport. Accounts for wrap (where one logical line can be multiple
+    // visual rows).
+    let target = raw.min(state.max_scroll_logical_line);
+    if target == state.scroll_logical_line {
+        return Ok(()); // no movement after clamping; skip the RPC
+    }
     scroll_to(client, state, target).await
 }
 
@@ -920,6 +984,8 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
         .await?;
     state.scroll_logical_line = target_line;
     state.window_first_logical_line = r.window.first_logical_line;
+    state.line_count = r.window.line_count;
+    state.max_scroll_logical_line = r.window.max_scroll_logical_line;
     state.lines = r.window.lines;
     Ok(())
 }
