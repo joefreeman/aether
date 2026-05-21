@@ -497,7 +497,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             state.should_quit = true;
         }
         (KeyCode::Esc, _) => {
-            // Drop the active search (clears highlights, disables n/Alt-n). Use `;` to drop the
+            // Drop the active search (clears highlights, disables n/Alt-n). Use `d` to drop the
             // current selection instead.
             if state.search.active || state.search.summary.is_some() {
                 let _ = client
@@ -507,7 +507,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             state.search.active = false;
             state.search.summary = None;
         }
-        (KeyCode::Char(';'), m) if m == KeyModifiers::NONE => {
+        (KeyCode::Char('d'), m) if m == KeyModifiers::NONE => {
             if state.cursor.anchor.is_some() {
                 clear_selection(client, state).await?;
             }
@@ -608,21 +608,21 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // and `Alt-x` picks the previous (or the current at end-of-line). The `Shift` variants
         // keep the other edge in place (extending); the non-shift variants collapse onto a single
         // line at the moved edge. The cursor stays on whichever end (top/bottom) it was on, so
-        // the bindings behave the same after `s` flips the selection direction.
+        // the bindings behave the same after `o` flips the selection direction.
         (KeyCode::Char('x'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             select_line(client, state, Direction::Forward, extend).await?,
         (KeyCode::Char('x'), m) if m.contains(KeyModifiers::ALT) =>
             select_line(client, state, Direction::Backward, extend).await?,
 
         // ---- selection manipulation ----
-        // Swap the cursor and anchor — flips which end of the selection is the "leading" edge,
-        // so a subsequent `Shift-*` motion extends from the other side.
-        (KeyCode::Char('s'), m) if m == KeyModifiers::NONE => swap_anchor(client, state).await?,
+        // `o` swaps the cursor and anchor — flips which end of the selection is the "leading"
+        // edge, so a subsequent `Shift-*` motion extends from the other side.
+        (KeyCode::Char('o'), m) if m == KeyModifiers::NONE => swap_anchor(client, state).await?,
 
         // Motion undo / redo — per-client history of cursor/selection changes, capped at the
-        // last buffer mutation. Distinct from `Ctrl-z`/`Ctrl-y` which rewind buffer edits.
-        (KeyCode::Char('z'), m) if m == KeyModifiers::NONE => motion_undo(client, state).await?,
-        (KeyCode::Char('y'), m) if m == KeyModifiers::NONE => motion_redo(client, state).await?,
+        // last buffer mutation. Distinct from `Ctrl-u`/`Ctrl-Alt-u` which rewind buffer edits.
+        (KeyCode::Char('u'), m) if m == ALT_ONLY => motion_redo(client, state).await?,
+        (KeyCode::Char('u'), m) if m == KeyModifiers::NONE => motion_undo(client, state).await?,
 
         // ---- mode transitions ----
         (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionStart).await?,
@@ -635,8 +635,9 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         // ---- edits ----
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
-        (KeyCode::Char('z'), CTRL_ONLY) => undo(client, state).await?,
-        (KeyCode::Char('y'), CTRL_ONLY) => redo(client, state).await?,
+        (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
+            redo(client, state).await?,
+        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state).await?,
         (KeyCode::Char('j'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Down).await?,
         (KeyCode::Char('k'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Up).await?,
         (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state).await?,
@@ -652,10 +653,15 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             delete_with_motion(client, state, Motion::Char { direction: Direction::Backward, count }).await?
         }
 
+        // ---- change ----
+        // `Ctrl-c` replaces the current selection (or the cursor's 1-char range) with a fresh
+        // edit — delete + enter Insert mode in one step.
+        (KeyCode::Char('c'), CTRL_ONLY) => change_selection(client, state).await?,
+
         // ---- clipboard ----
-        (KeyCode::Char('c'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Selection).await?,
+        (KeyCode::Char('y'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Selection).await?,
         (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Selection).await?,
-        (KeyCode::Char('v'), CTRL_ONLY) => paste_before(client, state).await?,
+        (KeyCode::Char('p'), CTRL_ONLY) => paste_before(client, state).await?,
         (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state).await?,
 
         // ---- search ----
@@ -678,15 +684,16 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
     match (code, mods) {
         (KeyCode::Esc, _) => leave_insert(state),
 
-        // Allow Ctrl-S/Z/Y to work in insert mode too.
+        // Allow Ctrl-S / Ctrl-U / Ctrl-Alt-U to work in insert mode too.
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
-        (KeyCode::Char('z'), CTRL_ONLY) => undo(client, state).await?,
-        (KeyCode::Char('y'), CTRL_ONLY) => redo(client, state).await?,
+        (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
+            redo(client, state).await?,
+        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state).await?,
 
         // Clipboard: in insert mode copy/cut operate on the current line.
-        (KeyCode::Char('c'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Line).await?,
+        (KeyCode::Char('y'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Line).await?,
         (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Line).await?,
-        (KeyCode::Char('v'), CTRL_ONLY) => paste_at_cursor(client, state).await?,
+        (KeyCode::Char('p'), CTRL_ONLY) => paste_at_cursor(client, state).await?,
 
         (KeyCode::Backspace, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Backward, count: 1 }).await?,
         (KeyCode::Delete, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count: 1 }).await?,
@@ -1271,6 +1278,20 @@ async fn insert_text_inner(
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
+    Ok(())
+}
+
+/// Delete the current selection (or the 1-char range at the cursor when there's no anchor) and
+/// enter Insert mode — the "change" operator. Server-side `apply_edit` treats the selection as
+/// the edit range when an anchor exists, so a forward Char(1) motion is just a placeholder.
+async fn change_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
+    delete_with_motion(
+        client,
+        state,
+        Motion::Char { direction: Direction::Forward, count: 1 },
+    )
+    .await?;
+    enter_insert_mode(state);
     Ok(())
 }
 
