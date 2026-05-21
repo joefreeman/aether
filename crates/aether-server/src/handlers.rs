@@ -9,6 +9,10 @@ use aether_protocol::buffer::{
     BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams, BufferOpenResult,
     BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
 };
+use aether_protocol::directory::{
+    DirectoryCreateParams, DirectoryCreateResult, DirectoryListParams, DirectoryListResult,
+    DirEntry,
+};
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
     SearchSetResult, SearchStateChanged, SearchSummary,
@@ -108,6 +112,7 @@ pub async fn buffer_open(
                 byte_count: buf.byte_count(),
                 revision: 0,
                 saved_revision: buf.saved_revision(),
+                path: None,
             };
             s.buffers.insert(id, buf);
             return Ok(result);
@@ -130,8 +135,30 @@ pub async fn buffer_open(
                 }
                 Some(r) => base.join(r),
             };
-            std::fs::canonicalize(&candidate)
-                .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", candidate.display())))?
+            // Canonicalize the parent (which must exist) and then re-attach the file name. This
+            // lets us resolve the absolute path even when `create_if_missing` is set and the
+            // file itself doesn't exist yet.
+            match std::fs::canonicalize(&candidate) {
+                Ok(p) => p,
+                Err(_) if params.create_if_missing => {
+                    let parent = candidate.parent().ok_or_else(|| {
+                        RpcError::invalid_path(format!("no parent for {}", candidate.display()))
+                    })?;
+                    let parent_canonical = std::fs::canonicalize(parent).map_err(|e| {
+                        RpcError::invalid_path(format!("canonicalizing {}: {e}", parent.display()))
+                    })?;
+                    let file_name = candidate.file_name().ok_or_else(|| {
+                        RpcError::invalid_path(format!("no file name in {}", candidate.display()))
+                    })?;
+                    parent_canonical.join(file_name)
+                }
+                Err(e) => {
+                    return Err(RpcError::invalid_path(format!(
+                        "canonicalizing {}: {e}",
+                        candidate.display()
+                    )));
+                }
+            }
         }
         (None, Some(_)) => {
             return Err(RpcError::invalid_params(
@@ -157,13 +184,19 @@ pub async fn buffer_open(
                 byte_count: buf.byte_count(),
                 revision: buf.revision,
                 saved_revision: buf.saved_revision(),
+                path: Some(canonical.display().to_string()),
             });
         }
     }
 
     let mut s = state.lock().await;
     let id = s.allocate_buffer_id();
-    let buf = Buffer::load_from_file(id, canonical.clone()).map_err(RpcError::file_io)?;
+    let buf = if params.create_if_missing && !canonical.exists() {
+        // New file: empty buffer with the target path attached. Save will write to disk.
+        Buffer::new_at_path(id, canonical.clone(), params.language.clone())
+    } else {
+        Buffer::load_from_file(id, canonical.clone()).map_err(RpcError::file_io)?
+    };
     let result = BufferOpenResult {
         buffer_id: id,
         language: buf.language.clone(),
@@ -171,6 +204,7 @@ pub async fn buffer_open(
         byte_count: buf.byte_count(),
         revision: buf.revision,
         saved_revision: buf.saved_revision(),
+        path: Some(canonical.display().to_string()),
     };
     s.buffers.insert(id, buf);
     tracing::info!(buffer_id = id, path = %canonical.display(), "buffer opened");
@@ -182,6 +216,127 @@ pub async fn buffer_open(
 /// Stateless regex search. Returns up to `MAX_MATCHES` matches; the client is responsible for
 /// stashing them and re-issuing the RPC after edits. Smartcase: case-insensitive unless the
 /// query has any uppercase character. An empty query returns an empty list.
+// ---- directory/* -------------------------------------------------------------------------------
+
+pub async fn directory_list(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: DirectoryListParams,
+) -> Result<DirectoryListResult, RpcError> {
+    let _ = ctx.require_hello()?;
+    let s = state.lock().await;
+
+    // Resolve the requested path. `None` means "first project path".
+    let raw_path = match params.path.as_deref() {
+        Some(p) => std::path::PathBuf::from(p),
+        None => s
+            .project_paths
+            .first()
+            .ok_or_else(|| RpcError::invalid_path("no project paths configured"))?
+            .clone(),
+    };
+    let canonical = std::fs::canonicalize(&raw_path)
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw_path.display())))?;
+    if !s.path_is_in_project(&canonical) {
+        return Err(RpcError::invalid_path(format!(
+            "{} is outside the project's access boundary",
+            canonical.display()
+        )));
+    }
+    let metadata = std::fs::metadata(&canonical).map_err(RpcError::file_io)?;
+    if !metadata.is_dir() {
+        return Err(RpcError::invalid_path(format!(
+            "{} is not a directory",
+            canonical.display()
+        )));
+    }
+
+    // The parent is allowed only if it's still inside the project.
+    let parent = canonical
+        .parent()
+        .and_then(|p| {
+            let p = p.to_path_buf();
+            if s.path_is_in_project(&p) { Some(p.display().to_string()) } else { None }
+        });
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+    let read = std::fs::read_dir(&canonical).map_err(RpcError::file_io)?;
+    for ent in read {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = match ent.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue, // non-UTF8 filename — skip
+        };
+        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        entries.push(DirEntry { name, is_dir });
+    }
+    // Directories first, then files, each alphabetical.
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
+    });
+
+    Ok(DirectoryListResult {
+        path: canonical.display().to_string(),
+        parent,
+        entries,
+    })
+}
+
+pub async fn directory_create(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: DirectoryCreateParams,
+) -> Result<DirectoryCreateResult, RpcError> {
+    let _ = ctx.require_hello()?;
+    let raw = std::path::PathBuf::from(&params.path);
+
+    // The target itself may not exist yet; canonicalize the nearest existing ancestor so we can
+    // validate the path is in the project even before creation.
+    let mut anchor = raw.clone();
+    loop {
+        if anchor.exists() {
+            break;
+        }
+        match anchor.parent() {
+            Some(p) if !p.as_os_str().is_empty() => anchor = p.to_path_buf(),
+            _ => return Err(RpcError::invalid_path(format!("no existing ancestor for {}", raw.display()))),
+        }
+    }
+    let anchor_canonical = std::fs::canonicalize(&anchor)
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", anchor.display())))?;
+    {
+        let s = state.lock().await;
+        if !s.path_is_in_project(&anchor_canonical) {
+            return Err(RpcError::invalid_path(format!(
+                "{} is outside the project's access boundary",
+                anchor_canonical.display()
+            )));
+        }
+    }
+
+    // Build the final target by suffixing the relative remainder onto the canonical anchor.
+    let suffix = raw
+        .strip_prefix(&anchor)
+        .unwrap_or_else(|_| std::path::Path::new(""))
+        .to_path_buf();
+    let target = anchor_canonical.join(&suffix);
+
+    if target.exists() && !target.is_dir() {
+        return Err(RpcError::invalid_path(format!(
+            "{} exists and is not a directory",
+            target.display()
+        )));
+    }
+    std::fs::create_dir_all(&target).map_err(RpcError::file_io)?;
+    let canonical = std::fs::canonicalize(&target).map_err(RpcError::file_io)?;
+    Ok(DirectoryCreateResult { path: canonical.display().to_string() })
+}
+
 // ---- search/* ----------------------------------------------------------------------------------
 
 pub const SEARCH_MAX_MATCHES: usize = 10_000;

@@ -4,6 +4,7 @@ use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::SharedState;
 use aether_protocol::buffer::{BufferCopy, BufferCut, BufferOpen, BufferSave};
+use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::cursor::{
     CursorMove, CursorRedo, CursorSelectLine, CursorSet, CursorSwapAnchor, CursorUndo,
@@ -143,6 +144,8 @@ async fn dispatch(
         ClientHello::NAME => run!(ClientHello, handlers::client_hello),
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
+        DirectoryList::NAME => run!(DirectoryList, handlers::directory_list),
+        DirectoryCreate::NAME => run!(DirectoryCreate, handlers::directory_create),
         SearchSet::NAME => run!(SearchSet, handlers::search_set),
         SearchClear::NAME => run!(SearchClear, handlers::search_clear),
         SearchNext::NAME => run!(SearchNext, handlers::search_next),

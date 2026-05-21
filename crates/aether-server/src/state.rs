@@ -283,6 +283,31 @@ impl Buffer {
         })
     }
 
+    /// Empty buffer with a target file path attached but no file on disk yet. Used by
+    /// `buffer/open` with `create_if_missing: true` — the file is created by `save_to_disk`
+    /// on the first save. Language is auto-detected from the extension if not provided.
+    pub fn new_at_path(id: BufferId, canonical: PathBuf, language: Option<String>) -> Self {
+        let text = ropey::Rope::new();
+        let language = language.or_else(|| detect_language(&canonical));
+        let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));
+        Buffer {
+            id,
+            canonical_path: Some(canonical),
+            text,
+            revision: 0,
+            language,
+            dirty: false,
+            line_ending: LineEnding::Lf,
+            last_modified_unix_ms: None,
+            syntax,
+            saved_revision: Some(0),
+            next_revision_id: 1,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            active_group: None,
+        }
+    }
+
     pub fn scratch(id: BufferId, language: Option<String>) -> Self {
         let text = ropey::Rope::new();
         let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));

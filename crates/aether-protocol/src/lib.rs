@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod buffer;
 pub mod cursor;
+pub mod directory;
 pub mod envelope;
 pub mod error;
 pub mod handshake;

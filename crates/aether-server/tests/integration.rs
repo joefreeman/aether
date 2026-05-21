@@ -125,6 +125,7 @@ async fn hello_then_open_file() {
             path_index: Some(0),
             relative_path: Some("hello.rs".into()),
             language: None,
+            create_if_missing: false,
         },
     )
     .await;
@@ -143,6 +144,7 @@ async fn hello_then_open_file() {
             path_index: Some(0),
             relative_path: Some("hello.rs".into()),
             language: None,
+            create_if_missing: false,
         },
     )
     .await;
@@ -207,6 +209,7 @@ async fn rejects_path_outside_project() {
                 path_index: Some(0),
                 relative_path: Some("../aether-outside-test.txt".into()),
                 language: None,
+                create_if_missing: false,
             })
             .unwrap(),
         ),
@@ -246,6 +249,7 @@ async fn viewport_subscribe_renders_window() {
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
+            create_if_missing: false,
         },
     )
     .await;
@@ -302,6 +306,7 @@ async fn viewport_subscribe_wraps_long_line() {
             path_index: Some(0),
             relative_path: Some("long.txt".into()),
             language: None,
+            create_if_missing: false,
         },
     )
     .await;
@@ -368,6 +373,7 @@ async fn viewport_scroll_returns_new_window() {
             path_index: Some(0),
             relative_path: Some("many.txt".into()),
             language: None,
+            create_if_missing: false,
         },
     )
     .await;
@@ -429,7 +435,7 @@ async fn setup_with_buffer(content: &str) -> (
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: Some(0), relative_path: Some("buf.txt".into()), language: None },
+        &BufferOpenParams { path_index: Some(0), relative_path: Some("buf.txt".into()), language: None, create_if_missing: false },
     )
     .await;
     (server, ws, open.buffer_id)
@@ -651,7 +657,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: Some(0), relative_path: Some("a.rs".into()), language: None },
+        &BufferOpenParams { path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false },
     )
     .await;
     assert_eq!(open.language.as_deref(), Some("rust"));
@@ -707,7 +713,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: Some(0), relative_path: Some("greet.txt".into()), language: None },
+        &BufferOpenParams { path_index: Some(0), relative_path: Some("greet.txt".into()), language: None, create_if_missing: false },
     )
     .await;
 
@@ -793,7 +799,7 @@ async fn save_preserves_crlf_endings() {
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: Some(0), relative_path: Some("windows.txt".into()), language: None },
+        &BufferOpenParams { path_index: Some(0), relative_path: Some("windows.txt".into()), language: None, create_if_missing: false },
     )
     .await;
 
@@ -828,7 +834,7 @@ async fn save_scratch_returns_buffer_has_no_path() {
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: None, relative_path: None, language: None },
+        &BufferOpenParams { path_index: None, relative_path: None, language: None, create_if_missing: false },
     )
     .await;
 

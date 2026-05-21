@@ -115,6 +115,7 @@ fn buffer_open_result_shape() {
         byte_count: 1234,
         revision: 0,
         saved_revision: 0,
+        path: None,
     })
     .unwrap();
     assert_eq!(v["buffer_id"], 42);
@@ -174,6 +175,7 @@ fn buffer_open_scratch_form() {
         path_index: None,
         relative_path: None,
         language: Some("rust".into()),
+        create_if_missing: false,
     })
     .unwrap();
     assert_eq!(v["path_index"], serde_json::Value::Null);

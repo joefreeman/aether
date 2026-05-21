@@ -14,11 +14,16 @@ impl RpcMethod for BufferOpen {
     type Result = BufferOpenResult;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BufferOpenParams {
     pub path_index: Option<u32>,
     pub relative_path: Option<String>,
     pub language: Option<String>,
+    /// When `true` and the target file doesn't exist on disk, the server creates an empty
+    /// buffer with the path set but no file on disk yet — the file gets created on the next
+    /// `buffer/save`. When `false` (the default) the server errors if the file is missing.
+    #[serde(default)]
+    pub create_if_missing: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +36,9 @@ pub struct BufferOpenResult {
     /// The revision at which this buffer was last persisted to disk (or `0` for a fresh scratch
     /// buffer). The client derives `dirty` as `revision != saved_revision`.
     pub saved_revision: Revision,
+    /// Canonical absolute path of the file on disk, when the buffer is backed by one. `None` for
+    /// scratch buffers. Lets the client (e.g. file-browser navigation) work in absolute paths.
+    pub path: Option<String>,
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------

@@ -5,8 +5,13 @@ use crate::client::Client;
 use crate::clipboard;
 use crate::ui;
 use aether_protocol::buffer::{
-    BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpenResult,
-    BufferSave, BufferSaveParams, BufferState, BufferStateParams, CopyScope,
+    BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
+    BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferState,
+    BufferStateParams, CopyScope,
+};
+use aether_protocol::directory::{
+    DirEntry, DirectoryCreate, DirectoryCreateParams, DirectoryList, DirectoryListParams,
+    DirectoryListResult,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNext, SearchPrev, SearchSet,
@@ -49,6 +54,37 @@ pub enum Mode {
     Normal,
     Insert,
     Search,
+    FileBrowser,
+}
+
+/// State for the directory listing UI. Populated when entering `Mode::FileBrowser` via `-`.
+#[derive(Debug, Default)]
+pub struct FileBrowserState {
+    /// Canonical absolute path of the directory currently being listed.
+    pub path: String,
+    /// Canonical absolute path of the parent (allowed) directory, or `None` if we're at a
+    /// project-root boundary.
+    pub parent: Option<String>,
+    pub entries: Vec<DirEntry>,
+    /// Highlight index into `entries`.
+    pub selected: usize,
+    /// Active prompt overlay (status bar takes over). `None` when navigating the listing.
+    pub prompt: Option<FileBrowserPrompt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileBrowserPrompt {
+    pub kind: FileBrowserPromptKind,
+    /// Text the user has typed so far.
+    pub input: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileBrowserPromptKind {
+    /// `Ctrl-n`: prompt for a filename, then open it as a new buffer (file created on save).
+    NewFile,
+    /// `Ctrl-Alt-n`: prompt for a directory name, then create it and step into it.
+    NewDirectory,
 }
 
 /// Captured state for a pending `f`/`t` keystroke — the next char the user types becomes the
@@ -143,6 +179,13 @@ pub struct AppState {
     /// abandoned every operation. `None` if the clipboard couldn't be initialised (e.g. headless).
     pub clipboard: Option<arboard::Clipboard>,
     pub search: SearchState,
+    /// Canonical absolute path of the current buffer's file on disk, if any. Used by the
+    /// file-browser entry point (`-`) to know which directory to open.
+    pub file_path: Option<String>,
+    /// Project paths declared at startup — used as the file-browser root when there's no
+    /// current file (scratch buffer).
+    pub project_paths: Vec<String>,
+    pub file_browser: FileBrowserState,
 }
 
 impl AppState {
@@ -176,6 +219,7 @@ pub async fn bootstrap(
                 path_index: Some(0),
                 relative_path: Some(f.into()),
                 language: None,
+                create_if_missing: false,
             },
             f.to_string(),
         ),
@@ -184,6 +228,7 @@ pub async fn bootstrap(
                 path_index: None,
                 relative_path: None,
                 language: None,
+                create_if_missing: false,
             },
             "[scratch]".to_string(),
         ),
@@ -231,6 +276,9 @@ pub async fn bootstrap(
         last_motion: None,
         clipboard: clipboard::new_handle(),
         search: SearchState::default(),
+        file_path: open.path.clone(),
+        project_paths: hello.project.paths.clone(),
+        file_browser: FileBrowserState::default(),
     })
 }
 
@@ -305,6 +353,7 @@ fn apply_cursor_style(mode: Mode) {
     let style = match mode {
         Mode::Normal => SetCursorStyle::SteadyBlock,
         Mode::Insert | Mode::Search => SetCursorStyle::SteadyBar,
+        Mode::FileBrowser => SetCursorStyle::SteadyBlock,
     };
     let _ = execute!(stdout(), style);
 }
@@ -374,6 +423,7 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
                 Mode::Normal => handle_normal_key(client, state, k).await?,
                 Mode::Insert => handle_insert_key(client, state, k).await?,
                 Mode::Search => handle_search_key(client, state, k).await?,
+                Mode::FileBrowser => handle_file_browser_key(client, state, k).await?,
             }
         }
         Event::Mouse(m) => handle_mouse_event(client, state, m).await?,
@@ -681,6 +731,11 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('p'), CTRL_ONLY) => paste_before(client, state, count).await?,
         (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state, count).await?,
 
+        // ---- file browser ----
+        // `-` lists the parent of the current file (or the first project path if scratch).
+        (KeyCode::Char('-'), m) if m == KeyModifiers::NONE =>
+            open_file_browser(client, state).await?,
+
         // ---- search ----
         (KeyCode::Char('/'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             enter_search_mode(client, state).await?,
@@ -722,11 +777,278 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Down, _) => move_motion(client, state, Motion::VisualLine { viewport_id: state.viewport_id, direction: VerticalDirection::Down, count: 1 }, false).await?,
 
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+            // `normalize_key` lowercased the char and synthesised SHIFT so the Ctrl-* bindings
+            // above can match consistently. Reverse that for actual text insertion.
+            let c = if m.contains(KeyModifiers::SHIFT) { c.to_ascii_uppercase() } else { c };
             insert_text(client, state, &c.to_string()).await?;
         }
 
         _ => {}
     }
+    Ok(())
+}
+
+/// Open the file browser, listing the parent directory of the current file (or the first project
+/// path for a scratch buffer). The previous buffer stays loaded server-side and is restored by
+/// `Esc`. The current file's entry is pre-selected in the listing so the user lands on it.
+async fn open_file_browser(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let file_name = state
+        .file_path
+        .as_ref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|os| os.to_str())
+        .map(|s| s.to_string());
+    let start = state
+        .file_path
+        .as_ref()
+        .and_then(|p| std::path::Path::new(p).parent().map(|p| p.display().to_string()));
+    load_file_browser(client, state, start).await?;
+    if let Some(name) = file_name {
+        select_entry_by_name(&mut state.file_browser, &name);
+    }
+    state.mode = Mode::FileBrowser;
+    apply_cursor_style(state.mode);
+    Ok(())
+}
+
+/// Move the highlight to the entry named `name`. No-op if no entry matches.
+fn select_entry_by_name(fb: &mut FileBrowserState, name: &str) {
+    if let Some(idx) = fb.entries.iter().position(|e| e.name == name) {
+        fb.selected = idx;
+    }
+}
+
+/// Ask the server for a directory listing and stash the result in `state.file_browser`.
+/// `path = None` lets the server default to the first project path.
+async fn load_file_browser(
+    client: &mut Client,
+    state: &mut AppState,
+    path: Option<String>,
+) -> Result<()> {
+    let result: DirectoryListResult = client
+        .rpc::<DirectoryList>(DirectoryListParams { path })
+        .await?;
+    state.file_browser = FileBrowserState {
+        path: result.path,
+        parent: result.parent,
+        entries: result.entries,
+        selected: 0,
+        prompt: None,
+    };
+    Ok(())
+}
+
+async fn handle_file_browser_key(
+    client: &mut Client,
+    state: &mut AppState,
+    k: KeyEvent,
+) -> Result<()> {
+    // Active prompt swallows input. Use the raw key (skipping `normalize_key`) so filenames keep
+    // their original casing.
+    if state.file_browser.prompt.is_some() {
+        return handle_file_browser_prompt_key(client, state, k).await;
+    }
+
+    let (code, mods) = normalize_key(k);
+    match (code, mods) {
+        (KeyCode::Char('q'), CTRL_ONLY) => state.should_quit = true,
+        (KeyCode::Char('n'), CTRL_ONLY) => begin_prompt(state, FileBrowserPromptKind::NewFile),
+        (KeyCode::Char('n'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
+            begin_prompt(state, FileBrowserPromptKind::NewDirectory),
+        (KeyCode::Esc, _) => leave_file_browser(state),
+        // Move the highlight.
+        (KeyCode::Char('j'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            if !state.file_browser.entries.is_empty() {
+                state.file_browser.selected =
+                    (state.file_browser.selected + 1).min(state.file_browser.entries.len() - 1);
+            }
+        }
+        (KeyCode::Char('k'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            state.file_browser.selected = state.file_browser.selected.saturating_sub(1);
+        }
+        (KeyCode::Down, _) => {
+            if !state.file_browser.entries.is_empty() {
+                state.file_browser.selected =
+                    (state.file_browser.selected + 1).min(state.file_browser.entries.len() - 1);
+            }
+        }
+        (KeyCode::Up, _) => {
+            state.file_browser.selected = state.file_browser.selected.saturating_sub(1);
+        }
+        // Go to the parent directory (clamped to the project boundary by the server). Pre-select
+        // the entry corresponding to the directory we're leaving so the user keeps their bearings.
+        (KeyCode::Char('-'), m) if m == KeyModifiers::NONE => {
+            if let Some(parent) = state.file_browser.parent.clone() {
+                let leaving = std::path::Path::new(&state.file_browser.path)
+                    .file_name()
+                    .and_then(|os| os.to_str())
+                    .map(|s| s.to_string());
+                load_file_browser(client, state, Some(parent)).await?;
+                if let Some(name) = leaving {
+                    select_entry_by_name(&mut state.file_browser, &name);
+                }
+            }
+        }
+        // Open the highlighted entry: descend if dir, switch to editing if file.
+        (KeyCode::Enter, _) => {
+            let Some(entry) = state.file_browser.entries.get(state.file_browser.selected) else {
+                return Ok(());
+            };
+            let entry_path = std::path::Path::new(&state.file_browser.path)
+                .join(&entry.name)
+                .display()
+                .to_string();
+            if entry.is_dir {
+                load_file_browser(client, state, Some(entry_path)).await?;
+            } else {
+                open_file_in_browser(client, state, entry_path).await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn leave_file_browser(state: &mut AppState) {
+    state.file_browser.prompt = None;
+    state.mode = Mode::Normal;
+    apply_cursor_style(state.mode);
+}
+
+fn begin_prompt(state: &mut AppState, kind: FileBrowserPromptKind) {
+    state.file_browser.prompt = Some(FileBrowserPrompt { kind, input: String::new() });
+    // Bar cursor while typing in the prompt — restored on commit/cancel.
+    let _ = execute!(stdout(), SetCursorStyle::SteadyBar);
+}
+
+async fn handle_file_browser_prompt_key(
+    client: &mut Client,
+    state: &mut AppState,
+    k: KeyEvent,
+) -> Result<()> {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => {
+            state.file_browser.prompt = None;
+            apply_cursor_style(state.mode);
+        }
+        (KeyCode::Enter, _) => {
+            let prompt = state.file_browser.prompt.take();
+            apply_cursor_style(state.mode);
+            if let Some(prompt) = prompt {
+                if !prompt.input.is_empty() {
+                    commit_prompt(client, state, prompt).await?;
+                }
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            if let Some(p) = state.file_browser.prompt.as_mut() {
+                p.input.pop();
+            }
+        }
+        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+            if let Some(p) = state.file_browser.prompt.as_mut() {
+                p.input.push(c);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn commit_prompt(
+    client: &mut Client,
+    state: &mut AppState,
+    prompt: FileBrowserPrompt,
+) -> Result<()> {
+    let target_abs = std::path::Path::new(&state.file_browser.path)
+        .join(&prompt.input)
+        .display()
+        .to_string();
+    match prompt.kind {
+        FileBrowserPromptKind::NewFile => {
+            open_file_in_browser_with_options(client, state, target_abs, true).await?;
+        }
+        FileBrowserPromptKind::NewDirectory => {
+            let result = client
+                .rpc::<DirectoryCreate>(DirectoryCreateParams { path: target_abs })
+                .await?;
+            // Step into the new directory.
+            load_file_browser(client, state, Some(result.path)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Switch the active buffer to the file at `path` and return to Normal mode. Subscribes a fresh
+/// viewport for the new buffer; the old viewport is left to be cleaned up by the server when the
+/// client disconnects (no `viewport/unsubscribe` here keeps the minimal slice minimal).
+async fn open_file_in_browser(
+    client: &mut Client,
+    state: &mut AppState,
+    abs_path: String,
+) -> Result<()> {
+    open_file_in_browser_with_options(client, state, abs_path, false).await
+}
+
+async fn open_file_in_browser_with_options(
+    client: &mut Client,
+    state: &mut AppState,
+    abs_path: String,
+    create_if_missing: bool,
+) -> Result<()> {
+    // Find a `path_index` + `relative_path` pair the server will accept. Each project path is
+    // either a file or a directory; we want the directory that contains the target.
+    let target = std::path::PathBuf::from(&abs_path);
+    let (path_index, relative) = state
+        .project_paths
+        .iter()
+        .enumerate()
+        .find_map(|(i, p)| {
+            let project_root = std::path::PathBuf::from(p);
+            target
+                .strip_prefix(&project_root)
+                .ok()
+                .map(|rel| (i as u32, rel.display().to_string()))
+        })
+        .ok_or_else(|| anyhow::anyhow!("file {} is outside any project path", abs_path))?;
+
+    let open: BufferOpenResult = client
+        .rpc::<BufferOpen>(BufferOpenParams {
+            path_index: Some(path_index),
+            relative_path: Some(relative.clone()),
+            language: None,
+            create_if_missing,
+        })
+        .await?;
+    let sub: ViewportSubscribeResult = client
+        .rpc::<ViewportSubscribe>(ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: state.viewport_cols,
+            rows: state.viewport_rows,
+            overscan_rows: state.viewport_rows,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: state.wrap,
+            continuation_marker_width: ui::CONTINUATION_MARKER_WIDTH,
+        })
+        .await?;
+
+    state.buffer_id = open.buffer_id;
+    state.viewport_id = sub.viewport_id;
+    state.cursor = CursorState::default();
+    state.scroll_logical_line = 0;
+    state.window_first_logical_line = sub.window.first_logical_line;
+    state.lines = sub.window.lines;
+    state.line_count = sub.window.line_count;
+    state.max_scroll_logical_line = sub.window.max_scroll_logical_line;
+    state.revision = open.revision;
+    state.saved_revision = open.saved_revision;
+    state.scroll_col = 0;
+    state.pending_scroll_lines = 0;
+    state.file_path = open.path.clone();
+    state.file_label = relative;
+    state.search = SearchState::default();
+    state.mode = Mode::Normal;
+    apply_cursor_style(state.mode);
     Ok(())
 }
 

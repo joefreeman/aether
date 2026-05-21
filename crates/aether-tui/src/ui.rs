@@ -42,9 +42,62 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(f.area());
-    draw_buffer(f, state, chunks[0]);
+    if matches!(state.mode, Mode::FileBrowser) {
+        draw_file_browser(f, state, chunks[0]);
+    } else {
+        draw_buffer(f, state, chunks[0]);
+    }
     draw_status(f, state, chunks[1]);
     place_terminal_cursor(f, state, chunks[0], chunks[1]);
+}
+
+fn draw_file_browser(f: &mut Frame, state: &AppState, area: Rect) {
+    let mut lines: Vec<Line> = Vec::with_capacity(state.file_browser.entries.len());
+    for (i, entry) in state.file_browser.entries.iter().enumerate() {
+        let highlighted = i == state.file_browser.selected;
+        let label = if entry.is_dir {
+            format!("{}/", entry.name)
+        } else {
+            entry.name.clone()
+        };
+        lines.push(Line::from(vec![Span::styled(
+            label,
+            entry_style(entry.is_dir, highlighted),
+        )]));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
+        area,
+    );
+}
+
+/// Strip the longest matching project-path prefix from `abs` and return what's left (or `abs`
+/// unchanged if no project path matches). Returns an empty string when the path *is* a project
+/// root — the caller decides how to render that.
+fn project_relative_path(abs: &str, project_paths: &[String]) -> String {
+    let abs_path = std::path::Path::new(abs);
+    let best = project_paths
+        .iter()
+        .filter_map(|p| {
+            let root = std::path::Path::new(p);
+            abs_path.strip_prefix(root).ok().map(|rel| (root, rel))
+        })
+        .max_by_key(|(root, _)| root.as_os_str().len());
+    match best {
+        Some((_, rel)) => rel.display().to_string(),
+        None => abs.to_string(),
+    }
+}
+
+fn entry_style(is_dir: bool, highlighted: bool) -> Style {
+    let mut style = Style::default();
+    if is_dir {
+        style = style.fg(NORD8);
+    }
+    if highlighted {
+        style = style.bg(NORD2);
+    }
+    style
 }
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
@@ -380,7 +433,19 @@ fn lookup_exact(name: &str) -> Option<Style> {
 
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let line = if matches!(state.mode, Mode::Search) {
+    let line = if matches!(state.mode, Mode::FileBrowser) {
+        if let Some(prompt) = state.file_browser.prompt.as_ref() {
+            let label = match prompt.kind {
+                crate::app::FileBrowserPromptKind::NewFile => "new file",
+                crate::app::FileBrowserPromptKind::NewDirectory => "new directory",
+            };
+            Line::from(vec![Span::raw(format!(" {label}: {}", prompt.input))])
+        } else {
+            let rel = project_relative_path(&state.file_browser.path, &state.project_paths);
+            let suffix = if rel.is_empty() { String::new() } else { format!(" {rel}/") };
+            Line::from(vec![Span::raw(format!(" [{}]{}", state.project_name, suffix))])
+        }
+    } else if matches!(state.mode, Mode::Search) {
         // Search-mode prompt takes over the status row. Append the live match-count summary
         // (derived from the search state at render time, not from `state.status`).
         let prompt = format!("/{}", state.search.query);
@@ -420,6 +485,7 @@ fn format_position(state: &AppState) -> String {
     let pos = state.cursor.position;
     match state.mode {
         Mode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
+        Mode::FileBrowser => String::new(),
         Mode::Normal | Mode::Search => {
             let (start, end_inclusive) = match state.cursor.anchor {
                 None => (pos, pos),
@@ -460,6 +526,29 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         let prompt_width = 1 + state.search.query.width() as u16;
         let col = status_area.x.saturating_add(prompt_width.min(status_area.width.saturating_sub(1)));
         f.set_cursor_position((col, status_area.y));
+        return;
+    }
+    if matches!(state.mode, Mode::FileBrowser) {
+        if let Some(prompt) = state.file_browser.prompt.as_ref() {
+            // Cursor sits at end of the prompt input on the status row. Label width matches the
+            // string built in `draw_status`: " <label>: " is `label.len() + 3` chars.
+            let label_len = match prompt.kind {
+                crate::app::FileBrowserPromptKind::NewFile => "new file".len(),
+                crate::app::FileBrowserPromptKind::NewDirectory => "new directory".len(),
+            };
+            let prefix_width = (label_len + 3) as u16; // " " + label + ": "
+            let col = status_area
+                .x
+                .saturating_add(prefix_width.saturating_add(prompt.input.width() as u16))
+                .min(status_area.x.saturating_add(status_area.width.saturating_sub(1)));
+            f.set_cursor_position((col, status_area.y));
+            return;
+        }
+        // Park the cursor at the highlighted listing entry. Entries start at row 0.
+        let row = buffer_area
+            .y
+            .saturating_add(state.file_browser.selected as u16);
+        f.set_cursor_position((buffer_area.x, row));
         return;
     }
     let Some((visual_row, visual_col)) = cursor_visual_position(state, buffer_area.height as u32)
