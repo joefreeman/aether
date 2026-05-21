@@ -296,13 +296,8 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             }
         }
 
-        // ---- motions: arrows kept alive ----
-        (KeyCode::Left, _) => move_motion(client, state, Motion::Char { direction: Direction::Backward, count }, extend).await?,
-        (KeyCode::Right, _) => move_motion(client, state, Motion::Char { direction: Direction::Forward, count }, extend).await?,
-        // Arrow up/down are visual-line motions so they walk wrapped rows naturally. Falls back
-        // to logical-line behavior server-side when `WrapMode::None`.
-        (KeyCode::Up, _) => move_motion(client, state, Motion::VisualLine { viewport_id: state.viewport_id, direction: VerticalDirection::Up, count }, extend).await?,
-        (KeyCode::Down, _) => move_motion(client, state, Motion::VisualLine { viewport_id: state.viewport_id, direction: VerticalDirection::Down, count }, extend).await?,
+        // ---- non-letter motions ----
+        // Home/End map to logical-line start/end; PageUp/Down scroll without moving the cursor.
         (KeyCode::Home, _) => move_motion(client, state, Motion::LineStart, extend).await?,
         (KeyCode::End, _) => move_motion(client, state, Motion::LineEnd, extend).await?,
         (KeyCode::PageDown, _) => {
@@ -314,13 +309,24 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             scroll_to(client, state, target).await?;
         }
 
-        // ---- motions: hjkl ----
+        // ---- motions: hjkl (logical) and Alt-hjkl (visual) ----
+        // `h/l/j/k` move by char and logical line; `Alt-h/l/j/k` move by visual row — start/end of
+        // the current visual row, and up/down by one visual row. The Alt variants are how you
+        // navigate inside wrapped lines.
+        (KeyCode::Char('h'), m) if m.contains(KeyModifiers::ALT) =>
+            move_motion(client, state, Motion::VisualLineStart { viewport_id: state.viewport_id }, extend).await?,
         (KeyCode::Char('h'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::Char { direction: Direction::Backward, count }, extend).await?,
+        (KeyCode::Char('l'), m) if m.contains(KeyModifiers::ALT) =>
+            move_motion(client, state, Motion::VisualLineEnd { viewport_id: state.viewport_id }, extend).await?,
         (KeyCode::Char('l'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::Char { direction: Direction::Forward, count }, extend).await?,
+        (KeyCode::Char('k'), m) if m.contains(KeyModifiers::ALT) =>
+            move_motion(client, state, Motion::VisualLine { viewport_id: state.viewport_id, direction: VerticalDirection::Up, count }, extend).await?,
         (KeyCode::Char('k'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::LogicalLine { direction: Direction::Backward, count, preserve_col: true }, extend).await?,
+        (KeyCode::Char('j'), m) if m.contains(KeyModifiers::ALT) =>
+            move_motion(client, state, Motion::VisualLine { viewport_id: state.viewport_id, direction: VerticalDirection::Down, count }, extend).await?,
         (KeyCode::Char('j'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::LogicalLine { direction: Direction::Forward, count, preserve_col: true }, extend).await?,
 
@@ -420,8 +426,8 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Tab, _) => insert_text(client, state, "\t").await?,
         (KeyCode::Left, _) => move_motion(client, state, Motion::Char { direction: Direction::Backward, count: 1 }, false).await?,
         (KeyCode::Right, _) => move_motion(client, state, Motion::Char { direction: Direction::Forward, count: 1 }, false).await?,
-        (KeyCode::Up, _) => move_motion(client, state, Motion::LogicalLine { direction: Direction::Backward, count: 1, preserve_col: true }, false).await?,
-        (KeyCode::Down, _) => move_motion(client, state, Motion::LogicalLine { direction: Direction::Forward, count: 1, preserve_col: true }, false).await?,
+        (KeyCode::Up, _) => move_motion(client, state, Motion::VisualLine { viewport_id: state.viewport_id, direction: VerticalDirection::Up, count: 1 }, false).await?,
+        (KeyCode::Down, _) => move_motion(client, state, Motion::VisualLine { viewport_id: state.viewport_id, direction: VerticalDirection::Down, count: 1 }, false).await?,
 
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
             insert_text(client, state, &c.to_string()).await?;
