@@ -37,6 +37,10 @@ impl RpcMethod for InputText {
 pub struct InputTextParams {
     pub buffer_id: BufferId,
     pub text: String,
+    /// If true, the post-edit cursor selects the just-inserted text (used by the paste path).
+    /// Default false: cursor lands just past the inserted text with no anchor.
+    #[serde(default)]
+    pub select_pasted: bool,
 }
 
 // ---- input/delete -------------------------------------------------------------------------------

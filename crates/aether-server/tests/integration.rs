@@ -2,8 +2,9 @@
 //! handshake and `buffer/open`.
 
 use aether_protocol::buffer::{
-    BufferOpen, BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams,
-    BufferSaveResult, BufferState, BufferStateParams,
+    BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
+    BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferSaveResult,
+    BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Motion,
@@ -555,7 +556,7 @@ async fn input_text_inserts_and_pushes_notification() {
     .await;
 
     let result: EditResult =
-        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "XY".into() }).await;
+        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "XY".into(), select_pasted: false }).await;
     assert_eq!(result.revision, 1);
 
     let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
@@ -727,7 +728,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let _edit: EditResult = send_request::<InputText>(
         &mut ws,
         6,
-        &InputTextParams { buffer_id: open.buffer_id, text: "!".into() },
+        &InputTextParams { buffer_id: open.buffer_id, text: "!".into(), select_pasted: false },
     )
     .await;
     // Drain the viewport/lines_changed pushed by the edit so it doesn't leak into the next test step.
@@ -833,6 +834,134 @@ async fn save_scratch_returns_buffer_has_no_path() {
 }
 
 #[tokio::test]
+async fn copy_selection_returns_inclusive_text() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta gamma\n").await;
+    // Move to col 6, extend forward 3 → selection "beta" (inclusive of position char).
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams { buffer_id, position: LogicalPosition { line: 0, col: 6 }, anchor: None },
+    )
+    .await;
+    let _: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        11,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Char { direction: Direction::Forward, count: 3 },
+            extend_selection: true,
+        },
+    )
+    .await;
+    let r: BufferCopyResult = send_request::<BufferCopy>(
+        &mut ws,
+        12,
+        &BufferCopyParams { buffer_id, scope: CopyScope::Selection },
+    )
+    .await;
+    assert_eq!(r.text, "beta");
+    drop(server);
+}
+
+#[tokio::test]
+async fn copy_line_returns_full_line_with_newline() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("first\nsecond\nthird\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams { buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None },
+    )
+    .await;
+    let r: BufferCopyResult = send_request::<BufferCopy>(
+        &mut ws,
+        11,
+        &BufferCopyParams { buffer_id, scope: CopyScope::Line },
+    )
+    .await;
+    assert_eq!(r.text, "second\n");
+    drop(server);
+}
+
+#[tokio::test]
+async fn cut_selection_deletes_and_returns_text() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta gamma\n").await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::Soft,
+        },
+    )
+    .await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams { buffer_id, position: LogicalPosition { line: 0, col: 6 }, anchor: None },
+    )
+    .await;
+    let _: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        12,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Char { direction: Direction::Forward, count: 3 },
+            extend_selection: true,
+        },
+    )
+    .await;
+    let r: BufferCutResult = send_request::<BufferCut>(
+        &mut ws,
+        13,
+        &BufferCopyParams { buffer_id, scope: CopyScope::Selection },
+    )
+    .await;
+    assert_eq!(r.text, "beta");
+    assert!(r.dirty);
+    let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "alpha  gamma");
+    drop(server);
+}
+
+#[tokio::test]
+async fn input_text_with_select_pasted_makes_selection() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams { buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        11,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::Soft,
+        },
+    )
+    .await;
+    let edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        12,
+        &InputTextParams { buffer_id, text: "XYZ".into(), select_pasted: true },
+    )
+    .await;
+    // Anchor at col 0 ('X'), position at col 2 (block on 'Z') — selection covers "XYZ".
+    assert_eq!(edit.cursor.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(edit.cursor.position, LogicalPosition { line: 0, col: 2 });
+    drop(server);
+}
+
+#[tokio::test]
 async fn undo_reverts_recent_edit_and_redo_reapplies() {
     let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
 
@@ -861,7 +990,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     )
     .await;
     let edit: EditResult =
-        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "XY".into() }).await;
+        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "XY".into(), select_pasted: false }).await;
     assert!(edit.dirty);
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
@@ -922,7 +1051,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
     .await;
     // Edit #1: insert "X"
     let _e1: EditResult =
-        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "X".into() }).await;
+        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "X".into(), select_pasted: false }).await;
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     // Save.
@@ -1124,7 +1253,7 @@ async fn input_text_with_selection_replaces_it() {
     let result: EditResult = send_request::<InputText>(
         &mut ws,
         13,
-        &InputTextParams { buffer_id, text: "DELTA".into() },
+        &InputTextParams { buffer_id, text: "DELTA".into(), select_pasted: false },
     )
     .await;
     assert_eq!(result.revision, 1);

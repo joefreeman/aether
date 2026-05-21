@@ -1,6 +1,8 @@
 mod app;
 mod client;
+mod clipboard;
 mod discovery;
+mod stderr_capture;
 mod ui;
 
 use clap::Parser;
@@ -29,8 +31,13 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // tracing logs go to stderr; not visible while in the alt screen but useful for debugging
-    // when invoked with `2>>/tmp/ae.log`.
+    // Capture stderr for the lifetime of the program so log/panic/library output never lands
+    // mid-frame on the alt-screen TUI. The capture is replayed to the real stderr on drop
+    // (at process exit), which happens *after* `restore_terminal` thanks to the variable's
+    // late drop order at the end of `main`.
+    let _stderr_capture = stderr_capture::StderrCapture::install().ok();
+
+    // Tracing writes to (captured) stderr. The user sees logs after the editor exits.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

@@ -27,4 +27,6 @@ anyhow.workspace = true
 
 ratatui.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
+arboard.workspace = true
 directories = "5"
+libc = "0.2"

@@ -6,8 +6,8 @@ use crate::state::{Buffer, ClientSession, EditKindTag, ServerState, SharedState,
 use crate::wrap;
 use std::collections::HashMap;
 use aether_protocol::buffer::{
-    BufferOpenParams, BufferOpenResult, BufferSaveParams, BufferSaveResult, BufferState,
-    BufferStateParams,
+    BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams, BufferOpenResult,
+    BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMoveParams, CursorSetParams, CursorState, Motion,
@@ -170,6 +170,114 @@ pub async fn buffer_open(
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------
+
+pub async fn buffer_copy(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferCopyParams,
+) -> Result<BufferCopyResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let cursor = s.cursors.get(&(client_id, params.buffer_id)).copied().unwrap_or_default();
+    let (start, end) = scope_range(buf, &cursor, params.scope);
+    let text = buf.text.slice(start..end).to_string();
+    Ok(BufferCopyResult { text })
+}
+
+pub async fn buffer_cut(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferCopyParams,
+) -> Result<BufferCutResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+
+    // Extract the text and compute the range while holding the lock; then apply the deletion via
+    // `Buffer::apply_edit` (which handles the undo entry and tree update) and broadcast.
+    let mut s = state.lock().await;
+    let cursor = s.cursors.get(&(client_id, params.buffer_id)).copied().unwrap_or_default();
+    let buf_ref = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let (start_char, end_char) = scope_range(buf_ref, &cursor, params.scope);
+    let text = buf_ref.text.slice(start_char..end_char).to_string();
+    let start_pos = motion::char_to_pos(buf_ref, start_char);
+    let end_pos_exclusive = motion::char_to_pos(buf_ref, end_char);
+    let old_first_line = start_pos.line;
+    let old_last_line_excl = end_pos_exclusive.line.saturating_add(1);
+
+    let cursors_before: HashMap<ClientId, CursorState> = s
+        .cursors
+        .iter()
+        .filter_map(|((c, b), cs)| if *b == params.buffer_id { Some((*c, *cs)) } else { None })
+        .collect();
+
+    let buf_mut = s.buffers.get_mut(&params.buffer_id).expect("just checked");
+    let revision = buf_mut.apply_edit(start_char, end_char, "", EditKindTag::Delete, cursors_before);
+    let new_cursor = CursorState { position: motion::char_to_pos(buf_mut, start_char), anchor: None };
+    s.cursors.insert((client_id, params.buffer_id), new_cursor);
+
+    let dirty = s.buffers[&params.buffer_id].dirty;
+    let buf_ref = &s.buffers[&params.buffer_id];
+
+    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    for vp in s.viewports.values() {
+        if vp.buffer_id != params.buffer_id {
+            continue;
+        }
+        if !ranges_overlap(vp.first_logical_line, vp.last_logical_line_exclusive, old_first_line, old_last_line_excl) {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision)));
+    }
+    let new_line_count = buf_ref.line_count();
+    for vp in s.viewports.values_mut() {
+        if vp.buffer_id != params.buffer_id {
+            continue;
+        }
+        vp.first_logical_line = vp.first_logical_line.min(new_line_count);
+        vp.last_logical_line_exclusive = vp.last_logical_line_exclusive.min(new_line_count);
+    }
+
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    Ok(BufferCutResult { text, revision, cursor: new_cursor, dirty })
+}
+
+/// Compute the `[start_char, end_char)` range for a copy/cut scope.
+fn scope_range(buf: &Buffer, cursor: &CursorState, scope: CopyScope) -> (usize, usize) {
+    match scope {
+        CopyScope::Selection => {
+            if let Some(anchor) = cursor.anchor {
+                let (start_pos, end_pos) = motion::ordered(cursor.position, anchor);
+                let start = motion::pos_to_char(buf, start_pos);
+                let end = motion::pos_to_char(buf, end_pos);
+                (start, (end + 1).min(buf.text.len_chars()))
+            } else {
+                let start = motion::pos_to_char(buf, cursor.position);
+                (start, (start + 1).min(buf.text.len_chars()))
+            }
+        }
+        CopyScope::Line => {
+            let line = cursor.position.line as usize;
+            let start = buf.text.line_to_char(line);
+            let end = if line + 1 < buf.text.len_lines() {
+                buf.text.line_to_char(line + 1)
+            } else {
+                buf.text.len_chars()
+            };
+            (start, end)
+        }
+    }
+}
 
 pub async fn buffer_save(
     state: &SharedState,
@@ -530,7 +638,13 @@ pub async fn input_text(
     params: InputTextParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.require_hello()?;
-    apply_edit(state, client_id, params.buffer_id, EditKind::ReplaceWith(params.text)).await
+    apply_edit(
+        state,
+        client_id,
+        params.buffer_id,
+        EditKind::ReplaceWith { text: params.text, select_pasted: params.select_pasted },
+    )
+    .await
 }
 
 pub async fn input_delete(
@@ -823,8 +937,9 @@ fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
 }
 
 enum EditKind {
-    /// Replace the selection with `text` (insert at cursor if no selection).
-    ReplaceWith(String),
+    /// Replace the selection with `text` (insert at cursor if no selection). If `select_pasted`
+    /// is true, the post-edit cursor selects the inserted text instead of collapsing past it.
+    ReplaceWith { text: String, select_pasted: bool },
     /// Delete from cursor through the motion's endpoint, or the selection if any.
     DeleteMotion(Motion),
 }
@@ -849,16 +964,16 @@ async fn apply_edit(
         motion::ordered(cursor.position, anchor)
     } else {
         match &edit {
-            EditKind::ReplaceWith(_) => (cursor.position, cursor.position),
+            EditKind::ReplaceWith { .. } => (cursor.position, cursor.position),
             EditKind::DeleteMotion(m) => {
                 let target = motion::resolve_motion(buf, cursor.position, m);
                 motion::ordered(cursor.position, target)
             }
         }
     };
-    let insert_text: &str = match &edit {
-        EditKind::ReplaceWith(t) => t.as_str(),
-        EditKind::DeleteMotion(_) => "",
+    let (insert_text, select_pasted): (&str, bool) = match &edit {
+        EditKind::ReplaceWith { text, select_pasted } => (text.as_str(), *select_pasted),
+        EditKind::DeleteMotion(_) => ("", false),
     };
 
     let start_char = motion::pos_to_char(buf, start_pos);
@@ -874,7 +989,7 @@ async fn apply_edit(
     let old_first_line = start_pos.line;
     let old_last_line = end_pos.line;
     let kind_tag = match &edit {
-        EditKind::ReplaceWith(_) => EditKindTag::Text,
+        EditKind::ReplaceWith { .. } => EditKindTag::Text,
         EditKind::DeleteMotion(_) => EditKindTag::Delete,
     };
 
@@ -889,13 +1004,25 @@ async fn apply_edit(
     let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
     let revision = buf_mut.apply_edit(start_char, end_char, insert_text, kind_tag, cursors_before);
 
-    // Compute the cursor's new position: just past the inserted text.
+    // Compute the cursor's new position.
     let inserted_char_count = insert_text.chars().count();
-    let new_cursor_char = start_char + inserted_char_count;
-    let new_cursor_pos = motion::char_to_pos(buf_mut, new_cursor_char);
-
-    s.cursors
-        .insert((client_id, buffer_id), CursorState { position: new_cursor_pos, anchor: None });
+    let new_cursor_state = if select_pasted && inserted_char_count > 0 {
+        // After pasting, select the inserted text. Block cursor on the last inserted char.
+        let last_char = start_char + inserted_char_count - 1;
+        let anchor_pos = motion::char_to_pos(buf_mut, start_char);
+        let position_pos = motion::char_to_pos(buf_mut, last_char);
+        if anchor_pos == position_pos {
+            CursorState { position: position_pos, anchor: None }
+        } else {
+            CursorState { position: position_pos, anchor: Some(anchor_pos) }
+        }
+    } else {
+        CursorState {
+            position: motion::char_to_pos(buf_mut, start_char + inserted_char_count),
+            anchor: None,
+        }
+    };
+    s.cursors.insert((client_id, buffer_id), new_cursor_state);
 
     // Collect notifications for all viewports whose pushed range intersects the edit.
     let edit_first = old_first_line;
@@ -933,11 +1060,7 @@ async fn apply_edit(
         let _ = sender.send(notif).await;
     }
 
-    Ok(EditResult {
-        revision,
-        cursor: CursorState { position: new_cursor_pos, anchor: None },
-        dirty,
-    })
+    Ok(EditResult { revision, cursor: new_cursor_state, dirty })
 }
 
 fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) -> bool {

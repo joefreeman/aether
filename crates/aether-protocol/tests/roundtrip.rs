@@ -101,8 +101,8 @@ fn cursor_move_params_use_motion() {
 
 #[test]
 fn input_text_params() {
-    let v = to_value(InputTextParams { buffer_id: 1, text: "hi".into() }).unwrap();
-    assert_eq!(v, json!({"buffer_id": 1, "text": "hi"}));
+    let v = to_value(InputTextParams { buffer_id: 1, text: "hi".into(), select_pasted: false }).unwrap();
+    assert_eq!(v, json!({"buffer_id": 1, "text": "hi", "select_pasted": false}));
 }
 
 #[test]

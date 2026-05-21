@@ -2,9 +2,11 @@
 //! server has no notion of mode.
 
 use crate::client::Client;
+use crate::clipboard;
 use crate::ui;
 use aether_protocol::buffer::{
-    BufferOpenResult, BufferSave, BufferSaveParams, BufferState, BufferStateParams,
+    BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpenResult,
+    BufferSave, BufferSaveParams, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Motion,
@@ -55,6 +57,9 @@ pub struct AppState {
     pub mode: Mode,
     /// Digit-prefix count for the next motion. Reset after consumption.
     pub pending_count: u32,
+    /// System clipboard handle. Held for the app's lifetime so the X11 selection isn't
+    /// abandoned every operation. `None` if the clipboard couldn't be initialised (e.g. headless).
+    pub clipboard: Option<arboard::Clipboard>,
 }
 
 pub async fn bootstrap(
@@ -126,6 +131,7 @@ pub async fn bootstrap(
         status: String::new(),
         mode: Mode::Normal,
         pending_count: 0,
+        clipboard: clipboard::new_handle(),
     })
 }
 
@@ -333,7 +339,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // ---- edits ----
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
         (KeyCode::Char('z'), CTRL_ONLY) => undo(client, state).await?,
-        (KeyCode::Char('r'), CTRL_ONLY) => redo(client, state).await?,
+        (KeyCode::Char('y'), CTRL_ONLY) => redo(client, state).await?,
         (KeyCode::Char('j'), CTRL_ONLY) => join_lines(client, state).await?,
         (KeyCode::Char('d'), CTRL_ONLY) | (KeyCode::Delete, _) => {
             delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count }).await?
@@ -341,6 +347,12 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Backspace, _) => {
             delete_with_motion(client, state, Motion::Char { direction: Direction::Backward, count }).await?
         }
+
+        // ---- clipboard ----
+        (KeyCode::Char('c'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Selection).await?,
+        (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Selection).await?,
+        (KeyCode::Char('v'), CTRL_ONLY) => paste_before(client, state).await?,
+        (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state).await?,
 
         _ => {}
     }
@@ -352,10 +364,15 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
     match (code, mods) {
         (KeyCode::Esc, _) => leave_insert(state),
 
-        // Allow Ctrl-S/Z/R to work in insert mode too — handy.
+        // Allow Ctrl-S/Z/Y to work in insert mode too.
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
         (KeyCode::Char('z'), CTRL_ONLY) => undo(client, state).await?,
-        (KeyCode::Char('r'), CTRL_ONLY) => redo(client, state).await?,
+        (KeyCode::Char('y'), CTRL_ONLY) => redo(client, state).await?,
+
+        // Clipboard: in insert mode copy/cut operate on the current line.
+        (KeyCode::Char('c'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Line).await?,
+        (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Line).await?,
+        (KeyCode::Char('v'), CTRL_ONLY) => paste_at_cursor(client, state).await?,
 
         (KeyCode::Backspace, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Backward, count: 1 }).await?,
         (KeyCode::Delete, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count: 1 }).await?,
@@ -526,8 +543,21 @@ fn max_pos(a: LogicalPosition, b: LogicalPosition) -> LogicalPosition {
 }
 
 async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> Result<()> {
+    insert_text_inner(client, state, text, false).await
+}
+
+async fn insert_text_inner(
+    client: &mut Client,
+    state: &mut AppState,
+    text: &str,
+    select_pasted: bool,
+) -> Result<()> {
     let r: EditResult = client
-        .rpc::<InputText>(InputTextParams { buffer_id: state.buffer_id, text: text.into() })
+        .rpc::<InputText>(InputTextParams {
+            buffer_id: state.buffer_id,
+            text: text.into(),
+            select_pasted,
+        })
         .await?;
     state.revision = r.revision;
     state.cursor = r.cursor;
@@ -553,6 +583,84 @@ async fn join_lines(client: &mut Client, state: &mut AppState) -> Result<()> {
     state.cursor = r.cursor;
     state.dirty = r.dirty;
     Ok(())
+}
+
+async fn copy_to_clipboard(client: &mut Client, state: &mut AppState, scope: CopyScope) -> Result<()> {
+    let r: BufferCopyResult = client
+        .rpc::<BufferCopy>(BufferCopyParams { buffer_id: state.buffer_id, scope })
+        .await?;
+    let len = r.text.len();
+    match clipboard::copy(&mut state.clipboard, r.text) {
+        Ok(()) => state.status = format!("copied {len} bytes"),
+        Err(e) => state.status = format!("copy failed: {e}"),
+    }
+    Ok(())
+}
+
+async fn cut_to_clipboard(client: &mut Client, state: &mut AppState, scope: CopyScope) -> Result<()> {
+    let r: BufferCutResult = client
+        .rpc::<BufferCut>(BufferCopyParams { buffer_id: state.buffer_id, scope })
+        .await?;
+    state.revision = r.revision;
+    state.cursor = r.cursor;
+    state.dirty = r.dirty;
+    let len = r.text.len();
+    match clipboard::copy(&mut state.clipboard, r.text) {
+        Ok(()) => state.status = format!("cut {len} bytes"),
+        Err(e) => state.status = format!("cut to clipboard failed: {e}"),
+    }
+    Ok(())
+}
+
+/// Normal-mode paste: insert clipboard content *before* the selection's start and select the
+/// pasted text.
+async fn paste_before(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let text = match clipboard::paste(&mut state.clipboard) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("paste failed: {e}");
+            return Ok(());
+        }
+    };
+    // Collapse to the start of the selection (or stay put if no anchor).
+    let start = match state.cursor.anchor {
+        Some(anchor) => min_pos(state.cursor.position, anchor),
+        None => state.cursor.position,
+    };
+    let new = client
+        .rpc::<CursorSet>(CursorSetParams {
+            buffer_id: state.buffer_id,
+            position: start,
+            anchor: None,
+        })
+        .await?;
+    state.cursor = new;
+    insert_text_inner(client, state, &text, true).await
+}
+
+/// Normal-mode paste-replace: replace the current selection (or the cursor char) with the
+/// clipboard content and select what was pasted.
+async fn paste_replace(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let text = match clipboard::paste(&mut state.clipboard) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("paste failed: {e}");
+            return Ok(());
+        }
+    };
+    insert_text_inner(client, state, &text, true).await
+}
+
+/// Insert-mode paste: just insert at the cursor, no selection of the inserted text.
+async fn paste_at_cursor(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let text = match clipboard::paste(&mut state.clipboard) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("paste failed: {e}");
+            return Ok(());
+        }
+    };
+    insert_text_inner(client, state, &text, false).await
 }
 
 async fn undo(client: &mut Client, state: &mut AppState) -> Result<()> {

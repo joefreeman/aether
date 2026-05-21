@@ -1,5 +1,6 @@
 //! Buffer lifecycle messages — §6 of the protocol doc.
 
+use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::{BufferId, Revision};
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,51 @@ impl RpcMethod for BufferClose {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BufferCloseParams {
     pub buffer_id: BufferId,
+}
+
+// ---- buffer/copy & buffer/cut -------------------------------------------------------------------
+
+pub struct BufferCopy;
+impl RpcMethod for BufferCopy {
+    const NAME: &'static str = "buffer/copy";
+    type Params = BufferCopyParams;
+    type Result = BufferCopyResult;
+}
+
+pub struct BufferCut;
+impl RpcMethod for BufferCut {
+    const NAME: &'static str = "buffer/cut";
+    type Params = BufferCopyParams;
+    type Result = BufferCutResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferCopyParams {
+    pub buffer_id: BufferId,
+    pub scope: CopyScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyScope {
+    /// The current selection (always ≥1 char in normal mode: an explicit selection if anchor is
+    /// set, the implicit 1-char range at the cursor otherwise).
+    Selection,
+    /// The cursor's current logical line, including its trailing newline.
+    Line,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferCopyResult {
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferCutResult {
+    pub text: String,
+    pub revision: Revision,
+    pub cursor: CursorState,
+    pub dirty: bool,
 }
 
 // ---- buffer/state (notification) ----------------------------------------------------------------
