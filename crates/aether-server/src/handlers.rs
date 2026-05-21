@@ -224,6 +224,7 @@ pub async fn buffer_cut(
     let new_cursor = CursorState { position: motion::char_to_pos(buf_mut, start_char), anchor: None };
     s.cursors.insert((client_id, params.buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(params.buffer_id);
+    s.clear_virtual_col_for_buffer(params.buffer_id);
 
     let dirty = s.buffers[&params.buffer_id].dirty;
     let buf_ref = &s.buffers[&params.buffer_id];
@@ -626,6 +627,9 @@ pub async fn cursor_move(
     // Visual motions need viewport state (wrap mode + width). Look it up and dispatch to the
     // dedicated resolver; everything else goes through `resolve_motion` which only needs the
     // buffer.
+    let virtual_col_in = s.virtual_col.get(&key).copied();
+    // `Some(col)` → set virtual col to `col`; `None` → clear it. Only `VisualLine` preserves it.
+    let mut new_virtual_col: Option<u32> = None;
     let new_pos = match &params.motion {
         Motion::VisualLine { viewport_id, direction, count } => {
             let vp = s.viewports.get(viewport_id).ok_or_else(|| {
@@ -634,15 +638,18 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line(
+            let (pos, target_vcol) = motion::resolve_visual_line(
                 buf,
                 vp.wrap,
                 vp.cols,
                 vp.continuation_marker_width,
                 current.position,
+                virtual_col_in,
                 *direction,
                 *count,
-            )
+            );
+            new_virtual_col = Some(target_vcol);
+            pos
         }
         Motion::VisualLineStart { viewport_id } => {
             let vp = s.viewports.get(viewport_id).ok_or_else(|| {
@@ -662,6 +669,18 @@ pub async fn cursor_move(
             })?;
             motion::resolve_visual_line_end(buf, vp.wrap, vp.cols, vp.continuation_marker_width, current.position)
         }
+        Motion::LogicalLine { direction, count, preserve_col } => {
+            let (pos, target_vcol) = motion::resolve_logical_line(
+                buf,
+                current.position,
+                virtual_col_in,
+                *direction,
+                *count,
+                *preserve_col,
+            );
+            new_virtual_col = target_vcol;
+            pos
+        }
         _ => motion::resolve_motion(buf, current.position, &params.motion),
     };
     let new_anchor = if params.extend_selection {
@@ -678,6 +697,14 @@ pub async fn cursor_move(
     let new_state = CursorState { position: new_pos, anchor: new_anchor };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
+    match new_virtual_col {
+        Some(col) => {
+            s.virtual_col.insert(key, col);
+        }
+        None => {
+            s.virtual_col.remove(&key);
+        }
+    }
     Ok(new_state)
 }
 
@@ -780,6 +807,7 @@ pub async fn cursor_select_line(
     let new_state = CursorState { position: cursor_pos, anchor };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
+    s.virtual_col.remove(&key);
     Ok(new_state)
 }
 
@@ -801,6 +829,7 @@ pub async fn cursor_swap_anchor(
     };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
+    s.virtual_col.remove(&key);
     Ok(new_state)
 }
 
@@ -826,6 +855,7 @@ pub async fn cursor_set(
     let result = CursorState { position, anchor };
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
+    s.virtual_col.remove(&key);
     Ok(result)
 }
 
@@ -854,6 +884,7 @@ pub async fn cursor_undo(
     }
 
     s.cursors.insert(key, prev);
+    s.virtual_col.remove(&key);
     Ok(CursorUndoResult { applied: true, cursor: prev })
 }
 
@@ -881,6 +912,7 @@ pub async fn cursor_redo(
     }
 
     s.cursors.insert(key, next);
+    s.virtual_col.remove(&key);
     Ok(CursorUndoResult { applied: true, cursor: next })
 }
 
@@ -1036,6 +1068,8 @@ pub async fn input_join_lines(
         let dirty = buf.dirty;
         s.cursors.insert((client_id, buffer_id), new_cursor);
         s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_virtual_col_for_buffer(buffer_id);
+        s.clear_virtual_col_for_buffer(buffer_id);
         (revision, dirty, new_cursor)
     };
 
@@ -1148,6 +1182,7 @@ async fn apply_undo_or_redo(
         s.cursors.insert((*cid, buffer_id), *cursor);
     }
     s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_virtual_col_for_buffer(buffer_id);
     let undoing_cursor =
         new_cursors.get(&client_id).copied().unwrap_or_else(CursorState::default);
 
@@ -1280,6 +1315,7 @@ async fn apply_edit(
     };
     s.cursors.insert((client_id, buffer_id), new_cursor_state);
     s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_virtual_col_for_buffer(buffer_id);
 
     // Collect notifications for all viewports whose pushed range intersects the edit.
     let edit_first = old_first_line;

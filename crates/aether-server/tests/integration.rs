@@ -1876,6 +1876,162 @@ async fn viewport_set_wrap_changes_visible_rows() {
     drop(server);
 }
 
+// ---- virtual column -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn virtual_col_prevents_drift_through_continuation_rows() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abcdefghijklmnopqrst\n").await;
+    // With cols=10, marker_width=2, line 0 wraps to 3 rows:
+    //   row 0 byte 0..10 = "abcdefghij" (prefix 0)
+    //   row 1 byte 10..18 = "klmnopqr"  (prefix 2 — continuation marker)
+    //   row 2 byte 18..20 = "st"        (prefix 2)
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+        continuation_marker_width: 2,
+    }).await;
+    let viewport_id = sub.viewport_id;
+
+    // Start at byte 1 (visual col 1 on row 0, prefix 0).
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 1 }, anchor: None,
+    }).await;
+
+    // Alt-j: visual col 1 < prefix 2 on row 1, so cursor clamps to start of row 1's text (byte 10).
+    // The remembered virtual col stays at 1.
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 10 });
+
+    // Alt-k: with virtual_col=1, target visual col is 1. On row 0 (prefix 0), byte = 1. We end
+    // back where we started, not at byte 2 (which is what naive preserve-col would do).
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 13, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 1 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
+    // The classic vim virtual-col case: j down through an empty line should land you back at
+    // your original column on the next non-empty line, not stick at col 0.
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello world\n\nanother line\n").await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 80, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+        continuation_marker_width: 2,
+    }).await;
+
+    // Start at col 5 of line 0.
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 5 }, anchor: None,
+    }).await;
+
+    // j → empty line 1; col clamps to 0 but virtual_col holds 5.
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::LogicalLine { direction: Direction::Forward, count: 1, preserve_col: true },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 0 });
+
+    // j → line 2 with content; virtual_col restores col 5.
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 13, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::LogicalLine { direction: Direction::Forward, count: 1, preserve_col: true },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn virtual_col_cleared_by_horizontal_motion() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abcdefghijklmnopqrst\n").await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+        continuation_marker_width: 2,
+    }).await;
+    let viewport_id = sub.viewport_id;
+
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 1 }, anchor: None,
+    }).await;
+    send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
+        extend_selection: false,
+    }).await;
+    // Cursor now at byte 10 (visual col 2 = prefix); virtual_col stashed = 1.
+
+    // Char Forward (a horizontal motion) clears the virtual col. Cursor at byte 11, visual col 3.
+    send_request::<CursorMove>(&mut ws, 13, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::Char { direction: Direction::Forward, count: 1 },
+        extend_selection: false,
+    }).await;
+
+    // Alt-k: without a virtual col, target is current visual col (3). Lands at byte 3 of row 0.
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 14, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn virtual_col_cleared_by_mutation() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abcdefghijklmnopqrst\n").await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+        continuation_marker_width: 2,
+    }).await;
+    let viewport_id = sub.viewport_id;
+
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 1 }, anchor: None,
+    }).await;
+    send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
+        extend_selection: false,
+    }).await;
+    // virtual_col = 1, cursor at byte 10.
+
+    // Insert "X" — the mutation clears the virtual col. Cursor advances to byte 11.
+    send_request::<InputText>(&mut ws, 13, &InputTextParams {
+        buffer_id, text: "X".into(), select_pasted: false,
+    }).await;
+
+    // Alt-k: target is current visual col (3, since cursor is on row 1 with prefix 2 at col 1
+    // within the text). Lands at byte 3, not the original byte 1.
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 14, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn continuation_marker_width_reduces_continuation_row_width() {
     let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\n").await;

@@ -153,25 +153,33 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
 /// Resolve a visual line motion: walk up or down by `count` visual rows under the given wrap
 /// settings, preserving the cursor's visual column where possible. When `wrap` is `None` this
 /// degenerates to a logical line step (each logical line is one visual row).
+///
+/// `virtual_col_in` is the cursor's remembered intended visual column from prior vertical
+/// motions; if `None`, the current visual column is used. The returned `u32` is the target
+/// visual column used by this call — the caller should stash it so repeated vertical motions
+/// don't drift across rows with different prefix widths (continuation marker + indent).
 pub fn resolve_visual_line(
     buf: &Buffer,
     wrap: WrapMode,
     cols: u32,
     marker_width: u32,
     current: LogicalPosition,
+    virtual_col_in: Option<u32>,
     direction: VerticalDirection,
     count: u32,
-) -> LogicalPosition {
+) -> (LogicalPosition, u32) {
     if matches!(wrap, WrapMode::None) || cols == 0 {
-        return logical_line_step(buf, current, direction, count);
+        let target = virtual_col_in.unwrap_or(current.col);
+        let new_pos = logical_line_step_with_target(buf, current, direction, count, target);
+        return (new_pos, target);
     }
 
     let line_count = buf.text.len_lines() as u32;
     let mut current_line = current.line.min(line_count.saturating_sub(1));
     let mut rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width);
     let mut row_idx = find_row_for_col(&rows, current.col as usize);
-    let target_visual_col =
-        visual_col_of_byte(&rows[row_idx], current.col as usize, marker_width);
+    let target_visual_col = virtual_col_in
+        .unwrap_or_else(|| visual_col_of_byte(&rows[row_idx], current.col as usize, marker_width));
 
     let mut remaining = count;
     while remaining > 0 {
@@ -211,10 +219,11 @@ pub fn resolve_visual_line(
 
     let row = &rows[row_idx];
     let new_col_within_text = byte_at_visual_col(row, target_visual_col, marker_width);
-    LogicalPosition {
+    let new_pos = LogicalPosition {
         line: current_line,
         col: row.byte_offset as u32 + new_col_within_text as u32,
-    }
+    };
+    (new_pos, target_visual_col)
 }
 
 /// Resolve VisualLineStart: cursor to the first byte of its current visual row.
@@ -314,11 +323,36 @@ fn row_prefix_width(row: &RowInfo, marker_width: u32) -> u32 {
     marker + row.continuation_indent
 }
 
-fn logical_line_step(
+/// Resolve a `LogicalLine` motion, threading the virtual column so that vertical hops over
+/// short or empty lines remember the cursor's original column.
+pub fn resolve_logical_line(
+    buf: &Buffer,
+    current: LogicalPosition,
+    virtual_col_in: Option<u32>,
+    direction: Direction,
+    count: u32,
+    preserve_col: bool,
+) -> (LogicalPosition, Option<u32>) {
+    let line_count = buf.text.len_lines() as u32;
+    let new_line = match direction {
+        Direction::Forward => current.line.saturating_add(count),
+        Direction::Backward => current.line.saturating_sub(count),
+    };
+    let new_line = new_line.min(line_count.saturating_sub(1));
+    if !preserve_col {
+        return (LogicalPosition { line: new_line, col: 0 }, None);
+    }
+    let target_col = virtual_col_in.unwrap_or(current.col);
+    let new_col = target_col.min(line_byte_len_excl_newline(buf, new_line));
+    (LogicalPosition { line: new_line, col: new_col }, Some(target_col))
+}
+
+fn logical_line_step_with_target(
     buf: &Buffer,
     current: LogicalPosition,
     direction: VerticalDirection,
     count: u32,
+    target_col: u32,
 ) -> LogicalPosition {
     let line_count = buf.text.len_lines() as u32;
     let new_line = match direction {
@@ -326,7 +360,7 @@ fn logical_line_step(
         VerticalDirection::Up => current.line.saturating_sub(count),
     };
     let new_line = new_line.min(line_count.saturating_sub(1));
-    let new_col = current.col.min(line_byte_len_excl_newline(buf, new_line));
+    let new_col = target_col.min(line_byte_len_excl_newline(buf, new_line));
     LogicalPosition { line: new_line, col: new_col }
 }
 

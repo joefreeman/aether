@@ -68,6 +68,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_viewports_for_client(client_id);
         s.drop_cursors_for_client(client_id);
         s.drop_motion_history_for_client(client_id);
+        s.drop_virtual_col_for_client(client_id);
         tracing::debug!(%client_id, "client session removed");
     }
     Ok(())

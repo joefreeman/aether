@@ -30,6 +30,12 @@ pub struct ServerState {
     /// buffer's own undo stack: this rewinds *only* the client's own cursor moves and is cleared
     /// by any buffer mutation (since prior positions may no longer be valid).
     pub motion_history: HashMap<(ClientId, BufferId), MotionHistory>,
+    /// The cursor's "intended" *visual* column for vertical motions — preserved across repeated
+    /// `Motion::VisualLine` presses so that landing on rows with different prefixes (continuation
+    /// marker + indent) doesn't cause the visual column to drift. Cleared by any non-vertical
+    /// motion, explicit cursor set, or buffer mutation. Only meaningful for `VisualLine`; logical
+    /// `j/k` clears it (mixing motion kinds resets intent).
+    pub virtual_col: HashMap<(ClientId, BufferId), u32>,
     next_buffer_id: u64,
     next_viewport_id: u64,
 }
@@ -63,6 +69,7 @@ impl ServerState {
             viewports: HashMap::new(),
             cursors: HashMap::new(),
             motion_history: HashMap::new(),
+            virtual_col: HashMap::new(),
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
@@ -128,6 +135,15 @@ impl ServerState {
                 h.clear();
             }
         }
+    }
+
+    pub fn drop_virtual_col_for_client(&mut self, client_id: ClientId) {
+        self.virtual_col.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Clear virtual column for every client on the given buffer. Called on any buffer mutation.
+    pub fn clear_virtual_col_for_buffer(&mut self, buffer_id: BufferId) {
+        self.virtual_col.retain(|(_, b), _| *b != buffer_id);
     }
 
     /// Locate an already-open buffer for the given canonical path, if any.
