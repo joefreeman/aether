@@ -610,13 +610,14 @@ pub async fn cursor_move(
     Ok(new_state)
 }
 
-/// Whole-line selection in either direction. Resulting selection always has the anchor at col 0
-/// and the cursor at the line's end byte, with `anchor.line <= cursor.line` (forward direction).
+/// Whole-line selection in either direction. The result is always whole lines (anchor at col 0
+/// of one line, cursor at the end byte of another); orientation (forward / backward) is whatever
+/// the input was.
 ///
-/// The "advance" trigger differs by direction because the operation's own resting state differs:
-/// after a forward press, the cursor sits at line end (so cursor-at-end advances forward); after
-/// a backward press, the anchor sits at col 0 (so anchor-at-col-0 advances backward). That's
-/// what lets repeated presses walk in their direction.
+/// Forward always grows the *bottom-most* edge of the selection downward; backward always grows
+/// the *top-most* edge upward. This means the operation looks the same to the user regardless of
+/// which end the cursor sits on — useful after `cursor/swap_anchor`. The cursor stays at the end
+/// it was already on; the anchor occupies the other end.
 pub async fn cursor_select_line(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -631,44 +632,78 @@ pub async fn cursor_select_line(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     let cur = current.position;
-    let cur_line_len = motion::line_byte_len_excl_newline(buf, cur.line);
-    let at_line_end = cur.col >= cur_line_len;
 
-    let (anchor_line, cursor_line) = match (params.direction, params.extend, current.anchor) {
-        // Extending: keep the trailing end, walk the leading end by one line.
-        (Direction::Forward, true, Some(a)) => {
-            let next = if at_line_end { cur.line.saturating_add(1) } else { cur.line };
-            (a.line, next)
-        }
-        (Direction::Backward, true, Some(a)) => {
-            let prev = if a.col == 0 { a.line.saturating_sub(1) } else { a.line };
-            (prev, cur.line)
-        }
-        // Non-extend backward with an existing anchor: walk the *anchor* so repeated presses
-        // advance upward (mirror of how the cursor naturally walks down for repeated forward).
-        (Direction::Backward, false, Some(a)) => {
-            let prev = if a.col == 0 { a.line.saturating_sub(1) } else { a.line };
-            (prev, prev)
-        }
-        // Fresh selection (or extend with no anchor — same shape, per the rule that the Shift
-        // variant matches the non-Shift one when there's nothing to extend). Uses cursor pos.
-        (Direction::Forward, _, _) => {
-            let line = if at_line_end { cur.line.saturating_add(1) } else { cur.line };
+    // Top / bottom edges of the current selection, normalized so we can reason about "extend the
+    // bottom down" independent of which end the cursor sits on. Without an anchor, both are at
+    // the cursor.
+    let (top_edge, bottom_edge) = match current.anchor {
+        Some(a) if (a.line, a.col) < (cur.line, cur.col) => (a, cur),
+        Some(a) => (cur, a),
+        None => (cur, cur),
+    };
+    let cursor_was_at_top = current.anchor.is_some() && cur == top_edge;
+
+    let (top_line, bottom_line) = match (params.direction, params.extend, current.anchor) {
+        // No prior selection: the line is picked by the cursor's position relative to its
+        // line's end. End-of-line is the trigger because that's where the cursor naturally
+        // lands after typing — forward advances past it, backward stays on the current line.
+        (Direction::Forward, _, None) => {
+            let len = motion::line_byte_len_excl_newline(buf, cur.line);
+            let at_end = cur.col >= len;
+            let line = if at_end { cur.line.saturating_add(1) } else { cur.line };
             (line, line)
         }
-        (Direction::Backward, _, _) => {
-            let line = if at_line_end { cur.line } else { cur.line.saturating_sub(1) };
+        (Direction::Backward, _, None) => {
+            let len = motion::line_byte_len_excl_newline(buf, cur.line);
+            let at_end = cur.col >= len;
+            let line = if at_end { cur.line } else { cur.line.saturating_sub(1) };
             (line, line)
+        }
+        // With an existing selection: walk the relevant edge. If it's already at its line
+        // boundary (end for forward, col 0 for backward) advance to the next line; otherwise
+        // snap to that boundary first. For non-extend, both edges collapse onto the moved one.
+        (Direction::Forward, extend, Some(_)) => {
+            let len = motion::line_byte_len_excl_newline(buf, bottom_edge.line);
+            let at_end = bottom_edge.col >= len;
+            let new_bottom = if at_end {
+                bottom_edge.line.saturating_add(1)
+            } else {
+                bottom_edge.line
+            };
+            if extend {
+                (top_edge.line, new_bottom)
+            } else {
+                (new_bottom, new_bottom)
+            }
+        }
+        (Direction::Backward, extend, Some(_)) => {
+            let new_top = if top_edge.col == 0 {
+                top_edge.line.saturating_sub(1)
+            } else {
+                top_edge.line
+            };
+            if extend {
+                (new_top, bottom_edge.line)
+            } else {
+                (new_top, new_top)
+            }
         }
     };
 
     let last_line = (buf.text.len_lines() as u32).saturating_sub(1);
-    let anchor_line = anchor_line.min(last_line);
-    let cursor_line = cursor_line.min(last_line);
-    let anchor_pos = LogicalPosition { line: anchor_line, col: 0 };
-    let cursor_pos = LogicalPosition {
-        line: cursor_line,
-        col: motion::line_byte_len_excl_newline(buf, cursor_line),
+    let top_line = top_line.min(last_line);
+    let bottom_line = bottom_line.min(last_line);
+    let top_pos = LogicalPosition { line: top_line, col: 0 };
+    let bottom_pos = LogicalPosition {
+        line: bottom_line,
+        col: motion::line_byte_len_excl_newline(buf, bottom_line),
+    };
+    // Cursor stays at the end it occupied (top or bottom). Default to bottom for a fresh
+    // selection so the result is forward-oriented.
+    let (cursor_pos, anchor_pos) = if cursor_was_at_top {
+        (top_pos, bottom_pos)
+    } else {
+        (bottom_pos, top_pos)
     };
     let anchor = if anchor_pos == cursor_pos { None } else { Some(anchor_pos) };
     let new_state = CursorState { position: cursor_pos, anchor };

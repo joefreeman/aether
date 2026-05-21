@@ -332,11 +332,12 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             move_motion(client, state, Motion::LineStart, extend).await?,
 
         // ---- line selection ----
-        // `x` selects the whole current line (or the next at end-of-line); `Alt-x` selects the
-        // whole previous line (or the current at end-of-line). The `Shift` variants behave the
-        // same on a fresh cursor and otherwise extend an existing selection: `Shift-x` walks the
-        // cursor down by one line, `Shift-Alt-x` walks the anchor up by one line. All four
-        // produce whole-line, forward-direction selections.
+        // `x` always grows the selection's bottom edge downward; `Alt-x` always grows the top
+        // edge upward. With no selection: `x` picks the current line (or the next at end-of-line)
+        // and `Alt-x` picks the previous (or the current at end-of-line). The `Shift` variants
+        // keep the other edge in place (extending); the non-shift variants collapse onto a single
+        // line at the moved edge. The cursor stays on whichever end (top/bottom) it was on, so
+        // the bindings behave the same after `s` flips the selection direction.
         (KeyCode::Char('x'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             select_line(client, state, Direction::Forward, extend).await?,
         (KeyCode::Char('x'), m) if m.contains(KeyModifiers::ALT) =>
