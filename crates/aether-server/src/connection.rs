@@ -7,7 +7,8 @@ use aether_protocol::buffer::{BufferCopy, BufferCut, BufferOpen, BufferSave};
 use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::cursor::{
-    CursorMove, CursorRedo, CursorSelectLine, CursorSet, CursorSwapAnchor, CursorUndo,
+    CursorContract, CursorExpand, CursorMove, CursorRedo, CursorSelectLine, CursorSet,
+    CursorSwapAnchor, CursorUndo,
 };
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
@@ -75,6 +76,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_motion_history_for_client(client_id);
         s.drop_virtual_col_for_client(client_id);
         s.drop_searches_for_client(client_id);
+        s.drop_tree_selection_history_for_client(client_id);
         tracing::debug!(%client_id, "client session removed");
     }
     Ok(())
@@ -162,6 +164,8 @@ async fn dispatch(
         CursorSelectLine::NAME => run!(CursorSelectLine, handlers::cursor_select_line),
         CursorSwapAnchor::NAME => run!(CursorSwapAnchor, handlers::cursor_swap_anchor),
         CursorUndo::NAME => run!(CursorUndo, handlers::cursor_undo),
+        CursorExpand::NAME => run!(CursorExpand, handlers::cursor_expand),
+        CursorContract::NAME => run!(CursorContract, handlers::cursor_contract),
         CursorRedo::NAME => run!(CursorRedo, handlers::cursor_redo),
         InputText::NAME => run!(InputText, handlers::input_text),
         InputDelete::NAME => run!(InputDelete, handlers::input_delete),

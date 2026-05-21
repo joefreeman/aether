@@ -18,9 +18,10 @@ use aether_protocol::search::{
     SearchSetParams, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::cursor::{
-    CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
-    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
-    CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection, WordBoundary,
+    CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams,
+    CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
+    CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
+    Direction, Motion, VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
@@ -673,6 +674,11 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // `o` swaps the cursor and anchor — flips which end of the selection is the "leading"
         // edge, so a subsequent `Shift-*` motion extends from the other side.
         (KeyCode::Char('o'), m) if m == KeyModifiers::NONE => swap_anchor(client, state).await?,
+
+        // Tree-sitter selection expansion / contraction. `,` grows the selection to the smallest
+        // enclosing syntax node; `.` reverses one step. With `N` prefix, applied N times.
+        (KeyCode::Char(','), m) if m == KeyModifiers::NONE => tree_expand(client, state, count).await?,
+        (KeyCode::Char('.'), m) if m == KeyModifiers::NONE => tree_contract(client, state, count).await?,
 
         // Motion undo / redo — per-client history of cursor/selection changes, capped at the
         // last buffer mutation. Distinct from `Ctrl-u`/`Ctrl-Alt-u` which rewind buffer edits.
@@ -1474,6 +1480,32 @@ async fn select_line(
                 extend,
             })
             .await?;
+        state.cursor = new;
+    }
+    Ok(())
+}
+
+async fn tree_expand(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    for _ in 0..count.max(1) {
+        let new = client
+            .rpc::<CursorExpand>(CursorBufferOnlyParams { buffer_id: state.buffer_id })
+            .await?;
+        if new == state.cursor {
+            break; // already at root
+        }
+        state.cursor = new;
+    }
+    Ok(())
+}
+
+async fn tree_contract(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    for _ in 0..count.max(1) {
+        let new = client
+            .rpc::<CursorContract>(CursorBufferOnlyParams { buffer_id: state.buffer_id })
+            .await?;
+        if new == state.cursor {
+            break; // history empty
+        }
         state.cursor = new;
     }
     Ok(())

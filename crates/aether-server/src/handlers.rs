@@ -18,8 +18,9 @@ use aether_protocol::search::{
     SearchSetResult, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::cursor::{
-    CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState, CursorSwapAnchorParams,
-    CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection,
+    CursorBufferOnlyParams, CursorMoveParams, CursorSelectLineParams, CursorSetParams,
+    CursorState, CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, Motion,
+    VerticalDirection,
 };
 use crate::state::MOTION_HISTORY_CAP;
 use aether_protocol::LogicalPosition;
@@ -436,6 +437,7 @@ pub async fn search_set(
                 s.cursors.insert(key, new_cursor);
                 s.record_motion(key, prev_cursor, new_cursor);
                 s.virtual_col.remove(&key);
+                s.clear_tree_selection_history(client_id, params.buffer_id);
                 cursor = new_cursor;
             }
         }
@@ -573,6 +575,7 @@ async fn search_navigate(
     s.cursors.insert(key, new_cursor);
     s.record_motion(key, prev_cursor, new_cursor);
     s.virtual_col.remove(&key);
+    s.clear_tree_selection_history(client_id, buffer_id);
     let buf_ref = &s.buffers[&buffer_id];
     let summary = {
         let entry_ref = s.searches.get(&key).expect("active search just confirmed");
@@ -867,6 +870,7 @@ pub async fn buffer_cut(
     let new_cursor = CursorState { position: motion::char_to_pos(buf_mut, start_char), anchor: None };
     s.cursors.insert((client_id, params.buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(params.buffer_id);
+    s.clear_tree_selection_history_for_buffer(params.buffer_id);
     s.clear_virtual_col_for_buffer(params.buffer_id);
 
     let search_summary_pushes = refresh_searches_for_buffer(&mut s, params.buffer_id);
@@ -1404,6 +1408,7 @@ pub async fn cursor_move(
     let new_state = CursorState { position: new_pos, anchor: new_anchor };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
     match new_virtual_col {
         Some(col) => {
             s.virtual_col.insert(key, col);
@@ -1520,6 +1525,7 @@ pub async fn cursor_select_line(
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
     drop(s);
     if let Some((sender, notif)) = search_update {
@@ -1547,6 +1553,7 @@ pub async fn cursor_swap_anchor(
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
     drop(s);
     if let Some((sender, notif)) = search_update {
@@ -1578,6 +1585,7 @@ pub async fn cursor_set(
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
     drop(s);
     if let Some((sender, notif)) = search_update {
@@ -1612,6 +1620,7 @@ pub async fn cursor_undo(
 
     s.cursors.insert(key, prev);
     s.virtual_col.remove(&key);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
     drop(s);
     if let Some((sender, notif)) = search_update {
@@ -1645,12 +1654,118 @@ pub async fn cursor_redo(
 
     s.cursors.insert(key, next);
     s.virtual_col.remove(&key);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
     }
     Ok(CursorUndoResult { applied: true, cursor: next })
+}
+
+// ---- cursor/expand and cursor/contract ---------------------------------------------------------
+
+pub async fn cursor_expand(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CursorBufferOnlyParams,
+) -> Result<CursorState, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let key = (client_id, params.buffer_id);
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
+
+    let Some(syntax) = buf.syntax.as_ref() else {
+        return Ok(current);
+    };
+
+    // Compute the current selection's byte range. For collapsed cursors, treat as the single
+    // char under the cursor (one-byte minimum so descendant_for_byte_range can find it).
+    let (sel_start_char, sel_end_char_excl) = current_selection_char_range(buf, &current);
+    let total_bytes = buf.text.len_bytes();
+    let start_byte = buf.text.char_to_byte(sel_start_char).min(total_bytes);
+    let end_byte_excl = buf.text.char_to_byte(sel_end_char_excl).min(total_bytes);
+
+    // Smallest descendant containing the byte range, then walk up while the node exactly equals
+    // our selection — that gives the smallest *strictly larger* enclosing node.
+    let root = syntax.tree.root_node();
+    let mut node = root.descendant_for_byte_range(start_byte, end_byte_excl).unwrap_or(root);
+    while node.start_byte() == start_byte && node.end_byte() == end_byte_excl {
+        match node.parent() {
+            Some(p) => node = p,
+            None => return Ok(current), // already at the root
+        }
+    }
+
+    let new_start_char = buf.text.byte_to_char(node.start_byte());
+    let new_end_char_excl = buf.text.byte_to_char(node.end_byte()).max(new_start_char + 1);
+    let new_last_char = new_end_char_excl.saturating_sub(1).max(new_start_char);
+    let anchor = motion::char_to_pos(buf, new_start_char);
+    let position = motion::char_to_pos(buf, new_last_char);
+    let new_cursor = if anchor == position {
+        CursorState { position, anchor: None }
+    } else {
+        CursorState { position, anchor: Some(anchor) }
+    };
+
+    s.cursors.insert(key, new_cursor);
+    s.record_motion(key, current, new_cursor);
+    s.virtual_col.remove(&key);
+    s.tree_selection_history.entry(key).or_default().push(current);
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
+    Ok(new_cursor)
+}
+
+pub async fn cursor_contract(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CursorBufferOnlyParams,
+) -> Result<CursorState, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    if !s.buffers.contains_key(&params.buffer_id) {
+        return Err(RpcError::buffer_not_found(params.buffer_id));
+    }
+    let key = (client_id, params.buffer_id);
+    let prev = s
+        .tree_selection_history
+        .get_mut(&key)
+        .and_then(|stack| stack.pop());
+    let Some(prev) = prev else {
+        // Nothing to contract back to.
+        return Ok(s.cursors.get(&key).copied().unwrap_or_default());
+    };
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
+    s.cursors.insert(key, prev);
+    s.record_motion(key, current, prev);
+    s.virtual_col.remove(&key);
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
+    Ok(prev)
+}
+
+/// Char range `[start, end_excl)` covered by the cursor's current selection. Collapsed cursors
+/// (no anchor) yield a 1-char range so byte conversion produces a non-empty span.
+fn current_selection_char_range(buf: &Buffer, cursor: &CursorState) -> (usize, usize) {
+    let (lo_pos, hi_pos) = match cursor.anchor {
+        Some(a) => motion::ordered(cursor.position, a),
+        None => (cursor.position, cursor.position),
+    };
+    let total = buf.text.len_chars();
+    let lo = motion::pos_to_char(buf, lo_pos).min(total);
+    let hi_inclusive = motion::pos_to_char(buf, hi_pos).min(total);
+    (lo, (hi_inclusive + 1).min(total).max(lo + 1).min(total.max(lo)))
 }
 
 // ---- input handlers ----------------------------------------------------------------------------
@@ -1829,6 +1944,7 @@ async fn apply_indent_or_dedent(
     };
     s.cursors.insert((client_id, buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
 
     let edit_first = a;
@@ -1989,6 +2105,7 @@ pub async fn input_move_lines(
     };
     s.cursors.insert((client_id, buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
 
     // Affected line range for viewport notifications.
@@ -2157,6 +2274,7 @@ pub async fn input_join_lines(
         };
         s.cursors.insert((client_id, buffer_id), new_cursor);
         s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_tree_selection_history_for_buffer(buffer_id);
         s.clear_virtual_col_for_buffer(buffer_id);
         (revision, new_cursor)
     };
@@ -2261,6 +2379,7 @@ async fn apply_undo_or_redo(
         s.cursors.insert((*cid, buffer_id), *cursor);
     }
     s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
     let undoing_cursor =
         new_cursors.get(&client_id).copied().unwrap_or_else(CursorState::default);
@@ -2392,6 +2511,7 @@ async fn apply_edit(
     };
     s.cursors.insert((client_id, buffer_id), new_cursor_state);
     s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
 
     // Recompute every active search on this buffer so the embedded `search_matches` in the

@@ -36,6 +36,10 @@ pub struct ServerState {
     /// motion, explicit cursor set, or buffer mutation. Only meaningful for `VisualLine`; logical
     /// `j/k` clears it (mixing motion kinds resets intent).
     pub virtual_col: HashMap<(ClientId, BufferId), u32>,
+    /// Per-`(client, buffer)` selection-expansion history. Each entry is a prior cursor state
+    /// that `cursor/contract` will restore. Pushed by `cursor/expand`; cleared by any other
+    /// cursor RPC (or buffer mutation) to keep contraction well-defined.
+    pub tree_selection_history: HashMap<(ClientId, BufferId), Vec<CursorState>>,
     /// Per-`(client, buffer)` active search. Set by `search/set`, cleared by `search/clear` or
     /// when the client disconnects / the buffer closes. Re-run whenever the buffer mutates.
     pub searches: HashMap<(ClientId, BufferId), SearchEntry>,
@@ -89,6 +93,7 @@ impl ServerState {
             cursors: HashMap::new(),
             motion_history: HashMap::new(),
             virtual_col: HashMap::new(),
+            tree_selection_history: HashMap::new(),
             searches: HashMap::new(),
             next_buffer_id: 1,
             next_viewport_id: 1,
@@ -164,6 +169,24 @@ impl ServerState {
     /// Remove all search records for the given client. Used on disconnect.
     pub fn drop_searches_for_client(&mut self, client_id: ClientId) {
         self.searches.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Drop the selection-expansion history for one client+buffer. Called from every cursor RPC
+    /// except `expand` / `contract` (and from every buffer mutation) so the contract chain only
+    /// follows a contiguous run of expands.
+    pub fn clear_tree_selection_history(&mut self, client_id: ClientId, buffer_id: BufferId) {
+        self.tree_selection_history.remove(&(client_id, buffer_id));
+    }
+
+    /// Clear selection-expansion history for every client on the given buffer. Called from
+    /// buffer mutation paths so a post-edit contract doesn't pop a stale (pre-edit) selection.
+    pub fn clear_tree_selection_history_for_buffer(&mut self, buffer_id: BufferId) {
+        self.tree_selection_history.retain(|(_, b), _| *b != buffer_id);
+    }
+
+    /// Remove all selection-expansion records for the given client. Used on disconnect.
+    pub fn drop_tree_selection_history_for_client(&mut self, client_id: ClientId) {
+        self.tree_selection_history.retain(|(c, _), _| *c != client_id);
     }
 
     /// Clear virtual column for every client on the given buffer. Called on any buffer mutation.

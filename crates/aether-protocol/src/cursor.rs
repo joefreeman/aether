@@ -175,6 +175,33 @@ pub struct CursorUndoResult {
     pub cursor: CursorState,
 }
 
+// ---- cursor/expand and cursor/contract ---------------------------------------------------------
+//
+// Tree-sitter–driven selection expansion (Helix `Alt-o`-style). `expand` grows the selection to
+// the smallest enclosing syntax node strictly larger than the current selection. `contract`
+// reverses one step. The server maintains a per-(client, buffer) history so a chain of expands
+// can be undone by an equal number of contracts. Any other cursor RPC (or buffer mutation)
+// clears the history.
+
+pub struct CursorExpand;
+impl RpcMethod for CursorExpand {
+    const NAME: &'static str = "cursor/expand";
+    type Params = CursorBufferOnlyParams;
+    type Result = CursorState;
+}
+
+pub struct CursorContract;
+impl RpcMethod for CursorContract {
+    const NAME: &'static str = "cursor/contract";
+    type Params = CursorBufferOnlyParams;
+    type Result = CursorState;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CursorBufferOnlyParams {
+    pub buffer_id: BufferId,
+}
+
 // ---- cursor/swap_anchor -------------------------------------------------------------------------
 
 pub struct CursorSwapAnchor;
