@@ -1825,6 +1825,34 @@ async fn visual_line_crosses_logical_line_boundary() {
 }
 
 #[tokio::test]
+async fn visual_line_preserves_display_column_across_multibyte_chars() {
+    // Line 0 has 7 ASCII chars; line 1 starts with an em dash ('—', 3 bytes / 1 display cell) and
+    // then 6 ASCII chars. Moving the cursor down from byte 3 on line 0 (display col 3, on 'd')
+    // should land it at byte 5 on line 1 (display col 3, on 'c'). Pre-fix it would have landed
+    // at byte 3 — inside / just past the em dash — which is display col 1.
+    let (server, mut ws, buffer_id) = setup_with_buffer("abcdefg\n—abcdef\n").await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
+        buffer_id, cols: 80, rows: 5, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+        wrap: WrapMode::Soft,
+        continuation_marker_width: 2,
+    }).await;
+    let viewport_id = sub.viewport_id;
+
+    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 3 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
+        buffer_id,
+        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
+        extend_selection: false,
+    }).await;
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn visual_line_with_wrap_none_falls_back_to_logical() {
     let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\nhi\n").await;
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {

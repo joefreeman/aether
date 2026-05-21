@@ -9,6 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 /// Glyph rendered at the start of each *continuation* row (rows after the first row of a
 /// wrapped logical line) under `WrapMode::Soft`. The width (2 cols: "↪" + space) is what the
@@ -370,10 +371,30 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
                 return None;
             }
             let row = &render.visual_rows[row_idx];
-            let text_len: u32 = row.segments.iter().map(|s| s.text.len() as u32).sum();
-            let col_in_text = cursor.col.saturating_sub(row.byte_offset).min(text_len);
+            // Walk chars in the row's text up to the cursor's byte offset, summing display
+            // widths. The cursor lives in byte coordinates on the wire, but we render at display
+            // columns — without this conversion a multi-byte char like `—` (3 bytes, 1 cell)
+            // would push the cursor 2 columns past where the char visually ends.
+            let row_text = row
+                .segments
+                .first()
+                .map(|s| s.text.as_str())
+                .unwrap_or("");
+            let cursor_byte_in_row = cursor
+                .col
+                .saturating_sub(row.byte_offset)
+                .min(row_text.len() as u32);
+            let mut display_col_in_text: u32 = 0;
+            let mut byte_cursor: usize = 0;
+            for c in row_text.chars() {
+                if byte_cursor >= cursor_byte_in_row as usize {
+                    break;
+                }
+                display_col_in_text += UnicodeWidthChar::width(c).unwrap_or(0) as u32;
+                byte_cursor += c.len_utf8();
+            }
             let marker = if row.byte_offset > 0 { CONTINUATION_MARKER_WIDTH } else { 0 };
-            let logical_visual_col = marker + row.continuation_indent + col_in_text;
+            let logical_visual_col = marker + row.continuation_indent + display_col_in_text;
             if logical_visual_col < scroll_col {
                 return None; // scrolled off the left
             }
