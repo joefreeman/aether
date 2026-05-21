@@ -232,11 +232,17 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
     if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
         return Ok(());
     }
+    // Track whether the cursor moved during this event. Pure-scroll bindings leave it alone, so
+    // the viewport stays where the user scrolled; any binding that actually moves the cursor
+    // triggers `ensure_cursor_in_window` to snap the view back to it.
+    let cursor_before = state.cursor.position;
     match state.mode {
         Mode::Normal => handle_normal_key(client, state, k).await?,
         Mode::Insert => handle_insert_key(client, state, k).await?,
     }
-    ensure_cursor_in_window(client, state).await?;
+    if state.cursor.position != cursor_before {
+        ensure_cursor_in_window(client, state).await?;
+    }
     Ok(())
 }
 
@@ -296,8 +302,10 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             }
         }
 
-        // ---- non-letter motions ----
-        // Home/End map to logical-line start/end; PageUp/Down scroll without moving the cursor.
+        // ---- non-letter motions and scroll ----
+        // Home/End map to logical-line start/end; arrows scroll the viewport without moving the
+        // cursor (so the cursor can drift off-screen until a motion snaps it back). Alt-arrow
+        // scrolls by a half-viewport. PageUp/Down are full-viewport scrolls.
         (KeyCode::Home, _) => move_motion(client, state, Motion::LineStart, extend).await?,
         (KeyCode::End, _) => move_motion(client, state, Motion::LineEnd, extend).await?,
         (KeyCode::PageDown, _) => {
@@ -308,6 +316,22 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             let target = state.scroll_logical_line.saturating_sub(state.viewport_rows);
             scroll_to(client, state, target).await?;
         }
+        (KeyCode::Up, m) if m.contains(KeyModifiers::ALT) => {
+            scroll_lines(client, state, -((state.viewport_rows / 2) as i64)).await?;
+        }
+        (KeyCode::Down, m) if m.contains(KeyModifiers::ALT) => {
+            scroll_lines(client, state, (state.viewport_rows / 2) as i64).await?;
+        }
+        (KeyCode::Up, _) => scroll_lines(client, state, -1).await?,
+        (KeyCode::Down, _) => scroll_lines(client, state, 1).await?,
+        (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => {
+            scroll_cols(state, -((state.viewport_cols / 2) as i64));
+        }
+        (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => {
+            scroll_cols(state, (state.viewport_cols / 2) as i64);
+        }
+        (KeyCode::Left, _) => scroll_cols(state, -1),
+        (KeyCode::Right, _) => scroll_cols(state, 1),
 
         // ---- motions: hjkl (logical) and Alt-hjkl (line jumps + visual rows) ----
         // `h/l` move by char; `Alt-h/l` jump to the first non-whitespace / end of the logical
@@ -861,6 +885,30 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
         WrapMode::None => "off",
     });
     Ok(())
+}
+
+/// Scroll the viewport vertically by `delta` logical lines (positive = down). Doesn't touch the
+/// cursor — pure viewport movement.
+async fn scroll_lines(client: &mut Client, state: &mut AppState, delta: i64) -> Result<()> {
+    let target = if delta >= 0 {
+        state.scroll_logical_line.saturating_add(delta as u32)
+    } else {
+        state.scroll_logical_line.saturating_sub((-delta) as u32)
+    };
+    scroll_to(client, state, target).await
+}
+
+/// Scroll the viewport horizontally by `delta` columns. Only meaningful under `WrapMode::None`;
+/// no-op when soft wrap is on (wrapped content never overflows right).
+fn scroll_cols(state: &mut AppState, delta: i64) {
+    if !matches!(state.wrap, WrapMode::None) {
+        return;
+    }
+    state.scroll_col = if delta >= 0 {
+        state.scroll_col.saturating_add(delta as u32)
+    } else {
+        state.scroll_col.saturating_sub((-delta) as u32)
+    };
 }
 
 async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) -> Result<()> {
