@@ -9,8 +9,8 @@ use aether_protocol::buffer::{
     BufferSave, BufferSaveParams, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
-    CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Motion,
-    WordBoundary,
+    CursorMove, CursorMoveParams, CursorSelectLine, CursorSelectLineParams, CursorSet,
+    CursorSetParams, CursorState, Direction, Motion, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
@@ -330,6 +330,17 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('0'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::LineStart, extend).await?,
 
+        // ---- line selection ----
+        // `x` selects the whole current line (or the next at end-of-line); `Alt-x` selects the
+        // whole previous line (or the current at end-of-line). The `Shift` variants behave the
+        // same on a fresh cursor and otherwise extend an existing selection: `Shift-x` walks the
+        // cursor down by one line, `Shift-Alt-x` walks the anchor up by one line. All four
+        // produce whole-line, forward-direction selections.
+        (KeyCode::Char('x'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            select_line(client, state, Direction::Forward, extend).await?,
+        (KeyCode::Char('x'), m) if m.contains(KeyModifiers::ALT) =>
+            select_line(client, state, Direction::Backward, extend).await?,
+
         // ---- mode transitions ----
         (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionStart).await?,
         (KeyCode::Char('a'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionEnd).await?,
@@ -414,6 +425,23 @@ async fn move_motion(client: &mut Client, state: &mut AppState, motion: Motion, 
             buffer_id: state.buffer_id,
             motion,
             extend_selection: extend,
+        })
+        .await?;
+    state.cursor = new;
+    Ok(())
+}
+
+async fn select_line(
+    client: &mut Client,
+    state: &mut AppState,
+    direction: Direction,
+    extend: bool,
+) -> Result<()> {
+    let new = client
+        .rpc::<CursorSelectLine>(CursorSelectLineParams {
+            buffer_id: state.buffer_id,
+            direction,
+            extend,
         })
         .await?;
     state.cursor = new;

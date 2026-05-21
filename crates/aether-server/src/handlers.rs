@@ -10,8 +10,9 @@ use aether_protocol::buffer::{
     BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
-    CursorMoveParams, CursorSetParams, CursorState, Motion,
+    CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState, Direction, Motion,
 };
+use aether_protocol::LogicalPosition;
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::handshake::{ClientHelloParams, ClientHelloResult, ProjectInfo};
@@ -604,6 +605,72 @@ pub async fn cursor_move(
     };
 
     let new_state = CursorState { position: new_pos, anchor: new_anchor };
+    s.cursors.insert(key, new_state);
+    Ok(new_state)
+}
+
+/// Whole-line selection in either direction. Resulting selection always has the anchor at col 0
+/// and the cursor at the line's end byte, with `anchor.line <= cursor.line` (forward direction).
+///
+/// The "advance" trigger differs by direction because the operation's own resting state differs:
+/// after a forward press, the cursor sits at line end (so cursor-at-end advances forward); after
+/// a backward press, the anchor sits at col 0 (so anchor-at-col-0 advances backward). That's
+/// what lets repeated presses walk in their direction.
+pub async fn cursor_select_line(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CursorSelectLineParams,
+) -> Result<CursorState, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let key = (client_id, params.buffer_id);
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
+    let cur = current.position;
+    let cur_line_len = motion::line_byte_len_excl_newline(buf, cur.line);
+    let at_line_end = cur.col >= cur_line_len;
+
+    let (anchor_line, cursor_line) = match (params.direction, params.extend, current.anchor) {
+        // Extending: keep the trailing end, walk the leading end by one line.
+        (Direction::Forward, true, Some(a)) => {
+            let next = if at_line_end { cur.line.saturating_add(1) } else { cur.line };
+            (a.line, next)
+        }
+        (Direction::Backward, true, Some(a)) => {
+            let prev = if a.col == 0 { a.line.saturating_sub(1) } else { a.line };
+            (prev, cur.line)
+        }
+        // Non-extend backward with an existing anchor: walk the *anchor* so repeated presses
+        // advance upward (mirror of how the cursor naturally walks down for repeated forward).
+        (Direction::Backward, false, Some(a)) => {
+            let prev = if a.col == 0 { a.line.saturating_sub(1) } else { a.line };
+            (prev, prev)
+        }
+        // Fresh selection (or extend with no anchor — same shape, per the rule that the Shift
+        // variant matches the non-Shift one when there's nothing to extend). Uses cursor pos.
+        (Direction::Forward, _, _) => {
+            let line = if at_line_end { cur.line.saturating_add(1) } else { cur.line };
+            (line, line)
+        }
+        (Direction::Backward, _, _) => {
+            let line = if at_line_end { cur.line } else { cur.line.saturating_sub(1) };
+            (line, line)
+        }
+    };
+
+    let last_line = (buf.text.len_lines() as u32).saturating_sub(1);
+    let anchor_line = anchor_line.min(last_line);
+    let cursor_line = cursor_line.min(last_line);
+    let anchor_pos = LogicalPosition { line: anchor_line, col: 0 };
+    let cursor_pos = LogicalPosition {
+        line: cursor_line,
+        col: motion::line_byte_len_excl_newline(buf, cursor_line),
+    };
+    let anchor = if anchor_pos == cursor_pos { None } else { Some(anchor_pos) };
+    let new_state = CursorState { position: cursor_pos, anchor };
     s.cursors.insert(key, new_state);
     Ok(new_state)
 }

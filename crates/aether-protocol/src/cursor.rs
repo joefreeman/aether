@@ -115,6 +115,22 @@ pub struct CursorSetParams {
     pub anchor: Option<LogicalPosition>,
 }
 
+// ---- cursor/select_line -------------------------------------------------------------------------
+
+pub struct CursorSelectLine;
+impl RpcMethod for CursorSelectLine {
+    const NAME: &'static str = "cursor/select_line";
+    type Params = CursorSelectLineParams;
+    type Result = CursorState;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CursorSelectLineParams {
+    pub buffer_id: BufferId,
+    pub direction: Direction,
+    pub extend: bool,
+}
+
 // ---- cursor/update (notification) ---------------------------------------------------------------
 
 pub struct CursorUpdate;
