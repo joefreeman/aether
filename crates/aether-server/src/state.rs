@@ -53,6 +53,10 @@ pub struct SearchEntry {
     /// `true` when the server hit its match cap (`SEARCH_MAX_MATCHES`) and the real count is
     /// higher. `matches.len()` is then a prefix.
     pub truncated: bool,
+    /// 1-based match index most recently sent in a `search/state_changed` notification for this
+    /// client+buffer. Used to dedup cursor-move-driven pushes so we only fire when the cursor
+    /// actually crosses a match boundary.
+    pub last_pushed_index: u32,
 }
 
 /// Cap on each direction's stack. Bounds memory in pathological cases (e.g. holding down a

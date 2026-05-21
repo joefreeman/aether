@@ -191,7 +191,12 @@ pub const SEARCH_MAX_MATCHES: usize = 10_000;
 /// patterns like `^` don't pin the cursor.
 pub fn compute_search_entry(buf: &Buffer, query: &str) -> Result<SearchEntry, RpcError> {
     if query.is_empty() {
-        return Ok(SearchEntry { query: String::new(), matches: Vec::new(), truncated: false });
+        return Ok(SearchEntry {
+            query: String::new(),
+            matches: Vec::new(),
+            truncated: false,
+            last_pushed_index: 0,
+        });
     }
     let regex = {
         let has_upper = query.chars().any(|c| c.is_uppercase());
@@ -205,7 +210,12 @@ pub fn compute_search_entry(buf: &Buffer, query: &str) -> Result<SearchEntry, Rp
     let mut truncated = false;
     let len_bytes = buf.text.len_bytes();
     if len_bytes == 0 {
-        return Ok(SearchEntry { query: query.to_string(), matches, truncated });
+        return Ok(SearchEntry {
+            query: query.to_string(),
+            matches,
+            truncated,
+            last_pushed_index: 0,
+        });
     }
     let source: String = buf.text.chunks().collect();
     for m in regex.find_iter(&source) {
@@ -218,7 +228,12 @@ pub fn compute_search_entry(buf: &Buffer, query: &str) -> Result<SearchEntry, Rp
         }
         matches.push((byte_to_logical(buf, m.start()), byte_to_logical(buf, m.end())));
     }
-    Ok(SearchEntry { query: query.to_string(), matches, truncated })
+    Ok(SearchEntry {
+        query: query.to_string(),
+        matches,
+        truncated,
+        last_pushed_index: 0,
+    })
 }
 
 pub async fn search_set(
@@ -246,7 +261,7 @@ pub async fn search_set(
         let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
         (summary, pushes)
     } else {
-        let entry = compute_search_entry(buf, &params.query)?;
+        let mut entry = compute_search_entry(buf, &params.query)?;
         // If the caller passed an anchor, jump the cursor to the first match at-or-after it
         // (wrapping to the first match if none). This is how incremental search keeps the cursor
         // anchored at `/`-press time across keystrokes.
@@ -269,7 +284,9 @@ pub async fn search_set(
                 cursor = new_cursor;
             }
         }
-        let summary = summary_for(&entry, params.buffer_id, &cursor);
+        let buf_ref = &s.buffers[&params.buffer_id];
+        let summary = summary_for(buf_ref, &entry, params.buffer_id, &cursor);
+        entry.last_pushed_index = summary.current_index;
         s.searches.insert(key, entry);
         let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
         (summary, pushes)
@@ -353,7 +370,7 @@ async fn search_navigate(
         let cursor = s.cursors.get(&key).copied().unwrap_or_default();
         return Ok(SearchNavResult {
             cursor,
-            summary: summary_for(entry, buffer_id, &cursor),
+            summary: summary_for(buf, entry, buffer_id, &cursor),
         });
     }
 
@@ -380,7 +397,7 @@ async fn search_navigate(
     let Some((start, end_excl)) = target else {
         return Ok(SearchNavResult {
             cursor: current,
-            summary: summary_for(entry, buffer_id, &current),
+            summary: summary_for(buf, entry, buffer_id, &current),
         });
     };
 
@@ -401,26 +418,14 @@ async fn search_navigate(
     s.cursors.insert(key, new_cursor);
     s.record_motion(key, prev_cursor, new_cursor);
     s.virtual_col.remove(&key);
-    let entry = &s.searches[&key];
-    let summary = summary_for(entry, buffer_id, &new_cursor);
+    let buf_ref = &s.buffers[&buffer_id];
+    let summary = {
+        let entry_ref = s.searches.get(&key).expect("active search just confirmed");
+        summary_for(buf_ref, entry_ref, buffer_id, &new_cursor)
+    };
+    let entry_mut = s.searches.get_mut(&key).expect("active search just confirmed");
+    entry_mut.last_pushed_index = summary.current_index;
     Ok(SearchNavResult { cursor: new_cursor, summary })
-}
-
-/// Compute the `SearchSummary` for the given entry and cursor.
-fn summary_for(entry: &SearchEntry, buffer_id: BufferId, cursor: &CursorState) -> SearchSummary {
-    let start = selection_start(cursor);
-    let current_index = entry
-        .matches
-        .iter()
-        .position(|(s, _)| *s == start)
-        .map(|i| (i as u32).saturating_add(1))
-        .unwrap_or(0);
-    SearchSummary {
-        buffer_id,
-        total: entry.matches.len() as u32,
-        truncated: entry.truncated,
-        current_index,
-    }
 }
 
 fn selection_start(c: &CursorState) -> LogicalPosition {
@@ -431,6 +436,47 @@ fn selection_start(c: &CursorState) -> LogicalPosition {
 }
 
 fn pos_tuple(p: LogicalPosition) -> (u32, u32) { (p.line, p.col) }
+
+/// Compute the `SearchSummary` for the given entry and cursor.
+fn summary_for(
+    buf: &Buffer,
+    entry: &SearchEntry,
+    buffer_id: BufferId,
+    cursor: &CursorState,
+) -> SearchSummary {
+    let current_index = match_index_for_cursor(buf, entry, cursor);
+    SearchSummary {
+        buffer_id,
+        total: entry.matches.len() as u32,
+        truncated: entry.truncated,
+        current_index,
+    }
+}
+
+/// 1-based index of the match whose range exactly equals the cursor's current selection
+/// (`anchor == m.start` *and* `cursor == last char of m`), or `0` if no match matches. Single-char
+/// matches collapse the anchor (server normalizes `anchor == position` to `None`), so we handle
+/// that case too. Comparing both endpoints means the counter only shows when the user is
+/// genuinely "on" a match — extending or shrinking the selection drops the counter.
+fn match_index_for_cursor(buf: &Buffer, entry: &SearchEntry, cursor: &CursorState) -> u32 {
+    let pos_char = motion::pos_to_char(buf, cursor.position);
+    let anchor_char = cursor.anchor.map(|a| motion::pos_to_char(buf, a));
+    entry
+        .matches
+        .iter()
+        .position(|(start, end_excl)| {
+            let m_start_char = motion::pos_to_char(buf, *start);
+            let m_end_char = motion::pos_to_char(buf, *end_excl);
+            let m_last_char = m_end_char.saturating_sub(1);
+            if m_start_char == m_last_char {
+                anchor_char.is_none() && pos_char == m_start_char
+            } else {
+                anchor_char == Some(m_start_char) && pos_char == m_last_char
+            }
+        })
+        .map(|i| (i as u32).saturating_add(1))
+        .unwrap_or(0)
+    }
 
 /// Build one `viewport/lines_changed` notification per viewport owned by `client_id` that's
 /// subscribed to `buffer_id`. Used to refresh highlights when a search is set or cleared.
@@ -482,6 +528,44 @@ fn collect_viewport_refresh(
         }));
     }
     pushes
+}
+
+/// After a cursor change for `(client_id, buffer_id)`, build a `search/state_changed`
+/// notification with the recomputed `current_index` — but only when a search is active *and*
+/// the index actually changed since the last push. The cursor counts as "on" a match only when
+/// the selection's full range coincides with the match (both endpoints), so extending or
+/// shrinking the selection drops the counter rather than leaving it stale.
+fn collect_cursor_search_update(
+    s: &mut ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Option<(mpsc::Sender<Notification>, Notification)> {
+    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+    let buf = s.buffers.get(&buffer_id)?;
+    let new_idx = {
+        let entry = s.searches.get(&(client_id, buffer_id))?;
+        match_index_for_cursor(buf, entry, &cursor)
+    };
+    let entry = s.searches.get_mut(&(client_id, buffer_id))?;
+    if new_idx == entry.last_pushed_index {
+        return None;
+    }
+    entry.last_pushed_index = new_idx;
+    let summary = SearchSummary {
+        buffer_id,
+        total: entry.matches.len() as u32,
+        truncated: entry.truncated,
+        current_index: new_idx,
+    };
+    let session = s.clients.get(&client_id)?;
+    Some((
+        session.outbound.clone(),
+        Notification {
+            jsonrpc: JsonRpc,
+            method: SearchStateChanged::NAME.into(),
+            params: serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null),
+        },
+    ))
 }
 
 /// Build the `buffer/state` notification pushes for every client that has a viewport on this
@@ -543,12 +627,13 @@ fn refresh_searches_for_buffer(
     for key in keys {
         let query = s.searches[&key].query.clone();
         let buf = &s.buffers[&buffer_id];
-        let entry = match compute_search_entry(buf, &query) {
+        let mut entry = match compute_search_entry(buf, &query) {
             Ok(e) => e,
             Err(_) => continue,
         };
         let cursor = s.cursors.get(&key).copied().unwrap_or_default();
-        let summary = summary_for(&entry, buffer_id, &cursor);
+        let summary = summary_for(buf, &entry, buffer_id, &cursor);
+        entry.last_pushed_index = summary.current_index;
         s.searches.insert(key, entry);
         if let Some(sender) = s.clients.get(&key.0).map(|c| c.outbound.clone()) {
             pushes.push((sender, Notification {
@@ -1162,6 +1247,11 @@ pub async fn cursor_move(
             s.virtual_col.remove(&key);
         }
     }
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
     Ok(new_state)
 }
 
@@ -1265,6 +1355,11 @@ pub async fn cursor_select_line(
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
     Ok(new_state)
 }
 
@@ -1287,6 +1382,11 @@ pub async fn cursor_swap_anchor(
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
     Ok(new_state)
 }
 
@@ -1313,6 +1413,11 @@ pub async fn cursor_set(
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
     Ok(result)
 }
 
@@ -1342,6 +1447,11 @@ pub async fn cursor_undo(
 
     s.cursors.insert(key, prev);
     s.virtual_col.remove(&key);
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
     Ok(CursorUndoResult { applied: true, cursor: prev })
 }
 
@@ -1370,6 +1480,11 @@ pub async fn cursor_redo(
 
     s.cursors.insert(key, next);
     s.virtual_col.remove(&key);
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
     Ok(CursorUndoResult { applied: true, cursor: next })
 }
 

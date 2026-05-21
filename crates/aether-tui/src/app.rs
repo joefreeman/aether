@@ -830,18 +830,35 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
         .snapshot
         .as_ref()
         .map(|s| selection_start(&s.cursor));
-    let r = client
+    let result = client
         .rpc::<SearchSet>(SearchSetParams {
             buffer_id: state.buffer_id,
             query: state.search.query.clone(),
             anchor,
         })
-        .await?;
-    state.cursor = r.cursor;
-    state.search.summary = Some(r.summary.clone());
-    // If the search came back with zero matches and the server didn't move the cursor, revert
-    // to the snapshot so a failed keystroke doesn't strand the user.
-    if r.summary.total == 0 {
+        .await;
+    let revert_needed = match result {
+        Ok(r) => {
+            state.cursor = r.cursor;
+            state.search.summary = Some(r.summary.clone());
+            // Zero matches: revert below so a failed keystroke doesn't strand the user.
+            r.summary.total == 0
+        }
+        Err(_) => {
+            // Most commonly an invalid regex while the user is mid-type (e.g. a trailing `\`).
+            // Treat it as a transient "no matches" state — empty highlights, cursor reverted,
+            // a short note in the status so the user knows why their search isn't matching.
+            state.search.summary = Some(SearchSummary {
+                buffer_id: state.buffer_id,
+                total: 0,
+                truncated: false,
+                current_index: 0,
+            });
+            state.status = "invalid regex".into();
+            true
+        }
+    };
+    if revert_needed {
         if let Some(snap_cursor) = state.search.snapshot.as_ref().map(|s| s.cursor) {
             if state.cursor.position != snap_cursor.position
                 || state.cursor.anchor != snap_cursor.anchor
