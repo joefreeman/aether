@@ -135,6 +135,10 @@ pub struct AppState {
     /// Set after `f`/`t`/`F`/`T` (and their Alt variants); the next keystroke is interpreted as
     /// the target character rather than a normal-mode binding.
     pub pending_find: Option<PendingFind>,
+    /// The most recent repeatable motion, replayed by `r` (cursor move) or `Shift-r` (cursor
+    /// move + extend selection). Absolute-position motions (line/buffer endpoints, goto) aren't
+    /// stored because repeating them is a no-op.
+    pub last_motion: Option<Motion>,
     /// System clipboard handle. Held for the app's lifetime so the X11 selection isn't
     /// abandoned every operation. `None` if the clipboard couldn't be initialised (e.g. headless).
     pub clipboard: Option<arboard::Clipboard>,
@@ -224,6 +228,7 @@ pub async fn bootstrap(
         mode: Mode::Normal,
         pending_count: 0,
         pending_find: None,
+        last_motion: None,
         clipboard: clipboard::new_handle(),
         search: SearchState::default(),
     })
@@ -623,6 +628,17 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // last buffer mutation. Distinct from `Ctrl-u`/`Ctrl-Alt-u` which rewind buffer edits.
         (KeyCode::Char('u'), m) if m == ALT_ONLY => motion_redo(client, state, count).await?,
         (KeyCode::Char('u'), m) if m == KeyModifiers::NONE => motion_undo(client, state, count).await?,
+
+        // Repeat the last *repeatable* motion (see `is_repeatable_motion`). `r` runs it as a
+        // plain cursor move; `Shift-r` runs it extending the current selection. `Nr` loops the
+        // motion N times — so e.g. after `f x`, `5r` jumps to the 5th next `x`.
+        (KeyCode::Char('r'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            if let Some(motion) = state.last_motion.clone() {
+                for _ in 0..count.max(1) {
+                    move_motion(client, state, motion.clone(), extend).await?;
+                }
+            }
+        }
 
         // ---- mode transitions ----
         (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionStart).await?,
@@ -1087,12 +1103,37 @@ async fn move_motion(client: &mut Client, state: &mut AppState, motion: Motion, 
     let new: CursorState = client
         .rpc::<CursorMove>(CursorMoveParams {
             buffer_id: state.buffer_id,
-            motion,
+            motion: motion.clone(),
             extend_selection: extend,
         })
         .await?;
     state.cursor = new;
+    if is_repeatable_motion(&motion) {
+        state.last_motion = Some(motion);
+    }
     Ok(())
+}
+
+/// Motions worth remembering for `r`/`Shift-r` repeat: those where each press makes incremental
+/// progress. Absolute positions (line endpoints, buffer endpoints, goto) are excluded because
+/// repeating them is a no-op.
+fn is_repeatable_motion(motion: &Motion) -> bool {
+    match motion {
+        Motion::Char { .. }
+        | Motion::Word { .. }
+        | Motion::WordEnd { .. }
+        | Motion::LogicalLine { .. }
+        | Motion::VisualLine { .. }
+        | Motion::FindChar { .. } => true,
+        Motion::LineStart
+        | Motion::LineEnd
+        | Motion::LineFirstNonblank
+        | Motion::BufferStart
+        | Motion::BufferEnd
+        | Motion::Goto { .. }
+        | Motion::VisualLineStart { .. }
+        | Motion::VisualLineEnd { .. } => false,
+    }
 }
 
 async fn select_line(
