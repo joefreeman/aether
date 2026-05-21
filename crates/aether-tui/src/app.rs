@@ -610,9 +610,9 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // line at the moved edge. The cursor stays on whichever end (top/bottom) it was on, so
         // the bindings behave the same after `o` flips the selection direction.
         (KeyCode::Char('x'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            select_line(client, state, Direction::Forward, extend).await?,
+            select_line(client, state, Direction::Forward, extend, count).await?,
         (KeyCode::Char('x'), m) if m.contains(KeyModifiers::ALT) =>
-            select_line(client, state, Direction::Backward, extend).await?,
+            select_line(client, state, Direction::Backward, extend, count).await?,
 
         // ---- selection manipulation ----
         // `o` swaps the cursor and anchor — flips which end of the selection is the "leading"
@@ -621,8 +621,8 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         // Motion undo / redo — per-client history of cursor/selection changes, capped at the
         // last buffer mutation. Distinct from `Ctrl-u`/`Ctrl-Alt-u` which rewind buffer edits.
-        (KeyCode::Char('u'), m) if m == ALT_ONLY => motion_redo(client, state).await?,
-        (KeyCode::Char('u'), m) if m == KeyModifiers::NONE => motion_undo(client, state).await?,
+        (KeyCode::Char('u'), m) if m == ALT_ONLY => motion_redo(client, state, count).await?,
+        (KeyCode::Char('u'), m) if m == KeyModifiers::NONE => motion_undo(client, state, count).await?,
 
         // ---- mode transitions ----
         (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionStart).await?,
@@ -636,13 +636,13 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // ---- edits ----
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
         (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
-            redo(client, state).await?,
-        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state).await?,
-        (KeyCode::Char('j'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Down).await?,
-        (KeyCode::Char('k'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Up).await?,
-        (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state).await?,
-        (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state).await?,
-        (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state).await?,
+            redo(client, state, count).await?,
+        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, count).await?,
+        (KeyCode::Char('j'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Down, count).await?,
+        (KeyCode::Char('k'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Up, count).await?,
+        (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state, count).await?,
+        (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state, count).await?,
+        (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state, count).await?,
         (KeyCode::Char('o'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
             open_line_above(client, state).await?,
         (KeyCode::Char('o'), CTRL_ONLY) => open_line_below(client, state).await?,
@@ -661,8 +661,8 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // ---- clipboard ----
         (KeyCode::Char('y'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Selection).await?,
         (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Selection).await?,
-        (KeyCode::Char('p'), CTRL_ONLY) => paste_before(client, state).await?,
-        (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state).await?,
+        (KeyCode::Char('p'), CTRL_ONLY) => paste_before(client, state, count).await?,
+        (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state, count).await?,
 
         // ---- search ----
         (KeyCode::Char('/'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
@@ -670,9 +670,9 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('/'), m) if m == ALT_ONLY =>
             search_from_selection(client, state).await?,
         (KeyCode::Char('n'), m) if m.contains(KeyModifiers::ALT) =>
-            search_cycle(client, state, Direction::Backward).await?,
+            search_cycle(client, state, Direction::Backward, count).await?,
         (KeyCode::Char('n'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            search_cycle(client, state, Direction::Forward).await?,
+            search_cycle(client, state, Direction::Forward, count).await?,
 
         _ => {}
     }
@@ -687,8 +687,8 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // Allow Ctrl-S / Ctrl-U / Ctrl-Alt-U to work in insert mode too.
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
         (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
-            redo(client, state).await?,
-        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state).await?,
+            redo(client, state, 1).await?,
+        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, 1).await?,
 
         // Clipboard: in insert mode copy/cut operate on the current line.
         (KeyCode::Char('y'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Line).await?,
@@ -1028,7 +1028,12 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
-async fn search_cycle(client: &mut Client, state: &mut AppState, direction: Direction) -> Result<()> {
+async fn search_cycle(
+    client: &mut Client,
+    state: &mut AppState,
+    direction: Direction,
+    count: u32,
+) -> Result<()> {
     if !state.search.active {
         // No active search: revive the most recent history entry server-side, then cycle.
         let Some(last) = state.search.history.last().cloned() else { return Ok(()) };
@@ -1048,13 +1053,15 @@ async fn search_cycle(client: &mut Client, state: &mut AppState, direction: Dire
     if summary_total == 0 {
         return Ok(());
     }
-    let params = SearchNavParams { buffer_id: state.buffer_id };
-    let result = match direction {
-        Direction::Forward => client.rpc::<SearchNext>(params).await?,
-        Direction::Backward => client.rpc::<SearchPrev>(params).await?,
-    };
-    state.cursor = result.cursor;
-    state.search.summary = Some(result.summary);
+    for _ in 0..count.max(1) {
+        let params = SearchNavParams { buffer_id: state.buffer_id };
+        let result = match direction {
+            Direction::Forward => client.rpc::<SearchNext>(params).await?,
+            Direction::Backward => client.rpc::<SearchPrev>(params).await?,
+        };
+        state.cursor = result.cursor;
+        state.search.summary = Some(result.summary);
+    }
     Ok(())
 }
 
@@ -1093,15 +1100,18 @@ async fn select_line(
     state: &mut AppState,
     direction: Direction,
     extend: bool,
+    count: u32,
 ) -> Result<()> {
-    let new = client
-        .rpc::<CursorSelectLine>(CursorSelectLineParams {
-            buffer_id: state.buffer_id,
-            direction,
-            extend,
-        })
-        .await?;
-    state.cursor = new;
+    for _ in 0..count.max(1) {
+        let new = client
+            .rpc::<CursorSelectLine>(CursorSelectLineParams {
+                buffer_id: state.buffer_id,
+                direction,
+                extend,
+            })
+            .await?;
+        state.cursor = new;
+    }
     Ok(())
 }
 
@@ -1113,19 +1123,31 @@ async fn swap_anchor(client: &mut Client, state: &mut AppState) -> Result<()> {
     Ok(())
 }
 
-async fn motion_undo(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let r: CursorUndoResult = client
-        .rpc::<CursorUndo>(CursorUndoParams { buffer_id: state.buffer_id })
-        .await?;
-    apply_motion_undo_result(state, r, "motion undo");
+async fn motion_undo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    for _ in 0..count.max(1) {
+        let r: CursorUndoResult = client
+            .rpc::<CursorUndo>(CursorUndoParams { buffer_id: state.buffer_id })
+            .await?;
+        let applied = r.applied;
+        apply_motion_undo_result(state, r, "motion undo");
+        if !applied {
+            break;
+        }
+    }
     Ok(())
 }
 
-async fn motion_redo(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let r: CursorUndoResult = client
-        .rpc::<CursorRedo>(CursorUndoParams { buffer_id: state.buffer_id })
-        .await?;
-    apply_motion_undo_result(state, r, "motion redo");
+async fn motion_redo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    for _ in 0..count.max(1) {
+        let r: CursorUndoResult = client
+            .rpc::<CursorRedo>(CursorUndoParams { buffer_id: state.buffer_id })
+            .await?;
+        let applied = r.applied;
+        apply_motion_undo_result(state, r, "motion redo");
+        if !applied {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -1304,30 +1326,36 @@ async fn delete_with_motion(client: &mut Client, state: &mut AppState, motion: M
     Ok(())
 }
 
-async fn join_lines(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let r: EditResult = client
-        .rpc::<InputJoinLines>(BufferOnlyParams { buffer_id: state.buffer_id })
-        .await?;
-    state.revision = r.revision;
-    state.cursor = r.cursor;
+async fn join_lines(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    for _ in 0..count.max(1) {
+        let r: EditResult = client
+            .rpc::<InputJoinLines>(BufferOnlyParams { buffer_id: state.buffer_id })
+            .await?;
+        state.revision = r.revision;
+        state.cursor = r.cursor;
+    }
     Ok(())
 }
 
-async fn indent(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let r: EditResult = client
-        .rpc::<InputIndent>(BufferOnlyParams { buffer_id: state.buffer_id })
-        .await?;
-    state.revision = r.revision;
-    state.cursor = r.cursor;
+async fn indent(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    for _ in 0..count.max(1) {
+        let r: EditResult = client
+            .rpc::<InputIndent>(BufferOnlyParams { buffer_id: state.buffer_id })
+            .await?;
+        state.revision = r.revision;
+        state.cursor = r.cursor;
+    }
     Ok(())
 }
 
-async fn dedent(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let r: EditResult = client
-        .rpc::<InputDedent>(BufferOnlyParams { buffer_id: state.buffer_id })
-        .await?;
-    state.revision = r.revision;
-    state.cursor = r.cursor;
+async fn dedent(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    for _ in 0..count.max(1) {
+        let r: EditResult = client
+            .rpc::<InputDedent>(BufferOnlyParams { buffer_id: state.buffer_id })
+            .await?;
+        state.revision = r.revision;
+        state.cursor = r.cursor;
+    }
     Ok(())
 }
 
@@ -1378,15 +1406,18 @@ async fn move_lines(
     client: &mut Client,
     state: &mut AppState,
     direction: VerticalDirection,
+    count: u32,
 ) -> Result<()> {
-    let r: EditResult = client
-        .rpc::<InputMoveLines>(InputMoveLinesParams {
-            buffer_id: state.buffer_id,
-            direction,
-        })
-        .await?;
-    state.revision = r.revision;
-    state.cursor = r.cursor;
+    for _ in 0..count.max(1) {
+        let r: EditResult = client
+            .rpc::<InputMoveLines>(InputMoveLinesParams {
+                buffer_id: state.buffer_id,
+                direction,
+            })
+            .await?;
+        state.revision = r.revision;
+        state.cursor = r.cursor;
+    }
     Ok(())
 }
 
@@ -1417,8 +1448,8 @@ async fn cut_to_clipboard(client: &mut Client, state: &mut AppState, scope: Copy
 }
 
 /// Normal-mode paste: insert clipboard content *before* the selection's start and select the
-/// pasted text.
-async fn paste_before(client: &mut Client, state: &mut AppState) -> Result<()> {
+/// pasted text. `count` repeats the clipboard contents, so `3p` pastes three copies in a row.
+async fn paste_before(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     let text = match clipboard::paste(&mut state.clipboard) {
         Ok(t) => t,
         Err(e) => {
@@ -1426,6 +1457,7 @@ async fn paste_before(client: &mut Client, state: &mut AppState) -> Result<()> {
             return Ok(());
         }
     };
+    let text = text.repeat(count.max(1) as usize);
     // Collapse to the start of the selection (or stay put if no anchor).
     let start = match state.cursor.anchor {
         Some(anchor) => min_pos(state.cursor.position, anchor),
@@ -1443,8 +1475,8 @@ async fn paste_before(client: &mut Client, state: &mut AppState) -> Result<()> {
 }
 
 /// Normal-mode paste-replace: replace the current selection (or the cursor char) with the
-/// clipboard content and select what was pasted.
-async fn paste_replace(client: &mut Client, state: &mut AppState) -> Result<()> {
+/// clipboard content and select what was pasted. `count` repeats the clipboard contents.
+async fn paste_replace(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     let text = match clipboard::paste(&mut state.clipboard) {
         Ok(t) => t,
         Err(e) => {
@@ -1452,6 +1484,7 @@ async fn paste_replace(client: &mut Client, state: &mut AppState) -> Result<()> 
             return Ok(());
         }
     };
+    let text = text.repeat(count.max(1) as usize);
     insert_text_inner(client, state, &text, true).await
 }
 
@@ -1467,19 +1500,31 @@ async fn paste_at_cursor(client: &mut Client, state: &mut AppState) -> Result<()
     insert_text_inner(client, state, &text, false).await
 }
 
-async fn undo(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let r: UndoResult = client
-        .rpc::<InputUndo>(BufferOnlyParams { buffer_id: state.buffer_id })
-        .await?;
-    apply_undo_result(state, r, "undo");
+async fn undo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    for _ in 0..count.max(1) {
+        let r: UndoResult = client
+            .rpc::<InputUndo>(BufferOnlyParams { buffer_id: state.buffer_id })
+            .await?;
+        let applied = r.applied;
+        apply_undo_result(state, r, "undo");
+        if !applied {
+            break;
+        }
+    }
     Ok(())
 }
 
-async fn redo(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let r: UndoResult = client
-        .rpc::<InputRedo>(BufferOnlyParams { buffer_id: state.buffer_id })
-        .await?;
-    apply_undo_result(state, r, "redo");
+async fn redo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    for _ in 0..count.max(1) {
+        let r: UndoResult = client
+            .rpc::<InputRedo>(BufferOnlyParams { buffer_id: state.buffer_id })
+            .await?;
+        let applied = r.applied;
+        apply_undo_result(state, r, "redo");
+        if !applied {
+            break;
+        }
+    }
     Ok(())
 }
 
