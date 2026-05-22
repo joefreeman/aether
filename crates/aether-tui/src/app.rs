@@ -28,7 +28,7 @@ use aether_protocol::handshake::ClientHelloResult;
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
-    InputText, InputTextParams,
+    InputText, InputTextParams, InputToggleComment,
     InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
@@ -725,6 +725,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state, count).await?,
         (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state, count).await?,
         (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state, count).await?,
+        (KeyCode::Char('b'), CTRL_ONLY) => toggle_comment(client, state).await?,
         (KeyCode::Char('o'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
             open_line_above(client, state).await?,
         (KeyCode::Char('o'), CTRL_ONLY) => open_line_below(client, state).await?,
@@ -1775,6 +1776,17 @@ async fn dedent(client: &mut Client, state: &mut AppState, count: u32) -> Result
         state.revision = r.revision;
         state.cursor = r.cursor;
     }
+    Ok(())
+}
+
+/// Toggle line-comment status on the cursor's line (or all selected lines). Server picks the
+/// prefix from the buffer language's `line_comment` and no-ops for languages without one.
+async fn toggle_comment(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<InputToggleComment>(BufferOnlyParams { buffer_id: state.buffer_id })
+        .await?;
+    state.revision = r.revision;
+    state.cursor = r.cursor;
     Ok(())
 }
 

@@ -23,7 +23,7 @@ use aether_protocol::search::{
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
-    InputText, InputTextParams, InputUndo, UndoResult,
+    InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportScroll,
@@ -2709,6 +2709,526 @@ async fn newline_and_indent_fallback_copies_previous_line() {
     // Falls back to 4 spaces — the leading whitespace of line 0 — even though the line ends
     // in `{`. Plain text doesn't get the opener heuristic.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
+
+    drop(server);
+}
+
+// ---- input/toggle_comment ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn toggle_comment_adds_prefix_to_rust_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "    let x = 1;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Cursor on `let` (col 4, after the 4-space indent).
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 4 }, anchor: None,
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "    // let x = 1;\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_strips_when_already_commented() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "    // let x = 1;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None,
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "    let x = 1;\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
+    // Indents differ across the selection; the inserted prefix should sit at the smallest
+    // indent (col 2) so all three lines line up.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.py");
+    std::fs::write(&path, "  a = 1\n    b = 2\n  c = 3\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
+    }).await;
+    assert_eq!(open.language.as_deref(), Some("python"));
+
+    // Selection covers all three lines.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 2, col: 0 },
+        anchor: Some(LogicalPosition { line: 0, col: 0 }),
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "  # a = 1\n  #   b = 2\n  # c = 3\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
+    // Markdown has no line-comment form; cursor-only should fall back to block-wrapping the
+    // current line in `<!-- ... -->`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.md");
+    std::fs::write(&path, "# Heading\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.md".into()), language: None, create_if_missing: false,
+    }).await;
+
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None,
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "<!-- # Heading -->\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_partial_selection_in_js_block_wraps() {
+    // JS has both forms. A mid-line selection (not whole-line) should route to block.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.js");
+    std::fs::write(&path, "const x = foo + bar;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Select `foo` (cols 10..=12 inclusive).
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 0, col: 12 },
+        anchor: Some(LogicalPosition { line: 0, col: 10 }),
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "const x = /* foo */ + bar;\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_block_unwrap_strips_wrappers() {
+    // Select the entire `/* foo */` span and toggle — should strip back to `foo`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.js");
+    std::fs::write(&path, "const x = /* foo */ + bar;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Select `/* foo */` (cols 10..=18 inclusive).
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 0, col: 18 },
+        anchor: Some(LogicalPosition { line: 0, col: 10 }),
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "const x = foo + bar;\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
+    // Anchor at the very start of line 0, cursor on the last char of line 2. After
+    // commenting, the selection should *grow* to cover the new `// ` on line 0 (anchor stays
+    // at col 0) and follow the content on line 2 (cursor shifts forward).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "let a = 1;\nlet b = 2;\nlet c = 3;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Last char of `let c = 3;` is `;` at col 9.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 2, col: 9 },
+        anchor: Some(LogicalPosition { line: 0, col: 0 }),
+    }).await;
+    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    // Anchor stays at line 0 col 0 (now on the `/` of `// let a = 1;`).
+    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    // Cursor shifts forward by `// `.len() = 3 to follow the `;` at col 12.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 2, col: 12 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
+    // Selecting `foo` and toggling should leave the selection covering the whole `/* foo */`,
+    // not just the inner `foo`. Matches the line-comment behaviour where the selection grows
+    // to include the inserted prefix.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.js");
+    std::fs::write(&path, "const x = foo + bar;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Select `foo` (cols 10..=12 inclusive).
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 0, col: 12 },
+        anchor: Some(LogicalPosition { line: 0, col: 10 }),
+    }).await;
+    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    // Selection now covers the entire `/* foo */` — anchor on the first `/`, cursor on the
+    // last `/`. The wrap is 9 chars (`/* foo */`), so cols 10..=18.
+    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 10 }));
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 18 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_block_wrap_selection_ending_at_newline() {
+    // Regression: selection ends exactly on the `\n` of its line. `start_pos.line ==
+    // end_pos.line` but the *selected text* contains the newline, so the wrap is multi-line
+    // (`close` lands on the following line). The new selection has to follow.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.go");
+    std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.go".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Selection from (0, 5) mid-line through (0, 10) — the newline. Single line in
+    // (line, col), but selected text includes `\n`.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 0, col: 10 },
+        anchor: Some(LogicalPosition { line: 0, col: 5 }),
+    }).await;
+    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    // The closing `*/` sits on line 1 (after the original `\n`).
+    assert_eq!(text, "let a/*  = 1;\n */let b = 2;\n");
+    // Anchor stays on the original start; cursor follows the `*/` onto line 1 at col 2.
+    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 5 }));
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
+
+    // Toggle again to uncomment. Round-trip must restore the original buffer *and* the
+    // original selection — cursor back on the `\n` at line 0 col 10, not on line 1 col 0.
+    let r2: EditResult = send_request::<InputToggleComment>(&mut ws, 6, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text2 = buffer_text(&mut ws, 7, open.buffer_id).await;
+    assert_eq!(text2, "let a = 1;\nlet b = 2;\n");
+    assert_eq!(r2.cursor.anchor, Some(LogicalPosition { line: 0, col: 5 }));
+    assert_eq!(r2.cursor.position, LogicalPosition { line: 0, col: 10 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
+    // Regression: pre-edit `char_to_pos` for a post-edit char index produces the wrong
+    // (line, col) once the wrap spans multiple lines. The selection used to extend by only
+    // `close.len() + 1` cols instead of the full `open + space + close + space` worth.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.ts");
+    std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.ts".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Multi-line partial selection: (0, 4) `a` through (1, 4) `b`.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 1, col: 4 },
+        anchor: Some(LogicalPosition { line: 0, col: 4 }),
+    }).await;
+    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    // Anchor stays at (0, 4) — the opening `/` of `/*` lives there post-edit. Cursor lands
+    // on the last `/` of `*/`, which is at col 7 of line 1 (`let b */ = 2;`).
+    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 4 }));
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 7 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
+    // Multi-line selection that *doesn't* cover complete lines (cursor stops mid-line on the
+    // last line) should route to block-comment, not line-comment.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.js");
+    std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Select from col 4 of line 0 (the `a`) to col 4 of line 1 (the `b`) — multi-line but
+    // neither line is fully covered.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 1, col: 4 },
+        anchor: Some(LogicalPosition { line: 0, col: 4 }),
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "let /* a = 1;\nlet b */ = 2;\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_round_trip_partial_selection() {
+    // Real-world toggle gesture: select `foo`, Ctrl-b to wrap, Ctrl-b again to unwrap. The
+    // second toggle works because tree-sitter sees the cursor inside a comment node — the
+    // post-wrap selection sits on the inner content, not around the wrappers.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.js");
+    std::fs::write(&path, "const x = foo + bar;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Select `foo` (cols 10..=12 inclusive).
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 0, col: 12 },
+        anchor: Some(LogicalPosition { line: 0, col: 10 }),
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let after_wrap = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(after_wrap, "const x = /* foo */ + bar;\n");
+
+    // Second toggle: the response from the first toggle moved the selection to the inner
+    // `foo`. We don't manually re-set the cursor — just press toggle again.
+    send_request::<InputToggleComment>(&mut ws, 6, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let after_unwrap = buffer_text(&mut ws, 7, open.buffer_id).await;
+    assert_eq!(after_unwrap, "const x = foo + bar;\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_cursor_inside_block_comment_unwraps() {
+    // Cursor placed somewhere inside an existing `/* ... */`. No selection, no exact-span
+    // gymnastics — just press toggle and have the wrappers come off.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.js");
+    std::fs::write(&path, "const x = /* foo */ + bar;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Cursor on the `f` of `foo` (col 13), inside the comment.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 13 }, anchor: None,
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "const x = foo + bar;\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
+    // CSS has only block tokens. Cursor-only → wrap the current line.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.css");
+    std::fs::write(&path, "color: red;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.css".into()), language: None, create_if_missing: false,
+    }).await;
+
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None,
+    }).await;
+    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "/* color: red; */\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
+    // Regression: in a block-only language (markdown / html / css), cursor-only on an empty
+    // line used to wrap the lone `\n`, producing a 2-line comment that ate the blank line.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.md");
+    std::fs::write(&path, "\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.md".into()), language: None, create_if_missing: false,
+    }).await;
+
+    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    // Revision unchanged (no edit), text unchanged.
+    assert_eq!(r.revision, open.revision);
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_is_noop_for_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.json");
+    std::fs::write(&path, "{}\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.json".into()), language: None, create_if_missing: false,
+    }).await;
+
+    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id: open.buffer_id,
+    }).await;
+    // Buffer revision unchanged (no edit); text unchanged.
+    assert_eq!(r.revision, open.revision);
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "{}\n");
 
     drop(server);
 }

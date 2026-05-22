@@ -1963,6 +1963,571 @@ fn previous_line_indent(buf: &Buffer, line_idx: usize) -> String {
     }
 }
 
+pub async fn input_toggle_comment(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<EditResult, RpcError> {
+    apply_toggle_comment(state, ctx, params.buffer_id).await
+}
+
+/// Toggle comment status on the cursor/selection.
+///
+/// Decision tree (closest to what users expect from `Ctrl-/` in modern editors):
+///   1. If the language has a *line* token and every non-blank line in the affected range
+///      already starts with it → strip it.
+///   2. Else if the language has *block* tokens and the cursor sits inside a block-comment
+///      node (via tree-sitter) or the selection exactly wraps a `start…end` span → strip
+///      them.
+///   3. Else if the selection is *partial-line* and the language has block tokens → wrap.
+///   4. Else if the language has a line token → add the line prefix on each line, aligned to
+///      the smallest indent so prefixes line up.
+///   5. Else if the language has block tokens → wrap (for languages with no line form).
+///   6. Else → no-op.
+async fn apply_toggle_comment(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    buffer_id: BufferId,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+
+    let (line_tok, block_tok) = buf
+        .syntax
+        .as_ref()
+        .map(|sy| (sy.config.line_comment, sy.config.block_comment))
+        .unwrap_or((None, None));
+    if line_tok.is_none() && block_tok.is_none() {
+        let revision = buf.revision;
+        let response = wrap_for_response(&s, buffer_id, cursor);
+        return Ok(EditResult { revision, cursor: response });
+    }
+
+    // Selection / line range.
+    let (a, b) = match cursor.anchor {
+        Some(anchor) => {
+            let (start, end) = motion::ordered(cursor.position, anchor);
+            (start.line, end.line)
+        }
+        None => (cursor.position.line, cursor.position.line),
+    };
+    let is_partial = is_partial_line_selection(buf, &cursor);
+
+    // Phase 1: decide the action.
+    let line_strings: Vec<String> =
+        (a..=b).map(|i| buf.text.line(i as usize).chunks().collect()).collect();
+    let line_classify = classify_line_range(&line_strings, line_tok);
+
+    let sel_block_unwrap = block_tok.and_then(|(open, close)| {
+        // Primary detector: tree-sitter `comment` ancestor containing the cursor. Handles the
+        // natural "wrap, then re-toggle to unwrap" gesture where the selection sits on the
+        // inner content rather than around the wrappers.
+        if let Some(syntax) = buf.syntax.as_ref() {
+            let cursor_byte =
+                buf.text.char_to_byte(motion::pos_to_char(buf, cursor.position));
+            let source: String = buf.text.chunks().collect();
+            if let Some((s, e)) = find_enclosing_block_comment(
+                &syntax.tree,
+                source.as_bytes(),
+                cursor_byte,
+                open,
+                close,
+            ) {
+                let span = source[s..e].to_string();
+                return Some((s, e, span, open, close));
+            }
+        }
+        // Fallback: the selection's text *exactly* equals a wrapped span. Catches incomplete
+        // parses where tree-sitter doesn't recognise the comment yet (e.g. the user just
+        // typed an opener without a closer).
+        let (start_pos, end_pos) = ordered_selection_or_cursor_line(&cursor);
+        let start_char = motion::pos_to_char(buf, start_pos);
+        let end_char_excl =
+            motion::pos_to_char(buf, end_pos).saturating_add(1).min(buf.text.len_chars());
+        let span: String = buf.text.slice(start_char..end_char_excl).chunks().collect();
+        if span.starts_with(open) && span.ends_with(close) && span.len() >= open.len() + close.len() {
+            Some((start_char, end_char_excl, span, open, close))
+        } else {
+            None
+        }
+    });
+
+    enum Plan {
+        Noop,
+        LineUncomment { prefix: &'static str },
+        LineComment { prefix: &'static str, min_indent: usize },
+        BlockUnwrap { start_char: usize, end_char_excl: usize, span: String, open: &'static str, close: &'static str },
+        BlockWrap { start_char: usize, end_char_excl: usize, open: &'static str, close: &'static str },
+    }
+
+    let plan = if let (Some(prefix), Some(c)) = (line_tok, &line_classify) {
+        if c.all_commented {
+            Plan::LineUncomment { prefix }
+        } else if let Some((sc, ec, span, open, close)) = sel_block_unwrap {
+            Plan::BlockUnwrap { start_char: sc, end_char_excl: ec, span, open, close }
+        } else if is_partial && block_tok.is_some() {
+            let (start_pos, end_pos) = ordered_selection_or_cursor_line(&cursor);
+            let sc = motion::pos_to_char(buf, start_pos);
+            let ec = motion::pos_to_char(buf, end_pos).saturating_add(1).min(buf.text.len_chars());
+            let (open, close) = block_tok.unwrap();
+            Plan::BlockWrap { start_char: sc, end_char_excl: ec, open, close }
+        } else if c.any_nonblank {
+            Plan::LineComment { prefix, min_indent: c.min_indent }
+        } else {
+            Plan::Noop
+        }
+    } else if let Some((sc, ec, span, open, close)) = sel_block_unwrap {
+        Plan::BlockUnwrap { start_char: sc, end_char_excl: ec, span, open, close }
+    } else if let Some((open, close)) = block_tok {
+        // No line tokens at all (markdown, html, css): everything routes to block.
+        let endpoints = if cursor.anchor.is_some() {
+            Some(ordered_selection_or_cursor_line(&cursor))
+        } else {
+            // Cursor-only: wrap the current line's content. Skip empty lines entirely —
+            // otherwise the wrap would swallow the line's `\n` and merge it with the next.
+            current_line_content_endpoints(buf, cursor.position.line)
+        };
+        match endpoints {
+            None => Plan::Noop,
+            Some((start_pos, end_pos)) => {
+                let sc = motion::pos_to_char(buf, start_pos);
+                let ec = motion::pos_to_char(buf, end_pos).saturating_add(1).min(buf.text.len_chars());
+                if sc == ec {
+                    Plan::Noop
+                } else {
+                    Plan::BlockWrap { start_char: sc, end_char_excl: ec, open, close }
+                }
+            }
+        }
+    } else {
+        Plan::Noop
+    };
+
+    // Phase 2: materialize the edit. Each variant produces (edit_start_char, edit_end_char,
+    // replacement_text, new_cursor).
+    let edit: Option<(usize, usize, String, CursorState, u32, u32)> = match plan {
+        Plan::Noop => None,
+        Plan::LineUncomment { prefix } => {
+            let (start_char, end_char) = line_edit_char_range(buf, a, b);
+            let (text, shifts, insert_cols) =
+                build_line_uncomment(&line_strings, a, prefix);
+            let nc = shift_cursor_by_line_map(cursor, a, b, &shifts, &insert_cols);
+            Some((start_char, end_char, text, nc, a, b))
+        }
+        Plan::LineComment { prefix, min_indent } => {
+            let (start_char, end_char) = line_edit_char_range(buf, a, b);
+            let (text, shifts, insert_cols) =
+                build_line_comment(&line_strings, a, prefix, min_indent);
+            let nc = shift_cursor_by_line_map(cursor, a, b, &shifts, &insert_cols);
+            Some((start_char, end_char, text, nc, a, b))
+        }
+        Plan::BlockUnwrap { start_char, end_char_excl, span, open, close } => {
+            // Strip `open` + optional inner space at the front, optional inner space + `close`
+            // at the back. Replace the wrapped span with the inner content; re-select that
+            // content.
+            let inner_start = open.len();
+            let inner_end = span.len() - close.len();
+            let mut inner = &span[inner_start..inner_end];
+            if inner.starts_with(' ') {
+                inner = &inner[1..];
+            }
+            if inner.ends_with(' ') {
+                inner = &inner[..inner.len() - 1];
+            }
+            let new_text = inner.to_string();
+            let start_pos = motion::char_to_pos(buf, start_char);
+            // Compute the post-edit position of inner's last byte directly. Walk to the last
+            // byte and ask "how many newlines came strictly before it, and where was the last
+            // one?". When inner *ends* with `\n` the cursor lands on that `\n` itself (which
+            // belongs to the previous line) — naively splitting on `\n` would wrongly put the
+            // cursor at col 0 of an empty trailing line.
+            let new_position = if inner.is_empty() {
+                start_pos
+            } else {
+                let last_byte_idx = inner.len() - 1;
+                let prefix = &inner[..last_byte_idx];
+                let newlines_before = prefix.matches('\n').count() as u32;
+                match prefix.rfind('\n') {
+                    Some(last_nl) => aether_protocol::LogicalPosition {
+                        line: start_pos.line + newlines_before,
+                        col: (last_byte_idx - last_nl - 1) as u32,
+                    },
+                    None => aether_protocol::LogicalPosition {
+                        line: start_pos.line,
+                        col: start_pos.col + last_byte_idx as u32,
+                    },
+                }
+            };
+            let nc = if start_pos == new_position {
+                CursorState { position: new_position, anchor: None, match_bracket: None }
+            } else {
+                CursorState { position: new_position, anchor: Some(start_pos), match_bracket: None }
+            };
+            let last_line = motion::char_to_pos(buf, end_char_excl.saturating_sub(1)).line;
+            Some((start_char, end_char_excl, new_text, nc, a.min(last_line), b.max(last_line)))
+        }
+        Plan::BlockWrap { start_char, end_char_excl, open, close } => {
+            let selected: String =
+                buf.text.slice(start_char..end_char_excl).chunks().collect();
+            let new_text = format!("{open} {selected} {close}");
+            // Compute new selection endpoints in (line, col) directly — `char_to_pos` on the
+            // pre-edit buffer is wrong for post-edit char indices once the wrap spans lines.
+            // Discriminate by whether the *selected text* contains a newline, not by whether
+            // start_pos.line == end_pos.line: a selection ending exactly on the `\n` of its
+            // line counts as single-line in (line, col) terms but produces multi-line output.
+            let start_pos = motion::char_to_pos(buf, start_char);
+            let end_pos = motion::char_to_pos(buf, end_char_excl.saturating_sub(1));
+            let newlines = selected.matches('\n').count() as u32;
+            let new_position = if newlines == 0 {
+                aether_protocol::LogicalPosition {
+                    line: end_pos.line,
+                    col: end_pos.col + open.len() as u32 + close.len() as u32 + 2,
+                }
+            } else {
+                // The wrap's last line consists of whatever followed the last newline in the
+                // selected text, plus the inserted ` close`.
+                let last_nl_byte = selected.rfind('\n').unwrap();
+                let bytes_after_last_nl = (selected.len() - last_nl_byte - 1) as u32;
+                let last_line_bytes = bytes_after_last_nl + 1 + close.len() as u32;
+                aether_protocol::LogicalPosition {
+                    line: start_pos.line + newlines,
+                    col: last_line_bytes.saturating_sub(1),
+                }
+            };
+            let nc = if start_pos == new_position {
+                CursorState { position: new_position, anchor: None, match_bracket: None }
+            } else {
+                CursorState { position: new_position, anchor: Some(start_pos), match_bracket: None }
+            };
+            let last_touched_line = start_pos.line + newlines;
+            Some((start_char, end_char_excl, new_text, nc, a.min(start_pos.line), b.max(last_touched_line)))
+        }
+    };
+
+    let Some((start_char, end_char, new_text, new_cursor, edit_first, edit_last_incl)) = edit
+    else {
+        let revision = buf.revision;
+        let response = wrap_for_response(&s, buffer_id, cursor);
+        return Ok(EditResult { revision, cursor: response });
+    };
+
+    let cursors_before: HashMap<ClientId, CursorState> = s
+        .cursors
+        .iter()
+        .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
+        .collect();
+
+    let revision = {
+        let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+        buf_mut.apply_edit(start_char, end_char, &new_text, EditKindTag::Text, cursors_before)
+    };
+    // Re-clamp the new cursor against the post-edit buffer (positions computed above used the
+    // pre-edit buffer; if the edit shortened lines, clamp_position keeps them legal).
+    let new_cursor = {
+        let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+        let mut c = new_cursor;
+        c.position = motion::clamp_position(buf_mut, c.position);
+        c.anchor = c.anchor.map(|a| motion::clamp_position(buf_mut, a));
+        if c.anchor == Some(c.position) {
+            c.anchor = None;
+        }
+        c
+    };
+    s.cursors.insert((client_id, buffer_id), new_cursor);
+    s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_tree_selection_history_for_buffer(buffer_id);
+    s.clear_virtual_col_for_buffer(buffer_id);
+
+    let edit_last_excl = edit_last_incl + 1;
+    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let new_line_count = s.buffers[&buffer_id].line_count();
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    let buf_ref = &s.buffers[&buffer_id];
+    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    for vp in s.viewports.values() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        if !ranges_overlap(
+            vp.first_logical_line,
+            vp.last_logical_line_exclusive,
+            edit_first,
+            edit_last_excl,
+        ) {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        let search = s.searches.get(&(vp.client_id, buffer_id));
+        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
+    }
+
+    let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(EditResult { revision, cursor: new_cursor })
+}
+
+/// Walk the cursor's ancestors looking for a tree-sitter node whose kind contains "comment"
+/// and whose text starts with `open` and ends with `close`. Returns the node's byte range.
+/// We match by kind-substring rather than exact name because grammars use different names
+/// (`comment`, `block_comment`, `line_comment`, …) and the open/close suffix check validates
+/// it's a block-style comment regardless.
+fn find_enclosing_block_comment(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    byte: usize,
+    open: &str,
+    close: &str,
+) -> Option<(usize, usize)> {
+    let root = tree.root_node();
+    let here = root.descendant_for_byte_range(byte, byte + 1)?;
+    let mut node = Some(here);
+    while let Some(n) = node {
+        if n.kind().contains("comment") {
+            let s = n.start_byte();
+            let e = n.end_byte();
+            let span = source.get(s..e)?;
+            if span.starts_with(open.as_bytes()) && span.ends_with(close.as_bytes())
+                && e - s >= open.len() + close.len()
+            {
+                return Some((s, e));
+            }
+        }
+        node = n.parent();
+    }
+    None
+}
+
+struct LineClassify {
+    any_nonblank: bool,
+    all_commented: bool,
+    min_indent: usize,
+}
+
+fn classify_line_range(lines: &[String], prefix: Option<&str>) -> Option<LineClassify> {
+    let prefix = prefix?;
+    let mut all_commented = true;
+    let mut min_indent: Option<usize> = None;
+    let mut any_nonblank = false;
+    for line in lines {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let leading: usize = content
+            .as_bytes()
+            .iter()
+            .take_while(|b| **b == b' ' || **b == b'\t')
+            .count();
+        let rest = &content[leading..];
+        if rest.is_empty() {
+            continue;
+        }
+        any_nonblank = true;
+        min_indent = Some(min_indent.map_or(leading, |m| m.min(leading)));
+        if !rest.starts_with(prefix) {
+            all_commented = false;
+        }
+    }
+    Some(LineClassify { any_nonblank, all_commented, min_indent: min_indent.unwrap_or(0) })
+}
+
+/// `true` when the selection doesn't cover a contiguous run of *complete* lines (lower
+/// endpoint at col 0 of its line, upper endpoint at the line end of its line). Cursor-only
+/// counts as non-partial. Partial selections — single mid-line, or multi-line where one of
+/// the boundary lines isn't fully covered — route to block-comment when the language has it.
+fn is_partial_line_selection(buf: &Buffer, cursor: &CursorState) -> bool {
+    let Some(anchor) = cursor.anchor else { return false };
+    let (lo, hi) = motion::ordered(cursor.position, anchor);
+    let line_end_hi = motion::line_byte_len_excl_newline(buf, hi.line);
+    let lo_at_start = lo.col == 0;
+    // Accept either exclusive end (col == line_end) or inclusive last byte (col + 1 ==
+    // line_end). Aether's selections are inclusive on both endpoints, so the natural
+    // "whole-line" form has the cursor on the last byte.
+    let hi_at_end = hi.col == line_end_hi || hi.col + 1 == line_end_hi;
+    !(lo_at_start && hi_at_end)
+}
+
+/// `(start_pos, end_pos)` of the selection, both inclusive, ordered. Cursor-only collapses to
+/// the single-char range at the cursor.
+fn ordered_selection_or_cursor_line(cursor: &CursorState) -> (aether_protocol::LogicalPosition, aether_protocol::LogicalPosition) {
+    match cursor.anchor {
+        Some(anchor) => motion::ordered(cursor.position, anchor),
+        None => (cursor.position, cursor.position),
+    }
+}
+
+/// Endpoints `(line_start, line_end_inclusive)` for the content of `line_idx`, excluding the
+/// trailing newline. Used to give "wrap the current line" a sensible char range when no
+/// selection exists in a block-only language. Returns `None` for empty lines so the caller
+/// can skip — otherwise a wrap on an empty line would replace its lone `\n` and merge the
+/// line with the next.
+fn current_line_content_endpoints(buf: &Buffer, line_idx: u32) -> Option<(aether_protocol::LogicalPosition, aether_protocol::LogicalPosition)> {
+    let end_col = motion::line_byte_len_excl_newline(buf, line_idx);
+    if end_col == 0 {
+        return None;
+    }
+    Some((
+        aether_protocol::LogicalPosition { line: line_idx, col: 0 },
+        aether_protocol::LogicalPosition { line: line_idx, col: end_col - 1 },
+    ))
+}
+
+fn line_edit_char_range(buf: &Buffer, a: u32, b: u32) -> (usize, usize) {
+    let len_lines = buf.text.len_lines() as u32;
+    let len_chars = buf.text.len_chars();
+    let start_char = buf.text.line_to_char(a as usize);
+    let end_char = if (b + 1) < len_lines {
+        buf.text.line_to_char((b + 1) as usize)
+    } else {
+        len_chars
+    };
+    (start_char, end_char)
+}
+
+fn build_line_comment(
+    lines: &[String],
+    a: u32,
+    prefix: &str,
+    min_indent: usize,
+) -> (String, HashMap<u32, i32>, HashMap<u32, usize>) {
+    let prefix_with_space = format!("{prefix} ");
+    let mut text = String::new();
+    let mut shifts = HashMap::new();
+    let mut insert_cols = HashMap::new();
+    for (offset, line) in lines.iter().enumerate() {
+        let line_idx = a + offset as u32;
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(s) => (s, "\n"),
+            None => (line.as_str(), ""),
+        };
+        let leading: usize = content
+            .as_bytes()
+            .iter()
+            .take_while(|b| **b == b' ' || **b == b'\t')
+            .count();
+        let is_blank = content[leading..].is_empty();
+        if is_blank {
+            text.push_str(content);
+            text.push_str(newline);
+            shifts.insert(line_idx, 0);
+            insert_cols.insert(line_idx, leading);
+            continue;
+        }
+        let (before, after) = content.split_at(min_indent);
+        text.push_str(before);
+        text.push_str(&prefix_with_space);
+        text.push_str(after);
+        text.push_str(newline);
+        shifts.insert(line_idx, prefix_with_space.len() as i32);
+        insert_cols.insert(line_idx, min_indent);
+    }
+    (text, shifts, insert_cols)
+}
+
+fn build_line_uncomment(
+    lines: &[String],
+    a: u32,
+    prefix: &str,
+) -> (String, HashMap<u32, i32>, HashMap<u32, usize>) {
+    let mut text = String::new();
+    let mut shifts = HashMap::new();
+    let mut insert_cols = HashMap::new();
+    for (offset, line) in lines.iter().enumerate() {
+        let line_idx = a + offset as u32;
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(s) => (s, "\n"),
+            None => (line.as_str(), ""),
+        };
+        let leading: usize = content
+            .as_bytes()
+            .iter()
+            .take_while(|b| **b == b' ' || **b == b'\t')
+            .count();
+        let rest = &content[leading..];
+        if rest.is_empty() {
+            text.push_str(content);
+            text.push_str(newline);
+            shifts.insert(line_idx, 0);
+            insert_cols.insert(line_idx, leading);
+            continue;
+        }
+        // We've already classified the range as `all_commented` so this strip is safe.
+        let after_prefix = rest.strip_prefix(prefix).unwrap_or(rest);
+        let (stripped_tail, removed) = if let Some(after_space) = after_prefix.strip_prefix(' ') {
+            (after_space, prefix.len() + 1)
+        } else {
+            (after_prefix, prefix.len())
+        };
+        text.push_str(&content[..leading]);
+        text.push_str(stripped_tail);
+        text.push_str(newline);
+        shifts.insert(line_idx, -(removed as i32));
+        insert_cols.insert(line_idx, leading);
+    }
+    (text, shifts, insert_cols)
+}
+
+fn shift_cursor_by_line_map(
+    cursor: CursorState,
+    a: u32,
+    b: u32,
+    shifts: &HashMap<u32, i32>,
+    insert_cols: &HashMap<u32, usize>,
+) -> CursorState {
+    // When a selection exists, treat its endpoints asymmetrically so the selection *extends*
+    // to cover any prefix we just added (rather than sliding with the content and leaving the
+    // new prefix outside the selection). The lower endpoint stays put when it sits exactly at
+    // the insert column; the upper endpoint shifts forward to follow the content.
+    let lower = cursor.anchor.map(|anch| motion::ordered(cursor.position, anch).0);
+
+    let shift_pos = |p: aether_protocol::LogicalPosition, is_lower_endpoint: bool| {
+        if p.line < a || p.line > b {
+            return p;
+        }
+        let shift = shifts.get(&p.line).copied().unwrap_or(0);
+        let insert_col = insert_cols.get(&p.line).copied().unwrap_or(0) as u32;
+        if p.col < insert_col {
+            return p;
+        }
+        let col = if shift >= 0 {
+            // The endpoint that anchors the selection's *start* stays at insert_col so the
+            // selection grows; everything else (including cursor-only) shifts forward.
+            if is_lower_endpoint && p.col == insert_col {
+                p.col
+            } else {
+                p.col.saturating_add(shift as u32)
+            }
+        } else {
+            let removed = (-shift) as u32;
+            let prefix_end = insert_col + removed;
+            if p.col >= prefix_end { p.col - removed } else { insert_col }
+        };
+        aether_protocol::LogicalPosition { line: p.line, col }
+    };
+
+    // Don't clamp here; positions are post-edit, and the post-edit clamp at the call site
+    // handles legality. Clamping against the pre-edit buffer would clip to shorter lines.
+    let position_is_lower = lower == Some(cursor.position);
+    let position = shift_pos(cursor.position, position_is_lower);
+    let anchor = cursor.anchor.map(|anch| {
+        let is_lower = lower == Some(anch);
+        shift_pos(anch, is_lower)
+    });
+    let anchor = match anchor {
+        Some(a) if a == position => None,
+        x => x,
+    };
+    CursorState { position, anchor, match_bracket: None }
+}
+
 pub async fn input_dedent(
     state: &SharedState,
     ctx: &mut ConnectionCtx,

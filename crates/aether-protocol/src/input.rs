@@ -80,6 +80,19 @@ impl RpcMethod for InputNewlineAndIndent {
     type Result = EditResult;
 }
 
+// ---- input/toggle_comment -----------------------------------------------------------------------
+
+/// Toggle line-comment status on the cursor's line, or — when there's a selection — on every
+/// line the selection touches. The server uses the buffer language's `line_comment` prefix
+/// (`"//"`, `"#"`, `"%"`, etc.). Languages without a single-line comment form (markdown, html,
+/// css, json) make this a no-op.
+pub struct InputToggleComment;
+impl RpcMethod for InputToggleComment {
+    const NAME: &'static str = "input/toggle_comment";
+    type Params = BufferOnlyParams;
+    type Result = EditResult;
+}
+
 // ---- input/move_lines ---------------------------------------------------------------------------
 
 /// Move the cursor's line (or, if a selection is active, all lines covered by it) up or down by
