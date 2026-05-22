@@ -148,6 +148,26 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         Motion::VisualLine { .. } | Motion::VisualLineStart { .. } | Motion::VisualLineEnd { .. } => {
             current
         }
+        Motion::MatchBracket => {
+            let Some(syntax) = buf.syntax.as_ref() else { return current };
+            let source: String = buf.text.chunks().collect();
+            let cursor_byte = buf.text.char_to_byte(pos_to_char(buf, current));
+            let Some((open, close)) = crate::brackets::find_match_bracket(&syntax.tree, cursor_byte)
+            else {
+                return current;
+            };
+            // Jump to whichever bracket isn't under the cursor. If the cursor isn't on either
+            // (i.e. inside the pair), default to the opener — Vim's `%` does the same.
+            let target_byte = if cursor_byte == open {
+                close
+            } else if cursor_byte == close {
+                open
+            } else {
+                open
+            };
+            let _ = source; // (kept for future predicate work)
+            char_to_pos(buf, buf.text.byte_to_char(target_byte))
+        }
         Motion::FindChar { ch, direction, count, till } => {
             let cur_idx = pos_to_char(buf, current);
             let total = buf.text.len_chars();

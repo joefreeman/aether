@@ -648,6 +648,13 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('t'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             state.pending_find = Some(PendingFind { direction: Direction::Forward, till: true, extend, count }),
 
+        // ---- motion: matching bracket ----
+        // `m` jumps to the bracket that matches the one under (or enclosing) the cursor.
+        // `Shift-m` does the same with `extend=true`, producing a selection from the original
+        // position to the match — a natural "select around brackets" gesture (Vim's `v%`).
+        (KeyCode::Char('m'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
+            move_motion(client, state, Motion::MatchBracket, extend).await?,
+
         // ---- motions: goto line ----
         // `g` jumps to line N (1-indexed; no prefix = line 1). `Alt-g` jumps to the last line.
         // Shift extends the selection. The server clamps line numbers past EOF.
@@ -1464,7 +1471,8 @@ fn is_repeatable_motion(motion: &Motion) -> bool {
         | Motion::BufferEnd
         | Motion::Goto { .. }
         | Motion::VisualLineStart { .. }
-        | Motion::VisualLineEnd { .. } => false,
+        | Motion::VisualLineEnd { .. }
+        | Motion::MatchBracket => false,
     }
 }
 

@@ -1,5 +1,6 @@
 //! Aether editor server.
 
+mod brackets;
 mod config;
 mod connection;
 mod cursor;

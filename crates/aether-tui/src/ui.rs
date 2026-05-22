@@ -164,11 +164,18 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             });
             let matches_on_row =
                 matches_on_visual_row(vrow.byte_offset, row_text_len, &render.search_matches);
+            let brackets_on_row =
+                bracket_positions_on_visual_row(logical_line, vrow.byte_offset, row_text_len, state.cursor.match_bracket);
 
             // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
             // bytes when scroll_col == 0 (the common case), so this is a no-op under soft wrap.
             let (clipped_text, clipped_highlights, clipped_sel, clipped_matches) =
                 clip_horizontal(&segment.text, &segment.highlights, sel_on_row, &matches_on_row, scroll_col);
+            let clipped_brackets: Vec<u32> = brackets_on_row
+                .iter()
+                .filter(|b| **b >= scroll_col)
+                .map(|b| b - scroll_col)
+                .collect();
 
             // Continuation row when byte_offset > 0. Prepend the marker; the server already
             // reserved this width when wrapping.
@@ -188,7 +195,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if indent > 0 {
                 spans.push(Span::raw(" ".repeat(indent as usize)));
             }
-            spans.extend(build_spans(&clipped_text, &clipped_highlights, clipped_sel, &clipped_matches, body_width, extend_sel_to_cursor));
+            spans.extend(build_spans(&clipped_text, &clipped_highlights, clipped_sel, &clipped_matches, &clipped_brackets, body_width, extend_sel_to_cursor));
             lines.push(Line::from(spans));
         }
         logical_line = match logical_line.checked_add(1) {
@@ -272,6 +279,29 @@ fn matches_on_visual_row(
         .collect()
 }
 
+/// For the visual row at `(logical_line, row_byte_offset..row_byte_offset+row_text_len)`,
+/// return the row-relative byte offsets of any match-bracket positions on it. Used to overlay
+/// the bracket-pair highlight on whichever rows actually contain the brackets.
+fn bracket_positions_on_visual_row(
+    logical_line: u32,
+    row_byte_offset: u32,
+    row_text_len: u32,
+    pair: Option<(LogicalPosition, LogicalPosition)>,
+) -> Vec<u32> {
+    let Some((a, b)) = pair else { return Vec::new() };
+    let row_end = row_byte_offset + row_text_len;
+    [a, b]
+        .iter()
+        .filter_map(|p| {
+            if p.line == logical_line && p.col >= row_byte_offset && p.col < row_end {
+                Some(p.col - row_byte_offset)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn ordered_selection(cursor: &CursorState) -> Option<(LogicalPosition, LogicalPosition)> {
     let anchor = cursor.anchor?;
     let p = cursor.position;
@@ -319,6 +349,7 @@ fn build_spans(
     highlights: &[Highlight],
     sel: Option<(u32, u32)>,
     matches: &[(u32, u32)],
+    match_brackets: &[u32],
     max_chars: u16,
     extend_sel_to_cursor: bool,
 ) -> Vec<Span<'static>> {
@@ -362,8 +393,23 @@ fn build_spans(
         }
     }
 
+    let mut byte_is_match_bracket: Vec<bool> = vec![false; trunc_len];
+    for &b in match_brackets {
+        let idx = (b as usize).min(trunc_len);
+        if idx < trunc_len {
+            byte_is_match_bracket[idx] = true;
+        }
+    }
+
     let style_at = |byte_idx: usize| -> Style {
         let mut style = byte_kind[byte_idx].map(theme_for).unwrap_or_default();
+        // Match-bracket overlay: bold + NORD12 (Aurora orange). The only warm tone in our
+        // palette, so it reads as a distinct "this bracket pairs with the cursor" signal
+        // without colliding with the frost-blue accents used elsewhere. Painted before search
+        // and selection so those (which use bg) still win when stacked.
+        if byte_is_match_bracket[byte_idx] {
+            style = style.fg(NORD12).add_modifier(Modifier::BOLD);
+        }
         // Match bg first; the active selection paints over it with a more saturated blue so the
         // selection stands out from the surrounding match highlights.
         if byte_in_match[byte_idx] {

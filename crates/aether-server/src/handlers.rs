@@ -429,9 +429,9 @@ pub async fn search_set(
                 let position = motion::char_to_pos(buf, last_char);
                 let anchor_p = motion::char_to_pos(buf, start_char);
                 let new_cursor = if anchor_p == position {
-                    CursorState { position, anchor: None }
+                    CursorState { position, anchor: None, match_bracket: None }
                 } else {
-                    CursorState { position, anchor: Some(anchor_p) }
+                    CursorState { position, anchor: Some(anchor_p), match_bracket: None }
                 };
                 let prev_cursor = cursor;
                 s.cursors.insert(key, new_cursor);
@@ -567,9 +567,9 @@ async fn search_navigate(
     let position = motion::char_to_pos(buf, last_char);
     let anchor_pos = motion::char_to_pos(buf, start_char);
     let new_cursor = if anchor_pos == position {
-        CursorState { position, anchor: None }
+        CursorState { position, anchor: None, match_bracket: None }
     } else {
-        CursorState { position, anchor: Some(anchor_pos) }
+        CursorState { position, anchor: Some(anchor_pos), match_bracket: None }
     };
     let prev_cursor = s.cursors.get(&key).copied().unwrap_or_default();
     s.cursors.insert(key, new_cursor);
@@ -868,7 +868,7 @@ pub async fn buffer_cut(
 
     let buf_mut = s.buffers.get_mut(&params.buffer_id).expect("just checked");
     let revision = buf_mut.apply_edit(start_char, end_char, "", EditKindTag::Delete, cursors_before);
-    let new_cursor = CursorState { position: motion::char_to_pos(buf_mut, start_char), anchor: None };
+    let new_cursor = CursorState { position: motion::char_to_pos(buf_mut, start_char), anchor: None, match_bracket: None };
     s.cursors.insert((client_id, params.buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(params.buffer_id);
     s.clear_tree_selection_history_for_buffer(params.buffer_id);
@@ -1421,7 +1421,7 @@ pub async fn cursor_move(
         x => x,
     };
 
-    let new_state = CursorState { position: new_pos, anchor: new_anchor };
+    let new_state = CursorState { position: new_pos, anchor: new_anchor, match_bracket: None };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -1434,11 +1434,12 @@ pub async fn cursor_move(
         }
     }
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let response = wrap_for_response(&s, params.buffer_id, new_state);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
     }
-    Ok(new_state)
+    Ok(response)
 }
 
 /// Whole-line selection in either direction. The result is always whole lines (anchor at col 0
@@ -1537,17 +1538,18 @@ pub async fn cursor_select_line(
         (bottom_pos, top_pos)
     };
     let anchor = if anchor_pos == cursor_pos { None } else { Some(anchor_pos) };
-    let new_state = CursorState { position: cursor_pos, anchor };
+    let new_state = CursorState { position: cursor_pos, anchor, match_bracket: None };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let response = wrap_for_response(&s, params.buffer_id, new_state);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
     }
-    Ok(new_state)
+    Ok(response)
 }
 
 pub async fn cursor_swap_anchor(
@@ -1563,7 +1565,7 @@ pub async fn cursor_swap_anchor(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     let new_state = match current.anchor {
-        Some(a) => CursorState { position: a, anchor: Some(current.position) },
+        Some(a) => CursorState { position: a, anchor: Some(current.position), match_bracket: None },
         None => current,
     };
     s.cursors.insert(key, new_state);
@@ -1571,11 +1573,12 @@ pub async fn cursor_swap_anchor(
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let response = wrap_for_response(&s, params.buffer_id, new_state);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
     }
-    Ok(new_state)
+    Ok(response)
 }
 
 pub async fn cursor_set(
@@ -1597,17 +1600,18 @@ pub async fn cursor_set(
         Some(a) if a == position => None,
         x => x,
     };
-    let result = CursorState { position, anchor };
+    let result = CursorState { position, anchor, match_bracket: None };
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let response = wrap_for_response(&s, params.buffer_id, result);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
     }
-    Ok(result)
+    Ok(response)
 }
 
 /// Rewind one step on this client's per-buffer motion history. Independent of `input/undo`.
@@ -1638,6 +1642,7 @@ pub async fn cursor_undo(
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let prev = wrap_for_response(&s, params.buffer_id, prev);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -1672,6 +1677,7 @@ pub async fn cursor_redo(
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let next = wrap_for_response(&s, params.buffer_id, next);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -1723,9 +1729,9 @@ pub async fn cursor_expand(
     let anchor = motion::char_to_pos(buf, new_start_char);
     let position = motion::char_to_pos(buf, new_last_char);
     let new_cursor = if anchor == position {
-        CursorState { position, anchor: None }
+        CursorState { position, anchor: None, match_bracket: None }
     } else {
-        CursorState { position, anchor: Some(anchor) }
+        CursorState { position, anchor: Some(anchor), match_bracket: None }
     };
 
     s.cursors.insert(key, new_cursor);
@@ -1733,6 +1739,7 @@ pub async fn cursor_expand(
     s.virtual_col.remove(&key);
     s.tree_selection_history.entry(key).or_default().push(current);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let new_cursor = wrap_for_response(&s, params.buffer_id, new_cursor);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -1757,13 +1764,15 @@ pub async fn cursor_contract(
         .and_then(|stack| stack.pop());
     let Some(prev) = prev else {
         // Nothing to contract back to.
-        return Ok(s.cursors.get(&key).copied().unwrap_or_default());
+        let cur = s.cursors.get(&key).copied().unwrap_or_default();
+        return Ok(wrap_for_response(&s, params.buffer_id, cur));
     };
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     s.cursors.insert(key, prev);
     s.record_motion(key, current, prev);
     s.virtual_col.remove(&key);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let prev = wrap_for_response(&s, params.buffer_id, prev);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -2068,11 +2077,13 @@ async fn apply_indent_or_dedent(
         let new_cursor = CursorState {
             position: motion::clamp_position(buf_mut, shift_pos(cursor.position)),
             anchor: cursor.anchor.map(|a| motion::clamp_position(buf_mut, shift_pos(a))),
+            match_bracket: None,
         };
         let new_cursor = match new_cursor.anchor {
             Some(a) if a == new_cursor.position => CursorState {
                 position: new_cursor.position,
                 anchor: None,
+                match_bracket: None,
             },
             _ => new_cursor,
         };
@@ -2107,6 +2118,7 @@ async fn apply_indent_or_dedent(
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
 
+    let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -2229,11 +2241,13 @@ pub async fn input_move_lines(
             anchor: cursor
                 .anchor
                 .map(|a| motion::clamp_position(buf_mut, shift(a))),
+            match_bracket: None,
         };
         let new_cursor = match new_cursor.anchor {
             Some(a) if a == new_cursor.position => CursorState {
                 position: new_cursor.position,
                 anchor: None,
+                match_bracket: None,
             },
             _ => new_cursor,
         };
@@ -2272,6 +2286,7 @@ pub async fn input_move_lines(
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
 
+    let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -2407,6 +2422,7 @@ pub async fn input_join_lines(
         let new_cursor = CursorState {
             position: motion::char_to_pos(buf, new_cursor_char),
             anchor: None,
+            match_bracket: None,
         };
         s.cursors.insert((client_id, buffer_id), new_cursor);
         s.clear_motion_history_for_buffer(buffer_id);
@@ -2416,7 +2432,7 @@ pub async fn input_join_lines(
     };
 
     // Push viewport/lines_changed for affected viewports (we changed multiple lines).
-    let (pushes, search_summary_pushes): (Vec<_>, Vec<_>) = {
+    let (pushes, search_summary_pushes, new_cursor): (Vec<_>, Vec<_>, _) = {
         let mut s = state.lock().await;
         let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
         let new_line_count = s.buffers[&buffer_id].line_count();
@@ -2433,7 +2449,8 @@ pub async fn input_join_lines(
             let search = s.searches.get(&(vp.client_id, buffer_id));
             pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search)));
         }
-        (pushes, search_summary_pushes)
+        let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
+        (pushes, search_summary_pushes, new_cursor)
     };
 
     for (sender, notif) in pushes {
@@ -2556,7 +2573,32 @@ fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
         Some(a) if a == position => None,
         x => x,
     };
-    CursorState { position, anchor }
+    CursorState { position, anchor, match_bracket: None }
+}
+
+/// Populate `match_bracket` on a cursor that's about to cross the wire. Looks up the bracket
+/// pair (if any) at the cursor's position and stamps it onto the state. `match_bracket` is
+/// never stored in `state.cursors`; it's purely a derived per-response field that drives the
+/// client's match-bracket highlight overlay.
+fn with_match_bracket(buf: &Buffer, mut cursor: CursorState) -> CursorState {
+    let Some(syntax) = buf.syntax.as_ref() else { return cursor };
+    let byte = buf.text.char_to_byte(motion::pos_to_char(buf, cursor.position));
+    if let Some((open, close)) = crate::brackets::find_match_bracket(&syntax.tree, byte) {
+        let open_pos = motion::char_to_pos(buf, buf.text.byte_to_char(open));
+        let close_pos = motion::char_to_pos(buf, buf.text.byte_to_char(close));
+        cursor.match_bracket = Some((open_pos, close_pos));
+    }
+    cursor
+}
+
+/// Same as `with_match_bracket` but starts from a `ServerState`: a one-liner for the many
+/// handlers that need to populate the field just before returning. Safe if the buffer was
+/// already dropped (returns the cursor unchanged).
+fn wrap_for_response(s: &ServerState, buffer_id: BufferId, cursor: CursorState) -> CursorState {
+    s.buffers
+        .get(&buffer_id)
+        .map(|buf| with_match_bracket(buf, cursor))
+        .unwrap_or(cursor)
 }
 
 enum EditKind {
@@ -2635,14 +2677,15 @@ async fn apply_edit(
         let anchor_pos = motion::char_to_pos(buf_mut, start_char);
         let position_pos = motion::char_to_pos(buf_mut, last_char);
         if anchor_pos == position_pos {
-            CursorState { position: position_pos, anchor: None }
+            CursorState { position: position_pos, anchor: None, match_bracket: None }
         } else {
-            CursorState { position: position_pos, anchor: Some(anchor_pos) }
+            CursorState { position: position_pos, anchor: Some(anchor_pos), match_bracket: None }
         }
     } else {
         CursorState {
             position: motion::char_to_pos(buf_mut, start_char + inserted_char_count),
             anchor: None,
+            match_bracket: None,
         }
     };
     s.cursors.insert((client_id, buffer_id), new_cursor_state);
@@ -2677,6 +2720,7 @@ async fn apply_edit(
         pushes.push((sender, notif));
     }
 
+    let new_cursor_state = wrap_for_response(&s, buffer_id, new_cursor_state);
     drop(s);
 
     for (sender, notif) in pushes {

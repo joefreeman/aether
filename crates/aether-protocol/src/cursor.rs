@@ -88,6 +88,11 @@ pub enum Motion {
         count: u32,
         till: bool,
     },
+    /// Jump to the bracket that matches the one at the cursor (or, if the cursor isn't on a
+    /// bracket, the bracket that encloses the cursor's position). With `extend_selection`,
+    /// produces a selection from the cursor's original position to the matching bracket — the
+    /// natural "select around brackets" gesture (Vim's `v%`).
+    MatchBracket,
     // Tree-sitter motions are added when phase 2 lands.
 }
 
@@ -111,6 +116,12 @@ pub struct CursorMoveParams {
 pub struct CursorState {
     pub position: LogicalPosition,
     pub anchor: Option<LogicalPosition>,
+    /// Bracket pair `(open, close)` related to the cursor — set when the cursor sits on or
+    /// inside a bracket-bounded construct, `None` otherwise. Server-populated on every
+    /// response that returns `CursorState`; never stored in `state.cursors`. Drives the
+    /// client's match-bracket highlight overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_bracket: Option<(LogicalPosition, LogicalPosition)>,
 }
 
 // ---- cursor/set ---------------------------------------------------------------------------------

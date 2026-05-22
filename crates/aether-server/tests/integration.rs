@@ -695,6 +695,109 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
 }
 
 #[tokio::test]
+async fn match_bracket_motion_jumps_to_pair() {
+    // Rust file so tree-sitter is active. Cursor on the `{` of `fn foo() {}`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Park on the `{` (col 9 on line 0).
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 0, col: 9 },
+        anchor: None,
+    }).await;
+    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
+        buffer_id: open.buffer_id,
+        motion: Motion::MatchBracket,
+        extend_selection: false,
+    }).await;
+    // `}` lives at col 22 on the same line.
+    assert_eq!(r.position, LogicalPosition { line: 0, col: 22 });
+    assert!(r.anchor.is_none());
+    // match_bracket is populated; positions are the same pair regardless of orientation.
+    let pair = r.match_bracket.expect("match_bracket should be populated");
+    assert!(pair == (LogicalPosition { line: 0, col: 9 }, LogicalPosition { line: 0, col: 22 })
+         || pair == (LogicalPosition { line: 0, col: 22 }, LogicalPosition { line: 0, col: 9 }));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn match_bracket_with_extend_selects_to_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 0, col: 9 },
+        anchor: None,
+    }).await;
+    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
+        buffer_id: open.buffer_id,
+        motion: Motion::MatchBracket,
+        extend_selection: true,
+    }).await;
+    // Cursor lands on the `}`; anchor pinned at the original `{`. Together they cover the
+    // whole `{...}` pair inclusive — that's the "select around brackets" gesture.
+    assert_eq!(r.position, LogicalPosition { line: 0, col: 22 });
+    assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 9 }));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn match_bracket_from_inside_pair_jumps_to_opener() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+
+    // Cursor on the `l` of `let` — inside the block, not on any bracket.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 0, col: 11 },
+        anchor: None,
+    }).await;
+    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
+        buffer_id: open.buffer_id,
+        motion: Motion::MatchBracket,
+        extend_selection: false,
+    }).await;
+    // Cursor jumps to the opening `{` (we pick the opener when cursor is between brackets).
+    assert_eq!(r.position, LogicalPosition { line: 0, col: 9 });
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn viewport_highlights_rust_inside_markdown_fence() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("notes.md");
