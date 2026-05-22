@@ -93,6 +93,22 @@ pub enum Motion {
     /// produces a selection from the cursor's original position to the matching bracket — the
     /// natural "select around brackets" gesture (Vim's `v%`).
     MatchBracket,
+    /// Jump to the next per-language "navigation unit" past the cursor (functions, structs,
+    /// HTML elements, CSS rule sets, etc. — see `LanguageConfig::navigation_kinds` on the
+    /// server). The cursor's position implicitly determines the level: inside a method, `]`
+    /// skips to the next method in the same class; on a class header, `]` skips to the next
+    /// top-level item; at the last unit in a container, `]` is a no-op rather than
+    /// crossing the scope boundary. Depth is preserved across presses.
+    NextNavigationUnit,
+    /// Mirror of [`NextNavigationUnit`].
+    PrevNavigationUnit,
+    /// Jump to the last char of the smallest navigation unit containing the cursor. Paired
+    /// with shift-extend on the TUI, this is "select to end of current function / element /
+    /// rule set". No-op when the cursor isn't inside any navigation unit (e.g. on a blank
+    /// line between top-level items).
+    EndOfNavigationUnit,
+    /// Mirror of [`EndOfNavigationUnit`] — jump to the first char of the enclosing unit.
+    StartOfNavigationUnit,
     // Tree-sitter motions are added when phase 2 lands.
 }
 

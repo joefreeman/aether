@@ -28,6 +28,12 @@ pub struct LanguageConfig {
     /// block form (python, bash, toml, yaml, elixir, erlang, json). Drives mid-line-selection
     /// comment toggling and provides a fallback for languages without `line_comment`.
     pub block_comment: Option<(&'static str, &'static str)>,
+    /// Tree-sitter node kinds that `[` / `]` treat as "navigation units" — the structural
+    /// chunks the user wants to skip between (functions, type declarations, HTML elements,
+    /// CSS rule sets, etc.). The motion walks up the tree from the cursor until it finds an
+    /// ancestor with a child of one of these kinds past (or before) the cursor. Languages
+    /// with an empty list have no `[` / `]` navigation.
+    pub navigation_kinds: &'static [&'static str],
 }
 
 /// Shared `indents.scm` bodies referenced from per-language `; inherits` directives. Loaded
@@ -88,6 +94,7 @@ fn simple<L: Into<Language> + Copy>(
     default_indent: IndentStyle,
     line_comment: Option<&'static str>,
     block_comment: Option<(&'static str, &'static str)>,
+    navigation_kinds: &'static [&'static str],
 ) -> &'static LanguageConfig {
     cell.get_or_init(move || {
         let language: Language = language_fn.into();
@@ -103,6 +110,7 @@ fn simple<L: Into<Language> + Copy>(
             default_indent,
             line_comment,
             block_comment,
+            navigation_kinds,
         }
     })
 }
@@ -119,6 +127,8 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
             tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY,
             Some(include_str!("../queries/rust/indents.scm")),
             IndentStyle::Spaces(4), Some("//"), Some(("/*", "*/")),
+            &["function_item", "struct_item", "enum_item", "impl_item", "trait_item",
+              "mod_item", "const_item", "static_item", "type_item", "macro_definition"],
         )),
         "markdown" | "md" => Some(MARKDOWN.get_or_init(|| {
             let language: Language = tree_sitter_md::LANGUAGE.into();
@@ -135,82 +145,107 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: None,
                 block_comment: Some(("<!--", "-->")),
+                navigation_kinds: &["section", "fenced_code_block"],
             }
         })),
         "toml" => Some(simple(
             &TOML, "toml",
             tree_sitter_toml_ng::LANGUAGE, tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
             None, IndentStyle::Spaces(2), Some("#"), None,
+            &["table", "table_array_element"],
         )),
         "html" | "htm" => Some(simple(
             &HTML, "html",
             tree_sitter_html::LANGUAGE, tree_sitter_html::HIGHLIGHTS_QUERY,
             None, IndentStyle::Spaces(2), None, Some(("<!--", "-->")),
+            &["element", "script_element", "style_element"],
         )),
         "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(simple(
             &JAVASCRIPT, "javascript",
             tree_sitter_javascript::LANGUAGE, tree_sitter_javascript::HIGHLIGHT_QUERY,
             Some(include_str!("../queries/javascript/indents.scm")),
             IndentStyle::Spaces(2), Some("//"), Some(("/*", "*/")),
+            &["function_declaration", "class_declaration", "export_statement",
+              "lexical_declaration", "variable_declaration", "method_definition"],
         )),
         "typescript" | "ts" => Some(simple(
             &TYPESCRIPT, "typescript",
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT, tree_sitter_typescript::HIGHLIGHTS_QUERY,
             Some(include_str!("../queries/typescript/indents.scm")),
             IndentStyle::Spaces(2), Some("//"), Some(("/*", "*/")),
+            &["function_declaration", "class_declaration", "export_statement",
+              "lexical_declaration", "variable_declaration", "method_definition",
+              "interface_declaration", "type_alias_declaration", "enum_declaration"],
         )),
         "tsx" => Some(simple(
             &TSX, "tsx",
             tree_sitter_typescript::LANGUAGE_TSX, tree_sitter_typescript::HIGHLIGHTS_QUERY,
             Some(include_str!("../queries/tsx/indents.scm")),
             IndentStyle::Spaces(2), Some("//"), Some(("/*", "*/")),
+            &["function_declaration", "class_declaration", "export_statement",
+              "lexical_declaration", "variable_declaration", "method_definition",
+              "interface_declaration", "type_alias_declaration", "enum_declaration",
+              "jsx_element", "jsx_self_closing_element"],
         )),
         "python" | "py" => Some(simple(
             &PYTHON, "python",
             tree_sitter_python::LANGUAGE, tree_sitter_python::HIGHLIGHTS_QUERY,
             Some(include_str!("../queries/python/indents.scm")),
             IndentStyle::Spaces(4), Some("#"), None,
+            &["function_definition", "class_definition", "decorated_definition"],
         )),
         "go" | "golang" => Some(simple(
             &GO, "go",
             tree_sitter_go::LANGUAGE, tree_sitter_go::HIGHLIGHTS_QUERY,
             Some(include_str!("../queries/go/indents.scm")),
             IndentStyle::Tab, Some("//"), Some(("/*", "*/")),
+            &["function_declaration", "method_declaration", "type_declaration",
+              "var_declaration", "const_declaration"],
         )),
         "elixir" | "ex" | "exs" => Some(simple(
             &ELIXIR, "elixir",
             tree_sitter_elixir::LANGUAGE, tree_sitter_elixir::HIGHLIGHTS_QUERY,
             Some(include_str!("../queries/elixir/indents.scm")),
             IndentStyle::Spaces(2), Some("#"), None,
+            // Elixir's grammar wraps everything (incl. `def`, `defmodule`, `defp`) in `call`
+            // nodes. Coarse but matches reality — refine later by filtering on call name.
+            &["call"],
         )),
         "erlang" | "erl" | "hrl" => Some(simple(
             &ERLANG, "erlang",
             tree_sitter_erlang::LANGUAGE, tree_sitter_erlang::HIGHLIGHTS_QUERY,
             None, IndentStyle::Spaces(4), Some("%"), None,
+            &["fun_decl", "attribute"],
         )),
         "css" => Some(simple(
             &CSS, "css",
             tree_sitter_css::LANGUAGE, tree_sitter_css::HIGHLIGHTS_QUERY,
             Some(include_str!("../queries/css/indents.scm")),
             IndentStyle::Spaces(2), None, Some(("/*", "*/")),
+            &["rule_set", "at_rule", "media_statement", "keyframes_statement",
+              "supports_statement"],
         )),
         "bash" | "sh" | "shell" | "zsh" => Some(simple(
             &BASH, "bash",
             tree_sitter_bash::LANGUAGE, tree_sitter_bash::HIGHLIGHT_QUERY,
             Some(include_str!("../queries/bash/indents.scm")),
             IndentStyle::Spaces(2), Some("#"), None,
+            &["function_definition", "if_statement", "while_statement", "for_statement",
+              "case_statement"],
         )),
         "json" => Some(simple(
             &JSON, "json",
             tree_sitter_json::LANGUAGE, tree_sitter_json::HIGHLIGHTS_QUERY,
             Some(include_str!("../queries/json/indents.scm")),
             IndentStyle::Spaces(2), None, None,
+            &["pair"],
         )),
         "yaml" | "yml" => Some(simple(
             &YAML, "yaml",
             tree_sitter_yaml::LANGUAGE, tree_sitter_yaml::HIGHLIGHTS_QUERY,
             Some(include_str!("../queries/yaml/indents.scm")),
             IndentStyle::Spaces(2), Some("#"), None,
+            &["block_mapping_pair", "block_sequence_item"],
         )),
         _ => None,
     }

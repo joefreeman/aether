@@ -168,6 +168,52 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             let _ = source; // (kept for future predicate work)
             char_to_pos(buf, buf.text.byte_to_char(target_byte))
         }
+        Motion::NextNavigationUnit | Motion::PrevNavigationUnit => {
+            let forward = matches!(motion, Motion::NextNavigationUnit);
+            let Some(syntax) = buf.syntax.as_ref() else { return current };
+            let cursor_byte = buf.text.char_to_byte(pos_to_char(buf, current));
+            let nav_kinds = syntax.config.navigation_kinds;
+            if nav_kinds.is_empty() {
+                return current;
+            }
+            match find_navigation_target(&syntax.tree, cursor_byte, nav_kinds, forward) {
+                Some(target) => char_to_pos(buf, buf.text.byte_to_char(target.start_byte())),
+                None => current,
+            }
+        }
+        Motion::EndOfNavigationUnit | Motion::StartOfNavigationUnit => {
+            let to_end = matches!(motion, Motion::EndOfNavigationUnit);
+            let Some(syntax) = buf.syntax.as_ref() else { return current };
+            let cursor_byte = buf.text.char_to_byte(pos_to_char(buf, current));
+            let nav_kinds = syntax.config.navigation_kinds;
+            if nav_kinds.is_empty() {
+                return current;
+            }
+            // First press from inside a unit jumps to that unit's boundary. A repeat press,
+            // where the cursor already sits at the boundary (or where the cursor isn't inside
+            // any unit), falls through to the next/prev sibling — so `}}}` walks through
+            // adjacent units, growing the selection one unit at a time.
+            let enclosing = enclosing_navigation_unit(&syntax.tree, cursor_byte, nav_kinds);
+            let already_at_boundary = match enclosing {
+                Some(u) if to_end => cursor_byte >= u.end_byte().saturating_sub(1),
+                Some(u) => cursor_byte <= u.start_byte(),
+                None => true,
+            };
+            let target = if already_at_boundary {
+                find_navigation_target(&syntax.tree, cursor_byte, nav_kinds, to_end)
+            } else {
+                enclosing
+            };
+            let Some(target) = target else { return current };
+            let target_byte = if to_end {
+                // Tree-sitter end byte is exclusive — back up one to land on the unit's last
+                // *char*, so an inclusive selection ends exactly at the unit's boundary.
+                target.end_byte().saturating_sub(1).max(target.start_byte())
+            } else {
+                target.start_byte()
+            };
+            char_to_pos(buf, buf.text.byte_to_char(target_byte))
+        }
         Motion::FindChar { ch, direction, count, till } => {
             let cur_idx = pos_to_char(buf, current);
             let total = buf.text.len_chars();
@@ -187,6 +233,81 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
                 None => current,
             }
         }
+    }
+}
+
+/// Walk up the tree from the cursor looking for the closest navigation-kind node past (or
+/// before) `cursor_byte`, at the cursor's *own* depth — the motion never crosses scope
+/// boundaries. The walk-up has two steps:
+///
+/// 1. **Skip nav-kind ancestors anchored at the cursor** — i.e. if the cursor sits at the
+///    exact start of a nav-kind, that nav-kind is the cursor's *self*, not its container; we
+///    keep walking so navigation happens among its siblings.
+/// 2. **Stop at the first ancestor with any nav-kind children.** That ancestor *is* the
+///    cursor's level; pick the next/prev qualifying child or no-op. We never walk past this
+///    level even when there's no hit, so a cursor on the last method of a class can't fall
+///    out of the class into top-level items.
+/// Smallest navigation-kind ancestor of the cursor — the unit the cursor is "inside" or "on".
+/// Walks up from the cursor's deepest descendant, returning the first ancestor whose kind is
+/// in `nav_kinds`. `None` when the cursor isn't inside any navigation unit (e.g. on a blank
+/// line between top-level items).
+fn enclosing_navigation_unit<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    cursor_byte: usize,
+    nav_kinds: &[&str],
+) -> Option<tree_sitter::Node<'tree>> {
+    let is_nav = |kind: &str| nav_kinds.contains(&kind);
+    let root = tree.root_node();
+    let mut node = root
+        .descendant_for_byte_range(cursor_byte, cursor_byte)
+        .unwrap_or(root);
+    loop {
+        if is_nav(node.kind()) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn find_navigation_target<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    cursor_byte: usize,
+    nav_kinds: &[&str],
+    forward: bool,
+) -> Option<tree_sitter::Node<'tree>> {
+    let is_nav = |kind: &str| nav_kinds.contains(&kind);
+    let root = tree.root_node();
+    let mut node = root
+        .descendant_for_byte_range(cursor_byte, cursor_byte)
+        .unwrap_or(root);
+
+    loop {
+        let on_self = is_nav(node.kind()) && node.start_byte() == cursor_byte;
+        if !on_self {
+            // Tree-sitter children iterate in source order, so for forward search the first
+            // qualifying child is the answer; for backward search the *last* qualifying child
+            // wins, which we get by overwriting `best` on every hit.
+            let mut walker = node.walk();
+            let mut best: Option<tree_sitter::Node<'tree>> = None;
+            let mut any_nav_child = false;
+            for child in node.children(&mut walker) {
+                if !is_nav(child.kind()) {
+                    continue;
+                }
+                any_nav_child = true;
+                if forward {
+                    if child.start_byte() > cursor_byte {
+                        return Some(child);
+                    }
+                } else if child.start_byte() < cursor_byte {
+                    best = Some(child);
+                }
+            }
+            if any_nav_child {
+                return best;
+            }
+        }
+        node = node.parent()?;
     }
 }
 

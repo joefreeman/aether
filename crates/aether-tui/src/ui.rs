@@ -147,14 +147,26 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         }
         let render = &state.lines[local_idx as usize];
 
-        for vrow in &render.visual_rows {
+        let last_vrow_idx = render.visual_rows.len().saturating_sub(1);
+        for (vrow_idx, vrow) in render.visual_rows.iter().enumerate() {
             if lines.len() >= viewport_rows {
                 break 'outer;
             }
+            // The implicit "newline" of the logical line is selected iff the selection
+            // spans past this whole line. Paint a single trailing cell on the last visual
+            // row of the line to make the line-break feel like it's part of the selection
+            // (rather than the highlight ending abruptly at the end of the text).
+            let is_last_vrow_of_line = vrow_idx == last_vrow_idx;
+            let highlight_trailing_newline = is_last_vrow_of_line
+                && selection.is_some_and(|(_, e)| e.line > logical_line);
             let segment = match vrow.segments.first() {
                 Some(s) => s,
                 None => {
-                    lines.push(Line::from(""));
+                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    if highlight_trailing_newline {
+                        spans.push(Span::styled(" ", Style::default().bg(NORD10)));
+                    }
+                    lines.push(Line::from(spans));
                     continue;
                 }
             };
@@ -196,6 +208,9 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 spans.push(Span::raw(" ".repeat(indent as usize)));
             }
             spans.extend(build_spans(&clipped_text, &clipped_highlights, clipped_sel, &clipped_matches, &clipped_brackets, body_width, extend_sel_to_cursor));
+            if highlight_trailing_newline {
+                spans.push(Span::styled(" ", Style::default().bg(NORD10)));
+            }
             lines.push(Line::from(spans));
         }
         logical_line = match logical_line.checked_add(1) {
@@ -335,10 +350,17 @@ fn selection_on_visual_row(
     let row_end = row_byte_offset + row_text_len;
     let start = line_sel_start.max(row_byte_offset);
     let end = line_sel_end_excl.min(row_end);
-    if start >= end {
-        return None;
+    if start < end {
+        return Some((start - row_byte_offset, end - row_byte_offset));
     }
-    Some((start - row_byte_offset, end - row_byte_offset))
+    // Empty intersection — normally "no selection on this row", but report a zero-width range
+    // when the selection ends exactly at the start of this row (e.g. anchor at col 0 of a
+    // line, with the cursor on a line above). Without this, `build_spans` has nothing to
+    // extend and the anchor char goes unpainted in backward selections.
+    if logical_line == sel_end.line && line_sel_end_excl == row_byte_offset {
+        return Some((0, 0));
+    }
+    None
 }
 
 /// Truncate `text` to fit `max_chars` columns and emit styled spans. Style at each byte is the

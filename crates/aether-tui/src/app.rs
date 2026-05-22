@@ -409,7 +409,12 @@ fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
     }
     let lo = local_start.max(0) as usize;
     let hi = (local_end as usize).min(state.lines.len());
+    let replacement_len = p.replacement_lines.len();
     state.lines.splice(lo..hi, p.replacement_lines);
+    // The server's notification covers the *current* (post-edit) viewport range. If the edit
+    // shrank the buffer, the OLD `state.lines` could extend past the new range — truncate any
+    // stale tail so subsequent draws never read a line that no longer exists.
+    state.lines.truncate(lo + replacement_len);
 }
 
 async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> Result<()> {
@@ -654,6 +659,25 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // position to the match — a natural "select around brackets" gesture (Vim's `v%`).
         (KeyCode::Char('m'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
             move_motion(client, state, Motion::MatchBracket, extend).await?,
+
+        // ---- motions: navigation units ----
+        // `]` / `[` *navigate between* per-language navigation units (function, struct, HTML
+        // element, CSS rule set, etc. — see `LanguageConfig::navigation_kinds`). The cursor's
+        // position implicitly determines the level: inside a method the next hit is the next
+        // method in the same class; on the class header the next hit is the next top-level
+        // item. Scope boundaries are *not* crossed.
+        // `}` / `{` *jump to the end / start* of the enclosing navigation unit, extending the
+        // selection. Use `}` on a function header to select the whole function; use `{` to
+        // select from the cursor back to the function's start. Unlike `]`/`[` they don't have
+        // a "next" hop, so they work on the last unit in a container too.
+        (KeyCode::Char(']'), m) if m == KeyModifiers::NONE =>
+            move_motion(client, state, Motion::NextNavigationUnit, false).await?,
+        (KeyCode::Char('['), m) if m == KeyModifiers::NONE =>
+            move_motion(client, state, Motion::PrevNavigationUnit, false).await?,
+        (KeyCode::Char('}'), _) =>
+            move_motion(client, state, Motion::EndOfNavigationUnit, true).await?,
+        (KeyCode::Char('{'), _) =>
+            move_motion(client, state, Motion::StartOfNavigationUnit, true).await?,
 
         // ---- motions: goto line ----
         // `g` jumps to line N (1-indexed; no prefix = line 1). `Alt-g` jumps to the last line.
@@ -1464,7 +1488,9 @@ fn is_repeatable_motion(motion: &Motion) -> bool {
         | Motion::WordEnd { .. }
         | Motion::LogicalLine { .. }
         | Motion::VisualLine { .. }
-        | Motion::FindChar { .. } => true,
+        | Motion::FindChar { .. }
+        | Motion::NextNavigationUnit
+        | Motion::PrevNavigationUnit => true,
         Motion::LineStart
         | Motion::LineEnd
         | Motion::LineFirstNonblank
@@ -1473,7 +1499,9 @@ fn is_repeatable_motion(motion: &Motion) -> bool {
         | Motion::Goto { .. }
         | Motion::VisualLineStart { .. }
         | Motion::VisualLineEnd { .. }
-        | Motion::MatchBracket => false,
+        | Motion::MatchBracket
+        | Motion::EndOfNavigationUnit
+        | Motion::StartOfNavigationUnit => false,
     }
 }
 
