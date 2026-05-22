@@ -918,7 +918,7 @@ async fn handle_file_browser_key(
         }
         // Go to the parent directory (clamped to the project boundary by the server). Pre-select
         // the entry corresponding to the directory we're leaving so the user keeps their bearings.
-        (KeyCode::Char('-'), m) if m == KeyModifiers::NONE => {
+        (KeyCode::Char('-') | KeyCode::Char('h'), m) if m == KeyModifiers::NONE => {
             if let Some(parent) = state.file_browser.parent.clone() {
                 let leaving = std::path::Path::new(&state.file_browser.path)
                     .file_name()
@@ -931,7 +931,7 @@ async fn handle_file_browser_key(
             }
         }
         // Open the highlighted entry: descend if dir, switch to editing if file.
-        (KeyCode::Enter, _) => {
+        (KeyCode::Enter, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => {
             let Some(entry) = state.file_browser.entries.get(state.file_browser.selected) else {
                 return Ok(());
             };
