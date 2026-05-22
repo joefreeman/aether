@@ -27,7 +27,8 @@ use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::handshake::ClientHelloResult;
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
-    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputRedo, InputText, InputTextParams,
+    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
+    InputText, InputTextParams,
     InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
@@ -247,6 +248,7 @@ pub async fn bootstrap(
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
             continuation_marker_width: ui::CONTINUATION_MARKER_WIDTH,
+            tab_width: ui::TAB_WIDTH,
         })
         .await?;
 
@@ -775,7 +777,7 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         (KeyCode::Backspace, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Backward, count: 1 }).await?,
         (KeyCode::Delete, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count: 1 }).await?,
-        (KeyCode::Enter, _) => insert_text(client, state, "\n").await?,
+        (KeyCode::Enter, _) => newline_and_indent(client, state).await?,
         (KeyCode::Tab, _) => insert_text(client, state, "\t").await?,
         (KeyCode::Left, _) => move_motion(client, state, Motion::Char { direction: Direction::Backward, count: 1 }, false).await?,
         (KeyCode::Right, _) => move_motion(client, state, Motion::Char { direction: Direction::Forward, count: 1 }, false).await?,
@@ -1035,6 +1037,7 @@ async fn open_file_in_browser_with_options(
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: state.wrap,
             continuation_marker_width: ui::CONTINUATION_MARKER_WIDTH,
+            tab_width: ui::TAB_WIDTH,
         })
         .await?;
 
@@ -1681,6 +1684,18 @@ async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> R
     insert_text_inner(client, state, text, false).await
 }
 
+/// Server-side smart indent: insert `\n` + indent computed from the cursor's context (current
+/// line's leading whitespace, plus one level if the cursor sits right after an opening bracket
+/// outside a string/comment).
+async fn newline_and_indent(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<InputNewlineAndIndent>(BufferOnlyParams { buffer_id: state.buffer_id })
+        .await?;
+    state.revision = r.revision;
+    state.cursor = r.cursor;
+    Ok(())
+}
+
 async fn insert_text_inner(
     client: &mut Client,
     state: &mut AppState,
@@ -1756,8 +1771,9 @@ async fn dedent(client: &mut Client, state: &mut AppState, count: u32) -> Result
 }
 
 /// Add a blank line after the cursor's current line and drop into Insert mode at its start.
-/// Implemented as: park cursor at end of current line, insert "\n", enter Insert. The newline
-/// pushes the cursor onto the (now empty) line below.
+/// Implemented as: park cursor at end of current line, then `newline_and_indent` (which copies
+/// the line's leading whitespace and adds one level if the line ends in an opener). The newline
+/// pushes the cursor onto the new line at the indent column.
 async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()> {
     let line = state.cursor.position.line;
     let new = client
@@ -1768,7 +1784,7 @@ async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()
         })
         .await?;
     state.cursor = new;
-    insert_text(client, state, "\n").await?;
+    newline_and_indent(client, state).await?;
     enter_insert_mode(state);
     Ok(())
 }

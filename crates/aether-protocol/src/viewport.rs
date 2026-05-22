@@ -96,6 +96,11 @@ pub struct ViewportSubscribeParams {
     /// glyph (e.g. "↪ "). The server subtracts this from the available width on continuation
     /// rows so the visible text + marker fit within `cols`. 0 disables.
     pub continuation_marker_width: u32,
+    /// On-screen width of a tab character, in cols. The server uses this for soft-wrap math,
+    /// visual-line motions, and centring so its idea of where bytes land matches what the
+    /// client actually renders. Most clients will pass 4 or 8; 0 collapses tabs to zero width
+    /// (don't do this unless you also strip tabs client-side).
+    pub tab_width: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

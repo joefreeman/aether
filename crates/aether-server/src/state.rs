@@ -1,5 +1,6 @@
 //! Authoritative in-memory state owned by the server.
 
+use crate::indent::{self, IndentStyle};
 use crate::syntax::{self, InjectionLayer, LanguageConfig};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
@@ -219,6 +220,9 @@ pub struct Buffer {
     pub line_ending: LineEnding,
     pub last_modified_unix_ms: Option<u64>,
     pub syntax: Option<BufferSyntax>,
+    /// Detected (or defaulted) once on load; stable for the buffer's lifetime so further edits
+    /// don't make the unit drift.
+    pub indent_style: IndentStyle,
 
     /// Revision at the most recent successful save. `None` only for a never-saved scratch
     /// buffer in its initial empty state — see `Buffer::scratch`.
@@ -292,6 +296,7 @@ impl Buffer {
         });
         let language = detect_language(&canonical);
         let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));
+        let indent_style = resolve_indent_style(&text, language.as_deref());
         Ok(Buffer {
             id,
             canonical_path: Some(canonical),
@@ -302,6 +307,7 @@ impl Buffer {
             line_ending,
             last_modified_unix_ms,
             syntax,
+            indent_style,
             saved_revision: Some(0),
             next_revision_id: 1,
             undo_stack: Vec::new(),
@@ -317,6 +323,7 @@ impl Buffer {
         let text = ropey::Rope::new();
         let language = language.or_else(|| detect_language(&canonical));
         let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));
+        let indent_style = resolve_indent_style(&text, language.as_deref());
         Buffer {
             id,
             canonical_path: Some(canonical),
@@ -327,6 +334,7 @@ impl Buffer {
             line_ending: LineEnding::Lf,
             last_modified_unix_ms: None,
             syntax,
+            indent_style,
             saved_revision: Some(0),
             next_revision_id: 1,
             undo_stack: Vec::new(),
@@ -338,6 +346,7 @@ impl Buffer {
     pub fn scratch(id: BufferId, language: Option<String>) -> Self {
         let text = ropey::Rope::new();
         let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));
+        let indent_style = resolve_indent_style(&text, language.as_deref());
         Buffer {
             id,
             canonical_path: None,
@@ -348,6 +357,7 @@ impl Buffer {
             line_ending: LineEnding::Lf,
             last_modified_unix_ms: None,
             syntax,
+            indent_style,
             // Treat empty scratch as "clean"; first edit makes it dirty.
             saved_revision: Some(0),
             next_revision_id: 1,
@@ -600,6 +610,19 @@ fn detect_language(path: &Path) -> Option<String> {
     .to_string())
 }
 
+/// Pick the buffer's indent unit: detect from the text first, fall back to the language's
+/// configured default, and to 2-space if even the language is unknown. Called once per buffer
+/// load so subsequent edits don't shift the unit out from under the user.
+fn resolve_indent_style(text: &ropey::Rope, language: Option<&str>) -> IndentStyle {
+    if let Some(detected) = indent::detect_indent_style(text) {
+        return detected;
+    }
+    if let Some(cfg) = language.and_then(syntax::get_config) {
+        return cfg.default_indent;
+    }
+    IndentStyle::Spaces(2)
+}
+
 fn make_syntax(text: &ropey::Rope, language: &str) -> Option<BufferSyntax> {
     let config = syntax::get_config(language)?;
     let mut parser = syntax::make_parser(config);
@@ -637,6 +660,7 @@ pub struct Viewport {
     pub scroll_sub_row: f32,
     pub wrap: WrapMode,
     pub continuation_marker_width: u32,
+    pub tab_width: u32,
     /// First logical line currently pushed to the client (inclusive).
     pub first_logical_line: u32,
     /// Last logical line currently pushed to the client (exclusive).

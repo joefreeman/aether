@@ -5,6 +5,7 @@ mod connection;
 mod cursor;
 mod error;
 mod handlers;
+mod indent;
 mod server;
 mod state;
 mod syntax;

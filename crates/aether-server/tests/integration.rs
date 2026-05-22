@@ -22,8 +22,8 @@ use aether_protocol::search::{
 };
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
-    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputRedo, InputText, InputTextParams,
-    InputUndo, UndoResult,
+    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
+    InputText, InputTextParams, InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportScroll,
@@ -266,7 +266,7 @@ async fn viewport_subscribe_renders_window() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -322,7 +322,7 @@ async fn viewport_subscribe_wraps_long_line() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -388,7 +388,7 @@ async fn viewport_scroll_returns_new_window() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -558,7 +558,7 @@ async fn input_text_inserts_and_pushes_notification() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -615,7 +615,7 @@ async fn input_delete_backspace_removes_char_before_cursor() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -673,7 +673,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::None,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -739,7 +739,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             overscan_rows: 0,
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::None,
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -794,7 +794,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -988,7 +988,7 @@ async fn cut_selection_deletes_and_returns_text() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -1043,7 +1043,7 @@ async fn input_text_with_select_pasted_makes_selection() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -1085,7 +1085,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -1147,7 +1147,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -1295,7 +1295,7 @@ async fn join_lines_collapses_lines_with_single_space() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -1351,7 +1351,7 @@ async fn input_text_with_selection_replaces_it() {
             scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0,
+            continuation_marker_width: 0, tab_width: 4,
         },
     )
     .await;
@@ -1828,7 +1828,7 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
 
-        continuation_marker_width: 0,
+        continuation_marker_width: 0, tab_width: 4,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -1851,7 +1851,7 @@ async fn visual_line_preserves_visual_column() {
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
 
-        continuation_marker_width: 0,
+        continuation_marker_width: 0, tab_width: 4,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -1886,7 +1886,7 @@ async fn visual_line_crosses_logical_line_boundary() {
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
 
-        continuation_marker_width: 0,
+        continuation_marker_width: 0, tab_width: 4,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -1915,7 +1915,7 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
         buffer_id, cols: 80, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
-        continuation_marker_width: 2,
+        continuation_marker_width: 2, tab_width: 4,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -1940,7 +1940,7 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::None,
 
-        continuation_marker_width: 0,
+        continuation_marker_width: 0, tab_width: 4,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -1968,7 +1968,7 @@ async fn viewport_set_wrap_changes_visible_rows() {
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
 
-        continuation_marker_width: 0,
+        continuation_marker_width: 0, tab_width: 4,
     }).await;
     // Soft: line 0 wraps to 2 visual rows at cols=10.
     assert_eq!(sub.window.lines[0].visual_rows.len(), 2);
@@ -1997,7 +1997,7 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
         buffer_id, cols: 10, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
-        continuation_marker_width: 2,
+        continuation_marker_width: 2, tab_width: 4,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -2036,7 +2036,7 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
         buffer_id, cols: 80, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
-        continuation_marker_width: 2,
+        continuation_marker_width: 2, tab_width: 4,
     }).await;
 
     // Start at col 5 of line 0.
@@ -2070,7 +2070,7 @@ async fn virtual_col_cleared_by_horizontal_motion() {
         buffer_id, cols: 10, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
-        continuation_marker_width: 2,
+        continuation_marker_width: 2, tab_width: 4,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -2109,7 +2109,7 @@ async fn virtual_col_cleared_by_mutation() {
         buffer_id, cols: 10, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
-        continuation_marker_width: 2,
+        continuation_marker_width: 2, tab_width: 4,
     }).await;
     let viewport_id = sub.viewport_id;
 
@@ -2149,7 +2149,7 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
         buffer_id, cols: 10, rows: 5, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::Soft,
-        continuation_marker_width: 2,
+        continuation_marker_width: 2, tab_width: 4,
     }).await;
     assert_eq!(sub.window.lines[0].visual_rows.len(), 3);
     let texts: Vec<&str> = sub.window.lines[0].visual_rows.iter()
@@ -2168,7 +2168,7 @@ async fn buffer_text(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungsteni
         buffer_id, cols: 200, rows: 100, overscan_rows: 0,
         scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
         wrap: WrapMode::None,
-        continuation_marker_width: 0,
+        continuation_marker_width: 0, tab_width: 4,
     }).await;
     sub.window.lines.iter()
         .map(|l| l.visual_rows[0].segments[0].text.as_str().to_string())
@@ -2364,6 +2364,248 @@ async fn dedent_with_single_leading_space_strips_one() {
     assert_eq!(text, "alpha\n");
     // Cursor was at (0, 0); dedent removes 1 char, cursor stays at 0 (saturated).
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
+
+    drop(server);
+}
+
+// ---- input/newline_and_indent -------------------------------------------------------------------
+
+#[tokio::test]
+async fn newline_and_indent_copies_leading_whitespace() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("    foo\n").await;
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 7 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 11, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text, "    foo\n    \n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn newline_and_indent_adds_one_level_after_opening_brace() {
+    // .rs file so tree-sitter is active (and would *correctly* not suppress, since the brace is
+    // a real syntactic opener here).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn foo() {\n").unwrap();
+
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+    let buffer_id = open.buffer_id;
+
+    // Cursor right after the opening brace.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 10 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    // Rust defaults to 4-space indent; cursor lands at col 4 on the new line.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
+    let text = buffer_text(&mut ws, 5, buffer_id).await;
+    assert_eq!(text, "fn foo() {\n    \n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn newline_and_indent_suppresses_brace_inside_comment() {
+    // Brace in a `//` comment must not trigger an indent — tree-sitter sees a `line_comment`
+    // node, not a code-level opener.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "// note {\n").unwrap();
+
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+    let buffer_id = open.buffer_id;
+
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 9 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
+    let text = buffer_text(&mut ws, 5, buffer_id).await;
+    assert_eq!(text, "// note {\n\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn newline_and_indent_on_empty_line_inserts_just_newline() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("\n").await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 10, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
+    let text = buffer_text(&mut ws, 11, buffer_id).await;
+    assert_eq!(text, "\n\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn newline_and_indent_engine_dedents_after_closing_brace() {
+    // Engine-driven test: cursor just past `}` should produce zero indent (block @indent and
+    // `}` @outdent cancel each other).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn foo() {\n  x;\n}\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+    let buffer_id = open.buffer_id;
+
+    // Park cursor just past the closing `}` on line 2.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 2, col: 1 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    // No indent on the new line — we just left the function body.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 3, col: 0 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn newline_and_indent_engine_python_def() {
+    // Python `def foo():` followed by Enter — function_definition's @indent should fire even
+    // though there's no `{` opener. Exercises the Python indents.scm.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.py");
+    std::fs::write(&path, "def foo():\n    pass\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
+    }).await;
+    assert_eq!(open.language.as_deref(), Some("python"));
+    let buffer_id = open.buffer_id;
+
+    // Cursor at end of `def foo():` (line 0 col 10).
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 10 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    // Python defaults to 4-space indent (PEP 8); cursor lands at col 4 on the new line.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
+    // Existing file uses 2-space indent — detection should override Rust's 4-space default
+    // and produce a 2-space new indent.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn foo() {\n  let x = 1;\n  let y = 2;\n}\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
+    }).await;
+    let buffer_id = open.buffer_id;
+
+    // Cursor at end of `let y = 2;` (line 2) — engine returns 1 level, unit is 2 spaces.
+    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 2, col: 12 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 3, col: 2 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn newline_and_indent_uses_language_default_for_empty_file() {
+    // Empty Go file — no indent to detect, so the Go default (Tab) applies. After typing
+    // `func foo() {` and pressing Enter, the new line should be a single tab.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.go");
+    std::fs::write(&path, "").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        path_index: Some(0), relative_path: Some("a.go".into()), language: None, create_if_missing: false,
+    }).await;
+    assert_eq!(open.language.as_deref(), Some("go"));
+    let buffer_id = open.buffer_id;
+
+    send_request::<InputText>(&mut ws, 3, &InputTextParams {
+        buffer_id, text: "func foo() {".into(), select_pasted: false,
+    }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    // One tab = col 1 (in byte columns). The opener-bonus heuristic fires because the parser
+    // hasn't seen a closing brace yet; one indent level for Go is one tab character.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 1 });
+    let text = buffer_text(&mut ws, 5, buffer_id).await;
+    assert_eq!(text, "func foo() {\n\t");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn newline_and_indent_fallback_copies_previous_line() {
+    // No indent query for `.txt` (no language detected) — fallback copies the previous line's
+    // leading whitespace verbatim, without any brace heuristic magic.
+    let (server, mut ws, buffer_id) = setup_with_buffer("    foo {\n").await;
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 0, col: 9 }, anchor: None,
+    }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 11, &BufferOnlyParams {
+        buffer_id,
+    }).await;
+    // Falls back to 4 spaces — the leading whitespace of line 0 — even though the line ends
+    // in `{`. Plain text doesn't get the opener heuristic.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
 
     drop(server);
 }

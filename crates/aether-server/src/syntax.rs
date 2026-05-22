@@ -1,5 +1,6 @@
 //! Tree-sitter integration: language registry, parsing, and per-range highlight computation.
 
+use crate::indent::{expand_inherits, CompiledIndentQuery, IndentStyle};
 use aether_protocol::viewport::Highlight;
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -14,6 +15,36 @@ pub struct LanguageConfig {
     /// `@injection.content` for the byte range to re-parse, and either `@injection.language`
     /// (capture text names the language) or a `#set! injection.language "<name>"` directive.
     pub injection_query: Option<Query>,
+    /// Optional `indents.scm` query (vendored from Helix). Drives the smart-indent engine; when
+    /// absent we fall back to copying the previous non-empty line's leading whitespace.
+    pub indent_query: Option<CompiledIndentQuery>,
+    /// Style to use when the buffer is empty or has no detectable indent — e.g. Rust/Python
+    /// default to 4 spaces (PEP 8 / rustfmt), Go to tabs, most web languages to 2 spaces.
+    pub default_indent: IndentStyle,
+}
+
+/// Shared `indents.scm` bodies referenced from per-language `; inherits` directives. Loaded
+/// once via `include_str!` and resolved by [`load_indent_query`] when compiling.
+fn shared_indent_body(name: &str) -> Option<&'static str> {
+    match name {
+        "ecma" => Some(include_str!("../queries/ecma/indents.scm")),
+        "_typescript" => Some(include_str!("../queries/_typescript/indents.scm")),
+        "_jsx" => Some(include_str!("../queries/_jsx/indents.scm")),
+        // `_javascript` is referenced by javascript/indents.scm but doesn't exist upstream —
+        // Helix's resolver silently skips missing inherits, so we do too.
+        _ => None,
+    }
+}
+
+fn load_indent_query(language: &Language, source: &'static str) -> Option<CompiledIndentQuery> {
+    let expanded = expand_inherits(source, shared_indent_body);
+    match CompiledIndentQuery::compile(language, &expanded) {
+        Ok(iq) => Some(iq),
+        Err(e) => {
+            tracing::warn!("indent query compile failed: {e}");
+            None
+        }
+    }
 }
 
 /// One embedded sub-language span inside a parent buffer (e.g. a `rust` fenced code block
@@ -46,12 +77,22 @@ fn simple<L: Into<Language> + Copy>(
     name: &'static str,
     language_fn: L,
     highlights: &'static str,
+    indents: Option<&'static str>,
+    default_indent: IndentStyle,
 ) -> &'static LanguageConfig {
     cell.get_or_init(move || {
         let language: Language = language_fn.into();
         let query = Query::new(&language, highlights)
             .unwrap_or_else(|e| panic!("{name} highlights query compiles: {e}"));
-        LanguageConfig { name, language, query, injection_query: None }
+        let indent_query = indents.and_then(|src| load_indent_query(&language, src));
+        LanguageConfig {
+            name,
+            language,
+            query,
+            injection_query: None,
+            indent_query,
+            default_indent,
+        }
     })
 }
 
@@ -62,7 +103,12 @@ fn simple<L: Into<Language> + Copy>(
 pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
-        "rust" | "rs" => Some(simple(&RUST, "rust", tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY)),
+        "rust" | "rs" => Some(simple(
+            &RUST, "rust",
+            tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY,
+            Some(include_str!("../queries/rust/indents.scm")),
+            IndentStyle::Spaces(4),
+        )),
         "markdown" | "md" => Some(MARKDOWN.get_or_init(|| {
             let language: Language = tree_sitter_md::LANGUAGE.into();
             let query = Query::new(&language, tree_sitter_md::HIGHLIGHT_QUERY_BLOCK)
@@ -74,41 +120,85 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 language,
                 query,
                 injection_query: Some(injection_query),
+                indent_query: None,
+                default_indent: IndentStyle::Spaces(2),
             }
         })),
-        "toml" => Some(simple(&TOML, "toml", tree_sitter_toml_ng::LANGUAGE, tree_sitter_toml_ng::HIGHLIGHTS_QUERY)),
-        "html" | "htm" => Some(simple(&HTML, "html", tree_sitter_html::LANGUAGE, tree_sitter_html::HIGHLIGHTS_QUERY)),
+        "toml" => Some(simple(
+            &TOML, "toml",
+            tree_sitter_toml_ng::LANGUAGE, tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+            None, IndentStyle::Spaces(2),
+        )),
+        "html" | "htm" => Some(simple(
+            &HTML, "html",
+            tree_sitter_html::LANGUAGE, tree_sitter_html::HIGHLIGHTS_QUERY,
+            None, IndentStyle::Spaces(2),
+        )),
         "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(simple(
-            &JAVASCRIPT,
-            "javascript",
-            tree_sitter_javascript::LANGUAGE,
-            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            &JAVASCRIPT, "javascript",
+            tree_sitter_javascript::LANGUAGE, tree_sitter_javascript::HIGHLIGHT_QUERY,
+            Some(include_str!("../queries/javascript/indents.scm")),
+            IndentStyle::Spaces(2),
         )),
         "typescript" | "ts" => Some(simple(
-            &TYPESCRIPT,
-            "typescript",
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            &TYPESCRIPT, "typescript",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT, tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            Some(include_str!("../queries/typescript/indents.scm")),
+            IndentStyle::Spaces(2),
         )),
         "tsx" => Some(simple(
-            &TSX,
-            "tsx",
-            tree_sitter_typescript::LANGUAGE_TSX,
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            &TSX, "tsx",
+            tree_sitter_typescript::LANGUAGE_TSX, tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            Some(include_str!("../queries/tsx/indents.scm")),
+            IndentStyle::Spaces(2),
         )),
-        "python" | "py" => Some(simple(&PYTHON, "python", tree_sitter_python::LANGUAGE, tree_sitter_python::HIGHLIGHTS_QUERY)),
-        "go" | "golang" => Some(simple(&GO, "go", tree_sitter_go::LANGUAGE, tree_sitter_go::HIGHLIGHTS_QUERY)),
-        "elixir" | "ex" | "exs" => Some(simple(&ELIXIR, "elixir", tree_sitter_elixir::LANGUAGE, tree_sitter_elixir::HIGHLIGHTS_QUERY)),
-        "erlang" | "erl" | "hrl" => Some(simple(&ERLANG, "erlang", tree_sitter_erlang::LANGUAGE, tree_sitter_erlang::HIGHLIGHTS_QUERY)),
-        "css" => Some(simple(&CSS, "css", tree_sitter_css::LANGUAGE, tree_sitter_css::HIGHLIGHTS_QUERY)),
+        "python" | "py" => Some(simple(
+            &PYTHON, "python",
+            tree_sitter_python::LANGUAGE, tree_sitter_python::HIGHLIGHTS_QUERY,
+            Some(include_str!("../queries/python/indents.scm")),
+            IndentStyle::Spaces(4),
+        )),
+        "go" | "golang" => Some(simple(
+            &GO, "go",
+            tree_sitter_go::LANGUAGE, tree_sitter_go::HIGHLIGHTS_QUERY,
+            Some(include_str!("../queries/go/indents.scm")),
+            IndentStyle::Tab,
+        )),
+        "elixir" | "ex" | "exs" => Some(simple(
+            &ELIXIR, "elixir",
+            tree_sitter_elixir::LANGUAGE, tree_sitter_elixir::HIGHLIGHTS_QUERY,
+            Some(include_str!("../queries/elixir/indents.scm")),
+            IndentStyle::Spaces(2),
+        )),
+        "erlang" | "erl" | "hrl" => Some(simple(
+            &ERLANG, "erlang",
+            tree_sitter_erlang::LANGUAGE, tree_sitter_erlang::HIGHLIGHTS_QUERY,
+            None, IndentStyle::Spaces(4),
+        )),
+        "css" => Some(simple(
+            &CSS, "css",
+            tree_sitter_css::LANGUAGE, tree_sitter_css::HIGHLIGHTS_QUERY,
+            Some(include_str!("../queries/css/indents.scm")),
+            IndentStyle::Spaces(2),
+        )),
         "bash" | "sh" | "shell" | "zsh" => Some(simple(
-            &BASH,
-            "bash",
-            tree_sitter_bash::LANGUAGE,
-            tree_sitter_bash::HIGHLIGHT_QUERY,
+            &BASH, "bash",
+            tree_sitter_bash::LANGUAGE, tree_sitter_bash::HIGHLIGHT_QUERY,
+            Some(include_str!("../queries/bash/indents.scm")),
+            IndentStyle::Spaces(2),
         )),
-        "json" => Some(simple(&JSON, "json", tree_sitter_json::LANGUAGE, tree_sitter_json::HIGHLIGHTS_QUERY)),
-        "yaml" | "yml" => Some(simple(&YAML, "yaml", tree_sitter_yaml::LANGUAGE, tree_sitter_yaml::HIGHLIGHTS_QUERY)),
+        "json" => Some(simple(
+            &JSON, "json",
+            tree_sitter_json::LANGUAGE, tree_sitter_json::HIGHLIGHTS_QUERY,
+            Some(include_str!("../queries/json/indents.scm")),
+            IndentStyle::Spaces(2),
+        )),
+        "yaml" | "yml" => Some(simple(
+            &YAML, "yaml",
+            tree_sitter_yaml::LANGUAGE, tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            Some(include_str!("../queries/yaml/indents.scm")),
+            IndentStyle::Spaces(2),
+        )),
         _ => None,
     }
 }

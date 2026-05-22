@@ -18,6 +18,22 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub const CONTINUATION_MARKER: &str = "↪ ";
 pub const CONTINUATION_MARKER_WIDTH: u32 = 2;
 
+/// Display width of a tab character. Tabs render as spaces aligned to the next multiple of
+/// this — i.e. proper tab stops, not a fixed-width substitution. Hardcoded for v1; making it
+/// per-buffer (driven by `IndentStyle::Tab(width)`) is the obvious follow-up.
+pub const TAB_WIDTH: u32 = 4;
+
+/// Number of columns a character contributes when rendered at visual column `current_col`.
+/// Tabs advance to the next tab stop; everything else falls back to `UnicodeWidthChar`. Used
+/// by every code path that converts between byte offsets and on-screen columns.
+fn char_display_width(c: char, current_col: u32) -> u32 {
+    if c == '\t' {
+        TAB_WIDTH - (current_col % TAB_WIDTH)
+    } else {
+        UnicodeWidthChar::width(c).unwrap_or(0) as u32
+    }
+}
+
 // ---- Nord palette ------------------------------------------------------------------------------
 // https://www.nordtheme.com/. Used for both the syntax-highlight foreground colors and the
 // painted background/status colors so the editor's appearance is independent of the terminal's
@@ -361,26 +377,36 @@ fn build_spans(
         style
     };
 
+    // Walk char-by-char so we can substitute tabs with the right number of spaces — ratatui
+    // would render a raw `\t` as a single zero-width control glyph and the rest of the line
+    // would visually collapse. Track `display_col` to size each tab to the next tab stop;
+    // highlight/selection byte ranges still apply to the *original* byte positions so they
+    // keep working untouched.
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut current_start = 0usize;
+    let mut current_text = String::new();
     let mut current_style: Option<Style> = None;
-    for (byte_idx, _) in truncated.char_indices() {
+    let mut display_col: u32 = 0;
+    for (byte_idx, c) in truncated.char_indices() {
         let style = style_at(byte_idx);
+        let pad = if c == '\t' { TAB_WIDTH - (display_col % TAB_WIDTH) } else { 0 };
+        display_col += char_display_width(c, display_col);
+        let rendered: std::borrow::Cow<'_, str> = if c == '\t' {
+            std::borrow::Cow::Owned(" ".repeat(pad as usize))
+        } else {
+            std::borrow::Cow::Borrowed(&truncated[byte_idx..byte_idx + c.len_utf8()])
+        };
         match current_style {
-            None => {
-                current_style = Some(style);
-                current_start = byte_idx;
-            }
             Some(s) if s != style => {
-                spans.push(Span::styled(truncated[current_start..byte_idx].to_string(), s));
+                spans.push(Span::styled(std::mem::take(&mut current_text), s));
                 current_style = Some(style);
-                current_start = byte_idx;
             }
+            None => current_style = Some(style),
             _ => {}
         }
+        current_text.push_str(&rendered);
     }
     if let Some(s) = current_style {
-        spans.push(Span::styled(truncated[current_start..].to_string(), s));
+        spans.push(Span::styled(current_text, s));
     }
     spans
 }
@@ -604,7 +630,7 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
                 if byte_cursor >= cursor_byte_in_row as usize {
                     break;
                 }
-                display_col_in_text += UnicodeWidthChar::width(c).unwrap_or(0) as u32;
+                display_col_in_text += char_display_width(c, display_col_in_text);
                 byte_cursor += c.len_utf8();
             }
             let marker = if row.byte_offset > 0 { CONTINUATION_MARKER_WIDTH } else { 0 };
@@ -694,7 +720,7 @@ fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u3
     let mut display_col: u32 = 0;
     let mut byte: u32 = 0;
     for c in text.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0) as u32;
+        let w = char_display_width(c, display_col);
         if display_col + w > target_in_text {
             break;
         }

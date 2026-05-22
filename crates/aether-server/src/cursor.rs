@@ -230,6 +230,7 @@ pub fn resolve_visual_line(
     wrap: WrapMode,
     cols: u32,
     marker_width: u32,
+    tab_width: u32,
     current: LogicalPosition,
     virtual_col_in: Option<u32>,
     direction: VerticalDirection,
@@ -242,7 +243,7 @@ pub fn resolve_visual_line(
         let cur_text = line_text(buf, current.line);
         let cur_row = RowInfo { byte_offset: 0, text: cur_text, continuation_indent: 0 };
         let target_display = virtual_col_in
-            .unwrap_or_else(|| visual_col_of_byte(&cur_row, current.col as usize, 0));
+            .unwrap_or_else(|| visual_col_of_byte(&cur_row, current.col as usize, 0, tab_width));
         let line_count = buf.text.len_lines() as u32;
         let new_line = match direction {
             VerticalDirection::Down => current.line.saturating_add(count),
@@ -251,16 +252,16 @@ pub fn resolve_visual_line(
         let new_line = new_line.min(line_count.saturating_sub(1));
         let new_text = line_text(buf, new_line);
         let new_row = RowInfo { byte_offset: 0, text: new_text, continuation_indent: 0 };
-        let new_col = byte_at_visual_col(&new_row, target_display, 0) as u32;
+        let new_col = byte_at_visual_col(&new_row, target_display, 0, tab_width) as u32;
         return (LogicalPosition { line: new_line, col: new_col }, target_display);
     }
 
     let line_count = buf.text.len_lines() as u32;
     let mut current_line = current.line.min(line_count.saturating_sub(1));
-    let mut rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width);
+    let mut rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width, tab_width);
     let mut row_idx = find_row_for_col(&rows, current.col as usize);
     let target_visual_col = virtual_col_in
-        .unwrap_or_else(|| visual_col_of_byte(&rows[row_idx], current.col as usize, marker_width));
+        .unwrap_or_else(|| visual_col_of_byte(&rows[row_idx], current.col as usize, marker_width, tab_width));
 
     let mut remaining = count;
     while remaining > 0 {
@@ -271,7 +272,7 @@ pub fn resolve_visual_line(
                     true
                 } else if current_line + 1 < line_count {
                     current_line += 1;
-                    rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width);
+                    rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width, tab_width);
                     row_idx = 0;
                     true
                 } else {
@@ -284,7 +285,7 @@ pub fn resolve_visual_line(
                     true
                 } else if current_line > 0 {
                     current_line -= 1;
-                    rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width);
+                    rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width, tab_width);
                     row_idx = rows.len().saturating_sub(1);
                     true
                 } else {
@@ -299,7 +300,7 @@ pub fn resolve_visual_line(
     }
 
     let row = &rows[row_idx];
-    let new_col_within_text = byte_at_visual_col(row, target_visual_col, marker_width);
+    let new_col_within_text = byte_at_visual_col(row, target_visual_col, marker_width, tab_width);
     let new_pos = LogicalPosition {
         line: current_line,
         col: row.byte_offset as u32 + new_col_within_text as u32,
@@ -313,9 +314,10 @@ pub fn resolve_visual_line_start(
     wrap: WrapMode,
     cols: u32,
     marker_width: u32,
+    tab_width: u32,
     current: LogicalPosition,
 ) -> LogicalPosition {
-    let rows = wrap_rows_for_cursor(buf, wrap, cols, marker_width, current);
+    let rows = wrap_rows_for_cursor(buf, wrap, cols, marker_width, tab_width, current);
     let row_idx = find_row_for_col(&rows, current.col as usize);
     LogicalPosition { line: current.line, col: rows[row_idx].byte_offset as u32 }
 }
@@ -326,9 +328,10 @@ pub fn resolve_visual_line_end(
     wrap: WrapMode,
     cols: u32,
     marker_width: u32,
+    tab_width: u32,
     current: LogicalPosition,
 ) -> LogicalPosition {
-    let rows = wrap_rows_for_cursor(buf, wrap, cols, marker_width, current);
+    let rows = wrap_rows_for_cursor(buf, wrap, cols, marker_width, tab_width, current);
     let row_idx = find_row_for_col(&rows, current.col as usize);
     let row = &rows[row_idx];
     let end_byte = row.byte_offset + row.text.len();
@@ -340,6 +343,7 @@ fn wrap_rows_for_cursor(
     wrap: WrapMode,
     cols: u32,
     marker_width: u32,
+    tab_width: u32,
     current: LogicalPosition,
 ) -> Vec<RowInfo> {
     let line_count = buf.text.len_lines() as u32;
@@ -352,7 +356,7 @@ fn wrap_rows_for_cursor(
             .map(|mut r| { r.text.truncate(len); r })
             .collect()
     } else {
-        wrap::compute_rows(&line_text(buf, line_idx), cols, marker_width)
+        wrap::compute_rows(&line_text(buf, line_idx), cols, marker_width, tab_width)
     }
 }
 
@@ -381,7 +385,7 @@ fn find_row_for_col(rows: &[RowInfo], col: usize) -> usize {
 /// `—` and `→` count as one cell each, and CJK chars as two). Includes the continuation marker
 /// (rendered by the client on rows where `byte_offset > 0`) and the indent. Bytes beyond the
 /// row's visible text clamp to the end of the visible text.
-fn visual_col_of_byte(row: &RowInfo, col_in_line: usize, marker_width: u32) -> u32 {
+fn visual_col_of_byte(row: &RowInfo, col_in_line: usize, marker_width: u32, tab_width: u32) -> u32 {
     let relative_byte = col_in_line
         .saturating_sub(row.byte_offset)
         .min(row.text.len());
@@ -391,7 +395,7 @@ fn visual_col_of_byte(row: &RowInfo, col_in_line: usize, marker_width: u32) -> u
         if byte_cursor >= relative_byte {
             break;
         }
-        display_col += UnicodeWidthChar::width(c).unwrap_or(0) as u32;
+        display_col += step_width(c, display_col, tab_width);
         byte_cursor += c.len_utf8();
     }
     row_prefix_width(row, marker_width) + display_col
@@ -401,7 +405,7 @@ fn visual_col_of_byte(row: &RowInfo, col_in_line: usize, marker_width: u32) -> u
 /// just before) the requested visual column. A target column landing in the middle of a wide
 /// char rounds down to that char's start. Visual columns inside the marker/indent prefix clamp
 /// to 0.
-fn byte_at_visual_col(row: &RowInfo, visual_col: u32, marker_width: u32) -> usize {
+fn byte_at_visual_col(row: &RowInfo, visual_col: u32, marker_width: u32, tab_width: u32) -> usize {
     let prefix = row_prefix_width(row, marker_width);
     if visual_col <= prefix {
         return 0;
@@ -410,7 +414,7 @@ fn byte_at_visual_col(row: &RowInfo, visual_col: u32, marker_width: u32) -> usiz
     let mut display_col: u32 = 0;
     let mut byte: usize = 0;
     for c in row.text.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0) as u32;
+        let w = step_width(c, display_col, tab_width);
         if display_col + w > target {
             break;
         }
@@ -418,6 +422,17 @@ fn byte_at_visual_col(row: &RowInfo, visual_col: u32, marker_width: u32) -> usiz
         byte += c.len_utf8();
     }
     byte
+}
+
+/// Width a single char contributes at `current_col`. Tabs use tab-stop math; everything else
+/// falls back to `UnicodeWidthChar`. Mirrors `wrap::char_display_width` — kept private here so
+/// the cursor module stays self-contained.
+fn step_width(c: char, current_col: u32, tab_width: u32) -> u32 {
+    if c == '\t' {
+        if tab_width == 0 { 0 } else { tab_width - (current_col % tab_width) }
+    } else {
+        UnicodeWidthChar::width(c).unwrap_or(0) as u32
+    }
 }
 
 /// Total visual width the client prepends to a row before its text: continuation marker (only on
@@ -437,6 +452,7 @@ pub fn resolve_logical_line(
     direction: Direction,
     count: u32,
     preserve_col: bool,
+    tab_width: u32,
 ) -> (LogicalPosition, Option<u32>) {
     let line_count = buf.text.len_lines() as u32;
     let new_line = match direction {
@@ -453,13 +469,13 @@ pub fn resolve_logical_line(
         continuation_indent: 0,
     };
     let target_display = virtual_col_in
-        .unwrap_or_else(|| visual_col_of_byte(&cur_row, current.col as usize, 0));
+        .unwrap_or_else(|| visual_col_of_byte(&cur_row, current.col as usize, 0, tab_width));
     let new_row = RowInfo {
         byte_offset: 0,
         text: line_text(buf, new_line),
         continuation_indent: 0,
     };
-    let new_col = byte_at_visual_col(&new_row, target_display, 0) as u32;
+    let new_col = byte_at_visual_col(&new_row, target_display, 0, tab_width) as u32;
     (LogicalPosition { line: new_line, col: new_col }, Some(target_display))
 }
 

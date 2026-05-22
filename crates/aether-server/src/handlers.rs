@@ -665,6 +665,7 @@ fn collect_viewport_refresh(
             vp.cols,
             vp.wrap,
             vp.continuation_marker_width,
+            vp.tab_width,
             vp.rows,
             search_entry,
         );
@@ -1034,7 +1035,7 @@ pub async fn viewport_subscribe(
     let (first, last_excl) = pushed_range(params.scroll.logical_line, params.rows, params.overscan_rows, line_count);
     let search = s.searches.get(&(client_id, params.buffer_id));
     let buf = &s.buffers[&params.buffer_id];
-    let window = render_window(buf, first, last_excl, params.cols, params.wrap, params.continuation_marker_width, params.rows, search);
+    let window = render_window(buf, first, last_excl, params.cols, params.wrap, params.continuation_marker_width, params.tab_width, params.rows, search);
 
     let viewport_id = s.allocate_viewport_id();
     let viewport = Viewport {
@@ -1048,6 +1049,7 @@ pub async fn viewport_subscribe(
         scroll_sub_row: params.scroll.sub_row,
         wrap: params.wrap,
         continuation_marker_width: params.continuation_marker_width,
+        tab_width: params.tab_width,
         first_logical_line: first,
         last_logical_line_exclusive: last_excl,
     };
@@ -1067,8 +1069,8 @@ pub async fn viewport_resize(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.cols = params.cols;
     vp.rows = params.rows;
-    let (cols, rows, overscan, wrap, marker_width, buffer_id, scroll_line) =
-        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.buffer_id, vp.scroll_logical_line);
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) =
+        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.tab_width, vp.buffer_id, vp.scroll_logical_line);
 
     let buf = s
         .buffers
@@ -1078,7 +1080,7 @@ pub async fn viewport_resize(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let buf = &s.buffers[&buffer_id];
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows, search);
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, tab_width, rows, search);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -1095,8 +1097,8 @@ pub async fn viewport_set_wrap(
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.wrap = params.wrap;
-    let (cols, rows, overscan, wrap, marker_width, buffer_id, scroll_line) =
-        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.buffer_id, vp.scroll_logical_line);
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) =
+        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.tab_width, vp.buffer_id, vp.scroll_logical_line);
 
     let buf = s
         .buffers
@@ -1106,7 +1108,7 @@ pub async fn viewport_set_wrap(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let buf = &s.buffers[&buffer_id];
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows, search);
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, tab_width, rows, search);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -1124,8 +1126,8 @@ pub async fn viewport_scroll(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.scroll_logical_line = params.scroll.logical_line;
     vp.scroll_sub_row = params.scroll.sub_row;
-    let (cols, rows, overscan, wrap, marker_width, buffer_id, scroll_line) =
-        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.buffer_id, vp.scroll_logical_line);
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) =
+        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.tab_width, vp.buffer_id, vp.scroll_logical_line);
 
     let buf = s
         .buffers
@@ -1135,7 +1137,7 @@ pub async fn viewport_scroll(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let buf = &s.buffers[&buffer_id];
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, rows, search);
+    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, tab_width, rows, search);
 
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
@@ -1221,6 +1223,7 @@ fn compute_max_scroll(
     cols: u32,
     wrap: aether_protocol::viewport::WrapMode,
     marker_width: u32,
+    tab_width: u32,
 ) -> u32 {
     let line_count = buf.line_count();
     if viewport_rows == 0 || line_count == 0 {
@@ -1236,7 +1239,7 @@ fn compute_max_scroll(
         if text.ends_with('\n') {
             text.pop();
         }
-        let n = wrap::compute_rows(&text, cols, marker_width).len() as u32;
+        let n = wrap::compute_rows(&text, cols, marker_width, tab_width).len() as u32;
         if n >= rows_remaining {
             return line_idx;
         }
@@ -1252,6 +1255,7 @@ fn render_window(
     cols: u32,
     wrap: aether_protocol::viewport::WrapMode,
     marker_width: u32,
+    tab_width: u32,
     viewport_rows: u32,
     search: Option<&SearchEntry>,
 ) -> Window {
@@ -1286,7 +1290,7 @@ fn render_window(
             _ => Vec::new(),
         };
 
-        let mut render = wrap::render_line(&text, i, cols, wrap, marker_width, highlights);
+        let mut render = wrap::render_line(&text, i, cols, wrap, marker_width, tab_width, highlights);
         if let Some(entry) = search {
             render.search_matches = matches_on_line(entry, i, text.len() as u32);
         }
@@ -1296,7 +1300,7 @@ fn render_window(
         first_logical_line: first,
         last_logical_line_exclusive: last_excl,
         line_count: buf.line_count(),
-        max_scroll_logical_line: compute_max_scroll(buf, viewport_rows, cols, wrap, marker_width),
+        max_scroll_logical_line: compute_max_scroll(buf, viewport_rows, cols, wrap, marker_width, tab_width),
         lines,
     }
 }
@@ -1355,6 +1359,7 @@ pub async fn cursor_move(
                 vp.wrap,
                 vp.cols,
                 vp.continuation_marker_width,
+                vp.tab_width,
                 current.position,
                 virtual_col_in,
                 *direction,
@@ -1370,7 +1375,7 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_start(buf, vp.wrap, vp.cols, vp.continuation_marker_width, current.position)
+            motion::resolve_visual_line_start(buf, vp.wrap, vp.cols, vp.continuation_marker_width, vp.tab_width, current.position)
         }
         Motion::VisualLineEnd { viewport_id } => {
             let vp = s.viewports.get(viewport_id).ok_or_else(|| {
@@ -1379,9 +1384,18 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_end(buf, vp.wrap, vp.cols, vp.continuation_marker_width, current.position)
+            motion::resolve_visual_line_end(buf, vp.wrap, vp.cols, vp.continuation_marker_width, vp.tab_width, current.position)
         }
         Motion::LogicalLine { direction, count, preserve_col } => {
+            // LogicalLine doesn't reference a viewport, but it does preserve virtual column,
+            // which is in display cells — so it needs `tab_width` to be right for tab-bearing
+            // lines. Borrow it from any of this client's viewports on this buffer.
+            let tab_width = s
+                .viewports
+                .values()
+                .find(|v| v.buffer_id == params.buffer_id && v.client_id == client_id)
+                .map(|v| v.tab_width)
+                .unwrap_or(4);
             let (pos, target_vcol) = motion::resolve_logical_line(
                 buf,
                 current.position,
@@ -1389,6 +1403,7 @@ pub async fn cursor_move(
                 *direction,
                 *count,
                 *preserve_col,
+                tab_width,
             );
             new_virtual_col = target_vcol;
             pos
@@ -1819,6 +1834,126 @@ pub async fn input_indent(
     apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Indent).await
 }
 
+pub async fn input_newline_and_indent(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let indent = {
+        let s = state.lock().await;
+        let buf = s
+            .buffers
+            .get(&params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let cursor = s.cursors.get(&(client_id, params.buffer_id)).copied().unwrap_or_default();
+        compute_smart_indent(buf, cursor.position)
+    };
+    let mut text = String::with_capacity(indent.len() + 1);
+    text.push('\n');
+    text.push_str(&indent);
+    apply_edit(
+        state,
+        client_id,
+        params.buffer_id,
+        EditKind::ReplaceWith { text, select_pasted: false },
+    )
+    .await
+}
+
+/// Choose the indent to emit after `\n`. When the buffer's language has an `indents.scm`
+/// query (vendored from Helix), runs the tree-sitter indent engine and multiplies its level
+/// count by `INDENT_UNIT`. Otherwise falls back to copying the previous non-empty line's
+/// leading whitespace.
+///
+/// The engine alone misses the very common "user just typed `fn foo() {` and pressed Enter"
+/// case: the parser hasn't seen a closing brace yet, so no `block` node exists and no
+/// `@indent` fires. We patch this with a small heuristic floor — `prev_line_levels +
+/// opener_bonus` — taken as `max` with the engine's answer. For complete code the engine
+/// already produces the right number, so the heuristic is a no-op; for incomplete code it
+/// recovers the level the parser couldn't.
+fn compute_smart_indent(buf: &Buffer, cursor_pos: LogicalPosition) -> String {
+    let unit = buf.indent_style.unit();
+
+    let line_idx = cursor_pos.line as usize;
+    if line_idx >= buf.text.len_lines() {
+        return String::new();
+    }
+
+    let Some(syntax) = buf.syntax.as_ref() else {
+        return previous_line_indent(buf, line_idx);
+    };
+    let Some(iq) = syntax.config.indent_query.as_ref() else {
+        return previous_line_indent(buf, line_idx);
+    };
+
+    let line_slice = buf.text.line(line_idx);
+    let line_byte_len = {
+        let n = line_slice.len_bytes();
+        if n > 0 && line_slice.byte(n - 1) == b'\n' { n - 1 } else { n }
+    };
+    let col = (cursor_pos.col as usize).min(line_byte_len);
+    let line_start_char = buf.text.line_to_char(line_idx);
+    let line_start_byte = buf.text.char_to_byte(line_start_char);
+    let cursor_byte = line_start_byte + col;
+    let source: String = buf.text.chunks().collect();
+
+    let target_levels = crate::indent::compute_indent_levels(
+        iq,
+        &syntax.tree,
+        source.as_bytes(),
+        cursor_byte,
+        line_idx + 1,
+    );
+
+    // Engine-only is enough when it returned anything non-zero — the parse covered the
+    // construct and the @indent / @outdent rules already account for it. We only step in
+    // with the opener heuristic when the engine reported zero levels *and* the user just
+    // typed a code-context opener — that's the "incomplete parse" signature.
+    if target_levels > 0 {
+        return unit.repeat(target_levels as usize);
+    }
+    let line_text: String = line_slice.chunks().collect();
+    let line_content = line_text.strip_suffix('\n').unwrap_or(&line_text);
+    let prefix = &line_content[..col];
+    let trimmed = prefix.trim_end_matches(|c: char| c == ' ' || c == '\t');
+    let mut opener_bonus = match trimmed.as_bytes().last() {
+        Some(b'{') | Some(b'(') | Some(b'[') => 1,
+        _ => 0,
+    };
+    if opener_bonus > 0 {
+        let opener_byte = line_start_byte + trimmed.len() - 1;
+        let node = syntax
+            .tree
+            .root_node()
+            .descendant_for_byte_range(opener_byte, opener_byte + 1);
+        if let Some(n) = node {
+            let kind = n.kind();
+            if kind.contains("string") || kind.contains("comment") || kind.contains("char") {
+                opener_bonus = 0;
+            }
+        }
+    }
+    unit.repeat(opener_bonus as usize)
+}
+
+/// Fallback indent for buffers without an indent query: copy the leading whitespace of the
+/// nearest preceding non-blank line. If no such line exists, return empty.
+fn previous_line_indent(buf: &Buffer, line_idx: usize) -> String {
+    let mut i = line_idx;
+    loop {
+        let line: String = buf.text.line(i).chunks().collect();
+        let content = line.strip_suffix('\n').unwrap_or(&line);
+        if !content.trim().is_empty() {
+            return content.chars().take_while(|c| c.is_whitespace()).collect();
+        }
+        if i == 0 {
+            return String::new();
+        }
+        i -= 1;
+    }
+}
+
 pub async fn input_dedent(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -1833,22 +1968,22 @@ enum IndentKind {
     Dedent,
 }
 
-/// Two-space soft indent. Selection's line range gets the prefix added (or stripped, on dedent).
-/// Cursor and anchor are shifted by the per-line delta — on indent that's always +2, on dedent
-/// it's 0/-1/-2 depending on what was actually there to strip.
+/// Per-buffer-style soft indent. Selection's line range gets the prefix added (or stripped, on
+/// dedent). Cursor and anchor are shifted by the per-line delta — on indent that's always
+/// +unit.len(); on dedent it's 0/-1/-unit.len() depending on what was actually there to strip.
 async fn apply_indent_or_dedent(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     buffer_id: BufferId,
     kind: IndentKind,
 ) -> Result<EditResult, RpcError> {
-    const INDENT: &str = "  ";
     let client_id = ctx.require_hello()?;
     let mut s = state.lock().await;
     let buf = s
         .buffers
         .get(&buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let indent = buf.indent_style.unit();
     let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
 
     let (a, b) = match cursor.anchor {
@@ -1879,10 +2014,10 @@ async fn apply_indent_or_dedent(
             None => (line_str.as_str(), ""),
         };
         let (modified, shift): (String, i32) = match kind {
-            IndentKind::Indent => (format!("{INDENT}{content}"), INDENT.len() as i32),
+            IndentKind::Indent => (format!("{indent}{content}"), indent.len() as i32),
             IndentKind::Dedent => {
-                if let Some(s) = content.strip_prefix(INDENT) {
-                    (s.to_string(), -(INDENT.len() as i32))
+                if let Some(s) = content.strip_prefix(indent.as_ref()) {
+                    (s.to_string(), -(indent.len() as i32))
                 } else if let Some(s) = content.strip_prefix(' ') {
                     (s.to_string(), -1)
                 } else {
@@ -2568,7 +2703,7 @@ fn build_lines_changed_notif(
     let line_count = buffer.line_count();
     let new_first = vp.first_logical_line.min(line_count);
     let new_last_excl = vp.last_logical_line_exclusive.min(line_count).max(new_first);
-    let window = render_window(buffer, new_first, new_last_excl, vp.cols, vp.wrap, vp.continuation_marker_width, vp.rows, search);
+    let window = render_window(buffer, new_first, new_last_excl, vp.cols, vp.wrap, vp.continuation_marker_width, vp.tab_width, vp.rows, search);
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
         revision,
