@@ -123,16 +123,6 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let viewport_cols = area.width;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
     let scroll_col = if matches!(state.wrap, WrapMode::None) { state.scroll_col } else { 0 };
-    // `selection_on_visual_row` normally omits the trailing char of the selection, expecting the
-    // block cursor to overdraw it. That assumption only holds when the cursor is at the *end* of
-    // the selection (forward selection). Extend the paint range when either:
-    //   - we're in Search mode (the hardware cursor is on the status row, not on the buffer), or
-    //   - the selection is backward (cursor at start, anchor at end — block cursor doesn't reach
-    //     the trailing char, so without the extension the anchor goes unpainted).
-    let backward_selection = state.cursor.anchor.is_some_and(|a| {
-        (a.line, a.col) > (state.cursor.position.line, state.cursor.position.col)
-    });
-    let extend_sel_to_cursor = matches!(state.mode, Mode::Search) || backward_selection;
 
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
     let mut logical_line = top;
@@ -152,25 +142,38 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if lines.len() >= viewport_rows {
                 break 'outer;
             }
-            // The implicit "newline" of the logical line is selected iff the selection
-            // spans past this whole line. Paint a single trailing cell on the last visual
-            // row of the line to make the line-break feel like it's part of the selection
-            // (rather than the highlight ending abruptly at the end of the text).
             let is_last_vrow_of_line = vrow_idx == last_vrow_idx;
-            let highlight_trailing_newline = is_last_vrow_of_line
-                && selection.is_some_and(|(_, e)| e.line > logical_line);
             let segment = match vrow.segments.first() {
                 Some(s) => s,
                 None => {
+                    // Empty line — paint a trailing cell when the selection continues past
+                    // this line (the line's newline char is conceptually in the range).
+                    let empty_newline_selected = is_last_vrow_of_line
+                        && selection.is_some_and(|(s, e)| {
+                            s.line <= logical_line && e.line > logical_line
+                        });
                     let mut spans: Vec<Span<'static>> = Vec::new();
-                    if highlight_trailing_newline {
-                        spans.push(Span::styled(" ", Style::default().bg(NORD10)));
+                    if empty_newline_selected {
+                        spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
                     }
                     lines.push(Line::from(spans));
                     continue;
                 }
             };
             let row_text_len = segment.text.len() as u32;
+            // The trailing "newline cell" represents the line's implicit `\n` and is painted
+            // when that `\n` falls inside the selection. The `\n` is at byte col
+            // `line_text_len` (just past the last char); the selection covers it when either:
+            //   - the selection continues past this whole line (`e.line > logical_line`), or
+            //   - the cursor / anchor sits *on* the `\n` cell (`e.col >= line_text_len`) —
+            //     not merely on the last real char.
+            let highlight_trailing_newline = is_last_vrow_of_line
+                && selection.is_some_and(|(s, e)| {
+                    s.line <= logical_line
+                        && (e.line > logical_line
+                            || (e.line == logical_line
+                                && e.col >= vrow.byte_offset + row_text_len))
+                });
             let sel_on_row = selection.and_then(|(s, e)| {
                 selection_on_visual_row(logical_line, vrow.byte_offset, row_text_len, s, e)
             });
@@ -207,9 +210,9 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if indent > 0 {
                 spans.push(Span::raw(" ".repeat(indent as usize)));
             }
-            spans.extend(build_spans(&clipped_text, &clipped_highlights, clipped_sel, &clipped_matches, &clipped_brackets, body_width, extend_sel_to_cursor));
+            spans.extend(build_spans(&clipped_text, &clipped_highlights, clipped_sel, &clipped_matches, &clipped_brackets, body_width));
             if highlight_trailing_newline {
-                spans.push(Span::styled(" ", Style::default().bg(NORD10)));
+                spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
             }
             lines.push(Line::from(spans));
         }
@@ -328,9 +331,10 @@ fn ordered_selection(cursor: &CursorState) -> Option<(LogicalPosition, LogicalPo
 }
 
 /// Intersect the selection with the byte range covered by `[row_byte_offset, +row_text_len)` on
-/// `logical_line`. Returns row-relative offsets. The selection is conceptually inclusive on both
-/// endpoints, but the block cursor renders the end char itself, so for the highlight we treat the
-/// range as half-open and let the cursor draw its own char.
+/// `logical_line`. Returns row-relative offsets. The selection is inclusive on both endpoints
+/// (per the protocol), so the returned range's exclusive end is `sel_end.col + 1` — meaning the
+/// last selected char is included in the paint. The block cursor is later overlaid by the
+/// terminal on whichever cell its position lands on.
 fn selection_on_visual_row(
     logical_line: u32,
     row_byte_offset: u32,
@@ -343,24 +347,17 @@ fn selection_on_visual_row(
     }
     let line_sel_start = if logical_line == sel_start.line { sel_start.col } else { 0 };
     let line_sel_end_excl = if logical_line == sel_end.line {
-        sel_end.col
+        sel_end.col + 1
     } else {
         row_byte_offset + row_text_len
     };
     let row_end = row_byte_offset + row_text_len;
     let start = line_sel_start.max(row_byte_offset);
     let end = line_sel_end_excl.min(row_end);
-    if start < end {
-        return Some((start - row_byte_offset, end - row_byte_offset));
+    if start >= end {
+        return None;
     }
-    // Empty intersection — normally "no selection on this row", but report a zero-width range
-    // when the selection ends exactly at the start of this row (e.g. anchor at col 0 of a
-    // line, with the cursor on a line above). Without this, `build_spans` has nothing to
-    // extend and the anchor char goes unpainted in backward selections.
-    if logical_line == sel_end.line && line_sel_end_excl == row_byte_offset {
-        return Some((0, 0));
-    }
-    None
+    Some((start - row_byte_offset, end - row_byte_offset))
 }
 
 /// Truncate `text` to fit `max_chars` columns and emit styled spans. Style at each byte is the
@@ -373,28 +370,12 @@ fn build_spans(
     matches: &[(u32, u32)],
     match_brackets: &[u32],
     max_chars: u16,
-    extend_sel_to_cursor: bool,
 ) -> Vec<Span<'static>> {
     let truncated: String = text.chars().take(max_chars as usize).collect();
     let trunc_len = truncated.len();
     if trunc_len == 0 {
         return Vec::new();
     }
-    // When asked, grow the selection to include the cursor's own char so the paint reaches the
-    // end of the match — used in Search mode where the hardware cursor lives on the status row.
-    let sel = if extend_sel_to_cursor {
-        sel.map(|(s, e)| {
-            let e_usize = e as usize;
-            let extra = truncated
-                .get(e_usize..)
-                .and_then(|tail| tail.chars().next())
-                .map(|c| c.len_utf8())
-                .unwrap_or(0);
-            (s, ((e_usize + extra).min(trunc_len)) as u32)
-        })
-    } else {
-        sel
-    };
 
     // Build a per-byte highlight-kind table. Highlights from the server are non-overlapping.
     let mut byte_kind: Vec<Option<&str>> = vec![None; trunc_len];
@@ -445,38 +426,76 @@ fn build_spans(
         style
     };
 
+    // Byte offset at which trailing whitespace starts on the row. If the row is all
+    // whitespace this is 0; if there's no trailing whitespace it's the row length.
+    let trailing_ws_start = {
+        let bytes = truncated.as_bytes();
+        let mut i = bytes.len();
+        while i > 0 && matches!(bytes[i - 1], b' ' | b'\t') {
+            i -= 1;
+        }
+        i
+    };
+
     // Walk char-by-char so we can substitute tabs with the right number of spaces — ratatui
     // would render a raw `\t` as a single zero-width control glyph and the rest of the line
     // would visually collapse. Track `display_col` to size each tab to the next tab stop;
     // highlight/selection byte ranges still apply to the *original* byte positions so they
-    // keep working untouched.
+    // keep working untouched. Selected whitespace (tabs, trailing spaces) gets a muted
+    // indicator glyph (NORD3) overlaid on the selection bg — `→` for tabs, `·` for trailing
+    // spaces — so the user can see the structure of what they've selected.
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut current_text = String::new();
     let mut current_style: Option<Style> = None;
     let mut display_col: u32 = 0;
     for (byte_idx, c) in truncated.char_indices() {
         let style = style_at(byte_idx);
+        let in_sel = sel.is_some_and(|(s, e)| byte_idx >= s as usize && byte_idx < e as usize);
         let pad = if c == '\t' { TAB_WIDTH - (display_col % TAB_WIDTH) } else { 0 };
         display_col += char_display_width(c, display_col);
-        let rendered: std::borrow::Cow<'_, str> = if c == '\t' {
-            std::borrow::Cow::Owned(" ".repeat(pad as usize))
-        } else {
-            std::borrow::Cow::Borrowed(&truncated[byte_idx..byte_idx + c.len_utf8()])
-        };
-        match current_style {
-            Some(s) if s != style => {
-                spans.push(Span::styled(std::mem::take(&mut current_text), s));
-                current_style = Some(style);
+        if c == '\t' {
+            if in_sel {
+                push_text(&mut spans, &mut current_text, &mut current_style, "→", style.fg(NORD3));
+                if pad > 1 {
+                    let pad_str = " ".repeat((pad - 1) as usize);
+                    push_text(&mut spans, &mut current_text, &mut current_style, &pad_str, style);
+                }
+            } else {
+                let pad_str = " ".repeat(pad as usize);
+                push_text(&mut spans, &mut current_text, &mut current_style, &pad_str, style);
             }
-            None => current_style = Some(style),
-            _ => {}
+        } else if c == ' ' && in_sel && byte_idx >= trailing_ws_start {
+            push_text(&mut spans, &mut current_text, &mut current_style, "·", style.fg(NORD3));
+        } else {
+            let rendered = &truncated[byte_idx..byte_idx + c.len_utf8()];
+            push_text(&mut spans, &mut current_text, &mut current_style, rendered, style);
         }
-        current_text.push_str(&rendered);
     }
     if let Some(s) = current_style {
         spans.push(Span::styled(current_text, s));
     }
     spans
+}
+
+/// Append `text` to the running span, flushing the previous span if `style` differs from the
+/// current accumulated style. Keeps adjacent chars of the same style in one span so ratatui
+/// doesn't waste cells on style transitions.
+fn push_text(
+    spans: &mut Vec<Span<'static>>,
+    current_text: &mut String,
+    current_style: &mut Option<Style>,
+    text: &str,
+    style: Style,
+) {
+    match *current_style {
+        Some(s) if s != style => {
+            spans.push(Span::styled(std::mem::take(current_text), s));
+            *current_style = Some(style);
+        }
+        None => *current_style = Some(style),
+        _ => {}
+    }
+    current_text.push_str(text);
 }
 
 /// Map a tree-sitter highlight name to a `Style`. Falls back along dotted prefixes
@@ -572,8 +591,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 /// In insert mode: `A:B` (just the cursor). In normal mode: `A:B-C:D` (half-open) — A:B is the
-/// first byte of the selection, C:D is one byte past the last char (the byte just after the
-/// block cursor). With no explicit anchor the selection is the implicit 1-char range at the
+/// first byte of the selection, C:D is one byte past the last selected char. When the cursor /
+/// anchor is *on the newline cell* of a line (col == line text length), the exclusive end
+/// wraps to the next line's col 0 — matching the conceptual "the \n is the last selected
+/// position". With no explicit anchor the selection is the implicit 1-char range at the
 /// cursor.
 fn format_position(state: &AppState) -> String {
     let pos = state.cursor.position;
@@ -591,27 +612,56 @@ fn format_position(state: &AppState) -> String {
                     }
                 }
             };
-            // The half-open exclusive end is one byte past the block cursor's char. For phase 1
-            // we approximate by incrementing the column; multi-byte chars and line-end overflow
-            // would need server help to compute exactly.
-            if start.line == end_inclusive.line {
-                format!(
-                    "{}:{}-{}",
-                    start.line + 1,
-                    start.col + 1,
-                    end_inclusive.col + 2,
-                )
+            let excl = exclusive_end_of(state, end_inclusive);
+            if start.line == excl.line {
+                format!("{}:{}-{}", start.line + 1, start.col + 1, excl.col + 1)
             } else {
                 format!(
                     "{}:{}-{}:{}",
                     start.line + 1,
                     start.col + 1,
-                    end_inclusive.line + 1,
-                    end_inclusive.col + 2,
+                    excl.line + 1,
+                    excl.col + 1,
                 )
             }
         }
     }
+}
+
+/// One byte past the char at `pos`, or `(pos.line + 1, 0)` if `pos` sits on the implicit `\n`
+/// at the end of its line. Falls back to a +1 approximation when the line isn't in the
+/// pushed window (which makes the cursor off-screen anyway).
+fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
+    let local_idx = (pos.line as i64) - (state.window_first_logical_line as i64);
+    let Some(render) = (if local_idx >= 0 {
+        state.lines.get(local_idx as usize)
+    } else {
+        None
+    }) else {
+        return LogicalPosition { line: pos.line, col: pos.col + 1 };
+    };
+    let last_vrow = match render.visual_rows.last() {
+        Some(r) => r,
+        None => return LogicalPosition { line: pos.line, col: pos.col + 1 },
+    };
+    let last_text = last_vrow.segments.first().map_or("", |s| s.text.as_str());
+    let line_text_len = last_vrow.byte_offset + last_text.len() as u32;
+    if pos.col >= line_text_len {
+        // Cursor on the line's implicit newline → exclusive end is the next line's col 0.
+        return LogicalPosition { line: pos.line + 1, col: 0 };
+    }
+    // Cursor on a real char — advance by that char's UTF-8 byte width.
+    let row = render.visual_rows.iter().find(|r| {
+        let row_len = r.segments.first().map_or(0, |s| s.text.len() as u32);
+        pos.col >= r.byte_offset && pos.col < r.byte_offset + row_len
+    });
+    let row_text = row.and_then(|r| r.segments.first()).map_or("", |s| s.text.as_str());
+    let row_local = pos.col.saturating_sub(row.map_or(0, |r| r.byte_offset)) as usize;
+    let char_bytes = row_text[row_local..]
+        .chars()
+        .next()
+        .map_or(1, |c| c.len_utf8() as u32);
+    LogicalPosition { line: pos.line, col: pos.col + char_bytes }
 }
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
