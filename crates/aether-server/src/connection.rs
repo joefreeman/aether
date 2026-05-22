@@ -78,6 +78,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_virtual_col_for_client(client_id);
         s.drop_searches_for_client(client_id);
         s.drop_tree_selection_history_for_client(client_id);
+        s.drop_last_scroll_for_client(client_id);
         tracing::debug!(%client_id, "client session removed");
     }
     Ok(())

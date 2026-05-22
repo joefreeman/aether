@@ -4,7 +4,7 @@ use crate::indent::{self, IndentStyle};
 use crate::syntax::{self, InjectionLayer, LanguageConfig};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
-use aether_protocol::viewport::WrapMode;
+use aether_protocol::viewport::{ScrollPosition, WrapMode};
 use aether_protocol::{BufferId, ClientId, LogicalPosition, Revision, ViewportId};
 use std::time::{Duration, Instant};
 use tree_sitter::{InputEdit, Parser, Point, Tree};
@@ -44,6 +44,11 @@ pub struct ServerState {
     /// Per-`(client, buffer)` active search. Set by `search/set`, cleared by `search/clear` or
     /// when the client disconnects / the buffer closes. Re-run whenever the buffer mutates.
     pub searches: HashMap<(ClientId, BufferId), SearchEntry>,
+    /// Per-`(client, buffer)` last-known scroll position. Written whenever the client subscribes
+    /// or scrolls a viewport on the buffer, and surfaced on `buffer/open` so the client can
+    /// restore the view when it reopens the buffer (e.g. navigating away and back via the file
+    /// browser). Cleared on disconnect.
+    pub last_scroll: HashMap<(ClientId, BufferId), ScrollPosition>,
     next_buffer_id: u64,
     next_viewport_id: u64,
 }
@@ -96,6 +101,7 @@ impl ServerState {
             virtual_col: HashMap::new(),
             tree_selection_history: HashMap::new(),
             searches: HashMap::new(),
+            last_scroll: HashMap::new(),
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
@@ -170,6 +176,11 @@ impl ServerState {
     /// Remove all search records for the given client. Used on disconnect.
     pub fn drop_searches_for_client(&mut self, client_id: ClientId) {
         self.searches.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Remove all last-scroll records for the given client. Used on disconnect.
+    pub fn drop_last_scroll_for_client(&mut self, client_id: ClientId) {
+        self.last_scroll.retain(|(c, _), _| *c != client_id);
     }
 
     /// Drop the selection-expansion history for one client+buffer. Called from every cursor RPC

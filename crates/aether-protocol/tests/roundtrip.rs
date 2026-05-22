@@ -116,11 +116,37 @@ fn buffer_open_result_shape() {
         revision: 0,
         saved_revision: 0,
         path: None,
+        cursor: Default::default(),
+        scroll: None,
     })
     .unwrap();
     assert_eq!(v["buffer_id"], 42);
     assert_eq!(v["language"], "rust");
     assert_eq!(v["saved_revision"], 0);
+    // Cursor always serialises (CursorState::default() is `{position: {line:0,col:0}, anchor: null}`).
+    assert_eq!(v["cursor"]["position"]["line"], 0);
+    assert_eq!(v["cursor"]["position"]["col"], 0);
+    // `scroll: None` skips serialisation — keeps the wire shape tight for first-open cases.
+    assert!(v.get("scroll").is_none(), "scroll: None should be skipped");
+}
+
+#[test]
+fn buffer_open_result_restored_scroll() {
+    use aether_protocol::viewport::ScrollPosition;
+    let v = to_value(BufferOpenResult {
+        buffer_id: 42,
+        language: None,
+        line_count: 1,
+        byte_count: 0,
+        revision: 0,
+        saved_revision: 0,
+        path: None,
+        cursor: Default::default(),
+        scroll: Some(ScrollPosition { logical_line: 7, sub_row: 0.5 }),
+    })
+    .unwrap();
+    assert_eq!(v["scroll"]["logical_line"], 7);
+    assert_eq!(v["scroll"]["sub_row"], 0.5);
 }
 
 #[test]

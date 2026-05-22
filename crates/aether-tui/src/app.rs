@@ -239,13 +239,14 @@ pub async fn bootstrap(
         .rpc::<aether_protocol::buffer::BufferOpen>(buffer_open_params)
         .await?;
 
+    let initial_scroll = open.scroll.unwrap_or(ScrollPosition { logical_line: 0, sub_row: 0.0 });
     let sub: ViewportSubscribeResult = client
         .rpc::<ViewportSubscribe>(ViewportSubscribeParams {
             buffer_id: open.buffer_id,
             cols: viewport_cols,
             rows: viewport_rows,
             overscan_rows: viewport_rows,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: initial_scroll,
             wrap: WrapMode::Soft,
             continuation_marker_width: ui::CONTINUATION_MARKER_WIDTH,
             tab_width: ui::TAB_WIDTH,
@@ -257,8 +258,8 @@ pub async fn bootstrap(
         file_label,
         buffer_id: open.buffer_id,
         viewport_id: sub.viewport_id,
-        cursor: CursorState::default(),
-        scroll_logical_line: 0,
+        cursor: open.cursor,
+        scroll_logical_line: initial_scroll.logical_line,
         window_first_logical_line: sub.window.first_logical_line,
         lines: sub.window.lines,
         viewport_cols,
@@ -1060,13 +1061,14 @@ async fn open_file_in_browser_with_options(
             create_if_missing,
         })
         .await?;
+    let initial_scroll = open.scroll.unwrap_or(ScrollPosition { logical_line: 0, sub_row: 0.0 });
     let sub: ViewportSubscribeResult = client
         .rpc::<ViewportSubscribe>(ViewportSubscribeParams {
             buffer_id: open.buffer_id,
             cols: state.viewport_cols,
             rows: state.viewport_rows,
             overscan_rows: state.viewport_rows,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: initial_scroll,
             wrap: state.wrap,
             continuation_marker_width: ui::CONTINUATION_MARKER_WIDTH,
             tab_width: ui::TAB_WIDTH,
@@ -1075,8 +1077,8 @@ async fn open_file_in_browser_with_options(
 
     state.buffer_id = open.buffer_id;
     state.viewport_id = sub.viewport_id;
-    state.cursor = CursorState::default();
-    state.scroll_logical_line = 0;
+    state.cursor = open.cursor;
+    state.scroll_logical_line = initial_scroll.logical_line;
     state.window_first_logical_line = sub.window.first_logical_line;
     state.lines = sub.window.lines;
     state.line_count = sub.window.line_count;

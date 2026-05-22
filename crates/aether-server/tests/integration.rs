@@ -135,6 +135,9 @@ async fn hello_then_open_file() {
     assert_eq!(open.revision, 0);
     assert!(open.line_count >= 3);
     assert!(open.byte_count > 0);
+    // First open: no prior cursor or scroll for this (client, buffer).
+    assert_eq!(open.cursor, CursorState::default());
+    assert!(open.scroll.is_none());
 
     // Re-opening returns the same buffer id (deduping by canonical path).
     let open2: BufferOpenResult = send_request::<BufferOpen>(
@@ -149,6 +152,200 @@ async fn hello_then_open_file() {
     )
     .await;
     assert_eq!(open2.buffer_id, open.buffer_id);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn buffer_open_restores_cursor_and_scroll() {
+    // Multi-line file so we can scroll meaningfully.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.txt");
+    let mut content = String::new();
+    for i in 0..30 {
+        content.push_str(&format!("line {i}\n"));
+    }
+    std::fs::write(&path, &content).unwrap();
+
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+    )
+    .await;
+
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let viewport_id = sub.viewport_id;
+
+    // Move the cursor and scroll the viewport so the (client, buffer) state diverges from defaults.
+    let cursor_target = LogicalPosition { line: 12, col: 3 };
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        4,
+        &CursorSetParams { buffer_id, position: cursor_target, anchor: None },
+    )
+    .await;
+    let _: ViewportWindowResult = send_request::<ViewportScroll>(
+        &mut ws,
+        5,
+        &ViewportScrollParams {
+            viewport_id,
+            scroll: ScrollPosition { logical_line: 8, sub_row: 0.0 },
+        },
+    )
+    .await;
+
+    // Reopen the same path (file-browser navigation pattern). The server should report the
+    // prior cursor and scroll so the client can restore the view.
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        6,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert_eq!(reopen.buffer_id, buffer_id);
+    assert_eq!(reopen.cursor.position, cursor_target);
+    let scroll = reopen.scroll.expect("scroll restored on reopen");
+    assert_eq!(scroll.logical_line, 8);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn buffer_open_isolates_scroll_per_client() {
+    // Two clients on the same buffer should see independent restored scroll positions.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.txt");
+    let mut content = String::new();
+    for i in 0..30 {
+        content.push_str(&format!("line {i}\n"));
+    }
+    std::fs::write(&path, &content).unwrap();
+
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+
+    let connect = || async {
+        let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+        let _: ClientHelloResult = send_request::<ClientHello>(
+            &mut ws,
+            1,
+            &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        )
+        .await;
+        let open: BufferOpenResult = send_request::<BufferOpen>(
+            &mut ws,
+            2,
+            &BufferOpenParams {
+                path_index: Some(0),
+                relative_path: Some("a.txt".into()),
+                language: None,
+                create_if_missing: false,
+            },
+        )
+        .await;
+        let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+            &mut ws,
+            3,
+            &ViewportSubscribeParams {
+                buffer_id: open.buffer_id,
+                cols: 80,
+                rows: 10,
+                overscan_rows: 0,
+                scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+                wrap: WrapMode::None,
+                continuation_marker_width: 0,
+                tab_width: 4,
+            },
+        )
+        .await;
+        (ws, open.buffer_id, sub.viewport_id)
+    };
+
+    let (mut ws_a, buf_a, vp_a) = connect().await;
+    let (mut ws_b, buf_b, vp_b) = connect().await;
+    assert_eq!(buf_a, buf_b, "shared buffer, deduped by canonical path");
+
+    let _: ViewportWindowResult = send_request::<ViewportScroll>(
+        &mut ws_a,
+        10,
+        &ViewportScrollParams {
+            viewport_id: vp_a,
+            scroll: ScrollPosition { logical_line: 5, sub_row: 0.0 },
+        },
+    )
+    .await;
+    let _: ViewportWindowResult = send_request::<ViewportScroll>(
+        &mut ws_b,
+        10,
+        &ViewportScrollParams {
+            viewport_id: vp_b,
+            scroll: ScrollPosition { logical_line: 17, sub_row: 0.0 },
+        },
+    )
+    .await;
+
+    let reopen_a: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws_a,
+        20,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let reopen_b: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws_b,
+        20,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert_eq!(reopen_a.scroll.expect("a").logical_line, 5);
+    assert_eq!(reopen_b.scroll.expect("b").logical_line, 17);
 
     drop(server);
 }

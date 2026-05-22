@@ -98,14 +98,22 @@ pub async fn client_hello(
 
 pub async fn buffer_open(
     state: &SharedState,
-    _ctx: &mut ConnectionCtx,
+    ctx: &mut ConnectionCtx,
     params: BufferOpenParams,
 ) -> Result<BufferOpenResult, RpcError> {
+    // Used to surface this client's prior cursor + scroll for the buffer on reopen. `None` when
+    // the client hasn't sent `client/hello` yet — in that case there's no per-client state to
+    // restore, and the result's `cursor` / `scroll` fields fall back to defaults.
+    let client_id = ctx.client_id;
     let canonical = match (params.path_index, params.relative_path.as_deref()) {
         (None, None) => {
             let mut s = state.lock().await;
             let id = s.allocate_buffer_id();
             let buf = Buffer::scratch(id, params.language.clone());
+            let cursor = client_id
+                .and_then(|c| s.cursors.get(&(c, id)).copied())
+                .unwrap_or_default();
+            let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, id)).copied());
             let result = BufferOpenResult {
                 buffer_id: id,
                 language: buf.language.clone(),
@@ -114,6 +122,8 @@ pub async fn buffer_open(
                 revision: 0,
                 saved_revision: buf.saved_revision(),
                 path: None,
+                cursor,
+                scroll,
             };
             s.buffers.insert(id, buf);
             return Ok(result);
@@ -178,6 +188,10 @@ pub async fn buffer_open(
         }
         if let Some(existing) = s.buffer_for_path(&canonical) {
             let buf = &s.buffers[&existing];
+            let cursor = client_id
+                .and_then(|c| s.cursors.get(&(c, existing)).copied())
+                .unwrap_or_default();
+            let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, existing)).copied());
             return Ok(BufferOpenResult {
                 buffer_id: existing,
                 language: buf.language.clone(),
@@ -186,6 +200,8 @@ pub async fn buffer_open(
                 revision: buf.revision,
                 saved_revision: buf.saved_revision(),
                 path: Some(canonical.display().to_string()),
+                cursor,
+                scroll,
             });
         }
     }
@@ -198,6 +214,13 @@ pub async fn buffer_open(
     } else {
         Buffer::load_from_file(id, canonical.clone()).map_err(RpcError::file_io)?
     };
+    // First-time open of this buffer: no prior cursor or scroll to surface — but the client could
+    // already have one if a previous server-side session allocated state. Look it up anyway for
+    // consistency with the reopen path.
+    let cursor = client_id
+        .and_then(|c| s.cursors.get(&(c, id)).copied())
+        .unwrap_or_default();
+    let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, id)).copied());
     let result = BufferOpenResult {
         buffer_id: id,
         language: buf.language.clone(),
@@ -206,6 +229,8 @@ pub async fn buffer_open(
         revision: buf.revision,
         saved_revision: buf.saved_revision(),
         path: Some(canonical.display().to_string()),
+        cursor,
+        scroll,
     };
     s.buffers.insert(id, buf);
     tracing::info!(buffer_id = id, path = %canonical.display(), "buffer opened");
@@ -1054,6 +1079,7 @@ pub async fn viewport_subscribe(
         last_logical_line_exclusive: last_excl,
     };
     s.viewports.insert(viewport_id, viewport);
+    s.last_scroll.insert((client_id, buffer_id), params.scroll);
     tracing::debug!(%client_id, viewport_id, buffer_id, first, last_excl, "viewport subscribed");
 
     Ok(ViewportSubscribeResult { viewport_id, window })
@@ -1142,6 +1168,7 @@ pub async fn viewport_scroll(
     let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
     vp.first_logical_line = first;
     vp.last_logical_line_exclusive = last_excl;
+    s.last_scroll.insert((client_id, buffer_id), params.scroll);
     Ok(ViewportWindowResult { window })
 }
 

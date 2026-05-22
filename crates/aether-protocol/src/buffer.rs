@@ -2,6 +2,7 @@
 
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
+use crate::viewport::ScrollPosition;
 use crate::{BufferId, Revision};
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,15 @@ pub struct BufferOpenResult {
     /// Canonical absolute path of the file on disk, when the buffer is backed by one. `None` for
     /// scratch buffers. Lets the client (e.g. file-browser navigation) work in absolute paths.
     pub path: Option<String>,
+    /// Server-side cursor state for this `(client, buffer)`. `CursorState::default()` for a buffer
+    /// the client hasn't touched yet; the prior position for a buffer the client is reopening.
+    #[serde(default)]
+    pub cursor: CursorState,
+    /// Last scroll position recorded for this `(client, buffer)` on a prior viewport subscription
+    /// for this buffer. `None` when the client has never had a viewport on the buffer — the client
+    /// should default to `{logical_line: 0, sub_row: 0.0}`. Lets reopen restore the prior view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll: Option<ScrollPosition>,
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------
