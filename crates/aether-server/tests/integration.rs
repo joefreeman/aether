@@ -2216,7 +2216,7 @@ async fn select_line_forward_picks_current_then_advances_at_end() {
     assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
-    // Now at end-of-line: advances to next line.
+    // Whole-line selection exists → advances to the next line.
     let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
         buffer_id, direction: Direction::Forward, extend: false,
     }).await;
@@ -2227,28 +2227,43 @@ async fn select_line_forward_picks_current_then_advances_at_end() {
 }
 
 #[tokio::test]
-async fn select_line_backward_picks_previous_then_stays_at_end() {
+async fn select_line_forward_at_end_of_line_no_anchor_picks_current_line() {
     let (server, mut ws, buffer_id) = setup_lines().await;
 
-    // Mid-line: selects previous line.
+    // Cursor at end-of-line with no anchor (the natural state after typing on a line).
+    // First press picks the current line, not the following one.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id, position: LogicalPosition { line: 1, col: 4 }, anchor: None,
+    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: false,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_line_backward_picks_current_then_walks_up() {
+    let (server, mut ws, buffer_id) = setup_lines().await;
+
+    // No anchor, mid-line: first press picks the current line regardless of column.
     send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
         buffer_id, position: LogicalPosition { line: 2, col: 2 }, anchor: None,
     }).await;
     let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
         buffer_id, direction: Direction::Backward, extend: false,
     }).await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
-    assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
-
-    // At end-of-line: stays on the current line (selecting it).
-    send_request::<CursorSet>(&mut ws, 12, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 2, col: 5 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Backward, extend: false,
-    }).await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    // Second press: whole-line selection exists → walks up to the previous line.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Backward, extend: false,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
     drop(server);
 }
@@ -2386,6 +2401,35 @@ async fn select_line_snaps_partial_selection_to_whole_lines() {
     }).await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_line_snaps_partial_selection_when_cursor_at_line_end() {
+    let (server, mut ws, buffer_id) = setup_lines().await;
+
+    // Partial selection whose bottom edge happens to sit exactly at end-of-line.
+    // The top edge is mid-line, so it's not a whole-line selection yet — x should
+    // snap, not advance to the next line.
+    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
+        buffer_id,
+        position: LogicalPosition { line: 2, col: 5 },
+        anchor: Some(LogicalPosition { line: 0, col: 2 }),
+    }).await;
+
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: true,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    // Now that the selection is whole-line, a second forward press advances.
+    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
+        buffer_id, direction: Direction::Forward, extend: true,
+    }).await;
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
 
     drop(server);
 }

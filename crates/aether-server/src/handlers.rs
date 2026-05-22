@@ -1502,51 +1502,27 @@ pub async fn cursor_select_line(
     };
     let cursor_was_at_top = current.anchor.is_some() && cur == top_edge;
 
-    let (top_line, bottom_line) = match (params.direction, params.extend, current.anchor) {
-        // No prior selection: the line is picked by the cursor's position relative to its
-        // line's end. End-of-line is the trigger because that's where the cursor naturally
-        // lands after typing — forward advances past it, backward stays on the current line.
-        (Direction::Forward, _, None) => {
-            let len = motion::line_byte_len_excl_newline(buf, cur.line);
-            let at_end = cur.col >= len;
-            let line = if at_end { cur.line.saturating_add(1) } else { cur.line };
-            (line, line)
-        }
-        (Direction::Backward, _, None) => {
-            let len = motion::line_byte_len_excl_newline(buf, cur.line);
-            let at_end = cur.col >= len;
-            let line = if at_end { cur.line } else { cur.line.saturating_sub(1) };
-            (line, line)
-        }
-        // With an existing selection: walk the relevant edge. If it's already at its line
-        // boundary (end for forward, col 0 for backward) advance to the next line; otherwise
-        // snap to that boundary first. For non-extend, both edges collapse onto the moved one.
-        (Direction::Forward, extend, Some(_)) => {
-            let len = motion::line_byte_len_excl_newline(buf, bottom_edge.line);
-            let at_end = bottom_edge.col >= len;
-            let new_bottom = if at_end {
-                bottom_edge.line.saturating_add(1)
-            } else {
-                bottom_edge.line
-            };
-            if extend {
-                (top_edge.line, new_bottom)
-            } else {
-                (new_bottom, new_bottom)
-            }
-        }
-        (Direction::Backward, extend, Some(_)) => {
-            let new_top = if top_edge.col == 0 {
-                top_edge.line.saturating_sub(1)
-            } else {
-                top_edge.line
-            };
-            if extend {
-                (new_top, bottom_edge.line)
-            } else {
-                (new_top, new_top)
-            }
-        }
+    // Advance the relevant edge only when the selection is already snapped to whole lines;
+    // otherwise snap it without advancing. The no-anchor case is treated as a degenerate
+    // single-point selection, which is never whole-line (on a non-empty line), so the first
+    // press always picks the current line — repeats then walk via the anchor.
+    let bottom_len = motion::line_byte_len_excl_newline(buf, bottom_edge.line);
+    let already_whole =
+        current.anchor.is_some() && top_edge.col == 0 && bottom_edge.col >= bottom_len;
+    let new_top = if already_whole && params.direction == Direction::Backward {
+        top_edge.line.saturating_sub(1)
+    } else {
+        top_edge.line
+    };
+    let new_bottom = if already_whole && params.direction == Direction::Forward {
+        bottom_edge.line.saturating_add(1)
+    } else {
+        bottom_edge.line
+    };
+    let (top_line, bottom_line) = match (params.extend && current.anchor.is_some(), params.direction) {
+        (true, _) => (new_top, new_bottom),
+        (false, Direction::Forward) => (new_bottom, new_bottom),
+        (false, Direction::Backward) => (new_top, new_top),
     };
 
     let last_line = (buf.text.len_lines() as u32).saturating_sub(1);
