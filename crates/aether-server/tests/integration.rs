@@ -695,6 +695,71 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
 }
 
 #[tokio::test]
+async fn viewport_highlights_rust_inside_markdown_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.md");
+    // Content layout (0-indexed logical lines):
+    //   0: "# Heading"
+    //   1: ""
+    //   2: "```rust"
+    //   3: "fn main() {}"
+    //   4: "```"
+    std::fs::write(&path, "# Heading\n\n```rust\nfn main() {}\n```\n").unwrap();
+
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("notes.md".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert_eq!(open.language.as_deref(), Some("markdown"));
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+        },
+    )
+    .await;
+
+    // Logical line 3 is `fn main() {}` — must inherit rust highlights from the injection layer.
+    let fence_body = &sub.window.lines[3];
+    let segs = &fence_body.visual_rows[0].segments;
+    let highlights: Vec<&aether_protocol::viewport::Highlight> =
+        segs.iter().flat_map(|s| s.highlights.iter()).collect();
+    let fn_kw = highlights.iter().find(|h| h.start == 0 && h.end == 2);
+    assert!(
+        fn_kw.is_some_and(|h| h.kind.contains("keyword")),
+        "expected rust 'fn' keyword highlight inside markdown fence, got highlights={:?}",
+        highlights,
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn save_in_place_writes_file_and_clears_dirty() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("greet.txt");

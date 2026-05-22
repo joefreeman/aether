@@ -1,6 +1,6 @@
 //! Authoritative in-memory state owned by the server.
 
-use crate::syntax::{self, LanguageConfig};
+use crate::syntax::{self, InjectionLayer, LanguageConfig};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
 use aether_protocol::viewport::WrapMode;
@@ -235,6 +235,10 @@ pub struct BufferSyntax {
     pub config: &'static LanguageConfig,
     pub parser: Parser,
     pub tree: Tree,
+    /// Embedded sub-language layers (e.g. fenced code blocks in markdown). Recomputed from
+    /// scratch after every reparse — cheap for the number of fences in a typical file, and
+    /// keeps the byte ranges synced with the parent tree without diff bookkeeping.
+    pub injections: Vec<InjectionLayer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,7 +442,7 @@ impl Buffer {
             });
             let parser = &mut syntax.parser;
             let tree = &mut syntax.tree;
-            let new_tree = parser.parse_with(
+            let new_tree = parser.parse_with_options(
                 &mut |byte_idx: usize, _: Point| -> &[u8] {
                     if byte_idx >= text.len_bytes() {
                         return &[];
@@ -448,10 +452,16 @@ impl Buffer {
                     &bytes[byte_idx - chunk_byte_start..]
                 },
                 Some(&*tree),
+                None,
             );
             if let Some(t) = new_tree {
                 *tree = t;
             }
+            // Injection layers are recomputed from scratch after every edit. Cheap relative to
+            // the parse itself for typical fence counts, and the alternative (tracking which
+            // layers were touched) would need its own diff bookkeeping.
+            let source: String = text.chunks().collect();
+            syntax.injections = syntax::compute_injections(syntax.config, &syntax.tree, &source);
         }
 
         self.revision
@@ -561,6 +571,7 @@ impl Buffer {
             let source: String = self.text.chunks().collect();
             if let Some(tree) = syntax.parser.parse(&source, None) {
                 syntax.tree = tree;
+                syntax.injections = syntax::compute_injections(syntax.config, &syntax.tree, &source);
             }
         }
     }
@@ -568,14 +579,22 @@ impl Buffer {
 
 fn detect_language(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_str()?;
-    Some(match ext {
+    Some(match ext.to_ascii_lowercase().as_str() {
         "rs" => "rust",
         "toml" => "toml",
-        "md" => "markdown",
+        "md" | "markdown" => "markdown",
         "json" => "json",
         "py" => "python",
-        "js" => "javascript",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
         "ts" => "typescript",
+        "tsx" => "tsx",
+        "go" => "go",
+        "ex" | "exs" => "elixir",
+        "erl" | "hrl" => "erlang",
+        "yaml" | "yml" => "yaml",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "sh" | "bash" | "zsh" => "bash",
         _ => return None,
     }
     .to_string())
@@ -586,7 +605,8 @@ fn make_syntax(text: &ropey::Rope, language: &str) -> Option<BufferSyntax> {
     let mut parser = syntax::make_parser(config);
     let source: String = text.chunks().collect();
     let tree = parser.parse(&source, None)?;
-    Some(BufferSyntax { config, parser, tree })
+    let injections = syntax::compute_injections(config, &tree, &source);
+    Some(BufferSyntax { config, parser, tree, injections })
 }
 
 fn rope_byte_to_point(rope: &ropey::Rope, byte_idx: usize) -> Point {

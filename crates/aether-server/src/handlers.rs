@@ -1277,6 +1277,7 @@ fn render_window(
                 crate::syntax::highlights_for_range(
                     syntax.config,
                     &syntax.tree,
+                    &syntax.injections,
                     source,
                     line_byte_start,
                     line_byte_end,
