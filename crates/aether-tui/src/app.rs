@@ -215,8 +215,25 @@ pub async fn bootstrap(
         )
         .await?;
 
-    let (buffer_open_params, file_label) = match file {
-        Some(f) => (
+    // Decide whether to open the file browser. With no arg we default to the first project
+    // root; with an arg, we open the browser when it resolves to an existing directory.
+    // Either way the underlying buffer is a scratch. The server canonicalizes and
+    // project-bounds-checks whatever path we send to `directory/list`.
+    let browse_dir: Option<String> = match file {
+        None => hello.project.paths.first().cloned(),
+        Some(f) => {
+            let raw = std::path::Path::new(f);
+            let abs = if raw.is_absolute() {
+                Some(raw.to_path_buf())
+            } else {
+                hello.project.paths.first().map(|root| std::path::Path::new(root).join(raw))
+            };
+            abs.filter(|p| p.is_dir()).map(|p| p.display().to_string())
+        }
+    };
+
+    let (buffer_open_params, file_label) = match (file, browse_dir.is_some()) {
+        (Some(f), false) => (
             aether_protocol::buffer::BufferOpenParams {
                 path_index: Some(0),
                 relative_path: Some(f.into()),
@@ -225,7 +242,7 @@ pub async fn bootstrap(
             },
             f.to_string(),
         ),
-        None => (
+        _ => (
             aether_protocol::buffer::BufferOpenParams {
                 path_index: None,
                 relative_path: None,
@@ -253,7 +270,7 @@ pub async fn bootstrap(
         })
         .await?;
 
-    Ok(AppState {
+    let mut state = AppState {
         project_name: hello.project.name,
         file_label,
         buffer_id: open.buffer_id,
@@ -283,7 +300,14 @@ pub async fn bootstrap(
         file_path: open.path.clone(),
         project_paths: hello.project.paths.clone(),
         file_browser: FileBrowserState::default(),
-    })
+    };
+
+    if let Some(dir) = browse_dir {
+        load_file_browser(client, &mut state, Some(dir)).await?;
+        state.mode = Mode::FileBrowser;
+    }
+
+    Ok(state)
 }
 
 pub async fn run(

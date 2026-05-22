@@ -24,7 +24,9 @@ use std::io::{stdout, Stdout};
 struct Cli {
     /// Project name (looks up the running server in $XDG_RUNTIME_DIR/aether/)
     project: String,
-    /// File to open, relative to the first project path. Omit to open a scratch buffer.
+    /// File or directory to open, relative to the first project path. A directory opens the
+    /// file browser at that location with a scratch buffer underneath. Omit to open the file
+    /// browser at the project root.
     file: Option<String>,
 }
 
