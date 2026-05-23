@@ -216,3 +216,85 @@ fn unit_result_round_trips() {
     assert_eq!(s, "null");
     let _: () = serde_json::from_str(&s).unwrap();
 }
+
+// ---- picker ------------------------------------------------------------------------------------
+
+#[test]
+fn picker_kind_serializes_snake_case() {
+    use aether_protocol::picker::PickerKind;
+    assert_eq!(to_value(PickerKind::Files).unwrap(), json!("files"));
+    assert_eq!(
+        from_value::<PickerKind>(json!("files")).unwrap(),
+        PickerKind::Files,
+    );
+}
+
+#[test]
+fn picker_item_file_is_tagged() {
+    use aether_protocol::picker::PickerItem;
+    let item = PickerItem::File { path: "src/main.rs".into(), match_indices: vec![0, 4] };
+    let v = to_value(&item).unwrap();
+    assert_eq!(v, json!({"kind": "file", "path": "src/main.rs", "match_indices": [0, 4]}));
+}
+
+#[test]
+fn picker_view_params_omit_center_on_when_none() {
+    use aether_protocol::picker::{PickerKind, PickerViewParams};
+    let p = PickerViewParams {
+        kind: PickerKind::Files,
+        reset: true,
+        offset: 0,
+        limit: 30,
+        center_on: None,
+    };
+    let v = to_value(&p).unwrap();
+    assert!(v.get("center_on").is_none(), "None center_on should be skipped");
+    assert_eq!(v["kind"], "files");
+    assert_eq!(v["reset"], true);
+}
+
+#[test]
+fn picker_view_params_center_on_serialized() {
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerViewParams};
+    let p = PickerViewParams {
+        kind: PickerKind::Files,
+        reset: false,
+        offset: 0,
+        limit: 30,
+        center_on: Some(PickerItem::File { path: "x".into(), match_indices: vec![] }),
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["center_on"]["kind"], "file");
+    assert_eq!(v["center_on"]["path"], "x");
+}
+
+#[test]
+fn picker_update_round_trips_through_notification() {
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdate, PickerUpdateParams};
+    let params = PickerUpdateParams {
+        kind: PickerKind::Files,
+        generation: 7,
+        offset: 0,
+        items: vec![PickerItem::File { path: "a".into(), match_indices: vec![0] }],
+        total_matches: 1,
+        total_candidates: 1,
+        ticking: false,
+    };
+    let notif = Notification {
+        jsonrpc: JsonRpc,
+        method: PickerUpdate::NAME.into(),
+        params: to_value(&params).unwrap(),
+    };
+    let s = serde_json::to_string(&notif).unwrap();
+    let v: serde_json::Value = from_str(&s).unwrap();
+    assert_eq!(v["method"], "picker/update");
+    assert_eq!(v["params"]["generation"], 7);
+    assert_eq!(v["params"]["items"][0]["path"], "a");
+}
+
+#[test]
+fn picker_select_result_is_tagged() {
+    use aether_protocol::picker::PickerSelectResult;
+    let r = PickerSelectResult::File { path: "/abs/path".into() };
+    assert_eq!(to_value(&r).unwrap(), json!({"kind": "file", "path": "/abs/path"}));
+}

@@ -57,6 +57,8 @@ streaming-iterator = "0.1"
 notify = "7"
 toml = "0.8"
 directories = "5"
+nucleo-matcher = "0.3"
+ignore = "0.4"
 
 # TUI-only
 ratatui = "0.29"

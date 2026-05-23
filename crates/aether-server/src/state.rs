@@ -1,9 +1,12 @@
 //! Authoritative in-memory state owned by the server.
 
 use crate::indent::{self, IndentStyle};
+use crate::picker::{self as picker_state, PickerState};
 use crate::syntax::{self, InjectionLayer, LanguageConfig};
+use crate::workspace_index::WorkspaceIndex;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
+use aether_protocol::picker::PickerKind;
 use aether_protocol::viewport::{ScrollPosition, WrapMode};
 use aether_protocol::{BufferId, ClientId, LogicalPosition, Revision, ViewportId};
 use std::time::{Duration, Instant};
@@ -49,6 +52,16 @@ pub struct ServerState {
     /// restore the view when it reopens the buffer (e.g. navigating away and back via the file
     /// browser). Cleared on disconnect.
     pub last_scroll: HashMap<(ClientId, BufferId), ScrollPosition>,
+    /// Workspace-wide candidate cache shared by all pickers. Walked lazily on first picker
+    /// access; survives picker hide/show.
+    pub workspace_index: Arc<WorkspaceIndex>,
+    /// Per-`(client, kind)` picker state. Survives `picker/hide` (so resume restores query +
+    /// ranking); cleared on disconnect.
+    pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
+    /// Single shared fuzzy matcher. `nucleo_matcher::Matcher` reuses scratch buffers across
+    /// calls, so it's cheaper to share one than construct per RPC. Not `Sync`, so the global
+    /// lock around `ServerState` is what serializes access.
+    pub matcher: nucleo_matcher::Matcher,
     next_buffer_id: u64,
     next_viewport_id: u64,
 }
@@ -89,6 +102,7 @@ impl MotionHistory {
 
 impl ServerState {
     pub fn new(project_name: String, project_paths: Vec<PathBuf>, token: String) -> Self {
+        let workspace_index = Arc::new(WorkspaceIndex::new(project_paths.clone()));
         Self {
             project_name,
             project_paths,
@@ -102,6 +116,9 @@ impl ServerState {
             tree_selection_history: HashMap::new(),
             searches: HashMap::new(),
             last_scroll: HashMap::new(),
+            workspace_index,
+            pickers: HashMap::new(),
+            matcher: picker_state::make_matcher(),
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
@@ -181,6 +198,11 @@ impl ServerState {
     /// Remove all last-scroll records for the given client. Used on disconnect.
     pub fn drop_last_scroll_for_client(&mut self, client_id: ClientId) {
         self.last_scroll.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Remove all picker state for the given client. Used on disconnect.
+    pub fn drop_pickers_for_client(&mut self, client_id: ClientId) {
+        self.pickers.retain(|(c, _), _| *c != client_id);
     }
 
     /// Drop the selection-expansion history for one client+buffer. Called from every cursor RPC

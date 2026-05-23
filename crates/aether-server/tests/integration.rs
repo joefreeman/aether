@@ -13,9 +13,14 @@ use aether_protocol::cursor::{
     CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{
-    ClientInbound, JsonRpc, Notification, NotificationMethod, Request, Response, RpcMethod,
+    ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod,
 };
 use aether_protocol::handshake::{ClientHello, ClientHelloParams, ClientHelloResult};
+use aether_protocol::picker::{
+    PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,
+    PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams,
+    PickerView, PickerViewParams,
+};
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
     SearchSet, SearchSetParams, SearchSetResult,
@@ -4114,6 +4119,185 @@ async fn search_clear_removes_active_search() {
     // After clear, n/prev should report no matches.
     let r: SearchNavResult = send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
     assert_eq!(r.summary.total, 0);
+
+    drop(server);
+}
+
+// -------- picker --------------------------------------------------------------------------------
+
+async fn setup_picker_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    // A small mix of file names so fuzzy matching has something to chew on.
+    std::fs::create_dir_all(dir_path.join("src")).unwrap();
+    std::fs::create_dir_all(dir_path.join("docs")).unwrap();
+    std::fs::write(dir_path.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(dir_path.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+    std::fs::write(dir_path.join("docs/intro.md"), "# intro\n").unwrap();
+    std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+    )
+    .await;
+    (server, ws)
+}
+
+#[tokio::test]
+async fn picker_view_returns_all_candidates_on_empty_query() {
+    let (server, mut ws) = setup_picker_workspace().await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
+    )
+    .await;
+    assert_eq!(view.query, "");
+    assert_eq!(view.effective_offset, 0);
+    assert!(view.total_candidates >= 4, "expected >=4 candidates, got {}", view.total_candidates);
+
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.kind, PickerKind::Files);
+    assert_eq!(update.offset, 0);
+    assert_eq!(update.total_candidates, view.total_candidates);
+    assert_eq!(update.total_matches, view.total_candidates, "empty query matches all");
+    let names: Vec<&str> = update
+        .items
+        .iter()
+        .map(|i| {
+            let PickerItem::File { path, .. } = i;
+            path.as_str()
+        })
+        .collect();
+    assert!(names.contains(&"src/main.rs"));
+    assert!(names.contains(&"README.md"));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn picker_query_ranks_matches_and_carries_indices() {
+    let (server, mut ws) = setup_picker_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws, 10,
+        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
+    ).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await; // drain initial
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws, 11,
+        &PickerQueryParams { kind: PickerKind::Files, query: "main".into(), generation: 1 },
+    ).await;
+
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.generation, 1);
+    let top = update.items.first().expect("at least one match");
+    let PickerItem::File { path, match_indices } = top;
+    assert_eq!(path, "src/main.rs", "best match for 'main' is src/main.rs");
+    assert!(
+        !match_indices.is_empty(),
+        "match indices should highlight where 'main' lines up"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn picker_select_returns_absolute_path() {
+    let (server, mut ws) = setup_picker_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws, 10,
+        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
+    ).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws, 11,
+        &PickerQueryParams { kind: PickerKind::Files, query: "lib".into(), generation: 1 },
+    ).await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let item = update.items.first().expect("a match for 'lib'").clone();
+    let PickerItem::File { ref path, .. } = item;
+    assert_eq!(path, "src/lib.rs");
+
+    let result: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws, 12,
+        &PickerSelectParams { kind: PickerKind::Files, item },
+    ).await;
+    let PickerSelectResult::File { path: abs } = result;
+    assert!(abs.ends_with("src/lib.rs"), "abs path should end with relative: got {abs}");
+    assert!(std::path::Path::new(&abs).is_absolute(), "select must return an absolute path");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn picker_resume_centers_on_remembered_item() {
+    // Resume = view { reset: false, center_on } recovers query+ranking and frames the item.
+    let (server, mut ws) = setup_picker_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws, 10,
+        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
+    ).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    // Query "rs" — narrows to .rs files; query is persisted on hide.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws, 11,
+        &PickerQueryParams { kind: PickerKind::Files, query: "rs".into(), generation: 1 },
+    ).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerHide>(
+        &mut ws, 12,
+        &PickerHideParams { kind: PickerKind::Files },
+    ).await;
+
+    // Resume with center_on pointing at a remembered item.
+    let resume = send_request::<PickerView>(
+        &mut ws, 13,
+        &PickerViewParams {
+            kind: PickerKind::Files, reset: false, offset: 0, limit: 30,
+            center_on: Some(PickerItem::File { path: "src/lib.rs".into(), match_indices: vec![] }),
+        },
+    ).await;
+    assert_eq!(resume.query, "rs", "query persisted across hide");
+    // Limit is larger than the result set so the window covers everything; effective_offset is 0.
+    assert_eq!(resume.effective_offset, 0);
+
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert!(update.items.iter().any(|i| matches!(i, PickerItem::File { path, .. } if path == "src/lib.rs")));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn picker_reset_wipes_persisted_query() {
+    let (server, mut ws) = setup_picker_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws, 10,
+        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
+    ).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws, 11,
+        &PickerQueryParams { kind: PickerKind::Files, query: "main".into(), generation: 1 },
+    ).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerHide>(&mut ws, 12, &PickerHideParams { kind: PickerKind::Files }).await;
+
+    // reset: true → query comes back empty even though we just typed one.
+    let reopened = send_request::<PickerView>(
+        &mut ws, 13,
+        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
+    ).await;
+    assert_eq!(reopened.query, "");
+    assert_eq!(reopened.generation, 0);
 
     drop(server);
 }

@@ -5,6 +5,7 @@ use crate::handlers::{self, ConnectionCtx};
 use crate::state::SharedState;
 use aether_protocol::buffer::{BufferCopy, BufferCut, BufferOpen, BufferSave};
 use aether_protocol::directory::{DirectoryCreate, DirectoryList};
+use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerView};
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::cursor::{
     CursorContract, CursorExpand, CursorMove, CursorRedo, CursorSelectLine, CursorSet,
@@ -79,6 +80,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_searches_for_client(client_id);
         s.drop_tree_selection_history_for_client(client_id);
         s.drop_last_scroll_for_client(client_id);
+        s.drop_pickers_for_client(client_id);
         tracing::debug!(%client_id, "client session removed");
     }
     Ok(())
@@ -179,6 +181,10 @@ async fn dispatch(
         InputDedent::NAME => run!(InputDedent, handlers::input_dedent),
         InputNewlineAndIndent::NAME => run!(InputNewlineAndIndent, handlers::input_newline_and_indent),
         InputToggleComment::NAME => run!(InputToggleComment, handlers::input_toggle_comment),
+        PickerView::NAME => run!(PickerView, handlers::picker_view),
+        PickerQuery::NAME => run!(PickerQuery, handlers::picker_query),
+        PickerSelect::NAME => run!(PickerSelect, handlers::picker_select),
+        PickerHide::NAME => run!(PickerHide, handlers::picker_hide),
         other => Err(RpcError::method_not_found(other)),
     }
 }

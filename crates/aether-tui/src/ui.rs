@@ -2,13 +2,14 @@
 
 use crate::app::{search_counter_label, search_match_count_label, AppState, Mode};
 use aether_protocol::cursor::CursorState;
+use aether_protocol::picker::PickerItem;
 use aether_protocol::search::SearchMatchRange;
 use aether_protocol::viewport::{Highlight, VisualRow, WrapMode};
 use aether_protocol::LogicalPosition;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -58,13 +59,314 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(f.area());
-    if matches!(state.mode, Mode::FileBrowser) {
+    // The picker overlays whichever view was active when it was opened. When the picker is
+    // open we look at `return_mode` instead of `mode` (which is now `Picker`), so the file
+    // browser stays visible underneath if that's where we came from.
+    let underlying_mode = if state.picker.open { state.picker.return_mode } else { state.mode };
+    if matches!(underlying_mode, Mode::FileBrowser) {
         draw_file_browser(f, state, chunks[0]);
     } else {
         draw_buffer(f, state, chunks[0]);
     }
+    if state.picker.open {
+        draw_picker_overlay(f, state, chunks[0]);
+    }
     draw_status(f, state, chunks[1]);
     place_terminal_cursor(f, state, chunks[0], chunks[1]);
+}
+
+// ---- picker overlay ----------------------------------------------------------------------------
+
+/// Picker box dimensions interpolate linearly with the buffer area. At or below the *min*
+/// breakpoint the box fills the viewport (no padding). At or above the *max* breakpoint the box
+/// is the *target percentage* of the viewport. In between, percentage scales linearly from 100%
+/// down to the target. `area` here is the buffer pane (one row shorter than the terminal).
+const PICKER_TARGET_WIDTH_PCT: u16 = 80;
+const PICKER_TARGET_HEIGHT_PCT: u16 = 60;
+const PICKER_MIN_COLS: u16 = 80;
+const PICKER_MAX_COLS: u16 = 200;
+const PICKER_MIN_ROWS: u16 = 24;
+const PICKER_MAX_ROWS: u16 = 60;
+
+/// Compute the picker overlay's rectangle inside `area` (the buffer pane).
+fn picker_box_rect(area: Rect) -> Rect {
+    let width = scale_box_dim(area.width, PICKER_MIN_COLS, PICKER_MAX_COLS, PICKER_TARGET_WIDTH_PCT);
+    let height = scale_box_dim(area.height, PICKER_MIN_ROWS, PICKER_MAX_ROWS, PICKER_TARGET_HEIGHT_PCT);
+    let width = width.min(area.width).max(1);
+    let height = height.min(area.height).max(1);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect { x, y, width, height }
+}
+
+/// Scale one box dimension: returns `dim` itself when `dim <= min` (no padding), `dim *
+/// target_pct/100` when `dim >= max` (full padding), and interpolates the percentage linearly
+/// from 100% down to `target_pct` in between.
+fn scale_box_dim(dim: u16, min: u16, max: u16, target_pct: u16) -> u16 {
+    if dim <= min {
+        return dim;
+    }
+    if dim >= max {
+        return ((dim as u32 * target_pct as u32) / 100) as u16;
+    }
+    let range = (max - min) as u32;
+    let progress = (dim - min) as u32;
+    let shrink = (100 - target_pct as u32) * progress / range; // 0 at min, 100 - target_pct at max
+    let pct = 100u32 - shrink;
+    ((dim as u32 * pct) / 100) as u16
+}
+
+/// How many result rows the picker can display given the buffer-area dimensions. Used by the
+/// app to set the `limit` it sends to the server. Subtracts box borders (2), input row (1), and
+/// separator row (1).
+pub fn picker_result_rows(buffer_area_cols: u32, buffer_area_rows: u32) -> u32 {
+    let area = Rect { x: 0, y: 0, width: buffer_area_cols as u16, height: buffer_area_rows as u16 };
+    let box_rect = picker_box_rect(area);
+    (box_rect.height as u32).saturating_sub(4)
+}
+
+fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+    let box_area = picker_box_rect(area);
+    if box_area.width < 4 || box_area.height < 4 {
+        return; // Too small to draw anything meaningful.
+    }
+    f.render_widget(Clear, box_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(NORD4))
+        .style(Style::default().bg(NORD0).fg(NORD4));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+
+    // Inner layout: input row, separator row (full-width, ties into the borders), results. The
+    // input and results panes get one column of horizontal padding so text isn't flush with the
+    // border; the separator deliberately uses the full inner width.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    draw_picker_input_row(f, state, pad_horizontal(rows[0]));
+    draw_picker_separator(f, box_area, rows[1]);
+    draw_picker_results(f, state, pad_horizontal(rows[2]));
+}
+
+/// Inset `area` by one column on each side. If the area is too narrow for any padding (≤2 cols),
+/// returns it unchanged so we degrade gracefully.
+fn pad_horizontal(area: Rect) -> Rect {
+    if area.width <= 2 {
+        return area;
+    }
+    Rect { x: area.x + 1, y: area.y, width: area.width - 2, height: area.height }
+}
+
+/// Query left-aligned, `N/M` (with a trailing `…` while ticking) right-aligned. When the query
+/// is empty we render a dim placeholder describing what the picker matches against. If the row
+/// is too narrow to hold both, the counts get dropped first so the query stays visible.
+fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
+    let base_style = Style::default().fg(NORD4).bg(NORD0);
+    let placeholder_style = Style::default().fg(NORD3).bg(NORD0).add_modifier(Modifier::ITALIC);
+
+    let (left_text, left_style, left_w) = if state.picker.query.is_empty() {
+        let ph = picker_placeholder(state.picker.kind);
+        (ph.to_string(), placeholder_style, ph.width())
+    } else {
+        let q = state.picker.query.clone();
+        let w = q.width();
+        (q, base_style, w)
+    };
+
+    let counts = if state.picker.total_candidates == 0 {
+        String::new()
+    } else {
+        let suffix = if state.picker.ticking { " …" } else { "" };
+        format!("{}/{}{}", state.picker.total_matches, state.picker.total_candidates, suffix)
+    };
+    let total_width = area.width as usize;
+    let counts_w = counts.width();
+
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(left_text, left_style)];
+    if !counts.is_empty() && left_w + counts_w + 1 <= total_width {
+        let pad = total_width.saturating_sub(left_w + counts_w);
+        spans.push(Span::styled(" ".repeat(pad), base_style));
+        spans.push(Span::styled(counts, base_style));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(base_style),
+        area,
+    );
+}
+
+fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'static str {
+    match kind {
+        Some(aether_protocol::picker::PickerKind::Files) => "Search files…",
+        None => "Search…",
+    }
+}
+
+/// Horizontal line under the input. Extends the line *into* the side borders with tee characters
+/// so the separator visually ties into the outer block — done by writing directly to the frame
+/// buffer because the block has already been rendered.
+fn draw_picker_separator(f: &mut Frame, box_area: Rect, area: Rect) {
+    let line: String = "─".repeat(area.width as usize);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().fg(NORD4).bg(NORD0)),
+        area,
+    );
+    let buf = f.buffer_mut();
+    let style = Style::default().fg(NORD4).bg(NORD0);
+    let left_x = box_area.x;
+    let right_x = box_area.x + box_area.width.saturating_sub(1);
+    if area.y >= buf.area.y && area.y < buf.area.y + buf.area.height {
+        buf.set_string(left_x, area.y, "├", style);
+        buf.set_string(right_x, area.y, "┤", style);
+    }
+}
+
+fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
+    // Reserve the rightmost column for the scroll indicator when the result set is taller than
+    // the visible window. Otherwise use the full width for paths.
+    let needs_scrollbar = state.picker.total_matches as u16 > area.height;
+    let text_width = if needs_scrollbar {
+        area.width.saturating_sub(1)
+    } else {
+        area.width
+    };
+    let text_area = Rect { x: area.x, y: area.y, width: text_width, height: area.height };
+
+    let mut lines: Vec<Line> = Vec::with_capacity(state.picker.items.len());
+    for (i, item) in state.picker.items.iter().enumerate() {
+        let highlighted = i == state.picker.selected;
+        lines.push(Line::from(picker_item_spans(item, highlighted, text_width as usize)));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
+        text_area,
+    );
+
+    if needs_scrollbar {
+        let scrollbar = Rect {
+            x: area.x + text_width,
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
+        draw_picker_scrollbar(f, state, scrollbar);
+    }
+}
+
+fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
+    let total = state.picker.total_matches.max(1) as u64;
+    let window = state.picker.items.len() as u64;
+    let offset = state.picker.offset as u64;
+    let track_h = area.height as u64;
+    if track_h == 0 {
+        return;
+    }
+    // Thumb spans `window / total` of the track, at least 1 cell. Position is `offset / total`.
+    let thumb_h = ((window * track_h + total - 1) / total).max(1).min(track_h) as u16;
+    let max_thumb_y = (track_h as u16).saturating_sub(thumb_h);
+    let thumb_y = ((offset * track_h) / total) as u16;
+    let thumb_y = thumb_y.min(max_thumb_y);
+
+    let buf = f.buffer_mut();
+    let thumb_style = Style::default().fg(NORD8).bg(NORD0);
+    let track_style = Style::default().fg(NORD3).bg(NORD0);
+    for i in 0..(area.height) {
+        let in_thumb = i >= thumb_y && i < thumb_y + thumb_h;
+        let glyph = if in_thumb { "█" } else { "│" };
+        let style = if in_thumb { thumb_style } else { track_style };
+        buf.set_string(area.x, area.y + i, glyph, style);
+    }
+}
+
+fn picker_item_spans(
+    item: &PickerItem,
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let PickerItem::File { path, match_indices } = item;
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let base = Style::default().fg(NORD4).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+
+    let (display, indices) = truncate_path_with_indices(path, match_indices, max_width);
+
+    if indices.is_empty() {
+        return vec![Span::styled(display, base)];
+    }
+    // Walk char-by-char emitting spans where matched/unmatched runs alternate. `indices` are
+    // char offsets into `display`, sorted ascending.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current = String::new();
+    let mut current_is_match = false;
+    let mut idx_iter = indices.iter().copied().peekable();
+    for (ci, ch) in display.chars().enumerate() {
+        let is_match = idx_iter.peek().copied() == Some(ci as u32);
+        if is_match {
+            idx_iter.next();
+        }
+        if is_match != current_is_match && !current.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut current),
+                if current_is_match { match_style } else { base },
+            ));
+        }
+        current_is_match = is_match;
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        spans.push(Span::styled(
+            current,
+            if current_is_match { match_style } else { base },
+        ));
+    }
+    spans
+}
+
+/// Trim `path` from the left (preserving the filename) when it overflows `max_width`, prefixing
+/// the trimmed result with `…`. Match indices that fall inside the dropped prefix are removed;
+/// surviving ones are shifted to reflect their new position in the displayed string.
+fn truncate_path_with_indices(
+    path: &str,
+    match_indices: &[u32],
+    max_width: usize,
+) -> (String, Vec<u32>) {
+    if max_width == 0 {
+        return (String::new(), Vec::new());
+    }
+    let total_w = path.width();
+    if total_w <= max_width {
+        return (path.to_string(), match_indices.to_vec());
+    }
+    // Keep characters from the end until we've filled max_width - 1 (leave 1 cell for `…`).
+    let chars: Vec<char> = path.chars().collect();
+    let budget = max_width.saturating_sub(1);
+    let mut kept_w = 0;
+    let mut kept_start_char: usize = chars.len();
+    for (i, c) in chars.iter().enumerate().rev() {
+        let w = UnicodeWidthChar::width(*c).unwrap_or(0);
+        if kept_w + w > budget {
+            break;
+        }
+        kept_w += w;
+        kept_start_char = i;
+    }
+    let kept: String = chars[kept_start_char..].iter().collect();
+    let truncated = format!("…{kept}");
+    // Shift indices: drop those falling before `kept_start_char`; the rest are offset by
+    // `-(kept_start_char) + 1` (the `…` prefix is char 0).
+    let new_indices: Vec<u32> = match_indices
+        .iter()
+        .copied()
+        .filter(|&i| (i as usize) >= kept_start_char)
+        .map(|i| ((i as usize - kept_start_char) + 1) as u32)
+        .collect();
+    (truncated, new_indices)
 }
 
 fn draw_file_browser(f: &mut Frame, state: &AppState, area: Rect) {
@@ -601,7 +903,7 @@ fn format_position(state: &AppState) -> String {
     match state.mode {
         Mode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
         Mode::FileBrowser => String::new(),
-        Mode::Normal | Mode::Search => {
+        Mode::Normal | Mode::Search | Mode::Picker => {
             let (start, end_inclusive) = match state.cursor.anchor {
                 None => (pos, pos),
                 Some(anchor) => {
@@ -670,6 +972,21 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         let prompt_width = 1 + state.search.query.width() as u16;
         let col = status_area.x.saturating_add(prompt_width.min(status_area.width.saturating_sub(1)));
         f.set_cursor_position((col, status_area.y));
+        return;
+    }
+    if state.picker.open {
+        // Place the cursor inside the picker overlay's input row, just past the query (or at
+        // the start, on the placeholder, when the query is empty).
+        let box_area = picker_box_rect(buffer_area);
+        if box_area.width >= 4 && box_area.height >= 4 {
+            // Inner = inside the borders; inner padding adds another column on each side.
+            let text_x = box_area.x + 2;
+            let text_y = box_area.y + 1;
+            let text_w = box_area.width.saturating_sub(4);
+            let query_w = state.picker.query.width() as u16;
+            let col = text_x.saturating_add(query_w.min(text_w.saturating_sub(1)));
+            f.set_cursor_position((col, text_y));
+        }
         return;
     }
     if matches!(state.mode, Mode::FileBrowser) {

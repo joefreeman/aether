@@ -24,6 +24,11 @@ use aether_protocol::cursor::{
     Direction, Motion, VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
+use aether_protocol::picker::{
+    PickerHide, PickerHideParams, PickerKind, PickerQuery, PickerQueryParams, PickerSelect,
+    PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
+    PickerViewParams,
+};
 use aether_protocol::handshake::ClientHelloResult;
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
@@ -51,12 +56,22 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{stdout, Stdout};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
+    #[default]
     Normal,
     Insert,
     Search,
     FileBrowser,
+    Picker,
+}
+
+/// Multi-key prefixes the next keystroke completes. `Space` is the only one for now (used by the
+/// `Space f` / `Space Alt-f` picker bindings) — adding more is "add a variant and a match arm in
+/// `handle_leader_key`".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingLeader {
+    Space,
 }
 
 /// State for the directory listing UI. Populated when entering `Mode::FileBrowser` via `-`.
@@ -188,6 +203,10 @@ pub struct AppState {
     /// current file (scratch buffer).
     pub project_paths: Vec<String>,
     pub file_browser: FileBrowserState,
+    /// Multi-key chord state. `Some(Space)` after the user pressed the leader key; consumed by
+    /// the next keystroke. Cleared in any other code path that decides the leader doesn't apply.
+    pub pending_leader: Option<PendingLeader>,
+    pub picker: crate::picker::PickerState,
 }
 
 impl AppState {
@@ -300,6 +319,8 @@ pub async fn bootstrap(
         file_path: open.path.clone(),
         project_paths: hello.project.paths.clone(),
         file_browser: FileBrowserState::default(),
+        pending_leader: None,
+        picker: crate::picker::PickerState::default(),
     };
 
     if let Some(dir) = browse_dir {
@@ -380,7 +401,7 @@ async fn dispatch_terminal_event(
 fn apply_cursor_style(mode: Mode) {
     let style = match mode {
         Mode::Normal => SetCursorStyle::SteadyBlock,
-        Mode::Insert | Mode::Search => SetCursorStyle::SteadyBar,
+        Mode::Insert | Mode::Search | Mode::Picker => SetCursorStyle::SteadyBar,
         Mode::FileBrowser => SetCursorStyle::SteadyBlock,
     };
     let _ = execute!(stdout(), style);
@@ -420,6 +441,21 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
             Ok(_) => {}
             Err(e) => state.status = format!("bad search/state_changed params: {e}"),
         }
+    } else if n.method == PickerUpdate::NAME {
+        match serde_json::from_value::<PickerUpdateParams>(n.params) {
+            Ok(p) => {
+                state.picker.apply_update(
+                    p.kind,
+                    p.generation,
+                    p.offset,
+                    p.items,
+                    p.total_matches,
+                    p.total_candidates,
+                    p.ticking,
+                );
+            }
+            Err(e) => state.status = format!("bad picker/update params: {e}"),
+        }
     }
 }
 
@@ -452,14 +488,27 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
             if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
                 return Ok(());
             }
+            // Pending leader chord (e.g. `Space f`): the next key resolves the binding, no
+            // matter which mode is current. The leader-trigger key itself is mode-specific (each
+            // mode that wants `Space` to mean "start a chord" sets `pending_leader` itself).
+            if let Some(leader) = state.pending_leader.take() {
+                return handle_leader_key(client, state, leader, k).await;
+            }
             match state.mode {
                 Mode::Normal => handle_normal_key(client, state, k).await?,
                 Mode::Insert => handle_insert_key(client, state, k).await?,
                 Mode::Search => handle_search_key(client, state, k).await?,
                 Mode::FileBrowser => handle_file_browser_key(client, state, k).await?,
+                Mode::Picker => handle_picker_key(client, state, k).await?,
             }
         }
-        Event::Mouse(m) => handle_mouse_event(client, state, m).await?,
+        Event::Mouse(m) => {
+            if matches!(state.mode, Mode::Picker) {
+                handle_picker_mouse(client, state, m).await?;
+            } else {
+                handle_mouse_event(client, state, m).await?;
+            }
+        }
         _ => return Ok(()),
     }
     if state.cursor.position != cursor_before {
@@ -796,6 +845,12 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('p'), CTRL_ONLY) => paste_before(client, state, count).await?,
         (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state, count).await?,
 
+        // ---- leader (Space) ----
+        // `Space` starts a multi-key chord; the next keystroke selects the action. See
+        // `handle_leader_key`.
+        (KeyCode::Char(' '), m) if m == KeyModifiers::NONE =>
+            state.pending_leader = Some(PendingLeader::Space),
+
         // ---- file browser ----
         // `-` lists the parent of the current file (or the first project path if scratch).
         (KeyCode::Char('-'), m) if m == KeyModifiers::NONE =>
@@ -813,6 +868,246 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         _ => {}
     }
+    Ok(())
+}
+
+/// Dispatch the second key of a chord opened by `state.pending_leader`. The leader itself was
+/// already consumed (and taken out of `pending_leader`) by the caller; this just resolves what
+/// the user wants to do.
+async fn handle_leader_key(
+    client: &mut Client,
+    state: &mut AppState,
+    leader: PendingLeader,
+    k: KeyEvent,
+) -> Result<()> {
+    let (code, mods) = normalize_key(k);
+    match (leader, code, mods) {
+        // `Space f` — open the file picker, resuming the prior query + highlight if any. The
+        // server treats absent state as a fresh picker, so first-ever open just works. Clear the
+        // query mid-picker with `Ctrl-u`; close (retaining state) with `Esc`.
+        (PendingLeader::Space, KeyCode::Char('f'), m) if m == KeyModifiers::NONE => {
+            open_picker(client, state, PickerKind::Files).await?;
+        }
+        // Esc or any other key cancels the chord without further action.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// How many result rows the picker overlay can fit, given the current buffer-area dimensions.
+/// Delegates to the ui module so the box geometry stays in one place.
+fn picker_limit(state: &AppState) -> u32 {
+    crate::ui::picker_result_rows(state.viewport_cols, state.viewport_rows).max(1)
+}
+
+async fn open_picker(
+    client: &mut Client,
+    state: &mut AppState,
+    kind: PickerKind,
+) -> Result<()> {
+    let limit = picker_limit(state);
+    let center_on = state.picker.last_selected.get(&kind).cloned();
+    let view = client
+        .rpc::<PickerView>(PickerViewParams {
+            kind,
+            reset: false,
+            offset: 0,
+            limit,
+            center_on: center_on.clone(),
+        })
+        .await?;
+    state.picker.open = true;
+    state.picker.kind = Some(kind);
+    state.picker.return_mode = state.mode;
+    state.picker.query = view.query;
+    state.picker.generation = view.generation;
+    state.picker.offset = view.effective_offset;
+    state.picker.limit = limit;
+    state.picker.items.clear();
+    state.picker.total_matches = 0;
+    state.picker.total_candidates = view.total_candidates;
+    state.picker.ticking = true;
+    state.picker.selected = 0;
+    state.picker.resume_target = center_on;
+    state.mode = Mode::Picker;
+    apply_cursor_style(state.mode);
+    Ok(())
+}
+
+async fn handle_picker_key(
+    client: &mut Client,
+    state: &mut AppState,
+    k: KeyEvent,
+) -> Result<()> {
+    // Keep query input case-sensitive (so smartcase works), so skip `normalize_key`.
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => hide_picker(client, state).await?,
+        (KeyCode::Enter, _) => select_picker_item(client, state).await?,
+        (KeyCode::Up, _) => picker_move_selection(client, state, -1).await?,
+        (KeyCode::Down, _) => picker_move_selection(client, state, 1).await?,
+        (KeyCode::PageUp, _) => {
+            let step = -(state.picker.limit as i64);
+            picker_move_selection(client, state, step).await?;
+        }
+        (KeyCode::PageDown, _) => {
+            let step = state.picker.limit as i64;
+            picker_move_selection(client, state, step).await?;
+        }
+        // `Ctrl-u` — wipe the query without leaving the picker. The currently-highlighted item
+        // is preserved as the resume anchor so the cursor stays on it once the broader (empty-
+        // query) result set re-pushes, rather than snapping to the top.
+        (KeyCode::Char('u'), m) if m == CTRL_ONLY => {
+            if !state.picker.query.is_empty() {
+                let anchor = state.picker.highlighted().cloned();
+                state.picker.query.clear();
+                send_picker_query(client, state).await?;
+                state.picker.resume_target = anchor;
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            if state.picker.query.pop().is_some() {
+                send_picker_query(client, state).await?;
+            }
+        }
+        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+            state.picker.query.push(c);
+            send_picker_query(client, state).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Mouse wheel inside the picker moves the highlight. Click/drag is ignored for now — the
+/// picker is a keyboard-driven modal; we can wire row-click-to-select later if it feels needed.
+async fn handle_picker_mouse(
+    client: &mut Client,
+    state: &mut AppState,
+    m: MouseEvent,
+) -> Result<()> {
+    match m.kind {
+        MouseEventKind::ScrollUp => picker_move_selection(client, state, -1).await?,
+        MouseEventKind::ScrollDown => picker_move_selection(client, state, 1).await?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Move selection by `delta` rows. Negative = up. When the move falls off the visible window, we
+/// slide the server-side window via `picker/view` so the highlighted item stays in range.
+async fn picker_move_selection(
+    client: &mut Client,
+    state: &mut AppState,
+    delta: i64,
+) -> Result<()> {
+    // A user-driven move cancels any pending resume re-anchor.
+    state.picker.resume_target = None;
+
+    let items_len = state.picker.items.len();
+    if items_len == 0 {
+        return Ok(());
+    }
+    let new_local = (state.picker.selected as i64 + delta).clamp(0, items_len as i64 - 1);
+    state.picker.selected = new_local as usize;
+
+    // If we're sitting at the top/bottom of the window and the user keeps pushing in that
+    // direction, slide the window by requesting a fresh view at a shifted offset.
+    let at_top = state.picker.selected == 0 && state.picker.offset > 0 && delta < 0;
+    let at_bottom_of_window = state.picker.selected + 1 == items_len
+        && (state.picker.offset as usize) + items_len < state.picker.total_matches as usize
+        && delta > 0;
+    if at_top || at_bottom_of_window {
+        let step = delta.unsigned_abs() as u32;
+        let new_offset = if delta < 0 {
+            state.picker.offset.saturating_sub(step)
+        } else {
+            (state.picker.offset + step).min(state.picker.total_matches.saturating_sub(state.picker.limit))
+        };
+        if new_offset != state.picker.offset {
+            request_picker_window(client, state, new_offset).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_picker_query(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(kind) = state.picker.kind else { return Ok(()) };
+    state.picker.generation = state.picker.generation.wrapping_add(1);
+    state.picker.offset = 0;
+    state.picker.selected = 0;
+    state.picker.ticking = true;
+    // Query changes invalidate the resume anchor — the user is steering somewhere new.
+    state.picker.resume_target = None;
+    client
+        .rpc::<PickerQuery>(PickerQueryParams {
+            kind,
+            query: state.picker.query.clone(),
+            generation: state.picker.generation,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn request_picker_window(
+    client: &mut Client,
+    state: &mut AppState,
+    new_offset: u32,
+) -> Result<()> {
+    let Some(kind) = state.picker.kind else { return Ok(()) };
+    let limit = state.picker.limit;
+    let view = client
+        .rpc::<PickerView>(PickerViewParams {
+            kind,
+            reset: false,
+            offset: new_offset,
+            limit,
+            center_on: None,
+        })
+        .await?;
+    state.picker.offset = view.effective_offset;
+    // Pin selection to the edge of the window we just scrolled toward. The follow-up
+    // `picker/update` push will refresh `items`; in the meantime keep the cursor where the user
+    // expects it.
+    if new_offset < view.effective_offset {
+        // Shouldn't happen with our offset math but guard anyway.
+        state.picker.selected = 0;
+    }
+    Ok(())
+}
+
+async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(kind) = state.picker.kind else { return Ok(()) };
+    let Some(item) = state.picker.highlighted().cloned() else { return Ok(()) };
+    state.picker.last_selected.insert(kind, item.clone());
+
+    let result = client
+        .rpc::<PickerSelect>(PickerSelectParams { kind, item: item.clone() })
+        .await?;
+    // Implicit hide: server keeps state alive for resume, just stops pushing.
+    let _ = client.rpc::<PickerHide>(PickerHideParams { kind }).await;
+    state.picker.open = false;
+    state.mode = Mode::Normal;
+    apply_cursor_style(state.mode);
+
+    match result {
+        PickerSelectResult::File { path } => {
+            open_file_in_browser_with_options(client, state, path, false).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(kind) = state.picker.kind else { return Ok(()) };
+    // Persist the highlight so the next `Space f` resumes here. Done client-side; server doesn't
+    // see selection at all.
+    if let Some(item) = state.picker.highlighted().cloned() {
+        state.picker.last_selected.insert(kind, item);
+    }
+    let _ = client.rpc::<PickerHide>(PickerHideParams { kind }).await;
+    state.picker.open = false;
+    state.mode = state.picker.return_mode;
+    apply_cursor_style(state.mode);
     Ok(())
 }
 
@@ -920,6 +1215,11 @@ async fn handle_file_browser_key(
         (KeyCode::Char('n'), CTRL_ONLY) => begin_prompt(state, FileBrowserPromptKind::NewFile),
         (KeyCode::Char('n'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
             begin_prompt(state, FileBrowserPromptKind::NewDirectory),
+        // `Space` starts a leader chord — same set as Normal mode (e.g. `Space f` opens the
+        // file picker). The chord is consumed in `handle_event` before the next key reaches
+        // this handler.
+        (KeyCode::Char(' '), m) if m == KeyModifiers::NONE =>
+            state.pending_leader = Some(PendingLeader::Space),
         (KeyCode::Esc, _) => leave_file_browser(state),
         // Move the highlight.
         (KeyCode::Char('j'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
@@ -1486,6 +1786,25 @@ async fn handle_resize(client: &mut Client, state: &mut AppState, cols: u16, row
     state.line_count = r.window.line_count;
     state.max_scroll_logical_line = r.window.max_scroll_logical_line;
     state.lines = r.window.lines;
+
+    // If the picker is open, the resize changed how many result rows fit. Re-subscribe with the
+    // new `limit`, keeping the current `offset`. The server's next push uses the new window.
+    if state.picker.open {
+        if let Some(kind) = state.picker.kind {
+            let new_limit = picker_limit(state);
+            let view = client
+                .rpc::<PickerView>(PickerViewParams {
+                    kind,
+                    reset: false,
+                    offset: state.picker.offset,
+                    limit: new_limit,
+                    center_on: None,
+                })
+                .await?;
+            state.picker.limit = new_limit;
+            state.picker.offset = view.effective_offset;
+        }
+    }
     Ok(())
 }
 

@@ -7,9 +7,11 @@ mod cursor;
 mod error;
 mod handlers;
 mod indent;
+mod picker;
 mod server;
 mod state;
 mod syntax;
+mod workspace_index;
 mod wrap;
 
 pub use config::ProjectConfig;

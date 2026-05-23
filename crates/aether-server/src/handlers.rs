@@ -2,9 +2,11 @@
 
 use crate::cursor as motion;
 use crate::error::RpcError;
+use crate::picker as picker_state;
 use crate::state::{Buffer, ClientSession, EditKindTag, SearchEntry, ServerState, SharedState, Viewport};
 use crate::wrap;
 use std::collections::HashMap;
+use std::sync::Arc;
 use aether_protocol::buffer::{
     BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams, BufferOpenResult,
     BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
@@ -12,6 +14,10 @@ use aether_protocol::buffer::{
 use aether_protocol::directory::{
     DirectoryCreateParams, DirectoryCreateResult, DirectoryListParams, DirectoryListResult,
     DirEntry,
+};
+use aether_protocol::picker::{
+    PickerHideParams, PickerItem, PickerQueryParams, PickerSelectParams, PickerSelectResult,
+    PickerUpdate, PickerViewParams, PickerViewResult,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
@@ -3332,5 +3338,162 @@ fn build_lines_changed_notif(
         method: ViewportLinesChanged::NAME.into(),
         params: serde_json::to_value(params).expect("infallible"),
     }
+}
+
+// ---- picker/* ----------------------------------------------------------------------------------
+
+pub async fn picker_view(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: PickerViewParams,
+) -> Result<PickerViewResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+
+    // Walk the workspace outside the global lock — on first call it can take seconds, and we
+    // don't want to stall every other RPC. The `Arc<WorkspaceIndex>` is cheap to clone; the
+    // walk itself is memoized inside the index.
+    let workspace_index = {
+        let s = state.lock().await;
+        s.workspace_index.clone()
+    };
+    let candidates = workspace_index.files().await;
+
+    let mut s = state.lock().await;
+    let key = (client_id, params.kind);
+
+    // (Re-)hydrate picker state. `reset` always wipes; otherwise we keep whatever was persisted
+    // from a prior `view`/`query`/`hide` cycle. Split-borrow `pickers` and `matcher` from `s`
+    // so we can hold mutable references to both at once.
+    let ServerState { pickers, matcher, .. } = &mut *s;
+    if params.reset {
+        pickers.remove(&key);
+    }
+    if !pickers.contains_key(&key) {
+        pickers.insert(key, picker_state::PickerState::new(params.kind, candidates.clone()));
+    } else {
+        // If the workspace index has been refreshed since the picker was last touched (file
+        // watcher would do this once wired up), re-bind to the latest candidate set and re-rank.
+        let p = pickers.get_mut(&key).expect("just checked");
+        if !Arc::ptr_eq(&p.candidates, &candidates) {
+            p.candidates = candidates.clone();
+            p.rerank(matcher);
+        }
+    }
+    let picker = pickers.get_mut(&key).expect("populated above");
+
+    // Resolve the window. `center_on` wins over `offset` and picks a frame containing the item;
+    // we centre it (roughly) so a small navigation away keeps it on screen. Falls through to
+    // `offset` if the item isn't currently ranked.
+    let limit = params.limit.max(1);
+    let mut effective_offset = params.offset;
+    if let Some(item) = params.center_on.as_ref() {
+        if let Some(rank) = picker.rank_of(item) {
+            let half = limit / 2;
+            effective_offset = rank.saturating_sub(half);
+        }
+    }
+    let total = picker.ranked.len() as u32;
+    if effective_offset >= total {
+        effective_offset = total.saturating_sub(limit);
+    }
+    picker.subscribed = Some(picker_state::SubscribedWindow { offset: effective_offset, limit });
+
+    // Build the initial push so the client doesn't have to wait for an async update to arrive
+    // before it can render. Caller will treat the response and the notification as redundant.
+    let update = picker_state::build_update(picker, matcher);
+    let result = PickerViewResult {
+        query: picker.query.clone(),
+        generation: picker.generation,
+        total_candidates: picker.total_candidates(),
+        effective_offset,
+    };
+    let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
+    drop(s);
+
+    if let (Some(sender), Some(params)) = (outbound, update) {
+        let notif = Notification {
+            jsonrpc: JsonRpc,
+            method: PickerUpdate::NAME.into(),
+            params: serde_json::to_value(params).expect("infallible"),
+        };
+        let _ = sender.send(notif).await;
+    }
+
+    Ok(result)
+}
+
+pub async fn picker_query(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: PickerQueryParams,
+) -> Result<(), RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    let key = (client_id, params.kind);
+    let ServerState { pickers, matcher, .. } = &mut *s;
+    let Some(picker) = pickers.get_mut(&key) else {
+        // No-op if the client never opened the picker. Could also error; silently dropping
+        // matches the lenient style of other handlers.
+        return Ok(());
+    };
+    picker.query = params.query;
+    picker.generation = params.generation;
+    picker.rerank(matcher);
+
+    // After a query change, the prior `offset` may now be past the end of the result set. Clamp.
+    if let Some(window) = picker.subscribed.as_mut() {
+        let total = picker.ranked.len() as u32;
+        if window.offset >= total {
+            window.offset = total.saturating_sub(window.limit);
+        }
+    }
+
+    let update = picker_state::build_update(picker, matcher);
+    let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
+    drop(s);
+
+    if let (Some(sender), Some(params)) = (outbound, update) {
+        let notif = Notification {
+            jsonrpc: JsonRpc,
+            method: PickerUpdate::NAME.into(),
+            params: serde_json::to_value(params).expect("infallible"),
+        };
+        let _ = sender.send(notif).await;
+    }
+    Ok(())
+}
+
+pub async fn picker_select(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: PickerSelectParams,
+) -> Result<PickerSelectResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let s = state.lock().await;
+    let key = (client_id, params.kind);
+    let picker = s.pickers.get(&key).ok_or_else(|| {
+        RpcError::new(ErrorCode::INVALID_REQUEST, "no active picker for this client")
+    })?;
+    match &params.item {
+        PickerItem::File { .. } => {
+            let abs = picker_state::resolve_file_abs(picker, &params.item).ok_or_else(|| {
+                RpcError::invalid_params("selected item is not in the picker's candidate set")
+            })?;
+            Ok(PickerSelectResult::File { path: abs })
+        }
+    }
+}
+
+pub async fn picker_hide(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: PickerHideParams,
+) -> Result<(), RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    if let Some(picker) = s.pickers.get_mut(&(client_id, params.kind)) {
+        picker.subscribed = None;
+    }
+    Ok(())
 }
 

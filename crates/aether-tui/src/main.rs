@@ -2,6 +2,7 @@ mod app;
 mod client;
 mod clipboard;
 mod discovery;
+mod picker;
 mod stderr_capture;
 mod ui;
 

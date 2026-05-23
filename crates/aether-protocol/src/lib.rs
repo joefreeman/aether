@@ -11,6 +11,7 @@ pub mod envelope;
 pub mod error;
 pub mod handshake;
 pub mod input;
+pub mod picker;
 pub mod search;
 pub mod viewport;
 
