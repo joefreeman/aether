@@ -2240,6 +2240,33 @@ pub async fn input_backspace(
     apply_edit(state, client_id, params.buffer_id, EditKind::Backspace).await
 }
 
+pub async fn input_delete_line(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    apply_edit(state, client_id, params.buffer_id, EditKind::DeleteLine).await
+}
+
+pub async fn input_change_line(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    apply_edit(state, client_id, params.buffer_id, EditKind::ChangeLine).await
+}
+
+pub async fn input_replace_line(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::input::InputReplaceLineParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    apply_edit(state, client_id, params.buffer_id, EditKind::ReplaceLine { text: params.text }).await
+}
+
 pub async fn input_undo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -3827,6 +3854,12 @@ enum EditKind {
     /// by Insert-mode `Backspace` — there's no meaningful selection in Insert mode and "delete
     /// the previous char" is its own gesture.
     Backspace,
+    /// Delete the cursor's whole line — content and trailing newline. Insert-mode `Ctrl-d`.
+    DeleteLine,
+    /// Blank the cursor's line — content only, newline preserved. Insert-mode `Ctrl-c`.
+    ChangeLine,
+    /// Replace the cursor's line (content + newline) with `text`. Insert-mode `Ctrl-r`.
+    ReplaceLine { text: String },
 }
 
 async fn apply_edit(
@@ -3848,57 +3881,90 @@ async fn apply_edit(
         .copied()
         .unwrap_or_default();
 
-    // Determine the byte/char range to replace, and the text to insert.
-    //   - ReplaceWith on a *point* cursor: pure insert at `position` (empty range).
-    //   - ReplaceWith on a *range* selection: replace the inclusive selection.
-    //   - DeleteSelection: delete the inclusive selection (1 char for point cursor).
-    //   - Backspace: delete `[position-1, position)`, half-open, ignoring the selection.
-    let (start_pos, end_pos, range_is_inclusive) = match &edit {
+    // Compute the char range to replace and the affected line range. The range_is_inclusive
+    // flag (selection mode) extends end_char by 1 to cover the cursor's char under the block.
+    struct EditRange {
+        start_char: usize,
+        end_char: usize,
+        first_line: u32,
+        last_line: u32,
+    }
+    let range: EditRange = match &edit {
         EditKind::ReplaceWith { .. } => {
             if cursor.is_point() {
-                (cursor.position, cursor.position, false)
+                // Pure insert at the point — no chars replaced.
+                let c = motion::pos_to_char(buf, cursor.position);
+                EditRange {
+                    start_char: c,
+                    end_char: c,
+                    first_line: cursor.position.line,
+                    last_line: cursor.position.line,
+                }
             } else {
                 let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
-                (lo, hi, true)
+                let sc = motion::pos_to_char(buf, lo);
+                let ec = motion::pos_to_char(buf, hi).saturating_add(1).min(buf.text.len_chars());
+                EditRange { start_char: sc, end_char: ec, first_line: lo.line, last_line: hi.line }
             }
         }
         EditKind::DeleteSelection => {
             let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
-            (lo, hi, true)
+            let sc = motion::pos_to_char(buf, lo);
+            let ec = motion::pos_to_char(buf, hi).saturating_add(1).min(buf.text.len_chars());
+            EditRange { start_char: sc, end_char: ec, first_line: lo.line, last_line: hi.line }
         }
         EditKind::Backspace => {
             let prev = motion::resolve_motion(
                 buf,
                 cursor.position,
-                &Motion::Char {
-                    direction: Direction::Backward,
-                    count: 1,
-                },
+                &Motion::Char { direction: Direction::Backward, count: 1 },
             );
             let (lo, hi) = motion::ordered(cursor.position, prev);
-            (lo, hi, false)
+            let sc = motion::pos_to_char(buf, lo);
+            let ec = motion::pos_to_char(buf, hi);
+            EditRange { start_char: sc, end_char: ec, first_line: lo.line, last_line: hi.line }
+        }
+        EditKind::DeleteLine | EditKind::ReplaceLine { .. } => {
+            let line = cursor.position.line as usize;
+            let total_lines = buf.text.len_lines();
+            let sc = buf.text.line_to_char(line);
+            let ec = if line + 1 < total_lines {
+                buf.text.line_to_char(line + 1)
+            } else {
+                buf.text.len_chars()
+            };
+            EditRange { start_char: sc, end_char: ec, first_line: line as u32, last_line: line as u32 }
+        }
+        EditKind::ChangeLine => {
+            let line = cursor.position.line as usize;
+            let sc = buf.text.line_to_char(line);
+            // Char count excluding the trailing newline, if any.
+            let line_slice = buf.text.line(line);
+            let len_chars = line_slice.len_chars();
+            let has_trailing_nl = len_chars > 0 && line_slice.char(len_chars - 1) == '\n';
+            let content_chars = if has_trailing_nl { len_chars - 1 } else { len_chars };
+            EditRange { start_char: sc, end_char: sc + content_chars, first_line: line as u32, last_line: line as u32 }
         }
     };
     let (insert_text, select_pasted): (&str, bool) = match &edit {
-        EditKind::ReplaceWith {
-            text,
-            select_pasted,
-        } => (text.as_str(), *select_pasted),
-        EditKind::DeleteSelection | EditKind::Backspace => ("", false),
+        EditKind::ReplaceWith { text, select_pasted } => (text.as_str(), *select_pasted),
+        EditKind::ReplaceLine { text } => (text.as_str(), false),
+        EditKind::DeleteSelection
+        | EditKind::Backspace
+        | EditKind::DeleteLine
+        | EditKind::ChangeLine => ("", false),
     };
 
-    let start_char = motion::pos_to_char(buf, start_pos);
-    let end_char_base = motion::pos_to_char(buf, end_pos);
-    let end_char = if range_is_inclusive {
-        end_char_base.saturating_add(1).min(buf.text.len_chars())
-    } else {
-        end_char_base
-    };
-    let old_first_line = start_pos.line;
-    let old_last_line = end_pos.line;
+    let start_char = range.start_char;
+    let end_char = range.end_char;
+    let old_first_line = range.first_line;
+    let old_last_line = range.last_line;
     let kind_tag = match &edit {
-        EditKind::ReplaceWith { .. } => EditKindTag::Text,
-        EditKind::DeleteSelection | EditKind::Backspace => EditKindTag::Delete,
+        EditKind::ReplaceWith { .. } | EditKind::ReplaceLine { .. } => EditKindTag::Text,
+        EditKind::DeleteSelection
+        | EditKind::Backspace
+        | EditKind::DeleteLine
+        | EditKind::ChangeLine => EditKindTag::Delete,
     };
 
     // Snapshot all per-client cursors on this buffer so the undo entry can restore them.

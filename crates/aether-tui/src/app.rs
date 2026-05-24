@@ -823,11 +823,15 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
     let extend = mods.contains(KeyModifiers::SHIFT);
 
+    // Ctrl-modified shortcuts that Normal and Insert share live in `handle_ctrl_binding`.
+    // Mode-specific divergences (e.g. clipboard scope) are handled inside that dispatcher's
+    // per-binding wrappers.
+    if handle_ctrl_binding(client, state, code, mods, count).await? {
+        return Ok(());
+    }
+
     match (code, mods) {
         // ---- meta ----
-        (KeyCode::Char('q'), CTRL_ONLY) => {
-            state.should_quit = true;
-        }
         (KeyCode::Esc, _) => {
             // Drop the active search (clears highlights, disables n/Alt-n). Use `d` to drop the
             // current selection instead.
@@ -1203,60 +1207,14 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         }
 
         // ---- viewport ----
-        (KeyCode::Char('p'), CTRL_ONLY) => toggle_wrap(client, state).await?,
+        // `Ctrl-p` (toggle wrap) goes through the shared Ctrl handler below; only the
+        // non-Ctrl viewport bindings (centre-cursor) live here.
         (KeyCode::Char('z'), m) if m == KeyModifiers::NONE => center_cursor(client, state).await?,
 
-        // ---- buffers ----
-        (KeyCode::Char('n'), CTRL_ONLY) => new_scratch(client, state).await?,
-        (KeyCode::Char('w'), CTRL_ONLY) => close_buffer(client, state).await?,
-
-        // ---- edits ----
-        (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
-        (KeyCode::Char('s'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
-            begin_save_prompt(state)
-        }
-        (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
-            redo(client, state, count).await?
-        }
-        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, count).await?,
-        (KeyCode::Char('j'), CTRL_ONLY) => {
-            move_lines(client, state, VerticalDirection::Down, count).await?
-        }
-        (KeyCode::Char('k'), CTRL_ONLY) => {
-            move_lines(client, state, VerticalDirection::Up, count).await?
-        }
-        (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state, count).await?,
-        (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state, count).await?,
-        (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state, count).await?,
-        (KeyCode::Char('t'), CTRL_ONLY) => toggle_comment(client, state).await?,
-        (KeyCode::Char('o'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
-            open_line_above(client, state).await?
-        }
-        (KeyCode::Char('o'), CTRL_ONLY) => open_line_below(client, state).await?,
-        // Normal-mode delete bindings act on the current selection (which is at least a
-        // 1-char point under the block cursor). Backspace is intentionally absent from Normal
-        // mode in this model — to delete the previous char, the user moves the cursor back
-        // (`h`) and presses `Ctrl-d`.
-        (KeyCode::Char('d'), CTRL_ONLY) | (KeyCode::Delete, _) => {
-            for _ in 0..count.max(1) {
-                delete_selection(client, state).await?;
-            }
-        }
-
-        // ---- change ----
-        // `Ctrl-c` replaces the current selection (or the cursor's 1-char range) with a fresh
-        // edit — delete + enter Insert mode in one step.
-        (KeyCode::Char('c'), CTRL_ONLY) => change_selection(client, state).await?,
-
-        // ---- clipboard ----
-        (KeyCode::Char('y'), CTRL_ONLY) => {
-            copy_to_clipboard(client, state, CopyScope::Selection).await?
-        }
-        (KeyCode::Char('x'), CTRL_ONLY) => {
-            cut_to_clipboard(client, state, CopyScope::Selection).await?
-        }
-        (KeyCode::Char('v'), CTRL_ONLY) => paste_before(client, state, count).await?,
-        (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state, count).await?,
+        // ---- delete (also bound to Delete key) ----
+        // The plain `Delete` key shares semantics with `Ctrl-d` in Normal mode (delete-
+        // selection, repeated `count` times). `Ctrl-d` itself is in `handle_ctrl_binding`.
+        (KeyCode::Delete, _) => handle_delete(client, state, count).await?,
 
         // ---- leader (Space) ----
         // `Space` starts a multi-key chord; the next keystroke selects the action. See
@@ -1740,26 +1698,14 @@ async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
 
 async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
     let (code, mods) = normalize_key(k);
+    // Try shared Ctrl shortcuts first; mode-specific divergences live inside the wrappers
+    // (handle_copy / handle_cut / etc.). Count is hardcoded to 1 in Insert — no pending_count
+    // accumulator here.
+    if handle_ctrl_binding(client, state, code, mods, 1).await? {
+        return Ok(());
+    }
     match (code, mods) {
         (KeyCode::Esc, _) => leave_insert(state),
-
-        // Allow Ctrl-S / Ctrl-Alt-S / Ctrl-U / Ctrl-Alt-U to work in insert mode too.
-        (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
-        (KeyCode::Char('s'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
-            begin_save_prompt(state)
-        }
-        (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
-            redo(client, state, 1).await?
-        }
-        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, 1).await?,
-
-        // Clipboard: in insert mode copy/cut operate on the current line.
-        (KeyCode::Char('y'), CTRL_ONLY) => {
-            copy_to_clipboard(client, state, CopyScope::Line).await?
-        }
-        (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Line).await?,
-        (KeyCode::Char('v'), CTRL_ONLY) => paste_at_cursor(client, state).await?,
-
         // Insert-mode Backspace deletes the char before the cursor; Delete deletes the 1-char
         // point at the cursor (the always-have-selection invariant means the point IS the
         // char to delete).
@@ -2943,6 +2889,169 @@ async fn backspace(client: &mut Client, state: &mut AppState) -> Result<()> {
     state.editor_mut().revision = r.revision;
     state.editor_mut().cursor = r.cursor;
     Ok(())
+}
+
+async fn delete_line(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<aether_protocol::input::InputDeleteLine>(BufferOnlyParams {
+            buffer_id: state.editor().buffer_id,
+        })
+        .await?;
+    state.editor_mut().revision = r.revision;
+    state.editor_mut().cursor = r.cursor;
+    Ok(())
+}
+
+async fn change_line(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<aether_protocol::input::InputChangeLine>(BufferOnlyParams {
+            buffer_id: state.editor().buffer_id,
+        })
+        .await?;
+    state.editor_mut().revision = r.revision;
+    state.editor_mut().cursor = r.cursor;
+    Ok(())
+}
+
+async fn replace_line_with_clipboard(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let text = match clipboard::paste(&mut state.clipboard) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("clipboard read failed: {e}");
+            return Ok(());
+        }
+    };
+    let r: EditResult = client
+        .rpc::<aether_protocol::input::InputReplaceLine>(
+            aether_protocol::input::InputReplaceLineParams {
+                buffer_id: state.editor().buffer_id,
+                text,
+            },
+        )
+        .await?;
+    state.editor_mut().revision = r.revision;
+    state.editor_mut().cursor = r.cursor;
+    Ok(())
+}
+
+// ---- shared Ctrl-binding dispatch -------------------------------------------------------------
+//
+// `handle_ctrl_binding` covers every Ctrl-modified shortcut that Normal and Insert mode share.
+// Mode-dependent commands (copy/cut/paste/change/delete/replace) get thin wrappers below that
+// branch on `state.editor().mode` to pick the right scope/behavior. This lets both mode
+// handlers delegate to one dispatcher instead of carrying ~22 duplicated arms each.
+
+/// Ctrl-y in Normal: copy selection. In Insert: copy current line.
+async fn handle_copy(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let scope = scope_for_mode(state);
+    copy_to_clipboard(client, state, scope).await
+}
+
+/// Ctrl-x in Normal: cut selection. In Insert: cut current line.
+async fn handle_cut(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let scope = scope_for_mode(state);
+    cut_to_clipboard(client, state, scope).await
+}
+
+/// Ctrl-v in Normal: paste-before (collapses to selection start + inserts with select_pasted).
+/// In Insert: paste at cursor (no selection of the inserted text — the bar cursor sits past it
+/// ready to keep typing).
+async fn handle_paste(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    match state.try_editor().map(|e| e.mode) {
+        Some(EditorMode::Insert) => paste_at_cursor(client, state).await,
+        _ => paste_before(client, state, count).await,
+    }
+}
+
+/// Ctrl-c. In Normal: delete the selection and enter Insert. In Insert: blank the current line
+/// (we're already in Insert).
+async fn handle_change(client: &mut Client, state: &mut AppState) -> Result<()> {
+    match state.try_editor().map(|e| e.mode) {
+        Some(EditorMode::Insert) => change_line(client, state).await,
+        _ => change_selection(client, state).await,
+    }
+}
+
+/// Ctrl-d. In Normal: delete the selection (looped `count` times). In Insert: delete the
+/// current line (count ignored — Insert has no count accumulator).
+async fn handle_delete(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
+    match state.try_editor().map(|e| e.mode) {
+        Some(EditorMode::Insert) => delete_line(client, state).await,
+        _ => {
+            for _ in 0..count.max(1) {
+                delete_selection(client, state).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Ctrl-r. In Normal: paste-replace selection (paste + select-pasted, looped). In Insert:
+/// replace the current line with the clipboard.
+async fn handle_replace_with_clipboard(
+    client: &mut Client,
+    state: &mut AppState,
+    count: u32,
+) -> Result<()> {
+    match state.try_editor().map(|e| e.mode) {
+        Some(EditorMode::Insert) => replace_line_with_clipboard(client, state).await,
+        _ => paste_replace(client, state, count).await,
+    }
+}
+
+fn scope_for_mode(state: &AppState) -> CopyScope {
+    match state.try_editor().map(|e| e.mode) {
+        Some(EditorMode::Insert) => CopyScope::Line,
+        _ => CopyScope::Selection,
+    }
+}
+
+/// Dispatch every Ctrl-modified binding shared between Normal and Insert. Returns `Ok(true)`
+/// when a binding matched (the caller short-circuits); `Ok(false)` when nothing matched and
+/// the caller should try mode-specific bindings. `count` is `pending_count` (Normal) or `1`
+/// (Insert).
+async fn handle_ctrl_binding(
+    client: &mut Client,
+    state: &mut AppState,
+    code: KeyCode,
+    mods: KeyModifiers,
+    count: u32,
+) -> Result<bool> {
+    let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    match (code, mods) {
+        // ---- top-level / app control ----
+        (KeyCode::Char('q'), CTRL_ONLY) => state.should_quit = true,
+        (KeyCode::Char('w'), CTRL_ONLY) => close_buffer(client, state).await?,
+        (KeyCode::Char('n'), CTRL_ONLY) => new_scratch(client, state).await?,
+        (KeyCode::Char('p'), CTRL_ONLY) => toggle_wrap(client, state).await?,
+        // ---- save / undo / redo ----
+        (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
+        (KeyCode::Char('s'), m) if m == ctrl_alt => begin_save_prompt(state),
+        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, count).await?,
+        (KeyCode::Char('u'), m) if m == ctrl_alt => redo(client, state, count).await?,
+        // ---- line manipulation (count-taking in Normal; count=1 in Insert) ----
+        (KeyCode::Char('j'), CTRL_ONLY) => {
+            move_lines(client, state, VerticalDirection::Down, count).await?
+        }
+        (KeyCode::Char('k'), CTRL_ONLY) => {
+            move_lines(client, state, VerticalDirection::Up, count).await?
+        }
+        (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state, count).await?,
+        (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state, count).await?,
+        (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state, count).await?,
+        (KeyCode::Char('t'), CTRL_ONLY) => toggle_comment(client, state).await?,
+        (KeyCode::Char('o'), CTRL_ONLY) => open_line_below(client, state).await?,
+        (KeyCode::Char('o'), m) if m == ctrl_alt => open_line_above(client, state).await?,
+        // ---- mode-dependent: clipboard, change, delete, replace ----
+        (KeyCode::Char('y'), CTRL_ONLY) => handle_copy(client, state).await?,
+        (KeyCode::Char('x'), CTRL_ONLY) => handle_cut(client, state).await?,
+        (KeyCode::Char('v'), CTRL_ONLY) => handle_paste(client, state, count).await?,
+        (KeyCode::Char('c'), CTRL_ONLY) => handle_change(client, state).await?,
+        (KeyCode::Char('d'), CTRL_ONLY) => handle_delete(client, state, count).await?,
+        (KeyCode::Char('r'), CTRL_ONLY) => handle_replace_with_clipboard(client, state, count).await?,
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 async fn join_lines(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {

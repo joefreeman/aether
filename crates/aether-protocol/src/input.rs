@@ -65,6 +65,43 @@ impl RpcMethod for InputBackspace {
     type Result = EditResult;
 }
 
+// ---- line operations (Insert-mode Ctrl-d / Ctrl-c / Ctrl-r) -------------------------------------
+
+/// Delete the cursor's line entirely — both content and trailing newline. The buffer shrinks
+/// by one line; the cursor lands at col 0 of what's now at the line's position (the next line
+/// promoted up, or the previous line if we deleted the last line). Insert-mode `Ctrl-d`.
+pub struct InputDeleteLine;
+impl RpcMethod for InputDeleteLine {
+    const NAME: &'static str = "input/delete_line";
+    type Params = BufferOnlyParams;
+    type Result = EditResult;
+}
+
+/// Blank the cursor's line — delete its content but keep the line and its newline. Cursor
+/// lands at col 0 of the now-empty line. Insert-mode `Ctrl-c` ("change line").
+pub struct InputChangeLine;
+impl RpcMethod for InputChangeLine {
+    const NAME: &'static str = "input/change_line";
+    type Params = BufferOnlyParams;
+    type Result = EditResult;
+}
+
+/// Replace the cursor's line (content + newline) with `text`. The clipboard payload usually
+/// ends in `\n`; if it doesn't, the replacement is "the line's text becomes `text`, and the
+/// newline boundary moves to wherever `text` ends." Insert-mode `Ctrl-r`.
+pub struct InputReplaceLine;
+impl RpcMethod for InputReplaceLine {
+    const NAME: &'static str = "input/replace_line";
+    type Params = InputReplaceLineParams;
+    type Result = EditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InputReplaceLineParams {
+    pub buffer_id: BufferId,
+    pub text: String,
+}
+
 // ---- input/indent, input/dedent -----------------------------------------------------------------
 
 pub struct InputIndent;

@@ -14,8 +14,9 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::handshake::ClientHello;
 use aether_protocol::input::{
-    InputBackspace, InputDedent, InputDelete, InputIndent, InputJoinLines, InputMoveLines,
-    InputNewlineAndIndent, InputRedo, InputText, InputToggleComment, InputUndo,
+    InputBackspace, InputChangeLine, InputDedent, InputDelete, InputDeleteLine, InputIndent,
+    InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine,
+    InputText, InputToggleComment, InputUndo,
 };
 use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerView};
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
@@ -186,6 +187,9 @@ async fn dispatch(
         InputText::NAME => run!(InputText, handlers::input_text),
         InputDelete::NAME => run!(InputDelete, handlers::input_delete),
         InputBackspace::NAME => run!(InputBackspace, handlers::input_backspace),
+        InputDeleteLine::NAME => run!(InputDeleteLine, handlers::input_delete_line),
+        InputChangeLine::NAME => run!(InputChangeLine, handlers::input_change_line),
+        InputReplaceLine::NAME => run!(InputReplaceLine, handlers::input_replace_line),
         InputUndo::NAME => run!(InputUndo, handlers::input_undo),
         InputRedo::NAME => run!(InputRedo, handlers::input_redo),
         InputJoinLines::NAME => run!(InputJoinLines, handlers::input_join_lines),
