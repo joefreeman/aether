@@ -240,6 +240,7 @@ fn buffer_open_scratch_form() {
         relative_path: None,
         language: Some("rust".into()),
         create_if_missing: false,
+        jump_to: None,
     })
     .unwrap();
     assert_eq!(v["path_index"], serde_json::Value::Null);
@@ -396,6 +397,57 @@ fn picker_kind_buffers_is_snake_case() {
 }
 
 #[test]
+fn picker_kind_grep_is_snake_case() {
+    use aether_protocol::picker::PickerKind;
+    assert_eq!(to_value(PickerKind::Grep).unwrap(), json!("grep"));
+    assert_eq!(
+        from_value::<PickerKind>(json!("grep")).unwrap(),
+        PickerKind::Grep,
+    );
+}
+
+#[test]
+fn picker_item_grep_hit_is_tagged() {
+    use aether_protocol::picker::PickerItem;
+    let item = PickerItem::GrepHit {
+        path: "src/main.rs".into(),
+        line: 12,
+        col: 4,
+        preview: "    let foo = 1;".into(),
+        match_indices: vec![8, 9, 10],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "kind": "grep_hit",
+            "path": "src/main.rs",
+            "line": 12,
+            "col": 4,
+            "preview": "    let foo = 1;",
+            "match_indices": [8, 9, 10],
+        })
+    );
+}
+
+#[test]
+fn picker_select_result_file_at_is_tagged() {
+    use aether_protocol::picker::PickerSelectResult;
+    let r = PickerSelectResult::FileAt {
+        path: "/abs/x.rs".into(),
+        position: LogicalPosition { line: 3, col: 7 },
+    };
+    assert_eq!(
+        to_value(&r).unwrap(),
+        json!({
+            "kind": "file_at",
+            "path": "/abs/x.rs",
+            "position": {"line": 3, "col": 7},
+        })
+    );
+}
+
+#[test]
 fn buffer_open_params_buffer_id_skipped_when_none() {
     use aether_protocol::buffer::BufferOpenParams;
     let p = BufferOpenParams {
@@ -404,6 +456,7 @@ fn buffer_open_params_buffer_id_skipped_when_none() {
         relative_path: Some("x".into()),
         language: None,
         create_if_missing: false,
+        jump_to: None,
     };
     let v = to_value(&p).unwrap();
     assert!(v.get("buffer_id").is_none());
@@ -419,7 +472,38 @@ fn buffer_open_params_buffer_id_round_trips() {
         relative_path: None,
         language: None,
         create_if_missing: false,
+        jump_to: None,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["buffer_id"], 11);
+}
+
+#[test]
+fn buffer_open_params_jump_to_skipped_when_none() {
+    use aether_protocol::buffer::BufferOpenParams;
+    let p = BufferOpenParams {
+        buffer_id: None,
+        path_index: Some(0),
+        relative_path: Some("x".into()),
+        language: None,
+        create_if_missing: false,
+        jump_to: None,
+    };
+    let v = to_value(&p).unwrap();
+    assert!(v.get("jump_to").is_none());
+}
+
+#[test]
+fn buffer_open_params_jump_to_round_trips() {
+    use aether_protocol::buffer::BufferOpenParams;
+    let p = BufferOpenParams {
+        buffer_id: None,
+        path_index: Some(0),
+        relative_path: Some("x".into()),
+        language: None,
+        create_if_missing: false,
+        jump_to: Some(LogicalPosition { line: 7, col: 13 }),
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["jump_to"], json!({"line": 7, "col": 13}));
 }

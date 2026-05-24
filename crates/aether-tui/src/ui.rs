@@ -143,6 +143,55 @@ pub fn picker_result_rows(buffer_area_cols: u32, buffer_area_rows: u32) -> u32 {
     (box_rect.height as u32).saturating_sub(4)
 }
 
+/// Count how many items starting at `start` fit when rendered with the grep picker's
+/// file-grouped layout (one non-selectable header row per distinct file path). Used by both the
+/// scroll math (where it caps the visible window inside the over-fetched cache) and the
+/// renderer (where it bounds the slice it draws).
+pub fn grep_visible_item_count_from(
+    items: &[PickerItem],
+    start: usize,
+    pane_height: usize,
+) -> usize {
+    if pane_height == 0 || start >= items.len() {
+        return 0;
+    }
+    let mut rows_used: usize = 0;
+    let mut prev_path: Option<&str> = None;
+    let mut visible: usize = 0;
+    for item in &items[start..] {
+        let needs_header = match item {
+            PickerItem::GrepHit { path, .. } => prev_path != Some(path.as_str()),
+            _ => false,
+        };
+        let cost = if needs_header { 2 } else { 1 };
+        if rows_used + cost > pane_height {
+            break;
+        }
+        rows_used += cost;
+        visible += 1;
+        if let PickerItem::GrepHit { path, .. } = item {
+            prev_path = Some(path.as_str());
+        }
+    }
+    visible
+}
+
+/// How many items fit when rendered starting at `start`, for any picker kind. Wraps the
+/// grep-specific helper for `Grep`, and is a flat `min(items.len() - start, pane_height)` for
+/// the rest.
+pub fn picker_visible_item_count_from(
+    items: &[PickerItem],
+    start: usize,
+    pane_height: usize,
+    kind: Option<aether_protocol::picker::PickerKind>,
+) -> usize {
+    if matches!(kind, Some(aether_protocol::picker::PickerKind::Grep)) {
+        grep_visible_item_count_from(items, start, pane_height)
+    } else {
+        items.len().saturating_sub(start).min(pane_height)
+    }
+}
+
 fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     let box_area = picker_box_rect(area);
     if box_area.width < 4 || box_area.height < 4 {
@@ -206,14 +255,15 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         (q, base_style, w)
     };
 
-    let counts = if state.picker.total_candidates == 0 {
+    let counts = if state.picker.total_matches == 0 {
         String::new()
     } else {
         let suffix = if state.picker.ticking { " …" } else { "" };
-        format!(
-            "{}/{}{}",
-            state.picker.total_matches, state.picker.total_candidates, suffix
-        )
+        // Position-in-results / total: "you're on item N of M". `selected` is a cache index;
+        // `offset + selected + 1` is the 1-based position in the full result set.
+        let position = state.picker.offset as u64 + state.picker.selected as u64 + 1;
+        let position = position.min(state.picker.total_matches as u64);
+        format!("{}/{}{}", position, state.picker.total_matches, suffix)
     };
     let total_width = area.width as usize;
     let counts_w = counts.width();
@@ -231,6 +281,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
     match kind {
         Some(aether_protocol::picker::PickerKind::Files) => "Search files…",
         Some(aether_protocol::picker::PickerKind::Buffers) => "Switch buffer…",
+        Some(aether_protocol::picker::PickerKind::Grep) => "Grep workspace…",
         None => "Search…",
     }
 }
@@ -270,8 +321,34 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         height: area.height,
     };
 
-    let mut lines: Vec<Line> = Vec::with_capacity(state.picker.items.len());
-    for (i, item) in state.picker.items.iter().enumerate() {
+    // Render only the visible slice — `visible_start..visible_start + visible_count`. Items
+    // outside that range are part of the over-fetched cache that lets us scroll without an RPC.
+    let pane_height = area.height as usize;
+    let visible_start = state.picker.visible_start.min(state.picker.items.len());
+    let visible_count = picker_visible_item_count_from(
+        &state.picker.items,
+        visible_start,
+        pane_height,
+        state.picker.kind,
+    );
+    let visible_end = (visible_start + visible_count).min(state.picker.items.len());
+
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_count);
+    // For Grep, insert a non-selectable file header above the first hit of each new file path.
+    // Headers eat into the visible row budget; the visible-count math above already accounts
+    // for them, so what we render here will fit in `pane_height` rows.
+    let mut prev_grep_path: Option<&str> = None;
+    for (offset_in_slice, item) in state.picker.items[visible_start..visible_end]
+        .iter()
+        .enumerate()
+    {
+        let i = visible_start + offset_in_slice;
+        if let PickerItem::GrepHit { path, .. } = item {
+            if prev_grep_path != Some(path.as_str()) {
+                lines.push(Line::from(grep_file_header_spans(path, text_width as usize)));
+                prev_grep_path = Some(path.as_str());
+            }
+        }
         let highlighted = i == state.picker.selected;
         lines.push(Line::from(picker_item_spans(
             item,
@@ -297,8 +374,17 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
 
 fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
     let total = state.picker.total_matches.max(1) as u64;
-    let window = state.picker.items.len() as u64;
-    let offset = state.picker.offset as u64;
+    // Use the actual on-screen item count for the thumb size, and the absolute position of the
+    // visible window's top item (`offset + visible_start`) for the thumb position. With
+    // over-fetch, `items.len()` would oversize the thumb and `offset` alone would peg it.
+    let visible_start = state.picker.visible_start.min(state.picker.items.len());
+    let window = picker_visible_item_count_from(
+        &state.picker.items,
+        visible_start,
+        area.height as usize,
+        state.picker.kind,
+    ) as u64;
+    let offset = state.picker.offset as u64 + visible_start as u64;
     let track_h = area.height as u64;
     if track_h == 0 {
         return;
@@ -321,6 +407,16 @@ fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> Vec<Span<'static>> {
+    if let PickerItem::GrepHit {
+        line,
+        preview,
+        match_indices,
+        ..
+    } = item
+    {
+        return grep_hit_spans(*line, preview, match_indices, highlighted, max_width);
+    }
+
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
@@ -342,6 +438,7 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
             match_indices.as_slice(),
             if *dirty { " [+]" } else { "" },
         ),
+        PickerItem::GrepHit { .. } => unreachable!("handled above"),
     };
 
     let text_budget = max_width.saturating_sub(dirty_suffix.len());
@@ -379,6 +476,91 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
     }
     if !dirty_suffix.is_empty() {
         spans.push(Span::styled(dirty_suffix.to_string(), base.fg(NORD13)));
+    }
+    spans
+}
+
+/// Header row above each file's hits in the Grep picker. Path in NORD8 (frost blue, distinct
+/// from regular item rows) — non-selectable; the picker cursor lives on the GrepHit rows.
+fn grep_file_header_spans(path: &str, max_width: usize) -> Vec<Span<'static>> {
+    let style = Style::default().fg(NORD8).bg(NORD0).add_modifier(Modifier::BOLD);
+    let (display, _) = truncate_path_with_indices(path, &[], max_width);
+    vec![Span::styled(display, style)]
+}
+
+/// One Grep hit row: indented under the file header, line number left-padded to a small fixed
+/// width in a dim color, then the preview with `match_indices` highlighted the same way the
+/// fuzzy-match-tinted Files/Buffers rows are.
+fn grep_hit_spans(
+    line: u32,
+    preview: &str,
+    match_indices: &[u32],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let base = Style::default().fg(NORD4).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let line_style = base.fg(NORD3);
+    let indent = "  ";
+    // Line numbers in this codebase happily fit in 5 cols; widen as needed for huge files.
+    let line_str = format!("{:>5} ", line + 1);
+    let prefix_w = indent.width() + line_str.width();
+    let preview_budget = max_width.saturating_sub(prefix_w);
+
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(indent.to_string(), base),
+        Span::styled(line_str, line_style),
+    ];
+
+    // Truncate the preview from the right when it overflows; drop match indices that fall past
+    // the cut. Centering on the first match would be a nicer follow-up; for now long lines just
+    // show their head, which is usually where the interesting prefix is anyway.
+    let truncated: String = preview
+        .chars()
+        .scan(0usize, |w, c| {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if *w + cw > preview_budget {
+                None
+            } else {
+                *w += cw;
+                Some(c)
+            }
+        })
+        .collect();
+    let kept_char_count = truncated.chars().count() as u32;
+    let kept_indices: Vec<u32> = match_indices
+        .iter()
+        .copied()
+        .filter(|&i| i < kept_char_count)
+        .collect();
+
+    if kept_indices.is_empty() {
+        spans.push(Span::styled(truncated, base));
+    } else {
+        let mut current = String::new();
+        let mut current_is_match = false;
+        let mut idx_iter = kept_indices.iter().copied().peekable();
+        for (ci, ch) in truncated.chars().enumerate() {
+            let is_match = idx_iter.peek().copied() == Some(ci as u32);
+            if is_match {
+                idx_iter.next();
+            }
+            if is_match != current_is_match && !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    if current_is_match { match_style } else { base },
+                ));
+            }
+            current_is_match = is_match;
+            current.push(ch);
+        }
+        if !current.is_empty() {
+            spans.push(Span::styled(
+                current,
+                if current_is_match { match_style } else { base },
+            ));
+        }
     }
     spans
 }

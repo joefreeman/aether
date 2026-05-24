@@ -3,7 +3,7 @@
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::viewport::ScrollPosition;
-use crate::{BufferId, Revision};
+use crate::{BufferId, LogicalPosition, Revision};
 use serde::{Deserialize, Serialize};
 
 // ---- buffer/open --------------------------------------------------------------------------------
@@ -31,6 +31,12 @@ pub struct BufferOpenParams {
     /// `buffer/save`. When `false` (the default) the server errors if the file is missing.
     #[serde(default)]
     pub create_if_missing: bool,
+    /// Place the cursor here after opening, overriding any persisted `CursorState` for this
+    /// `(client, buffer)`. Coordinates follow the same conventions as the rest of the protocol
+    /// (0-based line, 0-based byte col); out-of-range values are clamped (line to the last line,
+    /// col to the line's end). Used by the grep picker to open + jump in one round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_to: Option<LogicalPosition>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

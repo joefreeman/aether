@@ -9,7 +9,7 @@
 
 use crate::workspace_index::CachedFile;
 use aether_protocol::picker::{PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams};
-use aether_protocol::BufferId;
+use aether_protocol::{BufferId, LogicalPosition};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::sync::Arc;
@@ -26,6 +26,27 @@ pub struct BufferCandidate {
     pub dirty: bool,
 }
 
+/// One grep-picker candidate. One per *match* (a line with N matches yields N candidates), in
+/// the order ripgrep emitted them — walker order, then line order within each file.
+#[derive(Debug, Clone)]
+pub struct GrepHitCandidate {
+    /// Project-relative display path. Stored separately from `abs` so the picker can render
+    /// without re-resolving against project roots on every push.
+    pub display_path: String,
+    /// Absolute canonical path. Returned via `PickerSelectResult::FileAt` for the client to feed
+    /// into `buffer/open`.
+    pub abs_path: String,
+    /// 0-based line number within the file.
+    pub line: u32,
+    /// 0-based byte offset of the match's first byte within the line.
+    pub col: u32,
+    /// The full text of the matching line (trailing newline trimmed). Used as the haystack for
+    /// match-indices and as the preview shown in the picker row.
+    pub preview: String,
+    /// Char offsets into `preview` covered by the match.
+    pub match_indices: Vec<u32>,
+}
+
 /// The candidate set a `PickerState` is matching against. Per-kind variant keeps the candidate
 /// data shape strict — selecting an item of the wrong kind out of a Files picker is a type
 /// error, not a runtime branch.
@@ -36,6 +57,9 @@ pub enum PickerCandidates {
     Files(Arc<Vec<CachedFile>>),
     /// Open buffers in MRU order (most-recent first). Cheap to rebuild — small N, no I/O.
     Buffers(Vec<BufferCandidate>),
+    /// Grep matches in walker + line order. Grows as the streaming search runs; rerank is a
+    /// no-op (the query is the search, so the candidate set already *is* the match set).
+    Grep(Vec<GrepHitCandidate>),
 }
 
 impl PickerCandidates {
@@ -43,6 +67,7 @@ impl PickerCandidates {
         match self {
             PickerCandidates::Files(v) => v.len(),
             PickerCandidates::Buffers(v) => v.len(),
+            PickerCandidates::Grep(v) => v.len(),
         }
     }
 
@@ -50,18 +75,23 @@ impl PickerCandidates {
         match self {
             PickerCandidates::Files(_) => PickerKind::Files,
             PickerCandidates::Buffers(_) => PickerKind::Buffers,
+            PickerCandidates::Grep(_) => PickerKind::Grep,
         }
     }
 
-    /// Haystack string used for fuzzy matching at index `idx`.
+    /// Haystack string used for fuzzy matching at index `idx`. For Grep this is the preview but
+    /// it's only consulted by the fuzzy matcher, which we skip for Grep.
     pub fn display_at(&self, idx: usize) -> &str {
         match self {
             PickerCandidates::Files(v) => &v[idx].display,
             PickerCandidates::Buffers(v) => &v[idx].display,
+            PickerCandidates::Grep(v) => &v[idx].preview,
         }
     }
 
-    /// Build the protocol-level `PickerItem` for candidate `idx` with the given match indices.
+    /// Build the protocol-level `PickerItem` for candidate `idx`. `match_indices` is supplied by
+    /// the fuzzy matcher for Files/Buffers and ignored for Grep (the candidate already carries
+    /// the ripgrep-computed match positions, which we use verbatim).
     pub fn make_item(&self, idx: usize, match_indices: Vec<u32>) -> PickerItem {
         match self {
             PickerCandidates::Files(v) => PickerItem::File {
@@ -77,6 +107,16 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::Grep(v) => {
+                let c = &v[idx];
+                PickerItem::GrepHit {
+                    path: c.display_path.clone(),
+                    line: c.line,
+                    col: c.col,
+                    preview: c.preview.clone(),
+                    match_indices: c.match_indices.clone(),
+                }
+            }
         }
     }
 
@@ -90,6 +130,14 @@ impl PickerCandidates {
             (PickerCandidates::Buffers(v), PickerItem::Buffer { buffer_id, .. }) => {
                 v.iter().position(|c| c.buffer_id == *buffer_id)
             }
+            (
+                PickerCandidates::Grep(v),
+                PickerItem::GrepHit {
+                    path, line, col, ..
+                },
+            ) => v.iter().position(|c| {
+                c.display_path == *path && c.line == *line && c.col == *col
+            }),
             _ => None,
         }
     }
@@ -103,6 +151,16 @@ impl PickerCandidates {
             PickerCandidates::Buffers(v) => PickerSelectResult::Buffer {
                 buffer_id: v[idx].buffer_id,
             },
+            PickerCandidates::Grep(v) => {
+                let c = &v[idx];
+                PickerSelectResult::FileAt {
+                    path: c.abs_path.clone(),
+                    position: LogicalPosition {
+                        line: c.line,
+                        col: c.col,
+                    },
+                }
+            }
         }
     }
 }
@@ -121,6 +179,11 @@ pub struct PickerState {
     pub candidates: PickerCandidates,
     /// `Some` while the client has the picker open and is receiving pushes. `None` after `hide`.
     pub subscribed: Option<SubscribedWindow>,
+    /// Grep only: the query whose walk last completed (`ticking: false` push went out). When the
+    /// next `picker/query` arrives with the same string, the candidates are still valid — skip
+    /// the wipe + respawn and just re-emit the current window. Cleared whenever a new search
+    /// starts; set by the streaming coordinator's final-push branch.
+    pub last_completed_query: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +203,7 @@ impl PickerState {
             ranked,
             candidates,
             subscribed: None,
+            last_completed_query: None,
         }
     }
 
@@ -147,6 +211,12 @@ impl PickerState {
     /// "small" workspaces (< ~50k files in benchmarks); revisit if we ever need to stream.
     pub fn rerank(&mut self, matcher: &mut Matcher) {
         self.ranked.clear();
+        // Grep: candidates *are* the matches (ripgrep already ranked them by walker + line
+        // order). Preserve that order regardless of query.
+        if matches!(self.candidates, PickerCandidates::Grep(_)) {
+            self.ranked.extend(0..self.candidates.len() as u32);
+            return;
+        }
         if self.query.is_empty() {
             // Empty query → preserve the candidate set's natural order. For Files that's
             // alphabetical (set by the walker); for Buffers it's MRU (set by the rebuild).
@@ -189,7 +259,10 @@ impl PickerState {
         let total = self.ranked.len() as u32;
         let start = offset.min(total);
         let end = start.saturating_add(limit).min(total);
-        let pattern = if !self.query.is_empty() {
+        // Grep candidates carry their own match indices (ripgrep-computed) — bypass the fuzzy
+        // matcher and let `make_item` clone them straight through.
+        let is_grep = matches!(self.candidates, PickerCandidates::Grep(_));
+        let pattern = if !is_grep && !self.query.is_empty() {
             Some(Pattern::parse(
                 &self.query,
                 CaseMatching::Smart,

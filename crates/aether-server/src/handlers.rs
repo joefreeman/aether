@@ -2,6 +2,7 @@
 
 use crate::cursor as motion;
 use crate::error::RpcError;
+use crate::grep;
 use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
@@ -117,6 +118,32 @@ pub async fn client_hello(
 
 // ---- buffer/open --------------------------------------------------------------------------------
 
+/// Pick the cursor to return from `buffer/open`. When `clamped_jump` is set, build a fresh
+/// point-cursor at that position and persist it into `s.cursors` (overriding any prior state for
+/// this `(client, buffer)`). Otherwise return the previously-persisted cursor or default.
+fn resolve_open_cursor(
+    s: &mut ServerState,
+    client_id: Option<ClientId>,
+    buffer_id: BufferId,
+    clamped_jump: Option<LogicalPosition>,
+) -> CursorState {
+    if let Some(clamped) = clamped_jump {
+        let new = CursorState {
+            position: clamped,
+            anchor: clamped,
+            match_bracket: None,
+        };
+        if let Some(c) = client_id {
+            s.cursors.insert((c, buffer_id), new);
+        }
+        new
+    } else {
+        client_id
+            .and_then(|c| s.cursors.get(&(c, buffer_id)).copied())
+            .unwrap_or_default()
+    }
+}
+
 pub async fn buffer_open(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -136,18 +163,23 @@ pub async fn buffer_open(
             .buffers
             .get(&buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
-        let cursor = client_id
-            .and_then(|c| s.cursors.get(&(c, buffer_id)).copied())
-            .unwrap_or_default();
+        let language = buf.language.clone();
+        let line_count = buf.line_count();
+        let byte_count = buf.byte_count();
+        let revision = buf.revision;
+        let saved_revision = buf.saved_revision();
+        let path = buf.canonical_path.as_ref().map(|p| p.display().to_string());
+        let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
+        let cursor = resolve_open_cursor(&mut s, client_id, buffer_id, clamped_jump);
         let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, buffer_id)).copied());
         let result = BufferOpenResult {
             buffer_id,
-            language: buf.language.clone(),
-            line_count: buf.line_count(),
-            byte_count: buf.byte_count(),
-            revision: buf.revision,
-            saved_revision: buf.saved_revision(),
-            path: buf.canonical_path.as_ref().map(|p| p.display().to_string()),
+            language,
+            line_count,
+            byte_count,
+            revision,
+            saved_revision,
+            path,
             cursor,
             scroll,
         };
@@ -165,9 +197,8 @@ pub async fn buffer_open(
             let mut s = state.lock().await;
             let id = s.allocate_buffer_id();
             let buf = Buffer::scratch(id, params.language.clone());
-            let cursor = client_id
-                .and_then(|c| s.cursors.get(&(c, id)).copied())
-                .unwrap_or_default();
+            let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
+            let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump);
             let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, id)).copied());
             let result = BufferOpenResult {
                 buffer_id: id,
@@ -249,17 +280,21 @@ pub async fn buffer_open(
         }
         if let Some(existing) = s.buffer_for_path(&canonical) {
             let buf = &s.buffers[&existing];
-            let cursor = client_id
-                .and_then(|c| s.cursors.get(&(c, existing)).copied())
-                .unwrap_or_default();
+            let language = buf.language.clone();
+            let line_count = buf.line_count();
+            let byte_count = buf.byte_count();
+            let revision = buf.revision;
+            let saved_revision = buf.saved_revision();
+            let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
+            let cursor = resolve_open_cursor(&mut s, client_id, existing, clamped_jump);
             let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, existing)).copied());
             let result = BufferOpenResult {
                 buffer_id: existing,
-                language: buf.language.clone(),
-                line_count: buf.line_count(),
-                byte_count: buf.byte_count(),
-                revision: buf.revision,
-                saved_revision: buf.saved_revision(),
+                language,
+                line_count,
+                byte_count,
+                revision,
+                saved_revision,
                 path: Some(canonical.display().to_string()),
                 cursor,
                 scroll,
@@ -282,12 +317,11 @@ pub async fn buffer_open(
     } else {
         Buffer::load_from_file(id, canonical.clone()).map_err(RpcError::file_io)?
     };
+    let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
     // First-time open of this buffer: no prior cursor or scroll to surface — but the client could
     // already have one if a previous server-side session allocated state. Look it up anyway for
     // consistency with the reopen path.
-    let cursor = client_id
-        .and_then(|c| s.cursors.get(&(c, id)).copied())
-        .unwrap_or_default();
+    let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump);
     let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, id)).copied());
     let result = BufferOpenResult {
         buffer_id: id,
@@ -4207,7 +4241,7 @@ fn refresh_buffer_pickers(s: &mut ServerState) -> Vec<(mpsc::Sender<Notification
     pushes
 }
 
-fn picker_update_notif(params: PickerUpdateParams) -> Notification {
+pub(crate) fn picker_update_notif(params: PickerUpdateParams) -> Notification {
     Notification {
         jsonrpc: JsonRpc,
         method: PickerUpdate::NAME.into(),
@@ -4240,7 +4274,8 @@ pub async fn picker_view(
     let client_id = ctx.require_hello()?;
 
     // Build candidates outside the mutation phase. Files needs an async workspace walk;
-    // Buffers reads ServerState directly.
+    // Buffers reads ServerState directly. Grep starts empty — the candidate set is generated
+    // on demand by `picker/query`'s spawned search.
     let candidates = match params.kind {
         PickerKind::Files => {
             // Walk the workspace outside the global lock — on first call it can take seconds.
@@ -4255,6 +4290,7 @@ pub async fn picker_view(
             let s = state.lock().await;
             picker_state::PickerCandidates::Buffers(build_buffer_candidates(&s, client_id))
         }
+        PickerKind::Grep => picker_state::PickerCandidates::Grep(Vec::new()),
     };
 
     let mut s = state.lock().await;
@@ -4275,14 +4311,20 @@ pub async fn picker_view(
         let p = pickers.get_mut(&key).expect("just checked");
         // Files: the workspace index returns the same `Arc` until a refresh — skip the
         // rerank in that case. Buffers: the candidate set is fresh each call, always re-bind.
-        let same_snapshot = matches!(
-            (&p.candidates, &candidates),
+        // Grep: the persisted candidates *are* the prior search results — keep them on resume
+        // (the caller passed an empty placeholder). Discard them only on `reset`, which was
+        // handled by the `pickers.remove(&key)` call above.
+        let preserve_existing = match (&p.candidates, &candidates) {
             (
                 picker_state::PickerCandidates::Files(a),
                 picker_state::PickerCandidates::Files(b),
-            ) if Arc::ptr_eq(a, b)
-        );
-        if !same_snapshot {
+            ) => Arc::ptr_eq(a, b),
+            (picker_state::PickerCandidates::Grep(_), picker_state::PickerCandidates::Grep(_)) => {
+                true
+            }
+            _ => false,
+        };
+        if !preserve_existing {
             p.candidates = candidates;
             p.rerank(matcher);
         }
@@ -4344,9 +4386,28 @@ pub async fn picker_query(
         // matches the lenient style of other handlers.
         return Ok(());
     };
+    // Grep cache: if the query matches the one whose walk last completed, the existing
+    // candidates are still valid. Bump generation (so any in-flight worker from a prior query
+    // bails on its next batch) but skip the wipe + respawn. The initial push built below will
+    // carry the cached items.
+    let grep_cache_hit = matches!(params.kind, PickerKind::Grep)
+        && picker.last_completed_query.as_deref() == Some(params.query.as_str());
     picker.query = params.query;
     picker.generation = params.generation;
-    picker.rerank(matcher);
+    match params.kind {
+        // Grep: the query *is* the search. On a cache miss, drop any prior results and let the
+        // spawned worker (kicked off below, outside the lock) repopulate. On a cache hit, leave
+        // candidates intact. Either way, the generation bump above invalidates any in-flight
+        // worker from a previous query.
+        PickerKind::Grep => {
+            if !grep_cache_hit {
+                picker.candidates = picker_state::PickerCandidates::Grep(Vec::new());
+                picker.ranked.clear();
+                picker.last_completed_query = None;
+            }
+        }
+        _ => picker.rerank(matcher),
+    }
 
     // After a query change, the prior `offset` may now be past the end of the result set. Clamp.
     if let Some(window) = picker.subscribed.as_mut() {
@@ -4356,12 +4417,36 @@ pub async fn picker_query(
         }
     }
 
-    let update = picker_state::build_update(picker, matcher);
+    let mut update = picker_state::build_update(picker, matcher);
+    let query_for_grep = picker.query.clone();
+    let generation = picker.generation;
+    let will_spawn_grep_search = matches!(params.kind, PickerKind::Grep)
+        && query_for_grep.len() >= grep::MIN_QUERY_LEN
+        && !grep_cache_hit;
+    // Mark the initial push as ticking when we're about to spawn the search. Without this the
+    // client would briefly see "0 hits, search finished" between sending the query and the
+    // coordinator's first batch landing.
+    if will_spawn_grep_search {
+        if let Some(ref mut u) = update {
+            u.ticking = true;
+        }
+    }
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
+    let workspace_index_for_grep = if matches!(params.kind, PickerKind::Grep) {
+        Some(s.workspace_index.clone())
+    } else {
+        None
+    };
     drop(s);
 
     if let (Some(sender), Some(params)) = (outbound, update) {
         let _ = sender.send(picker_update_notif(params)).await;
+    }
+
+    if will_spawn_grep_search {
+        let workspace_index = workspace_index_for_grep.expect("set when kind == Grep");
+        let files = workspace_index.files().await;
+        grep::spawn_search(state.clone(), files, client_id, query_for_grep, generation);
     }
     Ok(())
 }

@@ -51,6 +51,9 @@ directories.workspace = true
 unicode-width.workspace = true
 nucleo-matcher.workspace = true
 ignore.workspace = true
+grep-searcher.workspace = true
+grep-regex.workspace = true
+grep-matcher.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

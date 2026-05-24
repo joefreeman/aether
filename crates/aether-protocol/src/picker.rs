@@ -10,7 +10,7 @@
 //! subscribed window's contents change or the matcher snapshot ticks.
 
 use crate::envelope::{NotificationMethod, RpcMethod};
-use crate::BufferId;
+use crate::{BufferId, LogicalPosition};
 use serde::{Deserialize, Serialize};
 
 /// Which picker the client is talking about. Keyed `(client_id, kind)` server-side; only one
@@ -23,6 +23,12 @@ pub enum PickerKind {
     /// Open buffers, ordered by most-recently-used. The current buffer sits at position 0 and
     /// selecting it is a no-op switch.
     Buffers,
+    /// Workspace-wide content search. Each candidate is a single match on a single line; the
+    /// query *is* the search (no fuzzy filtering on a pre-built candidate set), so query changes
+    /// throw out the prior candidates and start a fresh scan. Persisted hits stay around across
+    /// `hide`/`view` so the user can step through results — they may be stale relative to the
+    /// file on disk after editing, and that's accepted (jumps clamp to the current line bounds).
+    Grep,
 }
 
 /// A pickable item. Tagged enum so different pickers can carry the data they need; match-index
@@ -47,6 +53,23 @@ pub enum PickerItem {
         display: String,
         dirty: bool,
         /// Indices into `display` (char offsets) covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One match found by the grep picker. Identity is `(path, line, col)`. One row per match
+    /// (a line with N matches produces N hits) — keeps `match_indices` a flat list within the
+    /// preview, same as the other variants.
+    GrepHit {
+        /// Project-relative path of the file the match lives in (forward-slash separated).
+        path: String,
+        /// 0-based line number within the file.
+        line: u32,
+        /// 0-based byte offset of the match's first byte within the line.
+        col: u32,
+        /// The full text of the matching line, trimmed of its trailing newline. May be truncated
+        /// at the client side to fit the picker pane.
+        preview: String,
+        /// Char offsets into `preview` covered by the match.
         #[serde(default)]
         match_indices: Vec<u32>,
     },
@@ -138,8 +161,9 @@ pub struct PickerSelectParams {
 
 /// Per-kind action result. For `Files`, the canonical absolute path the client should open
 /// (via `buffer/open`). For `Buffers`, the `buffer_id` the client should attach to (via
-/// `buffer/open { buffer_id }`). The picker handler doesn't perform the switch itself — that's
-/// the client's job, same as the file browser flow.
+/// `buffer/open { buffer_id }`). For `Grep`, the canonical absolute path plus the position to
+/// jump to (client opens via `buffer/open { jump_to }`). The picker handler doesn't perform the
+/// switch itself — that's the client's job, same as the file browser flow.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PickerSelectResult {
@@ -149,6 +173,13 @@ pub enum PickerSelectResult {
     },
     Buffer {
         buffer_id: BufferId,
+    },
+    FileAt {
+        /// Absolute canonical path on disk.
+        path: String,
+        /// Position to land the cursor on. Coordinates may be stale if the file changed since the
+        /// hit was recorded; the server clamps in `buffer/open` when applying.
+        position: LogicalPosition,
     },
 }
 

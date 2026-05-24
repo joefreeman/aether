@@ -424,6 +424,7 @@ pub async fn bootstrap(
                 relative_path: Some(f.into()),
                 language: None,
                 create_if_missing: false,
+                jump_to: None,
             },
         )
         .await?;
@@ -444,6 +445,7 @@ pub async fn bootstrap(
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await?;
@@ -554,6 +556,7 @@ pub async fn run(
         }
         apply_pending_notifications(state, client);
         flush_pending_scroll(client, state).await?;
+        flush_pending_picker_scroll(client, state).await?;
         terminal.draw(|f| ui::draw(f, state))?;
     }
     Ok(())
@@ -637,7 +640,7 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
     } else if n.method == PickerUpdate::NAME {
         match serde_json::from_value::<PickerUpdateParams>(n.params) {
             Ok(p) => {
-                state.picker.apply_update(
+                let applied = state.picker.apply_update(
                     p.kind,
                     p.generation,
                     p.offset,
@@ -646,6 +649,12 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
                     p.total_candidates,
                     p.ticking,
                 );
+                // `apply_update` may snap `selected` (resume re-anchor, or `pending_offset`
+                // reconciliation) without touching `visible_start`. Slide the window now so the
+                // highlight is on-screen on first draw, not only after the user presses arrow keys.
+                if applied {
+                    ensure_picker_selected_visible(state);
+                }
             }
             Err(e) => state.status = format!("bad picker/update params: {e}"),
         }
@@ -1279,9 +1288,8 @@ async fn handle_leader_key(
     let (code, mods) = normalize_key(k);
     let alt_only: KeyModifiers = KeyModifiers::ALT;
     match (leader, code, mods) {
-        // `Space f` — open the file picker, resuming the prior query + highlight if any. The
-        // server treats absent state as a fresh picker, so first-ever open just works. Clear the
-        // query mid-picker with `Ctrl-u`; close (retaining state) with `Esc`.
+        // `Space f` — open the file picker. Resumes the prior query + highlight + scroll
+        // position; first-ever open is empty.
         (PendingLeader::Space, KeyCode::Char('f'), m) if m == KeyModifiers::NONE => {
             open_picker(client, state, PickerKind::Files).await?;
         }
@@ -1290,6 +1298,13 @@ async fn handle_leader_key(
         // without going through the file browser.
         (PendingLeader::Space, KeyCode::Char('b'), m) if m == KeyModifiers::NONE => {
             open_picker(client, state, PickerKind::Buffers).await?;
+        }
+        // `Space g` — open the grep picker. Pre-fills the input from the active buffer's search
+        // query (so workspace-search continues the in-buffer search), falling back to the last
+        // grep query, then empty. Same-query reopens hit the server-side cache and appear
+        // instantly; a different query reruns the search.
+        (PendingLeader::Space, KeyCode::Char('g'), m) if m == KeyModifiers::NONE => {
+            open_picker(client, state, PickerKind::Grep).await?;
         }
         // ---- app-level meta actions ----
         // These used to live under Ctrl-, but `Ctrl` is reserved for buffer-content edits.
@@ -1323,55 +1338,113 @@ async fn handle_leader_key(
 }
 
 /// How many result rows the picker overlay can fit, given the current buffer-area dimensions.
-/// Delegates to the ui module so the box geometry stays in one place.
-fn picker_limit(state: &AppState) -> u32 {
+/// Delegates to the ui module so the box geometry stays in one place. Distinct from the fetch
+/// limit (see `PICKER_OVER_FETCH` below): the renderer shows this many rows, but we ask the
+/// server for several pane-heights' worth so scrolling stays client-side.
+fn picker_pane_rows(state: &AppState) -> u32 {
     crate::ui::picker_result_rows(state.viewport_cols, state.viewport_rows).max(1)
 }
 
-async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind) -> Result<()> {
-    let limit = picker_limit(state);
-    // The Buffers picker always opens fresh — empty query, top of the MRU list. Its job is
-    // "switch to a recent buffer right now", not "resume a search session"; persisting the
-    // previous filter would force the user to clear it each time. The Files picker keeps its
-    // resume-on-reopen behavior since file browsing is more exploratory.
-    let preserves_state = kind_preserves_state(kind);
-    let center_on = if preserves_state {
+/// Over-fetch factor: we ask the server for `pane_rows * PICKER_OVER_FETCH` items so the user
+/// can scroll several pages within the local cache before we have to round-trip for more. Higher
+/// = fewer refetches but bigger pushes; 4× empirically covers the common case (scroll through a
+/// page or two looking for a hit) without bloating updates.
+const PICKER_OVER_FETCH: u32 = 4;
+
+fn picker_fetch_limit(state: &AppState) -> u32 {
+    picker_pane_rows(state) * PICKER_OVER_FETCH
+}
+
+async fn open_picker(
+    client: &mut Client,
+    state: &mut AppState,
+    kind: PickerKind,
+) -> Result<()> {
+    let pane_rows = picker_pane_rows(state);
+    let limit = picker_fetch_limit(state);
+    // Resume the previously highlighted item for kinds that preserve state (Files, Grep). The
+    // Buffers picker always opens fresh — it's "switch to a recent buffer right now", and
+    // `kind_preserves_state` keeps it from saving on hide/select either.
+    let saved = if kind_preserves_state(kind) {
         state.picker.last_selected.get(&kind).cloned()
     } else {
         None
     };
+    let (center_on, resume_row_offset) = match saved {
+        Some((item, off)) => (Some(item), Some(off)),
+        None => (None, None),
+    };
     let view = client
         .rpc::<PickerView>(PickerViewParams {
             kind,
-            reset: !preserves_state,
+            reset: !kind_preserves_state(kind),
             offset: 0,
             limit,
             center_on: center_on.clone(),
         })
         .await?;
+    // For grep, prefer the active buffer's search query as the input prefill. The server already
+    // remembers the last grep query (returned via `view.query`), which becomes the fallback when
+    // no buffer search is active — so we never need a client-side stash. If our prefill differs
+    // from what the server has, we sync below by sending a `picker/query`; a matching prefill
+    // short-circuits to the resume path (cached candidates, no extra RPC).
+    let grep_prefill: Option<String> = if kind == PickerKind::Grep {
+        compute_grep_prefill(state)
+    } else {
+        None
+    };
+    let initial_query = grep_prefill
+        .clone()
+        .unwrap_or_else(|| view.query.clone());
+
     state.picker.open = true;
     state.picker.kind = Some(kind);
-    state.picker.query.set(view.query);
+    state.picker.query.set(initial_query);
     state.picker.generation = view.generation;
     state.picker.offset = view.effective_offset;
     state.picker.limit = limit;
+    state.picker.pane_rows = pane_rows;
     state.picker.items.clear();
+    state.picker.visible_start = 0;
     state.picker.total_matches = 0;
     state.picker.total_candidates = view.total_candidates;
     state.picker.ticking = true;
     state.picker.selected = 0;
     state.picker.resume_target = center_on;
+    state.picker.resume_row_offset = resume_row_offset;
+    state.picker.pending_offset = None;
     apply_cursor_style(state);
+
+    // Push the prefill to the server only when it actually changes the active query. Cache hit
+    // on the server side (`last_completed_query == prefill`) makes this a near-no-op for
+    // "buffer search query already matches last grep query"; otherwise a fresh search runs.
+    if let Some(prefill) = grep_prefill {
+        if prefill != view.query {
+            send_picker_query(client, state).await?;
+        }
+    }
     Ok(())
 }
 
-/// Whether a picker kind retains query + highlighted-item across hide/show. The Buffers picker
-/// doesn't — opening it should always land on the MRU top (i.e. the current buffer), with no
-/// filter active.
+/// Compute the prefill string for `Space g` from the active buffer's committed search query.
+/// Returns `None` when no buffer is attached or no search is active; in that case the caller
+/// falls back to whatever the server's grep picker last had (`PickerViewResult::query`).
+fn compute_grep_prefill(state: &AppState) -> Option<String> {
+    let ed = state.try_editor()?;
+    if !ed.search.active || ed.search.query.is_empty() {
+        return None;
+    }
+    Some(ed.search.query.text.clone())
+}
+
+/// Whether a picker kind saves its highlight on hide/select so a later `Space Alt-{f,g}` resume
+/// can restore it. The Buffers picker doesn't — there's no resume binding for it, and it's
+/// designed around "switch to a recent buffer right now" rather than session continuity.
 fn kind_preserves_state(kind: PickerKind) -> bool {
     match kind {
         PickerKind::Files => true,
         PickerKind::Buffers => false,
+        PickerKind::Grep => true,
     }
 }
 
@@ -1380,30 +1453,40 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
     match (k.code, k.modifiers) {
         (KeyCode::Esc, _) => hide_picker(client, state).await?,
         (KeyCode::Enter, _) => select_picker_item(client, state).await?,
-        (KeyCode::Up, _) => picker_move_selection(client, state, -1).await?,
-        (KeyCode::Down, _) => picker_move_selection(client, state, 1).await?,
+        // `Alt-k` / `Alt-j` move the highlight up / down. Arrow keys are intentionally not bound
+        // — modal navigation keeps the hand on the home row, matching the editor's vim-style
+        // motions. The `Alt` modifier separates them from raw `j`/`k` typed into the query.
+        (KeyCode::Char('k'), m) if m == KeyModifiers::ALT => {
+            picker_move_selection(client, state, -1).await?
+        }
+        (KeyCode::Char('j'), m) if m == KeyModifiers::ALT => {
+            picker_move_selection(client, state, 1).await?
+        }
         (KeyCode::PageUp, _) => {
-            let step = -(state.picker.limit as i64);
+            let step = -(state.picker.pane_rows as i64);
             picker_move_selection(client, state, step).await?;
         }
         (KeyCode::PageDown, _) => {
-            let step = state.picker.limit as i64;
+            let step = state.picker.pane_rows as i64;
             picker_move_selection(client, state, step).await?;
         }
-        // `Ctrl-u` — wipe the query without leaving the picker. The currently-highlighted item
-        // is preserved as the resume anchor so the cursor stays on it once the broader (empty-
-        // query) result set re-pushes, rather than snapping to the top.
-        (KeyCode::Char('u'), m) if m == CTRL_ONLY => {
+        // `Alt-Backspace` — wipe the query without leaving the picker. The currently-highlighted
+        // item is preserved as the resume anchor so the cursor stays on it once the broader
+        // (empty-query) result set re-pushes, rather than snapping to the top.
+        (KeyCode::Backspace, m) if m == KeyModifiers::ALT => {
             if !state.picker.query.is_empty() {
                 let anchor = state.picker.highlighted().cloned();
+                let anchor_row =
+                    state.picker.selected.saturating_sub(state.picker.visible_start);
                 state.picker.query.clear();
                 send_picker_query(client, state).await?;
+                state.picker.resume_row_offset = anchor.as_ref().map(|_| anchor_row);
                 state.picker.resume_target = anchor;
             }
         }
         (KeyCode::Left, _) => state.picker.query.move_left(),
         (KeyCode::Right, _) => state.picker.query.move_right(),
-        (KeyCode::Backspace, _) => {
+        (KeyCode::Backspace, m) if m.is_empty() => {
             if !state.picker.query.is_empty() {
                 state.picker.query.backspace();
                 send_picker_query(client, state).await?;
@@ -1438,42 +1521,135 @@ async fn handle_picker_mouse(
 /// Move selection by `delta` rows. Negative = up. When the move falls off the visible window, we
 /// slide the server-side window via `picker/view` so the highlighted item stays in range.
 async fn picker_move_selection(
-    client: &mut Client,
+    _client: &mut Client,
     state: &mut AppState,
     delta: i64,
 ) -> Result<()> {
     // A user-driven move cancels any pending resume re-anchor.
     state.picker.resume_target = None;
+    state.picker.resume_row_offset = None;
 
     let items_len = state.picker.items.len();
     if items_len == 0 {
         return Ok(());
     }
-    let new_local = (state.picker.selected as i64 + delta).clamp(0, items_len as i64 - 1);
-    state.picker.selected = new_local as usize;
+    let pane_rows = state.picker.pane_rows.max(1) as usize;
 
-    // If we're sitting at the top/bottom of the window and the user keeps pushing in that
-    // direction, slide the window by requesting a fresh view at a shifted offset.
-    let at_top = state.picker.selected == 0 && state.picker.offset > 0 && delta < 0;
-    let at_bottom_of_window = state.picker.selected + 1 == items_len
-        && (state.picker.offset as usize) + items_len < state.picker.total_matches as usize
-        && delta > 0;
-    if at_top || at_bottom_of_window {
-        let step = delta.unsigned_abs() as u32;
-        let new_offset = if delta < 0 {
-            state.picker.offset.saturating_sub(step)
-        } else {
-            (state.picker.offset + step).min(
-                state
-                    .picker
-                    .total_matches
-                    .saturating_sub(state.picker.limit),
-            )
-        };
-        if new_offset != state.picker.offset {
-            request_picker_window(client, state, new_offset).await?;
+    // Update `selected` within the local cache. Then slide `visible_start` to keep `selected`
+    // on-screen — that's the cheap part, no RPC required.
+    let new_selected = (state.picker.selected as i64 + delta).clamp(0, items_len as i64 - 1);
+    state.picker.selected = new_selected as usize;
+    ensure_picker_selected_visible(state);
+
+    // Refetch trigger: when the visible window is within a pane's worth of the cache edge AND
+    // there are more results past it, queue a `pending_offset` shift so `flush_pending_picker_scroll`
+    // fires one RPC. The shift is sized to keep ~half the cache as history on the trailing side,
+    // so backward-scroll right after the refetch also stays local.
+    let kind = state.picker.kind;
+    let cache_end = items_len;
+    let server_more_forward =
+        (state.picker.offset as usize) + cache_end < state.picker.total_matches as usize;
+    let server_more_backward = state.picker.offset > 0;
+    let visible_count = crate::ui::picker_visible_item_count_from(
+        &state.picker.items,
+        state.picker.visible_start,
+        pane_rows,
+        kind,
+    );
+    let visible_end = state.picker.visible_start + visible_count;
+    let near_forward_edge = visible_end + pane_rows >= cache_end;
+    let near_backward_edge = state.picker.visible_start < pane_rows;
+
+    if delta > 0 && near_forward_edge && server_more_forward {
+        // Slide the cache forward by roughly half the over-fetch buffer; that way we keep a few
+        // pages of history (so a small backtrack doesn't re-RPC) while still extending the
+        // forward runway.
+        let shift = state
+            .picker
+            .limit
+            .saturating_sub(state.picker.pane_rows)
+            .max(state.picker.pane_rows);
+        let max_offset = state
+            .picker
+            .total_matches
+            .saturating_sub(state.picker.limit);
+        let target = (state.picker.offset + shift).min(max_offset);
+        if target != state.picker.offset {
+            state.picker.pending_offset = Some(target);
+        }
+    } else if delta < 0 && near_backward_edge && server_more_backward {
+        let shift = state
+            .picker
+            .limit
+            .saturating_sub(state.picker.pane_rows)
+            .max(state.picker.pane_rows);
+        let target = state.picker.offset.saturating_sub(shift);
+        if target != state.picker.offset {
+            state.picker.pending_offset = Some(target);
         }
     }
+    Ok(())
+}
+
+/// Adjust `visible_start` so `selected` is within the rendered window. Cheap and runs on every
+/// move — keeps the highlight on-screen as the user navigates the local cache, without any RPC.
+fn ensure_picker_selected_visible(state: &mut AppState) {
+    let pane_rows = state.picker.pane_rows.max(1) as usize;
+    let items = &state.picker.items;
+    let kind = state.picker.kind;
+
+    // Selected scrolled above the visible window — snap visible_start to it.
+    if state.picker.selected < state.picker.visible_start {
+        state.picker.visible_start = state.picker.selected;
+        return;
+    }
+    // Selected scrolled past the visible window — advance visible_start one row at a time until
+    // selected is the last visible item. For grep the visible count depends on the slice's
+    // header pattern, so we recompute each step rather than doing the math analytically.
+    loop {
+        let count =
+            crate::ui::picker_visible_item_count_from(items, state.picker.visible_start, pane_rows, kind);
+        let end = state.picker.visible_start + count;
+        if state.picker.selected < end {
+            break;
+        }
+        if state.picker.visible_start + 1 >= items.len() {
+            break;
+        }
+        state.picker.visible_start += 1;
+    }
+}
+
+/// Send the latest pending picker refetch, if any. Called from the main loop after each
+/// event-drain batch so trackpad / held-arrow bursts collapse into one RPC. We keep
+/// `pending_offset` set across the await — `apply_update` clears it when the matching push
+/// lands and shifts `visible_start` / `selected` so the user's spot in the result set is
+/// preserved across the cache swap.
+async fn flush_pending_picker_scroll(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(target) = state.picker.pending_offset else {
+        return Ok(());
+    };
+    if target == state.picker.offset {
+        state.picker.pending_offset = None;
+        return Ok(());
+    }
+    let Some(kind) = state.picker.kind else {
+        state.picker.pending_offset = None;
+        return Ok(());
+    };
+    let limit = state.picker.limit;
+    let view = client
+        .rpc::<PickerView>(PickerViewParams {
+            kind,
+            reset: false,
+            offset: target,
+            limit,
+            center_on: None,
+        })
+        .await?;
+    // The server may have clamped `target` (e.g. past EOF). Update `pending_offset` so the
+    // arriving push (which carries `effective_offset`) is recognized by `apply_update`.
+    state.picker.pending_offset = Some(view.effective_offset);
     Ok(())
 }
 
@@ -1484,9 +1660,12 @@ async fn send_picker_query(client: &mut Client, state: &mut AppState) -> Result<
     state.picker.generation = state.picker.generation.wrapping_add(1);
     state.picker.offset = 0;
     state.picker.selected = 0;
+    state.picker.visible_start = 0;
+    state.picker.pending_offset = None;
     state.picker.ticking = true;
     // Query changes invalidate the resume anchor — the user is steering somewhere new.
     state.picker.resume_target = None;
+    state.picker.resume_row_offset = None;
     client
         .rpc::<PickerQuery>(PickerQueryParams {
             kind,
@@ -1494,35 +1673,6 @@ async fn send_picker_query(client: &mut Client, state: &mut AppState) -> Result<
             generation: state.picker.generation,
         })
         .await?;
-    Ok(())
-}
-
-async fn request_picker_window(
-    client: &mut Client,
-    state: &mut AppState,
-    new_offset: u32,
-) -> Result<()> {
-    let Some(kind) = state.picker.kind else {
-        return Ok(());
-    };
-    let limit = state.picker.limit;
-    let view = client
-        .rpc::<PickerView>(PickerViewParams {
-            kind,
-            reset: false,
-            offset: new_offset,
-            limit,
-            center_on: None,
-        })
-        .await?;
-    state.picker.offset = view.effective_offset;
-    // Pin selection to the edge of the window we just scrolled toward. The follow-up
-    // `picker/update` push will refresh `items`; in the meantime keep the cursor where the user
-    // expects it.
-    if new_offset < view.effective_offset {
-        // Shouldn't happen with our offset math but guard anyway.
-        state.picker.selected = 0;
-    }
     Ok(())
 }
 
@@ -1534,8 +1684,18 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
         return Ok(());
     };
     if kind_preserves_state(kind) {
-        state.picker.last_selected.insert(kind, item.clone());
+        let row_offset = state.picker.selected.saturating_sub(state.picker.visible_start);
+        state.picker.last_selected.insert(kind, (item.clone(), row_offset));
     }
+
+    // Snapshot the picker query before hide/clear — we'll forward it to the opened buffer's
+    // search state when selecting a grep hit.
+    let grep_query: Option<String> = if kind == PickerKind::Grep {
+        let q = state.picker.query.text.clone();
+        if q.is_empty() { None } else { Some(q) }
+    } else {
+        None
+    };
 
     let result = client
         .rpc::<PickerSelect>(PickerSelectParams {
@@ -1549,10 +1709,33 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
 
     match result {
         PickerSelectResult::File { path } => {
-            open_file_in_browser_with_options(client, state, path, false).await?;
+            open_file_in_browser_with_options(client, state, path, false, None).await?;
         }
         PickerSelectResult::Buffer { buffer_id } => {
             attach_buffer(client, state, buffer_id).await?;
+        }
+        PickerSelectResult::FileAt { path, position } => {
+            open_file_in_browser_with_options(client, state, path, false, Some(position)).await?;
+            // For grep selects, prime the new buffer's search with the picker query so the
+            // matches are highlighted and `n` / `Alt-n` step through them. Anchor at the grep
+            // hit's position so the server resolves `current_index` to this match.
+            if let Some(query) = grep_query {
+                if let Some(buffer_id) = state.try_editor().map(|e| e.buffer_id) {
+                    let r = client
+                        .rpc::<SearchSet>(SearchSetParams {
+                            buffer_id,
+                            query: query.clone(),
+                            anchor: Some(position),
+                        })
+                        .await?;
+                    let ed = state.editor_mut();
+                    ed.cursor = r.cursor;
+                    ed.search.summary = Some(r.summary);
+                    ed.search.query.set(query.clone());
+                    ed.search.active = true;
+                    push_history(state, query);
+                }
+            }
         }
     }
     // Whatever the selection did (file open / buffer switch), we land in Editing/Normal.
@@ -1584,6 +1767,7 @@ async fn attach_buffer(
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         })
         .await?;
     subscribe_to_buffer(client, state, open).await
@@ -1600,6 +1784,7 @@ async fn new_scratch(client: &mut Client, state: &mut AppState) -> Result<()> {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         })
         .await?;
     subscribe_to_buffer(client, state, open).await
@@ -1657,9 +1842,17 @@ async fn subscribe_to_buffer(
     state: &mut AppState,
     open: BufferOpenResult,
 ) -> Result<()> {
-    let initial_scroll = open.scroll.unwrap_or(ScrollPosition {
-        logical_line: 0,
-        sub_row: 0.0,
+    // Initial scroll: prefer a restored value (reopen of a buffer we'd seen before), otherwise
+    // centre the viewport on the cursor. For a default cursor at (0,0) that's still line 0; for
+    // a `buffer/open { jump_to }` open (e.g. a grep-picker selection that lands in a file the
+    // user hasn't opened before), this puts the jump destination on-screen instead of leaving
+    // the viewport stuck at the top with the cursor off below.
+    let initial_scroll = open.scroll.unwrap_or_else(|| {
+        let half = state.viewport_rows / 2;
+        ScrollPosition {
+            logical_line: open.cursor.position.line.saturating_sub(half),
+            sub_row: 0.0,
+        }
     });
     // Inherit wrap from the current editor if we have one; otherwise default. Lets `Space b`
     // from the browser land in a freshly subscribed viewport without losing the user's prior
@@ -1705,6 +1898,10 @@ async fn subscribe_to_buffer(
         file_label,
     });
     apply_cursor_style(state);
+    // Cover the case where the restored scroll disagrees with the cursor (e.g. a `jump_to`
+    // override on a buffer we've already opened before, so the stored scroll wasn't computed
+    // around the new cursor). Cheap when the cursor is already visible — no RPC.
+    ensure_cursor_in_window(client, state).await?;
     Ok(())
 }
 
@@ -1734,11 +1931,13 @@ async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
     // so it stops pushing; whether to reset on next open is decided in `open_picker`.
     if kind_preserves_state(kind) {
         if let Some(item) = state.picker.highlighted().cloned() {
-            state.picker.last_selected.insert(kind, item);
+            let row_offset = state.picker.selected.saturating_sub(state.picker.visible_start);
+            state.picker.last_selected.insert(kind, (item, row_offset));
         }
     }
     let _ = client.rpc::<PickerHide>(PickerHideParams { kind }).await;
     state.picker.open = false;
+    state.picker.pending_offset = None;
     apply_cursor_style(state);
     Ok(())
 }
@@ -2057,6 +2256,7 @@ async fn commit_prompt(
                     relative_path: Some(prompt.input.text),
                     language: None,
                     create_if_missing: true,
+                    jump_to: None,
                 })
                 .await?;
             subscribe_to_buffer(client, state, open).await?;
@@ -2095,7 +2295,7 @@ async fn open_file_in_browser(
     state: &mut AppState,
     abs_path: String,
 ) -> Result<()> {
-    open_file_in_browser_with_options(client, state, abs_path, false).await
+    open_file_in_browser_with_options(client, state, abs_path, false, None).await
 }
 
 async fn open_file_in_browser_with_options(
@@ -2103,6 +2303,7 @@ async fn open_file_in_browser_with_options(
     state: &mut AppState,
     abs_path: String,
     create_if_missing: bool,
+    jump_to: Option<aether_protocol::LogicalPosition>,
 ) -> Result<()> {
     // Find a `path_index` + `relative_path` pair the server will accept. Each project path is
     // either a file or a directory; we want the directory that contains the target.
@@ -2127,6 +2328,7 @@ async fn open_file_in_browser_with_options(
             relative_path: Some(relative),
             language: None,
             create_if_missing,
+            jump_to,
         })
         .await?;
     subscribe_to_buffer(client, state, open).await
@@ -2606,7 +2808,8 @@ async fn handle_resize(
     // new `limit`, keeping the current `offset`. The server's next push uses the new window.
     if state.picker.open {
         if let Some(kind) = state.picker.kind {
-            let new_limit = picker_limit(state);
+            let new_pane_rows = picker_pane_rows(state);
+            let new_limit = picker_fetch_limit(state);
             let view = client
                 .rpc::<PickerView>(PickerViewParams {
                     kind,
@@ -2617,6 +2820,7 @@ async fn handle_resize(
                 })
                 .await?;
             state.picker.limit = new_limit;
+            state.picker.pane_rows = new_pane_rows;
             state.picker.offset = view.effective_offset;
         }
     }
@@ -3505,6 +3709,7 @@ async fn commit_new_file_prompt(client: &mut Client, state: &mut AppState) -> Re
             relative_path: Some(relative),
             language: None,
             create_if_missing: true,
+            jump_to: None,
         })
         .await?;
     subscribe_to_buffer(client, state, open).await

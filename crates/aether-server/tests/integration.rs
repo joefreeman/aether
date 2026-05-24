@@ -172,6 +172,7 @@ async fn hello_then_open_file() {
             relative_path: Some("hello.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -195,6 +196,7 @@ async fn hello_then_open_file() {
             relative_path: Some("hello.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -239,6 +241,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
             relative_path: Some("a.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -300,6 +303,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
             relative_path: Some("a.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -348,6 +352,7 @@ async fn buffer_open_isolates_scroll_per_client() {
                 relative_path: Some("a.txt".into()),
                 language: None,
                 create_if_missing: false,
+                jump_to: None,
             },
         )
         .await;
@@ -410,6 +415,7 @@ async fn buffer_open_isolates_scroll_per_client() {
             relative_path: Some("a.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -422,6 +428,7 @@ async fn buffer_open_isolates_scroll_per_client() {
             relative_path: Some("a.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -498,6 +505,7 @@ async fn rejects_path_outside_project() {
                 relative_path: Some("../aether-outside-test.txt".into()),
                 language: None,
                 create_if_missing: false,
+                jump_to: None,
             })
             .unwrap(),
         ),
@@ -546,6 +554,7 @@ async fn viewport_subscribe_renders_window() {
             relative_path: Some("a.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -613,6 +622,7 @@ async fn viewport_subscribe_wraps_long_line() {
             relative_path: Some("long.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -695,6 +705,7 @@ async fn viewport_scroll_returns_new_window() {
             relative_path: Some("many.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -778,6 +789,7 @@ async fn setup_with_buffer(
             relative_path: Some("buf.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1035,6 +1047,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1109,6 +1122,7 @@ async fn match_bracket_motion_jumps_to_pair() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1182,6 +1196,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1243,6 +1258,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1306,6 +1322,7 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1395,6 +1412,7 @@ async fn end_of_unit_works_on_last_function() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1459,6 +1477,7 @@ async fn start_of_unit_extends_back_to_function_start() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1522,6 +1541,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1623,6 +1643,7 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1697,6 +1718,7 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1761,6 +1783,7 @@ async fn nav_motion_jumps_between_top_level_rust_items() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1834,6 +1857,7 @@ async fn nav_motion_prev_walks_backward() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1894,6 +1918,7 @@ async fn nav_motion_noop_at_end_of_file() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1958,6 +1983,7 @@ async fn nav_motion_inside_python_class_finds_next_method() {
             relative_path: Some("a.py".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2022,6 +2048,7 @@ async fn nav_motion_from_last_method_stays_in_class() {
             relative_path: Some("a.py".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2089,6 +2116,7 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
             relative_path: Some("a.py".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2150,6 +2178,7 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
             relative_path: Some("a.html".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2246,6 +2275,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             relative_path: Some("notes.md".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2315,6 +2345,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             relative_path: Some("greet.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2429,6 +2460,7 @@ async fn save_preserves_crlf_endings() {
             relative_path: Some("windows.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2485,6 +2517,7 @@ async fn save_scratch_returns_buffer_has_no_path() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -4996,6 +5029,7 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5054,6 +5088,7 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5121,6 +5156,7 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5176,6 +5212,7 @@ async fn newline_and_indent_engine_python_def() {
             relative_path: Some("a.py".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5232,6 +5269,7 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5286,6 +5324,7 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
             relative_path: Some("a.go".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5368,6 +5407,7 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5426,6 +5466,7 @@ async fn toggle_comment_strips_when_already_commented() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5485,6 +5526,7 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
             relative_path: Some("a.py".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5546,6 +5588,7 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
             relative_path: Some("a.md".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5604,6 +5647,7 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
             relative_path: Some("a.js".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5663,6 +5707,7 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
             relative_path: Some("a.js".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5724,6 +5769,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
             relative_path: Some("a.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5787,6 +5833,7 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
             relative_path: Some("a.js".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5850,6 +5897,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
             relative_path: Some("a.go".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5931,6 +5979,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
             relative_path: Some("a.ts".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -5993,6 +6042,7 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
             relative_path: Some("a.js".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6055,6 +6105,7 @@ async fn toggle_comment_round_trip_partial_selection() {
             relative_path: Some("a.js".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6128,6 +6179,7 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
             relative_path: Some("a.js".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6187,6 +6239,7 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
             relative_path: Some("a.css".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6246,6 +6299,7 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
             relative_path: Some("a.md".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6295,6 +6349,7 @@ async fn toggle_comment_is_noop_for_json() {
             relative_path: Some("a.json".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6867,6 +6922,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             relative_path: Some("README.md".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6879,6 +6935,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             relative_path: Some("src/lib.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6891,6 +6948,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             relative_path: Some("src/main.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6937,6 +6995,7 @@ async fn buffers_picker_select_returns_buffer_id() {
             relative_path: Some("src/main.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -6986,6 +7045,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7000,6 +7060,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
             relative_path: Some("README.md".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7013,6 +7074,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7038,6 +7100,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7081,6 +7144,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             relative_path: Some("src/main.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7167,6 +7231,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             relative_path: Some("src/main.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7258,6 +7323,7 @@ async fn buffers_picker_pushes_on_save() {
             relative_path: Some("src/main.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7340,6 +7406,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7352,6 +7419,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7412,6 +7480,7 @@ async fn buffers_picker_mru_is_per_client() {
             relative_path: Some("README.md".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7424,6 +7493,7 @@ async fn buffers_picker_mru_is_per_client() {
             relative_path: Some("src/lib.rs".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7508,6 +7578,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7567,6 +7638,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7614,6 +7686,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
             relative_path: Some("existing.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7627,6 +7700,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7684,6 +7758,7 @@ async fn save_as_to_same_path_is_in_place_save() {
             relative_path: Some("doc.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7767,6 +7842,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7873,6 +7949,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
             relative_path: Some("file.txt".into()),
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -7963,6 +8040,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
             relative_path: None,
             language: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -8053,11 +8131,11 @@ async fn buffer_close_drops_buffer() {
     }).await;
     let a: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
         buffer_id: None, path_index: Some(0), relative_path: Some("a.txt".into()),
-        language: None, create_if_missing: false,
+        language: None, create_if_missing: false, jump_to: None,
     }).await;
     let b: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
         buffer_id: None, path_index: Some(0), relative_path: Some("b.txt".into()),
-        language: None, create_if_missing: false,
+        language: None, create_if_missing: false, jump_to: None,
     }).await;
     // MRU is [b, a]; closing b should return next = a.
     let r: BufferCloseResult = send_request::<BufferClose>(&mut ws, 4, &BufferCloseParams {
@@ -8067,7 +8145,7 @@ async fn buffer_close_drops_buffer() {
     // Trying to attach to the closed buffer is an error.
     let err = send_request_expect_err::<BufferOpen>(&mut ws, 5, &BufferOpenParams {
         buffer_id: Some(b.buffer_id), path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
+        language: None, create_if_missing: false, jump_to: None,
     }).await;
     assert!(err.contains("unknown buffer_id"), "expected buffer-not-found, got: {err}");
 
@@ -8089,7 +8167,7 @@ async fn buffer_close_last_buffer_returns_none() {
     }).await;
     let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
         buffer_id: None, path_index: Some(0), relative_path: Some("only.txt".into()),
-        language: None, create_if_missing: false,
+        language: None, create_if_missing: false, jump_to: None,
     }).await;
     let r: BufferCloseResult = send_request::<BufferClose>(&mut ws, 3, &BufferCloseParams {
         buffer_id: opened.buffer_id,
@@ -8114,7 +8192,7 @@ async fn buffer_close_drops_viewports() {
     }).await;
     let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
         buffer_id: None, path_index: Some(0), relative_path: Some("a.txt".into()),
-        language: None, create_if_missing: false,
+        language: None, create_if_missing: false, jump_to: None,
     }).await;
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
         buffer_id: opened.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
@@ -8213,5 +8291,478 @@ async fn input_replace_line_swaps_content() {
     // We don't actually have a project path matching this temp file, so saving would fail.
     // Instead just verify by issuing a fresh open and reading the line count.
     let _ = target;
+    drop(server);
+}
+
+// -------- buffer/open jump_to --------------------------------------------------------------------
+
+/// `buffer/open { jump_to }` lands the returned cursor at the requested position and persists it
+/// so a follow-up open without `jump_to` resumes from the same spot.
+#[tokio::test]
+async fn buffer_open_jump_to_places_and_persists_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.txt");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: Some(LogicalPosition { line: 1, col: 2 }),
+        },
+    )
+    .await;
+    assert_eq!(opened.cursor.position, LogicalPosition { line: 1, col: 2 });
+    assert_eq!(opened.cursor.anchor, LogicalPosition { line: 1, col: 2 });
+
+    // Reopen without jump_to — should resume the just-set position, not snap to origin.
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            buffer_id: Some(opened.buffer_id),
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert_eq!(reopen.cursor.position, LogicalPosition { line: 1, col: 2 });
+
+    drop(server);
+}
+
+/// `buffer/open { jump_to }` clamps line past EOF and col past line end — used by the grep
+/// picker when a persisted hit's coordinates have drifted out from under the file.
+#[tokio::test]
+async fn buffer_open_jump_to_clamps_out_of_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.txt");
+    std::fs::write(&path, "ab\ncd\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+
+    // Line 99 doesn't exist; col 99 is past any line. Server should clamp to (last_line, line_end).
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: Some(LogicalPosition {
+                line: 99,
+                col: 99,
+            }),
+        },
+    )
+    .await;
+    // The file has lines "ab\n", "cd\n", "". Last visible line is index 1 ("cd"), length 2 bytes.
+    assert!(opened.cursor.position.line <= 2);
+    assert!(opened.cursor.position.col <= 2);
+
+    drop(server);
+}
+
+// -------- picker grep ---------------------------------------------------------------------------
+
+async fn setup_grep_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::create_dir_all(dir_path.join("src")).unwrap();
+    std::fs::write(
+        dir_path.join("src/main.rs"),
+        "fn main() {\n    needle();\n    needle();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir_path.join("src/lib.rs"),
+        "fn needle() {}\nfn other() {}\n",
+    )
+    .unwrap();
+    std::fs::write(dir_path.join("README.md"), "no match here\n").unwrap();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    (server, ws)
+}
+
+/// Drain `picker/update` notifications until one arrives with `ticking: false` (the search has
+/// finished). Returns the final params so the caller can assert on hit count and items.
+async fn drain_grep_until_done(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> PickerUpdateParams {
+    loop {
+        let params: PickerUpdateParams = expect_notification::<PickerUpdate>(ws).await;
+        if !params.ticking {
+            return params;
+        }
+    }
+}
+
+#[tokio::test]
+async fn picker_grep_finds_matches_and_select_returns_file_at() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await; // initial empty push
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+
+    let final_update = drain_grep_until_done(&mut ws).await;
+    assert_eq!(final_update.kind, PickerKind::Grep);
+    assert_eq!(final_update.generation, 1);
+    // 2 hits in main.rs + 1 hit in lib.rs = 3 GrepHits total.
+    assert_eq!(final_update.total_matches, 3);
+    let hit = final_update
+        .items
+        .iter()
+        .find(|i| matches!(i, PickerItem::GrepHit { path, .. } if path == "src/lib.rs"))
+        .expect("lib.rs hit present");
+    let (line, col, preview) = match hit {
+        PickerItem::GrepHit {
+            line,
+            col,
+            preview,
+            ..
+        } => (*line, *col, preview.clone()),
+        _ => unreachable!(),
+    };
+    assert_eq!(line, 0, "lib.rs hit is on line 0 (`fn needle() {{}}`)");
+    assert_eq!(col, 3, "col 3 is the `n` of `needle`");
+    assert!(preview.contains("needle"));
+
+    // Select that hit; should return FileAt with the absolute path and position.
+    let select_result: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        12,
+        &PickerSelectParams {
+            kind: PickerKind::Grep,
+            item: hit.clone(),
+        },
+    )
+    .await;
+    let (sel_path, sel_pos) = match select_result {
+        PickerSelectResult::FileAt { path, position } => (path, position),
+        other => panic!("expected FileAt, got {other:?}"),
+    };
+    assert!(sel_path.ends_with("src/lib.rs"));
+    assert_eq!(sel_pos.line, 0);
+    assert_eq!(sel_pos.col, 3);
+
+    drop(server);
+}
+
+/// Queries shorter than the min length don't spawn a search and produce an empty,
+/// not-ticking result set.
+#[tokio::test]
+async fn picker_grep_short_query_yields_empty_result() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Grep,
+            query: "n".into(), // below MIN_QUERY_LEN
+            generation: 1,
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.generation, 1);
+    assert_eq!(update.total_matches, 0);
+    assert!(
+        !update.ticking,
+        "below-min queries should not flag the picker as still searching"
+    );
+
+    drop(server);
+}
+
+/// Grep hits persist across `hide` + non-reset `view` so the user can step through them. After
+/// resume the previously-set query is still active and the prior result set is intact.
+#[tokio::test]
+async fn picker_grep_persists_hits_across_hide_and_resume() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let before = drain_grep_until_done(&mut ws).await;
+    let before_hits = before.total_matches;
+    assert!(before_hits >= 1);
+
+    let _: () = send_request::<PickerHide>(
+        &mut ws,
+        12,
+        &PickerHideParams {
+            kind: PickerKind::Grep,
+        },
+    )
+    .await;
+
+    // Resume without reset: we should get the prior hits back without re-running the search.
+    let resume = send_request::<PickerView>(
+        &mut ws,
+        13,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: false,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
+    assert_eq!(resume.query, "needle", "query persists across hide/show");
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, before_hits, "hits preserved on resume");
+
+    drop(server);
+}
+
+/// Grep queries are regex, same as buffer search (`/`). A pattern like `n.+dle` matches `needle`
+/// — confirms `regex::escape` is not being applied (which would turn the `.+` into a literal).
+#[tokio::test]
+async fn picker_grep_treats_query_as_regex() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Grep,
+            query: "n.+dle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let final_update = drain_grep_until_done(&mut ws).await;
+    assert!(
+        final_update.total_matches >= 1,
+        "regex `n.+dle` should match `needle` ({} hits)",
+        final_update.total_matches,
+    );
+
+    drop(server);
+}
+
+/// Re-issuing the same query after a search completes uses the cached candidates: the response
+/// arrives without `ticking: true` (no fresh walker spawned) and the hit count matches the
+/// previous run.
+#[tokio::test]
+async fn picker_grep_caches_completed_query() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let first = drain_grep_until_done(&mut ws).await;
+    let first_hits = first.total_matches;
+    assert!(first_hits >= 1);
+
+    // Same query again — should hit the cache. The single push that arrives must already be
+    // non-ticking (no spawn) and carry the cached hit count.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        12,
+        &PickerQueryParams {
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 2,
+        },
+    )
+    .await;
+    let cached: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(cached.generation, 2);
+    assert_eq!(cached.total_matches, first_hits);
+    assert!(
+        !cached.ticking,
+        "cache hit must not mark the picker as ticking — no new search was spawned"
+    );
+
+    drop(server);
+}
+
+/// Mid-typing invalid regex (e.g. trailing `[`) is treated as a transient "no matches" rather
+/// than an error — the picker stays responsive. The RPC succeeds; the streaming search emits one
+/// final non-ticking, zero-hit update and exits.
+#[tokio::test]
+async fn picker_grep_invalid_regex_yields_no_hits() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Grep,
+            query: "foo[".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let final_update = drain_grep_until_done(&mut ws).await;
+    assert_eq!(final_update.total_matches, 0);
+    assert!(!final_update.ticking);
+
     drop(server);
 }
