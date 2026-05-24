@@ -151,7 +151,7 @@ fn buffer_open_result_shape() {
     assert_eq!(v["buffer_id"], 42);
     assert_eq!(v["language"], "rust");
     assert_eq!(v["saved_revision"], 0);
-    // Cursor always serialises (CursorState::default() is `{position: {line:0,col:0}, anchor: null}`).
+    // Cursor always serialises (CursorState::default() is `{position: {line:0,col:0}, anchor: {line:0,col:0}}`).
     assert_eq!(v["cursor"]["position"]["line"], 0);
     assert_eq!(v["cursor"]["position"]["col"], 0);
     // `scroll: None` skips serialisation — keeps the wire shape tight for first-open cases.

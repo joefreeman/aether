@@ -23,7 +23,7 @@ use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::handshake::ClientHelloResult;
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
+    BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
     InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
 };
@@ -699,7 +699,7 @@ async fn handle_mouse_event(
                     .rpc::<CursorSet>(CursorSetParams {
                         buffer_id: state.editor_mut().buffer_id,
                         position: pos,
-                        anchor: None,
+                        anchor: pos,
                     })
                     .await?;
                 state.editor_mut().cursor = new;
@@ -713,7 +713,7 @@ async fn handle_mouse_event(
                         .rpc::<CursorSet>(CursorSetParams {
                             buffer_id: state.editor_mut().buffer_id,
                             position: pos,
-                            anchor: Some(anchor),
+                            anchor: anchor,
                         })
                         .await?;
                     state.editor_mut().cursor = new;
@@ -815,8 +815,10 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             state.editor_mut().search.active = false;
             state.editor_mut().search.summary = None;
         }
+        // `d` collapses any multi-char selection to a 1-char point at the cursor. No-op if
+        // already a point. Visually unchanged: the block cursor stays where it was.
         (KeyCode::Char('d'), m) if m == KeyModifiers::NONE => {
-            if state.editor_mut().cursor.anchor.is_some() {
+            if !state.editor().cursor.is_point() {
                 clear_selection(client, state).await?;
             }
         }
@@ -1204,27 +1206,14 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             open_line_above(client, state).await?
         }
         (KeyCode::Char('o'), CTRL_ONLY) => open_line_below(client, state).await?,
+        // Normal-mode delete bindings act on the current selection (which is at least a
+        // 1-char point under the block cursor). Backspace is intentionally absent from Normal
+        // mode in this model — to delete the previous char, the user moves the cursor back
+        // (`h`) and presses `Ctrl-d`.
         (KeyCode::Char('d'), CTRL_ONLY) | (KeyCode::Delete, _) => {
-            delete_with_motion(
-                client,
-                state,
-                Motion::Char {
-                    direction: Direction::Forward,
-                    count,
-                },
-            )
-            .await?
-        }
-        (KeyCode::Backspace, _) => {
-            delete_with_motion(
-                client,
-                state,
-                Motion::Char {
-                    direction: Direction::Backward,
-                    count,
-                },
-            )
-            .await?
+            for _ in 0..count.max(1) {
+                delete_selection(client, state).await?;
+            }
         }
 
         // ---- change ----
@@ -1700,28 +1689,11 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Line).await?,
         (KeyCode::Char('p'), CTRL_ONLY) => paste_at_cursor(client, state).await?,
 
-        (KeyCode::Backspace, _) => {
-            delete_with_motion(
-                client,
-                state,
-                Motion::Char {
-                    direction: Direction::Backward,
-                    count: 1,
-                },
-            )
-            .await?
-        }
-        (KeyCode::Delete, _) => {
-            delete_with_motion(
-                client,
-                state,
-                Motion::Char {
-                    direction: Direction::Forward,
-                    count: 1,
-                },
-            )
-            .await?
-        }
+        // Insert-mode Backspace deletes the char before the cursor; Delete deletes the 1-char
+        // point at the cursor (the always-have-selection invariant means the point IS the
+        // char to delete).
+        (KeyCode::Backspace, _) => backspace(client, state).await?,
+        (KeyCode::Delete, _) => delete_selection(client, state).await?,
         (KeyCode::Enter, _) => newline_and_indent(client, state).await?,
         (KeyCode::Tab, _) => insert_text(client, state, "\t").await?,
         (KeyCode::Left, _) => {
@@ -2359,9 +2331,10 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
 }
 
 fn selection_start(c: &CursorState) -> LogicalPosition {
-    match c.anchor {
-        Some(a) if pos_tuple(a) < pos_tuple(c.position) => a,
-        _ => c.position,
+    if pos_tuple(c.anchor) < pos_tuple(c.position) {
+        c.anchor
+    } else {
+        c.position
     }
 }
 
@@ -2721,11 +2694,14 @@ fn apply_motion_undo_result(state: &mut AppState, r: CursorUndoResult, label: &s
 }
 
 async fn clear_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
+    // "Clear selection" now means "collapse to a 1-char point at the current position" since
+    // the data model always has an anchor. Visually unchanged: the block cursor stays put.
+    let pos = state.editor().cursor.position;
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
-            buffer_id: state.editor_mut().buffer_id,
-            position: state.editor_mut().cursor.position,
-            anchor: None,
+            buffer_id: state.editor().buffer_id,
+            position: pos,
+            anchor: pos,
         })
         .await?;
     state.editor_mut().cursor = new;
@@ -2748,43 +2724,29 @@ async fn enter_insert_at(
     state: &mut AppState,
     where_: InsertWhere,
 ) -> Result<()> {
-    match (where_, state.editor_mut().cursor.anchor) {
-        // `i` — start of selection (or cursor if collapsed).
-        (InsertWhere::SelectionStart, Some(anchor)) => {
-            let target = min_pos(state.editor_mut().cursor.position, anchor);
-            let new = client
+    // Entering Insert mode always collapses to a 1-char point at the chosen position. The
+    // model invariant is that Insert mode never has a multi-char selection — typing inserts at
+    // `position`, motion-based deletes (Backspace/Delete) ignore the anchor.
+    let (pos, cursor, buffer_id) = {
+        let ed = state.editor();
+        (ed.cursor.position, ed.cursor, ed.buffer_id)
+    };
+    let target = match where_ {
+        InsertWhere::SelectionStart => min_pos(pos, cursor.anchor),
+        InsertWhere::SelectionEnd => {
+            // Just past the (possibly multi-char) selection — set to the max position, then
+            // step one char forward server-side to handle multi-byte chars / end-of-line.
+            let max = max_pos(pos, cursor.anchor);
+            let _ = client
                 .rpc::<CursorSet>(CursorSetParams {
-                    buffer_id: state.editor_mut().buffer_id,
-                    position: target,
-                    anchor: None,
-                })
-                .await?;
-            state.editor_mut().cursor = new;
-        }
-        (InsertWhere::SelectionStart, None) => {
-            // Already at the right place; nothing to do.
-        }
-
-        // `a` — just *past* the selection (or one char after the cursor if collapsed). Selection
-        // is inclusive, so for a forward selection the cursor char IS the last selected char;
-        // "after the selection" is one char past the max position.
-        (InsertWhere::SelectionEnd, anchor_opt) => {
-            let max = match anchor_opt {
-                Some(anchor) => max_pos(state.editor_mut().cursor.position, anchor),
-                None => state.editor_mut().cursor.position,
-            };
-            // Park the cursor at the last-selected position (with no anchor), then step one char
-            // forward — handles multi-byte chars and end-of-line transitions correctly.
-            client
-                .rpc::<CursorSet>(CursorSetParams {
-                    buffer_id: state.editor_mut().buffer_id,
+                    buffer_id,
                     position: max,
-                    anchor: None,
+                    anchor: max,
                 })
                 .await?;
             let new = client
                 .rpc::<CursorMove>(CursorMoveParams {
-                    buffer_id: state.editor_mut().buffer_id,
+                    buffer_id,
                     motion: Motion::Char {
                         direction: Direction::Forward,
                         count: 1,
@@ -2793,46 +2755,29 @@ async fn enter_insert_at(
                 })
                 .await?;
             state.editor_mut().cursor = new;
+            enter_insert_mode(state);
+            return Ok(());
         }
-
-        // `Alt-i` — start of the first line in the selection (or the cursor's line).
-        (InsertWhere::FirstLineStart, anchor_opt) => {
-            let first_line = match anchor_opt {
-                Some(anchor) => state.editor_mut().cursor.position.line.min(anchor.line),
-                None => state.editor_mut().cursor.position.line,
-            };
-            let new = client
-                .rpc::<CursorSet>(CursorSetParams {
-                    buffer_id: state.editor_mut().buffer_id,
-                    position: LogicalPosition {
-                        line: first_line,
-                        col: 0,
-                    },
-                    anchor: None,
-                })
-                .await?;
-            state.editor_mut().cursor = new;
+        InsertWhere::FirstLineStart => {
+            let line = pos.line.min(cursor.anchor.line);
+            LogicalPosition { line, col: 0 }
         }
-
-        // `Alt-a` — end of the last line in the selection (server clamps the huge col).
-        (InsertWhere::LastLineEnd, anchor_opt) => {
-            let last_line = match anchor_opt {
-                Some(anchor) => state.editor_mut().cursor.position.line.max(anchor.line),
-                None => state.editor_mut().cursor.position.line,
-            };
-            let new = client
-                .rpc::<CursorSet>(CursorSetParams {
-                    buffer_id: state.editor_mut().buffer_id,
-                    position: LogicalPosition {
-                        line: last_line,
-                        col: u32::MAX,
-                    },
-                    anchor: None,
-                })
-                .await?;
-            state.editor_mut().cursor = new;
+        InsertWhere::LastLineEnd => {
+            let line = pos.line.max(cursor.anchor.line);
+            LogicalPosition {
+                line,
+                col: u32::MAX,
+            }
         }
-    }
+    };
+    let new = client
+        .rpc::<CursorSet>(CursorSetParams {
+            buffer_id,
+            position: target,
+            anchor: target,
+        })
+        .await?;
+    state.editor_mut().cursor = new;
     enter_insert_mode(state);
     Ok(())
 }
@@ -2901,30 +2846,27 @@ async fn insert_text_inner(
 
 /// Delete the current selection (or the 1-char range at the cursor when there's no anchor) and
 /// enter Insert mode — the "change" operator. Server-side `apply_edit` treats the selection as
-/// the edit range when an anchor exists, so a forward Char(1) motion is just a placeholder.
 async fn change_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
-    delete_with_motion(
-        client,
-        state,
-        Motion::Char {
-            direction: Direction::Forward,
-            count: 1,
-        },
-    )
-    .await?;
+    delete_selection(client, state).await?;
     enter_insert_mode(state);
     Ok(())
 }
 
-async fn delete_with_motion(
-    client: &mut Client,
-    state: &mut AppState,
-    motion: Motion,
-) -> Result<()> {
+async fn delete_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
-        .rpc::<InputDelete>(InputDeleteParams {
-            buffer_id: state.editor_mut().buffer_id,
-            motion,
+        .rpc::<InputDelete>(BufferOnlyParams {
+            buffer_id: state.editor().buffer_id,
+        })
+        .await?;
+    state.editor_mut().revision = r.revision;
+    state.editor_mut().cursor = r.cursor;
+    Ok(())
+}
+
+async fn backspace(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<InputBackspace>(BufferOnlyParams {
+            buffer_id: state.editor().buffer_id,
         })
         .await?;
     state.editor_mut().revision = r.revision;
@@ -2989,15 +2931,16 @@ async fn toggle_comment(client: &mut Client, state: &mut AppState) -> Result<()>
 /// the line's leading whitespace and adds one level if the line ends in an opener). The newline
 /// pushes the cursor onto the new line at the indent column.
 async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let line = state.editor_mut().cursor.position.line;
+    let line = state.editor().cursor.position.line;
+    let target = LogicalPosition {
+        line,
+        col: u32::MAX,
+    };
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
-            buffer_id: state.editor_mut().buffer_id,
-            position: LogicalPosition {
-                line,
-                col: u32::MAX,
-            },
-            anchor: None,
+            buffer_id: state.editor().buffer_id,
+            position: target,
+            anchor: target,
         })
         .await?;
     state.editor_mut().cursor = new;
@@ -3010,12 +2953,13 @@ async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()
 /// Park at col 0 of the current line, insert "\n" (which pushes the original line down a row
 /// and lands the cursor at its new start), then step back up onto the freshly-blank line.
 async fn open_line_above(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let line = state.editor_mut().cursor.position.line;
+    let line = state.editor().cursor.position.line;
+    let target = LogicalPosition { line, col: 0 };
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
-            buffer_id: state.editor_mut().buffer_id,
-            position: LogicalPosition { line, col: 0 },
-            anchor: None,
+            buffer_id: state.editor().buffer_id,
+            position: target,
+            anchor: target,
         })
         .await?;
     state.editor_mut().cursor = new;
@@ -3105,16 +3049,13 @@ async fn paste_before(client: &mut Client, state: &mut AppState, count: u32) -> 
         }
     };
     let text = text.repeat(count.max(1) as usize);
-    // Collapse to the start of the selection (or stay put if no anchor).
-    let start = match state.editor_mut().cursor.anchor {
-        Some(anchor) => min_pos(state.editor_mut().cursor.position, anchor),
-        None => state.editor_mut().cursor.position,
-    };
+    // Collapse to the start of the selection (no-op for a point cursor).
+    let start = min_pos(state.editor().cursor.position, state.editor().cursor.anchor);
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
-            buffer_id: state.editor_mut().buffer_id,
+            buffer_id: state.editor().buffer_id,
             position: start,
-            anchor: None,
+            anchor: start,
         })
         .await?;
     state.editor_mut().cursor = new;

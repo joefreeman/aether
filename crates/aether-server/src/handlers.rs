@@ -25,8 +25,7 @@ use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::handshake::{ClientHelloParams, ClientHelloResult, ProjectInfo};
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDeleteParams, InputMoveLinesParams, InputTextParams,
-    UndoResult,
+    BufferOnlyParams, EditResult, InputMoveLinesParams, InputTextParams, UndoResult,
 };
 use aether_protocol::picker::{
     PickerHideParams, PickerKind, PickerQueryParams, PickerSelectParams, PickerSelectResult,
@@ -540,18 +539,10 @@ pub async fn search_set(
                 let last_char = end_char_excl.saturating_sub(1).max(start_char);
                 let position = motion::char_to_pos(buf, last_char);
                 let anchor_p = motion::char_to_pos(buf, start_char);
-                let new_cursor = if anchor_p == position {
-                    CursorState {
-                        position,
-                        anchor: None,
-                        match_bracket: None,
-                    }
-                } else {
-                    CursorState {
-                        position,
-                        anchor: Some(anchor_p),
-                        match_bracket: None,
-                    }
+                let new_cursor = CursorState {
+                    position,
+                    anchor: anchor_p,
+                    match_bracket: None,
                 };
                 let prev_cursor = cursor;
                 s.cursors.insert(key, new_cursor);
@@ -691,18 +682,10 @@ async fn search_navigate(
     let last_char = end_char_excl.saturating_sub(1).max(start_char);
     let position = motion::char_to_pos(buf, last_char);
     let anchor_pos = motion::char_to_pos(buf, start_char);
-    let new_cursor = if anchor_pos == position {
-        CursorState {
-            position,
-            anchor: None,
-            match_bracket: None,
-        }
-    } else {
-        CursorState {
-            position,
-            anchor: Some(anchor_pos),
-            match_bracket: None,
-        }
+    let new_cursor = CursorState {
+        position,
+        anchor: anchor_pos,
+        match_bracket: None,
     };
     let prev_cursor = s.cursors.get(&key).copied().unwrap_or_default();
     s.cursors.insert(key, new_cursor);
@@ -726,9 +709,10 @@ async fn search_navigate(
 }
 
 fn selection_start(c: &CursorState) -> LogicalPosition {
-    match c.anchor {
-        Some(a) if pos_tuple(a) < pos_tuple(c.position) => a,
-        _ => c.position,
+    if pos_tuple(c.anchor) < pos_tuple(c.position) {
+        c.anchor
+    } else {
+        c.position
     }
 }
 
@@ -753,13 +737,13 @@ fn summary_for(
 }
 
 /// 1-based index of the match whose range exactly equals the cursor's current selection
-/// (`anchor == m.start` *and* `cursor == last char of m`), or `0` if no match matches. Single-char
-/// matches collapse the anchor (server normalizes `anchor == position` to `None`), so we handle
-/// that case too. Comparing both endpoints means the counter only shows when the user is
-/// genuinely "on" a match — extending or shrinking the selection drops the counter.
+/// (`anchor == m.start` *and* `cursor == last char of m`), or `0` if no match matches.
+/// Single-char matches: the cursor's selection collapses to a 1-char point, and we match it
+/// against the match's single char. Comparing both endpoints means the counter only shows
+/// when the user is genuinely "on" a match — extending or shrinking the selection drops it.
 fn match_index_for_cursor(buf: &Buffer, entry: &SearchEntry, cursor: &CursorState) -> u32 {
     let pos_char = motion::pos_to_char(buf, cursor.position);
-    let anchor_char = cursor.anchor.map(|a| motion::pos_to_char(buf, a));
+    let anchor_char = motion::pos_to_char(buf, cursor.anchor);
     entry
         .matches
         .iter()
@@ -767,11 +751,7 @@ fn match_index_for_cursor(buf: &Buffer, entry: &SearchEntry, cursor: &CursorStat
             let m_start_char = motion::pos_to_char(buf, *start);
             let m_end_char = motion::pos_to_char(buf, *end_excl);
             let m_last_char = m_end_char.saturating_sub(1);
-            if m_start_char == m_last_char {
-                anchor_char.is_none() && pos_char == m_start_char
-            } else {
-                anchor_char == Some(m_start_char) && pos_char == m_last_char
-            }
+            anchor_char == m_start_char && pos_char == m_last_char
         })
         .map(|i| (i as u32).saturating_add(1))
         .unwrap_or(0)
@@ -1047,9 +1027,10 @@ pub async fn buffer_cut(
         EditKindTag::Delete,
         cursors_before,
     );
+    let new_pos = motion::char_to_pos(buf_mut, start_char);
     let new_cursor = CursorState {
-        position: motion::char_to_pos(buf_mut, start_char),
-        anchor: None,
+        position: new_pos,
+        anchor: new_pos,
         match_bracket: None,
     };
     s.cursors.insert((client_id, params.buffer_id), new_cursor);
@@ -1109,15 +1090,12 @@ pub async fn buffer_cut(
 fn scope_range(buf: &Buffer, cursor: &CursorState, scope: CopyScope) -> (usize, usize) {
     match scope {
         CopyScope::Selection => {
-            if let Some(anchor) = cursor.anchor {
-                let (start_pos, end_pos) = motion::ordered(cursor.position, anchor);
-                let start = motion::pos_to_char(buf, start_pos);
-                let end = motion::pos_to_char(buf, end_pos);
-                (start, (end + 1).min(buf.text.len_chars()))
-            } else {
-                let start = motion::pos_to_char(buf, cursor.position);
-                (start, (start + 1).min(buf.text.len_chars()))
-            }
+            // The selection always covers at least 1 char (point: anchor == position). The
+            // inclusive endpoint extension by 1 produces a non-empty char range.
+            let (start_pos, end_pos) = motion::ordered(cursor.position, cursor.anchor);
+            let start = motion::pos_to_char(buf, start_pos);
+            let end = motion::pos_to_char(buf, end_pos);
+            (start, (end + 1).min(buf.text.len_chars()))
         }
         CopyScope::Line => {
             let line = cursor.position.line as usize;
@@ -1776,15 +1754,13 @@ pub async fn cursor_move(
         }
         _ => motion::resolve_motion(buf, current.position, &params.motion),
     };
+    // Extending: keep the current anchor (which may already equal position, i.e. a point).
+    // Not extending: collapse to a 1-char point at the new position. The data model always
+    // has an anchor, so "no selection" means `anchor == position`.
     let new_anchor = if params.extend_selection {
-        current.anchor.or(Some(current.position))
+        current.anchor
     } else {
-        None
-    };
-    // Collapse zero-width selections.
-    let new_anchor = match new_anchor {
-        Some(a) if a == new_pos => None,
-        x => x,
+        new_pos
     };
 
     let new_state = CursorState {
@@ -1835,24 +1811,24 @@ pub async fn cursor_select_line(
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     let cur = current.position;
 
-    // Top / bottom edges of the current selection, normalized so we can reason about "extend the
-    // bottom down" independent of which end the cursor sits on. Without an anchor, both are at
-    // the cursor.
-    let (top_edge, bottom_edge) = match current.anchor {
-        Some(a) if (a.line, a.col) < (cur.line, cur.col) => (a, cur),
-        Some(a) => (cur, a),
-        None => (cur, cur),
+    // Top / bottom edges of the current selection, normalized so we can reason about "extend
+    // the bottom down" independent of which end the cursor sits on. For a point cursor
+    // (anchor == position) both edges land on the cursor.
+    let (top_edge, bottom_edge) = if (current.anchor.line, current.anchor.col) < (cur.line, cur.col)
+    {
+        (current.anchor, cur)
+    } else {
+        (cur, current.anchor)
     };
-    let cursor_was_at_top = current.anchor.is_some() && cur == top_edge;
+    let has_range = !current.is_point();
+    let cursor_was_at_top = has_range && cur == top_edge;
 
     // Advance the relevant edge only when the selection is already snapped to whole lines;
-    // otherwise snap it without advancing. The no-anchor case is treated as a degenerate
-    // single-point selection — but on an empty line that point already covers everything
-    // there is, so we treat it as whole and advance on the first press. Without that
-    // special case the user gets stuck: snapping a no-anchor empty line to "whole" yields
-    // the same (line, 0) position, so repeated presses make no progress.
+    // otherwise snap it without advancing. A point cursor (anchor == position) on an empty
+    // line is trivially whole — there's nothing within the line to extend over, so we
+    // advance on the first press rather than getting stuck.
     let bottom_len = motion::line_byte_len_excl_newline(buf, bottom_edge.line);
-    let already_whole = if current.anchor.is_some() {
+    let already_whole = if has_range {
         top_edge.col == 0 && bottom_edge.col >= bottom_len
     } else {
         bottom_len == 0 && cur.col == 0
@@ -1867,12 +1843,11 @@ pub async fn cursor_select_line(
     } else {
         bottom_edge.line
     };
-    let (top_line, bottom_line) =
-        match (params.extend && current.anchor.is_some(), params.direction) {
-            (true, _) => (new_top, new_bottom),
-            (false, Direction::Forward) => (new_bottom, new_bottom),
-            (false, Direction::Backward) => (new_top, new_top),
-        };
+    let (top_line, bottom_line) = match (params.extend && has_range, params.direction) {
+        (true, _) => (new_top, new_bottom),
+        (false, Direction::Forward) => (new_bottom, new_bottom),
+        (false, Direction::Backward) => (new_top, new_top),
+    };
 
     let last_line = (buf.text.len_lines() as u32).saturating_sub(1);
     let top_line = top_line.min(last_line);
@@ -1892,14 +1867,9 @@ pub async fn cursor_select_line(
     } else {
         (bottom_pos, top_pos)
     };
-    let anchor = if anchor_pos == cursor_pos {
-        None
-    } else {
-        Some(anchor_pos)
-    };
     let new_state = CursorState {
         position: cursor_pos,
-        anchor,
+        anchor: anchor_pos,
         match_bracket: None,
     };
     s.cursors.insert(key, new_state);
@@ -1927,13 +1897,11 @@ pub async fn cursor_swap_anchor(
     }
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
-    let new_state = match current.anchor {
-        Some(a) => CursorState {
-            position: a,
-            anchor: Some(current.position),
-            match_bracket: None,
-        },
-        None => current,
+    // Swap anchor and position. For a point cursor (anchor == position) this is a no-op.
+    let new_state = CursorState {
+        position: current.anchor,
+        anchor: current.position,
+        match_bracket: None,
     };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
@@ -1962,11 +1930,7 @@ pub async fn cursor_set(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     let position = motion::clamp_position(buf, params.position);
-    let anchor = params.anchor.map(|a| motion::clamp_position(buf, a));
-    let anchor = match anchor {
-        Some(a) if a == position => None,
-        x => x,
-    };
+    let anchor = motion::clamp_position(buf, params.anchor);
     let result = CursorState {
         position,
         anchor,
@@ -2116,18 +2080,10 @@ pub async fn cursor_expand(
     let new_last_char = new_end_char_excl.saturating_sub(1).max(new_start_char);
     let anchor = motion::char_to_pos(buf, new_start_char);
     let position = motion::char_to_pos(buf, new_last_char);
-    let new_cursor = if anchor == position {
-        CursorState {
-            position,
-            anchor: None,
-            match_bracket: None,
-        }
-    } else {
-        CursorState {
-            position,
-            anchor: Some(anchor),
-            match_bracket: None,
-        }
+    let new_cursor = CursorState {
+        position,
+        anchor,
+        match_bracket: None,
     };
 
     s.cursors.insert(key, new_cursor);
@@ -2182,10 +2138,7 @@ pub async fn cursor_contract(
 /// Char range `[start, end_excl)` covered by the cursor's current selection. Collapsed cursors
 /// (no anchor) yield a 1-char range so byte conversion produces a non-empty span.
 fn current_selection_char_range(buf: &Buffer, cursor: &CursorState) -> (usize, usize) {
-    let (lo_pos, hi_pos) = match cursor.anchor {
-        Some(a) => motion::ordered(cursor.position, a),
-        None => (cursor.position, cursor.position),
-    };
+    let (lo_pos, hi_pos) = motion::ordered(cursor.position, cursor.anchor);
     let total = buf.text.len_chars();
     let lo = motion::pos_to_char(buf, lo_pos).min(total);
     let hi_inclusive = motion::pos_to_char(buf, hi_pos).min(total);
@@ -2218,16 +2171,25 @@ pub async fn input_text(
 pub async fn input_delete(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: InputDeleteParams,
+    params: BufferOnlyParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.require_hello()?;
     apply_edit(
         state,
         client_id,
         params.buffer_id,
-        EditKind::DeleteMotion(params.motion),
+        EditKind::DeleteSelection,
     )
     .await
+}
+
+pub async fn input_backspace(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    apply_edit(state, client_id, params.buffer_id, EditKind::Backspace).await
 }
 
 pub async fn input_undo(
@@ -2438,13 +2400,8 @@ async fn apply_toggle_comment(
     }
 
     // Selection / line range.
-    let (a, b) = match cursor.anchor {
-        Some(anchor) => {
-            let (start, end) = motion::ordered(cursor.position, anchor);
-            (start.line, end.line)
-        }
-        None => (cursor.position.line, cursor.position.line),
-    };
+    let (start, end) = motion::ordered(cursor.position, cursor.anchor);
+    let (a, b) = (start.line, end.line);
     let is_partial = is_partial_line_selection(buf, &cursor);
 
     // Phase 1: decide the action.
@@ -2556,7 +2513,7 @@ async fn apply_toggle_comment(
         }
     } else if let Some((open, close)) = block_tok {
         // No line tokens at all (markdown, html, css): everything routes to block.
-        let endpoints = if cursor.anchor.is_some() {
+        let endpoints = if !cursor.is_point() {
             Some(ordered_selection_or_cursor_line(&cursor))
         } else {
             // Cursor-only: wrap the current line's content. Skip empty lines entirely —
@@ -2649,13 +2606,13 @@ async fn apply_toggle_comment(
             let nc = if start_pos == new_position {
                 CursorState {
                     position: new_position,
-                    anchor: None,
+                    anchor: new_position,
                     match_bracket: None,
                 }
             } else {
                 CursorState {
                     position: new_position,
-                    anchor: Some(start_pos),
+                    anchor: start_pos,
                     match_bracket: None,
                 }
             };
@@ -2704,13 +2661,13 @@ async fn apply_toggle_comment(
             let nc = if start_pos == new_position {
                 CursorState {
                     position: new_position,
-                    anchor: None,
+                    anchor: new_position,
                     match_bracket: None,
                 }
             } else {
                 CursorState {
                     position: new_position,
-                    anchor: Some(start_pos),
+                    anchor: start_pos,
                     match_bracket: None,
                 }
             };
@@ -2765,10 +2722,7 @@ async fn apply_toggle_comment(
         let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
         let mut c = new_cursor;
         c.position = motion::clamp_position(buf_mut, c.position);
-        c.anchor = c.anchor.map(|a| motion::clamp_position(buf_mut, a));
-        if c.anchor == Some(c.position) {
-            c.anchor = None;
-        }
+        c.anchor = motion::clamp_position(buf_mut, c.anchor);
         c
     };
     s.cursors.insert((client_id, buffer_id), new_cursor);
@@ -2895,10 +2849,12 @@ fn classify_line_range(lines: &[String], prefix: Option<&str>) -> Option<LineCla
 /// counts as non-partial. Partial selections — single mid-line, or multi-line where one of
 /// the boundary lines isn't fully covered — route to block-comment when the language has it.
 fn is_partial_line_selection(buf: &Buffer, cursor: &CursorState) -> bool {
-    let Some(anchor) = cursor.anchor else {
+    if cursor.is_point() {
+        // A point cursor is a 1-char selection — single-line, definitionally non-partial
+        // for the comment-toggle decision.
         return false;
-    };
-    let (lo, hi) = motion::ordered(cursor.position, anchor);
+    }
+    let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
     let line_end_hi = motion::line_byte_len_excl_newline(buf, hi.line);
     let lo_at_start = lo.col == 0;
     // Accept either exclusive end (col == line_end) or inclusive last byte (col + 1 ==
@@ -2908,18 +2864,15 @@ fn is_partial_line_selection(buf: &Buffer, cursor: &CursorState) -> bool {
     !(lo_at_start && hi_at_end)
 }
 
-/// `(start_pos, end_pos)` of the selection, both inclusive, ordered. Cursor-only collapses to
-/// the single-char range at the cursor.
+/// `(start_pos, end_pos)` of the selection, both inclusive, ordered. For a point cursor both
+/// endpoints land on the cursor's position.
 fn ordered_selection_or_cursor_line(
     cursor: &CursorState,
 ) -> (
     aether_protocol::LogicalPosition,
     aether_protocol::LogicalPosition,
 ) {
-    match cursor.anchor {
-        Some(anchor) => motion::ordered(cursor.position, anchor),
-        None => (cursor.position, cursor.position),
-    }
+    motion::ordered(cursor.position, cursor.anchor)
 }
 
 /// Endpoints `(line_start, line_end_inclusive)` for the content of `line_idx`, excluding the
@@ -3056,9 +3009,7 @@ fn shift_cursor_by_line_map(
     // to cover any prefix we just added (rather than sliding with the content and leaving the
     // new prefix outside the selection). The lower endpoint stays put when it sits exactly at
     // the insert column; the upper endpoint shifts forward to follow the content.
-    let lower = cursor
-        .anchor
-        .map(|anch| motion::ordered(cursor.position, anch).0);
+    let lower = motion::ordered(cursor.position, cursor.anchor).0;
 
     let shift_pos = |p: aether_protocol::LogicalPosition, is_lower_endpoint: bool| {
         if p.line < a || p.line > b {
@@ -3091,16 +3042,10 @@ fn shift_cursor_by_line_map(
 
     // Don't clamp here; positions are post-edit, and the post-edit clamp at the call site
     // handles legality. Clamping against the pre-edit buffer would clip to shorter lines.
-    let position_is_lower = lower == Some(cursor.position);
+    let position_is_lower = lower == cursor.position;
     let position = shift_pos(cursor.position, position_is_lower);
-    let anchor = cursor.anchor.map(|anch| {
-        let is_lower = lower == Some(anch);
-        shift_pos(anch, is_lower)
-    });
-    let anchor = match anchor {
-        Some(a) if a == position => None,
-        x => x,
-    };
+    let anchor_is_lower = lower == cursor.anchor;
+    let anchor = shift_pos(cursor.anchor, anchor_is_lower);
     CursorState {
         position,
         anchor,
@@ -3144,13 +3089,8 @@ async fn apply_indent_or_dedent(
         .copied()
         .unwrap_or_default();
 
-    let (a, b) = match cursor.anchor {
-        Some(anchor) => {
-            let (start, end) = motion::ordered(cursor.position, anchor);
-            (start.line, end.line)
-        }
-        None => (cursor.position.line, cursor.position.line),
-    };
+    let (start, end) = motion::ordered(cursor.position, cursor.anchor);
+    let (a, b) = (start.line, end.line);
 
     let len_lines = buf.text.len_lines() as u32;
     let len_chars = buf.text.len_chars();
@@ -3232,18 +3172,8 @@ async fn apply_indent_or_dedent(
         };
         let new_cursor = CursorState {
             position: motion::clamp_position(buf_mut, shift_pos(cursor.position)),
-            anchor: cursor
-                .anchor
-                .map(|a| motion::clamp_position(buf_mut, shift_pos(a))),
+            anchor: motion::clamp_position(buf_mut, shift_pos(cursor.anchor)),
             match_bracket: None,
-        };
-        let new_cursor = match new_cursor.anchor {
-            Some(a) if a == new_cursor.position => CursorState {
-                position: new_cursor.position,
-                anchor: None,
-                match_bracket: None,
-            },
-            _ => new_cursor,
         };
         (revision, new_cursor)
     };
@@ -3321,13 +3251,8 @@ pub async fn input_move_lines(
         .unwrap_or_default();
 
     // Selection's line range: the lines the user wants to move.
-    let (a, b) = match cursor.anchor {
-        Some(anchor) => {
-            let (start_pos, end_pos) = motion::ordered(cursor.position, anchor);
-            (start_pos.line, end_pos.line)
-        }
-        None => (cursor.position.line, cursor.position.line),
-    };
+    let (start_pos, end_pos) = motion::ordered(cursor.position, cursor.anchor);
+    let (a, b) = (start_pos.line, end_pos.line);
 
     // The "last real line" — ropey counts a trailing empty line after a final newline that's not
     // user-visible; treat it as out-of-bounds for move purposes.
@@ -3420,18 +3345,8 @@ pub async fn input_move_lines(
         };
         let new_cursor = CursorState {
             position: motion::clamp_position(buf_mut, shift(cursor.position)),
-            anchor: cursor
-                .anchor
-                .map(|a| motion::clamp_position(buf_mut, shift(a))),
+            anchor: motion::clamp_position(buf_mut, shift(cursor.anchor)),
             match_bracket: None,
-        };
-        let new_cursor = match new_cursor.anchor {
-            Some(a) if a == new_cursor.position => CursorState {
-                position: new_cursor.position,
-                anchor: None,
-                match_bracket: None,
-            },
-            _ => new_cursor,
         };
         (revision, new_cursor)
     };
@@ -3529,10 +3444,7 @@ pub async fn input_join_lines(
             .get(&(client_id, buffer_id))
             .copied()
             .unwrap_or_default();
-        let (a, b) = match cursor.anchor {
-            Some(anchor) => motion::ordered(cursor.position, anchor),
-            None => (cursor.position, cursor.position),
-        };
+        let (a, b) = motion::ordered(cursor.position, cursor.anchor);
         let buf = s
             .buffers
             .get(&buffer_id)
@@ -3633,9 +3545,10 @@ pub async fn input_join_lines(
             cursors_before,
         );
         let new_cursor_char = first_char + joined.chars().count();
+        let new_pos = motion::char_to_pos(buf, new_cursor_char);
         let new_cursor = CursorState {
-            position: motion::char_to_pos(buf, new_cursor_char),
-            anchor: None,
+            position: new_pos,
+            anchor: new_pos,
             match_bracket: None,
         };
         s.cursors.insert((client_id, buffer_id), new_cursor);
@@ -3814,11 +3727,7 @@ async fn apply_undo_or_redo(
 
 fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
     let position = motion::clamp_position(buf, cursor.position);
-    let anchor = cursor.anchor.map(|a| motion::clamp_position(buf, a));
-    let anchor = match anchor {
-        Some(a) if a == position => None,
-        x => x,
-    };
+    let anchor = motion::clamp_position(buf, cursor.anchor);
     CursorState {
         position,
         anchor,
@@ -3856,11 +3765,20 @@ fn wrap_for_response(s: &ServerState, buffer_id: BufferId, cursor: CursorState) 
 }
 
 enum EditKind {
-    /// Replace the selection with `text` (insert at cursor if no selection). If `select_pasted`
-    /// is true, the post-edit cursor selects the inserted text instead of collapsing past it.
+    /// Insert `text` at the cursor. For a point cursor (Insert-mode typing, paste-before)
+    /// this is a pure insert at `position` — no chars are replaced. For a range (paste-
+    /// replace, Ctrl-c after delete), the selection is replaced with `text`. When
+    /// `select_pasted` is true and the inserted text is non-empty, the post-edit cursor
+    /// selects the inserted text.
     ReplaceWith { text: String, select_pasted: bool },
-    /// Delete from cursor through the motion's endpoint, or the selection if any.
-    DeleteMotion(Motion),
+    /// Delete the current inclusive selection. For a point cursor this deletes the 1 char at
+    /// `position`. Used by Normal-mode `Ctrl-d` / `Delete` / `Ctrl-c`, and by Insert-mode
+    /// `Delete` (forward).
+    DeleteSelection,
+    /// Delete the char immediately before `cursor.position` and leave the cursor there. Used
+    /// by Insert-mode `Backspace` — there's no meaningful selection in Insert mode and "delete
+    /// the previous char" is its own gesture.
+    Backspace,
 }
 
 async fn apply_edit(
@@ -3883,15 +3801,34 @@ async fn apply_edit(
         .unwrap_or_default();
 
     // Determine the byte/char range to replace, and the text to insert.
-    let (start_pos, end_pos) = if let Some(anchor) = cursor.anchor {
-        motion::ordered(cursor.position, anchor)
-    } else {
-        match &edit {
-            EditKind::ReplaceWith { .. } => (cursor.position, cursor.position),
-            EditKind::DeleteMotion(m) => {
-                let target = motion::resolve_motion(buf, cursor.position, m);
-                motion::ordered(cursor.position, target)
+    //   - ReplaceWith on a *point* cursor: pure insert at `position` (empty range).
+    //   - ReplaceWith on a *range* selection: replace the inclusive selection.
+    //   - DeleteSelection: delete the inclusive selection (1 char for point cursor).
+    //   - Backspace: delete `[position-1, position)`, half-open, ignoring the selection.
+    let (start_pos, end_pos, range_is_inclusive) = match &edit {
+        EditKind::ReplaceWith { .. } => {
+            if cursor.is_point() {
+                (cursor.position, cursor.position, false)
+            } else {
+                let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
+                (lo, hi, true)
             }
+        }
+        EditKind::DeleteSelection => {
+            let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
+            (lo, hi, true)
+        }
+        EditKind::Backspace => {
+            let prev = motion::resolve_motion(
+                buf,
+                cursor.position,
+                &Motion::Char {
+                    direction: Direction::Backward,
+                    count: 1,
+                },
+            );
+            let (lo, hi) = motion::ordered(cursor.position, prev);
+            (lo, hi, false)
         }
     };
     let (insert_text, select_pasted): (&str, bool) = match &edit {
@@ -3899,15 +3836,12 @@ async fn apply_edit(
             text,
             select_pasted,
         } => (text.as_str(), *select_pasted),
-        EditKind::DeleteMotion(_) => ("", false),
+        EditKind::DeleteSelection | EditKind::Backspace => ("", false),
     };
 
     let start_char = motion::pos_to_char(buf, start_pos);
     let end_char_base = motion::pos_to_char(buf, end_pos);
-    // When an anchor exists, the selection conceptually includes the position char (the one
-    // under the block cursor). Operationally extend the half-open range by one char so the
-    // visible block cursor's char is part of the affected range.
-    let end_char = if cursor.anchor.is_some() {
+    let end_char = if range_is_inclusive {
         end_char_base.saturating_add(1).min(buf.text.len_chars())
     } else {
         end_char_base
@@ -3916,7 +3850,7 @@ async fn apply_edit(
     let old_last_line = end_pos.line;
     let kind_tag = match &edit {
         EditKind::ReplaceWith { .. } => EditKindTag::Text,
-        EditKind::DeleteMotion(_) => EditKindTag::Delete,
+        EditKind::DeleteSelection | EditKind::Backspace => EditKindTag::Delete,
     };
 
     // Snapshot all per-client cursors on this buffer so the undo entry can restore them.
@@ -3944,23 +3878,16 @@ async fn apply_edit(
         let last_char = start_char + inserted_char_count - 1;
         let anchor_pos = motion::char_to_pos(buf_mut, start_char);
         let position_pos = motion::char_to_pos(buf_mut, last_char);
-        if anchor_pos == position_pos {
-            CursorState {
-                position: position_pos,
-                anchor: None,
-                match_bracket: None,
-            }
-        } else {
-            CursorState {
-                position: position_pos,
-                anchor: Some(anchor_pos),
-                match_bracket: None,
-            }
+        CursorState {
+            position: position_pos,
+            anchor: anchor_pos,
+            match_bracket: None,
         }
     } else {
+        let post_pos = motion::char_to_pos(buf_mut, start_char + inserted_char_count);
         CursorState {
-            position: motion::char_to_pos(buf_mut, start_char + inserted_char_count),
-            anchor: None,
+            position: post_pos,
+            anchor: post_pos,
             match_bracket: None,
         }
     };

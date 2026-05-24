@@ -131,13 +131,25 @@ pub struct CursorMoveParams {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorState {
     pub position: LogicalPosition,
-    pub anchor: Option<LogicalPosition>,
+    /// The other end of the cursor's selection. The selection is always non-empty: it's the
+    /// inclusive range `[min(anchor, position), max(anchor, position)]`. When `anchor ==
+    /// position` the selection is a single character (the "point" cursor visualised as the
+    /// block). In Insert mode the invariant `anchor == position` is maintained — operations
+    /// that take a motion (Backspace, Delete) bypass the selection.
+    pub anchor: LogicalPosition,
     /// Bracket pair `(open, close)` related to the cursor — set when the cursor sits on or
     /// inside a bracket-bounded construct, `None` otherwise. Server-populated on every
     /// response that returns `CursorState`; never stored in `state.cursors`. Drives the
     /// client's match-bracket highlight overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_bracket: Option<(LogicalPosition, LogicalPosition)>,
+}
+
+impl CursorState {
+    /// True when the selection covers exactly one char (anchor and position coincide).
+    pub fn is_point(&self) -> bool {
+        self.anchor == self.position
+    }
 }
 
 // ---- cursor/set ---------------------------------------------------------------------------------
@@ -153,7 +165,8 @@ impl RpcMethod for CursorSet {
 pub struct CursorSetParams {
     pub buffer_id: BufferId,
     pub position: LogicalPosition,
-    pub anchor: Option<LogicalPosition>,
+    /// Other end of the selection. Pass `anchor == position` to collapse to a point.
+    pub anchor: LogicalPosition,
 }
 
 // ---- cursor/select_line -------------------------------------------------------------------------
@@ -257,5 +270,5 @@ pub struct CursorUpdateParams {
     pub client_id: ClientId,
     pub revision: Revision,
     pub position: LogicalPosition,
-    pub anchor: Option<LogicalPosition>,
+    pub anchor: LogicalPosition,
 }

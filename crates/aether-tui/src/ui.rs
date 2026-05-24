@@ -707,9 +707,15 @@ fn bracket_positions_on_visual_row(
         .collect()
 }
 
+/// `Some((lo, hi))` when the selection covers more than one char (range). `None` for a point
+/// cursor — the block cursor alone visualises the 1-char "selection", so we don't draw the
+/// extra range highlight.
 fn ordered_selection(cursor: &CursorState) -> Option<(LogicalPosition, LogicalPosition)> {
-    let anchor = cursor.anchor?;
+    if cursor.is_point() {
+        return None;
+    }
     let p = cursor.position;
+    let anchor = cursor.anchor;
     if (p.line, p.col) <= (anchor.line, anchor.col) {
         Some((p, anchor))
     } else {
@@ -1043,15 +1049,11 @@ fn format_position(state: &AppState) -> String {
     match ed.mode {
         EditorMode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
         EditorMode::Normal | EditorMode::Search => {
-            let (start, end_inclusive) = match state.editor().cursor.anchor {
-                None => (pos, pos),
-                Some(anchor) => {
-                    if (pos.line, pos.col) <= (anchor.line, anchor.col) {
-                        (pos, anchor)
-                    } else {
-                        (anchor, pos)
-                    }
-                }
+            let anchor = state.editor().cursor.anchor;
+            let (start, end_inclusive) = if (pos.line, pos.col) <= (anchor.line, anchor.col) {
+                (pos, anchor)
+            } else {
+                (anchor, pos)
             };
             let excl = exclusive_end_of(state, end_inclusive);
             if start.line == excl.line {

@@ -14,7 +14,7 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::handshake::{ClientHello, ClientHelloParams, ClientHelloResult};
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
+    BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
     InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
 };
@@ -271,7 +271,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         &CursorSetParams {
             buffer_id,
             position: cursor_target,
-            anchor: None,
+            anchor: cursor_target,
         },
     )
     .await;
@@ -801,7 +801,7 @@ async fn cursor_starts_at_origin_and_moves_by_char() {
     )
     .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
-    assert!(st.anchor.is_none());
+    assert!((st.anchor == st.position));
 
     // Moving forward past the end of line should land on the next line.
     let st: CursorState = send_request::<CursorMove>(
@@ -835,7 +835,7 @@ async fn cursor_set_and_extend_selection() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 6 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 6 },
         },
     )
     .await;
@@ -856,7 +856,7 @@ async fn cursor_set_and_extend_selection() {
     )
     .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 9 });
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 6 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 6 });
 
     drop(server);
 }
@@ -927,7 +927,7 @@ async fn input_text_inserts_and_pushes_notification() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 1 },
         },
     )
     .await;
@@ -964,7 +964,7 @@ async fn input_delete_backspace_removes_char_before_cursor() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 5 }, // end of "hello"
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 5 },
         },
     )
     .await;
@@ -990,18 +990,8 @@ async fn input_delete_backspace_removes_char_before_cursor() {
     .await;
     let _ = sub;
 
-    let result: EditResult = send_request::<InputDelete>(
-        &mut ws,
-        12,
-        &InputDeleteParams {
-            buffer_id,
-            motion: Motion::Char {
-                direction: Direction::Backward,
-                count: 1,
-            },
-        },
-    )
-    .await;
+    let result: EditResult =
+        send_request::<InputBackspace>(&mut ws, 12, &BufferOnlyParams { buffer_id }).await;
     assert_eq!(result.revision, 1);
 
     let notif: ViewportLinesChangedParams =
@@ -1129,7 +1119,7 @@ async fn match_bracket_motion_jumps_to_pair() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 9 },
         },
     )
     .await;
@@ -1145,7 +1135,7 @@ async fn match_bracket_motion_jumps_to_pair() {
     .await;
     // `}` lives at col 22 on the same line.
     assert_eq!(r.position, LogicalPosition { line: 0, col: 22 });
-    assert!(r.anchor.is_none());
+    assert!((r.anchor == r.position));
     // match_bracket is populated; positions are the same pair regardless of orientation.
     let pair = r.match_bracket.expect("match_bracket should be populated");
     assert!(
@@ -1201,7 +1191,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 9 },
         },
     )
     .await;
@@ -1218,7 +1208,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
     // Cursor lands on the `}`; anchor pinned at the original `{`. Together they cover the
     // whole `{...}` pair inclusive — that's the "select around brackets" gesture.
     assert_eq!(r.position, LogicalPosition { line: 0, col: 22 });
-    assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 9 }));
+    assert_eq!(r.anchor, LogicalPosition { line: 0, col: 9 });
 
     drop(server);
 }
@@ -1263,7 +1253,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 11 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 11 },
         },
     )
     .await;
@@ -1327,7 +1317,7 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -1343,19 +1333,15 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
     .await;
     // `fn one() {}` is 11 chars; the closing `}` sits at col 10 of line 0.
     assert_eq!(r.position, LogicalPosition { line: 0, col: 10 });
-    assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(r.anchor, LogicalPosition { line: 0, col: 0 });
 
     // Delete the selection — the function should be removed exactly, leaving the trailing
     // newline (and the next two functions) intact.
     let _: EditResult = send_request::<InputDelete>(
         &mut ws,
         5,
-        &InputDeleteParams {
+        &BufferOnlyParams {
             buffer_id: open.buffer_id,
-            motion: Motion::Char {
-                direction: Direction::Forward,
-                count: 1,
-            },
         },
     )
     .await;
@@ -1419,7 +1405,7 @@ async fn end_of_unit_works_on_last_function() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 0 },
         },
     )
     .await;
@@ -1435,7 +1421,7 @@ async fn end_of_unit_works_on_last_function() {
     .await;
     // `fn last() {}` is 12 chars; closing `}` at col 11.
     assert_eq!(r.position, LogicalPosition { line: 1, col: 11 });
-    assert_eq!(r.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(r.anchor, LogicalPosition { line: 1, col: 0 });
 
     drop(server);
 }
@@ -1483,7 +1469,7 @@ async fn start_of_unit_extends_back_to_function_start() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 8 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 8 },
         },
     )
     .await;
@@ -1498,7 +1484,7 @@ async fn start_of_unit_extends_back_to_function_start() {
     )
     .await;
     assert_eq!(r.position, LogicalPosition { line: 0, col: 0 });
-    assert_eq!(r.anchor, Some(LogicalPosition { line: 1, col: 8 }));
+    assert_eq!(r.anchor, LogicalPosition { line: 1, col: 8 });
 
     drop(server);
 }
@@ -1545,7 +1531,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -1561,7 +1547,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
     )
     .await;
     assert_eq!(r.position, LogicalPosition { line: 0, col: 10 });
-    assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(r.anchor, LogicalPosition { line: 0, col: 0 });
 
     // Second `}`: cursor at end of fn one, fall through to end of fn two.
     let r: CursorState = send_request::<CursorMove>(
@@ -1575,7 +1561,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
     )
     .await;
     assert_eq!(r.position, LogicalPosition { line: 1, col: 10 });
-    assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(r.anchor, LogicalPosition { line: 0, col: 0 });
 
     // Third `}`: end of fn three.
     let r: CursorState = send_request::<CursorMove>(
@@ -1589,7 +1575,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
     )
     .await;
     assert_eq!(r.position, LogicalPosition { line: 2, col: 12 });
-    assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(r.anchor, LogicalPosition { line: 0, col: 0 });
 
     // Fourth `}`: no more siblings, no-op.
     let r: CursorState = send_request::<CursorMove>(
@@ -1647,7 +1633,7 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 12 },
-            anchor: None,
+            anchor: LogicalPosition { line: 2, col: 12 },
         },
     )
     .await;
@@ -1720,7 +1706,7 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 0 },
         },
     )
     .await;
@@ -1736,7 +1722,7 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
     .await;
     // Lands on the closing `}` of `fn two` (line 2, col 10).
     assert_eq!(r.position, LogicalPosition { line: 2, col: 10 });
-    assert_eq!(r.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(r.anchor, LogicalPosition { line: 1, col: 0 });
 
     drop(server);
 }
@@ -1786,7 +1772,7 @@ async fn nav_motion_jumps_between_top_level_rust_items() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 8 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 8 },
         },
     )
     .await;
@@ -1858,7 +1844,7 @@ async fn nav_motion_prev_walks_backward() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 2, col: 0 },
         },
     )
     .await;
@@ -1917,7 +1903,7 @@ async fn nav_motion_noop_at_end_of_file() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -1982,7 +1968,7 @@ async fn nav_motion_inside_python_class_finds_next_method() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 8 },
-            anchor: None,
+            anchor: LogicalPosition { line: 2, col: 8 },
         },
     )
     .await;
@@ -2047,7 +2033,7 @@ async fn nav_motion_from_last_method_stays_in_class() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 4, col: 8 },
-            anchor: None,
+            anchor: LogicalPosition { line: 4, col: 8 },
         },
     )
     .await;
@@ -2112,7 +2098,7 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -2175,7 +2161,7 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 4 },
-            anchor: None,
+            anchor: LogicalPosition { line: 2, col: 4 },
         },
     )
     .await;
@@ -2204,7 +2190,7 @@ async fn nav_motion_with_no_syntax_is_noop() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -2371,7 +2357,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
         &aether_protocol::cursor::CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 5 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 5 },
         },
     )
     .await;
@@ -2537,7 +2523,7 @@ async fn copy_selection_returns_inclusive_text() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 6 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 6 },
         },
     )
     .await;
@@ -2576,7 +2562,7 @@ async fn copy_line_returns_full_line_with_newline() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 2 },
         },
     )
     .await;
@@ -2621,7 +2607,7 @@ async fn cut_selection_deletes_and_returns_text() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 6 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 6 },
         },
     )
     .await;
@@ -2669,7 +2655,7 @@ async fn input_text_with_select_pasted_makes_selection() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -2703,10 +2689,7 @@ async fn input_text_with_select_pasted_makes_selection() {
     )
     .await;
     // Anchor at col 0 ('X'), position at col 2 (block on 'Z') — selection covers "XYZ".
-    assert_eq!(
-        edit.cursor.anchor,
-        Some(LogicalPosition { line: 0, col: 0 })
-    );
+    assert_eq!(edit.cursor.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(edit.cursor.position, LogicalPosition { line: 0, col: 2 });
     drop(server);
 }
@@ -2722,7 +2705,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
         &aether_protocol::cursor::CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 3 },
         },
     )
     .await;
@@ -2806,7 +2789,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
         &aether_protocol::cursor::CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 3 },
         },
     )
     .await;
@@ -2858,18 +2841,8 @@ async fn dirty_clears_when_undoing_back_past_save() {
     assert_eq!(saved_state.saved_revision, save.revision);
 
     // Edit #2: delete (different kind, so a new group). Backspace removes the "X".
-    let _e2: EditResult = send_request::<InputDelete>(
-        &mut ws,
-        14,
-        &InputDeleteParams {
-            buffer_id,
-            motion: Motion::Char {
-                direction: Direction::Backward,
-                count: 1,
-            },
-        },
-    )
-    .await;
+    let _e2: EditResult =
+        send_request::<InputBackspace>(&mut ws, 14, &BufferOnlyParams { buffer_id }).await;
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     // Undo: should put "X" back, taking us back to the saved revision → derived dirty == false.
@@ -2932,7 +2905,7 @@ async fn word_motion_forward_and_back() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -3060,7 +3033,7 @@ async fn input_text_with_selection_replaces_it() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 6 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 6 },
         },
     )
     .await;
@@ -3145,7 +3118,7 @@ async fn select_line_forward_picks_current_then_advances_at_end() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 2 },
         },
     )
     .await;
@@ -3159,7 +3132,7 @@ async fn select_line_forward_picks_current_then_advances_at_end() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 1, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
     // Whole-line selection exists → advances to the next line.
@@ -3173,7 +3146,7 @@ async fn select_line_forward_picks_current_then_advances_at_end() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 2, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     drop(server);
@@ -3191,7 +3164,7 @@ async fn select_line_forward_at_end_of_line_no_anchor_picks_current_line() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 4 },
         },
     )
     .await;
@@ -3205,7 +3178,7 @@ async fn select_line_forward_at_end_of_line_no_anchor_picks_current_line() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 1, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
     drop(server);
@@ -3225,7 +3198,7 @@ async fn select_line_forward_on_empty_line_advances() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 0 },
         },
     )
     .await;
@@ -3240,7 +3213,7 @@ async fn select_line_forward_on_empty_line_advances() {
     )
     .await;
     // Advanced to line 2, with a whole-line selection over "gamma".
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 2, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     drop(server);
@@ -3257,7 +3230,7 @@ async fn select_line_backward_on_empty_line_walks_up() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 0 },
         },
     )
     .await;
@@ -3273,7 +3246,7 @@ async fn select_line_backward_on_empty_line_walks_up() {
     .await;
     // Whole-line selection over "alpha". Cursor at end (same convention as the non-empty
     // backward case), anchor at start.
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
 
     drop(server);
@@ -3290,7 +3263,7 @@ async fn select_line_backward_picks_current_then_walks_up() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 2, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 2, col: 2 },
         },
     )
     .await;
@@ -3304,7 +3277,7 @@ async fn select_line_backward_picks_current_then_walks_up() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 2, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     // Second press: whole-line selection exists → walks up to the previous line.
@@ -3318,7 +3291,7 @@ async fn select_line_backward_picks_current_then_walks_up() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 1, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
     drop(server);
@@ -3335,7 +3308,7 @@ async fn select_line_backward_walks_up_via_anchor_on_repeat() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 3, col: 5 },
-            anchor: None,
+            anchor: LogicalPosition { line: 3, col: 5 },
         },
     )
     .await;
@@ -3349,7 +3322,7 @@ async fn select_line_backward_walks_up_via_anchor_on_repeat() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 3, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 3, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
 
     // Second press: walks up via anchor-at-col-0 → line 2.
@@ -3363,7 +3336,7 @@ async fn select_line_backward_walks_up_via_anchor_on_repeat() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 2, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     // Third press: → line 1.
@@ -3377,7 +3350,7 @@ async fn select_line_backward_walks_up_via_anchor_on_repeat() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 1, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
     drop(server);
@@ -3394,7 +3367,7 @@ async fn select_line_forward_extend_walks_cursor_down() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 2 },
         },
     )
     .await;
@@ -3420,7 +3393,7 @@ async fn select_line_forward_extend_walks_cursor_down() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
     // Shift-x again: lines 0–2.
@@ -3434,7 +3407,7 @@ async fn select_line_forward_extend_walks_cursor_down() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     drop(server);
@@ -3451,7 +3424,7 @@ async fn select_line_backward_extend_walks_anchor_up() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 3, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 3, col: 2 },
         },
     )
     .await;
@@ -3477,7 +3450,7 @@ async fn select_line_backward_extend_walks_anchor_up() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 2, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
 
     // Shift-Alt-x again: lines 1–3.
@@ -3491,7 +3464,7 @@ async fn select_line_backward_extend_walks_anchor_up() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 1, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
 
     drop(server);
@@ -3508,7 +3481,7 @@ async fn select_line_after_swap_preserves_backward_orientation() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -3525,7 +3498,7 @@ async fn select_line_after_swap_preserves_backward_orientation() {
     let st: CursorState =
         send_request::<CursorSwapAnchor>(&mut ws, 12, &CursorSwapAnchorParams { buffer_id }).await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 0 });
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 5 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 5 });
 
     // Shift-x grows the *bottom* edge down (anchor moves), cursor stays at top.
     let st: CursorState = send_request::<CursorSelectLine>(
@@ -3539,7 +3512,7 @@ async fn select_line_after_swap_preserves_backward_orientation() {
     )
     .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 0 });
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 4 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 1, col: 4 });
 
     drop(server);
 }
@@ -3555,7 +3528,7 @@ async fn select_line_snaps_partial_selection_to_whole_lines() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 2, col: 3 },
-            anchor: Some(LogicalPosition { line: 0, col: 2 }),
+            anchor: LogicalPosition { line: 0, col: 2 },
         },
     )
     .await;
@@ -3571,7 +3544,7 @@ async fn select_line_snaps_partial_selection_to_whole_lines() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     drop(server);
@@ -3590,7 +3563,7 @@ async fn select_line_snaps_partial_selection_when_cursor_at_line_end() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 2, col: 5 },
-            anchor: Some(LogicalPosition { line: 0, col: 2 }),
+            anchor: LogicalPosition { line: 0, col: 2 },
         },
     )
     .await;
@@ -3605,7 +3578,7 @@ async fn select_line_snaps_partial_selection_when_cursor_at_line_end() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     // Now that the selection is whole-line, a second forward press advances.
@@ -3619,7 +3592,7 @@ async fn select_line_snaps_partial_selection_when_cursor_at_line_end() {
         },
     )
     .await;
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
 
     drop(server);
@@ -3637,7 +3610,7 @@ async fn swap_anchor_swaps_position_and_anchor() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 3 },
-            anchor: Some(LogicalPosition { line: 0, col: 1 }),
+            anchor: LogicalPosition { line: 0, col: 1 },
         },
     )
     .await;
@@ -3645,7 +3618,7 @@ async fn swap_anchor_swaps_position_and_anchor() {
     let st: CursorState =
         send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams { buffer_id }).await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 1 });
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 3 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 1, col: 3 });
 
     drop(server);
 }
@@ -3660,14 +3633,14 @@ async fn swap_anchor_with_no_selection_is_noop() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 3 },
         },
     )
     .await;
     let st: CursorState =
         send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams { buffer_id }).await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
-    assert_eq!(st.anchor, None);
+    assert_eq!(st.anchor, st.position);
 
     drop(server);
 }
@@ -3695,7 +3668,7 @@ async fn word_motion_exclusive_progresses_across_boundaries() {
     )
     .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
-    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
 
     // Repeated press from the space — pre-advance kicks in so we skip "world" entirely and
     // land on the space before "foo" (col 11), rather than getting stuck.
@@ -3732,7 +3705,7 @@ async fn motion_undo_restores_previous_cursor() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 2 },
         },
     )
     .await;
@@ -3742,7 +3715,7 @@ async fn motion_undo_restores_previous_cursor() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 2, col: 3 },
-            anchor: None,
+            anchor: LogicalPosition { line: 2, col: 3 },
         },
     )
     .await;
@@ -3772,7 +3745,7 @@ async fn motion_undo_then_redo_round_trips() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 3 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 3 },
         },
     )
     .await;
@@ -3813,7 +3786,7 @@ async fn motion_undo_stack_cleared_by_mutation() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 2 },
         },
     )
     .await;
@@ -3823,7 +3796,7 @@ async fn motion_undo_stack_cleared_by_mutation() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 4 },
         },
     )
     .await;
@@ -3857,7 +3830,7 @@ async fn motion_redo_cleared_by_new_motion() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 3 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 3 },
         },
     )
     .await;
@@ -3870,7 +3843,7 @@ async fn motion_redo_cleared_by_new_motion() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 2 },
         },
     )
     .await;
@@ -3896,7 +3869,7 @@ async fn motion_undo_records_select_line_and_swap() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 2 },
         },
     )
     .await;
@@ -3921,14 +3894,14 @@ async fn motion_undo_records_select_line_and_swap() {
         send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
-    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 1, col: 0 }));
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 0 });
 
     // Undo the select_line.
     let r: CursorUndoResult =
         send_request::<CursorUndo>(&mut ws, 14, &CursorUndoParams { buffer_id }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
-    assert_eq!(r.cursor.anchor, None);
+    assert_eq!(r.cursor.anchor, r.cursor.position);
 
     drop(server);
 }
@@ -3944,7 +3917,7 @@ async fn word_motion_exclusive_at_buffer_end_does_not_move_past() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 4 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 4 },
         },
     )
     .await;
@@ -4046,7 +4019,7 @@ async fn visual_line_preserves_visual_column() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 5 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 5 },
         },
     )
     .await;
@@ -4118,7 +4091,7 @@ async fn visual_line_crosses_logical_line_boundary() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 1 },
         },
     )
     .await;
@@ -4174,7 +4147,7 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 3 },
         },
     )
     .await;
@@ -4228,7 +4201,7 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 5 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 5 },
         },
     )
     .await;
@@ -4333,7 +4306,7 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 1 },
         },
     )
     .await;
@@ -4408,7 +4381,7 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 5 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 5 },
         },
     )
     .await;
@@ -4479,7 +4452,7 @@ async fn virtual_col_cleared_by_horizontal_motion() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 1 },
         },
     )
     .await;
@@ -4563,7 +4536,7 @@ async fn virtual_col_cleared_by_mutation() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 1 },
         },
     )
     .await;
@@ -4696,7 +4669,7 @@ async fn move_lines_swaps_with_neighbor_below() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 2 },
         },
     )
     .await;
@@ -4727,7 +4700,7 @@ async fn move_lines_swaps_with_neighbor_above() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 1 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 1 },
         },
     )
     .await;
@@ -4757,7 +4730,7 @@ async fn move_lines_moves_whole_selection() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 2, col: 0 },
-            anchor: Some(LogicalPosition { line: 1, col: 0 }),
+            anchor: LogicalPosition { line: 1, col: 0 },
         },
     )
     .await;
@@ -4771,7 +4744,7 @@ async fn move_lines_moves_whole_selection() {
     )
     .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 3, col: 0 });
-    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 2, col: 0 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "a\nd\nb\nc\ne\n");
 
@@ -4806,7 +4779,7 @@ async fn move_lines_at_bottom_is_noop_down() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 0 },
         },
     )
     .await;
@@ -4837,7 +4810,7 @@ async fn move_lines_preserves_missing_trailing_newline() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 1, col: 0 },
         },
     )
     .await;
@@ -4868,7 +4841,7 @@ async fn indent_single_line_adds_two_spaces() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 3 },
         },
     )
     .await;
@@ -4891,7 +4864,7 @@ async fn dedent_strips_two_spaces() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 4 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 4 },
         },
     )
     .await;
@@ -4913,7 +4886,7 @@ async fn indent_multi_line_selection() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 2, col: 0 },
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -4921,7 +4894,7 @@ async fn indent_multi_line_selection() {
         send_request::<InputIndent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
     // Anchor and cursor both shift +2 since both lines were indented.
     assert_eq!(r.cursor.position, LogicalPosition { line: 2, col: 2 });
-    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 2 }));
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "  a\n  b\n  c\n");
 
@@ -4938,7 +4911,7 @@ async fn dedent_line_without_indent_is_noop_for_that_line() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 1, col: 1 },
-            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+            anchor: LogicalPosition { line: 0, col: 4 },
         },
     )
     .await;
@@ -4946,7 +4919,7 @@ async fn dedent_line_without_indent_is_noop_for_that_line() {
         send_request::<InputDedent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
     // Line 0 lost 2 chars, line 1 unchanged.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 1 });
-    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 2 }));
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "alpha\nbeta\n");
 
@@ -4977,7 +4950,7 @@ async fn newline_and_indent_copies_leading_whitespace() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 7 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 7 },
         },
     )
     .await;
@@ -5034,7 +5007,7 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 10 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 10 },
         },
     )
     .await;
@@ -5091,7 +5064,7 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 9 },
         },
     )
     .await;
@@ -5159,7 +5132,7 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 2, col: 1 },
-            anchor: None,
+            anchor: LogicalPosition { line: 2, col: 1 },
         },
     )
     .await;
@@ -5215,7 +5188,7 @@ async fn newline_and_indent_engine_python_def() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 10 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 10 },
         },
     )
     .await;
@@ -5270,7 +5243,7 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 2, col: 12 },
-            anchor: None,
+            anchor: LogicalPosition { line: 2, col: 12 },
         },
     )
     .await;
@@ -5350,7 +5323,7 @@ async fn newline_and_indent_fallback_copies_previous_line() {
         &CursorSetParams {
             buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 9 },
         },
     )
     .await;
@@ -5405,7 +5378,7 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 4 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 4 },
         },
     )
     .await;
@@ -5462,7 +5435,7 @@ async fn toggle_comment_strips_when_already_commented() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -5523,7 +5496,7 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 0 },
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -5582,7 +5555,7 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -5641,7 +5614,7 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 12 },
-            anchor: Some(LogicalPosition { line: 0, col: 10 }),
+            anchor: LogicalPosition { line: 0, col: 10 },
         },
     )
     .await;
@@ -5700,7 +5673,7 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 18 },
-            anchor: Some(LogicalPosition { line: 0, col: 10 }),
+            anchor: LogicalPosition { line: 0, col: 10 },
         },
     )
     .await;
@@ -5761,7 +5734,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 9 },
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -5774,7 +5747,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
     )
     .await;
     // Anchor stays at line 0 col 0 (now on the `/` of `// let a = 1;`).
-    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 0 });
     // Cursor shifts forward by `// `.len() = 3 to follow the `;` at col 12.
     assert_eq!(r.cursor.position, LogicalPosition { line: 2, col: 12 });
 
@@ -5824,7 +5797,7 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 12 },
-            anchor: Some(LogicalPosition { line: 0, col: 10 }),
+            anchor: LogicalPosition { line: 0, col: 10 },
         },
     )
     .await;
@@ -5838,7 +5811,7 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
     .await;
     // Selection now covers the entire `/* foo */` — anchor on the first `/`, cursor on the
     // last `/`. The wrap is 9 chars (`/* foo */`), so cols 10..=18.
-    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 10 }));
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 10 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 18 });
 
     drop(server);
@@ -5888,7 +5861,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 10 },
-            anchor: Some(LogicalPosition { line: 0, col: 5 }),
+            anchor: LogicalPosition { line: 0, col: 5 },
         },
     )
     .await;
@@ -5904,7 +5877,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
     // The closing `*/` sits on line 1 (after the original `\n`).
     assert_eq!(text, "let a/*  = 1;\n */let b = 2;\n");
     // Anchor stays on the original start; cursor follows the `*/` onto line 1 at col 2.
-    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 5 }));
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 5 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
 
     // Toggle again to uncomment. Round-trip must restore the original buffer *and* the
@@ -5919,7 +5892,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
     .await;
     let text2 = buffer_text(&mut ws, 7, open.buffer_id).await;
     assert_eq!(text2, "let a = 1;\nlet b = 2;\n");
-    assert_eq!(r2.cursor.anchor, Some(LogicalPosition { line: 0, col: 5 }));
+    assert_eq!(r2.cursor.anchor, LogicalPosition { line: 0, col: 5 });
     assert_eq!(r2.cursor.position, LogicalPosition { line: 0, col: 10 });
 
     drop(server);
@@ -5968,7 +5941,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
-            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+            anchor: LogicalPosition { line: 0, col: 4 },
         },
     )
     .await;
@@ -5982,7 +5955,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
     .await;
     // Anchor stays at (0, 4) — the opening `/` of `/*` lives there post-edit. Cursor lands
     // on the last `/` of `*/`, which is at col 7 of line 1 (`let b */ = 2;`).
-    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 4 }));
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 4 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 7 });
 
     drop(server);
@@ -6031,7 +6004,7 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
-            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+            anchor: LogicalPosition { line: 0, col: 4 },
         },
     )
     .await;
@@ -6092,7 +6065,7 @@ async fn toggle_comment_round_trip_partial_selection() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 12 },
-            anchor: Some(LogicalPosition { line: 0, col: 10 }),
+            anchor: LogicalPosition { line: 0, col: 10 },
         },
     )
     .await;
@@ -6165,7 +6138,7 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 13 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 13 },
         },
     )
     .await;
@@ -6223,7 +6196,7 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
         &CursorSetParams {
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
-            anchor: None,
+            anchor: LogicalPosition { line: 0, col: 0 },
         },
     )
     .await;
@@ -6360,7 +6333,7 @@ async fn search_set_returns_summary_and_jumps_to_first_match() {
     assert!(!r.summary.truncated);
     assert_eq!(r.summary.current_index, 1);
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
-    assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 0 });
 
     drop(server);
 }
@@ -6483,7 +6456,7 @@ async fn search_next_cycles_forward_and_wraps() {
     let r1: SearchNavResult =
         send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id }).await;
     assert_eq!(r1.summary.current_index, 2);
-    assert_eq!(r1.cursor.anchor, Some(LogicalPosition { line: 0, col: 8 }));
+    assert_eq!(r1.cursor.anchor, LogicalPosition { line: 0, col: 8 });
     let r2: SearchNavResult =
         send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
     assert_eq!(r2.summary.current_index, 3);

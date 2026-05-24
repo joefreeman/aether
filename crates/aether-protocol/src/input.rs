@@ -3,7 +3,7 @@
 //! All input commands are cursor-relative; none carry positions on the wire. If a selection
 //! exists, the command's implicit range is that selection.
 
-use crate::cursor::{CursorState, Motion, VerticalDirection};
+use crate::cursor::{CursorState, VerticalDirection};
 use crate::envelope::RpcMethod;
 use crate::{BufferId, Revision};
 use serde::{Deserialize, Serialize};
@@ -42,17 +42,27 @@ pub struct InputTextParams {
 
 // ---- input/delete -------------------------------------------------------------------------------
 
+/// Delete the current inclusive selection. For a point cursor (`anchor == position`) this is
+/// the 1-char range under the block cursor. Used by Normal-mode `Ctrl-d` / `Delete` /
+/// `Ctrl-c`, and by Insert-mode `Delete` (forward) — the point at the cursor IS the char to
+/// delete.
 pub struct InputDelete;
 impl RpcMethod for InputDelete {
     const NAME: &'static str = "input/delete";
-    type Params = InputDeleteParams;
+    type Params = BufferOnlyParams;
     type Result = EditResult;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InputDeleteParams {
-    pub buffer_id: BufferId,
-    pub motion: Motion,
+// ---- input/backspace ----------------------------------------------------------------------------
+
+/// Delete the char immediately before the cursor's position and leave the cursor at that
+/// position. Used by Insert-mode `Backspace` — there's no meaningful selection in Insert mode,
+/// and "delete the previous char" is its own gesture, distinct from "delete the selection".
+pub struct InputBackspace;
+impl RpcMethod for InputBackspace {
+    const NAME: &'static str = "input/backspace";
+    type Params = BufferOnlyParams;
+    type Result = EditResult;
 }
 
 // ---- input/indent, input/dedent -----------------------------------------------------------------
