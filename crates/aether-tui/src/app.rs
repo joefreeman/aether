@@ -941,11 +941,20 @@ async fn open_picker(
     kind: PickerKind,
 ) -> Result<()> {
     let limit = picker_limit(state);
-    let center_on = state.picker.last_selected.get(&kind).cloned();
+    // The Buffers picker always opens fresh — empty query, top of the MRU list. Its job is
+    // "switch to a recent buffer right now", not "resume a search session"; persisting the
+    // previous filter would force the user to clear it each time. The Files picker keeps its
+    // resume-on-reopen behavior since file browsing is more exploratory.
+    let preserves_state = kind_preserves_state(kind);
+    let center_on = if preserves_state {
+        state.picker.last_selected.get(&kind).cloned()
+    } else {
+        None
+    };
     let view = client
         .rpc::<PickerView>(PickerViewParams {
             kind,
-            reset: false,
+            reset: !preserves_state,
             offset: 0,
             limit,
             center_on: center_on.clone(),
@@ -967,6 +976,16 @@ async fn open_picker(
     state.mode = Mode::Picker;
     apply_cursor_style(state.mode);
     Ok(())
+}
+
+/// Whether a picker kind retains query + highlighted-item across hide/show. The Buffers picker
+/// doesn't — opening it should always land on the MRU top (i.e. the current buffer), with no
+/// filter active.
+fn kind_preserves_state(kind: PickerKind) -> bool {
+    match kind {
+        PickerKind::Files => true,
+        PickerKind::Buffers => false,
+    }
 }
 
 async fn handle_picker_key(
@@ -1116,7 +1135,9 @@ async fn request_picker_window(
 async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result<()> {
     let Some(kind) = state.picker.kind else { return Ok(()) };
     let Some(item) = state.picker.highlighted().cloned() else { return Ok(()) };
-    state.picker.last_selected.insert(kind, item.clone());
+    if kind_preserves_state(kind) {
+        state.picker.last_selected.insert(kind, item.clone());
+    }
 
     let result = client
         .rpc::<PickerSelect>(PickerSelectParams { kind, item: item.clone() })
@@ -1238,10 +1259,13 @@ fn project_relative_label(abs: &str, project_paths: &[String]) -> String {
 
 async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
     let Some(kind) = state.picker.kind else { return Ok(()) };
-    // Persist the highlight so the next `Space f` resumes here. Done client-side; server doesn't
-    // see selection at all.
-    if let Some(item) = state.picker.highlighted().cloned() {
-        state.picker.last_selected.insert(kind, item);
+    // Persist the highlight so the next open resumes here — only for kinds that preserve
+    // state. The server's own per-picker state is independent: we always send `picker/hide`
+    // so it stops pushing; whether to reset on next open is decided in `open_picker`.
+    if kind_preserves_state(kind) {
+        if let Some(item) = state.picker.highlighted().cloned() {
+            state.picker.last_selected.insert(kind, item);
+        }
     }
     let _ = client.rpc::<PickerHide>(PickerHideParams { kind }).await;
     state.picker.open = false;
