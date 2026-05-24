@@ -4,6 +4,7 @@ mod clipboard;
 mod discovery;
 mod picker;
 mod stderr_capture;
+mod text_input;
 mod ui;
 
 use clap::Parser;

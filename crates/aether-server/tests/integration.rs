@@ -85,6 +85,33 @@ async fn send_request<M: RpcMethod>(
     }
 }
 
+/// Like `send_request` but expects the RPC to return an error; returns the error message.
+/// Panics on a successful response.
+async fn send_request_expect_err<M: RpcMethod>(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    id: u64,
+    params: &M::Params,
+) -> String {
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id,
+        method: M::NAME.into(),
+        params: Some(serde_json::to_value(params).unwrap()),
+    };
+    let s = serde_json::to_string(&req).unwrap();
+    ws.send(Message::text(s)).await.unwrap();
+    loop {
+        let text = next_text(ws).await;
+        match serde_json::from_str::<ClientInbound>(&text).expect("parseable inbound") {
+            ClientInbound::Response(r) if r.id == id => {
+                panic!("expected error for {}, got Ok: {:?}", M::NAME, r.result);
+            }
+            ClientInbound::Error(e) if e.id == id => return e.error.message,
+            _ => {}
+        }
+    }
+}
+
 /// Read frames until one matching notification arrives. Panics if the stream ends first.
 async fn expect_notification<N: NotificationMethod>(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -1055,8 +1082,7 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
         motion: Motion::Char { direction: Direction::Forward, count: 1 },
     }).await;
     let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 6, &BufferSaveParams {
-        buffer_id: open.buffer_id, path_index: None, relative_path: None,
-    }).await;
+        buffer_id: open.buffer_id, path_index: None, relative_path: None, overwrite: false }).await;
     let disk = std::fs::read_to_string(&path).unwrap();
     assert_eq!(disk, "\nfn two() {}\nfn three() {}\n");
 
@@ -1682,7 +1708,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let save: BufferSaveResult = send_request::<BufferSave>(
         &mut ws,
         7,
-        &BufferSaveParams { buffer_id: open.buffer_id, path_index: None, relative_path: None },
+        &BufferSaveParams { buffer_id: open.buffer_id, path_index: None, relative_path: None, overwrite: false },
     )
     .await;
     assert!(save.saved_at_unix_ms > 0);
@@ -1725,7 +1751,7 @@ async fn save_preserves_crlf_endings() {
     let _save: BufferSaveResult = send_request::<BufferSave>(
         &mut ws,
         3,
-        &BufferSaveParams { buffer_id: open.buffer_id, path_index: None, relative_path: None },
+        &BufferSaveParams { buffer_id: open.buffer_id, path_index: None, relative_path: None, overwrite: false },
     )
     .await;
     let bytes = std::fs::read(&path).unwrap();
@@ -1765,8 +1791,7 @@ async fn save_scratch_returns_buffer_has_no_path() {
             serde_json::to_value(BufferSaveParams {
                 buffer_id: open.buffer_id,
                 path_index: None,
-                relative_path: None,
-            })
+                relative_path: None, overwrite: false })
             .unwrap(),
         ),
     };
@@ -2013,7 +2038,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
     let save: BufferSaveResult = send_request::<BufferSave>(
         &mut ws,
         13,
-        &BufferSaveParams { buffer_id, path_index: None, relative_path: None },
+        &BufferSaveParams { buffer_id, path_index: None, relative_path: None, overwrite: false },
     )
     .await;
     let saved_state = expect_notification::<BufferState>(&mut ws).await;
@@ -4591,8 +4616,7 @@ async fn buffers_picker_pushes_on_save() {
     assert!(saw_dirty, "main.rs should be dirty after the edit");
 
     let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 6, &BufferSaveParams {
-        buffer_id: opened.buffer_id, path_index: None, relative_path: None,
-    }).await;
+        buffer_id: opened.buffer_id, path_index: None, relative_path: None, overwrite: false }).await;
     let clean: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let saw_clean = clean.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, dirty, .. } if *buffer_id == opened.buffer_id && !*dirty));
     assert!(saw_clean, "save should flip dirty back off and re-push the picker");
@@ -4664,6 +4688,249 @@ async fn buffers_picker_mru_is_per_client() {
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     assert_eq!(ids, sorted, "client B should see buffers in id order (no MRU touches yet)");
+
+    drop(server);
+}
+
+// -------- save-as --------------------------------------------------------------------------------
+
+/// Save-as: writes a scratch buffer to a new file under the project root. The buffer picks up
+/// a canonical path so subsequent in-place saves work, and dirty flips off.
+#[tokio::test]
+async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
+        buffer_id: scratch.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
+        continuation_marker_width: 0, tab_width: 4,
+    }).await;
+    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
+        buffer_id: scratch.buffer_id, text: "hello world\n".into(), select_pasted: false,
+    }).await;
+
+    // Save-as to "notes.txt" under the project root.
+    let saved: BufferSaveResult = send_request::<BufferSave>(&mut ws, 5, &BufferSaveParams {
+        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("notes.txt".into()), overwrite: false }).await;
+
+    // File exists with the right contents.
+    let on_disk = std::fs::read_to_string(dir_path.join("notes.txt")).expect("file written");
+    assert_eq!(on_disk, "hello world\n");
+
+    // Dirty cleared. Reopen the buffer by id to check its post-save state.
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 6, &BufferOpenParams {
+        buffer_id: Some(scratch.buffer_id), path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    assert_eq!(reopen.saved_revision, saved.revision);
+    assert_eq!(reopen.revision, saved.revision);
+    assert!(reopen.path.as_deref().is_some_and(|p| p.ends_with("notes.txt")));
+
+    drop(server);
+}
+
+/// Save-as into a path already owned by another open buffer is rejected — otherwise we'd
+/// silently displace the other buffer.
+#[tokio::test]
+async fn save_as_rejects_path_conflict_with_open_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::write(dir_path.join("existing.txt"), "old content\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+
+    // Open the existing file (now claimed by buffer A).
+    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("existing.txt".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    // Open a fresh scratch (buffer B).
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
+        buffer_id: None, path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+
+    // Try to save-as scratch -> existing.txt. Expect error, expect the on-disk content
+    // untouched.
+    let msg = send_request_expect_err::<BufferSave>(&mut ws, 4, &BufferSaveParams {
+        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("existing.txt".into()), overwrite: false }).await;
+    assert!(msg.contains("already open"), "expected conflict message, got: {msg}");
+
+    drop(server);
+}
+
+/// Save-as on an already-path-backed buffer to its *own* current path is the in-place save
+/// case — no conflict, even though `buffer_for_path` finds a match.
+#[tokio::test]
+async fn save_as_to_same_path_is_in_place_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::write(dir_path.join("doc.txt"), "x\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("doc.txt".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
+        buffer_id: opened.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
+        continuation_marker_width: 0, tab_width: 4,
+    }).await;
+    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
+        buffer_id: opened.buffer_id, text: "y".into(), select_pasted: false,
+    }).await;
+    // Same-path save-as. Should succeed.
+    let _saved: BufferSaveResult = send_request::<BufferSave>(&mut ws, 5, &BufferSaveParams {
+        buffer_id: opened.buffer_id, path_index: Some(0), relative_path: Some("doc.txt".into()), overwrite: false }).await;
+    let on_disk = std::fs::read_to_string(dir_path.join("doc.txt")).unwrap();
+    assert!(on_disk.starts_with("y"));
+
+    drop(server);
+}
+
+/// Save-as into an existing file (not owned by any open buffer) is rejected with
+/// WOULD_OVERWRITE unless overwrite=true. The on-disk content stays put on rejection.
+#[tokio::test]
+async fn save_as_rejects_existing_file_without_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::write(dir_path.join("target.txt"), "original\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+
+    // Scratch buffer with some content.
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
+        buffer_id: scratch.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
+        continuation_marker_width: 0, tab_width: 4,
+    }).await;
+    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
+        buffer_id: scratch.buffer_id, text: "fresh\n".into(), select_pasted: false,
+    }).await;
+
+    // First try: overwrite=false should bounce with WOULD_OVERWRITE.
+    let msg = send_request_expect_err::<BufferSave>(&mut ws, 5, &BufferSaveParams {
+        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("target.txt".into()),
+        overwrite: false,
+    }).await;
+    assert!(msg.contains("would overwrite"), "expected would-overwrite message, got: {msg}");
+    // On-disk unchanged.
+    assert_eq!(std::fs::read_to_string(dir_path.join("target.txt")).unwrap(), "original\n");
+
+    // Second try: overwrite=true succeeds.
+    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 6, &BufferSaveParams {
+        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("target.txt".into()),
+        overwrite: true,
+    }).await;
+    assert_eq!(std::fs::read_to_string(dir_path.join("target.txt")).unwrap(), "fresh\n");
+
+    drop(server);
+}
+
+/// In-place save (target == buffer's current canonical_path) doesn't trigger WOULD_OVERWRITE
+/// even though the file obviously exists. Save-as to the same path is also fine.
+#[tokio::test]
+async fn in_place_save_never_triggers_overwrite_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::write(dir_path.join("file.txt"), "before\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("file.txt".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
+        buffer_id: opened.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
+        continuation_marker_width: 0, tab_width: 4,
+    }).await;
+    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
+        buffer_id: opened.buffer_id, text: "x".into(), select_pasted: false,
+    }).await;
+    // In-place save — overwrite=false, no path args. Must not error.
+    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 5, &BufferSaveParams {
+        buffer_id: opened.buffer_id, path_index: None, relative_path: None, overwrite: false,
+    }).await;
+    // Save-as to the same path — also fine with overwrite=false.
+    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 6, &BufferSaveParams {
+        buffer_id: opened.buffer_id, path_index: Some(0), relative_path: Some("file.txt".into()),
+        overwrite: false,
+    }).await;
+
+    drop(server);
+}
+
+/// After a scratch buffer is named via save-as, a plain in-place save (path_index/relative_path
+/// = None) targets the path the save-as set, rather than erroring on "buffer has no path".
+#[tokio::test]
+async fn in_place_save_after_save_as_targets_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
+        buffer_id: scratch.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
+        continuation_marker_width: 0, tab_width: 4,
+    }).await;
+    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
+        buffer_id: scratch.buffer_id, text: "one\n".into(), select_pasted: false,
+    }).await;
+    // Save-as to a fresh path.
+    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 5, &BufferSaveParams {
+        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("named.txt".into()),
+        overwrite: false,
+    }).await;
+    // Edit again, then plain in-place save (no path fields). Should write to named.txt.
+    let _: EditResult = send_request::<InputText>(&mut ws, 6, &InputTextParams {
+        buffer_id: scratch.buffer_id, text: "two\n".into(), select_pasted: false,
+    }).await;
+    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 7, &BufferSaveParams {
+        buffer_id: scratch.buffer_id, path_index: None, relative_path: None, overwrite: false,
+    }).await;
+    let on_disk = std::fs::read_to_string(dir_path.join("named.txt")).expect("file on disk");
+    assert_eq!(on_disk, "one\ntwo\n");
 
     drop(server);
 }

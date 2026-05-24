@@ -17,7 +17,7 @@ pub struct PickerState {
     /// lands in `Normal` (via the selected file's buffer), regardless. Defaults to `Normal` —
     /// the field is only consulted when `open` is true.
     pub return_mode: Mode,
-    pub query: String,
+    pub query: crate::text_input::TextInput,
     /// Generation we minted on the most recent `picker/query`. Pushes carrying a different
     /// generation came from a stale query and must be ignored.
     pub generation: u64,

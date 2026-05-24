@@ -47,6 +47,17 @@ impl RpcError {
     pub fn buffer_has_no_path() -> Self {
         Self::new(ErrorCode::BUFFER_HAS_NO_PATH, "buffer has no associated file path")
     }
+
+    pub fn would_overwrite(detail: impl std::fmt::Display) -> Self {
+        Self::new(ErrorCode::WOULD_OVERWRITE, format!("would overwrite existing file: {detail}"))
+    }
+
+    pub fn path_owned_by_buffer(buffer_id: aether_protocol::BufferId) -> Self {
+        Self::new(
+            ErrorCode::PATH_OWNED_BY_BUFFER,
+            format!("buffer {buffer_id} is already open at this path"),
+        )
+    }
 }
 
 impl From<RpcError> for ErrorObject {

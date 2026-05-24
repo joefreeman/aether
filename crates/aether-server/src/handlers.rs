@@ -1080,10 +1080,32 @@ pub async fn buffer_save(
         }
     };
 
-    // Perform the write. I/O happens under the lock; in v1 that's acceptable (single client).
-    // For multi-client we'd clone the rope, drop the lock, write, then re-lock to update state.
+    // Save-as conflict + would-overwrite checks live in the same critical section as the
+    // actual write so the existence check can't race with the save (TOCTOU). In v1 single-
+    // client this is theoretical, but folding the locks keeps the invariant tidy.
+    //
+    // Conflict: target path already canonical-bound to a *different* buffer — refuse rather
+    // than silently transferring the path. Skipped when target matches the saving buffer's
+    // own current path (the in-place save case).
+    //
+    // Would-overwrite: the file exists on disk but isn't this buffer's current path, and the
+    // caller hasn't confirmed. The client retries with `overwrite: true` after asking.
+    //
+    // I/O happens under the lock; in v1 that's acceptable (single client). For multi-client
+    // we'd clone the rope, drop the lock, write, then re-lock to update state.
     let (saved_at_unix_ms, revision) = {
         let mut s = state.lock().await;
+        if let Some(existing) = s.buffer_for_path(&target) {
+            if existing != params.buffer_id {
+                return Err(RpcError::path_owned_by_buffer(existing));
+            }
+        }
+        if !params.overwrite && target.exists() {
+            let own_path = s.buffers.get(&params.buffer_id).and_then(|b| b.canonical_path.as_ref());
+            if own_path.map(|p| p.as_path()) != Some(target.as_path()) {
+                return Err(RpcError::would_overwrite(target.display()));
+            }
+        }
         let buf = s
             .buffers
             .get_mut(&params.buffer_id)

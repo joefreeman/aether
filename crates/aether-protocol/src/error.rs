@@ -22,6 +22,12 @@ impl ErrorCode {
     pub const INVALID_POSITION: Self = Self(-32013);
     pub const STALE_REVISION: Self = Self(-32014);
     pub const BUFFER_HAS_NO_PATH: Self = Self(-32015);
+    /// Save-as target points at an on-disk file that isn't the saving buffer's current path.
+    /// The client should confirm with the user and retry with `overwrite: true`.
+    pub const WOULD_OVERWRITE: Self = Self(-32016);
+    /// Save-as target is already the canonical path of another open buffer. The client could
+    /// (eventually) react by offering to switch to that buffer.
+    pub const PATH_OWNED_BY_BUFFER: Self = Self(-32017);
     pub const FILE_IO: Self = Self(-32020);
     pub const LANGUAGE_NOT_FOUND: Self = Self(-32030);
 

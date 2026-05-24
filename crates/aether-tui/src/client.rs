@@ -3,14 +3,33 @@
 use aether_protocol::envelope::{
     ClientInbound, JsonRpc, Notification, Request, RpcMethod,
 };
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, Context};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::VecDeque;
+use std::fmt;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// JSON-RPC error from the server, surfaced as an `anyhow` source so the rest of the app's
+/// `anyhow::Result` plumbing keeps working while callers that care about the code can
+/// `downcast_ref::<RpcError>()` to branch on it (e.g. `WOULD_OVERWRITE` for save-as).
+#[derive(Debug, Clone)]
+pub struct RpcError {
+    pub method: &'static str,
+    pub code: i32,
+    pub message: String,
+}
+
+impl fmt::Display for RpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RPC {} returned error {}: {}", self.method, self.code, self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 pub struct Client {
     ws: Ws,
@@ -56,7 +75,11 @@ impl Client {
                     return Ok(serde_json::from_value(r.result)?);
                 }
                 ClientInbound::Error(e) if e.id == id => {
-                    bail!("RPC {} returned error {}: {}", M::NAME, e.error.code, e.error.message);
+                    return Err(anyhow::Error::new(RpcError {
+                        method: M::NAME,
+                        code: e.error.code,
+                        message: e.error.message,
+                    }));
                 }
                 ClientInbound::Notification(n) => self.pending_notifications.push_back(n),
                 ClientInbound::Response(_) | ClientInbound::Error(_) => {

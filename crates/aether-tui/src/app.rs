@@ -24,6 +24,7 @@ use aether_protocol::cursor::{
     Direction, Motion, VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
+use aether_protocol::error::ErrorCode;
 use aether_protocol::picker::{
     PickerHide, PickerHideParams, PickerKind, PickerQuery, PickerQueryParams, PickerSelect,
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
@@ -64,6 +65,9 @@ pub enum Mode {
     Search,
     FileBrowser,
     Picker,
+    /// Status-bar prompt for `Ctrl-Alt-s` (save-as). Typed text is the project-relative target
+    /// path; Enter commits, Esc returns to the prior mode without saving.
+    SavePrompt,
 }
 
 /// Multi-key prefixes the next keystroke completes. `Space` is the only one for now (used by
@@ -93,7 +97,7 @@ pub struct FileBrowserState {
 pub struct FileBrowserPrompt {
     pub kind: FileBrowserPromptKind,
     /// Text the user has typed so far.
-    pub input: String,
+    pub input: crate::text_input::TextInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +124,7 @@ pub struct PendingFind {
 #[derive(Debug, Default)]
 pub struct SearchState {
     /// The current query — live while in Mode::Search, the committed query otherwise.
-    pub query: String,
+    pub query: crate::text_input::TextInput,
     /// True when there is a committed search on the server (set via `search/set` with a non-empty
     /// query and not later cleared). Used to gate highlighting and the `n`/`Alt-n` bindings.
     pub active: bool,
@@ -207,6 +211,22 @@ pub struct AppState {
     /// the next keystroke. Cleared in any other code path that decides the leader doesn't apply.
     pub pending_leader: Option<PendingLeader>,
     pub picker: crate::picker::PickerState,
+    /// Active save-as prompt. `Some` iff `mode == Mode::SavePrompt`. Holds the typed path and
+    /// the mode to restore on Esc.
+    pub save_prompt: Option<SavePromptState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SavePromptState {
+    pub input: crate::text_input::TextInput,
+    /// Mode the user was in when the prompt opened (Normal or Insert). Restored on Esc and on
+    /// successful commit, so saving from inside Insert doesn't yank the user back to Normal.
+    pub return_mode: Mode,
+    /// `true` after the server rejected the save with `WOULD_OVERWRITE`. The prompt switches
+    /// to a y/N question; `y` resends with `overwrite: true`; `n` / Enter / Esc returns to
+    /// path editing with the same input still in place. The path being confirmed is read from
+    /// `input.text` — no need to store it again here.
+    pub pending_overwrite: bool,
 }
 
 impl AppState {
@@ -323,6 +343,7 @@ pub async fn bootstrap(
         file_browser: FileBrowserState::default(),
         pending_leader: None,
         picker: crate::picker::PickerState::default(),
+        save_prompt: None,
     };
 
     if let Some(dir) = browse_dir {
@@ -403,7 +424,7 @@ async fn dispatch_terminal_event(
 fn apply_cursor_style(mode: Mode) {
     let style = match mode {
         Mode::Normal => SetCursorStyle::SteadyBlock,
-        Mode::Insert | Mode::Search | Mode::Picker => SetCursorStyle::SteadyBar,
+        Mode::Insert | Mode::Search | Mode::Picker | Mode::SavePrompt => SetCursorStyle::SteadyBar,
         Mode::FileBrowser => SetCursorStyle::SteadyBlock,
     };
     let _ = execute!(stdout(), style);
@@ -501,6 +522,7 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
                 Mode::Insert => handle_insert_key(client, state, k).await?,
                 Mode::Search => handle_search_key(client, state, k).await?,
                 Mode::FileBrowser => handle_file_browser_key(client, state, k).await?,
+                Mode::SavePrompt => handle_save_prompt_key(client, state, k).await?,
                 Mode::Picker => handle_picker_key(client, state, k).await?,
             }
         }
@@ -820,6 +842,8 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         // ---- edits ----
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
+        (KeyCode::Char('s'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
+            begin_save_prompt(state),
         (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
             redo(client, state, count).await?,
         (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, count).await?,
@@ -930,7 +954,7 @@ async fn open_picker(
     state.picker.open = true;
     state.picker.kind = Some(kind);
     state.picker.return_mode = state.mode;
-    state.picker.query = view.query;
+    state.picker.query.set(view.query);
     state.picker.generation = view.generation;
     state.picker.offset = view.effective_offset;
     state.picker.limit = limit;
@@ -975,13 +999,16 @@ async fn handle_picker_key(
                 state.picker.resume_target = anchor;
             }
         }
+        (KeyCode::Left, _) => state.picker.query.move_left(),
+        (KeyCode::Right, _) => state.picker.query.move_right(),
         (KeyCode::Backspace, _) => {
-            if state.picker.query.pop().is_some() {
+            if !state.picker.query.is_empty() {
+                state.picker.query.backspace();
                 send_picker_query(client, state).await?;
             }
         }
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
-            state.picker.query.push(c);
+            state.picker.query.insert_char(c);
             send_picker_query(client, state).await?;
         }
         _ => {}
@@ -1052,7 +1079,7 @@ async fn send_picker_query(client: &mut Client, state: &mut AppState) -> Result<
     client
         .rpc::<PickerQuery>(PickerQueryParams {
             kind,
-            query: state.picker.query.clone(),
+            query: state.picker.query.text.clone(),
             generation: state.picker.generation,
         })
         .await?;
@@ -1228,8 +1255,10 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
     match (code, mods) {
         (KeyCode::Esc, _) => leave_insert(state),
 
-        // Allow Ctrl-S / Ctrl-U / Ctrl-Alt-U to work in insert mode too.
+        // Allow Ctrl-S / Ctrl-Alt-S / Ctrl-U / Ctrl-Alt-U to work in insert mode too.
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
+        (KeyCode::Char('s'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
+            begin_save_prompt(state),
         (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
             redo(client, state, 1).await?,
         (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, 1).await?,
@@ -1393,7 +1422,10 @@ fn leave_file_browser(state: &mut AppState) {
 }
 
 fn begin_prompt(state: &mut AppState, kind: FileBrowserPromptKind) {
-    state.file_browser.prompt = Some(FileBrowserPrompt { kind, input: String::new() });
+    state.file_browser.prompt = Some(FileBrowserPrompt {
+        kind,
+        input: crate::text_input::TextInput::default(),
+    });
     // Bar cursor while typing in the prompt — restored on commit/cancel.
     let _ = execute!(stdout(), SetCursorStyle::SteadyBar);
 }
@@ -1417,14 +1449,24 @@ async fn handle_file_browser_prompt_key(
                 }
             }
         }
+        (KeyCode::Left, _) => {
+            if let Some(p) = state.file_browser.prompt.as_mut() {
+                p.input.move_left();
+            }
+        }
+        (KeyCode::Right, _) => {
+            if let Some(p) = state.file_browser.prompt.as_mut() {
+                p.input.move_right();
+            }
+        }
         (KeyCode::Backspace, _) => {
             if let Some(p) = state.file_browser.prompt.as_mut() {
-                p.input.pop();
+                p.input.backspace();
             }
         }
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
             if let Some(p) = state.file_browser.prompt.as_mut() {
-                p.input.push(c);
+                p.input.insert_char(c);
             }
         }
         _ => {}
@@ -1438,7 +1480,7 @@ async fn commit_prompt(
     prompt: FileBrowserPrompt,
 ) -> Result<()> {
     let target_abs = std::path::Path::new(&state.file_browser.path)
-        .join(&prompt.input)
+        .join(&prompt.input.text)
         .display()
         .to_string();
     match prompt.kind {
@@ -1546,13 +1588,15 @@ async fn handle_search_key(client: &mut Client, state: &mut AppState, k: KeyEven
             history_down(state);
             run_incremental_search(client, state).await?;
         }
+        (KeyCode::Left, _) => state.search.query.move_left(),
+        (KeyCode::Right, _) => state.search.query.move_right(),
         (KeyCode::Backspace, _) => {
-            state.search.query.pop();
+            state.search.query.backspace();
             state.search.history_cursor = None;
             run_incremental_search(client, state).await?;
         }
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
-            state.search.query.push(c);
+            state.search.query.insert_char(c);
             state.search.history_cursor = None;
             run_incremental_search(client, state).await?;
         }
@@ -1565,7 +1609,7 @@ async fn enter_search_mode(client: &mut Client, state: &mut AppState) -> Result<
     state.search.snapshot = Some(SearchSnapshot {
         cursor: state.cursor,
         scroll_logical_line: state.scroll_logical_line,
-        query: std::mem::take(&mut state.search.query),
+        query: state.search.query.take_text(),
         active: state.search.active,
     });
     state.search.active = false;
@@ -1585,7 +1629,7 @@ fn commit_search(state: &mut AppState) {
     state.search.snapshot = None;
     if !state.search.query.is_empty() {
         state.search.active = true;
-        push_history(state, state.search.query.clone());
+        push_history(state, state.search.query.text.clone());
     } else {
         state.search.active = false;
         state.search.summary = None;
@@ -1618,14 +1662,14 @@ fn history_up(state: &mut AppState) {
     }
     let new_idx = match state.search.history_cursor {
         None => {
-            state.search.history_draft = state.search.query.clone();
+            state.search.history_draft = state.search.query.text.clone();
             state.search.history.len() - 1
         }
         Some(0) => 0,
         Some(i) => i - 1,
     };
     state.search.history_cursor = Some(new_idx);
-    state.search.query = state.search.history[new_idx].clone();
+    state.search.query.set(state.search.history[new_idx].clone());
 }
 
 fn history_down(state: &mut AppState) {
@@ -1633,11 +1677,11 @@ fn history_down(state: &mut AppState) {
         None => {} // already past the newest entry
         Some(i) if i + 1 < state.search.history.len() => {
             state.search.history_cursor = Some(i + 1);
-            state.search.query = state.search.history[i + 1].clone();
+            state.search.query.set(state.search.history[i + 1].clone());
         }
         Some(_) => {
             state.search.history_cursor = None;
-            state.search.query = std::mem::take(&mut state.search.history_draft);
+            state.search.query.set(std::mem::take(&mut state.search.history_draft));
         }
     }
 }
@@ -1665,7 +1709,7 @@ async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
             .await;
         state.search.summary = None;
     }
-    state.search.query = snap.query;
+    state.search.query.set(snap.query);
     state.search.active = snap.active;
     // Restore cursor + selection.
     let new = client
@@ -1720,7 +1764,7 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
     let result = client
         .rpc::<SearchSet>(SearchSetParams {
             buffer_id: state.buffer_id,
-            query: state.search.query.clone(),
+            query: state.search.query.text.clone(),
             anchor,
         })
         .await;
@@ -1818,13 +1862,13 @@ async fn search_from_selection(client: &mut Client, state: &mut AppState) -> Res
     if r.text.is_empty() {
         return Ok(());
     }
-    state.search.query = regex_escape(&r.text);
+    state.search.query.set(regex_escape(&r.text));
     state.search.active = true;
-    push_history(state, state.search.query.clone());
+    push_history(state, state.search.query.text.clone());
     let result = client
         .rpc::<SearchSet>(SearchSetParams {
             buffer_id: state.buffer_id,
-            query: state.search.query.clone(),
+            query: state.search.query.text.clone(),
             anchor: None,
         })
         .await?;
@@ -1856,7 +1900,7 @@ async fn search_cycle(
     if !state.search.active {
         // No active search: revive the most recent history entry server-side, then cycle.
         let Some(last) = state.search.history.last().cloned() else { return Ok(()) };
-        state.search.query = last.clone();
+        state.search.query.set(last.clone());
         let r = client
             .rpc::<SearchSet>(SearchSetParams {
                 buffer_id: state.buffer_id,
@@ -2457,11 +2501,19 @@ fn apply_undo_result(state: &mut AppState, r: UndoResult, label: &str) {
 }
 
 async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
+    if state.file_path.is_none() {
+        // Scratch buffer — no path to save to. Don't auto-prompt: the user has to be explicit
+        // about creating a file with Ctrl-Alt-s. This keeps `Ctrl-s` semantics uniform: it only
+        // ever writes to an already-known path.
+        state.status = "scratch buffer has no path — use Ctrl-Alt-s to save as".into();
+        return Ok(());
+    }
     let result = client
         .rpc::<BufferSave>(BufferSaveParams {
             buffer_id: state.buffer_id,
             path_index: None,
             relative_path: None,
+            overwrite: false,
         })
         .await;
     match result {
@@ -2475,6 +2527,157 @@ async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Open the status-bar save-as prompt. Pre-filled with the current file's project-relative
+/// path so a small rename is one Backspace + a few keys; empty for scratch buffers. Cursor
+/// lands at the end of the pre-fill.
+fn begin_save_prompt(state: &mut AppState) {
+    let initial = state
+        .file_path
+        .as_deref()
+        .map(|p| project_relative_label(p, &state.project_paths))
+        .unwrap_or_default();
+    state.save_prompt = Some(SavePromptState {
+        input: crate::text_input::TextInput::new(initial),
+        return_mode: state.mode,
+        pending_overwrite: false,
+    });
+    state.mode = Mode::SavePrompt;
+    apply_cursor_style(state.mode);
+}
+
+async fn handle_save_prompt_key(
+    client: &mut Client,
+    state: &mut AppState,
+    k: KeyEvent,
+) -> Result<()> {
+    // Don't `normalize_key` here — that lowercases uppercase chars, which would mangle paths.
+    let confirming = state.save_prompt.as_ref().is_some_and(|p| p.pending_overwrite);
+    if confirming {
+        match (k.code, k.modifiers) {
+            // Default (Enter / Esc / n) is "don't overwrite" — matching the uppercase `N` in
+            // the `[y/N]` prompt. Drops the confirmation and returns to path editing so the
+            // user can pick a different filename.
+            (KeyCode::Esc, _) | (KeyCode::Enter, _) | (KeyCode::Char('n' | 'N'), _) => {
+                if let Some(p) = state.save_prompt.as_mut() {
+                    p.pending_overwrite = false;
+                }
+            }
+            (KeyCode::Char('y' | 'Y'), _) => {
+                send_save_prompt(client, state, true).await?;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => abort_save_prompt(state),
+        (KeyCode::Enter, _) => send_save_prompt(client, state, false).await?,
+        (KeyCode::Left, _) => {
+            if let Some(p) = state.save_prompt.as_mut() {
+                p.input.move_left();
+            }
+        }
+        (KeyCode::Right, _) => {
+            if let Some(p) = state.save_prompt.as_mut() {
+                p.input.move_right();
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            if let Some(p) = state.save_prompt.as_mut() {
+                p.input.backspace();
+            }
+        }
+        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+            if let Some(p) = state.save_prompt.as_mut() {
+                p.input.insert_char(c);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn abort_save_prompt(state: &mut AppState) {
+    if let Some(prompt) = state.save_prompt.take() {
+        state.mode = prompt.return_mode;
+    } else {
+        state.mode = Mode::Normal;
+    }
+    apply_cursor_style(state.mode);
+}
+
+/// Send the save-as RPC. With `overwrite = false` we may get a `WOULD_OVERWRITE` back, in
+/// which case we keep the prompt open and switch it to the y/N confirmation; with `true` we
+/// resend after confirmation. On success we close the prompt and refresh local state; on any
+/// other error we just stash the message in the status bar and close.
+async fn send_save_prompt(
+    client: &mut Client,
+    state: &mut AppState,
+    overwrite: bool,
+) -> Result<()> {
+    let (path, return_mode) = match state.save_prompt.as_ref() {
+        Some(p) if !p.input.trim().is_empty() => (p.input.text.clone(), p.return_mode),
+        Some(p) => {
+            // Empty input — treat as cancel.
+            let return_mode = p.return_mode;
+            state.save_prompt = None;
+            state.mode = return_mode;
+            apply_cursor_style(state.mode);
+            return Ok(());
+        }
+        None => return Ok(()),
+    };
+
+    // TODO: multi-root support — when `project_paths.len() > 1` we should let the user pick a
+    // root (or accept absolute paths in the prompt and infer the root) rather than silently
+    // saving under the first project root.
+    let result = client
+        .rpc::<BufferSave>(BufferSaveParams {
+            buffer_id: state.buffer_id,
+            path_index: Some(0),
+            relative_path: Some(path.clone()),
+            overwrite,
+        })
+        .await;
+    match result {
+        Ok(r) => {
+            state.save_prompt = None;
+            state.mode = return_mode;
+            apply_cursor_style(state.mode);
+            state.revision = r.revision;
+            state.saved_revision = r.revision;
+            state.file_label = path.clone();
+            if let Some(root) = state.project_paths.first() {
+                state.file_path = Some(
+                    std::path::Path::new(root).join(&path).display().to_string(),
+                );
+            }
+            state.status = format!("saved as {} (rev {})", path, r.revision);
+        }
+        Err(e) if is_would_overwrite(&e) => {
+            // Keep the prompt open and switch to confirmation. The user's typed path stays
+            // in `input.text`; the confirmation row reads it from there.
+            if let Some(p) = state.save_prompt.as_mut() {
+                p.pending_overwrite = true;
+            }
+        }
+        Err(e) => {
+            state.save_prompt = None;
+            state.mode = return_mode;
+            apply_cursor_style(state.mode);
+            state.status = format!("save failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// True iff `e` is the server's `WOULD_OVERWRITE` JSON-RPC error. `Client::rpc` wraps server
+/// errors as `RpcError` inside an anyhow chain; we downcast rather than match on the message.
+fn is_would_overwrite(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::client::RpcError>()
+        .is_some_and(|r| r.code == ErrorCode::WOULD_OVERWRITE.code())
 }
 
 async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> Result<()> {

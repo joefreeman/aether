@@ -175,7 +175,7 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         let ph = picker_placeholder(state.picker.kind);
         (ph.to_string(), placeholder_style, ph.width())
     } else {
-        let q = state.picker.query.clone();
+        let q = state.picker.query.text.clone();
         let w = q.width();
         (q, base_style, w)
     };
@@ -868,7 +868,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 crate::app::FileBrowserPromptKind::NewFile => "new file",
                 crate::app::FileBrowserPromptKind::NewDirectory => "new directory",
             };
-            Line::from(vec![Span::raw(format!(" {label}: {}", prompt.input))])
+            Line::from(vec![Span::raw(format!(" {label}: {}", prompt.input.text))])
         } else {
             let rel = project_relative_path(&state.file_browser.path, &state.project_paths);
             let suffix = if rel.is_empty() { String::new() } else { format!(" {rel}/") };
@@ -877,12 +877,20 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     } else if matches!(state.mode, Mode::Search) {
         // Search-mode prompt takes over the status row. Append the live match-count summary
         // (derived from the search state at render time, not from `state.status`).
-        let prompt = format!("/{}", state.search.query);
+        let prompt = format!("/{}", state.search.query.text);
         let text = match search_match_count_label(state) {
             Some(count) => format!("{prompt}    {count}"),
             None => prompt,
         };
         Line::from(vec![Span::raw(text)])
+    } else if matches!(state.mode, Mode::SavePrompt) {
+        match state.save_prompt.as_ref() {
+            Some(p) if p.pending_overwrite => {
+                Line::from(vec![Span::raw(format!(" overwrite {}? [y/N]", p.input.text))])
+            }
+            Some(p) => Line::from(vec![Span::raw(format!(" save as: {}", p.input.text))]),
+            None => Line::from(vec![Span::raw("")]),
+        }
     } else {
         let dirty_marker = if state.dirty() { "[+]" } else { "" };
         let counter = search_counter_label(state)
@@ -916,7 +924,7 @@ fn format_position(state: &AppState) -> String {
     let pos = state.cursor.position;
     match state.mode {
         Mode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
-        Mode::FileBrowser => String::new(),
+        Mode::FileBrowser | Mode::SavePrompt => String::new(),
         Mode::Normal | Mode::Search | Mode::Picker => {
             let (start, end_inclusive) = match state.cursor.anchor {
                 None => (pos, pos),
@@ -982,31 +990,53 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
     if matches!(state.mode, Mode::Search) {
-        // Park the terminal cursor on the status row, just past `/` + the typed query.
-        let prompt_width = 1 + state.search.query.width() as u16;
-        let col = status_area.x.saturating_add(prompt_width.min(status_area.width.saturating_sub(1)));
+        // Park the terminal cursor on the status row, just past `/` + the typed query up to the
+        // input cursor (so Left/Right navigate within the query, not always at the end).
+        let typed_w = state.search.query.width_to_cursor() as u16;
+        let col = status_area
+            .x
+            .saturating_add((1 + typed_w).min(status_area.width.saturating_sub(1)));
         f.set_cursor_position((col, status_area.y));
         return;
     }
     if state.picker.open {
-        // Place the cursor inside the picker overlay's input row, just past the query (or at
-        // the start, on the placeholder, when the query is empty).
+        // Place the cursor inside the picker overlay's input row, at the current insertion
+        // point within the query (or at the start, on the placeholder, when empty).
         let box_area = picker_box_rect(buffer_area);
         if box_area.width >= 4 && box_area.height >= 4 {
             // Inner = inside the borders; inner padding adds another column on each side.
             let text_x = box_area.x + 2;
             let text_y = box_area.y + 1;
             let text_w = box_area.width.saturating_sub(4);
-            let query_w = state.picker.query.width() as u16;
-            let col = text_x.saturating_add(query_w.min(text_w.saturating_sub(1)));
+            let typed_w = state.picker.query.width_to_cursor() as u16;
+            let col = text_x.saturating_add(typed_w.min(text_w.saturating_sub(1)));
             f.set_cursor_position((col, text_y));
+        }
+        return;
+    }
+    if matches!(state.mode, Mode::SavePrompt) {
+        if let Some(prompt) = state.save_prompt.as_ref() {
+            let max_col = status_area.x.saturating_add(status_area.width.saturating_sub(1));
+            let col = if prompt.pending_overwrite {
+                // Confirmation stage: park at the end of " overwrite <path>? [y/N]" so the
+                // I-beam sits past the prompt rather than mid-path.
+                let line = format!(" overwrite {}? [y/N]", prompt.input.text);
+                status_area.x.saturating_add(line.width() as u16).min(max_col)
+            } else {
+                const PREFIX: &str = " save as: ";
+                let prefix_w = PREFIX.width() as u16;
+                let typed_w = prompt.input.width_to_cursor() as u16;
+                status_area.x.saturating_add(prefix_w.saturating_add(typed_w)).min(max_col)
+            };
+            f.set_cursor_position((col, status_area.y));
         }
         return;
     }
     if matches!(state.mode, Mode::FileBrowser) {
         if let Some(prompt) = state.file_browser.prompt.as_ref() {
-            // Cursor sits at end of the prompt input on the status row. Label width matches the
-            // string built in `draw_status`: " <label>: " is `label.len() + 3` chars.
+            // Cursor sits at the prompt's current insertion point on the status row. Label
+            // width matches the string built in `draw_status`: " <label>: " is `label.len() + 3`
+            // chars.
             let label_len = match prompt.kind {
                 crate::app::FileBrowserPromptKind::NewFile => "new file".len(),
                 crate::app::FileBrowserPromptKind::NewDirectory => "new directory".len(),
@@ -1014,7 +1044,7 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
             let prefix_width = (label_len + 3) as u16; // " " + label + ": "
             let col = status_area
                 .x
-                .saturating_add(prefix_width.saturating_add(prompt.input.width() as u16))
+                .saturating_add(prefix_width.saturating_add(prompt.input.width_to_cursor() as u16))
                 .min(status_area.x.saturating_add(status_area.width.saturating_sub(1)));
             f.set_cursor_position((col, status_area.y));
             return;

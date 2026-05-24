@@ -71,6 +71,12 @@ pub struct BufferSaveParams {
     pub buffer_id: BufferId,
     pub path_index: Option<u32>,
     pub relative_path: Option<String>,
+    /// When the resolved target points at an on-disk file that isn't this buffer's current
+    /// path, the server rejects with `WOULD_OVERWRITE` unless this is `true`. The client uses
+    /// it as a two-step "ask, then confirm" handshake: first attempt with `false`, and on the
+    /// specific error retry with `true` after the user confirms.
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
