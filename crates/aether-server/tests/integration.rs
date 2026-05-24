@@ -875,7 +875,8 @@ async fn line_end_and_buffer_end_motions() {
         },
     )
     .await;
-    assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
+    // LineEnd lands on the last visible char ('c'), not on the trailing newline.
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 2 });
 
     let st: CursorState = send_request::<CursorMove>(
         &mut ws,

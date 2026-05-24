@@ -52,6 +52,26 @@ fn line_byte_len_excl_newline_slice(slice: ropey::RopeSlice<'_>) -> u32 {
     }
 }
 
+/// Byte offset (within the line) of the last char on the line that isn't the trailing newline.
+/// For a non-empty visible line this is the start byte of the last visible char (so the cursor
+/// "block" covers that char rather than the newline). For an empty line — only a newline, or
+/// the final line with no trailing newline and zero visible content — returns 0.
+pub fn line_last_char_byte_idx(buf: &Buffer, line_idx: u32) -> u32 {
+    let slice = buf.text.line(line_idx as usize);
+    let len_excl_nl = line_byte_len_excl_newline_slice(slice) as usize;
+    if len_excl_nl == 0 {
+        return 0;
+    }
+    // Walk back from the byte just past the last visible char to its start boundary. We use
+    // the rope's byte_to_char (which falls onto a char even mid-byte for multi-byte UTF-8)
+    // plus char_to_byte to land on the char's first byte.
+    let line_start_byte = buf.text.line_to_byte(line_idx as usize);
+    let last_byte_in_line = line_start_byte + len_excl_nl - 1;
+    let last_char_idx = buf.text.byte_to_char(last_byte_in_line);
+    let last_char_byte_start = buf.text.char_to_byte(last_char_idx);
+    (last_char_byte_start - line_start_byte) as u32
+}
+
 pub fn clamp_position(buf: &Buffer, pos: LogicalPosition) -> LogicalPosition {
     let line_count = buf.text.len_lines() as u32;
     let line = pos.line.min(line_count.saturating_sub(1));
@@ -106,7 +126,7 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         },
         Motion::LineEnd => LogicalPosition {
             line: current.line,
-            col: line_byte_len_excl_newline(buf, current.line),
+            col: line_last_char_byte_idx(buf, current.line),
         },
         Motion::LineFirstNonblank => {
             let slice = buf.text.line(current.line as usize);
