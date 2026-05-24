@@ -2,21 +2,17 @@
 //! client owns the highlighted row plus a small persisted slot (`last_selected`) used to restore
 //! the highlight on reopen via `view { center_on }`.
 
-use crate::app::Mode;
 use aether_protocol::picker::{PickerItem, PickerKind};
 use std::collections::HashMap;
 
-/// In-flight picker UI state. `open` toggles the modal; when `false` all the other fields are
+/// In-flight picker UI state. `open` toggles the overlay; when `false` all the other fields are
 /// dormant carry-over from a prior session (we don't bother zeroing them — `Space f` resets the
-/// server, and the next push will repopulate items).
+/// server, and the next push will repopulate items). Opening/closing the picker doesn't change
+/// which screen is underneath, so there's no "return mode" bookkeeping to do.
 #[derive(Debug, Default)]
 pub struct PickerState {
     pub open: bool,
     pub kind: Option<PickerKind>,
-    /// Mode the user was in when the picker was opened. `Esc` returns here. `Enter` always
-    /// lands in `Normal` (via the selected file's buffer), regardless. Defaults to `Normal` —
-    /// the field is only consulted when `open` is true.
-    pub return_mode: Mode,
     pub query: crate::text_input::TextInput,
     /// Generation we minted on the most recent `picker/query`. Pushes carrying a different
     /// generation came from a stale query and must be ignored.

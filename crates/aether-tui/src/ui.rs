@@ -1,6 +1,6 @@
 //! Ratatui rendering. The buffer fills the screen except for the bottom status row.
 
-use crate::app::{search_counter_label, search_match_count_label, AppState, Mode};
+use crate::app::{search_counter_label, search_match_count_label, AppState, EditorMode};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::picker::PickerItem;
 use aether_protocol::search::SearchMatchRange;
@@ -59,11 +59,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(f.area());
-    // The picker overlays whichever view was active when it was opened. When the picker is
-    // open we look at `return_mode` instead of `mode` (which is now `Picker`), so the file
-    // browser stays visible underneath if that's where we came from.
-    let underlying_mode = if state.picker.open { state.picker.return_mode } else { state.mode };
-    if matches!(underlying_mode, Mode::FileBrowser) {
+    // The picker overlays whichever screen is underneath. Render the screen first, then the
+    // overlay on top.
+    if state.is_browsing() {
         draw_file_browser(f, state, chunks[0]);
     } else {
         draw_buffer(f, state, chunks[0]);
@@ -384,9 +382,9 @@ fn truncate_path_with_indices(
 }
 
 fn draw_file_browser(f: &mut Frame, state: &AppState, area: Rect) {
-    let mut lines: Vec<Line> = Vec::with_capacity(state.file_browser.entries.len());
-    for (i, entry) in state.file_browser.entries.iter().enumerate() {
-        let highlighted = i == state.file_browser.selected;
+    let mut lines: Vec<Line> = Vec::with_capacity(state.browsing().file_browser.entries.len());
+    for (i, entry) in state.browsing().file_browser.entries.iter().enumerate() {
+        let highlighted = i == state.browsing().file_browser.selected;
         let label = if entry.is_dir {
             format!("{}/", entry.name)
         } else {
@@ -433,12 +431,12 @@ fn entry_style(is_dir: bool, highlighted: bool) -> Style {
 }
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
-    let top = state.scroll_logical_line;
-    let selection = ordered_selection(&state.cursor);
+    let top = state.editor().scroll_logical_line;
+    let selection = ordered_selection(&state.editor().cursor);
     let viewport_rows = area.height as usize;
     let viewport_cols = area.width;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
-    let scroll_col = if matches!(state.wrap, WrapMode::None) { state.scroll_col } else { 0 };
+    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) { state.editor().scroll_col } else { 0 };
 
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
     let mut logical_line = top;
@@ -447,11 +445,11 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         if lines.len() >= viewport_rows {
             break;
         }
-        let local_idx = (logical_line as i64) - (state.window_first_logical_line as i64);
-        if local_idx < 0 || local_idx >= state.lines.len() as i64 {
+        let local_idx = (logical_line as i64) - (state.editor().window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.editor().lines.len() as i64 {
             break;
         }
-        let render = &state.lines[local_idx as usize];
+        let render = &state.editor().lines[local_idx as usize];
 
         let last_vrow_idx = render.visual_rows.len().saturating_sub(1);
         for (vrow_idx, vrow) in render.visual_rows.iter().enumerate() {
@@ -496,7 +494,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             let matches_on_row =
                 matches_on_visual_row(vrow.byte_offset, row_text_len, &render.search_matches);
             let brackets_on_row =
-                bracket_positions_on_visual_row(logical_line, vrow.byte_offset, row_text_len, state.cursor.match_bracket);
+                bracket_positions_on_visual_row(logical_line, vrow.byte_offset, row_text_len, state.editor().cursor.match_bracket);
 
             // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
             // bytes when scroll_col == 0 (the common case), so this is a no-op under soft wrap.
@@ -862,28 +860,8 @@ fn lookup_exact(name: &str) -> Option<Style> {
 
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let line = if matches!(state.mode, Mode::FileBrowser) {
-        if let Some(prompt) = state.file_browser.prompt.as_ref() {
-            let label = match prompt.kind {
-                crate::app::FileBrowserPromptKind::NewFile => "new file",
-                crate::app::FileBrowserPromptKind::NewDirectory => "new directory",
-            };
-            Line::from(vec![Span::raw(format!(" {label}: {}", prompt.input.text))])
-        } else {
-            let rel = project_relative_path(&state.file_browser.path, &state.project_paths);
-            let suffix = if rel.is_empty() { String::new() } else { format!(" {rel}/") };
-            Line::from(vec![Span::raw(format!(" [{}]{}", state.project_name, suffix))])
-        }
-    } else if matches!(state.mode, Mode::Search) {
-        // Search-mode prompt takes over the status row. Append the live match-count summary
-        // (derived from the search state at render time, not from `state.status`).
-        let prompt = format!("/{}", state.search.query.text);
-        let text = match search_match_count_label(state) {
-            Some(count) => format!("{prompt}    {count}"),
-            None => prompt,
-        };
-        Line::from(vec![Span::raw(text)])
-    } else if matches!(state.mode, Mode::SavePrompt) {
+    let line = if state.save_prompt.is_some() {
+        // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
         match state.save_prompt.as_ref() {
             Some(p) if p.pending_overwrite => {
                 Line::from(vec![Span::raw(format!(" overwrite {}? [y/N]", p.input.text))])
@@ -891,6 +869,25 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             Some(p) => Line::from(vec![Span::raw(format!(" save as: {}", p.input.text))]),
             None => Line::from(vec![Span::raw("")]),
         }
+    } else if let Some(browsing) = state.try_browsing() {
+        if let Some(prompt) = browsing.file_browser.prompt.as_ref() {
+            let label = match prompt.kind {
+                crate::app::FileBrowserPromptKind::NewFile => "new file",
+                crate::app::FileBrowserPromptKind::NewDirectory => "new directory",
+            };
+            Line::from(vec![Span::raw(format!(" {label}: {}", prompt.input.text))])
+        } else {
+            let rel = project_relative_path(&browsing.file_browser.path, &state.project_paths);
+            let suffix = if rel.is_empty() { String::new() } else { format!(" {rel}/") };
+            Line::from(vec![Span::raw(format!(" [{}]{}", state.project_name, suffix))])
+        }
+    } else if matches!(state.editor().mode, EditorMode::Search) {
+        let prompt = format!("/{}", state.editor().search.query.text);
+        let text = match search_match_count_label(state) {
+            Some(count) => format!("{prompt}    {count}"),
+            None => prompt,
+        };
+        Line::from(vec![Span::raw(text)])
     } else {
         let dirty_marker = if state.dirty() { "[+]" } else { "" };
         let counter = search_counter_label(state)
@@ -899,7 +896,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         let main = format!(
             " [{project}] {file} {dirty}  {pos}{counter}",
             project = state.project_name,
-            file = state.file_label,
+            file = state.editor().file_label,
             dirty = dirty_marker,
             pos = format_position(state),
         );
@@ -921,12 +918,14 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 /// position". With no explicit anchor the selection is the implicit 1-char range at the
 /// cursor.
 fn format_position(state: &AppState) -> String {
-    let pos = state.cursor.position;
-    match state.mode {
-        Mode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
-        Mode::FileBrowser | Mode::SavePrompt => String::new(),
-        Mode::Normal | Mode::Search | Mode::Picker => {
-            let (start, end_inclusive) = match state.cursor.anchor {
+    // Only called from the default status-bar branch which already guarantees Editing screen
+    // with no save_prompt active.
+    let ed = state.editor();
+    let pos = ed.cursor.position;
+    match ed.mode {
+        EditorMode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
+        EditorMode::Normal | EditorMode::Search => {
+            let (start, end_inclusive) = match state.editor().cursor.anchor {
                 None => (pos, pos),
                 Some(anchor) => {
                     if (pos.line, pos.col) <= (anchor.line, anchor.col) {
@@ -956,9 +955,9 @@ fn format_position(state: &AppState) -> String {
 /// at the end of its line. Falls back to a +1 approximation when the line isn't in the
 /// pushed window (which makes the cursor off-screen anyway).
 fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
-    let local_idx = (pos.line as i64) - (state.window_first_logical_line as i64);
+    let local_idx = (pos.line as i64) - (state.editor().window_first_logical_line as i64);
     let Some(render) = (if local_idx >= 0 {
-        state.lines.get(local_idx as usize)
+        state.editor().lines.get(local_idx as usize)
     } else {
         None
     }) else {
@@ -989,15 +988,18 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
 }
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
-    if matches!(state.mode, Mode::Search) {
-        // Park the terminal cursor on the status row, just past `/` + the typed query up to the
-        // input cursor (so Left/Right navigate within the query, not always at the end).
-        let typed_w = state.search.query.width_to_cursor() as u16;
-        let col = status_area
-            .x
-            .saturating_add((1 + typed_w).min(status_area.width.saturating_sub(1)));
-        f.set_cursor_position((col, status_area.y));
-        return;
+    if let Some(ed) = state.try_editor() {
+        if matches!(ed.mode, EditorMode::Search) && state.save_prompt.is_none() && !state.picker.open {
+            // Park the terminal cursor on the status row, just past `/` + the typed query up
+            // to the input cursor (so Left/Right navigate within the query, not always at the
+            // end).
+            let typed_w = ed.search.query.width_to_cursor() as u16;
+            let col = status_area
+                .x
+                .saturating_add((1 + typed_w).min(status_area.width.saturating_sub(1)));
+            f.set_cursor_position((col, status_area.y));
+            return;
+        }
     }
     if state.picker.open {
         // Place the cursor inside the picker overlay's input row, at the current insertion
@@ -1014,7 +1016,7 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         }
         return;
     }
-    if matches!(state.mode, Mode::SavePrompt) {
+    if state.save_prompt.is_some() {
         if let Some(prompt) = state.save_prompt.as_ref() {
             let max_col = status_area.x.saturating_add(status_area.width.saturating_sub(1));
             let col = if prompt.pending_overwrite {
@@ -1032,8 +1034,8 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         }
         return;
     }
-    if matches!(state.mode, Mode::FileBrowser) {
-        if let Some(prompt) = state.file_browser.prompt.as_ref() {
+    if let Some(browsing) = state.try_browsing() {
+        if let Some(prompt) = browsing.file_browser.prompt.as_ref() {
             // Cursor sits at the prompt's current insertion point on the status row. Label
             // width matches the string built in `draw_status`: " <label>: " is `label.len() + 3`
             // chars.
@@ -1052,7 +1054,7 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         // Park the cursor at the highlighted listing entry. Entries start at row 0.
         let row = buffer_area
             .y
-            .saturating_add(state.file_browser.selected as u16);
+            .saturating_add(browsing.file_browser.selected as u16);
         f.set_cursor_position((buffer_area.x, row));
         return;
     }
@@ -1069,20 +1071,20 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
 /// Returns `None` if the cursor is off-screen (above the top, below the bottom, off-screen left
 /// after horizontal scroll, or its logical line hasn't been pushed into the window yet).
 pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u16, u16)> {
-    let top = state.scroll_logical_line;
-    let cursor = state.cursor.position;
+    let top = state.editor().scroll_logical_line;
+    let cursor = state.editor().cursor.position;
     if cursor.line < top {
         return None;
     }
-    let scroll_col = if matches!(state.wrap, WrapMode::None) { state.scroll_col } else { 0 };
+    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) { state.editor().scroll_col } else { 0 };
 
     let mut visual_offset: u32 = 0;
     for line_idx in top..=cursor.line {
-        let local_idx = (line_idx as i64) - (state.window_first_logical_line as i64);
-        if local_idx < 0 || local_idx >= state.lines.len() as i64 {
+        let local_idx = (line_idx as i64) - (state.editor().window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.editor().lines.len() as i64 {
             return None;
         }
-        let render = &state.lines[local_idx as usize];
+        let render = &state.editor().lines[local_idx as usize];
         if line_idx == cursor.line {
             let row_idx = find_row_idx_for_col(&render.visual_rows, cursor.col);
             visual_offset += row_idx as u32;
@@ -1158,15 +1160,15 @@ pub fn screen_to_logical(
         return None;
     }
     let mut rows_remaining = screen_row as u32;
-    let mut logical_line = state.scroll_logical_line;
+    let mut logical_line = state.editor().scroll_logical_line;
     loop {
-        let local_idx = (logical_line as i64) - (state.window_first_logical_line as i64);
-        if local_idx < 0 || local_idx >= state.lines.len() as i64 {
+        let local_idx = (logical_line as i64) - (state.editor().window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.editor().lines.len() as i64 {
             // Click is past the last line we have rendered — clamp to the end of the buffer.
-            let last_line = state.line_count.saturating_sub(1);
+            let last_line = state.editor().line_count.saturating_sub(1);
             return Some(LogicalPosition { line: last_line, col: u32::MAX });
         }
-        let render = &state.lines[local_idx as usize];
+        let render = &state.editor().lines[local_idx as usize];
         let visual_rows_in_line = render.visual_rows.len() as u32;
         if rows_remaining < visual_rows_in_line {
             let vrow = &render.visual_rows[rows_remaining as usize];
@@ -1187,7 +1189,7 @@ pub fn screen_to_logical(
 /// that lines up with `screen_col`. Clicks on the marker / continuation indent map to the start
 /// of the row's text. Clicks past the end of the text map to the end of the text.
 fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u32 {
-    let scroll_col = if matches!(state.wrap, WrapMode::None) { state.scroll_col } else { 0 };
+    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) { state.editor().scroll_col } else { 0 };
     let marker = if vrow.byte_offset > 0 { CONTINUATION_MARKER_WIDTH } else { 0 };
     let prefix = marker + vrow.continuation_indent;
     let target_display = (screen_col as u32).saturating_add(scroll_col);
