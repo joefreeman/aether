@@ -1,6 +1,6 @@
 //! Client-side picker state. The server owns the candidate cache, query, and ranked list; the
 //! client owns the highlighted row plus a small persisted slot (`last_selected`) used to restore
-//! the highlight on `Space Alt-f` via `view { center_on }`.
+//! the highlight on reopen via `view { center_on }`.
 
 use crate::app::Mode;
 use aether_protocol::picker::{PickerItem, PickerKind};
@@ -36,9 +36,9 @@ pub struct PickerState {
     /// in the pushed items (or once the user navigates, whichever comes first) — see
     /// `apply_update`.
     pub resume_target: Option<PickerItem>,
-    /// Per-kind last-selected item, persisted across hide/show so `Space Alt-f` can resume the
-    /// highlight (not just the listing). Lives outside `kind`-scoped fields above because it
-    /// survives reset.
+    /// Per-kind last-selected item, persisted across hide/show so reopening a picker can resume
+    /// the highlight (not just the listing). Lives outside `kind`-scoped fields above because
+    /// it survives reset.
     pub last_selected: HashMap<PickerKind, PickerItem>,
 }
 
@@ -96,9 +96,17 @@ impl PickerState {
 }
 
 /// Stable identity for a picker item — used to find a previously-selected item in a freshly
-/// pushed window after re-rank or resume.
-pub fn item_key(item: &PickerItem) -> &str {
+/// pushed window after re-rank or resume. For files this is the path; for buffers it's the id
+/// (stable across rename/Save-As, where the display string changes).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ItemKey<'a> {
+    File(&'a str),
+    Buffer(aether_protocol::BufferId),
+}
+
+pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
     match item {
-        PickerItem::File { path, .. } => path.as_str(),
+        PickerItem::File { path, .. } => ItemKey::File(path.as_str()),
+        PickerItem::Buffer { buffer_id, .. } => ItemKey::Buffer(*buffer_id),
     }
 }

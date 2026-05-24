@@ -10,6 +10,7 @@
 //! subscribed window's contents change or the matcher snapshot ticks.
 
 use crate::envelope::{NotificationMethod, RpcMethod};
+use crate::BufferId;
 use serde::{Deserialize, Serialize};
 
 /// Which picker the client is talking about. Keyed `(client_id, kind)` server-side; only one
@@ -19,6 +20,9 @@ use serde::{Deserialize, Serialize};
 pub enum PickerKind {
     /// Project files, fuzzy-matched on path.
     Files,
+    /// Open buffers, ordered by most-recently-used. The current buffer sits at position 0 and
+    /// selecting it is a no-op switch.
+    Buffers,
 }
 
 /// A pickable item. Tagged enum so different pickers can carry the data they need; match-index
@@ -33,15 +37,29 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
+    /// An open buffer. Identity is `buffer_id` — stable across rename / Save-As, where the
+    /// `display` string would change. `dirty` is captured at row-build time and may go stale
+    /// between pushes (an active picker re-pushes on dirty transitions).
+    Buffer {
+        buffer_id: BufferId,
+        /// What the row renders: project-relative path for file-backed buffers, `[scratch N]`
+        /// for scratch buffers. Also the haystack the matcher scores against.
+        display: String,
+        dirty: bool,
+        /// Indices into `display` (char offsets) covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
 }
 
 // ---- picker/view --------------------------------------------------------------------------------
 
 /// Attach to a picker, declare the scroll window to be pushed, and start receiving updates. If
-/// `reset` is true, any persisted state (query, selection) is wiped first — that's how
-/// `Space f` differs from `Space Alt-f`. If `center_on` is provided, the server picks an offset
-/// that frames the named item; this is how the client restores its highlight on resume. `offset`
-/// and `center_on` are mutually exclusive — `center_on` wins if both are sent.
+/// `reset` is true, any persisted state (query, selection) is wiped first; otherwise the picker
+/// resumes from whatever the prior `view`/`query`/`hide` cycle left behind. If `center_on` is
+/// provided, the server picks an offset that frames the named item — this is how the client
+/// restores its highlight on resume. `offset` and `center_on` are mutually exclusive —
+/// `center_on` wins if both are sent.
 pub struct PickerView;
 impl RpcMethod for PickerView {
     const NAME: &'static str = "picker/view";
@@ -119,14 +137,18 @@ pub struct PickerSelectParams {
 }
 
 /// Per-kind action result. For `Files`, the canonical absolute path the client should open
-/// (via `buffer/open`); the picker handler itself doesn't open the buffer — that's the client's
-/// job, same as the file browser flow.
+/// (via `buffer/open`). For `Buffers`, the `buffer_id` the client should attach to (via
+/// `buffer/open { buffer_id }`). The picker handler doesn't perform the switch itself — that's
+/// the client's job, same as the file browser flow.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PickerSelectResult {
     File {
         /// Absolute canonical path on disk.
         path: String,
+    },
+    Buffer {
+        buffer_id: BufferId,
     },
 }
 

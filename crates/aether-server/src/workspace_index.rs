@@ -6,9 +6,35 @@
 //! lazy: the first `files()` call runs it on a blocking task; subsequent calls reuse the cached
 //! `Arc`. The cache survives `hide`, so reopening a picker doesn't re-walk.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+
+/// Format an absolute path as the picker display string: project-relative, prefixed with the
+/// root's basename for multi-root projects. Returns `None` if `abs` is outside every root —
+/// callers should treat that as "no display available" rather than fall back to the absolute
+/// path, since that would be inconsistent with the file walker's output.
+///
+/// Kept here so the file walker and the buffer-picker candidate builder produce identical
+/// display strings for the same on-disk file.
+pub fn project_relative_display(abs: &Path, roots: &[PathBuf]) -> Option<String> {
+    let multi_root = roots.len() > 1;
+    for root in roots {
+        let root_name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if abs == root {
+            return Some(root_name.to_string());
+        }
+        if let Ok(rel) = abs.strip_prefix(root) {
+            let rel = rel.to_str()?;
+            return Some(if multi_root && !root_name.is_empty() {
+                format!("{root_name}/{rel}")
+            } else {
+                rel.to_string()
+            });
+        }
+    }
+    None
+}
 
 /// One file found by the workspace walk.
 #[derive(Debug, Clone)]

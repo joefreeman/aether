@@ -66,9 +66,9 @@ pub enum Mode {
     Picker,
 }
 
-/// Multi-key prefixes the next keystroke completes. `Space` is the only one for now (used by the
-/// `Space f` / `Space Alt-f` picker bindings) — adding more is "add a variant and a match arm in
-/// `handle_leader_key`".
+/// Multi-key prefixes the next keystroke completes. `Space` is the only one for now (used by
+/// the `Space f` / `Space b` picker bindings) — adding more is "add a variant and a match arm
+/// in `handle_leader_key`".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingLeader {
     Space,
@@ -254,6 +254,7 @@ pub async fn bootstrap(
     let (buffer_open_params, file_label) = match (file, browse_dir.is_some()) {
         (Some(f), false) => (
             aether_protocol::buffer::BufferOpenParams {
+                buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some(f.into()),
                 language: None,
@@ -263,6 +264,7 @@ pub async fn bootstrap(
         ),
         _ => (
             aether_protocol::buffer::BufferOpenParams {
+                buffer_id: None,
                 path_index: None,
                 relative_path: None,
                 language: None,
@@ -888,6 +890,12 @@ async fn handle_leader_key(
         (PendingLeader::Space, KeyCode::Char('f'), m) if m == KeyModifiers::NONE => {
             open_picker(client, state, PickerKind::Files).await?;
         }
+        // `Space b` — open the buffer picker. MRU-ordered with the current buffer at the top;
+        // selecting it is a no-op switch. Useful for quickly cycling back to a recent buffer
+        // without going through the file browser.
+        (PendingLeader::Space, KeyCode::Char('b'), m) if m == KeyModifiers::NONE => {
+            open_picker(client, state, PickerKind::Buffers).await?;
+        }
         // Esc or any other key cancels the chord without further action.
         _ => {}
     }
@@ -1093,8 +1101,82 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
         PickerSelectResult::File { path } => {
             open_file_in_browser_with_options(client, state, path, false).await?;
         }
+        PickerSelectResult::Buffer { buffer_id } => {
+            attach_buffer(client, state, buffer_id).await?;
+        }
     }
     Ok(())
+}
+
+/// Switch to an already-open buffer by id (no path lookup; works for scratch buffers too).
+/// Subscribes a fresh viewport and restores per-buffer cursor + scroll from the server. No-op
+/// in the sense that the buffer's contents and per-client state already exist server-side —
+/// we're just rebinding the client to it.
+async fn attach_buffer(client: &mut Client, state: &mut AppState, buffer_id: BufferId) -> Result<()> {
+    if buffer_id == state.buffer_id {
+        // Already attached. Skip the round-trip; the picker's "current at position 0" feature
+        // makes selecting the current buffer a frequent no-op.
+        return Ok(());
+    }
+    let open: BufferOpenResult = client
+        .rpc::<BufferOpen>(BufferOpenParams {
+            buffer_id: Some(buffer_id),
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        })
+        .await?;
+    let initial_scroll = open.scroll.unwrap_or(ScrollPosition { logical_line: 0, sub_row: 0.0 });
+    let sub: ViewportSubscribeResult = client
+        .rpc::<ViewportSubscribe>(ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: state.viewport_cols,
+            rows: state.viewport_rows,
+            overscan_rows: state.viewport_rows,
+            scroll: initial_scroll,
+            wrap: state.wrap,
+            continuation_marker_width: ui::CONTINUATION_MARKER_WIDTH,
+            tab_width: ui::TAB_WIDTH,
+        })
+        .await?;
+
+    state.buffer_id = open.buffer_id;
+    state.viewport_id = sub.viewport_id;
+    state.cursor = open.cursor;
+    state.scroll_logical_line = initial_scroll.logical_line;
+    state.window_first_logical_line = sub.window.first_logical_line;
+    state.lines = sub.window.lines;
+    state.line_count = sub.window.line_count;
+    state.max_scroll_logical_line = sub.window.max_scroll_logical_line;
+    state.revision = open.revision;
+    state.saved_revision = open.saved_revision;
+    state.scroll_col = 0;
+    state.pending_scroll_lines = 0;
+    state.file_path = open.path.clone();
+    state.file_label = match open.path.as_deref() {
+        Some(p) => project_relative_label(p, &state.project_paths),
+        None => format!("[scratch {}]", open.buffer_id),
+    };
+    state.search = SearchState::default();
+    Ok(())
+}
+
+/// Strip the longest matching project path off `abs`, or fall back to the raw absolute path.
+/// Mirrors the server's display rule for buffer-picker items.
+fn project_relative_label(abs: &str, project_paths: &[String]) -> String {
+    let abs_path = std::path::Path::new(abs);
+    let best = project_paths
+        .iter()
+        .filter_map(|p| {
+            let root = std::path::Path::new(p);
+            abs_path.strip_prefix(root).ok().map(|rel| (root, rel))
+        })
+        .max_by_key(|(root, _)| root.as_os_str().len());
+    match best {
+        Some((_, rel)) => rel.display().to_string(),
+        None => abs.to_string(),
+    }
 }
 
 async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
@@ -1379,6 +1461,7 @@ async fn open_file_in_browser_with_options(
 
     let open: BufferOpenResult = client
         .rpc::<BufferOpen>(BufferOpenParams {
+            buffer_id: None,
             path_index: Some(path_index),
             relative_path: Some(relative.clone()),
             language: None,

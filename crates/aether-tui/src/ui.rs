@@ -204,6 +204,7 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
 fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'static str {
     match kind {
         Some(aether_protocol::picker::PickerKind::Files) => "Search files…",
+        Some(aether_protocol::picker::PickerKind::Buffers) => "Switch buffer…",
         None => "Search…",
     }
 }
@@ -289,41 +290,54 @@ fn picker_item_spans(
     highlighted: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
-    let PickerItem::File { path, match_indices } = item;
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
 
-    let (display, indices) = truncate_path_with_indices(path, match_indices, max_width);
-
-    if indices.is_empty() {
-        return vec![Span::styled(display, base)];
-    }
-    // Walk char-by-char emitting spans where matched/unmatched runs alternate. `indices` are
-    // char offsets into `display`, sorted ascending.
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut current = String::new();
-    let mut current_is_match = false;
-    let mut idx_iter = indices.iter().copied().peekable();
-    for (ci, ch) in display.chars().enumerate() {
-        let is_match = idx_iter.peek().copied() == Some(ci as u32);
-        if is_match {
-            idx_iter.next();
+    // Trailing dirty marker for buffer items — matches the status bar's `[+]` indicator. Goes
+    // after the display so it doesn't shift `match_indices` (which index into the display).
+    let (display_raw, match_indices, dirty_suffix) = match item {
+        PickerItem::File { path, match_indices } => (path.as_str(), match_indices.as_slice(), ""),
+        PickerItem::Buffer { display, dirty, match_indices, .. } => {
+            (display.as_str(), match_indices.as_slice(), if *dirty { " [+]" } else { "" })
         }
-        if is_match != current_is_match && !current.is_empty() {
+    };
+
+    let text_budget = max_width.saturating_sub(dirty_suffix.len());
+    let (display, indices) = truncate_path_with_indices(display_raw, match_indices, text_budget);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if indices.is_empty() {
+        spans.push(Span::styled(display, base));
+    } else {
+        // Walk char-by-char emitting spans where matched/unmatched runs alternate. `indices`
+        // are char offsets into `display`, sorted ascending.
+        let mut current = String::new();
+        let mut current_is_match = false;
+        let mut idx_iter = indices.iter().copied().peekable();
+        for (ci, ch) in display.chars().enumerate() {
+            let is_match = idx_iter.peek().copied() == Some(ci as u32);
+            if is_match {
+                idx_iter.next();
+            }
+            if is_match != current_is_match && !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    if current_is_match { match_style } else { base },
+                ));
+            }
+            current_is_match = is_match;
+            current.push(ch);
+        }
+        if !current.is_empty() {
             spans.push(Span::styled(
-                std::mem::take(&mut current),
+                current,
                 if current_is_match { match_style } else { base },
             ));
         }
-        current_is_match = is_match;
-        current.push(ch);
     }
-    if !current.is_empty() {
-        spans.push(Span::styled(
-            current,
-            if current_is_match { match_style } else { base },
-        ));
+    if !dirty_suffix.is_empty() {
+        spans.push(Span::styled(dirty_suffix.to_string(), base.fg(NORD13)));
     }
     spans
 }

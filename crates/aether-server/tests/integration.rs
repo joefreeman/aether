@@ -127,6 +127,7 @@ async fn hello_then_open_file() {
         &mut ws,
         2,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("hello.rs".into()),
             language: None,
@@ -149,6 +150,7 @@ async fn hello_then_open_file() {
         &mut ws,
         3,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("hello.rs".into()),
             language: None,
@@ -187,6 +189,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         &mut ws,
         2,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -237,6 +240,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         &mut ws,
         6,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -279,6 +283,7 @@ async fn buffer_open_isolates_scroll_per_client() {
             &mut ws,
             2,
             &BufferOpenParams {
+                buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some("a.txt".into()),
                 language: None,
@@ -331,6 +336,7 @@ async fn buffer_open_isolates_scroll_per_client() {
         &mut ws_a,
         20,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -342,6 +348,7 @@ async fn buffer_open_isolates_scroll_per_client() {
         &mut ws_b,
         20,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -408,6 +415,7 @@ async fn rejects_path_outside_project() {
         method: BufferOpen::NAME.into(),
         params: Some(
             serde_json::to_value(BufferOpenParams {
+                buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some("../aether-outside-test.txt".into()),
                 language: None,
@@ -448,6 +456,7 @@ async fn viewport_subscribe_renders_window() {
         &mut ws,
         2,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -505,6 +514,7 @@ async fn viewport_subscribe_wraps_long_line() {
         &mut ws,
         2,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("long.txt".into()),
             language: None,
@@ -572,6 +582,7 @@ async fn viewport_scroll_returns_new_window() {
         &mut ws,
         2,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("many.txt".into()),
             language: None,
@@ -637,7 +648,7 @@ async fn setup_with_buffer(content: &str) -> (
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: Some(0), relative_path: Some("buf.txt".into()), language: None, create_if_missing: false },
+        &BufferOpenParams { buffer_id: None, path_index: Some(0), relative_path: Some("buf.txt".into()), language: None, create_if_missing: false },
     )
     .await;
     (server, ws, open.buffer_id)
@@ -859,7 +870,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false },
+        &BufferOpenParams { buffer_id: None, path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false },
     )
     .await;
     assert_eq!(open.language.as_deref(), Some("rust"));
@@ -909,6 +920,7 @@ async fn match_bracket_motion_jumps_to_pair() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -946,6 +958,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -979,6 +992,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1014,6 +1028,7 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1063,6 +1078,7 @@ async fn end_of_unit_works_on_last_function() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1099,6 +1115,7 @@ async fn start_of_unit_extends_back_to_function_start() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1134,6 +1151,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1192,6 +1210,7 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1233,6 +1252,7 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1265,6 +1285,7 @@ async fn nav_motion_jumps_between_top_level_rust_items() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1305,6 +1326,7 @@ async fn nav_motion_prev_walks_backward() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1337,6 +1359,7 @@ async fn nav_motion_noop_at_end_of_file() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1373,6 +1396,7 @@ async fn nav_motion_inside_python_class_finds_next_method() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1409,6 +1433,7 @@ async fn nav_motion_from_last_method_stays_in_class() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1447,6 +1472,7 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1480,6 +1506,7 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.html".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -1545,6 +1572,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
         &mut ws,
         2,
         &BufferOpenParams {
+            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("notes.md".into()),
             language: None,
@@ -1603,7 +1631,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: Some(0), relative_path: Some("greet.txt".into()), language: None, create_if_missing: false },
+        &BufferOpenParams { buffer_id: None, path_index: Some(0), relative_path: Some("greet.txt".into()), language: None, create_if_missing: false },
     )
     .await;
 
@@ -1689,7 +1717,7 @@ async fn save_preserves_crlf_endings() {
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: Some(0), relative_path: Some("windows.txt".into()), language: None, create_if_missing: false },
+        &BufferOpenParams { buffer_id: None, path_index: Some(0), relative_path: Some("windows.txt".into()), language: None, create_if_missing: false },
     )
     .await;
 
@@ -1724,7 +1752,7 @@ async fn save_scratch_returns_buffer_has_no_path() {
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { path_index: None, relative_path: None, language: None, create_if_missing: false },
+        &BufferOpenParams { buffer_id: None, path_index: None, relative_path: None, language: None, create_if_missing: false },
     )
     .await;
 
@@ -3270,6 +3298,7 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
     let buffer_id = open.buffer_id;
@@ -3304,6 +3333,7 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
     let buffer_id = open.buffer_id;
@@ -3348,6 +3378,7 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
     let buffer_id = open.buffer_id;
@@ -3379,6 +3410,7 @@ async fn newline_and_indent_engine_python_def() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
     }).await;
     assert_eq!(open.language.as_deref(), Some("python"));
@@ -3411,6 +3443,7 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
     let buffer_id = open.buffer_id;
@@ -3441,6 +3474,7 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.go".into()), language: None, create_if_missing: false,
     }).await;
     assert_eq!(open.language.as_deref(), Some("go"));
@@ -3493,6 +3527,7 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3521,6 +3556,7 @@ async fn toggle_comment_strips_when_already_commented() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3550,6 +3586,7 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
     }).await;
     assert_eq!(open.language.as_deref(), Some("python"));
@@ -3583,6 +3620,7 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.md".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3611,6 +3649,7 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3642,6 +3681,7 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3675,6 +3715,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3710,6 +3751,7 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3745,6 +3787,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.go".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3793,6 +3836,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.ts".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3827,6 +3871,7 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3861,6 +3906,7 @@ async fn toggle_comment_round_trip_partial_selection() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3901,6 +3947,7 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3930,6 +3977,7 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.css".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3959,6 +4007,7 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.md".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -3985,6 +4034,7 @@ async fn toggle_comment_is_noop_for_json() {
         token: TEST_TOKEN.into(), client_version: "test".into(),
     }).await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None,
         path_index: Some(0), relative_path: Some("a.json".into()), language: None, create_if_missing: false,
     }).await;
 
@@ -4173,7 +4223,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
         .items
         .iter()
         .map(|i| {
-            let PickerItem::File { path, .. } = i;
+            let PickerItem::File { path, .. } = i else { panic!("expected File item, got {i:?}") };
             path.as_str()
         })
         .collect();
@@ -4200,7 +4250,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.generation, 1);
     let top = update.items.first().expect("at least one match");
-    let PickerItem::File { path, match_indices } = top;
+    let PickerItem::File { path, match_indices } = top else { panic!("expected File item, got {top:?}") };
     assert_eq!(path, "src/main.rs", "best match for 'main' is src/main.rs");
     assert!(
         !match_indices.is_empty(),
@@ -4224,14 +4274,14 @@ async fn picker_select_returns_absolute_path() {
     ).await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let item = update.items.first().expect("a match for 'lib'").clone();
-    let PickerItem::File { ref path, .. } = item;
+    let PickerItem::File { ref path, .. } = item else { panic!("expected File item, got {item:?}") };
     assert_eq!(path, "src/lib.rs");
 
     let result: PickerSelectResult = send_request::<PickerSelect>(
         &mut ws, 12,
         &PickerSelectParams { kind: PickerKind::Files, item },
     ).await;
-    let PickerSelectResult::File { path: abs } = result;
+    let PickerSelectResult::File { path: abs } = result else { panic!("expected File result, got {result:?}") };
     assert!(abs.ends_with("src/lib.rs"), "abs path should end with relative: got {abs}");
     assert!(std::path::Path::new(&abs).is_absolute(), "select must return an absolute path");
 
@@ -4298,6 +4348,290 @@ async fn picker_reset_wipes_persisted_query() {
     ).await;
     assert_eq!(reopened.query, "");
     assert_eq!(reopened.generation, 0);
+
+    drop(server);
+}
+
+// -------- buffer picker --------------------------------------------------------------------------
+
+/// Workspace + handshake. Same shape as `setup_picker_workspace` but loads a few files we'll
+/// open through `buffer/open` so the buffer picker has something to surface.
+async fn setup_buffer_picker_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::create_dir_all(dir_path.join("src")).unwrap();
+    std::fs::write(dir_path.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(dir_path.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+    std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws, 1,
+        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+    ).await;
+    (server, ws)
+}
+
+/// MRU is per-client and the most-recent open lands at position 0. The first item is the
+/// "current" buffer; selecting it is the no-op switch.
+#[tokio::test]
+async fn buffers_picker_orders_by_mru_with_current_first() {
+    let (server, mut ws) = setup_buffer_picker_workspace().await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("README.md".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("src/lib.rs".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 4, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
+        language: None, create_if_missing: false,
+    }).await;
+
+    let _ = send_request::<PickerView>(&mut ws, 10, &PickerViewParams {
+        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
+    }).await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let displays: Vec<&str> = update.items.iter().map(|i| {
+        let PickerItem::Buffer { display, .. } = i else { panic!("expected Buffer, got {i:?}") };
+        display.as_str()
+    }).collect();
+    assert_eq!(displays, vec!["src/main.rs", "src/lib.rs", "README.md"]);
+
+    drop(server);
+}
+
+/// Selecting an item returns the buffer_id, which is the stable handle the client uses to
+/// attach via `buffer/open { buffer_id }`.
+#[tokio::test]
+async fn buffers_picker_select_returns_buffer_id() {
+    let (server, mut ws) = setup_buffer_picker_workspace().await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let _ = send_request::<PickerView>(&mut ws, 10, &PickerViewParams {
+        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
+    }).await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let item = update.items.first().expect("at least one buffer").clone();
+    let result: PickerSelectResult = send_request::<PickerSelect>(&mut ws, 11, &PickerSelectParams {
+        kind: PickerKind::Buffers, item,
+    }).await;
+    let PickerSelectResult::Buffer { buffer_id } = result else {
+        panic!("expected Buffer result, got {result:?}");
+    };
+    assert_eq!(buffer_id, opened.buffer_id);
+
+    drop(server);
+}
+
+/// `buffer/open { buffer_id }` attaches to an already-open buffer without consulting paths —
+/// the path to a scratch buffer is `None`, and this is the only way to switch to it.
+#[tokio::test]
+async fn buffer_open_by_id_attaches_to_scratch() {
+    let (server, mut ws) = setup_buffer_picker_workspace().await;
+    // Scratch buffer: no path fields.
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    assert!(scratch.path.is_none());
+    // Open a file so the current buffer is different.
+    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("README.md".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    // Now attach back to the scratch by id — no path fields needed.
+    let reattach: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 4, &BufferOpenParams {
+        buffer_id: Some(scratch.buffer_id), path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    assert_eq!(reattach.buffer_id, scratch.buffer_id);
+    assert!(reattach.path.is_none(), "scratch buffer still has no path on reattach");
+
+    drop(server);
+}
+
+/// Scratch buffers show up in the picker with a `[scratch N]` placeholder display.
+#[tokio::test]
+async fn buffers_picker_renders_scratch_placeholder() {
+    let (server, mut ws) = setup_buffer_picker_workspace().await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    let _ = send_request::<PickerView>(&mut ws, 10, &PickerViewParams {
+        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
+    }).await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let expected = format!("[scratch {}]", scratch.buffer_id);
+    assert!(
+        update.items.iter().any(|i| matches!(i, PickerItem::Buffer { display, .. } if display == &expected)),
+        "expected display {expected:?} in items: {:?}", update.items,
+    );
+
+    drop(server);
+}
+
+/// While the picker is open, a buffer mutation that flips dirty from false → true pushes a
+/// fresh `picker/update` so the dirty marker appears without the user closing+reopening.
+#[tokio::test]
+async fn buffers_picker_pushes_on_dirty_transition() {
+    let (server, mut ws) = setup_buffer_picker_workspace().await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    // Subscribe a viewport so subsequent edits' lines_changed pushes are routed (they'd be
+    // dropped otherwise, but the picker push lives on its own channel either way).
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
+        buffer_id: opened.buffer_id, cols: 80, rows: 24, overscan_rows: 24,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
+        continuation_marker_width: 1, tab_width: 4,
+    }).await;
+    // Open the picker. Initial push shows dirty: false.
+    let _ = send_request::<PickerView>(&mut ws, 4, &PickerViewParams {
+        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
+    }).await;
+    let initial: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let initial_dirty = match initial.items.first().unwrap() {
+        PickerItem::Buffer { dirty, .. } => *dirty,
+        other => panic!("expected Buffer, got {other:?}"),
+    };
+    assert!(!initial_dirty);
+
+    // Type a char into the buffer — flips dirty true. Picker should push.
+    let _: EditResult = send_request::<InputText>(&mut ws, 5, &InputTextParams {
+        buffer_id: opened.buffer_id, text: "x".into(), select_pasted: false,
+    }).await;
+    // Drain notifications until we get a picker update (other pushes — viewport lines, etc.
+    // — may arrive first).
+    let next: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let dirty_after = next.items.iter().find_map(|i| match i {
+        PickerItem::Buffer { buffer_id, dirty, .. } if *buffer_id == opened.buffer_id => Some(*dirty),
+        _ => None,
+    }).expect("buffer still in items");
+    assert!(dirty_after, "dirty marker should flip after the first edit");
+
+    drop(server);
+}
+
+/// Subsequent edits don't generate picker pushes — the dirty flag is already set, so there's
+/// no display change. Verifies the hot-path gate.
+#[tokio::test]
+async fn buffers_picker_no_push_on_subsequent_edits() {
+    let (server, mut ws) = setup_buffer_picker_workspace().await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
+        buffer_id: opened.buffer_id, cols: 80, rows: 24, overscan_rows: 24,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
+        continuation_marker_width: 1, tab_width: 4,
+    }).await;
+    let _ = send_request::<PickerView>(&mut ws, 4, &PickerViewParams {
+        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
+    }).await;
+    let _: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: EditResult = send_request::<InputText>(&mut ws, 5, &InputTextParams {
+        buffer_id: opened.buffer_id, text: "a".into(), select_pasted: false,
+    }).await;
+    let _: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await; // dirty flip
+
+    // Second edit — dirty already true, no picker push expected. Drain frames for a short
+    // window and assert none of them are picker/update notifications.
+    let _: EditResult = send_request::<InputText>(&mut ws, 6, &InputTextParams {
+        buffer_id: opened.buffer_id, text: "b".into(), select_pasted: false,
+    }).await;
+    let timed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        loop {
+            let text = next_text(&mut ws).await;
+            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text) {
+                if n.method == PickerUpdate::NAME {
+                    return n;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(timed.is_err(), "no picker/update should arrive after a same-dirty edit, got {timed:?}");
+
+    drop(server);
+}
+
+/// Saving a dirty buffer flips dirty back to clean — picker re-pushes so the marker vanishes.
+#[tokio::test]
+async fn buffers_picker_pushes_on_save() {
+    let (server, mut ws) = setup_buffer_picker_workspace().await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
+        buffer_id: opened.buffer_id, cols: 80, rows: 24, overscan_rows: 24,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
+        continuation_marker_width: 1, tab_width: 4,
+    }).await;
+    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
+        buffer_id: opened.buffer_id, text: "z".into(), select_pasted: false,
+    }).await;
+    let _ = send_request::<PickerView>(&mut ws, 5, &PickerViewParams {
+        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
+    }).await;
+    let dirty_view: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let saw_dirty = dirty_view.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, dirty, .. } if *buffer_id == opened.buffer_id && *dirty));
+    assert!(saw_dirty, "main.rs should be dirty after the edit");
+
+    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 6, &BufferSaveParams {
+        buffer_id: opened.buffer_id, path_index: None, relative_path: None,
+    }).await;
+    let clean: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let saw_clean = clean.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, dirty, .. } if *buffer_id == opened.buffer_id && !*dirty));
+    assert!(saw_clean, "save should flip dirty back off and re-push the picker");
+
+    drop(server);
+}
+
+/// MRU is per-client: a buffer that was open before disconnect doesn't sit forever in
+/// another client's MRU. Closing the connection drops MRU; reconnecting fresh shows the open
+/// buffers in id order (since this client hasn't touched any).
+#[tokio::test]
+async fn buffers_picker_mru_is_per_client() {
+    let (server, mut ws_a) = setup_buffer_picker_workspace().await;
+    // Client A opens two files in a specific order.
+    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws_a, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("README.md".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws_a, 3, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("src/lib.rs".into()),
+        language: None, create_if_missing: false,
+    }).await;
+
+    // Client B connects fresh — no touches yet. Buffers should appear in id order.
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws_b, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let _ = send_request::<PickerView>(&mut ws_b, 10, &PickerViewParams {
+        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
+    }).await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws_b).await;
+    let ids: Vec<u64> = update.items.iter().map(|i| {
+        let PickerItem::Buffer { buffer_id, .. } = i else { panic!("expected Buffer, got {i:?}") };
+        *buffer_id
+    }).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "client B should see buffers in id order (no MRU touches yet)");
 
     drop(server);
 }

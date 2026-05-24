@@ -17,6 +17,12 @@ impl RpcMethod for BufferOpen {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BufferOpenParams {
+    /// Attach to an already-open buffer by id. When set, `path_index` / `relative_path` /
+    /// `create_if_missing` are ignored — the server returns the existing buffer's state. Errors
+    /// if the id isn't a live buffer. Used by the buffer picker to switch to a scratch buffer
+    /// (which has no path to feed into the path-keyed open flow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
     pub path_index: Option<u32>,
     pub relative_path: Option<String>,
     pub language: Option<String>,

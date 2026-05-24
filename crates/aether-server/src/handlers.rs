@@ -16,8 +16,8 @@ use aether_protocol::directory::{
     DirEntry,
 };
 use aether_protocol::picker::{
-    PickerHideParams, PickerItem, PickerQueryParams, PickerSelectParams, PickerSelectResult,
-    PickerUpdate, PickerViewParams, PickerViewResult,
+    PickerHideParams, PickerKind, PickerQueryParams, PickerSelectParams, PickerSelectResult,
+    PickerUpdate, PickerUpdateParams, PickerViewParams, PickerViewResult,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
@@ -111,6 +111,40 @@ pub async fn buffer_open(
     // the client hasn't sent `client/hello` yet — in that case there's no per-client state to
     // restore, and the result's `cursor` / `scroll` fields fall back to defaults.
     let client_id = ctx.client_id;
+
+    // Attach-by-id: shortcut path used by the buffer picker (which needs to switch to scratch
+    // buffers too, where there's no path to feed the path-keyed open flow). Ignores the path
+    // fields; errors if the id isn't live.
+    if let Some(buffer_id) = params.buffer_id {
+        let mut s = state.lock().await;
+        let buf = s
+            .buffers
+            .get(&buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+        let cursor = client_id
+            .and_then(|c| s.cursors.get(&(c, buffer_id)).copied())
+            .unwrap_or_default();
+        let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, buffer_id)).copied());
+        let result = BufferOpenResult {
+            buffer_id,
+            language: buf.language.clone(),
+            line_count: buf.line_count(),
+            byte_count: buf.byte_count(),
+            revision: buf.revision,
+            saved_revision: buf.saved_revision(),
+            path: buf.canonical_path.as_ref().map(|p| p.display().to_string()),
+            cursor,
+            scroll,
+        };
+        s.touch_mru(client_id, buffer_id);
+        let pushes = refresh_buffer_pickers(&mut s);
+        drop(s);
+        for (sender, notif) in pushes {
+            let _ = sender.send(notif).await;
+        }
+        return Ok(result);
+    }
+
     let canonical = match (params.path_index, params.relative_path.as_deref()) {
         (None, None) => {
             let mut s = state.lock().await;
@@ -132,6 +166,12 @@ pub async fn buffer_open(
                 scroll,
             };
             s.buffers.insert(id, buf);
+            s.touch_mru(client_id, id);
+            let pushes = refresh_buffer_pickers(&mut s);
+            drop(s);
+            for (sender, notif) in pushes {
+                let _ = sender.send(notif).await;
+            }
             return Ok(result);
         }
         (Some(idx), rel) => {
@@ -185,7 +225,7 @@ pub async fn buffer_open(
     };
 
     {
-        let s = state.lock().await;
+        let mut s = state.lock().await;
         if !s.path_is_in_project(&canonical) {
             return Err(RpcError::invalid_path(format!(
                 "{} is outside the project's access boundary",
@@ -198,7 +238,7 @@ pub async fn buffer_open(
                 .and_then(|c| s.cursors.get(&(c, existing)).copied())
                 .unwrap_or_default();
             let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, existing)).copied());
-            return Ok(BufferOpenResult {
+            let result = BufferOpenResult {
                 buffer_id: existing,
                 language: buf.language.clone(),
                 line_count: buf.line_count(),
@@ -208,7 +248,14 @@ pub async fn buffer_open(
                 path: Some(canonical.display().to_string()),
                 cursor,
                 scroll,
-            });
+            };
+            s.touch_mru(client_id, existing);
+            let pushes = refresh_buffer_pickers(&mut s);
+            drop(s);
+            for (sender, notif) in pushes {
+                let _ = sender.send(notif).await;
+            }
+            return Ok(result);
         }
     }
 
@@ -239,6 +286,12 @@ pub async fn buffer_open(
         scroll,
     };
     s.buffers.insert(id, buf);
+    s.touch_mru(client_id, id);
+    let pushes = refresh_buffer_pickers(&mut s);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
     tracing::info!(buffer_id = id, path = %canonical.display(), "buffer opened");
     Ok(result)
 }
@@ -898,6 +951,7 @@ pub async fn buffer_cut(
         .collect();
 
     let buf_mut = s.buffers.get_mut(&params.buffer_id).expect("just checked");
+    let was_dirty = buf_mut.dirty;
     let revision = buf_mut.apply_edit(start_char, end_char, "", EditKindTag::Delete, cursors_before);
     let new_cursor = CursorState { position: motion::char_to_pos(buf_mut, start_char), anchor: None, match_bracket: None };
     s.cursors.insert((client_id, params.buffer_id), new_cursor);
@@ -923,11 +977,16 @@ pub async fn buffer_cut(
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
 
+    let picker_pushes = maybe_refresh_dirty(&mut s, params.buffer_id, was_dirty);
+
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
 
@@ -1033,13 +1092,19 @@ pub async fn buffer_save(
         (saved_at, buf.revision)
     };
 
-    // Broadcast buffer/state to all clients with viewports on this buffer.
-    let pushes = {
-        let s = state.lock().await;
-        collect_buffer_state_pushes(&s, params.buffer_id)
+    // Broadcast buffer/state to all clients with viewports on this buffer, and re-push any
+    // open buffer pickers (the dirty flag just flipped off; the path may have moved on Save-As).
+    let (state_pushes, picker_pushes) = {
+        let mut s = state.lock().await;
+        let state_pushes = collect_buffer_state_pushes(&s, params.buffer_id);
+        let picker_pushes = refresh_buffer_pickers(&mut s);
+        (state_pushes, picker_pushes)
     };
     let _ = saved_at_unix_ms; // saved_at is captured inside the helper via Buffer::last_modified.
-    for (sender, notif) in pushes {
+    for (sender, notif) in state_pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
 
@@ -2231,6 +2296,7 @@ async fn apply_toggle_comment(
         .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
         .collect();
 
+    let was_dirty = s.buffers[&buffer_id].dirty;
     let revision = {
         let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
         buf_mut.apply_edit(start_char, end_char, &new_text, EditKindTag::Text, cursors_before)
@@ -2275,12 +2341,17 @@ async fn apply_toggle_comment(
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
 
+    let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+
     let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
     Ok(EditResult { revision, cursor: new_cursor })
@@ -2629,6 +2700,7 @@ async fn apply_indent_or_dedent(
         .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
         .collect();
 
+    let was_dirty = s.buffers[&buffer_id].dirty;
     let (revision, new_cursor) = {
         let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
         let revision = buf_mut.apply_edit(
@@ -2692,12 +2764,17 @@ async fn apply_indent_or_dedent(
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
 
+    let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+
     let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
     Ok(EditResult { revision, cursor: new_cursor })
@@ -2794,6 +2871,7 @@ pub async fn input_move_lines(
         .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
         .collect();
 
+    let was_dirty = s.buffers[&buffer_id].dirty;
     let (revision, new_cursor) = {
         let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
         let revision = buf_mut.apply_edit(
@@ -2860,12 +2938,17 @@ pub async fn input_move_lines(
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
 
+    let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+
     let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
     Ok(EditResult { revision, cursor: new_cursor })
@@ -2982,8 +3065,9 @@ pub async fn input_join_lines(
             .collect()
     };
 
-    let (revision, new_cursor) = {
+    let (revision, new_cursor, was_dirty) = {
         let mut s = state.lock().await;
+        let was_dirty = s.buffers[&buffer_id].dirty;
         let buf = s.buffers.get_mut(&buffer_id).expect("just checked");
         let revision = buf.apply_edit(
             first_char,
@@ -3002,11 +3086,11 @@ pub async fn input_join_lines(
         s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
         s.clear_virtual_col_for_buffer(buffer_id);
-        (revision, new_cursor)
+        (revision, new_cursor, was_dirty)
     };
 
     // Push viewport/lines_changed for affected viewports (we changed multiple lines).
-    let (pushes, search_summary_pushes, new_cursor): (Vec<_>, Vec<_>, _) = {
+    let (pushes, search_summary_pushes, picker_pushes, new_cursor): (Vec<_>, Vec<_>, Vec<_>, _) = {
         let mut s = state.lock().await;
         let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
         let new_line_count = s.buffers[&buffer_id].line_count();
@@ -3023,14 +3107,18 @@ pub async fn input_join_lines(
             let search = s.searches.get(&(vp.client_id, buffer_id));
             pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search)));
         }
+        let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
         let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
-        (pushes, search_summary_pushes, new_cursor)
+        (pushes, search_summary_pushes, picker_pushes, new_cursor)
     };
 
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
 
@@ -3058,6 +3146,7 @@ async fn apply_undo_or_redo(
         .filter_map(|((c, b), cs)| if *b == buffer_id { Some((*c, *cs)) } else { None })
         .collect();
 
+    let was_dirty = s.buffers.get(&buffer_id).map(|b| b.dirty).unwrap_or(false);
     let outcome = {
         let buf = s
             .buffers
@@ -3129,11 +3218,16 @@ async fn apply_undo_or_redo(
         pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
     }
 
+    let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
 
@@ -3241,6 +3335,7 @@ async fn apply_edit(
 
     // Mutate the buffer (rope edit + incremental reparse + undo-group bookkeeping).
     let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+    let was_dirty = buf_mut.dirty;
     let revision = buf_mut.apply_edit(start_char, end_char, insert_text, kind_tag, cursors_before);
 
     // Compute the cursor's new position.
@@ -3294,6 +3389,11 @@ async fn apply_edit(
         pushes.push((sender, notif));
     }
 
+    // Re-push any open Buffers pickers only when the dirty flag flipped (typically the first
+    // edit after a save). The picker row renders dirty + display only, so per-keystroke edits
+    // mid-burst don't need pushes.
+    let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+
     let new_cursor_state = wrap_for_response(&s, buffer_id, new_cursor_state);
     drop(s);
 
@@ -3302,6 +3402,9 @@ async fn apply_edit(
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
 
@@ -3342,6 +3445,102 @@ fn build_lines_changed_notif(
 
 // ---- picker/* ----------------------------------------------------------------------------------
 
+/// Build the buffer-picker candidate list for `client_id`: every live buffer, MRU first,
+/// then any buffers the client hasn't touched yet (e.g. opened by another client) in
+/// buffer-id order. `[scratch N]` placeholder display for buffers without a path.
+fn build_buffer_candidates(s: &ServerState, client_id: ClientId) -> Vec<picker_state::BufferCandidate> {
+    let mut out: Vec<picker_state::BufferCandidate> = Vec::with_capacity(s.buffers.len());
+    let mut seen: std::collections::HashSet<BufferId> = std::collections::HashSet::new();
+
+    if let Some(mru) = s.mru_buffers.get(&client_id) {
+        for &id in mru {
+            let Some(buf) = s.buffers.get(&id) else { continue };
+            out.push(buffer_candidate(buf, &s.project_paths));
+            seen.insert(id);
+        }
+    }
+    // Append any buffers not in the MRU yet so the picker still surfaces them. Stable order
+    // (by id) so the tail is deterministic.
+    let mut leftovers: Vec<BufferId> = s
+        .buffers
+        .keys()
+        .copied()
+        .filter(|id| !seen.contains(id))
+        .collect();
+    leftovers.sort_unstable();
+    for id in leftovers {
+        out.push(buffer_candidate(&s.buffers[&id], &s.project_paths));
+    }
+    out
+}
+
+fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state::BufferCandidate {
+    let display = match buf.canonical_path.as_deref() {
+        Some(p) => crate::workspace_index::project_relative_display(p, roots)
+            .unwrap_or_else(|| p.display().to_string()),
+        None => format!("[scratch {}]", buf.id),
+    };
+    picker_state::BufferCandidate { buffer_id: buf.id, display, dirty: buf.dirty }
+}
+
+/// Rebuild candidates for every subscribed `Buffers` picker, re-rank under the existing query,
+/// and collect the resulting `picker/update` pushes. Caller sends them after dropping the lock.
+/// Cheap when no picker is open: a HashMap scan over `pickers` and an early return.
+fn refresh_buffer_pickers(
+    s: &mut ServerState,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    // Collect client_ids with a *subscribed* Buffers picker. Skip the rest — they may still
+    // have persisted state from a prior session, but they're not waiting for pushes.
+    let client_ids: Vec<ClientId> = s
+        .pickers
+        .iter()
+        .filter_map(|((c, k), p)| (*k == PickerKind::Buffers && p.subscribed.is_some()).then_some(*c))
+        .collect();
+    let mut pushes = Vec::new();
+    for client_id in client_ids {
+        let new_candidates = build_buffer_candidates(s, client_id);
+        let ServerState { pickers, matcher, clients, .. } = &mut *s;
+        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Buffers)) else { continue };
+        picker.candidates = picker_state::PickerCandidates::Buffers(new_candidates);
+        picker.rerank(matcher);
+        if let Some(window) = picker.subscribed.as_mut() {
+            let total = picker.ranked.len() as u32;
+            if window.offset >= total {
+                window.offset = total.saturating_sub(window.limit);
+            }
+        }
+        let Some(update) = picker_state::build_update(picker, matcher) else { continue };
+        let Some(sender) = clients.get(&client_id).map(|c| c.outbound.clone()) else { continue };
+        pushes.push((sender, picker_update_notif(update)));
+    }
+    pushes
+}
+
+fn picker_update_notif(params: PickerUpdateParams) -> Notification {
+    Notification {
+        jsonrpc: JsonRpc,
+        method: PickerUpdate::NAME.into(),
+        params: serde_json::to_value(params).expect("infallible"),
+    }
+}
+
+/// If `buffer_id`'s dirty flag changed across the just-completed mutation, collect picker
+/// refresh pushes. Caller captures `was_dirty` before the mutation; this reads the post-
+/// mutation value and decides. No-op (no allocation, no rerank) when dirty didn't change —
+/// the typical hot path during a typing burst.
+fn maybe_refresh_dirty(
+    s: &mut ServerState,
+    buffer_id: BufferId,
+    was_dirty: bool,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    let now_dirty = s.buffers.get(&buffer_id).map(|b| b.dirty).unwrap_or(false);
+    if now_dirty == was_dirty {
+        Vec::new()
+    } else {
+        refresh_buffer_pickers(s)
+    }
+}
+
 pub async fn picker_view(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -3349,14 +3548,23 @@ pub async fn picker_view(
 ) -> Result<PickerViewResult, RpcError> {
     let client_id = ctx.require_hello()?;
 
-    // Walk the workspace outside the global lock — on first call it can take seconds, and we
-    // don't want to stall every other RPC. The `Arc<WorkspaceIndex>` is cheap to clone; the
-    // walk itself is memoized inside the index.
-    let workspace_index = {
-        let s = state.lock().await;
-        s.workspace_index.clone()
+    // Build candidates outside the mutation phase. Files needs an async workspace walk;
+    // Buffers reads ServerState directly.
+    let candidates = match params.kind {
+        PickerKind::Files => {
+            // Walk the workspace outside the global lock — on first call it can take seconds.
+            // The `Arc<WorkspaceIndex>` clone is cheap; the walk itself is memoized inside.
+            let workspace_index = {
+                let s = state.lock().await;
+                s.workspace_index.clone()
+            };
+            picker_state::PickerCandidates::Files(workspace_index.files().await)
+        }
+        PickerKind::Buffers => {
+            let s = state.lock().await;
+            picker_state::PickerCandidates::Buffers(build_buffer_candidates(&s, client_id))
+        }
     };
-    let candidates = workspace_index.files().await;
 
     let mut s = state.lock().await;
     let key = (client_id, params.kind);
@@ -3369,13 +3577,20 @@ pub async fn picker_view(
         pickers.remove(&key);
     }
     if !pickers.contains_key(&key) {
-        pickers.insert(key, picker_state::PickerState::new(params.kind, candidates.clone()));
+        pickers.insert(key, picker_state::PickerState::new(candidates));
     } else {
-        // If the workspace index has been refreshed since the picker was last touched (file
-        // watcher would do this once wired up), re-bind to the latest candidate set and re-rank.
         let p = pickers.get_mut(&key).expect("just checked");
-        if !Arc::ptr_eq(&p.candidates, &candidates) {
-            p.candidates = candidates.clone();
+        // Files: the workspace index returns the same `Arc` until a refresh — skip the
+        // rerank in that case. Buffers: the candidate set is fresh each call, always re-bind.
+        let same_snapshot = matches!(
+            (&p.candidates, &candidates),
+            (
+                picker_state::PickerCandidates::Files(a),
+                picker_state::PickerCandidates::Files(b),
+            ) if Arc::ptr_eq(a, b)
+        );
+        if !same_snapshot {
+            p.candidates = candidates;
             p.rerank(matcher);
         }
     }
@@ -3411,12 +3626,7 @@ pub async fn picker_view(
     drop(s);
 
     if let (Some(sender), Some(params)) = (outbound, update) {
-        let notif = Notification {
-            jsonrpc: JsonRpc,
-            method: PickerUpdate::NAME.into(),
-            params: serde_json::to_value(params).expect("infallible"),
-        };
-        let _ = sender.send(notif).await;
+        let _ = sender.send(picker_update_notif(params)).await;
     }
 
     Ok(result)
@@ -3453,12 +3663,7 @@ pub async fn picker_query(
     drop(s);
 
     if let (Some(sender), Some(params)) = (outbound, update) {
-        let notif = Notification {
-            jsonrpc: JsonRpc,
-            method: PickerUpdate::NAME.into(),
-            params: serde_json::to_value(params).expect("infallible"),
-        };
-        let _ = sender.send(notif).await;
+        let _ = sender.send(picker_update_notif(params)).await;
     }
     Ok(())
 }
@@ -3474,14 +3679,9 @@ pub async fn picker_select(
     let picker = s.pickers.get(&key).ok_or_else(|| {
         RpcError::new(ErrorCode::INVALID_REQUEST, "no active picker for this client")
     })?;
-    match &params.item {
-        PickerItem::File { .. } => {
-            let abs = picker_state::resolve_file_abs(picker, &params.item).ok_or_else(|| {
-                RpcError::invalid_params("selected item is not in the picker's candidate set")
-            })?;
-            Ok(PickerSelectResult::File { path: abs })
-        }
-    }
+    picker_state::resolve_select(picker, &params.item).ok_or_else(|| {
+        RpcError::invalid_params("selected item is not in the picker's candidate set")
+    })
 }
 
 pub async fn picker_hide(

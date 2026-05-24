@@ -58,6 +58,10 @@ pub struct ServerState {
     /// Per-`(client, kind)` picker state. Survives `picker/hide` (so resume restores query +
     /// ranking); cleared on disconnect.
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
+    /// Per-client buffer most-recently-used order. Front = most recent. Pushed on every
+    /// `buffer/open` (whether opening fresh, reopening an existing buffer, or attaching by id);
+    /// drives the empty-query order of the buffer picker. Cleared on disconnect.
+    pub mru_buffers: HashMap<ClientId, VecDeque<BufferId>>,
     /// Single shared fuzzy matcher. `nucleo_matcher::Matcher` reuses scratch buffers across
     /// calls, so it's cheaper to share one than construct per RPC. Not `Sync`, so the global
     /// lock around `ServerState` is what serializes access.
@@ -118,6 +122,7 @@ impl ServerState {
             last_scroll: HashMap::new(),
             workspace_index,
             pickers: HashMap::new(),
+            mru_buffers: HashMap::new(),
             matcher: picker_state::make_matcher(),
             next_buffer_id: 1,
             next_viewport_id: 1,
@@ -203,6 +208,21 @@ impl ServerState {
     /// Remove all picker state for the given client. Used on disconnect.
     pub fn drop_pickers_for_client(&mut self, client_id: ClientId) {
         self.pickers.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Remove the MRU buffer ordering for the given client. Used on disconnect.
+    pub fn drop_mru_for_client(&mut self, client_id: ClientId) {
+        self.mru_buffers.remove(&client_id);
+    }
+
+    /// Bump `buffer_id` to the front of the client's MRU list. No-op when `client_id` is
+    /// `None` (handler invoked before `client/hello`). Called from `buffer/open` every time
+    /// the client lands on a buffer — fresh open, reopen, or attach-by-id.
+    pub fn touch_mru(&mut self, client_id: Option<ClientId>, buffer_id: BufferId) {
+        let Some(cid) = client_id else { return };
+        let mru = self.mru_buffers.entry(cid).or_default();
+        mru.retain(|&b| b != buffer_id);
+        mru.push_front(buffer_id);
     }
 
     /// Drop the selection-expansion history for one client+buffer. Called from every cursor RPC

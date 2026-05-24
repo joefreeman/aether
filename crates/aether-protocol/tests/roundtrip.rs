@@ -198,6 +198,7 @@ fn project_info_shape() {
 fn buffer_open_scratch_form() {
     // Both path_index and relative_path null => scratch buffer per §6.1.
     let v = to_value(BufferOpenParams {
+        buffer_id: None,
         path_index: None,
         relative_path: None,
         language: Some("rust".into()),
@@ -297,4 +298,68 @@ fn picker_select_result_is_tagged() {
     use aether_protocol::picker::PickerSelectResult;
     let r = PickerSelectResult::File { path: "/abs/path".into() };
     assert_eq!(to_value(&r).unwrap(), json!({"kind": "file", "path": "/abs/path"}));
+}
+
+#[test]
+fn picker_item_buffer_is_tagged() {
+    use aether_protocol::picker::PickerItem;
+    let item = PickerItem::Buffer {
+        buffer_id: 7,
+        display: "src/main.rs".into(),
+        dirty: true,
+        match_indices: vec![0, 4],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "kind": "buffer",
+            "buffer_id": 7,
+            "display": "src/main.rs",
+            "dirty": true,
+            "match_indices": [0, 4],
+        })
+    );
+}
+
+#[test]
+fn picker_select_result_buffer_is_tagged() {
+    use aether_protocol::picker::PickerSelectResult;
+    let r = PickerSelectResult::Buffer { buffer_id: 42 };
+    assert_eq!(to_value(&r).unwrap(), json!({"kind": "buffer", "buffer_id": 42}));
+}
+
+#[test]
+fn picker_kind_buffers_is_snake_case() {
+    use aether_protocol::picker::PickerKind;
+    assert_eq!(to_value(PickerKind::Buffers).unwrap(), json!("buffers"));
+}
+
+#[test]
+fn buffer_open_params_buffer_id_skipped_when_none() {
+    use aether_protocol::buffer::BufferOpenParams;
+    let p = BufferOpenParams {
+        buffer_id: None,
+        path_index: Some(0),
+        relative_path: Some("x".into()),
+        language: None,
+        create_if_missing: false,
+    };
+    let v = to_value(&p).unwrap();
+    assert!(v.get("buffer_id").is_none());
+    assert_eq!(v["path_index"], 0);
+}
+
+#[test]
+fn buffer_open_params_buffer_id_round_trips() {
+    use aether_protocol::buffer::BufferOpenParams;
+    let p = BufferOpenParams {
+        buffer_id: Some(11),
+        path_index: None,
+        relative_path: None,
+        language: None,
+        create_if_missing: false,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["buffer_id"], 11);
 }
