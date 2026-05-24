@@ -976,16 +976,12 @@ fn lookup_exact(name: &str) -> Option<Style> {
 }
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let line = if state.save_prompt.is_some() {
+    let line = if let Some(confirm) = state.confirm_prompt.as_ref() {
+        // Confirm prompt always wins the status row — it can layer over save_prompt.
+        Line::from(vec![Span::raw(format!(" {}? [y/N]", confirm.message))])
+    } else if let Some(prompt) = state.save_prompt.as_ref() {
         // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
-        match state.save_prompt.as_ref() {
-            Some(p) if p.pending_overwrite => Line::from(vec![Span::raw(format!(
-                " overwrite {}? [y/N]",
-                p.input.text
-            ))]),
-            Some(p) => Line::from(vec![Span::raw(format!(" save as: {}", p.input.text))]),
-            None => Line::from(vec![Span::raw("")]),
-        }
+        Line::from(vec![Span::raw(format!(" save as: {}", prompt.input.text))])
     } else if let Some(browsing) = state.try_browsing() {
         if let Some(prompt) = browsing.file_browser.prompt.as_ref() {
             let label = match prompt.kind {
@@ -1155,30 +1151,31 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         }
         return;
     }
-    if state.save_prompt.is_some() {
-        if let Some(prompt) = state.save_prompt.as_ref() {
-            let max_col = status_area
-                .x
-                .saturating_add(status_area.width.saturating_sub(1));
-            let col = if prompt.pending_overwrite {
-                // Confirmation stage: park at the end of " overwrite <path>? [y/N]" so the
-                // I-beam sits past the prompt rather than mid-path.
-                let line = format!(" overwrite {}? [y/N]", prompt.input.text);
-                status_area
-                    .x
-                    .saturating_add(line.width() as u16)
-                    .min(max_col)
-            } else {
-                const PREFIX: &str = " save as: ";
-                let prefix_w = PREFIX.width() as u16;
-                let typed_w = prompt.input.width_to_cursor() as u16;
-                status_area
-                    .x
-                    .saturating_add(prefix_w.saturating_add(typed_w))
-                    .min(max_col)
-            };
-            f.set_cursor_position((col, status_area.y));
-        }
+    if let Some(confirm) = state.confirm_prompt.as_ref() {
+        // Park at the end of " {message}? [y/N]" so the I-beam sits past the prompt.
+        let line = format!(" {}? [y/N]", confirm.message);
+        let max_col = status_area
+            .x
+            .saturating_add(status_area.width.saturating_sub(1));
+        let col = status_area
+            .x
+            .saturating_add(line.width() as u16)
+            .min(max_col);
+        f.set_cursor_position((col, status_area.y));
+        return;
+    }
+    if let Some(prompt) = state.save_prompt.as_ref() {
+        const PREFIX: &str = " save as: ";
+        let prefix_w = PREFIX.width() as u16;
+        let typed_w = prompt.input.width_to_cursor() as u16;
+        let max_col = status_area
+            .x
+            .saturating_add(status_area.width.saturating_sub(1));
+        let col = status_area
+            .x
+            .saturating_add(prefix_w.saturating_add(typed_w))
+            .min(max_col);
+        f.set_cursor_position((col, status_area.y));
         return;
     }
     if let Some(browsing) = state.try_browsing() {

@@ -5,8 +5,9 @@ use crate::client::Client;
 use crate::clipboard;
 use crate::ui;
 use aether_protocol::buffer::{
-    BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
-    BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferState,
+    BufferClose, BufferCloseParams, BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut,
+    BufferCutResult, BufferOpen, BufferOpenParams, BufferOpenResult, BufferSave,
+    BufferSaveParams, BufferState,
     BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
@@ -169,7 +170,32 @@ pub struct AppState {
     /// Active save-as prompt. Overlays whichever screen we're in; only useful from
     /// `Screen::Editing` since the browser has no buffer to save.
     pub save_prompt: Option<SavePromptState>,
+    /// Active binary y/N confirmation prompt. Layers on top of any other overlay (including
+    /// `save_prompt`, e.g. for the save-as overwrite confirm). Holds the question text and the
+    /// action to run on `y`.
+    pub confirm_prompt: Option<ConfirmPrompt>,
     pub screen: Screen,
+}
+
+/// Generic `[y/N]` confirmation overlay. The save-as overwrite confirm and the close-with-
+/// unsaved-changes confirm both route through this. Esc / Enter / `n` decline (matching the
+/// uppercase `N` default); only `y` / `Y` proceeds.
+#[derive(Debug, Clone)]
+pub struct ConfirmPrompt {
+    /// What gets shown on the status row, formatted as `" {message}? [y/N]"`.
+    pub message: String,
+    pub action: ConfirmAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    /// Retry the save-as RPC with `overwrite: true`. The path is read from
+    /// `state.save_prompt.input.text` (the save-prompt stays open beneath the confirm), so
+    /// nothing is carried in this variant.
+    OverwriteSaveAs,
+    /// Close `buffer_id` despite it being dirty. After closing, the client picks the next
+    /// MRU buffer or spawns a scratch.
+    CloseBuffer { buffer_id: BufferId },
 }
 
 /// What the app is currently doing — editing a buffer or navigating the file browser. The
@@ -229,11 +255,6 @@ pub struct BrowsingState {
 #[derive(Debug, Clone)]
 pub struct SavePromptState {
     pub input: crate::text_input::TextInput,
-    /// `true` after the server rejected the save with `WOULD_OVERWRITE`. The prompt switches
-    /// to a y/N question; `y` resends with `overwrite: true`; `n` / Enter / Esc returns to
-    /// path editing with the same input still in place. The path being confirmed is read from
-    /// `input.text` — no need to store it again here.
-    pub pending_overwrite: bool,
 }
 
 impl AppState {
@@ -356,6 +377,7 @@ pub async fn bootstrap(
         pending_leader: None,
         picker: crate::picker::PickerState::default(),
         save_prompt: None,
+        confirm_prompt: None,
         // Placeholder — replaced below by either a freshly-opened editor or the file browser.
         screen: Screen::Browsing(BrowsingState {
             file_browser: FileBrowserState::default(),
@@ -541,7 +563,7 @@ async fn dispatch_terminal_event(
 fn apply_cursor_style(state: &AppState) {
     // Overlays always use the bar cursor (they're text-prompt UIs). Otherwise it depends on
     // screen + editor mode: block in Normal / file browser, bar in Insert / Search.
-    let style = if state.picker.open || state.save_prompt.is_some() {
+    let style = if state.picker.open || state.save_prompt.is_some() || state.confirm_prompt.is_some() {
         SetCursorStyle::SteadyBar
     } else {
         match &state.screen {
@@ -648,8 +670,12 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
             if let Some(leader) = state.pending_leader.take() {
                 return handle_leader_key(client, state, leader, k).await;
             }
-            // Overlays first — they sit on top of whichever screen is underneath.
-            if state.save_prompt.is_some() {
+            // Overlays first — they sit on top of whichever screen is underneath. The
+            // confirm prompt takes priority over everything else (it can layer on top of the
+            // save prompt for the overwrite case).
+            if state.confirm_prompt.is_some() {
+                handle_confirm_prompt_key(client, state, k).await?;
+            } else if state.save_prompt.is_some() {
                 handle_save_prompt_key(client, state, k).await?;
             } else if state.picker.open {
                 handle_picker_key(client, state, k).await?;
@@ -1177,11 +1203,12 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         }
 
         // ---- viewport ----
-        (KeyCode::Char('w'), CTRL_ONLY) => toggle_wrap(client, state).await?,
+        (KeyCode::Char('p'), CTRL_ONLY) => toggle_wrap(client, state).await?,
         (KeyCode::Char('z'), m) if m == KeyModifiers::NONE => center_cursor(client, state).await?,
 
         // ---- buffers ----
         (KeyCode::Char('n'), CTRL_ONLY) => new_scratch(client, state).await?,
+        (KeyCode::Char('w'), CTRL_ONLY) => close_buffer(client, state).await?,
 
         // ---- edits ----
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
@@ -1201,7 +1228,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state, count).await?,
         (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state, count).await?,
         (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state, count).await?,
-        (KeyCode::Char('b'), CTRL_ONLY) => toggle_comment(client, state).await?,
+        (KeyCode::Char('t'), CTRL_ONLY) => toggle_comment(client, state).await?,
         (KeyCode::Char('o'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
             open_line_above(client, state).await?
         }
@@ -1228,7 +1255,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('x'), CTRL_ONLY) => {
             cut_to_clipboard(client, state, CopyScope::Selection).await?
         }
-        (KeyCode::Char('p'), CTRL_ONLY) => paste_before(client, state, count).await?,
+        (KeyCode::Char('v'), CTRL_ONLY) => paste_before(client, state, count).await?,
         (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state, count).await?,
 
         // ---- leader (Space) ----
@@ -1573,6 +1600,50 @@ async fn new_scratch(client: &mut Client, state: &mut AppState) -> Result<()> {
     subscribe_to_buffer(client, state, open).await
 }
 
+/// Close the active buffer. If it's dirty, opens a confirm prompt first; the user's `y`
+/// answer routes through `handle_confirm_prompt_key` back to `finalize_close_buffer`.
+async fn close_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(ed) = state.try_editor() else { return Ok(()) };
+    let buffer_id = ed.buffer_id;
+    let dirty = ed.revision != ed.saved_revision;
+    let label = ed.file_label.clone();
+    if dirty {
+        state.confirm_prompt = Some(ConfirmPrompt {
+            message: format!("discard unsaved changes in {label}"),
+            action: ConfirmAction::CloseBuffer { buffer_id },
+        });
+        apply_cursor_style(state);
+        return Ok(());
+    }
+    finalize_close_buffer(client, state, buffer_id).await
+}
+
+/// Actually close `buffer_id`. The server returns the next-MRU buffer to switch to; if
+/// `None`, no buffers remain and we open a fresh scratch. Called either directly (clean
+/// buffer) or via the confirm-prompt flow (dirty).
+async fn finalize_close_buffer(
+    client: &mut Client,
+    state: &mut AppState,
+    buffer_id: BufferId,
+) -> Result<()> {
+    // Capture the display name before the buffer's gone so the status message can refer to it.
+    let closed_label = state
+        .try_editor()
+        .filter(|e| e.buffer_id == buffer_id)
+        .map(|e| e.file_label.clone())
+        .unwrap_or_else(|| format!("buffer {buffer_id}"));
+    let result: aether_protocol::buffer::BufferCloseResult = client
+        .rpc::<BufferClose>(BufferCloseParams { buffer_id })
+        .await?;
+    state.status = format!("closed {closed_label}");
+    if let Some(next) = result.next_buffer_id {
+        attach_buffer(client, state, next).await?;
+    } else {
+        new_scratch(client, state).await?;
+    }
+    Ok(())
+}
+
 /// Shared post-`buffer/open` plumbing: subscribe a viewport and refresh AppState. Both
 /// `attach_buffer` and `new_scratch` route through this; the only difference is the
 /// `buffer/open` params they send.
@@ -1687,7 +1758,7 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
             copy_to_clipboard(client, state, CopyScope::Line).await?
         }
         (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Line).await?,
-        (KeyCode::Char('p'), CTRL_ONLY) => paste_at_cursor(client, state).await?,
+        (KeyCode::Char('v'), CTRL_ONLY) => paste_at_cursor(client, state).await?,
 
         // Insert-mode Backspace deletes the char before the cursor; Delete deletes the 1-char
         // point at the cursor (the always-have-selection invariant means the point IS the
@@ -3170,7 +3241,6 @@ fn begin_save_prompt(state: &mut AppState) {
         .unwrap_or_default();
     state.save_prompt = Some(SavePromptState {
         input: crate::text_input::TextInput::new(initial),
-        pending_overwrite: false,
     });
     apply_cursor_style(state);
 }
@@ -3181,27 +3251,6 @@ async fn handle_save_prompt_key(
     k: KeyEvent,
 ) -> Result<()> {
     // Don't `normalize_key` here — that lowercases uppercase chars, which would mangle paths.
-    let confirming = state
-        .save_prompt
-        .as_ref()
-        .is_some_and(|p| p.pending_overwrite);
-    if confirming {
-        match (k.code, k.modifiers) {
-            // Default (Enter / Esc / n) is "don't overwrite" — matching the uppercase `N` in
-            // the `[y/N]` prompt. Drops the confirmation and returns to path editing so the
-            // user can pick a different filename.
-            (KeyCode::Esc, _) | (KeyCode::Enter, _) | (KeyCode::Char('n' | 'N'), _) => {
-                if let Some(p) = state.save_prompt.as_mut() {
-                    p.pending_overwrite = false;
-                }
-            }
-            (KeyCode::Char('y' | 'Y'), _) => {
-                send_save_prompt(client, state, true).await?;
-            }
-            _ => {}
-        }
-        return Ok(());
-    }
     match (k.code, k.modifiers) {
         (KeyCode::Esc, _) => abort_save_prompt(state),
         (KeyCode::Enter, _) => send_save_prompt(client, state, false).await?,
@@ -3292,11 +3341,13 @@ async fn send_save_prompt(
             state.status = format!("saved as {} (rev {})", path, r.revision);
         }
         Err(e) if is_would_overwrite(&e) => {
-            // Keep the prompt open and switch to confirmation. The user's typed path stays
-            // in `input.text`; the confirmation row reads it from there.
-            if let Some(p) = state.save_prompt.as_mut() {
-                p.pending_overwrite = true;
-            }
+            // Keep the save-prompt open and overlay a confirm prompt on top. If the user
+            // declines we drop the confirm and they're back editing the path; if they accept
+            // we re-send with `overwrite: true`.
+            state.confirm_prompt = Some(ConfirmPrompt {
+                message: format!("overwrite {path}"),
+                action: ConfirmAction::OverwriteSaveAs,
+            });
         }
         Err(e) => {
             state.save_prompt = None;
@@ -3312,6 +3363,35 @@ async fn send_save_prompt(
 fn is_would_overwrite(e: &anyhow::Error) -> bool {
     e.downcast_ref::<crate::client::RpcError>()
         .is_some_and(|r| r.code == ErrorCode::WOULD_OVERWRITE.code())
+}
+
+async fn handle_confirm_prompt_key(
+    client: &mut Client,
+    state: &mut AppState,
+    k: KeyEvent,
+) -> Result<()> {
+    match (k.code, k.modifiers) {
+        // Default (Enter / Esc / n) declines — matches the uppercase `N` in `[y/N]`. Drops the
+        // confirm prompt; whatever it was layered on top of stays put.
+        (KeyCode::Esc, _) | (KeyCode::Enter, _) | (KeyCode::Char('n' | 'N'), _) => {
+            state.confirm_prompt = None;
+            apply_cursor_style(state);
+        }
+        (KeyCode::Char('y' | 'Y'), _) => {
+            let Some(prompt) = state.confirm_prompt.take() else { return Ok(()) };
+            match prompt.action {
+                ConfirmAction::OverwriteSaveAs => {
+                    send_save_prompt(client, state, true).await?;
+                }
+                ConfirmAction::CloseBuffer { buffer_id } => {
+                    finalize_close_buffer(client, state, buffer_id).await?;
+                }
+            }
+            apply_cursor_style(state);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> Result<()> {

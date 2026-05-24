@@ -9,8 +9,9 @@ use crate::state::{
 };
 use crate::wrap;
 use aether_protocol::buffer::{
-    BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams, BufferOpenResult,
-    BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
+    BufferCloseParams, BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams,
+    BufferOpenResult, BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams,
+    CopyScope,
 };
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState,
@@ -955,6 +956,53 @@ fn byte_to_logical(buf: &Buffer, byte_idx: usize) -> aether_protocol::LogicalPos
         line: line_idx as u32,
         col: col_bytes as u32,
     }
+}
+
+// ---- buffer/close -------------------------------------------------------------------------------
+
+/// Close a buffer globally. Drops the buffer from the server, plus all viewports subscribed
+/// to it across every client, all per-`(client, buffer)` state (cursors, motion history,
+/// virtual col, tree-selection history, search, last scroll), and all MRU references.
+/// Refreshes any subscribed Buffers picker so clients see the buffer vanish from the list.
+///
+/// Closes are unconditional from the server's point of view — the client is expected to ask
+/// for confirmation if the buffer is dirty.
+pub async fn buffer_close(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferCloseParams,
+) -> Result<aether_protocol::buffer::BufferCloseResult, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    if !s.buffers.contains_key(&params.buffer_id) {
+        return Err(RpcError::buffer_not_found(params.buffer_id));
+    }
+    s.buffers.remove(&params.buffer_id);
+    s.viewports.retain(|_, v| v.buffer_id != params.buffer_id);
+    s.cursors.retain(|(_, b), _| *b != params.buffer_id);
+    s.motion_history.retain(|(_, b), _| *b != params.buffer_id);
+    s.virtual_col.retain(|(_, b), _| *b != params.buffer_id);
+    s.tree_selection_history.retain(|(_, b), _| *b != params.buffer_id);
+    s.searches.retain(|(_, b), _| *b != params.buffer_id);
+    s.last_scroll.retain(|(_, b), _| *b != params.buffer_id);
+    for mru in s.mru_buffers.values_mut() {
+        mru.retain(|&id| id != params.buffer_id);
+    }
+    // Pick the next buffer for the requesting client: top of their MRU after cleanup, or
+    // — if their MRU is empty — any remaining buffer (some other client may have it open).
+    // The client uses this to attach without an extra RPC round-trip.
+    let next_buffer_id = s
+        .mru_buffers
+        .get(&client_id)
+        .and_then(|mru| mru.front().copied())
+        .or_else(|| s.buffers.keys().next().copied());
+    let pushes = refresh_buffer_pickers(&mut s);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    tracing::info!(buffer_id = params.buffer_id, "buffer closed");
+    Ok(aether_protocol::buffer::BufferCloseResult { next_buffer_id })
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------

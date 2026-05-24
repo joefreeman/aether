@@ -28,9 +28,10 @@ use aether_protocol::search::{
     SearchSet, SearchSetParams, SearchSetResult,
 };
 use aether_protocol::viewport::{
-    ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportScroll,
-    ViewportScrollParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, WrapMode,
+    ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
+    ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSetWrap,
+    ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
+    ViewportWindowResult, WrapMode,
 };
 use aether_protocol::LogicalPosition;
 use aether_server::spawn_for_test;
@@ -8029,6 +8030,105 @@ async fn in_place_save_after_save_as_targets_new_path() {
     .await;
     let on_disk = std::fs::read_to_string(dir_path.join("named.txt")).expect("file on disk");
     assert_eq!(on_disk, "one\ntwo\n");
+
+    drop(server);
+}
+
+// -------- buffer/close ---------------------------------------------------------------------------
+
+use aether_protocol::buffer::{BufferClose, BufferCloseParams, BufferCloseResult};
+
+/// Closing a buffer drops it from the server. After close, opening by id fails.
+#[tokio::test]
+async fn buffer_close_drops_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir_path.join("b.txt"), "beta\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let a: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("a.txt".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let b: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("b.txt".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    // MRU is [b, a]; closing b should return next = a.
+    let r: BufferCloseResult = send_request::<BufferClose>(&mut ws, 4, &BufferCloseParams {
+        buffer_id: b.buffer_id,
+    }).await;
+    assert_eq!(r.next_buffer_id, Some(a.buffer_id));
+    // Trying to attach to the closed buffer is an error.
+    let err = send_request_expect_err::<BufferOpen>(&mut ws, 5, &BufferOpenParams {
+        buffer_id: Some(b.buffer_id), path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    assert!(err.contains("unknown buffer_id"), "expected buffer-not-found, got: {err}");
+
+    drop(server);
+}
+
+/// Closing the last buffer returns `next_buffer_id: None` so the client knows to spawn a
+/// scratch.
+#[tokio::test]
+async fn buffer_close_last_buffer_returns_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::write(dir_path.join("only.txt"), "x\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("only.txt".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let r: BufferCloseResult = send_request::<BufferClose>(&mut ws, 3, &BufferCloseParams {
+        buffer_id: opened.buffer_id,
+    }).await;
+    assert_eq!(r.next_buffer_id, None);
+
+    drop(server);
+}
+
+/// Closing also drops any subscribed viewports, so subsequent operations on a dangling
+/// viewport return errors gracefully.
+#[tokio::test]
+async fn buffer_close_drops_viewports() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
+        token: TEST_TOKEN.into(), client_version: "test".into(),
+    }).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("a.txt".into()),
+        language: None, create_if_missing: false,
+    }).await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
+        buffer_id: opened.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
+        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
+        continuation_marker_width: 0, tab_width: 4,
+    }).await;
+    let _: BufferCloseResult = send_request::<BufferClose>(&mut ws, 4, &BufferCloseParams {
+        buffer_id: opened.buffer_id,
+    }).await;
+    // Resizing the now-dangling viewport should fail rather than return stale data.
+    let err = send_request_expect_err::<ViewportResize>(&mut ws, 5, &ViewportResizeParams {
+        viewport_id: sub.viewport_id, cols: 100, rows: 20,
+    }).await;
+    let _ = err;  // exact message isn't important; just that it's an error.
 
     drop(server);
 }

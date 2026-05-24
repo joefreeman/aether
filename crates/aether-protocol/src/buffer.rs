@@ -91,12 +91,20 @@ pub struct BufferClose;
 impl RpcMethod for BufferClose {
     const NAME: &'static str = "buffer/close";
     type Params = BufferCloseParams;
-    type Result = ();
+    type Result = BufferCloseResult;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BufferCloseParams {
     pub buffer_id: BufferId,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferCloseResult {
+    /// The next-most-recently-used buffer in this client's MRU after the close. `None` when
+    /// no buffers remain — the client should open a fresh scratch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_buffer_id: Option<BufferId>,
 }
 
 // ---- buffer/copy & buffer/cut -------------------------------------------------------------------
