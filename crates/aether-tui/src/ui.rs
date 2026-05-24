@@ -982,6 +982,8 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     } else if let Some(prompt) = state.save_prompt.as_ref() {
         // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
         Line::from(vec![Span::raw(format!(" save as: {}", prompt.input.text))])
+    } else if let Some(prompt) = state.new_file_prompt.as_ref() {
+        Line::from(vec![Span::raw(format!(" new file: {}", prompt.input.text))])
     } else if let Some(browsing) = state.try_browsing() {
         if let Some(prompt) = browsing.file_browser.prompt.as_ref() {
             let label = match prompt.kind {
@@ -1123,6 +1125,7 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
     if let Some(ed) = state.try_editor() {
         if matches!(ed.mode, EditorMode::Search)
             && state.save_prompt.is_none()
+            && state.new_file_prompt.is_none()
             && !state.picker.open
         {
             // Park the terminal cursor on the status row, just past `/` + the typed query up
@@ -1166,6 +1169,20 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
     }
     if let Some(prompt) = state.save_prompt.as_ref() {
         const PREFIX: &str = " save as: ";
+        let prefix_w = PREFIX.width() as u16;
+        let typed_w = prompt.input.width_to_cursor() as u16;
+        let max_col = status_area
+            .x
+            .saturating_add(status_area.width.saturating_sub(1));
+        let col = status_area
+            .x
+            .saturating_add(prefix_w.saturating_add(typed_w))
+            .min(max_col);
+        f.set_cursor_position((col, status_area.y));
+        return;
+    }
+    if let Some(prompt) = state.new_file_prompt.as_ref() {
+        const PREFIX: &str = " new file: ";
         let prefix_w = PREFIX.width() as u16;
         let typed_w = prompt.input.width_to_cursor() as u16;
         let max_col = status_area

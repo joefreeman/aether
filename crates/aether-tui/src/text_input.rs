@@ -6,9 +6,53 @@
 //! work without unwrapping. Mutating callers go through the methods so the cursor never lands
 //! between code units.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::fmt;
 use std::ops::Deref;
 use unicode_width::UnicodeWidthStr;
+
+/// What a single key event meant for a status-bar prompt. The shared keymap (in
+/// `apply_prompt_key`) handles all editing locally; this enum communicates the user-intent keys
+/// (Enter/Esc) back to the caller so each prompt can run its own commit/cancel action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKeyOutcome {
+    /// Key was an edit (char insert, cursor move, backspace) or an ignored key.
+    Edited,
+    /// Enter pressed — the caller should commit.
+    Commit,
+    /// Esc pressed — the caller should cancel/close.
+    Cancel,
+}
+
+/// Shared keymap for every single-line prompt overlay (save-as, new-file, file-browser
+/// new-file/new-directory). Returns `Commit`/`Cancel` for Enter/Esc; otherwise applies the edit
+/// to `input` and returns `Edited`. Ignores Ctrl-/Alt-modified chars so the caller's parent
+/// keymap can still match those as commands rather than text.
+pub fn apply_prompt_key(input: &mut TextInput, k: KeyEvent) -> PromptKeyOutcome {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => PromptKeyOutcome::Cancel,
+        (KeyCode::Enter, _) => PromptKeyOutcome::Commit,
+        (KeyCode::Left, _) => {
+            input.move_left();
+            PromptKeyOutcome::Edited
+        }
+        (KeyCode::Right, _) => {
+            input.move_right();
+            PromptKeyOutcome::Edited
+        }
+        (KeyCode::Backspace, _) => {
+            input.backspace();
+            PromptKeyOutcome::Edited
+        }
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            input.insert_char(c);
+            PromptKeyOutcome::Edited
+        }
+        _ => PromptKeyOutcome::Edited,
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct TextInput {
@@ -222,5 +266,38 @@ mod tests {
         assert_eq!(s, "abc");
         assert_eq!(t.text, "");
         assert_eq!(t.cursor, 0);
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn apply_prompt_key_routes_enter_and_esc() {
+        let mut t = TextInput::new("abc");
+        assert_eq!(apply_prompt_key(&mut t, key(KeyCode::Enter)), PromptKeyOutcome::Commit);
+        assert_eq!(apply_prompt_key(&mut t, key(KeyCode::Esc)), PromptKeyOutcome::Cancel);
+        assert_eq!(t.text, "abc"); // untouched on Enter/Esc
+    }
+
+    #[test]
+    fn apply_prompt_key_edits_text() {
+        let mut t = TextInput::new("");
+        apply_prompt_key(&mut t, key(KeyCode::Char('h')));
+        apply_prompt_key(&mut t, key(KeyCode::Char('i')));
+        assert_eq!(t.text, "hi");
+        apply_prompt_key(&mut t, key(KeyCode::Backspace));
+        assert_eq!(t.text, "h");
+        apply_prompt_key(&mut t, key(KeyCode::Left));
+        assert_eq!(t.cursor, 0);
+    }
+
+    #[test]
+    fn apply_prompt_key_ignores_ctrl_chars() {
+        // Ctrl-modified chars are claimed by the surrounding keymap, not the prompt input.
+        let mut t = TextInput::new("");
+        let k = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(apply_prompt_key(&mut t, k), PromptKeyOutcome::Edited);
+        assert_eq!(t.text, "");
     }
 }

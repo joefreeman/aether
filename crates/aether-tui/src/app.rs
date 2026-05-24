@@ -3,6 +3,7 @@
 
 use crate::client::Client;
 use crate::clipboard;
+use crate::text_input::PromptKeyOutcome;
 use crate::ui;
 use aether_protocol::buffer::{
     BufferClose, BufferCloseParams, BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut,
@@ -170,6 +171,10 @@ pub struct AppState {
     /// Active save-as prompt. Overlays whichever screen we're in; only useful from
     /// `Screen::Editing` since the browser has no buffer to save.
     pub save_prompt: Option<SavePromptState>,
+    /// Active "new file" prompt opened by `Space n`. Pre-filled with the current directory so
+    /// the user just types the filename to append. Commits via `create_if_missing`, leaving the
+    /// new buffer attached.
+    pub new_file_prompt: Option<NewFilePromptState>,
     /// Active binary y/N confirmation prompt. Layers on top of any other overlay (including
     /// `save_prompt`, e.g. for the save-as overwrite confirm). Holds the question text and the
     /// action to run on `y`.
@@ -255,6 +260,15 @@ pub struct BrowsingState {
 #[derive(Debug, Clone)]
 pub struct SavePromptState {
     pub input: crate::text_input::TextInput,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewFilePromptState {
+    pub input: crate::text_input::TextInput,
+    /// The project root the typed path is relative to. Captured at prompt-open from the current
+    /// file's containing root (or first root, when nothing is open). On commit we send this to
+    /// the server alongside the typed relative path.
+    pub path_index: u32,
 }
 
 impl AppState {
@@ -377,6 +391,7 @@ pub async fn bootstrap(
         pending_leader: None,
         picker: crate::picker::PickerState::default(),
         save_prompt: None,
+        new_file_prompt: None,
         confirm_prompt: None,
         // Placeholder — replaced below by either a freshly-opened editor or the file browser.
         screen: Screen::Browsing(BrowsingState {
@@ -563,7 +578,11 @@ async fn dispatch_terminal_event(
 fn apply_cursor_style(state: &AppState) {
     // Overlays always use the bar cursor (they're text-prompt UIs). Otherwise it depends on
     // screen + editor mode: block in Normal / file browser, bar in Insert / Search.
-    let style = if state.picker.open || state.save_prompt.is_some() || state.confirm_prompt.is_some() {
+    let style = if state.picker.open
+        || state.save_prompt.is_some()
+        || state.new_file_prompt.is_some()
+        || state.confirm_prompt.is_some()
+    {
         SetCursorStyle::SteadyBar
     } else {
         match &state.screen {
@@ -677,6 +696,8 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
                 handle_confirm_prompt_key(client, state, k).await?;
             } else if state.save_prompt.is_some() {
                 handle_save_prompt_key(client, state, k).await?;
+            } else if state.new_file_prompt.is_some() {
+                handle_new_file_prompt_key(client, state, k).await?;
             } else if state.picker.open {
                 handle_picker_key(client, state, k).await?;
             } else {
@@ -1256,6 +1277,7 @@ async fn handle_leader_key(
     k: KeyEvent,
 ) -> Result<()> {
     let (code, mods) = normalize_key(k);
+    let alt_only: KeyModifiers = KeyModifiers::ALT;
     match (leader, code, mods) {
         // `Space f` — open the file picker, resuming the prior query + highlight if any. The
         // server treats absent state as a fresh picker, so first-ever open just works. Clear the
@@ -1268,6 +1290,31 @@ async fn handle_leader_key(
         // without going through the file browser.
         (PendingLeader::Space, KeyCode::Char('b'), m) if m == KeyModifiers::NONE => {
             open_picker(client, state, PickerKind::Buffers).await?;
+        }
+        // ---- app-level meta actions ----
+        // These used to live under Ctrl-, but `Ctrl` is reserved for buffer-content edits.
+        // Quit / close buffer / save / save-as / new file / new scratch all sit under `Space`.
+        (PendingLeader::Space, KeyCode::Char('q'), m) if m == KeyModifiers::NONE => {
+            state.should_quit = true;
+        }
+        (PendingLeader::Space, KeyCode::Char('w'), m) if m == KeyModifiers::NONE => {
+            close_buffer(client, state).await?;
+        }
+        (PendingLeader::Space, KeyCode::Char('s'), m) if m == KeyModifiers::NONE => {
+            save_buffer(client, state).await?;
+        }
+        (PendingLeader::Space, KeyCode::Char('s'), m) if m == alt_only => {
+            begin_save_prompt(state);
+        }
+        // `Space n` — open a "new file" prompt pre-filled with the current directory. Same
+        // current-directory rule as `-` (file browser entry): parent of the current file, or
+        // the first project root when there's no current file.
+        (PendingLeader::Space, KeyCode::Char('n'), m) if m == KeyModifiers::NONE => {
+            begin_new_file_prompt(state);
+        }
+        // `Space Alt-n` — fresh scratch buffer.
+        (PendingLeader::Space, KeyCode::Char('n'), m) if m == alt_only => {
+            new_scratch(client, state).await?;
         }
         // Esc or any other key cancels the chord without further action.
         _ => {}
@@ -1944,9 +1991,19 @@ async fn handle_file_browser_key(
 }
 
 fn begin_prompt(state: &mut AppState, kind: FileBrowserPromptKind) {
+    // Pre-fill with the browser's current directory *relative to the project root*, plus a
+    // trailing `/` — same shape as the `Space n` prompt, so both ways of opening a "new file"
+    // prompt look identical. `commit_prompt` re-joins with the matching project root.
+    let browser_path = state.browsing_mut().file_browser.path.clone();
+    let mut initial = relative_to_project(std::path::Path::new(&browser_path), &state.project_paths)
+        .map(|(_, rel)| rel)
+        .unwrap_or_default();
+    if !initial.is_empty() && !initial.ends_with('/') {
+        initial.push('/');
+    }
     state.browsing_mut().file_browser.prompt = Some(FileBrowserPrompt {
         kind,
-        input: crate::text_input::TextInput::default(),
+        input: crate::text_input::TextInput::new(initial),
     });
     // Bar cursor while typing in the prompt — restored on commit/cancel.
     let _ = execute!(stdout(), SetCursorStyle::SteadyBar);
@@ -1957,12 +2014,15 @@ async fn handle_file_browser_prompt_key(
     state: &mut AppState,
     k: KeyEvent,
 ) -> Result<()> {
-    match (k.code, k.modifiers) {
-        (KeyCode::Esc, _) => {
+    let Some(p) = state.browsing_mut().file_browser.prompt.as_mut() else {
+        return Ok(());
+    };
+    match crate::text_input::apply_prompt_key(&mut p.input, k) {
+        PromptKeyOutcome::Cancel => {
             state.browsing_mut().file_browser.prompt = None;
             apply_cursor_style(state);
         }
-        (KeyCode::Enter, _) => {
+        PromptKeyOutcome::Commit => {
             let prompt = state.browsing_mut().file_browser.prompt.take();
             apply_cursor_style(state);
             if let Some(prompt) = prompt {
@@ -1971,29 +2031,7 @@ async fn handle_file_browser_prompt_key(
                 }
             }
         }
-        (KeyCode::Left, _) => {
-            if let Some(p) = state.browsing_mut().file_browser.prompt.as_mut() {
-                p.input.move_left();
-            }
-        }
-        (KeyCode::Right, _) => {
-            if let Some(p) = state.browsing_mut().file_browser.prompt.as_mut() {
-                p.input.move_right();
-            }
-        }
-        (KeyCode::Backspace, _) => {
-            if let Some(p) = state.browsing_mut().file_browser.prompt.as_mut() {
-                p.input.backspace();
-            }
-        }
-        (KeyCode::Char(c), m)
-            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
-        {
-            if let Some(p) = state.browsing_mut().file_browser.prompt.as_mut() {
-                p.input.insert_char(c);
-            }
-        }
-        _ => {}
+        PromptKeyOutcome::Edited => {}
     }
     Ok(())
 }
@@ -2003,15 +2041,37 @@ async fn commit_prompt(
     state: &mut AppState,
     prompt: FileBrowserPrompt,
 ) -> Result<()> {
-    let target_abs = std::path::Path::new(&state.browsing_mut().file_browser.path)
-        .join(&prompt.input.text)
-        .display()
-        .to_string();
+    // The input is project-relative (the prompt was pre-filled with the dir relative to a
+    // project root). Resolve which root via the browser's current path — it's always under
+    // one. Fall back to the first project root if not (unreachable in practice).
+    let browser_path = state.browsing_mut().file_browser.path.clone();
+    let (path_index, _) =
+        relative_to_project(std::path::Path::new(&browser_path), &state.project_paths)
+            .unwrap_or((0, String::new()));
     match prompt.kind {
         FileBrowserPromptKind::NewFile => {
-            open_file_in_browser_with_options(client, state, target_abs, true).await?;
+            let open: BufferOpenResult = client
+                .rpc::<BufferOpen>(BufferOpenParams {
+                    buffer_id: None,
+                    path_index: Some(path_index),
+                    relative_path: Some(prompt.input.text),
+                    language: None,
+                    create_if_missing: true,
+                })
+                .await?;
+            subscribe_to_buffer(client, state, open).await?;
         }
         FileBrowserPromptKind::NewDirectory => {
+            // directory/create takes an absolute path; rejoin with the resolved root.
+            let root = state
+                .project_paths
+                .get(path_index as usize)
+                .cloned()
+                .unwrap_or_default();
+            let target_abs = std::path::Path::new(&root)
+                .join(&prompt.input.text)
+                .display()
+                .to_string();
             let result = client
                 .rpc::<DirectoryCreate>(DirectoryCreateParams { path: target_abs })
                 .await?;
@@ -3018,15 +3078,13 @@ async fn handle_ctrl_binding(
     count: u32,
 ) -> Result<bool> {
     let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    // The Ctrl shortcuts here are limited to things that *change the buffer's contents*
+    // (edits, clipboard, undo/redo, indent, etc.). App-level meta actions — quit, save,
+    // close/open buffers — live under the `Space` leader instead (`handle_leader_key`).
     match (code, mods) {
-        // ---- top-level / app control ----
-        (KeyCode::Char('q'), CTRL_ONLY) => state.should_quit = true,
-        (KeyCode::Char('w'), CTRL_ONLY) => close_buffer(client, state).await?,
-        (KeyCode::Char('n'), CTRL_ONLY) => new_scratch(client, state).await?,
+        // ---- viewport ----
         (KeyCode::Char('p'), CTRL_ONLY) => toggle_wrap(client, state).await?,
-        // ---- save / undo / redo ----
-        (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
-        (KeyCode::Char('s'), m) if m == ctrl_alt => begin_save_prompt(state),
+        // ---- undo / redo ----
         (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, count).await?,
         (KeyCode::Char('u'), m) if m == ctrl_alt => redo(client, state, count).await?,
         // ---- line manipulation (count-taking in Normal; count=1 in Insert) ----
@@ -3354,38 +3412,116 @@ fn begin_save_prompt(state: &mut AppState) {
     apply_cursor_style(state);
 }
 
+/// Open the `Space n` "new file" prompt. Pre-filled with the project-relative directory the
+/// user would land in via `-` (parent of the current file, or the file browser's current dir),
+/// plus a trailing `/` so the user just types the filename and Enter. The relative path is
+/// resolved against `path_index` on commit.
+fn begin_new_file_prompt(state: &mut AppState) {
+    let (path_index, mut initial) = current_directory_for_new_file(state);
+    if !initial.is_empty() && !initial.ends_with('/') {
+        initial.push('/');
+    }
+    state.new_file_prompt = Some(NewFilePromptState {
+        input: crate::text_input::TextInput::new(initial),
+        path_index,
+    });
+    apply_cursor_style(state);
+}
+
+/// Best-effort `(path_index, dir_relative_to_root)` for the new-file prompt. Mirrors the
+/// resolution `-` uses to pick a starting dir for the file browser: parent of the current file,
+/// or the browser's current path, or the first project root. The returned dir is always
+/// project-relative — empty string means "at the project root".
+fn current_directory_for_new_file(state: &AppState) -> (u32, String) {
+    if let Some(ed) = state.try_editor() {
+        if let Some(p) = ed.file_path.as_deref() {
+            if let Some(parent) = std::path::Path::new(p).parent() {
+                if let Some(found) = relative_to_project(parent, &state.project_paths) {
+                    return found;
+                }
+            }
+        }
+    }
+    if let Some(b) = state.try_browsing() {
+        if let Some(found) =
+            relative_to_project(std::path::Path::new(&b.file_browser.path), &state.project_paths)
+        {
+            return found;
+        }
+    }
+    (0, String::new())
+}
+
+/// Find the longest project root containing `abs` and return `(path_index, relative)`. `None`
+/// when `abs` lies outside every root.
+fn relative_to_project(abs: &std::path::Path, project_paths: &[String]) -> Option<(u32, String)> {
+    project_paths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let root = std::path::Path::new(p);
+            abs.strip_prefix(root)
+                .ok()
+                .map(|rel| (i as u32, root, rel.display().to_string()))
+        })
+        .max_by_key(|(_, root, _)| root.as_os_str().len())
+        .map(|(i, _, rel)| (i, rel))
+}
+
+async fn handle_new_file_prompt_key(
+    client: &mut Client,
+    state: &mut AppState,
+    k: KeyEvent,
+) -> Result<()> {
+    let Some(p) = state.new_file_prompt.as_mut() else {
+        return Ok(());
+    };
+    match crate::text_input::apply_prompt_key(&mut p.input, k) {
+        PromptKeyOutcome::Cancel => {
+            state.new_file_prompt = None;
+            apply_cursor_style(state);
+        }
+        PromptKeyOutcome::Commit => commit_new_file_prompt(client, state).await?,
+        PromptKeyOutcome::Edited => {}
+    }
+    Ok(())
+}
+
+async fn commit_new_file_prompt(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let (path_index, relative) = match state.new_file_prompt.as_ref() {
+        Some(p) if !p.input.trim().is_empty() => (p.path_index, p.input.text.clone()),
+        _ => {
+            state.new_file_prompt = None;
+            apply_cursor_style(state);
+            return Ok(());
+        }
+    };
+    state.new_file_prompt = None;
+    apply_cursor_style(state);
+    let open: BufferOpenResult = client
+        .rpc::<BufferOpen>(BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(path_index),
+            relative_path: Some(relative),
+            language: None,
+            create_if_missing: true,
+        })
+        .await?;
+    subscribe_to_buffer(client, state, open).await
+}
+
 async fn handle_save_prompt_key(
     client: &mut Client,
     state: &mut AppState,
     k: KeyEvent,
 ) -> Result<()> {
-    // Don't `normalize_key` here — that lowercases uppercase chars, which would mangle paths.
-    match (k.code, k.modifiers) {
-        (KeyCode::Esc, _) => abort_save_prompt(state),
-        (KeyCode::Enter, _) => send_save_prompt(client, state, false).await?,
-        (KeyCode::Left, _) => {
-            if let Some(p) = state.save_prompt.as_mut() {
-                p.input.move_left();
-            }
-        }
-        (KeyCode::Right, _) => {
-            if let Some(p) = state.save_prompt.as_mut() {
-                p.input.move_right();
-            }
-        }
-        (KeyCode::Backspace, _) => {
-            if let Some(p) = state.save_prompt.as_mut() {
-                p.input.backspace();
-            }
-        }
-        (KeyCode::Char(c), m)
-            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
-        {
-            if let Some(p) = state.save_prompt.as_mut() {
-                p.input.insert_char(c);
-            }
-        }
-        _ => {}
+    let Some(p) = state.save_prompt.as_mut() else {
+        return Ok(());
+    };
+    match crate::text_input::apply_prompt_key(&mut p.input, k) {
+        PromptKeyOutcome::Cancel => abort_save_prompt(state),
+        PromptKeyOutcome::Commit => send_save_prompt(client, state, false).await?,
+        PromptKeyOutcome::Edited => {}
     }
     Ok(())
 }
