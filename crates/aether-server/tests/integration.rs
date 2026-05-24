@@ -3211,6 +3211,74 @@ async fn select_line_forward_at_end_of_line_no_anchor_picks_current_line() {
     drop(server);
 }
 
+/// On an empty line, "selecting" the line is a degenerate no-op (the only position is the
+/// newline at col 0). Without special-casing, repeated `x` presses would stay on the empty
+/// line forever. The forward variant should advance to the next line on first press.
+#[tokio::test]
+async fn select_line_forward_on_empty_line_advances() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n\ngamma\n").await;
+
+    // Park on the empty line (line 1), no anchor.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+        },
+    )
+    .await;
+    // Advanced to line 2, with a whole-line selection over "gamma".
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    drop(server);
+}
+
+/// Backward `Alt-x` on an empty line walks back to the previous line.
+#[tokio::test]
+async fn select_line_backward_on_empty_line_walks_up() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n\ngamma\n").await;
+
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Backward,
+            extend: false,
+        },
+    )
+    .await;
+    // Whole-line selection over "alpha". Cursor at end (same convention as the non-empty
+    // backward case), anchor at start.
+    assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn select_line_backward_picks_current_then_walks_up() {
     let (server, mut ws, buffer_id) = setup_lines().await;

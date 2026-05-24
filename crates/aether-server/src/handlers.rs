@@ -1847,11 +1847,16 @@ pub async fn cursor_select_line(
 
     // Advance the relevant edge only when the selection is already snapped to whole lines;
     // otherwise snap it without advancing. The no-anchor case is treated as a degenerate
-    // single-point selection, which is never whole-line (on a non-empty line), so the first
-    // press always picks the current line — repeats then walk via the anchor.
+    // single-point selection — but on an empty line that point already covers everything
+    // there is, so we treat it as whole and advance on the first press. Without that
+    // special case the user gets stuck: snapping a no-anchor empty line to "whole" yields
+    // the same (line, 0) position, so repeated presses make no progress.
     let bottom_len = motion::line_byte_len_excl_newline(buf, bottom_edge.line);
-    let already_whole =
-        current.anchor.is_some() && top_edge.col == 0 && bottom_edge.col >= bottom_len;
+    let already_whole = if current.anchor.is_some() {
+        top_edge.col == 0 && bottom_edge.col >= bottom_len
+    } else {
+        bottom_len == 0 && cur.col == 0
+    };
     let new_top = if already_whole && params.direction == Direction::Backward {
         top_edge.line.saturating_sub(1)
     } else {
