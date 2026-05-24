@@ -13,19 +13,32 @@ pub struct RpcError {
 
 impl RpcError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code: code.code(), message: message.into(), data: None }
+        Self {
+            code: code.code(),
+            message: message.into(),
+            data: None,
+        }
     }
 
     pub fn method_not_found(method: &str) -> Self {
-        Self::new(ErrorCode::METHOD_NOT_FOUND, format!("method not found: {method}"))
+        Self::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            format!("method not found: {method}"),
+        )
     }
 
     pub fn invalid_params(detail: impl std::fmt::Display) -> Self {
-        Self::new(ErrorCode::INVALID_PARAMS, format!("invalid params: {detail}"))
+        Self::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("invalid params: {detail}"),
+        )
     }
 
     pub fn internal(detail: impl std::fmt::Display) -> Self {
-        Self::new(ErrorCode::INTERNAL_ERROR, format!("internal error: {detail}"))
+        Self::new(
+            ErrorCode::INTERNAL_ERROR,
+            format!("internal error: {detail}"),
+        )
     }
 
     pub fn invalid_path(detail: impl std::fmt::Display) -> Self {
@@ -33,7 +46,10 @@ impl RpcError {
     }
 
     pub fn buffer_not_found(id: u64) -> Self {
-        Self::new(ErrorCode::BUFFER_NOT_FOUND, format!("unknown buffer_id: {id}"))
+        Self::new(
+            ErrorCode::BUFFER_NOT_FOUND,
+            format!("unknown buffer_id: {id}"),
+        )
     }
 
     pub fn invalid_token() -> Self {
@@ -45,11 +61,17 @@ impl RpcError {
     }
 
     pub fn buffer_has_no_path() -> Self {
-        Self::new(ErrorCode::BUFFER_HAS_NO_PATH, "buffer has no associated file path")
+        Self::new(
+            ErrorCode::BUFFER_HAS_NO_PATH,
+            "buffer has no associated file path",
+        )
     }
 
     pub fn would_overwrite(detail: impl std::fmt::Display) -> Self {
-        Self::new(ErrorCode::WOULD_OVERWRITE, format!("would overwrite existing file: {detail}"))
+        Self::new(
+            ErrorCode::WOULD_OVERWRITE,
+            format!("would overwrite existing file: {detail}"),
+        )
     }
 
     pub fn path_owned_by_buffer(buffer_id: aether_protocol::BufferId) -> Self {
@@ -62,7 +84,11 @@ impl RpcError {
 
 impl From<RpcError> for ErrorObject {
     fn from(e: RpcError) -> Self {
-        ErrorObject { code: e.code, message: e.message, data: e.data }
+        ErrorObject {
+            code: e.code,
+            message: e.message,
+            data: e.data,
+        }
     }
 }
 

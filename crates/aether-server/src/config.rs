@@ -41,7 +41,11 @@ pub fn load_project(name: &str) -> anyhow::Result<ProjectConfig> {
 pub fn project_config_path(name: &str) -> anyhow::Result<PathBuf> {
     let base = directories::BaseDirs::new()
         .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
-    Ok(base.config_dir().join("aether").join("projects").join(format!("{name}.toml")))
+    Ok(base
+        .config_dir()
+        .join("aether")
+        .join("projects")
+        .join(format!("{name}.toml")))
 }
 
 pub fn runtime_info_path(name: &str) -> anyhow::Result<PathBuf> {
@@ -84,7 +88,9 @@ pub fn pid_is_alive(pid: u32) -> bool {
 /// Expand a leading `~/` or bare `~` to the user's home directory. Leaves the path unchanged
 /// otherwise.
 pub fn expand_home(path: &Path) -> PathBuf {
-    let Some(s) = path.to_str() else { return path.to_path_buf() };
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
     let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) else {
         return path.to_path_buf();
     };

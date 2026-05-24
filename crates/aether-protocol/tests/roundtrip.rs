@@ -47,8 +47,14 @@ fn client_inbound_discriminates() {
     let err = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32010, "message": "bad path"}});
     let notif = json!({"jsonrpc": "2.0", "method": "buffer/state", "params": {}});
 
-    assert!(matches!(from_value::<ClientInbound>(resp).unwrap(), ClientInbound::Response(_)));
-    assert!(matches!(from_value::<ClientInbound>(err).unwrap(), ClientInbound::Error(_)));
+    assert!(matches!(
+        from_value::<ClientInbound>(resp).unwrap(),
+        ClientInbound::Response(_)
+    ));
+    assert!(matches!(
+        from_value::<ClientInbound>(err).unwrap(),
+        ClientInbound::Error(_)
+    ));
     assert!(matches!(
         from_value::<ClientInbound>(notif).unwrap(),
         ClientInbound::Notification(_)
@@ -57,9 +63,15 @@ fn client_inbound_discriminates() {
 
 #[test]
 fn motion_is_internally_tagged() {
-    let m = Motion::Char { direction: Direction::Backward, count: 1 };
+    let m = Motion::Char {
+        direction: Direction::Backward,
+        count: 1,
+    };
     let v = to_value(&m).unwrap();
-    assert_eq!(v, json!({"kind": "char", "direction": "backward", "count": 1}));
+    assert_eq!(
+        v,
+        json!({"kind": "char", "direction": "backward", "count": 1})
+    );
 
     let m = Motion::LineStart;
     let v = to_value(&m).unwrap();
@@ -77,16 +89,24 @@ fn motion_is_internally_tagged() {
         json!({"kind": "word", "direction": "forward", "count": 2, "boundary": "WORD", "exclusive": false})
     );
 
-    let m = Motion::Goto { position: LogicalPosition { line: 17, col: 4 } };
+    let m = Motion::Goto {
+        position: LogicalPosition { line: 17, col: 4 },
+    };
     let v = to_value(&m).unwrap();
-    assert_eq!(v, json!({"kind": "goto", "position": {"line": 17, "col": 4}}));
+    assert_eq!(
+        v,
+        json!({"kind": "goto", "position": {"line": 17, "col": 4}})
+    );
 }
 
 #[test]
 fn cursor_move_params_use_motion() {
     let v = to_value(CursorMoveParams {
         buffer_id: 42,
-        motion: Motion::Char { direction: Direction::Forward, count: 1 },
+        motion: Motion::Char {
+            direction: Direction::Forward,
+            count: 1,
+        },
         extend_selection: true,
     })
     .unwrap();
@@ -102,8 +122,16 @@ fn cursor_move_params_use_motion() {
 
 #[test]
 fn input_text_params() {
-    let v = to_value(InputTextParams { buffer_id: 1, text: "hi".into(), select_pasted: false }).unwrap();
-    assert_eq!(v, json!({"buffer_id": 1, "text": "hi", "select_pasted": false}));
+    let v = to_value(InputTextParams {
+        buffer_id: 1,
+        text: "hi".into(),
+        select_pasted: false,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 1, "text": "hi", "select_pasted": false})
+    );
 }
 
 #[test]
@@ -142,7 +170,10 @@ fn buffer_open_result_restored_scroll() {
         saved_revision: 0,
         path: None,
         cursor: Default::default(),
-        scroll: Some(ScrollPosition { logical_line: 7, sub_row: 0.5 }),
+        scroll: Some(ScrollPosition {
+            logical_line: 7,
+            sub_row: 0.5,
+        }),
     })
     .unwrap();
     assert_eq!(v["scroll"]["logical_line"], 7);
@@ -162,7 +193,10 @@ fn error_response_shape() {
     };
     let v = to_value(&er).unwrap();
     assert_eq!(v["error"]["code"], -32010);
-    assert!(v["error"].get("data").is_none(), "data: None should be skipped");
+    assert!(
+        v["error"].get("data").is_none(),
+        "data: None should be skipped"
+    );
 }
 
 #[test]
@@ -189,7 +223,10 @@ fn notification_roundtrip() {
 
 #[test]
 fn project_info_shape() {
-    let p = ProjectInfo { name: "aether".into(), paths: vec!["/home/joe/x".into()] };
+    let p = ProjectInfo {
+        name: "aether".into(),
+        paths: vec!["/home/joe/x".into()],
+    };
     let v = to_value(&p).unwrap();
     assert_eq!(v, json!({"name": "aether", "paths": ["/home/joe/x"]}));
 }
@@ -233,9 +270,15 @@ fn picker_kind_serializes_snake_case() {
 #[test]
 fn picker_item_file_is_tagged() {
     use aether_protocol::picker::PickerItem;
-    let item = PickerItem::File { path: "src/main.rs".into(), match_indices: vec![0, 4] };
+    let item = PickerItem::File {
+        path: "src/main.rs".into(),
+        match_indices: vec![0, 4],
+    };
     let v = to_value(&item).unwrap();
-    assert_eq!(v, json!({"kind": "file", "path": "src/main.rs", "match_indices": [0, 4]}));
+    assert_eq!(
+        v,
+        json!({"kind": "file", "path": "src/main.rs", "match_indices": [0, 4]})
+    );
 }
 
 #[test]
@@ -249,7 +292,10 @@ fn picker_view_params_omit_center_on_when_none() {
         center_on: None,
     };
     let v = to_value(&p).unwrap();
-    assert!(v.get("center_on").is_none(), "None center_on should be skipped");
+    assert!(
+        v.get("center_on").is_none(),
+        "None center_on should be skipped"
+    );
     assert_eq!(v["kind"], "files");
     assert_eq!(v["reset"], true);
 }
@@ -262,7 +308,10 @@ fn picker_view_params_center_on_serialized() {
         reset: false,
         offset: 0,
         limit: 30,
-        center_on: Some(PickerItem::File { path: "x".into(), match_indices: vec![] }),
+        center_on: Some(PickerItem::File {
+            path: "x".into(),
+            match_indices: vec![],
+        }),
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["center_on"]["kind"], "file");
@@ -276,7 +325,10 @@ fn picker_update_round_trips_through_notification() {
         kind: PickerKind::Files,
         generation: 7,
         offset: 0,
-        items: vec![PickerItem::File { path: "a".into(), match_indices: vec![0] }],
+        items: vec![PickerItem::File {
+            path: "a".into(),
+            match_indices: vec![0],
+        }],
         total_matches: 1,
         total_candidates: 1,
         ticking: false,
@@ -296,8 +348,13 @@ fn picker_update_round_trips_through_notification() {
 #[test]
 fn picker_select_result_is_tagged() {
     use aether_protocol::picker::PickerSelectResult;
-    let r = PickerSelectResult::File { path: "/abs/path".into() };
-    assert_eq!(to_value(&r).unwrap(), json!({"kind": "file", "path": "/abs/path"}));
+    let r = PickerSelectResult::File {
+        path: "/abs/path".into(),
+    };
+    assert_eq!(
+        to_value(&r).unwrap(),
+        json!({"kind": "file", "path": "/abs/path"})
+    );
 }
 
 #[test]
@@ -326,7 +383,10 @@ fn picker_item_buffer_is_tagged() {
 fn picker_select_result_buffer_is_tagged() {
     use aether_protocol::picker::PickerSelectResult;
     let r = PickerSelectResult::Buffer { buffer_id: 42 };
-    assert_eq!(to_value(&r).unwrap(), json!({"kind": "buffer", "buffer_id": 42}));
+    assert_eq!(
+        to_value(&r).unwrap(),
+        json!({"kind": "buffer", "buffer_id": 42})
+    );
 }
 
 #[test]

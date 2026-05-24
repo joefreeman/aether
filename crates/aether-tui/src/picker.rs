@@ -69,7 +69,11 @@ impl PickerState {
         // in the freshly-pushed items. If it's not present (matcher still ticking, or it's no
         // longer matched) we leave `resume_target` set so a later push can re-snap.
         if let Some(target) = self.resume_target.clone() {
-            if let Some(idx) = self.items.iter().position(|i| item_key(i) == item_key(&target)) {
+            if let Some(idx) = self
+                .items
+                .iter()
+                .position(|i| item_key(i) == item_key(&target))
+            {
                 self.selected = idx;
                 self.resume_target = None;
             } else if self.selected >= self.items.len() {

@@ -43,7 +43,11 @@ pub async fn run(project_name: &str) -> anyhow::Result<()> {
     // Drop guard to clean up the runtime file regardless of how we exit.
     let _guard = RuntimeFileGuard(runtime_path);
 
-    let state = Arc::new(Mutex::new(ServerState::new(project.name.clone(), canonical_paths, token)));
+    let state = Arc::new(Mutex::new(ServerState::new(
+        project.name.clone(),
+        canonical_paths,
+        token,
+    )));
     run_with_listener(listener, state).await
 }
 
@@ -107,7 +111,11 @@ pub async fn spawn_for_test(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let token = token.into();
-    let state = Arc::new(Mutex::new(ServerState::new(project_name.into(), project_paths, token.clone())));
+    let state = Arc::new(Mutex::new(ServerState::new(
+        project_name.into(),
+        project_paths,
+        token.clone(),
+    )));
     let join = tokio::spawn(async move {
         let _ = run_with_listener(listener, state).await;
     });

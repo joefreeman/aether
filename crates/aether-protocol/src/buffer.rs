@@ -160,4 +160,3 @@ pub struct BufferStateParams {
     pub saved_revision: Revision,
     pub saved_at_unix_ms: Option<u64>,
 }
-

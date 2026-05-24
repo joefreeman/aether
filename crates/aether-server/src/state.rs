@@ -235,12 +235,14 @@ impl ServerState {
     /// Clear selection-expansion history for every client on the given buffer. Called from
     /// buffer mutation paths so a post-edit contract doesn't pop a stale (pre-edit) selection.
     pub fn clear_tree_selection_history_for_buffer(&mut self, buffer_id: BufferId) {
-        self.tree_selection_history.retain(|(_, b), _| *b != buffer_id);
+        self.tree_selection_history
+            .retain(|(_, b), _| *b != buffer_id);
     }
 
     /// Remove all selection-expansion records for the given client. Used on disconnect.
     pub fn drop_tree_selection_history_for_client(&mut self, client_id: ClientId) {
-        self.tree_selection_history.retain(|(c, _), _| *c != client_id);
+        self.tree_selection_history
+            .retain(|(c, _), _| *c != client_id);
     }
 
     /// Clear virtual column for every client on the given buffer. Called on any buffer mutation.
@@ -258,7 +260,9 @@ impl ServerState {
 
     /// True iff the given canonical path is allowed by the project's access boundary.
     pub fn path_is_in_project(&self, canonical: &Path) -> bool {
-        self.project_paths.iter().any(|p| canonical == p || canonical.starts_with(p))
+        self.project_paths
+            .iter()
+            .any(|p| canonical == p || canonical.starts_with(p))
     }
 }
 
@@ -333,7 +337,11 @@ impl Buffer {
     /// Load a buffer from disk. Detects line endings, normalizes to LF in-memory.
     pub fn load_from_file(id: BufferId, canonical: PathBuf) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(&canonical)?;
-        let line_ending = if content.contains("\r\n") { LineEnding::Crlf } else { LineEnding::Lf };
+        let line_ending = if content.contains("\r\n") {
+            LineEnding::Crlf
+        } else {
+            LineEnding::Lf
+        };
         let normalized = if line_ending == LineEnding::Crlf {
             content.replace("\r\n", "\n")
         } else {
@@ -348,7 +356,9 @@ impl Buffer {
                 .map(|d| d.as_millis() as u64)
         });
         let language = detect_language(&canonical);
-        let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));
+        let syntax = language
+            .as_deref()
+            .and_then(|name| make_syntax(&text, name));
         let indent_style = resolve_indent_style(&text, language.as_deref());
         Ok(Buffer {
             id,
@@ -375,7 +385,9 @@ impl Buffer {
     pub fn new_at_path(id: BufferId, canonical: PathBuf, language: Option<String>) -> Self {
         let text = ropey::Rope::new();
         let language = language.or_else(|| detect_language(&canonical));
-        let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));
+        let syntax = language
+            .as_deref()
+            .and_then(|name| make_syntax(&text, name));
         let indent_style = resolve_indent_style(&text, language.as_deref());
         Buffer {
             id,
@@ -398,7 +410,9 @@ impl Buffer {
 
     pub fn scratch(id: BufferId, language: Option<String>) -> Self {
         let text = ropey::Rope::new();
-        let syntax = language.as_deref().and_then(|name| make_syntax(&text, name));
+        let syntax = language
+            .as_deref()
+            .and_then(|name| make_syntax(&text, name));
         let indent_style = resolve_indent_style(&text, language.as_deref());
         Buffer {
             id,
@@ -486,7 +500,10 @@ impl Buffer {
         }
         self.revision = self.next_revision_id;
         self.next_revision_id += 1;
-        self.active_group = Some(ActiveGroup { last_edit_at: now, kind });
+        self.active_group = Some(ActiveGroup {
+            last_edit_at: now,
+            kind,
+        });
         self.recompute_dirty();
 
         if let Some((start_byte, old_end_byte, start_position, old_end_position)) = edit_info {
@@ -544,9 +561,15 @@ impl Buffer {
         }
 
         let parent = target.parent().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "save target has no parent dir")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "save target has no parent dir",
+            )
         })?;
-        let file_name = target.file_name().and_then(|s| s.to_str()).unwrap_or("aether");
+        let file_name = target
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("aether");
         let tmp_path = parent.join(format!(".aether-tmp-{}-{file_name}", std::process::id()));
 
         // Write to tmp.
@@ -602,7 +625,10 @@ impl Buffer {
         self.active_group = None;
         self.recompute_dirty();
         self.reparse_full();
-        Some(UndoOutcome { new_revision: self.revision, restored_cursors: entry.cursors })
+        Some(UndoOutcome {
+            new_revision: self.revision,
+            restored_cursors: entry.cursors,
+        })
     }
 
     pub fn redo(
@@ -620,7 +646,10 @@ impl Buffer {
         self.active_group = None;
         self.recompute_dirty();
         self.reparse_full();
-        Some(UndoOutcome { new_revision: self.revision, restored_cursors: entry.cursors })
+        Some(UndoOutcome {
+            new_revision: self.revision,
+            restored_cursors: entry.cursors,
+        })
     }
 
     fn recompute_dirty(&mut self) {
@@ -634,7 +663,8 @@ impl Buffer {
             let source: String = self.text.chunks().collect();
             if let Some(tree) = syntax.parser.parse(&source, None) {
                 syntax.tree = tree;
-                syntax.injections = syntax::compute_injections(syntax.config, &syntax.tree, &source);
+                syntax.injections =
+                    syntax::compute_injections(syntax.config, &syntax.tree, &source);
             }
         }
     }
@@ -642,25 +672,27 @@ impl Buffer {
 
 fn detect_language(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_str()?;
-    Some(match ext.to_ascii_lowercase().as_str() {
-        "rs" => "rust",
-        "toml" => "toml",
-        "md" | "markdown" => "markdown",
-        "json" => "json",
-        "py" => "python",
-        "js" | "mjs" | "cjs" | "jsx" => "javascript",
-        "ts" => "typescript",
-        "tsx" => "tsx",
-        "go" => "go",
-        "ex" | "exs" => "elixir",
-        "erl" | "hrl" => "erlang",
-        "yaml" | "yml" => "yaml",
-        "html" | "htm" => "html",
-        "css" => "css",
-        "sh" | "bash" | "zsh" => "bash",
-        _ => return None,
-    }
-    .to_string())
+    Some(
+        match ext.to_ascii_lowercase().as_str() {
+            "rs" => "rust",
+            "toml" => "toml",
+            "md" | "markdown" => "markdown",
+            "json" => "json",
+            "py" => "python",
+            "js" | "mjs" | "cjs" | "jsx" => "javascript",
+            "ts" => "typescript",
+            "tsx" => "tsx",
+            "go" => "go",
+            "ex" | "exs" => "elixir",
+            "erl" | "hrl" => "erlang",
+            "yaml" | "yml" => "yaml",
+            "html" | "htm" => "html",
+            "css" => "css",
+            "sh" | "bash" | "zsh" => "bash",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 /// Pick the buffer's indent unit: detect from the text first, fall back to the language's
@@ -682,7 +714,12 @@ fn make_syntax(text: &ropey::Rope, language: &str) -> Option<BufferSyntax> {
     let source: String = text.chunks().collect();
     let tree = parser.parse(&source, None)?;
     let injections = syntax::compute_injections(config, &tree, &source);
-    Some(BufferSyntax { config, parser, tree, injections })
+    Some(BufferSyntax {
+        config,
+        parser,
+        tree,
+        injections,
+    })
 }
 
 fn rope_byte_to_point(rope: &ropey::Rope, byte_idx: usize) -> Point {
@@ -692,7 +729,10 @@ fn rope_byte_to_point(rope: &ropey::Rope, byte_idx: usize) -> Point {
     let col_chars = char_idx - line_start_char;
     let line_slice = rope.line(line);
     let col_bytes = line_slice.char_to_byte(col_chars);
-    Point { row: line, column: col_bytes }
+    Point {
+        row: line,
+        column: col_bytes,
+    }
 }
 
 pub struct ClientSession {

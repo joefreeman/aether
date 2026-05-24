@@ -60,7 +60,11 @@ impl StderrCapture {
             }
         });
 
-        Ok(Self { saved_stderr_fd: saved, buffer, reader: Some(reader) })
+        Ok(Self {
+            saved_stderr_fd: saved,
+            buffer,
+            reader: Some(reader),
+        })
     }
 }
 

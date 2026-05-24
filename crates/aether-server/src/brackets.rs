@@ -130,7 +130,10 @@ mod tests {
         let inner_open = src.find("{ bar").unwrap() + 0; // the inner `{`
         let inner_close = src.find("} }").unwrap(); // the inner `}`
         let inside_inner = src.find("bar").unwrap();
-        assert_eq!(find_match_bracket(&tree, inside_inner), Some((inner_open, inner_close)));
+        assert_eq!(
+            find_match_bracket(&tree, inside_inner),
+            Some((inner_open, inner_close))
+        );
     }
 
     #[test]

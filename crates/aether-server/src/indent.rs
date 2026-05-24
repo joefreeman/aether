@@ -176,14 +176,25 @@ impl CompiledIndentQuery {
                     // not-kind-eq?. Adding them is mechanical when a query needs one.)
                     _ => continue,
                 };
-                if let [QueryPredicateArg::Capture(a), QueryPredicateArg::Capture(b)] = &pred.args[..] {
-                    pat_preds.push(CompiledPredicate::SameLine { a: *a, b: *b, negated });
+                if let [QueryPredicateArg::Capture(a), QueryPredicateArg::Capture(b)] =
+                    &pred.args[..]
+                {
+                    pat_preds.push(CompiledPredicate::SameLine {
+                        a: *a,
+                        b: *b,
+                        negated,
+                    });
                 }
             }
             predicates.push(pat_preds);
         }
 
-        Ok(Self { query, capture_kinds, scope_overrides, predicates })
+        Ok(Self {
+            query,
+            capture_kinds,
+            scope_overrides,
+            predicates,
+        })
     }
 }
 
@@ -227,8 +238,11 @@ impl LineContribution {
     /// Per-line net level: `indent` and `outdent` *on the same line* cancel each other (rather
     /// than producing -1 or +1); the `always` variants stack regardless.
     fn level(self) -> i32 {
-        let (i, o) =
-            if self.indent > 0 && self.outdent > 0 { (0, 0) } else { (self.indent, self.outdent) };
+        let (i, o) = if self.indent > 0 && self.outdent > 0 {
+            (0, 0)
+        } else {
+            (self.indent, self.outdent)
+        };
         i + self.indent_always - o - self.outdent_always
     }
 }
@@ -269,7 +283,10 @@ pub fn compute_indent_levels(
         for cap in m.captures {
             if let Some(&ic) = kinds.get(&cap.index) {
                 let scope = scope_override.unwrap_or_else(|| ic.default_scope());
-                captures_by_node.entry(cap.node.id()).or_default().push((ic, scope));
+                captures_by_node
+                    .entry(cap.node.id())
+                    .or_default()
+                    .push((ic, scope));
             }
         }
     }
@@ -369,7 +386,10 @@ mod tests {
         let iq = rust_iq();
         let cursor_byte = src.find('{').unwrap() + 1;
         let levels = compute_indent_levels(&iq, &tree, src.as_bytes(), cursor_byte, 1);
-        assert_eq!(levels, 0, "engine should not bandage incomplete parses on its own");
+        assert_eq!(
+            levels, 0,
+            "engine should not bandage incomplete parses on its own"
+        );
     }
 
     #[test]
@@ -433,7 +453,10 @@ mod tests {
         use std::borrow::Cow;
         assert!(matches!(IndentStyle::Tab.unit(), Cow::Borrowed("\t")));
         assert!(matches!(IndentStyle::Spaces(2).unit(), Cow::Borrowed("  ")));
-        assert!(matches!(IndentStyle::Spaces(4).unit(), Cow::Borrowed("    ")));
+        assert!(matches!(
+            IndentStyle::Spaces(4).unit(),
+            Cow::Borrowed("    ")
+        ));
         // Uncommon widths fall back to owned strings — still correct, just allocate.
         assert_eq!(IndentStyle::Spaces(3).unit(), "   ");
     }

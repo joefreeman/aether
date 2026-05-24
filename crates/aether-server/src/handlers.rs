@@ -3,17 +3,30 @@
 use crate::cursor as motion;
 use crate::error::RpcError;
 use crate::picker as picker_state;
-use crate::state::{Buffer, ClientSession, EditKindTag, SearchEntry, ServerState, SharedState, Viewport};
+use crate::state::MOTION_HISTORY_CAP;
+use crate::state::{
+    Buffer, ClientSession, EditKindTag, SearchEntry, ServerState, SharedState, Viewport,
+};
 use crate::wrap;
-use std::collections::HashMap;
-use std::sync::Arc;
 use aether_protocol::buffer::{
     BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams, BufferOpenResult,
     BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
 };
+use aether_protocol::cursor::{
+    CursorBufferOnlyParams, CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState,
+    CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, Motion,
+    VerticalDirection,
+};
 use aether_protocol::directory::{
-    DirectoryCreateParams, DirectoryCreateResult, DirectoryListParams, DirectoryListResult,
-    DirEntry,
+    DirEntry, DirectoryCreateParams, DirectoryCreateResult, DirectoryListParams,
+    DirectoryListResult,
+};
+use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+use aether_protocol::error::ErrorCode;
+use aether_protocol::handshake::{ClientHelloParams, ClientHelloResult, ProjectInfo};
+use aether_protocol::input::{
+    BufferOnlyParams, EditResult, InputDeleteParams, InputMoveLinesParams, InputTextParams,
+    UndoResult,
 };
 use aether_protocol::picker::{
     PickerHideParams, PickerKind, PickerQueryParams, PickerSelectParams, PickerSelectResult,
@@ -23,26 +36,15 @@ use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
     SearchSetResult, SearchStateChanged, SearchSummary,
 };
-use aether_protocol::cursor::{
-    CursorBufferOnlyParams, CursorMoveParams, CursorSelectLineParams, CursorSetParams,
-    CursorState, CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, Motion,
-    VerticalDirection,
-};
-use crate::state::MOTION_HISTORY_CAP;
-use aether_protocol::LogicalPosition;
-use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
-use aether_protocol::error::ErrorCode;
-use aether_protocol::handshake::{ClientHelloParams, ClientHelloResult, ProjectInfo};
-use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDeleteParams, InputMoveLinesParams, InputTextParams,
-    UndoResult,
-};
 use aether_protocol::viewport::{
     LogicalLineRange, LogicalLineRender, ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams,
     ViewportSubscribeResult, ViewportUnsubscribeParams, ViewportWindowResult, Window,
 };
+use aether_protocol::LogicalPosition;
 use aether_protocol::{BufferId, ClientId, Revision};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -58,7 +60,10 @@ pub struct ConnectionCtx {
 impl ConnectionCtx {
     pub fn require_hello(&self) -> Result<ClientId, RpcError> {
         self.client_id.ok_or_else(|| {
-            RpcError::new(ErrorCode::INVALID_REQUEST, "client/hello must be sent first")
+            RpcError::new(
+                ErrorCode::INVALID_REQUEST,
+                "client/hello must be sent first",
+            )
         })
     }
 }
@@ -72,7 +77,11 @@ pub async fn client_hello(
 ) -> Result<ClientHelloResult, RpcError> {
     let (project_name, project_paths, server_token) = {
         let s = state.lock().await;
-        (s.project_name.clone(), s.project_paths.clone(), s.token.clone())
+        (
+            s.project_name.clone(),
+            s.project_paths.clone(),
+            s.token.clone(),
+        )
     };
     if params.token != server_token {
         return Err(RpcError::invalid_token());
@@ -86,7 +95,10 @@ pub async fn client_hello(
     let client_id = Uuid::new_v4();
     ctx.client_id = Some(client_id);
 
-    let session = ClientSession { client_id, outbound: ctx.outbound_tx.clone() };
+    let session = ClientSession {
+        client_id,
+        outbound: ctx.outbound_tx.clone(),
+    };
     state.lock().await.clients.insert(client_id, session);
     tracing::info!(%client_id, client_version = %params.client_version, "client registered");
 
@@ -95,7 +107,10 @@ pub async fn client_hello(
         server_version: env!("CARGO_PKG_VERSION").into(),
         project: ProjectInfo {
             name: project_name,
-            paths: project_paths.iter().map(|p| p.display().to_string()).collect(),
+            paths: project_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
         },
     })
 }
@@ -320,8 +335,9 @@ pub async fn directory_list(
             .ok_or_else(|| RpcError::invalid_path("no project paths configured"))?
             .clone(),
     };
-    let canonical = std::fs::canonicalize(&raw_path)
-        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw_path.display())))?;
+    let canonical = std::fs::canonicalize(&raw_path).map_err(|e| {
+        RpcError::invalid_path(format!("canonicalizing {}: {e}", raw_path.display()))
+    })?;
     if !s.path_is_in_project(&canonical) {
         return Err(RpcError::invalid_path(format!(
             "{} is outside the project's access boundary",
@@ -337,12 +353,14 @@ pub async fn directory_list(
     }
 
     // The parent is allowed only if it's still inside the project.
-    let parent = canonical
-        .parent()
-        .and_then(|p| {
-            let p = p.to_path_buf();
-            if s.path_is_in_project(&p) { Some(p.display().to_string()) } else { None }
-        });
+    let parent = canonical.parent().and_then(|p| {
+        let p = p.to_path_buf();
+        if s.path_is_in_project(&p) {
+            Some(p.display().to_string())
+        } else {
+            None
+        }
+    });
 
     let mut entries: Vec<DirEntry> = Vec::new();
     let read = std::fs::read_dir(&canonical).map_err(RpcError::file_io)?;
@@ -389,7 +407,12 @@ pub async fn directory_create(
         }
         match anchor.parent() {
             Some(p) if !p.as_os_str().is_empty() => anchor = p.to_path_buf(),
-            _ => return Err(RpcError::invalid_path(format!("no existing ancestor for {}", raw.display()))),
+            _ => {
+                return Err(RpcError::invalid_path(format!(
+                    "no existing ancestor for {}",
+                    raw.display()
+                )))
+            }
         }
     }
     let anchor_canonical = std::fs::canonicalize(&anchor)
@@ -419,7 +442,9 @@ pub async fn directory_create(
     }
     std::fs::create_dir_all(&target).map_err(RpcError::file_io)?;
     let canonical = std::fs::canonicalize(&target).map_err(RpcError::file_io)?;
-    Ok(DirectoryCreateResult { path: canonical.display().to_string() })
+    Ok(DirectoryCreateResult {
+        path: canonical.display().to_string(),
+    })
 }
 
 // ---- search/* ----------------------------------------------------------------------------------
@@ -466,7 +491,10 @@ pub fn compute_search_entry(buf: &Buffer, query: &str) -> Result<SearchEntry, Rp
         if m.start() == m.end() {
             continue;
         }
-        matches.push((byte_to_logical(buf, m.start()), byte_to_logical(buf, m.end())));
+        matches.push((
+            byte_to_logical(buf, m.start()),
+            byte_to_logical(buf, m.end()),
+        ));
     }
     Ok(SearchEntry {
         query: query.to_string(),
@@ -513,9 +541,17 @@ pub async fn search_set(
                 let position = motion::char_to_pos(buf, last_char);
                 let anchor_p = motion::char_to_pos(buf, start_char);
                 let new_cursor = if anchor_p == position {
-                    CursorState { position, anchor: None, match_bracket: None }
+                    CursorState {
+                        position,
+                        anchor: None,
+                        match_bracket: None,
+                    }
                 } else {
-                    CursorState { position, anchor: Some(anchor_p), match_bracket: None }
+                    CursorState {
+                        position,
+                        anchor: Some(anchor_p),
+                        match_bracket: None,
+                    }
                 };
                 let prev_cursor = cursor;
                 s.cursors.insert(key, new_cursor);
@@ -604,7 +640,12 @@ async fn search_navigate(
         let cursor = s.cursors.get(&key).copied().unwrap_or_default();
         return Ok(SearchNavResult {
             cursor,
-            summary: SearchSummary { buffer_id, total: 0, truncated: false, current_index: 0 },
+            summary: SearchSummary {
+                buffer_id,
+                total: 0,
+                truncated: false,
+                current_index: 0,
+            },
         });
     };
     if entry.matches.is_empty() {
@@ -651,9 +692,17 @@ async fn search_navigate(
     let position = motion::char_to_pos(buf, last_char);
     let anchor_pos = motion::char_to_pos(buf, start_char);
     let new_cursor = if anchor_pos == position {
-        CursorState { position, anchor: None, match_bracket: None }
+        CursorState {
+            position,
+            anchor: None,
+            match_bracket: None,
+        }
     } else {
-        CursorState { position, anchor: Some(anchor_pos), match_bracket: None }
+        CursorState {
+            position,
+            anchor: Some(anchor_pos),
+            match_bracket: None,
+        }
     };
     let prev_cursor = s.cursors.get(&key).copied().unwrap_or_default();
     s.cursors.insert(key, new_cursor);
@@ -665,9 +714,15 @@ async fn search_navigate(
         let entry_ref = s.searches.get(&key).expect("active search just confirmed");
         summary_for(buf_ref, entry_ref, buffer_id, &new_cursor)
     };
-    let entry_mut = s.searches.get_mut(&key).expect("active search just confirmed");
+    let entry_mut = s
+        .searches
+        .get_mut(&key)
+        .expect("active search just confirmed");
     entry_mut.last_pushed_index = summary.current_index;
-    Ok(SearchNavResult { cursor: new_cursor, summary })
+    Ok(SearchNavResult {
+        cursor: new_cursor,
+        summary,
+    })
 }
 
 fn selection_start(c: &CursorState) -> LogicalPosition {
@@ -677,7 +732,9 @@ fn selection_start(c: &CursorState) -> LogicalPosition {
     }
 }
 
-fn pos_tuple(p: LogicalPosition) -> (u32, u32) { (p.line, p.col) }
+fn pos_tuple(p: LogicalPosition) -> (u32, u32) {
+    (p.line, p.col)
+}
 
 /// Compute the `SearchSummary` for the given entry and cursor.
 fn summary_for(
@@ -718,7 +775,7 @@ fn match_index_for_cursor(buf: &Buffer, entry: &SearchEntry, cursor: &CursorStat
         })
         .map(|i| (i as u32).saturating_add(1))
         .unwrap_or(0)
-    }
+}
 
 /// Build one `viewport/lines_changed` notification per viewport owned by `client_id` that's
 /// subscribed to `buffer_id`. Used to refresh highlights when a search is set or cleared.
@@ -738,10 +795,15 @@ fn collect_viewport_refresh(
         if vp.client_id != client_id || vp.buffer_id != buffer_id {
             continue;
         }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
         let line_count = buf.line_count();
         let new_first = vp.first_logical_line.min(line_count);
-        let new_last_excl = vp.last_logical_line_exclusive.min(line_count).max(new_first);
+        let new_last_excl = vp
+            .last_logical_line_exclusive
+            .min(line_count)
+            .max(new_first);
         let window = render_window(
             buf,
             new_first,
@@ -764,11 +826,14 @@ fn collect_viewport_refresh(
             line_count,
             max_scroll_logical_line: window.max_scroll_logical_line,
         };
-        pushes.push((sender, Notification {
-            jsonrpc: JsonRpc,
-            method: ViewportLinesChanged::NAME.into(),
-            params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
-        }));
+        pushes.push((
+            sender,
+            Notification {
+                jsonrpc: JsonRpc,
+                method: ViewportLinesChanged::NAME.into(),
+                params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
+            },
+        ));
     }
     pushes
 }
@@ -783,7 +848,11 @@ fn collect_cursor_search_update(
     client_id: ClientId,
     buffer_id: BufferId,
 ) -> Option<(mpsc::Sender<Notification>, Notification)> {
-    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
     let buf = s.buffers.get(&buffer_id)?;
     let new_idx = {
         let entry = s.searches.get(&(client_id, buffer_id))?;
@@ -820,7 +889,9 @@ fn collect_buffer_state_pushes(
     s: &ServerState,
     buffer_id: BufferId,
 ) -> Vec<(mpsc::Sender<Notification>, Notification)> {
-    let Some(buf) = s.buffers.get(&buffer_id) else { return Vec::new() };
+    let Some(buf) = s.buffers.get(&buffer_id) else {
+        return Vec::new();
+    };
     let params = BufferStateParams {
         buffer_id,
         saved_revision: buf.saved_revision(),
@@ -879,11 +950,14 @@ fn refresh_searches_for_buffer(
         entry.last_pushed_index = summary.current_index;
         s.searches.insert(key, entry);
         if let Some(sender) = s.clients.get(&key.0).map(|c| c.outbound.clone()) {
-            pushes.push((sender, Notification {
-                jsonrpc: JsonRpc,
-                method: SearchStateChanged::NAME.into(),
-                params: serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null),
-            }));
+            pushes.push((
+                sender,
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: SearchStateChanged::NAME.into(),
+                    params: serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null),
+                },
+            ));
         }
     }
     pushes
@@ -916,7 +990,11 @@ pub async fn buffer_copy(
         .buffers
         .get(&params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
-    let cursor = s.cursors.get(&(client_id, params.buffer_id)).copied().unwrap_or_default();
+    let cursor = s
+        .cursors
+        .get(&(client_id, params.buffer_id))
+        .copied()
+        .unwrap_or_default();
     let (start, end) = scope_range(buf, &cursor, params.scope);
     let text = buf.text.slice(start..end).to_string();
     Ok(BufferCopyResult { text })
@@ -932,7 +1010,11 @@ pub async fn buffer_cut(
     // Extract the text and compute the range while holding the lock; then apply the deletion via
     // `Buffer::apply_edit` (which handles the undo entry and tree update) and broadcast.
     let mut s = state.lock().await;
-    let cursor = s.cursors.get(&(client_id, params.buffer_id)).copied().unwrap_or_default();
+    let cursor = s
+        .cursors
+        .get(&(client_id, params.buffer_id))
+        .copied()
+        .unwrap_or_default();
     let buf_ref = s
         .buffers
         .get(&params.buffer_id)
@@ -947,13 +1029,29 @@ pub async fn buffer_cut(
     let cursors_before: HashMap<ClientId, CursorState> = s
         .cursors
         .iter()
-        .filter_map(|((c, b), cs)| if *b == params.buffer_id { Some((*c, *cs)) } else { None })
+        .filter_map(|((c, b), cs)| {
+            if *b == params.buffer_id {
+                Some((*c, *cs))
+            } else {
+                None
+            }
+        })
         .collect();
 
     let buf_mut = s.buffers.get_mut(&params.buffer_id).expect("just checked");
     let was_dirty = buf_mut.dirty;
-    let revision = buf_mut.apply_edit(start_char, end_char, "", EditKindTag::Delete, cursors_before);
-    let new_cursor = CursorState { position: motion::char_to_pos(buf_mut, start_char), anchor: None, match_bracket: None };
+    let revision = buf_mut.apply_edit(
+        start_char,
+        end_char,
+        "",
+        EditKindTag::Delete,
+        cursors_before,
+    );
+    let new_cursor = CursorState {
+        position: motion::char_to_pos(buf_mut, start_char),
+        anchor: None,
+        match_bracket: None,
+    };
     s.cursors.insert((client_id, params.buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(params.buffer_id);
     s.clear_tree_selection_history_for_buffer(params.buffer_id);
@@ -969,12 +1067,22 @@ pub async fn buffer_cut(
         if vp.buffer_id != params.buffer_id {
             continue;
         }
-        if !ranges_overlap(vp.first_logical_line, vp.last_logical_line_exclusive, old_first_line, old_last_line_excl) {
+        if !ranges_overlap(
+            vp.first_logical_line,
+            vp.last_logical_line_exclusive,
+            old_first_line,
+            old_last_line_excl,
+        ) {
             continue;
         }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
         let search = s.searches.get(&(vp.client_id, params.buffer_id));
-        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(buf_ref, vp, revision, search),
+        ));
     }
 
     let picker_pushes = maybe_refresh_dirty(&mut s, params.buffer_id, was_dirty);
@@ -990,7 +1098,11 @@ pub async fn buffer_cut(
         let _ = sender.send(notif).await;
     }
 
-    Ok(BufferCutResult { text, revision, cursor: new_cursor })
+    Ok(BufferCutResult {
+        text,
+        revision,
+        cursor: new_cursor,
+    })
 }
 
 /// Compute the `[start_char, end_char)` range for a copy/cut scope.
@@ -1076,7 +1188,9 @@ pub async fn buffer_save(
             resolved
         }
         (None, Some(_)) => {
-            return Err(RpcError::invalid_params("relative_path provided without path_index"));
+            return Err(RpcError::invalid_params(
+                "relative_path provided without path_index",
+            ));
         }
     };
 
@@ -1101,7 +1215,10 @@ pub async fn buffer_save(
             }
         }
         if !params.overwrite && target.exists() {
-            let own_path = s.buffers.get(&params.buffer_id).and_then(|b| b.canonical_path.as_ref());
+            let own_path = s
+                .buffers
+                .get(&params.buffer_id)
+                .and_then(|b| b.canonical_path.as_ref());
             if own_path.map(|p| p.as_path()) != Some(target.as_path()) {
                 return Err(RpcError::would_overwrite(target.display()));
             }
@@ -1130,7 +1247,10 @@ pub async fn buffer_save(
         let _ = sender.send(notif).await;
     }
 
-    Ok(BufferSaveResult { saved_at_unix_ms, revision })
+    Ok(BufferSaveResult {
+        saved_at_unix_ms,
+        revision,
+    })
 }
 
 // ---- viewport handlers -------------------------------------------------------------------------
@@ -1150,10 +1270,25 @@ pub async fn viewport_subscribe(
     let line_count = buf.line_count();
     let buffer_id = buf.id;
 
-    let (first, last_excl) = pushed_range(params.scroll.logical_line, params.rows, params.overscan_rows, line_count);
+    let (first, last_excl) = pushed_range(
+        params.scroll.logical_line,
+        params.rows,
+        params.overscan_rows,
+        line_count,
+    );
     let search = s.searches.get(&(client_id, params.buffer_id));
     let buf = &s.buffers[&params.buffer_id];
-    let window = render_window(buf, first, last_excl, params.cols, params.wrap, params.continuation_marker_width, params.tab_width, params.rows, search);
+    let window = render_window(
+        buf,
+        first,
+        last_excl,
+        params.cols,
+        params.wrap,
+        params.continuation_marker_width,
+        params.tab_width,
+        params.rows,
+        search,
+    );
 
     let viewport_id = s.allocate_viewport_id();
     let viewport = Viewport {
@@ -1175,7 +1310,10 @@ pub async fn viewport_subscribe(
     s.last_scroll.insert((client_id, buffer_id), params.scroll);
     tracing::debug!(%client_id, viewport_id, buffer_id, first, last_excl, "viewport subscribed");
 
-    Ok(ViewportSubscribeResult { viewport_id, window })
+    Ok(ViewportSubscribeResult {
+        viewport_id,
+        window,
+    })
 }
 
 pub async fn viewport_resize(
@@ -1188,8 +1326,16 @@ pub async fn viewport_resize(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.cols = params.cols;
     vp.rows = params.rows;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) =
-        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.tab_width, vp.buffer_id, vp.scroll_logical_line);
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) = (
+        vp.cols,
+        vp.rows,
+        vp.overscan_rows,
+        vp.wrap,
+        vp.continuation_marker_width,
+        vp.tab_width,
+        vp.buffer_id,
+        vp.scroll_logical_line,
+    );
 
     let buf = s
         .buffers
@@ -1199,9 +1345,22 @@ pub async fn viewport_resize(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let buf = &s.buffers[&buffer_id];
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, tab_width, rows, search);
+    let window = render_window(
+        buf,
+        first,
+        last_excl,
+        cols,
+        wrap,
+        marker_width,
+        tab_width,
+        rows,
+        search,
+    );
 
-    let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
+    let vp = s
+        .viewports
+        .get_mut(&params.viewport_id)
+        .expect("just checked");
     vp.first_logical_line = first;
     vp.last_logical_line_exclusive = last_excl;
     Ok(ViewportWindowResult { window })
@@ -1216,8 +1375,16 @@ pub async fn viewport_set_wrap(
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.wrap = params.wrap;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) =
-        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.tab_width, vp.buffer_id, vp.scroll_logical_line);
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) = (
+        vp.cols,
+        vp.rows,
+        vp.overscan_rows,
+        vp.wrap,
+        vp.continuation_marker_width,
+        vp.tab_width,
+        vp.buffer_id,
+        vp.scroll_logical_line,
+    );
 
     let buf = s
         .buffers
@@ -1227,9 +1394,22 @@ pub async fn viewport_set_wrap(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let buf = &s.buffers[&buffer_id];
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, tab_width, rows, search);
+    let window = render_window(
+        buf,
+        first,
+        last_excl,
+        cols,
+        wrap,
+        marker_width,
+        tab_width,
+        rows,
+        search,
+    );
 
-    let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
+    let vp = s
+        .viewports
+        .get_mut(&params.viewport_id)
+        .expect("just checked");
     vp.first_logical_line = first;
     vp.last_logical_line_exclusive = last_excl;
     Ok(ViewportWindowResult { window })
@@ -1245,8 +1425,16 @@ pub async fn viewport_scroll(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.scroll_logical_line = params.scroll.logical_line;
     vp.scroll_sub_row = params.scroll.sub_row;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) =
-        (vp.cols, vp.rows, vp.overscan_rows, vp.wrap, vp.continuation_marker_width, vp.tab_width, vp.buffer_id, vp.scroll_logical_line);
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) = (
+        vp.cols,
+        vp.rows,
+        vp.overscan_rows,
+        vp.wrap,
+        vp.continuation_marker_width,
+        vp.tab_width,
+        vp.buffer_id,
+        vp.scroll_logical_line,
+    );
 
     let buf = s
         .buffers
@@ -1256,9 +1444,22 @@ pub async fn viewport_scroll(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let buf = &s.buffers[&buffer_id];
-    let window = render_window(buf, first, last_excl, cols, wrap, marker_width, tab_width, rows, search);
+    let window = render_window(
+        buf,
+        first,
+        last_excl,
+        cols,
+        wrap,
+        marker_width,
+        tab_width,
+        rows,
+        search,
+    );
 
-    let vp = s.viewports.get_mut(&params.viewport_id).expect("just checked");
+    let vp = s
+        .viewports
+        .get_mut(&params.viewport_id)
+        .expect("just checked");
     vp.first_logical_line = first;
     vp.last_logical_line_exclusive = last_excl;
     s.last_scroll.insert((client_id, buffer_id), params.scroll);
@@ -1272,10 +1473,12 @@ pub async fn viewport_unsubscribe(
 ) -> Result<(), RpcError> {
     let client_id = ctx.require_hello()?;
     let mut s = state.lock().await;
-    let vp = s
-        .viewports
-        .get(&params.viewport_id)
-        .ok_or_else(|| RpcError::new(ErrorCode::VIEWPORT_NOT_FOUND, format!("unknown viewport_id: {}", params.viewport_id)))?;
+    let vp = s.viewports.get(&params.viewport_id).ok_or_else(|| {
+        RpcError::new(
+            ErrorCode::VIEWPORT_NOT_FOUND,
+            format!("unknown viewport_id: {}", params.viewport_id),
+        )
+    })?;
     if vp.client_id != client_id {
         return Err(RpcError::new(
             ErrorCode::VIEWPORT_NOT_FOUND,
@@ -1293,10 +1496,12 @@ fn require_viewport_mut<'a>(
     viewport_id: aether_protocol::ViewportId,
     client_id: ClientId,
 ) -> Result<&'a mut Viewport, RpcError> {
-    let vp = state
-        .viewports
-        .get_mut(&viewport_id)
-        .ok_or_else(|| RpcError::new(ErrorCode::VIEWPORT_NOT_FOUND, format!("unknown viewport_id: {viewport_id}")))?;
+    let vp = state.viewports.get_mut(&viewport_id).ok_or_else(|| {
+        RpcError::new(
+            ErrorCode::VIEWPORT_NOT_FOUND,
+            format!("unknown viewport_id: {viewport_id}"),
+        )
+    })?;
     if vp.client_id != client_id {
         return Err(RpcError::new(
             ErrorCode::VIEWPORT_NOT_FOUND,
@@ -1328,7 +1533,12 @@ fn refresh_viewport_ranges_for_buffer(s: &mut ServerState, buffer_id: BufferId, 
         if vp.buffer_id != buffer_id {
             continue;
         }
-        let (first, last_excl) = pushed_range(vp.scroll_logical_line, vp.rows, vp.overscan_rows, line_count);
+        let (first, last_excl) = pushed_range(
+            vp.scroll_logical_line,
+            vp.rows,
+            vp.overscan_rows,
+            line_count,
+        );
         vp.first_logical_line = first;
         vp.last_logical_line_exclusive = last_excl;
     }
@@ -1383,8 +1593,10 @@ fn render_window(
 
     // For highlighting we need the whole source as bytes. Computed once per render rather than
     // per line. Skipped entirely when no syntax is attached.
-    let source: Option<String> =
-        buf.syntax.as_ref().map(|_| buf.text.chunks().collect::<String>());
+    let source: Option<String> = buf
+        .syntax
+        .as_ref()
+        .map(|_| buf.text.chunks().collect::<String>());
 
     for i in first..last_excl {
         let line_slice = buf.text.line(i as usize);
@@ -1410,7 +1622,8 @@ fn render_window(
             _ => Vec::new(),
         };
 
-        let mut render = wrap::render_line(&text, i, cols, wrap, marker_width, tab_width, highlights);
+        let mut render =
+            wrap::render_line(&text, i, cols, wrap, marker_width, tab_width, highlights);
         if let Some(entry) = search {
             render.search_matches = matches_on_line(entry, i, text.len() as u32);
         }
@@ -1420,7 +1633,14 @@ fn render_window(
         first_logical_line: first,
         last_logical_line_exclusive: last_excl,
         line_count: buf.line_count(),
-        max_scroll_logical_line: compute_max_scroll(buf, viewport_rows, cols, wrap, marker_width, tab_width),
+        max_scroll_logical_line: compute_max_scroll(
+            buf,
+            viewport_rows,
+            cols,
+            wrap,
+            marker_width,
+            tab_width,
+        ),
         lines,
     }
 }
@@ -1434,7 +1654,11 @@ fn matches_on_line(entry: &SearchEntry, line_idx: u32, line_len: u32) -> Vec<Sea
             continue;
         }
         let s = if line_idx == start.line { start.col } else { 0 };
-        let e = if line_idx == end_excl.line { end_excl.col } else { line_len };
+        let e = if line_idx == end_excl.line {
+            end_excl.col
+        } else {
+            line_len
+        };
         let s = s.min(line_len);
         let e = e.min(line_len);
         if s < e {
@@ -1467,7 +1691,11 @@ pub async fn cursor_move(
     // `Some(col)` → set virtual col to `col`; `None` → clear it. Only `VisualLine` preserves it.
     let mut new_virtual_col: Option<u32> = None;
     let new_pos = match &params.motion {
-        Motion::VisualLine { viewport_id, direction, count } => {
+        Motion::VisualLine {
+            viewport_id,
+            direction,
+            count,
+        } => {
             let vp = s.viewports.get(viewport_id).ok_or_else(|| {
                 RpcError::new(
                     aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND,
@@ -1495,7 +1723,14 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_start(buf, vp.wrap, vp.cols, vp.continuation_marker_width, vp.tab_width, current.position)
+            motion::resolve_visual_line_start(
+                buf,
+                vp.wrap,
+                vp.cols,
+                vp.continuation_marker_width,
+                vp.tab_width,
+                current.position,
+            )
         }
         Motion::VisualLineEnd { viewport_id } => {
             let vp = s.viewports.get(viewport_id).ok_or_else(|| {
@@ -1504,9 +1739,20 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_end(buf, vp.wrap, vp.cols, vp.continuation_marker_width, vp.tab_width, current.position)
+            motion::resolve_visual_line_end(
+                buf,
+                vp.wrap,
+                vp.cols,
+                vp.continuation_marker_width,
+                vp.tab_width,
+                current.position,
+            )
         }
-        Motion::LogicalLine { direction, count, preserve_col } => {
+        Motion::LogicalLine {
+            direction,
+            count,
+            preserve_col,
+        } => {
             // LogicalLine doesn't reference a viewport, but it does preserve virtual column,
             // which is in display cells — so it needs `tab_width` to be right for tab-bearing
             // lines. Borrow it from any of this client's viewports on this buffer.
@@ -1541,7 +1787,11 @@ pub async fn cursor_move(
         x => x,
     };
 
-    let new_state = CursorState { position: new_pos, anchor: new_anchor, match_bracket: None };
+    let new_state = CursorState {
+        position: new_pos,
+        anchor: new_anchor,
+        match_bracket: None,
+    };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -1612,16 +1862,20 @@ pub async fn cursor_select_line(
     } else {
         bottom_edge.line
     };
-    let (top_line, bottom_line) = match (params.extend && current.anchor.is_some(), params.direction) {
-        (true, _) => (new_top, new_bottom),
-        (false, Direction::Forward) => (new_bottom, new_bottom),
-        (false, Direction::Backward) => (new_top, new_top),
-    };
+    let (top_line, bottom_line) =
+        match (params.extend && current.anchor.is_some(), params.direction) {
+            (true, _) => (new_top, new_bottom),
+            (false, Direction::Forward) => (new_bottom, new_bottom),
+            (false, Direction::Backward) => (new_top, new_top),
+        };
 
     let last_line = (buf.text.len_lines() as u32).saturating_sub(1);
     let top_line = top_line.min(last_line);
     let bottom_line = bottom_line.min(last_line);
-    let top_pos = LogicalPosition { line: top_line, col: 0 };
+    let top_pos = LogicalPosition {
+        line: top_line,
+        col: 0,
+    };
     let bottom_pos = LogicalPosition {
         line: bottom_line,
         col: motion::line_byte_len_excl_newline(buf, bottom_line),
@@ -1633,8 +1887,16 @@ pub async fn cursor_select_line(
     } else {
         (bottom_pos, top_pos)
     };
-    let anchor = if anchor_pos == cursor_pos { None } else { Some(anchor_pos) };
-    let new_state = CursorState { position: cursor_pos, anchor, match_bracket: None };
+    let anchor = if anchor_pos == cursor_pos {
+        None
+    } else {
+        Some(anchor_pos)
+    };
+    let new_state = CursorState {
+        position: cursor_pos,
+        anchor,
+        match_bracket: None,
+    };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
@@ -1661,7 +1923,11 @@ pub async fn cursor_swap_anchor(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     let new_state = match current.anchor {
-        Some(a) => CursorState { position: a, anchor: Some(current.position), match_bracket: None },
+        Some(a) => CursorState {
+            position: a,
+            anchor: Some(current.position),
+            match_bracket: None,
+        },
         None => current,
     };
     s.cursors.insert(key, new_state);
@@ -1696,7 +1962,11 @@ pub async fn cursor_set(
         Some(a) if a == position => None,
         x => x,
     };
-    let result = CursorState { position, anchor, match_bracket: None };
+    let result = CursorState {
+        position,
+        anchor,
+        match_bracket: None,
+    };
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
@@ -1726,7 +1996,10 @@ pub async fn cursor_undo(
 
     let history = s.motion_history.entry(key).or_default();
     if history.undo.is_empty() {
-        return Ok(CursorUndoResult { applied: false, cursor: current });
+        return Ok(CursorUndoResult {
+            applied: false,
+            cursor: current,
+        });
     }
     let prev = history.undo.pop_back().expect("just checked non-empty");
     history.redo.push(current);
@@ -1743,7 +2016,10 @@ pub async fn cursor_undo(
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
     }
-    Ok(CursorUndoResult { applied: true, cursor: prev })
+    Ok(CursorUndoResult {
+        applied: true,
+        cursor: prev,
+    })
 }
 
 pub async fn cursor_redo(
@@ -1761,7 +2037,10 @@ pub async fn cursor_redo(
 
     let history = s.motion_history.entry(key).or_default();
     if history.redo.is_empty() {
-        return Ok(CursorUndoResult { applied: false, cursor: current });
+        return Ok(CursorUndoResult {
+            applied: false,
+            cursor: current,
+        });
     }
     let next = history.redo.pop().expect("just checked non-empty");
     history.undo.push_back(current);
@@ -1778,7 +2057,10 @@ pub async fn cursor_redo(
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
     }
-    Ok(CursorUndoResult { applied: true, cursor: next })
+    Ok(CursorUndoResult {
+        applied: true,
+        cursor: next,
+    })
 }
 
 // ---- cursor/expand and cursor/contract ---------------------------------------------------------
@@ -1811,7 +2093,9 @@ pub async fn cursor_expand(
     // Smallest descendant containing the byte range, then walk up while the node exactly equals
     // our selection — that gives the smallest *strictly larger* enclosing node.
     let root = syntax.tree.root_node();
-    let mut node = root.descendant_for_byte_range(start_byte, end_byte_excl).unwrap_or(root);
+    let mut node = root
+        .descendant_for_byte_range(start_byte, end_byte_excl)
+        .unwrap_or(root);
     while node.start_byte() == start_byte && node.end_byte() == end_byte_excl {
         match node.parent() {
             Some(p) => node = p,
@@ -1820,20 +2104,34 @@ pub async fn cursor_expand(
     }
 
     let new_start_char = buf.text.byte_to_char(node.start_byte());
-    let new_end_char_excl = buf.text.byte_to_char(node.end_byte()).max(new_start_char + 1);
+    let new_end_char_excl = buf
+        .text
+        .byte_to_char(node.end_byte())
+        .max(new_start_char + 1);
     let new_last_char = new_end_char_excl.saturating_sub(1).max(new_start_char);
     let anchor = motion::char_to_pos(buf, new_start_char);
     let position = motion::char_to_pos(buf, new_last_char);
     let new_cursor = if anchor == position {
-        CursorState { position, anchor: None, match_bracket: None }
+        CursorState {
+            position,
+            anchor: None,
+            match_bracket: None,
+        }
     } else {
-        CursorState { position, anchor: Some(anchor), match_bracket: None }
+        CursorState {
+            position,
+            anchor: Some(anchor),
+            match_bracket: None,
+        }
     };
 
     s.cursors.insert(key, new_cursor);
     s.record_motion(key, current, new_cursor);
     s.virtual_col.remove(&key);
-    s.tree_selection_history.entry(key).or_default().push(current);
+    s.tree_selection_history
+        .entry(key)
+        .or_default()
+        .push(current);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
     let new_cursor = wrap_for_response(&s, params.buffer_id, new_cursor);
     drop(s);
@@ -1886,7 +2184,10 @@ fn current_selection_char_range(buf: &Buffer, cursor: &CursorState) -> (usize, u
     let total = buf.text.len_chars();
     let lo = motion::pos_to_char(buf, lo_pos).min(total);
     let hi_inclusive = motion::pos_to_char(buf, hi_pos).min(total);
-    (lo, (hi_inclusive + 1).min(total).max(lo + 1).min(total.max(lo)))
+    (
+        lo,
+        (hi_inclusive + 1).min(total).max(lo + 1).min(total.max(lo)),
+    )
 }
 
 // ---- input handlers ----------------------------------------------------------------------------
@@ -1901,7 +2202,10 @@ pub async fn input_text(
         state,
         client_id,
         params.buffer_id,
-        EditKind::ReplaceWith { text: params.text, select_pasted: params.select_pasted },
+        EditKind::ReplaceWith {
+            text: params.text,
+            select_pasted: params.select_pasted,
+        },
     )
     .await
 }
@@ -1912,7 +2216,13 @@ pub async fn input_delete(
     params: InputDeleteParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.require_hello()?;
-    apply_edit(state, client_id, params.buffer_id, EditKind::DeleteMotion(params.motion)).await
+    apply_edit(
+        state,
+        client_id,
+        params.buffer_id,
+        EditKind::DeleteMotion(params.motion),
+    )
+    .await
 }
 
 pub async fn input_undo(
@@ -1951,7 +2261,11 @@ pub async fn input_newline_and_indent(
             .buffers
             .get(&params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
-        let cursor = s.cursors.get(&(client_id, params.buffer_id)).copied().unwrap_or_default();
+        let cursor = s
+            .cursors
+            .get(&(client_id, params.buffer_id))
+            .copied()
+            .unwrap_or_default();
         compute_smart_indent(buf, cursor.position)
     };
     let mut text = String::with_capacity(indent.len() + 1);
@@ -1961,7 +2275,10 @@ pub async fn input_newline_and_indent(
         state,
         client_id,
         params.buffer_id,
-        EditKind::ReplaceWith { text, select_pasted: false },
+        EditKind::ReplaceWith {
+            text,
+            select_pasted: false,
+        },
     )
     .await
 }
@@ -1995,7 +2312,11 @@ fn compute_smart_indent(buf: &Buffer, cursor_pos: LogicalPosition) -> String {
     let line_slice = buf.text.line(line_idx);
     let line_byte_len = {
         let n = line_slice.len_bytes();
-        if n > 0 && line_slice.byte(n - 1) == b'\n' { n - 1 } else { n }
+        if n > 0 && line_slice.byte(n - 1) == b'\n' {
+            n - 1
+        } else {
+            n
+        }
     };
     let col = (cursor_pos.col as usize).min(line_byte_len);
     let line_start_char = buf.text.line_to_char(line_idx);
@@ -2091,7 +2412,11 @@ async fn apply_toggle_comment(
         .buffers
         .get(&buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
-    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
 
     let (line_tok, block_tok) = buf
         .syntax
@@ -2101,7 +2426,10 @@ async fn apply_toggle_comment(
     if line_tok.is_none() && block_tok.is_none() {
         let revision = buf.revision;
         let response = wrap_for_response(&s, buffer_id, cursor);
-        return Ok(EditResult { revision, cursor: response });
+        return Ok(EditResult {
+            revision,
+            cursor: response,
+        });
     }
 
     // Selection / line range.
@@ -2115,8 +2443,9 @@ async fn apply_toggle_comment(
     let is_partial = is_partial_line_selection(buf, &cursor);
 
     // Phase 1: decide the action.
-    let line_strings: Vec<String> =
-        (a..=b).map(|i| buf.text.line(i as usize).chunks().collect()).collect();
+    let line_strings: Vec<String> = (a..=b)
+        .map(|i| buf.text.line(i as usize).chunks().collect())
+        .collect();
     let line_classify = classify_line_range(&line_strings, line_tok);
 
     let sel_block_unwrap = block_tok.and_then(|(open, close)| {
@@ -2124,8 +2453,9 @@ async fn apply_toggle_comment(
         // natural "wrap, then re-toggle to unwrap" gesture where the selection sits on the
         // inner content rather than around the wrappers.
         if let Some(syntax) = buf.syntax.as_ref() {
-            let cursor_byte =
-                buf.text.char_to_byte(motion::pos_to_char(buf, cursor.position));
+            let cursor_byte = buf
+                .text
+                .char_to_byte(motion::pos_to_char(buf, cursor.position));
             let source: String = buf.text.chunks().collect();
             if let Some((s, e)) = find_enclosing_block_comment(
                 &syntax.tree,
@@ -2143,10 +2473,12 @@ async fn apply_toggle_comment(
         // typed an opener without a closer).
         let (start_pos, end_pos) = ordered_selection_or_cursor_line(&cursor);
         let start_char = motion::pos_to_char(buf, start_pos);
-        let end_char_excl =
-            motion::pos_to_char(buf, end_pos).saturating_add(1).min(buf.text.len_chars());
+        let end_char_excl = motion::pos_to_char(buf, end_pos)
+            .saturating_add(1)
+            .min(buf.text.len_chars());
         let span: String = buf.text.slice(start_char..end_char_excl).chunks().collect();
-        if span.starts_with(open) && span.ends_with(close) && span.len() >= open.len() + close.len() {
+        if span.starts_with(open) && span.ends_with(close) && span.len() >= open.len() + close.len()
+        {
             Some((start_char, end_char_excl, span, open, close))
         } else {
             None
@@ -2155,30 +2487,68 @@ async fn apply_toggle_comment(
 
     enum Plan {
         Noop,
-        LineUncomment { prefix: &'static str },
-        LineComment { prefix: &'static str, min_indent: usize },
-        BlockUnwrap { start_char: usize, end_char_excl: usize, span: String, open: &'static str, close: &'static str },
-        BlockWrap { start_char: usize, end_char_excl: usize, open: &'static str, close: &'static str },
+        LineUncomment {
+            prefix: &'static str,
+        },
+        LineComment {
+            prefix: &'static str,
+            min_indent: usize,
+        },
+        BlockUnwrap {
+            start_char: usize,
+            end_char_excl: usize,
+            span: String,
+            open: &'static str,
+            close: &'static str,
+        },
+        BlockWrap {
+            start_char: usize,
+            end_char_excl: usize,
+            open: &'static str,
+            close: &'static str,
+        },
     }
 
     let plan = if let (Some(prefix), Some(c)) = (line_tok, &line_classify) {
         if c.all_commented {
             Plan::LineUncomment { prefix }
         } else if let Some((sc, ec, span, open, close)) = sel_block_unwrap {
-            Plan::BlockUnwrap { start_char: sc, end_char_excl: ec, span, open, close }
+            Plan::BlockUnwrap {
+                start_char: sc,
+                end_char_excl: ec,
+                span,
+                open,
+                close,
+            }
         } else if is_partial && block_tok.is_some() {
             let (start_pos, end_pos) = ordered_selection_or_cursor_line(&cursor);
             let sc = motion::pos_to_char(buf, start_pos);
-            let ec = motion::pos_to_char(buf, end_pos).saturating_add(1).min(buf.text.len_chars());
+            let ec = motion::pos_to_char(buf, end_pos)
+                .saturating_add(1)
+                .min(buf.text.len_chars());
             let (open, close) = block_tok.unwrap();
-            Plan::BlockWrap { start_char: sc, end_char_excl: ec, open, close }
+            Plan::BlockWrap {
+                start_char: sc,
+                end_char_excl: ec,
+                open,
+                close,
+            }
         } else if c.any_nonblank {
-            Plan::LineComment { prefix, min_indent: c.min_indent }
+            Plan::LineComment {
+                prefix,
+                min_indent: c.min_indent,
+            }
         } else {
             Plan::Noop
         }
     } else if let Some((sc, ec, span, open, close)) = sel_block_unwrap {
-        Plan::BlockUnwrap { start_char: sc, end_char_excl: ec, span, open, close }
+        Plan::BlockUnwrap {
+            start_char: sc,
+            end_char_excl: ec,
+            span,
+            open,
+            close,
+        }
     } else if let Some((open, close)) = block_tok {
         // No line tokens at all (markdown, html, css): everything routes to block.
         let endpoints = if cursor.anchor.is_some() {
@@ -2192,11 +2562,18 @@ async fn apply_toggle_comment(
             None => Plan::Noop,
             Some((start_pos, end_pos)) => {
                 let sc = motion::pos_to_char(buf, start_pos);
-                let ec = motion::pos_to_char(buf, end_pos).saturating_add(1).min(buf.text.len_chars());
+                let ec = motion::pos_to_char(buf, end_pos)
+                    .saturating_add(1)
+                    .min(buf.text.len_chars());
                 if sc == ec {
                     Plan::Noop
                 } else {
-                    Plan::BlockWrap { start_char: sc, end_char_excl: ec, open, close }
+                    Plan::BlockWrap {
+                        start_char: sc,
+                        end_char_excl: ec,
+                        open,
+                        close,
+                    }
                 }
             }
         }
@@ -2210,8 +2587,7 @@ async fn apply_toggle_comment(
         Plan::Noop => None,
         Plan::LineUncomment { prefix } => {
             let (start_char, end_char) = line_edit_char_range(buf, a, b);
-            let (text, shifts, insert_cols) =
-                build_line_uncomment(&line_strings, a, prefix);
+            let (text, shifts, insert_cols) = build_line_uncomment(&line_strings, a, prefix);
             let nc = shift_cursor_by_line_map(cursor, a, b, &shifts, &insert_cols);
             Some((start_char, end_char, text, nc, a, b))
         }
@@ -2222,7 +2598,13 @@ async fn apply_toggle_comment(
             let nc = shift_cursor_by_line_map(cursor, a, b, &shifts, &insert_cols);
             Some((start_char, end_char, text, nc, a, b))
         }
-        Plan::BlockUnwrap { start_char, end_char_excl, span, open, close } => {
+        Plan::BlockUnwrap {
+            start_char,
+            end_char_excl,
+            span,
+            open,
+            close,
+        } => {
             // Strip `open` + optional inner space at the front, optional inner space + `close`
             // at the back. Replace the wrapped span with the inner content; re-select that
             // content.
@@ -2260,16 +2642,35 @@ async fn apply_toggle_comment(
                 }
             };
             let nc = if start_pos == new_position {
-                CursorState { position: new_position, anchor: None, match_bracket: None }
+                CursorState {
+                    position: new_position,
+                    anchor: None,
+                    match_bracket: None,
+                }
             } else {
-                CursorState { position: new_position, anchor: Some(start_pos), match_bracket: None }
+                CursorState {
+                    position: new_position,
+                    anchor: Some(start_pos),
+                    match_bracket: None,
+                }
             };
             let last_line = motion::char_to_pos(buf, end_char_excl.saturating_sub(1)).line;
-            Some((start_char, end_char_excl, new_text, nc, a.min(last_line), b.max(last_line)))
+            Some((
+                start_char,
+                end_char_excl,
+                new_text,
+                nc,
+                a.min(last_line),
+                b.max(last_line),
+            ))
         }
-        Plan::BlockWrap { start_char, end_char_excl, open, close } => {
-            let selected: String =
-                buf.text.slice(start_char..end_char_excl).chunks().collect();
+        Plan::BlockWrap {
+            start_char,
+            end_char_excl,
+            open,
+            close,
+        } => {
+            let selected: String = buf.text.slice(start_char..end_char_excl).chunks().collect();
             let new_text = format!("{open} {selected} {close}");
             // Compute new selection endpoints in (line, col) directly — `char_to_pos` on the
             // pre-edit buffer is wrong for post-edit char indices once the wrap spans lines.
@@ -2296,12 +2697,27 @@ async fn apply_toggle_comment(
                 }
             };
             let nc = if start_pos == new_position {
-                CursorState { position: new_position, anchor: None, match_bracket: None }
+                CursorState {
+                    position: new_position,
+                    anchor: None,
+                    match_bracket: None,
+                }
             } else {
-                CursorState { position: new_position, anchor: Some(start_pos), match_bracket: None }
+                CursorState {
+                    position: new_position,
+                    anchor: Some(start_pos),
+                    match_bracket: None,
+                }
             };
             let last_touched_line = start_pos.line + newlines;
-            Some((start_char, end_char_excl, new_text, nc, a.min(start_pos.line), b.max(last_touched_line)))
+            Some((
+                start_char,
+                end_char_excl,
+                new_text,
+                nc,
+                a.min(start_pos.line),
+                b.max(last_touched_line),
+            ))
         }
     };
 
@@ -2309,19 +2725,34 @@ async fn apply_toggle_comment(
     else {
         let revision = buf.revision;
         let response = wrap_for_response(&s, buffer_id, cursor);
-        return Ok(EditResult { revision, cursor: response });
+        return Ok(EditResult {
+            revision,
+            cursor: response,
+        });
     };
 
     let cursors_before: HashMap<ClientId, CursorState> = s
         .cursors
         .iter()
-        .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
+        .filter_map(|((c, bid), cs)| {
+            if *bid == buffer_id {
+                Some((*c, *cs))
+            } else {
+                None
+            }
+        })
         .collect();
 
     let was_dirty = s.buffers[&buffer_id].dirty;
     let revision = {
         let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
-        buf_mut.apply_edit(start_char, end_char, &new_text, EditKindTag::Text, cursors_before)
+        buf_mut.apply_edit(
+            start_char,
+            end_char,
+            &new_text,
+            EditKindTag::Text,
+            cursors_before,
+        )
     };
     // Re-clamp the new cursor against the post-edit buffer (positions computed above used the
     // pre-edit buffer; if the edit shortened lines, clamp_position keeps them legal).
@@ -2358,9 +2789,14 @@ async fn apply_toggle_comment(
         ) {
             continue;
         }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
         let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(buf_ref, vp, revision, search),
+        ));
     }
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
@@ -2376,7 +2812,10 @@ async fn apply_toggle_comment(
     for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
-    Ok(EditResult { revision, cursor: new_cursor })
+    Ok(EditResult {
+        revision,
+        cursor: new_cursor,
+    })
 }
 
 /// Walk the cursor's ancestors looking for a tree-sitter node whose kind contains "comment"
@@ -2399,7 +2838,8 @@ fn find_enclosing_block_comment(
             let s = n.start_byte();
             let e = n.end_byte();
             let span = source.get(s..e)?;
-            if span.starts_with(open.as_bytes()) && span.ends_with(close.as_bytes())
+            if span.starts_with(open.as_bytes())
+                && span.ends_with(close.as_bytes())
                 && e - s >= open.len() + close.len()
             {
                 return Some((s, e));
@@ -2438,7 +2878,11 @@ fn classify_line_range(lines: &[String], prefix: Option<&str>) -> Option<LineCla
             all_commented = false;
         }
     }
-    Some(LineClassify { any_nonblank, all_commented, min_indent: min_indent.unwrap_or(0) })
+    Some(LineClassify {
+        any_nonblank,
+        all_commented,
+        min_indent: min_indent.unwrap_or(0),
+    })
 }
 
 /// `true` when the selection doesn't cover a contiguous run of *complete* lines (lower
@@ -2446,7 +2890,9 @@ fn classify_line_range(lines: &[String], prefix: Option<&str>) -> Option<LineCla
 /// counts as non-partial. Partial selections — single mid-line, or multi-line where one of
 /// the boundary lines isn't fully covered — route to block-comment when the language has it.
 fn is_partial_line_selection(buf: &Buffer, cursor: &CursorState) -> bool {
-    let Some(anchor) = cursor.anchor else { return false };
+    let Some(anchor) = cursor.anchor else {
+        return false;
+    };
     let (lo, hi) = motion::ordered(cursor.position, anchor);
     let line_end_hi = motion::line_byte_len_excl_newline(buf, hi.line);
     let lo_at_start = lo.col == 0;
@@ -2459,7 +2905,12 @@ fn is_partial_line_selection(buf: &Buffer, cursor: &CursorState) -> bool {
 
 /// `(start_pos, end_pos)` of the selection, both inclusive, ordered. Cursor-only collapses to
 /// the single-char range at the cursor.
-fn ordered_selection_or_cursor_line(cursor: &CursorState) -> (aether_protocol::LogicalPosition, aether_protocol::LogicalPosition) {
+fn ordered_selection_or_cursor_line(
+    cursor: &CursorState,
+) -> (
+    aether_protocol::LogicalPosition,
+    aether_protocol::LogicalPosition,
+) {
     match cursor.anchor {
         Some(anchor) => motion::ordered(cursor.position, anchor),
         None => (cursor.position, cursor.position),
@@ -2471,14 +2922,26 @@ fn ordered_selection_or_cursor_line(cursor: &CursorState) -> (aether_protocol::L
 /// selection exists in a block-only language. Returns `None` for empty lines so the caller
 /// can skip — otherwise a wrap on an empty line would replace its lone `\n` and merge the
 /// line with the next.
-fn current_line_content_endpoints(buf: &Buffer, line_idx: u32) -> Option<(aether_protocol::LogicalPosition, aether_protocol::LogicalPosition)> {
+fn current_line_content_endpoints(
+    buf: &Buffer,
+    line_idx: u32,
+) -> Option<(
+    aether_protocol::LogicalPosition,
+    aether_protocol::LogicalPosition,
+)> {
     let end_col = motion::line_byte_len_excl_newline(buf, line_idx);
     if end_col == 0 {
         return None;
     }
     Some((
-        aether_protocol::LogicalPosition { line: line_idx, col: 0 },
-        aether_protocol::LogicalPosition { line: line_idx, col: end_col - 1 },
+        aether_protocol::LogicalPosition {
+            line: line_idx,
+            col: 0,
+        },
+        aether_protocol::LogicalPosition {
+            line: line_idx,
+            col: end_col - 1,
+        },
     ))
 }
 
@@ -2588,7 +3051,9 @@ fn shift_cursor_by_line_map(
     // to cover any prefix we just added (rather than sliding with the content and leaving the
     // new prefix outside the selection). The lower endpoint stays put when it sits exactly at
     // the insert column; the upper endpoint shifts forward to follow the content.
-    let lower = cursor.anchor.map(|anch| motion::ordered(cursor.position, anch).0);
+    let lower = cursor
+        .anchor
+        .map(|anch| motion::ordered(cursor.position, anch).0);
 
     let shift_pos = |p: aether_protocol::LogicalPosition, is_lower_endpoint: bool| {
         if p.line < a || p.line > b {
@@ -2610,7 +3075,11 @@ fn shift_cursor_by_line_map(
         } else {
             let removed = (-shift) as u32;
             let prefix_end = insert_col + removed;
-            if p.col >= prefix_end { p.col - removed } else { insert_col }
+            if p.col >= prefix_end {
+                p.col - removed
+            } else {
+                insert_col
+            }
         };
         aether_protocol::LogicalPosition { line: p.line, col }
     };
@@ -2627,7 +3096,11 @@ fn shift_cursor_by_line_map(
         Some(a) if a == position => None,
         x => x,
     };
-    CursorState { position, anchor, match_bracket: None }
+    CursorState {
+        position,
+        anchor,
+        match_bracket: None,
+    }
 }
 
 pub async fn input_dedent(
@@ -2660,7 +3133,11 @@ async fn apply_indent_or_dedent(
         .get(&buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let indent = buf.indent_style.unit();
-    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
 
     let (a, b) = match cursor.anchor {
         Some(anchor) => {
@@ -2719,7 +3196,13 @@ async fn apply_indent_or_dedent(
     let cursors_before: HashMap<ClientId, CursorState> = s
         .cursors
         .iter()
-        .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
+        .filter_map(|((c, bid), cs)| {
+            if *bid == buffer_id {
+                Some((*c, *cs))
+            } else {
+                None
+            }
+        })
         .collect();
 
     let was_dirty = s.buffers[&buffer_id].dirty;
@@ -2744,7 +3227,9 @@ async fn apply_indent_or_dedent(
         };
         let new_cursor = CursorState {
             position: motion::clamp_position(buf_mut, shift_pos(cursor.position)),
-            anchor: cursor.anchor.map(|a| motion::clamp_position(buf_mut, shift_pos(a))),
+            anchor: cursor
+                .anchor
+                .map(|a| motion::clamp_position(buf_mut, shift_pos(a))),
             match_bracket: None,
         };
         let new_cursor = match new_cursor.anchor {
@@ -2781,9 +3266,14 @@ async fn apply_indent_or_dedent(
         ) {
             continue;
         }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
         let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(buf_ref, vp, revision, search),
+        ));
     }
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
@@ -2799,7 +3289,10 @@ async fn apply_indent_or_dedent(
     for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
-    Ok(EditResult { revision, cursor: new_cursor })
+    Ok(EditResult {
+        revision,
+        cursor: new_cursor,
+    })
 }
 
 pub async fn input_move_lines(
@@ -2816,7 +3309,11 @@ pub async fn input_move_lines(
         .buffers
         .get(&buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
-    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
 
     // Selection's line range: the lines the user wants to move.
     let (a, b) = match cursor.anchor {
@@ -2890,7 +3387,13 @@ pub async fn input_move_lines(
     let cursors_before: HashMap<ClientId, CursorState> = s
         .cursors
         .iter()
-        .filter_map(|((c, bid), cs)| if *bid == buffer_id { Some((*c, *cs)) } else { None })
+        .filter_map(|((c, bid), cs)| {
+            if *bid == buffer_id {
+                Some((*c, *cs))
+            } else {
+                None
+            }
+        })
         .collect();
 
     let was_dirty = s.buffers[&buffer_id].dirty;
@@ -2955,9 +3458,14 @@ pub async fn input_move_lines(
         ) {
             continue;
         }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
         let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(buf_ref, vp, revision, search),
+        ));
     }
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
@@ -2973,7 +3481,10 @@ pub async fn input_move_lines(
     for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
-    Ok(EditResult { revision, cursor: new_cursor })
+    Ok(EditResult {
+        revision,
+        cursor: new_cursor,
+    })
 }
 
 /// Build a new string with `bottom` first, then `top`, preserving "this is the last line of the
@@ -3008,7 +3519,11 @@ pub async fn input_join_lines(
     // lines, join all of them. Otherwise, join the cursor's line with the one below.
     let (first_line, last_line) = {
         let s = state.lock().await;
-        let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+        let cursor = s
+            .cursors
+            .get(&(client_id, buffer_id))
+            .copied()
+            .unwrap_or_default();
         let (a, b) = match cursor.anchor {
             Some(anchor) => motion::ordered(cursor.position, anchor),
             None => (cursor.position, cursor.position),
@@ -3021,7 +3536,11 @@ pub async fn input_join_lines(
         let first = a.line;
         // If single line, join with the line below it. If multi-line selection, join through
         // last selected line.
-        let last = if a.line == b.line { a.line.saturating_add(1) } else { b.line };
+        let last = if a.line == b.line {
+            a.line.saturating_add(1)
+        } else {
+            b.line
+        };
         let last = last.min(line_count.saturating_sub(1));
         (first, last)
     };
@@ -3032,7 +3551,11 @@ pub async fn input_join_lines(
         let buf = &s.buffers[&buffer_id];
         return Ok(EditResult {
             revision: buf.revision,
-            cursor: s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default(),
+            cursor: s
+                .cursors
+                .get(&(client_id, buffer_id))
+                .copied()
+                .unwrap_or_default(),
         });
     }
 
@@ -3083,7 +3606,13 @@ pub async fn input_join_lines(
         let s = state.lock().await;
         s.cursors
             .iter()
-            .filter_map(|((c, b), cs)| if *b == buffer_id { Some((*c, *cs)) } else { None })
+            .filter_map(|((c, b), cs)| {
+                if *b == buffer_id {
+                    Some((*c, *cs))
+                } else {
+                    None
+                }
+            })
             .collect()
     };
 
@@ -3106,7 +3635,7 @@ pub async fn input_join_lines(
         };
         s.cursors.insert((client_id, buffer_id), new_cursor);
         s.clear_motion_history_for_buffer(buffer_id);
-    s.clear_tree_selection_history_for_buffer(buffer_id);
+        s.clear_tree_selection_history_for_buffer(buffer_id);
         s.clear_virtual_col_for_buffer(buffer_id);
         (revision, new_cursor, was_dirty)
     };
@@ -3144,7 +3673,10 @@ pub async fn input_join_lines(
         let _ = sender.send(notif).await;
     }
 
-    Ok(EditResult { revision, cursor: new_cursor })
+    Ok(EditResult {
+        revision,
+        cursor: new_cursor,
+    })
 }
 
 enum UndoDirection {
@@ -3165,7 +3697,13 @@ async fn apply_undo_or_redo(
     let current_cursors: HashMap<ClientId, CursorState> = s
         .cursors
         .iter()
-        .filter_map(|((c, b), cs)| if *b == buffer_id { Some((*c, *cs)) } else { None })
+        .filter_map(|((c, b), cs)| {
+            if *b == buffer_id {
+                Some((*c, *cs))
+            } else {
+                None
+            }
+        })
         .collect();
 
     let was_dirty = s.buffers.get(&buffer_id).map(|b| b.dirty).unwrap_or(false);
@@ -3183,7 +3721,11 @@ async fn apply_undo_or_redo(
     let Some(outcome) = outcome else {
         // Nothing to undo/redo. Echo current cursor and revision back.
         let buf = s.buffers.get(&buffer_id).expect("just checked");
-        let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+        let cursor = s
+            .cursors
+            .get(&(client_id, buffer_id))
+            .copied()
+            .unwrap_or_default();
         return Ok(UndoResult {
             revision: buf.revision,
             applied: false,
@@ -3219,8 +3761,10 @@ async fn apply_undo_or_redo(
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
-    let undoing_cursor =
-        new_cursors.get(&client_id).copied().unwrap_or_else(CursorState::default);
+    let undoing_cursor = new_cursors
+        .get(&client_id)
+        .copied()
+        .unwrap_or_else(CursorState::default);
 
     // Push the full visible window to every viewport on this buffer — the rope was swapped
     // wholesale, so we can't be surgical about it.
@@ -3237,7 +3781,10 @@ async fn apply_undo_or_redo(
             continue;
         };
         let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((sender, build_lines_changed_notif(buf_ref, vp, revision, search)));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(buf_ref, vp, revision, search),
+        ));
     }
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
@@ -3253,7 +3800,11 @@ async fn apply_undo_or_redo(
         let _ = sender.send(notif).await;
     }
 
-    Ok(UndoResult { revision, applied: true, cursor: undoing_cursor })
+    Ok(UndoResult {
+        revision,
+        applied: true,
+        cursor: undoing_cursor,
+    })
 }
 
 fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
@@ -3263,7 +3814,11 @@ fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
         Some(a) if a == position => None,
         x => x,
     };
-    CursorState { position, anchor, match_bracket: None }
+    CursorState {
+        position,
+        anchor,
+        match_bracket: None,
+    }
 }
 
 /// Populate `match_bracket` on a cursor that's about to cross the wire. Looks up the bracket
@@ -3271,8 +3826,12 @@ fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
 /// never stored in `state.cursors`; it's purely a derived per-response field that drives the
 /// client's match-bracket highlight overlay.
 fn with_match_bracket(buf: &Buffer, mut cursor: CursorState) -> CursorState {
-    let Some(syntax) = buf.syntax.as_ref() else { return cursor };
-    let byte = buf.text.char_to_byte(motion::pos_to_char(buf, cursor.position));
+    let Some(syntax) = buf.syntax.as_ref() else {
+        return cursor;
+    };
+    let byte = buf
+        .text
+        .char_to_byte(motion::pos_to_char(buf, cursor.position));
     if let Some((open, close)) = crate::brackets::find_match_bracket(&syntax.tree, byte) {
         let open_pos = motion::char_to_pos(buf, buf.text.byte_to_char(open));
         let close_pos = motion::char_to_pos(buf, buf.text.byte_to_char(close));
@@ -3312,7 +3871,11 @@ async fn apply_edit(
         .buffers
         .get(&buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
-    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
 
     // Determine the byte/char range to replace, and the text to insert.
     let (start_pos, end_pos) = if let Some(anchor) = cursor.anchor {
@@ -3327,7 +3890,10 @@ async fn apply_edit(
         }
     };
     let (insert_text, select_pasted): (&str, bool) = match &edit {
-        EditKind::ReplaceWith { text, select_pasted } => (text.as_str(), *select_pasted),
+        EditKind::ReplaceWith {
+            text,
+            select_pasted,
+        } => (text.as_str(), *select_pasted),
         EditKind::DeleteMotion(_) => ("", false),
     };
 
@@ -3352,7 +3918,13 @@ async fn apply_edit(
     let cursors_before: HashMap<ClientId, CursorState> = s
         .cursors
         .iter()
-        .filter_map(|((c, b), cs)| if *b == buffer_id { Some((*c, *cs)) } else { None })
+        .filter_map(|((c, b), cs)| {
+            if *b == buffer_id {
+                Some((*c, *cs))
+            } else {
+                None
+            }
+        })
         .collect();
 
     // Mutate the buffer (rope edit + incremental reparse + undo-group bookkeeping).
@@ -3368,9 +3940,17 @@ async fn apply_edit(
         let anchor_pos = motion::char_to_pos(buf_mut, start_char);
         let position_pos = motion::char_to_pos(buf_mut, last_char);
         if anchor_pos == position_pos {
-            CursorState { position: position_pos, anchor: None, match_bracket: None }
+            CursorState {
+                position: position_pos,
+                anchor: None,
+                match_bracket: None,
+            }
         } else {
-            CursorState { position: position_pos, anchor: Some(anchor_pos), match_bracket: None }
+            CursorState {
+                position: position_pos,
+                anchor: Some(anchor_pos),
+                match_bracket: None,
+            }
         }
     } else {
         CursorState {
@@ -3402,10 +3982,17 @@ async fn apply_edit(
         if vp.buffer_id != buffer_id {
             continue;
         }
-        if !ranges_overlap(vp.first_logical_line, vp.last_logical_line_exclusive, edit_first, edit_last_excl) {
+        if !ranges_overlap(
+            vp.first_logical_line,
+            vp.last_logical_line_exclusive,
+            edit_first,
+            edit_last_excl,
+        ) {
             continue;
         }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else { continue };
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
         let search = s.searches.get(&(vp.client_id, buffer_id));
         let notif = build_lines_changed_notif(buf_ref, vp, revision, search);
         pushes.push((sender, notif));
@@ -3430,7 +4017,10 @@ async fn apply_edit(
         let _ = sender.send(notif).await;
     }
 
-    Ok(EditResult { revision, cursor: new_cursor_state })
+    Ok(EditResult {
+        revision,
+        cursor: new_cursor_state,
+    })
 }
 
 fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) -> bool {
@@ -3445,8 +4035,21 @@ fn build_lines_changed_notif(
 ) -> Notification {
     let line_count = buffer.line_count();
     let new_first = vp.first_logical_line.min(line_count);
-    let new_last_excl = vp.last_logical_line_exclusive.min(line_count).max(new_first);
-    let window = render_window(buffer, new_first, new_last_excl, vp.cols, vp.wrap, vp.continuation_marker_width, vp.tab_width, vp.rows, search);
+    let new_last_excl = vp
+        .last_logical_line_exclusive
+        .min(line_count)
+        .max(new_first);
+    let window = render_window(
+        buffer,
+        new_first,
+        new_last_excl,
+        vp.cols,
+        vp.wrap,
+        vp.continuation_marker_width,
+        vp.tab_width,
+        vp.rows,
+        search,
+    );
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
         revision,
@@ -3470,13 +4073,18 @@ fn build_lines_changed_notif(
 /// Build the buffer-picker candidate list for `client_id`: every live buffer, MRU first,
 /// then any buffers the client hasn't touched yet (e.g. opened by another client) in
 /// buffer-id order. `[scratch N]` placeholder display for buffers without a path.
-fn build_buffer_candidates(s: &ServerState, client_id: ClientId) -> Vec<picker_state::BufferCandidate> {
+fn build_buffer_candidates(
+    s: &ServerState,
+    client_id: ClientId,
+) -> Vec<picker_state::BufferCandidate> {
     let mut out: Vec<picker_state::BufferCandidate> = Vec::with_capacity(s.buffers.len());
     let mut seen: std::collections::HashSet<BufferId> = std::collections::HashSet::new();
 
     if let Some(mru) = s.mru_buffers.get(&client_id) {
         for &id in mru {
-            let Some(buf) = s.buffers.get(&id) else { continue };
+            let Some(buf) = s.buffers.get(&id) else {
+                continue;
+            };
             out.push(buffer_candidate(buf, &s.project_paths));
             seen.insert(id);
         }
@@ -3502,27 +4110,38 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
             .unwrap_or_else(|| p.display().to_string()),
         None => format!("[scratch {}]", buf.id),
     };
-    picker_state::BufferCandidate { buffer_id: buf.id, display, dirty: buf.dirty }
+    picker_state::BufferCandidate {
+        buffer_id: buf.id,
+        display,
+        dirty: buf.dirty,
+    }
 }
 
 /// Rebuild candidates for every subscribed `Buffers` picker, re-rank under the existing query,
 /// and collect the resulting `picker/update` pushes. Caller sends them after dropping the lock.
 /// Cheap when no picker is open: a HashMap scan over `pickers` and an early return.
-fn refresh_buffer_pickers(
-    s: &mut ServerState,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+fn refresh_buffer_pickers(s: &mut ServerState) -> Vec<(mpsc::Sender<Notification>, Notification)> {
     // Collect client_ids with a *subscribed* Buffers picker. Skip the rest — they may still
     // have persisted state from a prior session, but they're not waiting for pushes.
     let client_ids: Vec<ClientId> = s
         .pickers
         .iter()
-        .filter_map(|((c, k), p)| (*k == PickerKind::Buffers && p.subscribed.is_some()).then_some(*c))
+        .filter_map(|((c, k), p)| {
+            (*k == PickerKind::Buffers && p.subscribed.is_some()).then_some(*c)
+        })
         .collect();
     let mut pushes = Vec::new();
     for client_id in client_ids {
         let new_candidates = build_buffer_candidates(s, client_id);
-        let ServerState { pickers, matcher, clients, .. } = &mut *s;
-        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Buffers)) else { continue };
+        let ServerState {
+            pickers,
+            matcher,
+            clients,
+            ..
+        } = &mut *s;
+        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Buffers)) else {
+            continue;
+        };
         picker.candidates = picker_state::PickerCandidates::Buffers(new_candidates);
         picker.rerank(matcher);
         if let Some(window) = picker.subscribed.as_mut() {
@@ -3531,8 +4150,12 @@ fn refresh_buffer_pickers(
                 window.offset = total.saturating_sub(window.limit);
             }
         }
-        let Some(update) = picker_state::build_update(picker, matcher) else { continue };
-        let Some(sender) = clients.get(&client_id).map(|c| c.outbound.clone()) else { continue };
+        let Some(update) = picker_state::build_update(picker, matcher) else {
+            continue;
+        };
+        let Some(sender) = clients.get(&client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
         pushes.push((sender, picker_update_notif(update)));
     }
     pushes
@@ -3594,7 +4217,9 @@ pub async fn picker_view(
     // (Re-)hydrate picker state. `reset` always wipes; otherwise we keep whatever was persisted
     // from a prior `view`/`query`/`hide` cycle. Split-borrow `pickers` and `matcher` from `s`
     // so we can hold mutable references to both at once.
-    let ServerState { pickers, matcher, .. } = &mut *s;
+    let ServerState {
+        pickers, matcher, ..
+    } = &mut *s;
     if params.reset {
         pickers.remove(&key);
     }
@@ -3633,7 +4258,10 @@ pub async fn picker_view(
     if effective_offset >= total {
         effective_offset = total.saturating_sub(limit);
     }
-    picker.subscribed = Some(picker_state::SubscribedWindow { offset: effective_offset, limit });
+    picker.subscribed = Some(picker_state::SubscribedWindow {
+        offset: effective_offset,
+        limit,
+    });
 
     // Build the initial push so the client doesn't have to wait for an async update to arrive
     // before it can render. Caller will treat the response and the notification as redundant.
@@ -3662,7 +4290,9 @@ pub async fn picker_query(
     let client_id = ctx.require_hello()?;
     let mut s = state.lock().await;
     let key = (client_id, params.kind);
-    let ServerState { pickers, matcher, .. } = &mut *s;
+    let ServerState {
+        pickers, matcher, ..
+    } = &mut *s;
     let Some(picker) = pickers.get_mut(&key) else {
         // No-op if the client never opened the picker. Could also error; silently dropping
         // matches the lenient style of other handlers.
@@ -3699,7 +4329,10 @@ pub async fn picker_select(
     let s = state.lock().await;
     let key = (client_id, params.kind);
     let picker = s.pickers.get(&key).ok_or_else(|| {
-        RpcError::new(ErrorCode::INVALID_REQUEST, "no active picker for this client")
+        RpcError::new(
+            ErrorCode::INVALID_REQUEST,
+            "no active picker for this client",
+        )
     })?;
     picker_state::resolve_select(picker, &params.item).ok_or_else(|| {
         RpcError::invalid_params("selected item is not in the picker's candidate set")
@@ -3718,4 +4351,3 @@ pub async fn picker_hide(
     }
     Ok(())
 }
-

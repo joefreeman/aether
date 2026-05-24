@@ -64,9 +64,10 @@ impl PickerCandidates {
     /// Build the protocol-level `PickerItem` for candidate `idx` with the given match indices.
     pub fn make_item(&self, idx: usize, match_indices: Vec<u32>) -> PickerItem {
         match self {
-            PickerCandidates::Files(v) => {
-                PickerItem::File { path: v[idx].display.clone(), match_indices }
-            }
+            PickerCandidates::Files(v) => PickerItem::File {
+                path: v[idx].display.clone(),
+                match_indices,
+            },
             PickerCandidates::Buffers(v) => {
                 let c = &v[idx];
                 PickerItem::Buffer {
@@ -96,10 +97,12 @@ impl PickerCandidates {
     /// Produce the per-kind result of `picker/select` for candidate `idx`.
     pub fn select_result(&self, idx: usize) -> PickerSelectResult {
         match self {
-            PickerCandidates::Files(v) => PickerSelectResult::File { path: v[idx].abs.clone() },
-            PickerCandidates::Buffers(v) => {
-                PickerSelectResult::Buffer { buffer_id: v[idx].buffer_id }
-            }
+            PickerCandidates::Files(v) => PickerSelectResult::File {
+                path: v[idx].abs.clone(),
+            },
+            PickerCandidates::Buffers(v) => PickerSelectResult::Buffer {
+                buffer_id: v[idx].buffer_id,
+            },
         }
     }
 }
@@ -130,7 +133,14 @@ impl PickerState {
     pub fn new(candidates: PickerCandidates) -> Self {
         let kind = candidates.kind();
         let ranked: Vec<u32> = (0..candidates.len() as u32).collect();
-        Self { kind, query: String::new(), generation: 0, ranked, candidates, subscribed: None }
+        Self {
+            kind,
+            query: String::new(),
+            generation: 0,
+            ranked,
+            candidates,
+            subscribed: None,
+        }
     }
 
     /// Recompute the ranked match list against the current candidates and query. Cheap for
@@ -162,7 +172,10 @@ impl PickerState {
     /// item is no longer present (file deleted, buffer closed, no longer matches the query, ...).
     pub fn rank_of(&self, item: &PickerItem) -> Option<u32> {
         let cand_idx = self.candidates.position_of(item)? as u32;
-        self.ranked.iter().position(|&ci| ci == cand_idx).map(|p| p as u32)
+        self.ranked
+            .iter()
+            .position(|&ci| ci == cand_idx)
+            .map(|p| p as u32)
     }
 
     /// Build the items + match indices for the subscribed window. Returns the slice items and
@@ -177,7 +190,11 @@ impl PickerState {
         let start = offset.min(total);
         let end = start.saturating_add(limit).min(total);
         let pattern = if !self.query.is_empty() {
-            Some(Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart))
+            Some(Pattern::parse(
+                &self.query,
+                CaseMatching::Smart,
+                Normalization::Smart,
+            ))
         } else {
             None
         };
@@ -208,10 +225,7 @@ impl PickerState {
 
 /// Construct a `PickerUpdateParams` for the current window. Mirrors `build_window_items` plus
 /// the metadata fields. Caller is responsible for `generation` matching the latest query.
-pub fn build_update(
-    state: &PickerState,
-    matcher: &mut Matcher,
-) -> Option<PickerUpdateParams> {
+pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<PickerUpdateParams> {
     let window = state.subscribed?;
     let (offset, items) = state.build_window_items(window.offset, window.limit, matcher);
     Some(PickerUpdateParams {

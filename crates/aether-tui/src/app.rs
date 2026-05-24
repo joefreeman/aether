@@ -9,33 +9,32 @@ use aether_protocol::buffer::{
     BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferState,
     BufferStateParams, CopyScope,
 };
+use aether_protocol::cursor::{
+    CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams, CursorRedo,
+    CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
+    CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
+    Direction, Motion, VerticalDirection, WordBoundary,
+};
 use aether_protocol::directory::{
     DirEntry, DirectoryCreate, DirectoryCreateParams, DirectoryList, DirectoryListParams,
     DirectoryListResult,
 };
-use aether_protocol::search::{
-    SearchClear, SearchClearParams, SearchNavParams, SearchNext, SearchPrev, SearchSet,
-    SearchSetParams, SearchStateChanged, SearchSummary,
-};
-use aether_protocol::cursor::{
-    CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams,
-    CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
-    CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
-    Direction, Motion, VerticalDirection, WordBoundary,
-};
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
+use aether_protocol::handshake::ClientHelloResult;
+use aether_protocol::input::{
+    BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
+    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
+    InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
+};
 use aether_protocol::picker::{
     PickerHide, PickerHideParams, PickerKind, PickerQuery, PickerQueryParams, PickerSelect,
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
     PickerViewParams,
 };
-use aether_protocol::handshake::ClientHelloResult;
-use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
-    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
-    InputText, InputTextParams, InputToggleComment,
-    InputUndo, UndoResult,
+use aether_protocol::search::{
+    SearchClear, SearchClearParams, SearchNavParams, SearchNext, SearchPrev, SearchSet,
+    SearchSetParams, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::viewport::{
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
@@ -50,12 +49,12 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use tokio::sync::mpsc;
 use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{stdout, Stdout};
+use tokio::sync::mpsc;
 
 /// Editor-screen sub-mode. Only meaningful inside `Screen::Editing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -336,7 +335,11 @@ pub async fn bootstrap(
             let abs = if raw.is_absolute() {
                 Some(raw.to_path_buf())
             } else {
-                hello.project.paths.first().map(|root| std::path::Path::new(root).join(raw))
+                hello
+                    .project
+                    .paths
+                    .first()
+                    .map(|root| std::path::Path::new(root).join(raw))
             };
             abs.filter(|p| p.is_dir()).map(|p| p.display().to_string())
         }
@@ -354,14 +357,18 @@ pub async fn bootstrap(
         picker: crate::picker::PickerState::default(),
         save_prompt: None,
         // Placeholder — replaced below by either a freshly-opened editor or the file browser.
-        screen: Screen::Browsing(BrowsingState { file_browser: FileBrowserState::default() }),
+        screen: Screen::Browsing(BrowsingState {
+            file_browser: FileBrowserState::default(),
+        }),
     };
 
     let project_paths = hello.project.paths.clone();
     if let Some(dir) = browse_dir {
         // Starting with a directory: load the browser, no buffer is opened. The user picks
         // a file (or hits `Ctrl-n` for a scratch) to enter editing.
-        let mut browsing = BrowsingState { file_browser: FileBrowserState::default() };
+        let mut browsing = BrowsingState {
+            file_browser: FileBrowserState::default(),
+        };
         load_file_browser_into(client, &mut browsing.file_browser, Some(dir)).await?;
         state.screen = Screen::Browsing(browsing);
         return Ok(state);
@@ -419,7 +426,10 @@ async fn open_buffer_and_subscribe(
     let open: BufferOpenResult = client
         .rpc::<aether_protocol::buffer::BufferOpen>(open_params)
         .await?;
-    let initial_scroll = open.scroll.unwrap_or(ScrollPosition { logical_line: 0, sub_row: 0.0 });
+    let initial_scroll = open.scroll.unwrap_or(ScrollPosition {
+        logical_line: 0,
+        sub_row: 0.0,
+    });
     let sub: ViewportSubscribeResult = client
         .rpc::<ViewportSubscribe>(ViewportSubscribeParams {
             buffer_id: open.buffer_id,
@@ -605,8 +615,10 @@ fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
     state.editor_mut().revision = p.revision;
     state.editor_mut().line_count = p.line_count;
     state.editor_mut().max_scroll_logical_line = p.max_scroll_logical_line;
-    let local_start = (p.range.start_logical_line as i64) - (state.editor_mut().window_first_logical_line as i64);
-    let local_end = (p.range.end_logical_line_exclusive as i64) - (state.editor_mut().window_first_logical_line as i64);
+    let local_start =
+        (p.range.start_logical_line as i64) - (state.editor_mut().window_first_logical_line as i64);
+    let local_end = (p.range.end_logical_line_exclusive as i64)
+        - (state.editor_mut().window_first_logical_line as i64);
     if local_end < 0 || local_start > state.editor_mut().lines.len() as i64 {
         return;
     }
@@ -761,7 +773,10 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
     if let KeyCode::Char(c @ '1'..='9') = code {
         if mods == KeyModifiers::NONE {
             let ed = state.editor_mut();
-            ed.pending_count = ed.pending_count.saturating_mul(10).saturating_add(c.to_digit(10).unwrap_or(0));
+            ed.pending_count = ed
+                .pending_count
+                .saturating_mul(10)
+                .saturating_add(c.to_digit(10).unwrap_or(0));
             return Ok(());
         }
     }
@@ -773,7 +788,11 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
     }
 
     // Whatever this command consumes for `count`, reset after.
-    let count = if state.editor_mut().pending_count == 0 { 1 } else { state.editor_mut().pending_count };
+    let count = if state.editor_mut().pending_count == 0 {
+        1
+    } else {
+        state.editor_mut().pending_count
+    };
     state.editor_mut().pending_count = 0;
 
     let extend = mods.contains(KeyModifiers::SHIFT);
@@ -788,7 +807,9 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             // current selection instead.
             if state.editor_mut().search.active || state.editor_mut().search.summary.is_some() {
                 let _ = client
-                    .rpc::<SearchClear>(SearchClearParams { buffer_id: state.editor_mut().buffer_id })
+                    .rpc::<SearchClear>(SearchClearParams {
+                        buffer_id: state.editor_mut().buffer_id,
+                    })
                     .await;
             }
             state.editor_mut().search.active = false;
@@ -808,16 +829,20 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::End, _) => move_motion(client, state, Motion::LineEnd, extend).await?,
         (KeyCode::PageDown, _) => scroll_lines(state, state.viewport_rows as i64),
         (KeyCode::PageUp, _) => scroll_lines(state, -(state.viewport_rows as i64)),
-        (KeyCode::Up, m) if m.contains(KeyModifiers::ALT) =>
-            scroll_lines(state, -((state.viewport_rows / 2) as i64)),
-        (KeyCode::Down, m) if m.contains(KeyModifiers::ALT) =>
-            scroll_lines(state, (state.viewport_rows / 2) as i64),
+        (KeyCode::Up, m) if m.contains(KeyModifiers::ALT) => {
+            scroll_lines(state, -((state.viewport_rows / 2) as i64))
+        }
+        (KeyCode::Down, m) if m.contains(KeyModifiers::ALT) => {
+            scroll_lines(state, (state.viewport_rows / 2) as i64)
+        }
         (KeyCode::Up, _) => scroll_lines(state, -1),
         (KeyCode::Down, _) => scroll_lines(state, 1),
-        (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) =>
-            scroll_cols(state, -((state.viewport_cols / 2) as i64)),
-        (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) =>
-            scroll_cols(state, (state.viewport_cols / 2) as i64),
+        (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => {
+            scroll_cols(state, -((state.viewport_cols / 2) as i64))
+        }
+        (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => {
+            scroll_cols(state, (state.viewport_cols / 2) as i64)
+        }
         (KeyCode::Left, _) => scroll_cols(state, -1),
         (KeyCode::Right, _) => scroll_cols(state, 1),
 
@@ -826,67 +851,227 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // line. `j/k` move by logical line; `Alt-j/k` move by one visual row (the only "visual"
         // motion now — used to step inside wrapped content). `0` (below) goes to literal col 0
         // for cases where you want column zero, not first non-blank.
-        (KeyCode::Char('h'), m) if m.contains(KeyModifiers::ALT) =>
-            move_motion(client, state, Motion::LineFirstNonblank, extend).await?,
-        (KeyCode::Char('h'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            move_motion(client, state, Motion::Char { direction: Direction::Backward, count }, extend).await?,
-        (KeyCode::Char('l'), m) if m.contains(KeyModifiers::ALT) =>
-            move_motion(client, state, Motion::LineEnd, extend).await?,
-        (KeyCode::Char('l'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            move_motion(client, state, Motion::Char { direction: Direction::Forward, count }, extend).await?,
+        (KeyCode::Char('h'), m) if m.contains(KeyModifiers::ALT) => {
+            move_motion(client, state, Motion::LineFirstNonblank, extend).await?
+        }
+        (KeyCode::Char('h'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            move_motion(
+                client,
+                state,
+                Motion::Char {
+                    direction: Direction::Backward,
+                    count,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('l'), m) if m.contains(KeyModifiers::ALT) => {
+            move_motion(client, state, Motion::LineEnd, extend).await?
+        }
+        (KeyCode::Char('l'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            move_motion(
+                client,
+                state,
+                Motion::Char {
+                    direction: Direction::Forward,
+                    count,
+                },
+                extend,
+            )
+            .await?
+        }
         (KeyCode::Char('k'), m) if m.contains(KeyModifiers::ALT) => {
             let viewport_id = state.editor().viewport_id;
-            move_motion(client, state, Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count }, extend).await?
-        },
-        (KeyCode::Char('k'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            move_motion(client, state, Motion::LogicalLine { direction: Direction::Backward, count, preserve_col: true }, extend).await?,
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction: VerticalDirection::Up,
+                    count,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('k'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            move_motion(
+                client,
+                state,
+                Motion::LogicalLine {
+                    direction: Direction::Backward,
+                    count,
+                    preserve_col: true,
+                },
+                extend,
+            )
+            .await?
+        }
         (KeyCode::Char('j'), m) if m.contains(KeyModifiers::ALT) => {
             let viewport_id = state.editor().viewport_id;
-            move_motion(client, state, Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count }, extend).await?
-        },
-        (KeyCode::Char('j'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            move_motion(client, state, Motion::LogicalLine { direction: Direction::Forward, count, preserve_col: true }, extend).await?,
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction: VerticalDirection::Down,
+                    count,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('j'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            move_motion(
+                client,
+                state,
+                Motion::LogicalLine {
+                    direction: Direction::Forward,
+                    count,
+                    preserve_col: true,
+                },
+                extend,
+            )
+            .await?
+        }
 
         // ---- motions: WORD (w/b/e) and Alt for word ----
         // Plain `w/b/e` use big WORDs (whitespace-delimited); `Alt-w/b/e` use small words
         // (alphanumeric/symbol category transitions). Forward `w` is exclusive when extending —
         // Shift-w selects up to (but not including) the start of the next WORD, matching the
         // vim/helix convention that operator-style selections don't bleed into the next word.
-        (KeyCode::Char('w'), m) if m.contains(KeyModifiers::ALT) =>
-            move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::Word, exclusive: extend }, extend).await?,
-        (KeyCode::Char('w'), m) if !m.contains(KeyModifiers::CONTROL) =>
-            move_motion(client, state, Motion::Word { direction: Direction::Forward, count, boundary: WordBoundary::BigWord, exclusive: extend }, extend).await?,
-        (KeyCode::Char('b'), m) if m.contains(KeyModifiers::ALT) =>
-            move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::Word, exclusive: false }, extend).await?,
-        (KeyCode::Char('b'), m) if !m.contains(KeyModifiers::CONTROL) =>
-            move_motion(client, state, Motion::Word { direction: Direction::Backward, count, boundary: WordBoundary::BigWord, exclusive: false }, extend).await?,
-        (KeyCode::Char('e'), m) if m.contains(KeyModifiers::ALT) =>
-            move_motion(client, state, Motion::WordEnd { direction: Direction::Forward, count, boundary: WordBoundary::Word }, extend).await?,
-        (KeyCode::Char('e'), _) =>
-            move_motion(client, state, Motion::WordEnd { direction: Direction::Forward, count, boundary: WordBoundary::BigWord }, extend).await?,
+        (KeyCode::Char('w'), m) if m.contains(KeyModifiers::ALT) => {
+            move_motion(
+                client,
+                state,
+                Motion::Word {
+                    direction: Direction::Forward,
+                    count,
+                    boundary: WordBoundary::Word,
+                    exclusive: extend,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('w'), m) if !m.contains(KeyModifiers::CONTROL) => {
+            move_motion(
+                client,
+                state,
+                Motion::Word {
+                    direction: Direction::Forward,
+                    count,
+                    boundary: WordBoundary::BigWord,
+                    exclusive: extend,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('b'), m) if m.contains(KeyModifiers::ALT) => {
+            move_motion(
+                client,
+                state,
+                Motion::Word {
+                    direction: Direction::Backward,
+                    count,
+                    boundary: WordBoundary::Word,
+                    exclusive: false,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('b'), m) if !m.contains(KeyModifiers::CONTROL) => {
+            move_motion(
+                client,
+                state,
+                Motion::Word {
+                    direction: Direction::Backward,
+                    count,
+                    boundary: WordBoundary::BigWord,
+                    exclusive: false,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('e'), m) if m.contains(KeyModifiers::ALT) => {
+            move_motion(
+                client,
+                state,
+                Motion::WordEnd {
+                    direction: Direction::Forward,
+                    count,
+                    boundary: WordBoundary::Word,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('e'), _) => {
+            move_motion(
+                client,
+                state,
+                Motion::WordEnd {
+                    direction: Direction::Forward,
+                    count,
+                    boundary: WordBoundary::BigWord,
+                },
+                extend,
+            )
+            .await?
+        }
 
         // ---- motions: line start ----
-        (KeyCode::Char('0'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            move_motion(client, state, Motion::LineStart, extend).await?,
+        (KeyCode::Char('0'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            move_motion(client, state, Motion::LineStart, extend).await?
+        }
 
         // ---- motions: find char (`f`/`t` + Alt for backward, Shift to extend) ----
         // After pressing one of these, the *next* keystroke is interpreted as the target
         // character (see the `pending_find` block at the top of this handler).
-        (KeyCode::Char('f'), m) if m.contains(KeyModifiers::ALT) =>
-            state.editor_mut().pending_find = Some(PendingFind { direction: Direction::Backward, till: false, extend, count }),
-        (KeyCode::Char('f'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            state.editor_mut().pending_find = Some(PendingFind { direction: Direction::Forward, till: false, extend, count }),
-        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::ALT) =>
-            state.editor_mut().pending_find = Some(PendingFind { direction: Direction::Backward, till: true, extend, count }),
-        (KeyCode::Char('t'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            state.editor_mut().pending_find = Some(PendingFind { direction: Direction::Forward, till: true, extend, count }),
+        (KeyCode::Char('f'), m) if m.contains(KeyModifiers::ALT) => {
+            state.editor_mut().pending_find = Some(PendingFind {
+                direction: Direction::Backward,
+                till: false,
+                extend,
+                count,
+            })
+        }
+        (KeyCode::Char('f'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            state.editor_mut().pending_find = Some(PendingFind {
+                direction: Direction::Forward,
+                till: false,
+                extend,
+                count,
+            })
+        }
+        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::ALT) => {
+            state.editor_mut().pending_find = Some(PendingFind {
+                direction: Direction::Backward,
+                till: true,
+                extend,
+                count,
+            })
+        }
+        (KeyCode::Char('t'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            state.editor_mut().pending_find = Some(PendingFind {
+                direction: Direction::Forward,
+                till: true,
+                extend,
+                count,
+            })
+        }
 
         // ---- motion: matching bracket ----
         // `m` jumps to the bracket that matches the one under (or enclosing) the cursor.
         // `Shift-m` does the same with `extend=true`, producing a selection from the original
         // position to the match — a natural "select around brackets" gesture (Vim's `v%`).
-        (KeyCode::Char('m'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            move_motion(client, state, Motion::MatchBracket, extend).await?,
+        (KeyCode::Char('m'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            move_motion(client, state, Motion::MatchBracket, extend).await?
+        }
 
         // ---- motions: navigation units ----
         // `]` / `[` *navigate between* per-language navigation units (function, struct, HTML
@@ -898,24 +1083,34 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // selection. Use `}` on a function header to select the whole function; use `{` to
         // select from the cursor back to the function's start. Unlike `]`/`[` they don't have
         // a "next" hop, so they work on the last unit in a container too.
-        (KeyCode::Char(']'), m) if m == KeyModifiers::NONE =>
-            move_motion(client, state, Motion::NextNavigationUnit, false).await?,
-        (KeyCode::Char('['), m) if m == KeyModifiers::NONE =>
-            move_motion(client, state, Motion::PrevNavigationUnit, false).await?,
-        (KeyCode::Char('}'), _) =>
-            move_motion(client, state, Motion::EndOfNavigationUnit, true).await?,
-        (KeyCode::Char('{'), _) =>
-            move_motion(client, state, Motion::StartOfNavigationUnit, true).await?,
+        (KeyCode::Char(']'), m) if m == KeyModifiers::NONE => {
+            move_motion(client, state, Motion::NextNavigationUnit, false).await?
+        }
+        (KeyCode::Char('['), m) if m == KeyModifiers::NONE => {
+            move_motion(client, state, Motion::PrevNavigationUnit, false).await?
+        }
+        (KeyCode::Char('}'), _) => {
+            move_motion(client, state, Motion::EndOfNavigationUnit, true).await?
+        }
+        (KeyCode::Char('{'), _) => {
+            move_motion(client, state, Motion::StartOfNavigationUnit, true).await?
+        }
 
         // ---- motions: goto line ----
         // `g` jumps to line N (1-indexed; no prefix = line 1). `Alt-g` jumps to the last line.
         // Shift extends the selection. The server clamps line numbers past EOF.
         (KeyCode::Char('g'), m) if m.contains(KeyModifiers::ALT) => {
-            let target = LogicalPosition { line: state.editor_mut().line_count.saturating_sub(1), col: 0 };
+            let target = LogicalPosition {
+                line: state.editor_mut().line_count.saturating_sub(1),
+                col: 0,
+            };
             move_motion(client, state, Motion::Goto { position: target }, extend).await?
         }
         (KeyCode::Char('g'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            let target = LogicalPosition { line: count.saturating_sub(1), col: 0 };
+            let target = LogicalPosition {
+                line: count.saturating_sub(1),
+                col: 0,
+            };
             move_motion(client, state, Motion::Goto { position: target }, extend).await?
         }
 
@@ -926,10 +1121,12 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // keep the other edge in place (extending); the non-shift variants collapse onto a single
         // line at the moved edge. The cursor stays on whichever end (top/bottom) it was on, so
         // the bindings behave the same after `o` flips the selection direction.
-        (KeyCode::Char('x'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            select_line(client, state, Direction::Forward, extend, count).await?,
-        (KeyCode::Char('x'), m) if m.contains(KeyModifiers::ALT) =>
-            select_line(client, state, Direction::Backward, extend, count).await?,
+        (KeyCode::Char('x'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            select_line(client, state, Direction::Forward, extend, count).await?
+        }
+        (KeyCode::Char('x'), m) if m.contains(KeyModifiers::ALT) => {
+            select_line(client, state, Direction::Backward, extend, count).await?
+        }
 
         // ---- selection manipulation ----
         // `o` swaps the cursor and anchor — flips which end of the selection is the "leading"
@@ -938,13 +1135,19 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         // Tree-sitter selection expansion / contraction. `,` grows the selection to the smallest
         // enclosing syntax node; `.` reverses one step. With `N` prefix, applied N times.
-        (KeyCode::Char(','), m) if m == KeyModifiers::NONE => tree_expand(client, state, count).await?,
-        (KeyCode::Char('.'), m) if m == KeyModifiers::NONE => tree_contract(client, state, count).await?,
+        (KeyCode::Char(','), m) if m == KeyModifiers::NONE => {
+            tree_expand(client, state, count).await?
+        }
+        (KeyCode::Char('.'), m) if m == KeyModifiers::NONE => {
+            tree_contract(client, state, count).await?
+        }
 
         // Motion undo / redo — per-client history of cursor/selection changes, capped at the
         // last buffer mutation. Distinct from `Ctrl-u`/`Ctrl-Alt-u` which rewind buffer edits.
         (KeyCode::Char('u'), m) if m == ALT_ONLY => motion_redo(client, state, count).await?,
-        (KeyCode::Char('u'), m) if m == KeyModifiers::NONE => motion_undo(client, state, count).await?,
+        (KeyCode::Char('u'), m) if m == KeyModifiers::NONE => {
+            motion_undo(client, state, count).await?
+        }
 
         // Repeat the last *repeatable* motion (see `is_repeatable_motion`). `r` runs it as a
         // plain cursor move; `Shift-r` runs it extending the current selection. `Nr` loops the
@@ -958,10 +1161,18 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         }
 
         // ---- mode transitions ----
-        (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionStart).await?,
-        (KeyCode::Char('a'), m) if m == KeyModifiers::NONE => enter_insert_at(client, state, InsertWhere::SelectionEnd).await?,
-        (KeyCode::Char('i'), m) if m == ALT_ONLY => enter_insert_at(client, state, InsertWhere::FirstLineStart).await?,
-        (KeyCode::Char('a'), m) if m == ALT_ONLY => enter_insert_at(client, state, InsertWhere::LastLineEnd).await?,
+        (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => {
+            enter_insert_at(client, state, InsertWhere::SelectionStart).await?
+        }
+        (KeyCode::Char('a'), m) if m == KeyModifiers::NONE => {
+            enter_insert_at(client, state, InsertWhere::SelectionEnd).await?
+        }
+        (KeyCode::Char('i'), m) if m == ALT_ONLY => {
+            enter_insert_at(client, state, InsertWhere::FirstLineStart).await?
+        }
+        (KeyCode::Char('a'), m) if m == ALT_ONLY => {
+            enter_insert_at(client, state, InsertWhere::LastLineEnd).await?
+        }
 
         // ---- viewport ----
         (KeyCode::Char('w'), CTRL_ONLY) => toggle_wrap(client, state).await?,
@@ -972,25 +1183,48 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         // ---- edits ----
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
-        (KeyCode::Char('s'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
-            begin_save_prompt(state),
-        (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
-            redo(client, state, count).await?,
+        (KeyCode::Char('s'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
+            begin_save_prompt(state)
+        }
+        (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
+            redo(client, state, count).await?
+        }
         (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, count).await?,
-        (KeyCode::Char('j'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Down, count).await?,
-        (KeyCode::Char('k'), CTRL_ONLY) => move_lines(client, state, VerticalDirection::Up, count).await?,
+        (KeyCode::Char('j'), CTRL_ONLY) => {
+            move_lines(client, state, VerticalDirection::Down, count).await?
+        }
+        (KeyCode::Char('k'), CTRL_ONLY) => {
+            move_lines(client, state, VerticalDirection::Up, count).await?
+        }
         (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state, count).await?,
         (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state, count).await?,
         (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state, count).await?,
         (KeyCode::Char('b'), CTRL_ONLY) => toggle_comment(client, state).await?,
-        (KeyCode::Char('o'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
-            open_line_above(client, state).await?,
+        (KeyCode::Char('o'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
+            open_line_above(client, state).await?
+        }
         (KeyCode::Char('o'), CTRL_ONLY) => open_line_below(client, state).await?,
         (KeyCode::Char('d'), CTRL_ONLY) | (KeyCode::Delete, _) => {
-            delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count }).await?
+            delete_with_motion(
+                client,
+                state,
+                Motion::Char {
+                    direction: Direction::Forward,
+                    count,
+                },
+            )
+            .await?
         }
         (KeyCode::Backspace, _) => {
-            delete_with_motion(client, state, Motion::Char { direction: Direction::Backward, count }).await?
+            delete_with_motion(
+                client,
+                state,
+                Motion::Char {
+                    direction: Direction::Backward,
+                    count,
+                },
+            )
+            .await?
         }
 
         // ---- change ----
@@ -999,31 +1233,39 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('c'), CTRL_ONLY) => change_selection(client, state).await?,
 
         // ---- clipboard ----
-        (KeyCode::Char('y'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Selection).await?,
-        (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Selection).await?,
+        (KeyCode::Char('y'), CTRL_ONLY) => {
+            copy_to_clipboard(client, state, CopyScope::Selection).await?
+        }
+        (KeyCode::Char('x'), CTRL_ONLY) => {
+            cut_to_clipboard(client, state, CopyScope::Selection).await?
+        }
         (KeyCode::Char('p'), CTRL_ONLY) => paste_before(client, state, count).await?,
         (KeyCode::Char('r'), CTRL_ONLY) => paste_replace(client, state, count).await?,
 
         // ---- leader (Space) ----
         // `Space` starts a multi-key chord; the next keystroke selects the action. See
         // `handle_leader_key`.
-        (KeyCode::Char(' '), m) if m == KeyModifiers::NONE =>
-            state.pending_leader = Some(PendingLeader::Space),
+        (KeyCode::Char(' '), m) if m == KeyModifiers::NONE => {
+            state.pending_leader = Some(PendingLeader::Space)
+        }
 
         // ---- file browser ----
         // `-` lists the parent of the current file (or the first project path if scratch).
-        (KeyCode::Char('-'), m) if m == KeyModifiers::NONE =>
-            open_file_browser(client, state).await?,
+        (KeyCode::Char('-'), m) if m == KeyModifiers::NONE => {
+            open_file_browser(client, state).await?
+        }
 
         // ---- search ----
-        (KeyCode::Char('/'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            enter_search_mode(client, state).await?,
-        (KeyCode::Char('/'), m) if m == ALT_ONLY =>
-            search_from_selection(client, state).await?,
-        (KeyCode::Char('n'), m) if m.contains(KeyModifiers::ALT) =>
-            search_cycle(client, state, Direction::Backward, count).await?,
-        (KeyCode::Char('n'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY =>
-            search_cycle(client, state, Direction::Forward, count).await?,
+        (KeyCode::Char('/'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            enter_search_mode(client, state).await?
+        }
+        (KeyCode::Char('/'), m) if m == ALT_ONLY => search_from_selection(client, state).await?,
+        (KeyCode::Char('n'), m) if m.contains(KeyModifiers::ALT) => {
+            search_cycle(client, state, Direction::Backward, count).await?
+        }
+        (KeyCode::Char('n'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            search_cycle(client, state, Direction::Forward, count).await?
+        }
 
         _ => {}
     }
@@ -1065,11 +1307,7 @@ fn picker_limit(state: &AppState) -> u32 {
     crate::ui::picker_result_rows(state.viewport_cols, state.viewport_rows).max(1)
 }
 
-async fn open_picker(
-    client: &mut Client,
-    state: &mut AppState,
-    kind: PickerKind,
-) -> Result<()> {
+async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind) -> Result<()> {
     let limit = picker_limit(state);
     // The Buffers picker always opens fresh — empty query, top of the MRU list. Its job is
     // "switch to a recent buffer right now", not "resume a search session"; persisting the
@@ -1116,11 +1354,7 @@ fn kind_preserves_state(kind: PickerKind) -> bool {
     }
 }
 
-async fn handle_picker_key(
-    client: &mut Client,
-    state: &mut AppState,
-    k: KeyEvent,
-) -> Result<()> {
+async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
     // Keep query input case-sensitive (so smartcase works), so skip `normalize_key`.
     match (k.code, k.modifiers) {
         (KeyCode::Esc, _) => hide_picker(client, state).await?,
@@ -1154,7 +1388,9 @@ async fn handle_picker_key(
                 send_picker_query(client, state).await?;
             }
         }
-        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
             state.picker.query.insert_char(c);
             send_picker_query(client, state).await?;
         }
@@ -1206,7 +1442,12 @@ async fn picker_move_selection(
         let new_offset = if delta < 0 {
             state.picker.offset.saturating_sub(step)
         } else {
-            (state.picker.offset + step).min(state.picker.total_matches.saturating_sub(state.picker.limit))
+            (state.picker.offset + step).min(
+                state
+                    .picker
+                    .total_matches
+                    .saturating_sub(state.picker.limit),
+            )
         };
         if new_offset != state.picker.offset {
             request_picker_window(client, state, new_offset).await?;
@@ -1216,7 +1457,9 @@ async fn picker_move_selection(
 }
 
 async fn send_picker_query(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let Some(kind) = state.picker.kind else { return Ok(()) };
+    let Some(kind) = state.picker.kind else {
+        return Ok(());
+    };
     state.picker.generation = state.picker.generation.wrapping_add(1);
     state.picker.offset = 0;
     state.picker.selected = 0;
@@ -1238,7 +1481,9 @@ async fn request_picker_window(
     state: &mut AppState,
     new_offset: u32,
 ) -> Result<()> {
-    let Some(kind) = state.picker.kind else { return Ok(()) };
+    let Some(kind) = state.picker.kind else {
+        return Ok(());
+    };
     let limit = state.picker.limit;
     let view = client
         .rpc::<PickerView>(PickerViewParams {
@@ -1261,14 +1506,21 @@ async fn request_picker_window(
 }
 
 async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let Some(kind) = state.picker.kind else { return Ok(()) };
-    let Some(item) = state.picker.highlighted().cloned() else { return Ok(()) };
+    let Some(kind) = state.picker.kind else {
+        return Ok(());
+    };
+    let Some(item) = state.picker.highlighted().cloned() else {
+        return Ok(());
+    };
     if kind_preserves_state(kind) {
         state.picker.last_selected.insert(kind, item.clone());
     }
 
     let result = client
-        .rpc::<PickerSelect>(PickerSelectParams { kind, item: item.clone() })
+        .rpc::<PickerSelect>(PickerSelectParams {
+            kind,
+            item: item.clone(),
+        })
         .await?;
     // Implicit hide: server keeps state alive for resume, just stops pushing.
     let _ = client.rpc::<PickerHide>(PickerHideParams { kind }).await;
@@ -1294,7 +1546,11 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
 /// Subscribes a fresh viewport and restores per-buffer cursor + scroll from the server. No-op
 /// in the sense that the buffer's contents and per-client state already exist server-side —
 /// we're just rebinding the client to it.
-async fn attach_buffer(client: &mut Client, state: &mut AppState, buffer_id: BufferId) -> Result<()> {
+async fn attach_buffer(
+    client: &mut Client,
+    state: &mut AppState,
+    buffer_id: BufferId,
+) -> Result<()> {
     if state.try_editor().map(|e| e.buffer_id) == Some(buffer_id) {
         // Already attached. Skip the round-trip; the picker's "current at position 0" feature
         // makes selecting the current buffer a frequent no-op.
@@ -1336,7 +1592,10 @@ async fn subscribe_to_buffer(
     state: &mut AppState,
     open: BufferOpenResult,
 ) -> Result<()> {
-    let initial_scroll = open.scroll.unwrap_or(ScrollPosition { logical_line: 0, sub_row: 0.0 });
+    let initial_scroll = open.scroll.unwrap_or(ScrollPosition {
+        logical_line: 0,
+        sub_row: 0.0,
+    });
     // Inherit wrap from the current editor if we have one; otherwise default. Lets `Space b`
     // from the browser land in a freshly subscribed viewport without losing the user's prior
     // wrap setting if they had one.
@@ -1402,7 +1661,9 @@ fn project_relative_label(abs: &str, project_paths: &[String]) -> String {
 }
 
 async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let Some(kind) = state.picker.kind else { return Ok(()) };
+    let Some(kind) = state.picker.kind else {
+        return Ok(());
+    };
     // Persist the highlight so the next open resumes here — only for kinds that preserve
     // state. The server's own per-picker state is independent: we always send `picker/hide`
     // so it stops pushing; whether to reset on next open is decided in `open_picker`.
@@ -1424,36 +1685,108 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
         // Allow Ctrl-S / Ctrl-Alt-S / Ctrl-U / Ctrl-Alt-U to work in insert mode too.
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
-        (KeyCode::Char('s'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
-            begin_save_prompt(state),
-        (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
-            redo(client, state, 1).await?,
+        (KeyCode::Char('s'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
+            begin_save_prompt(state)
+        }
+        (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
+            redo(client, state, 1).await?
+        }
         (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, 1).await?,
 
         // Clipboard: in insert mode copy/cut operate on the current line.
-        (KeyCode::Char('y'), CTRL_ONLY) => copy_to_clipboard(client, state, CopyScope::Line).await?,
+        (KeyCode::Char('y'), CTRL_ONLY) => {
+            copy_to_clipboard(client, state, CopyScope::Line).await?
+        }
         (KeyCode::Char('x'), CTRL_ONLY) => cut_to_clipboard(client, state, CopyScope::Line).await?,
         (KeyCode::Char('p'), CTRL_ONLY) => paste_at_cursor(client, state).await?,
 
-        (KeyCode::Backspace, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Backward, count: 1 }).await?,
-        (KeyCode::Delete, _) => delete_with_motion(client, state, Motion::Char { direction: Direction::Forward, count: 1 }).await?,
+        (KeyCode::Backspace, _) => {
+            delete_with_motion(
+                client,
+                state,
+                Motion::Char {
+                    direction: Direction::Backward,
+                    count: 1,
+                },
+            )
+            .await?
+        }
+        (KeyCode::Delete, _) => {
+            delete_with_motion(
+                client,
+                state,
+                Motion::Char {
+                    direction: Direction::Forward,
+                    count: 1,
+                },
+            )
+            .await?
+        }
         (KeyCode::Enter, _) => newline_and_indent(client, state).await?,
         (KeyCode::Tab, _) => insert_text(client, state, "\t").await?,
-        (KeyCode::Left, _) => move_motion(client, state, Motion::Char { direction: Direction::Backward, count: 1 }, false).await?,
-        (KeyCode::Right, _) => move_motion(client, state, Motion::Char { direction: Direction::Forward, count: 1 }, false).await?,
+        (KeyCode::Left, _) => {
+            move_motion(
+                client,
+                state,
+                Motion::Char {
+                    direction: Direction::Backward,
+                    count: 1,
+                },
+                false,
+            )
+            .await?
+        }
+        (KeyCode::Right, _) => {
+            move_motion(
+                client,
+                state,
+                Motion::Char {
+                    direction: Direction::Forward,
+                    count: 1,
+                },
+                false,
+            )
+            .await?
+        }
         (KeyCode::Up, _) => {
             let viewport_id = state.editor().viewport_id;
-            move_motion(client, state, Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count: 1 }, false).await?
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction: VerticalDirection::Up,
+                    count: 1,
+                },
+                false,
+            )
+            .await?
         }
         (KeyCode::Down, _) => {
             let viewport_id = state.editor().viewport_id;
-            move_motion(client, state, Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 }, false).await?
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction: VerticalDirection::Down,
+                    count: 1,
+                },
+                false,
+            )
+            .await?
         }
 
-        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
             // `normalize_key` lowercased the char and synthesised SHIFT so the Ctrl-* bindings
             // above can match consistently. Reverse that for actual text insertion.
-            let c = if m.contains(KeyModifiers::SHIFT) { c.to_ascii_uppercase() } else { c };
+            let c = if m.contains(KeyModifiers::SHIFT) {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            };
             insert_text(client, state, &c.to_string()).await?;
         }
 
@@ -1475,13 +1808,17 @@ async fn open_file_browser(client: &mut Client, state: &mut AppState) -> Result<
                 .and_then(|os| os.to_str())
                 .map(|s| s.to_string());
             let dir = p.and_then(|s| {
-                std::path::Path::new(s).parent().map(|p| p.display().to_string())
+                std::path::Path::new(s)
+                    .parent()
+                    .map(|p| p.display().to_string())
             });
             (name, dir)
         }
         None => (None, None),
     };
-    let mut browsing = BrowsingState { file_browser: FileBrowserState::default() };
+    let mut browsing = BrowsingState {
+        file_browser: FileBrowserState::default(),
+    };
     load_file_browser_into(client, &mut browsing.file_browser, start).await?;
     if let Some(name) = file_name {
         select_entry_by_name(&mut browsing.file_browser, &name);
@@ -1533,13 +1870,15 @@ async fn handle_file_browser_key(
     match (code, mods) {
         (KeyCode::Char('q'), CTRL_ONLY) => state.should_quit = true,
         (KeyCode::Char('n'), CTRL_ONLY) => begin_prompt(state, FileBrowserPromptKind::NewFile),
-        (KeyCode::Char('n'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
-            begin_prompt(state, FileBrowserPromptKind::NewDirectory),
+        (KeyCode::Char('n'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
+            begin_prompt(state, FileBrowserPromptKind::NewDirectory)
+        }
         // `Space` starts a leader chord — same set as Normal mode (e.g. `Space f` opens the
         // file picker). The chord is consumed in `handle_event` before the next key reaches
         // this handler.
-        (KeyCode::Char(' '), m) if m == KeyModifiers::NONE =>
-            state.pending_leader = Some(PendingLeader::Space),
+        (KeyCode::Char(' '), m) if m == KeyModifiers::NONE => {
+            state.pending_leader = Some(PendingLeader::Space)
+        }
         // Esc in the file browser is a no-op — there's no implicit buffer to fall back to.
         // To switch to an open buffer, use `Space b` + Enter.
         (KeyCode::Esc, _) => {}
@@ -1547,20 +1886,24 @@ async fn handle_file_browser_key(
         (KeyCode::Char('j'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
             if !state.browsing_mut().file_browser.entries.is_empty() {
                 state.browsing_mut().file_browser.selected =
-                    (state.browsing_mut().file_browser.selected + 1).min(state.browsing_mut().file_browser.entries.len() - 1);
+                    (state.browsing_mut().file_browser.selected + 1)
+                        .min(state.browsing_mut().file_browser.entries.len() - 1);
             }
         }
         (KeyCode::Char('k'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            state.browsing_mut().file_browser.selected = state.browsing_mut().file_browser.selected.saturating_sub(1);
+            state.browsing_mut().file_browser.selected =
+                state.browsing_mut().file_browser.selected.saturating_sub(1);
         }
         (KeyCode::Down, _) => {
             if !state.browsing_mut().file_browser.entries.is_empty() {
                 state.browsing_mut().file_browser.selected =
-                    (state.browsing_mut().file_browser.selected + 1).min(state.browsing_mut().file_browser.entries.len() - 1);
+                    (state.browsing_mut().file_browser.selected + 1)
+                        .min(state.browsing_mut().file_browser.entries.len() - 1);
             }
         }
         (KeyCode::Up, _) => {
-            state.browsing_mut().file_browser.selected = state.browsing_mut().file_browser.selected.saturating_sub(1);
+            state.browsing_mut().file_browser.selected =
+                state.browsing_mut().file_browser.selected.saturating_sub(1);
         }
         // Go to the parent directory (clamped to the project boundary by the server). Pre-select
         // the entry corresponding to the directory we're leaving so the user keeps their bearings.
@@ -1571,7 +1914,12 @@ async fn handle_file_browser_key(
                     .file_name()
                     .and_then(|os| os.to_str())
                     .map(|s| s.to_string());
-                load_file_browser_into(client, &mut state.browsing_mut().file_browser, Some(parent)).await?;
+                load_file_browser_into(
+                    client,
+                    &mut state.browsing_mut().file_browser,
+                    Some(parent),
+                )
+                .await?;
                 if let Some(name) = leaving {
                     select_entry_by_name(&mut state.browsing_mut().file_browser, &name);
                 }
@@ -1591,7 +1939,12 @@ async fn handle_file_browser_key(
                 (entry.is_dir, entry_path)
             };
             if is_dir {
-                load_file_browser_into(client, &mut state.browsing_mut().file_browser, Some(entry_path)).await?;
+                load_file_browser_into(
+                    client,
+                    &mut state.browsing_mut().file_browser,
+                    Some(entry_path),
+                )
+                .await?;
             } else {
                 open_file_in_browser(client, state, entry_path).await?;
             }
@@ -1644,7 +1997,9 @@ async fn handle_file_browser_prompt_key(
                 p.input.backspace();
             }
         }
-        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
             if let Some(p) = state.browsing_mut().file_browser.prompt.as_mut() {
                 p.input.insert_char(c);
             }
@@ -1672,7 +2027,12 @@ async fn commit_prompt(
                 .rpc::<DirectoryCreate>(DirectoryCreateParams { path: target_abs })
                 .await?;
             // Step into the new directory.
-            load_file_browser_into(client, &mut state.browsing_mut().file_browser, Some(result.path)).await?;
+            load_file_browser_into(
+                client,
+                &mut state.browsing_mut().file_browser,
+                Some(result.path),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1744,7 +2104,9 @@ async fn handle_search_key(client: &mut Client, state: &mut AppState, k: KeyEven
             state.editor_mut().search.history_cursor = None;
             run_incremental_search(client, state).await?;
         }
-        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
             state.editor_mut().search.query.insert_char(c);
             state.editor_mut().search.history_cursor = None;
             run_incremental_search(client, state).await?;
@@ -1872,7 +2234,9 @@ async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
         state.editor_mut().search.summary = Some(r.summary);
     } else {
         let _ = client
-            .rpc::<SearchClear>(SearchClearParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<SearchClear>(SearchClearParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await;
         state.editor_mut().search.summary = None;
     }
@@ -1902,12 +2266,20 @@ async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
 async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Result<()> {
     if state.editor_mut().search.query.is_empty() {
         let _ = client
-            .rpc::<SearchClear>(SearchClearParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<SearchClear>(SearchClearParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await;
         state.editor_mut().search.summary = None;
         // No matches — revert the cursor to the pre-search position so the user sees where
         // they started rather than wherever the previous query stranded them.
-        if let Some(snap_cursor) = state.editor_mut().search.snapshot.as_ref().map(|s| s.cursor) {
+        if let Some(snap_cursor) = state
+            .editor_mut()
+            .search
+            .snapshot
+            .as_ref()
+            .map(|s| s.cursor)
+        {
             if state.editor_mut().cursor.position != snap_cursor.position
                 || state.editor_mut().cursor.anchor != snap_cursor.anchor
             {
@@ -1962,7 +2334,13 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
         }
     };
     if revert_needed {
-        if let Some(snap_cursor) = state.editor_mut().search.snapshot.as_ref().map(|s| s.cursor) {
+        if let Some(snap_cursor) = state
+            .editor_mut()
+            .search
+            .snapshot
+            .as_ref()
+            .map(|s| s.cursor)
+        {
             if state.editor_mut().cursor.position != snap_cursor.position
                 || state.editor_mut().cursor.anchor != snap_cursor.anchor
             {
@@ -1987,7 +2365,9 @@ fn selection_start(c: &CursorState) -> LogicalPosition {
     }
 }
 
-fn pos_tuple(p: LogicalPosition) -> (u32, u32) { (p.line, p.col) }
+fn pos_tuple(p: LogicalPosition) -> (u32, u32) {
+    (p.line, p.col)
+}
 
 /// `Some("3/47")` when a search is active and the server says the cursor is currently on a match
 /// (i.e., `current_index != 0`). The status bar only shows the counter when the cursor is
@@ -2001,11 +2381,19 @@ pub fn search_counter_label(state: &AppState) -> Option<String> {
     if summary.current_index == 0 || summary.total == 0 {
         return None;
     }
-    Some(format!("{}/{}", summary.current_index, format_total(summary)))
+    Some(format!(
+        "{}/{}",
+        summary.current_index,
+        format_total(summary)
+    ))
 }
 
 fn format_total(s: &SearchSummary) -> String {
-    if s.truncated { format!("{}+", s.total) } else { s.total.to_string() }
+    if s.truncated {
+        format!("{}+", s.total)
+    } else {
+        s.total.to_string()
+    }
 }
 
 /// Summary line for the search prompt: "3/47", "3/10000+", or "no matches". `None` when the
@@ -2031,7 +2419,10 @@ pub fn search_match_count_label(state: &AppState) -> Option<String> {
 /// search term. The cursor stays on the original selection — `n` / `Alt-n` then cycle from there.
 async fn search_from_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: BufferCopyResult = client
-        .rpc::<BufferCopy>(BufferCopyParams { buffer_id: state.editor_mut().buffer_id, scope: CopyScope::Selection })
+        .rpc::<BufferCopy>(BufferCopyParams {
+            buffer_id: state.editor_mut().buffer_id,
+            scope: CopyScope::Selection,
+        })
         .await?;
     if r.text.is_empty() {
         return Ok(());
@@ -2062,7 +2453,26 @@ async fn search_from_selection(client: &mut Client, state: &mut AppState) -> Res
 fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(c, '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '#' | '&' | '-' | '~') {
+        if matches!(
+            c,
+            '\\' | '.'
+                | '+'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '|'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '^'
+                | '$'
+                | '#'
+                | '&'
+                | '-'
+                | '~'
+        ) {
             out.push('\\');
         }
         out.push(c);
@@ -2078,7 +2488,9 @@ async fn search_cycle(
 ) -> Result<()> {
     if !state.editor_mut().search.active {
         // No active search: revive the most recent history entry server-side, then cycle.
-        let Some(last) = state.editor_mut().search.history.last().cloned() else { return Ok(()) };
+        let Some(last) = state.editor_mut().search.history.last().cloned() else {
+            return Ok(());
+        };
         state.editor_mut().search.query.set(last.clone());
         let r = client
             .rpc::<SearchSet>(SearchSetParams {
@@ -2091,12 +2503,20 @@ async fn search_cycle(
         state.editor_mut().search.summary = Some(r.summary);
         state.editor_mut().search.active = true;
     }
-    let summary_total = state.editor_mut().search.summary.as_ref().map(|s| s.total).unwrap_or(0);
+    let summary_total = state
+        .editor_mut()
+        .search
+        .summary
+        .as_ref()
+        .map(|s| s.total)
+        .unwrap_or(0);
     if summary_total == 0 {
         return Ok(());
     }
     for _ in 0..count.max(1) {
-        let params = SearchNavParams { buffer_id: state.editor_mut().buffer_id };
+        let params = SearchNavParams {
+            buffer_id: state.editor_mut().buffer_id,
+        };
         let result = match direction {
             Direction::Forward => client.rpc::<SearchNext>(params).await?,
             Direction::Backward => client.rpc::<SearchPrev>(params).await?,
@@ -2107,7 +2527,12 @@ async fn search_cycle(
     Ok(())
 }
 
-async fn handle_resize(client: &mut Client, state: &mut AppState, cols: u16, rows: u16) -> Result<()> {
+async fn handle_resize(
+    client: &mut Client,
+    state: &mut AppState,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
     let viewport_rows = rows.saturating_sub(1) as u32;
     state.viewport_cols = cols as u32;
     state.viewport_rows = viewport_rows;
@@ -2148,7 +2573,12 @@ async fn handle_resize(client: &mut Client, state: &mut AppState, cols: u16, row
     Ok(())
 }
 
-async fn move_motion(client: &mut Client, state: &mut AppState, motion: Motion, extend: bool) -> Result<()> {
+async fn move_motion(
+    client: &mut Client,
+    state: &mut AppState,
+    motion: Motion,
+    extend: bool,
+) -> Result<()> {
     let new: CursorState = client
         .rpc::<CursorMove>(CursorMoveParams {
             buffer_id: state.editor_mut().buffer_id,
@@ -2213,7 +2643,9 @@ async fn select_line(
 async fn tree_expand(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
         let new = client
-            .rpc::<CursorExpand>(CursorBufferOnlyParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<CursorExpand>(CursorBufferOnlyParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await?;
         if new == state.editor_mut().cursor {
             break; // already at root
@@ -2226,7 +2658,9 @@ async fn tree_expand(client: &mut Client, state: &mut AppState, count: u32) -> R
 async fn tree_contract(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
         let new = client
-            .rpc::<CursorContract>(CursorBufferOnlyParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<CursorContract>(CursorBufferOnlyParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await?;
         if new == state.editor_mut().cursor {
             break; // history empty
@@ -2238,7 +2672,9 @@ async fn tree_contract(client: &mut Client, state: &mut AppState, count: u32) ->
 
 async fn swap_anchor(client: &mut Client, state: &mut AppState) -> Result<()> {
     let new = client
-        .rpc::<CursorSwapAnchor>(CursorSwapAnchorParams { buffer_id: state.editor_mut().buffer_id })
+        .rpc::<CursorSwapAnchor>(CursorSwapAnchorParams {
+            buffer_id: state.editor_mut().buffer_id,
+        })
         .await?;
     state.editor_mut().cursor = new;
     Ok(())
@@ -2247,7 +2683,9 @@ async fn swap_anchor(client: &mut Client, state: &mut AppState) -> Result<()> {
 async fn motion_undo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
         let r: CursorUndoResult = client
-            .rpc::<CursorUndo>(CursorUndoParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<CursorUndo>(CursorUndoParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await?;
         let applied = r.applied;
         apply_motion_undo_result(state, r, "motion undo");
@@ -2261,7 +2699,9 @@ async fn motion_undo(client: &mut Client, state: &mut AppState, count: u32) -> R
 async fn motion_redo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
         let r: CursorUndoResult = client
-            .rpc::<CursorRedo>(CursorUndoParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<CursorRedo>(CursorUndoParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await?;
         let applied = r.applied;
         apply_motion_undo_result(state, r, "motion redo");
@@ -2303,7 +2743,11 @@ enum InsertWhere {
     LastLineEnd,
 }
 
-async fn enter_insert_at(client: &mut Client, state: &mut AppState, where_: InsertWhere) -> Result<()> {
+async fn enter_insert_at(
+    client: &mut Client,
+    state: &mut AppState,
+    where_: InsertWhere,
+) -> Result<()> {
     match (where_, state.editor_mut().cursor.anchor) {
         // `i` — start of selection (or cursor if collapsed).
         (InsertWhere::SelectionStart, Some(anchor)) => {
@@ -2341,7 +2785,10 @@ async fn enter_insert_at(client: &mut Client, state: &mut AppState, where_: Inse
             let new = client
                 .rpc::<CursorMove>(CursorMoveParams {
                     buffer_id: state.editor_mut().buffer_id,
-                    motion: Motion::Char { direction: Direction::Forward, count: 1 },
+                    motion: Motion::Char {
+                        direction: Direction::Forward,
+                        count: 1,
+                    },
                     extend_selection: false,
                 })
                 .await?;
@@ -2357,7 +2804,10 @@ async fn enter_insert_at(client: &mut Client, state: &mut AppState, where_: Inse
             let new = client
                 .rpc::<CursorSet>(CursorSetParams {
                     buffer_id: state.editor_mut().buffer_id,
-                    position: LogicalPosition { line: first_line, col: 0 },
+                    position: LogicalPosition {
+                        line: first_line,
+                        col: 0,
+                    },
                     anchor: None,
                 })
                 .await?;
@@ -2373,7 +2823,10 @@ async fn enter_insert_at(client: &mut Client, state: &mut AppState, where_: Inse
             let new = client
                 .rpc::<CursorSet>(CursorSetParams {
                     buffer_id: state.editor_mut().buffer_id,
-                    position: LogicalPosition { line: last_line, col: u32::MAX },
+                    position: LogicalPosition {
+                        line: last_line,
+                        col: u32::MAX,
+                    },
                     anchor: None,
                 })
                 .await?;
@@ -2395,11 +2848,19 @@ fn leave_insert(state: &mut AppState) {
 }
 
 fn min_pos(a: LogicalPosition, b: LogicalPosition) -> LogicalPosition {
-    if (a.line, a.col) <= (b.line, b.col) { a } else { b }
+    if (a.line, a.col) <= (b.line, b.col) {
+        a
+    } else {
+        b
+    }
 }
 
 fn max_pos(a: LogicalPosition, b: LogicalPosition) -> LogicalPosition {
-    if (a.line, a.col) >= (b.line, b.col) { a } else { b }
+    if (a.line, a.col) >= (b.line, b.col) {
+        a
+    } else {
+        b
+    }
 }
 
 async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> Result<()> {
@@ -2411,7 +2872,9 @@ async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> R
 /// outside a string/comment).
 async fn newline_and_indent(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
-        .rpc::<InputNewlineAndIndent>(BufferOnlyParams { buffer_id: state.editor_mut().buffer_id })
+        .rpc::<InputNewlineAndIndent>(BufferOnlyParams {
+            buffer_id: state.editor_mut().buffer_id,
+        })
         .await?;
     state.editor_mut().revision = r.revision;
     state.editor_mut().cursor = r.cursor;
@@ -2443,16 +2906,26 @@ async fn change_selection(client: &mut Client, state: &mut AppState) -> Result<(
     delete_with_motion(
         client,
         state,
-        Motion::Char { direction: Direction::Forward, count: 1 },
+        Motion::Char {
+            direction: Direction::Forward,
+            count: 1,
+        },
     )
     .await?;
     enter_insert_mode(state);
     Ok(())
 }
 
-async fn delete_with_motion(client: &mut Client, state: &mut AppState, motion: Motion) -> Result<()> {
+async fn delete_with_motion(
+    client: &mut Client,
+    state: &mut AppState,
+    motion: Motion,
+) -> Result<()> {
     let r: EditResult = client
-        .rpc::<InputDelete>(InputDeleteParams { buffer_id: state.editor_mut().buffer_id, motion })
+        .rpc::<InputDelete>(InputDeleteParams {
+            buffer_id: state.editor_mut().buffer_id,
+            motion,
+        })
         .await?;
     state.editor_mut().revision = r.revision;
     state.editor_mut().cursor = r.cursor;
@@ -2462,7 +2935,9 @@ async fn delete_with_motion(client: &mut Client, state: &mut AppState, motion: M
 async fn join_lines(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
         let r: EditResult = client
-            .rpc::<InputJoinLines>(BufferOnlyParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<InputJoinLines>(BufferOnlyParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await?;
         state.editor_mut().revision = r.revision;
         state.editor_mut().cursor = r.cursor;
@@ -2473,7 +2948,9 @@ async fn join_lines(client: &mut Client, state: &mut AppState, count: u32) -> Re
 async fn indent(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
         let r: EditResult = client
-            .rpc::<InputIndent>(BufferOnlyParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<InputIndent>(BufferOnlyParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await?;
         state.editor_mut().revision = r.revision;
         state.editor_mut().cursor = r.cursor;
@@ -2484,7 +2961,9 @@ async fn indent(client: &mut Client, state: &mut AppState, count: u32) -> Result
 async fn dedent(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
         let r: EditResult = client
-            .rpc::<InputDedent>(BufferOnlyParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<InputDedent>(BufferOnlyParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await?;
         state.editor_mut().revision = r.revision;
         state.editor_mut().cursor = r.cursor;
@@ -2496,7 +2975,9 @@ async fn dedent(client: &mut Client, state: &mut AppState, count: u32) -> Result
 /// prefix from the buffer language's `line_comment` and no-ops for languages without one.
 async fn toggle_comment(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
-        .rpc::<InputToggleComment>(BufferOnlyParams { buffer_id: state.editor_mut().buffer_id })
+        .rpc::<InputToggleComment>(BufferOnlyParams {
+            buffer_id: state.editor_mut().buffer_id,
+        })
         .await?;
     state.editor_mut().revision = r.revision;
     state.editor_mut().cursor = r.cursor;
@@ -2512,7 +2993,10 @@ async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
             buffer_id: state.editor_mut().buffer_id,
-            position: LogicalPosition { line, col: u32::MAX },
+            position: LogicalPosition {
+                line,
+                col: u32::MAX,
+            },
             anchor: None,
         })
         .await?;
@@ -2539,7 +3023,11 @@ async fn open_line_above(client: &mut Client, state: &mut AppState) -> Result<()
     move_motion(
         client,
         state,
-        Motion::LogicalLine { direction: Direction::Backward, count: 1, preserve_col: false },
+        Motion::LogicalLine {
+            direction: Direction::Backward,
+            count: 1,
+            preserve_col: false,
+        },
         false,
     )
     .await?;
@@ -2566,9 +3054,16 @@ async fn move_lines(
     Ok(())
 }
 
-async fn copy_to_clipboard(client: &mut Client, state: &mut AppState, scope: CopyScope) -> Result<()> {
+async fn copy_to_clipboard(
+    client: &mut Client,
+    state: &mut AppState,
+    scope: CopyScope,
+) -> Result<()> {
     let r: BufferCopyResult = client
-        .rpc::<BufferCopy>(BufferCopyParams { buffer_id: state.editor_mut().buffer_id, scope })
+        .rpc::<BufferCopy>(BufferCopyParams {
+            buffer_id: state.editor_mut().buffer_id,
+            scope,
+        })
         .await?;
     let len = r.text.len();
     match clipboard::copy(&mut state.clipboard, r.text) {
@@ -2578,9 +3073,16 @@ async fn copy_to_clipboard(client: &mut Client, state: &mut AppState, scope: Cop
     Ok(())
 }
 
-async fn cut_to_clipboard(client: &mut Client, state: &mut AppState, scope: CopyScope) -> Result<()> {
+async fn cut_to_clipboard(
+    client: &mut Client,
+    state: &mut AppState,
+    scope: CopyScope,
+) -> Result<()> {
     let r: BufferCutResult = client
-        .rpc::<BufferCut>(BufferCopyParams { buffer_id: state.editor_mut().buffer_id, scope })
+        .rpc::<BufferCut>(BufferCopyParams {
+            buffer_id: state.editor_mut().buffer_id,
+            scope,
+        })
         .await?;
     state.editor_mut().revision = r.revision;
     state.editor_mut().cursor = r.cursor;
@@ -2648,7 +3150,9 @@ async fn paste_at_cursor(client: &mut Client, state: &mut AppState) -> Result<()
 async fn undo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
         let r: UndoResult = client
-            .rpc::<InputUndo>(BufferOnlyParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<InputUndo>(BufferOnlyParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await?;
         let applied = r.applied;
         apply_undo_result(state, r, "undo");
@@ -2662,7 +3166,9 @@ async fn undo(client: &mut Client, state: &mut AppState, count: u32) -> Result<(
 async fn redo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
         let r: UndoResult = client
-            .rpc::<InputRedo>(BufferOnlyParams { buffer_id: state.editor_mut().buffer_id })
+            .rpc::<InputRedo>(BufferOnlyParams {
+                buffer_id: state.editor_mut().buffer_id,
+            })
             .await?;
         let applied = r.applied;
         apply_undo_result(state, r, "redo");
@@ -2734,7 +3240,10 @@ async fn handle_save_prompt_key(
     k: KeyEvent,
 ) -> Result<()> {
     // Don't `normalize_key` here — that lowercases uppercase chars, which would mangle paths.
-    let confirming = state.save_prompt.as_ref().is_some_and(|p| p.pending_overwrite);
+    let confirming = state
+        .save_prompt
+        .as_ref()
+        .is_some_and(|p| p.pending_overwrite);
     if confirming {
         match (k.code, k.modifiers) {
             // Default (Enter / Esc / n) is "don't overwrite" — matching the uppercase `N` in
@@ -2770,7 +3279,9 @@ async fn handle_save_prompt_key(
                 p.input.backspace();
             }
         }
-        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
             if let Some(p) = state.save_prompt.as_mut() {
                 p.input.insert_char(c);
             }
@@ -2833,9 +3344,8 @@ async fn send_save_prompt(
                 ed.saved_revision = r.revision;
                 ed.file_label = path.clone();
                 if let Some(root) = project_paths.first() {
-                    ed.file_path = Some(
-                        std::path::Path::new(root).join(&path).display().to_string(),
-                    );
+                    ed.file_path =
+                        Some(std::path::Path::new(root).join(&path).display().to_string());
                 }
             }
             state.status = format!("saved as {} (rev {})", path, r.revision);
@@ -2874,8 +3384,14 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
         let col = state.editor_mut().cursor.position.col;
         if col < state.editor_mut().scroll_col {
             state.editor_mut().scroll_col = col;
-        } else if col >= state.editor_mut().scroll_col.saturating_add(state.viewport_cols) {
-            state.editor_mut().scroll_col = col.saturating_sub(state.viewport_cols.saturating_sub(1));
+        } else if col
+            >= state
+                .editor_mut()
+                .scroll_col
+                .saturating_add(state.viewport_cols)
+        {
+            state.editor_mut().scroll_col =
+                col.saturating_sub(state.viewport_cols.saturating_sub(1));
         }
     }
 
@@ -2892,8 +3408,7 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
     // the top. Clamp the target to `max_scroll_logical_line` so a jump to (or near) the last
     // line doesn't overscroll — `Alt-g` would otherwise put the last line at the very top of
     // an otherwise-empty viewport.
-    let cursor_visible =
-        ui::cursor_visual_position(state, state.viewport_rows).is_some();
+    let cursor_visible = ui::cursor_visual_position(state, state.viewport_rows).is_some();
     if !cursor_visible {
         let target = cursor_line.min(state.editor_mut().max_scroll_logical_line);
         scroll_to(client, state, target).await?;
@@ -2920,7 +3435,10 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
         WrapMode::None => WrapMode::Soft,
     };
     let r = client
-        .rpc::<ViewportSetWrap>(ViewportSetWrapParams { viewport_id: state.editor_mut().viewport_id, wrap: new_wrap })
+        .rpc::<ViewportSetWrap>(ViewportSetWrapParams {
+            viewport_id: state.editor_mut().viewport_id,
+            wrap: new_wrap,
+        })
         .await?;
     state.editor_mut().wrap = new_wrap;
     state.editor_mut().window_first_logical_line = r.window.first_logical_line;
@@ -2929,10 +3447,13 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
     if matches!(new_wrap, WrapMode::Soft) {
         state.editor_mut().scroll_col = 0;
     }
-    state.status = format!("wrap: {}", match new_wrap {
-        WrapMode::Soft => "on",
-        WrapMode::None => "off",
-    });
+    state.status = format!(
+        "wrap: {}",
+        match new_wrap {
+            WrapMode::Soft => "on",
+            WrapMode::None => "off",
+        }
+    );
     Ok(())
 }
 
@@ -2941,14 +3462,19 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
 /// at the start of `ensure_cursor_in_window`). This lets a trackpad burst of N scroll events
 /// collapse into one server round-trip.
 fn scroll_lines(state: &mut AppState, delta: i64) {
-    state.editor_mut().pending_scroll_lines = state.editor_mut().pending_scroll_lines.saturating_add(delta);
+    state.editor_mut().pending_scroll_lines = state
+        .editor_mut()
+        .pending_scroll_lines
+        .saturating_add(delta);
 }
 
 /// Apply any accumulated `pending_scroll_lines` to the server via one `viewport/scroll` call.
 /// No-op if zero. Called before every draw and from inside `ensure_cursor_in_window` so the
 /// cursor-visibility check sees the user's intended scroll position.
 async fn flush_pending_scroll(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let Some(ed) = state.try_editor_mut() else { return Ok(()) };
+    let Some(ed) = state.try_editor_mut() else {
+        return Ok(());
+    };
     if ed.pending_scroll_lines == 0 {
         return Ok(());
     }
@@ -2978,7 +3504,10 @@ fn scroll_cols(state: &mut AppState, delta: i64) {
     state.editor_mut().scroll_col = if delta >= 0 {
         state.editor_mut().scroll_col.saturating_add(delta as u32)
     } else {
-        state.editor_mut().scroll_col.saturating_sub((-delta) as u32)
+        state
+            .editor_mut()
+            .scroll_col
+            .saturating_sub((-delta) as u32)
     };
 }
 
@@ -2986,7 +3515,10 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
     let r = client
         .rpc::<ViewportScroll>(ViewportScrollParams {
             viewport_id: state.editor_mut().viewport_id,
-            scroll: ScrollPosition { logical_line: target_line, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: target_line,
+                sub_row: 0.0,
+            },
         })
         .await?;
     state.editor_mut().scroll_logical_line = target_line;
@@ -2996,4 +3528,3 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
     state.editor_mut().lines = r.window.lines;
     Ok(())
 }
-

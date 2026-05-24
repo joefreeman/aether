@@ -1,8 +1,6 @@
 //! WebSocket client wrapper with typed JSON-RPC.
 
-use aether_protocol::envelope::{
-    ClientInbound, JsonRpc, Notification, Request, RpcMethod,
-};
+use aether_protocol::envelope::{ClientInbound, JsonRpc, Notification, Request, RpcMethod};
 use anyhow::{anyhow, Context};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::VecDeque;
@@ -25,7 +23,11 @@ pub struct RpcError {
 
 impl fmt::Display for RpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RPC {} returned error {}: {}", self.method, self.code, self.message)
+        write!(
+            f,
+            "RPC {} returned error {}: {}",
+            self.method, self.code, self.message
+        )
     }
 }
 
@@ -43,7 +45,11 @@ impl Client {
         let (ws, _) = tokio_tungstenite::connect_async(url)
             .await
             .with_context(|| format!("connecting to {url}"))?;
-        Ok(Self { ws, next_id: 1, pending_notifications: VecDeque::new() })
+        Ok(Self {
+            ws,
+            next_id: 1,
+            pending_notifications: VecDeque::new(),
+        })
     }
 
     pub async fn rpc<M: RpcMethod>(&mut self, params: M::Params) -> anyhow::Result<M::Result> {
@@ -101,7 +107,9 @@ impl Client {
             return Ok(Some(ClientInbound::Notification(n)));
         }
         loop {
-            let Some(frame) = self.ws.next().await else { return Ok(None) };
+            let Some(frame) = self.ws.next().await else {
+                return Ok(None);
+            };
             let frame = frame?;
             let Message::Text(text) = frame else { continue };
             let inbound: ClientInbound = serde_json::from_str(&text)

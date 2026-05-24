@@ -40,19 +40,19 @@ fn char_display_width(c: char, current_col: u32) -> u32 {
 // painted background/status colors so the editor's appearance is independent of the terminal's
 // own color scheme.
 
-const NORD0: Color = Color::Rgb(46, 52, 64);    // Polar Night — main background
-const NORD1: Color = Color::Rgb(59, 66, 82);    // Polar Night — status line / panel
-const NORD2: Color = Color::Rgb(67, 76, 94);    // Polar Night — selection background
-const NORD3: Color = Color::Rgb(76, 86, 106);   // Polar Night — comments / dim
+const NORD0: Color = Color::Rgb(46, 52, 64); // Polar Night — main background
+const NORD1: Color = Color::Rgb(59, 66, 82); // Polar Night — status line / panel
+const NORD2: Color = Color::Rgb(67, 76, 94); // Polar Night — selection background
+const NORD3: Color = Color::Rgb(76, 86, 106); // Polar Night — comments / dim
 const NORD4: Color = Color::Rgb(216, 222, 233); // Snow Storm — main foreground
 const NORD7: Color = Color::Rgb(143, 188, 187); // Frost — types
 const NORD8: Color = Color::Rgb(136, 192, 208); // Frost — functions, accents
 const NORD9: Color = Color::Rgb(129, 161, 193); // Frost — keywords, operators
 const NORD10: Color = Color::Rgb(94, 129, 172); // Frost — deep blue (active selection bg)
-const NORD12: Color = Color::Rgb(208, 135, 112);// Aurora orange — attributes, macros
-const NORD13: Color = Color::Rgb(235, 203, 139);// Aurora yellow — string escapes
-const NORD14: Color = Color::Rgb(163, 190, 140);// Aurora green — strings
-const NORD15: Color = Color::Rgb(180, 142, 173);// Aurora purple — numbers, constants
+const NORD12: Color = Color::Rgb(208, 135, 112); // Aurora orange — attributes, macros
+const NORD13: Color = Color::Rgb(235, 203, 139); // Aurora yellow — string escapes
+const NORD14: Color = Color::Rgb(163, 190, 140); // Aurora green — strings
+const NORD15: Color = Color::Rgb(180, 142, 173); // Aurora purple — numbers, constants
 
 pub fn draw(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
@@ -88,13 +88,28 @@ const PICKER_MAX_ROWS: u16 = 60;
 
 /// Compute the picker overlay's rectangle inside `area` (the buffer pane).
 fn picker_box_rect(area: Rect) -> Rect {
-    let width = scale_box_dim(area.width, PICKER_MIN_COLS, PICKER_MAX_COLS, PICKER_TARGET_WIDTH_PCT);
-    let height = scale_box_dim(area.height, PICKER_MIN_ROWS, PICKER_MAX_ROWS, PICKER_TARGET_HEIGHT_PCT);
+    let width = scale_box_dim(
+        area.width,
+        PICKER_MIN_COLS,
+        PICKER_MAX_COLS,
+        PICKER_TARGET_WIDTH_PCT,
+    );
+    let height = scale_box_dim(
+        area.height,
+        PICKER_MIN_ROWS,
+        PICKER_MAX_ROWS,
+        PICKER_TARGET_HEIGHT_PCT,
+    );
     let width = width.min(area.width).max(1);
     let height = height.min(area.height).max(1);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
-    Rect { x, y, width, height }
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 /// Scale one box dimension: returns `dim` itself when `dim <= min` (no padding), `dim *
@@ -118,7 +133,12 @@ fn scale_box_dim(dim: u16, min: u16, max: u16, target_pct: u16) -> u16 {
 /// app to set the `limit` it sends to the server. Subtracts box borders (2), input row (1), and
 /// separator row (1).
 pub fn picker_result_rows(buffer_area_cols: u32, buffer_area_rows: u32) -> u32 {
-    let area = Rect { x: 0, y: 0, width: buffer_area_cols as u16, height: buffer_area_rows as u16 };
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: buffer_area_cols as u16,
+        height: buffer_area_rows as u16,
+    };
     let box_rect = picker_box_rect(area);
     (box_rect.height as u32).saturating_sub(4)
 }
@@ -159,7 +179,12 @@ fn pad_horizontal(area: Rect) -> Rect {
     if area.width <= 2 {
         return area;
     }
-    Rect { x: area.x + 1, y: area.y, width: area.width - 2, height: area.height }
+    Rect {
+        x: area.x + 1,
+        y: area.y,
+        width: area.width - 2,
+        height: area.height,
+    }
 }
 
 /// Query left-aligned, `N/M` (with a trailing `…` while ticking) right-aligned. When the query
@@ -167,7 +192,10 @@ fn pad_horizontal(area: Rect) -> Rect {
 /// is too narrow to hold both, the counts get dropped first so the query stays visible.
 fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     let base_style = Style::default().fg(NORD4).bg(NORD0);
-    let placeholder_style = Style::default().fg(NORD3).bg(NORD0).add_modifier(Modifier::ITALIC);
+    let placeholder_style = Style::default()
+        .fg(NORD3)
+        .bg(NORD0)
+        .add_modifier(Modifier::ITALIC);
 
     let (left_text, left_style, left_w) = if state.picker.query.is_empty() {
         let ph = picker_placeholder(state.picker.kind);
@@ -182,7 +210,10 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         String::new()
     } else {
         let suffix = if state.picker.ticking { " …" } else { "" };
-        format!("{}/{}{}", state.picker.total_matches, state.picker.total_candidates, suffix)
+        format!(
+            "{}/{}{}",
+            state.picker.total_matches, state.picker.total_candidates, suffix
+        )
     };
     let total_width = area.width as usize;
     let counts_w = counts.width();
@@ -193,10 +224,7 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         spans.push(Span::styled(" ".repeat(pad), base_style));
         spans.push(Span::styled(counts, base_style));
     }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(base_style),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)).style(base_style), area);
 }
 
 fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'static str {
@@ -235,12 +263,21 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     } else {
         area.width
     };
-    let text_area = Rect { x: area.x, y: area.y, width: text_width, height: area.height };
+    let text_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: text_width,
+        height: area.height,
+    };
 
     let mut lines: Vec<Line> = Vec::with_capacity(state.picker.items.len());
     for (i, item) in state.picker.items.iter().enumerate() {
         let highlighted = i == state.picker.selected;
-        lines.push(Line::from(picker_item_spans(item, highlighted, text_width as usize)));
+        lines.push(Line::from(picker_item_spans(
+            item,
+            highlighted,
+            text_width as usize,
+        )));
     }
     f.render_widget(
         Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
@@ -283,11 +320,7 @@ fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
     }
 }
 
-fn picker_item_spans(
-    item: &PickerItem,
-    highlighted: bool,
-    max_width: usize,
-) -> Vec<Span<'static>> {
+fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> Vec<Span<'static>> {
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
@@ -295,10 +328,20 @@ fn picker_item_spans(
     // Trailing dirty marker for buffer items — matches the status bar's `[+]` indicator. Goes
     // after the display so it doesn't shift `match_indices` (which index into the display).
     let (display_raw, match_indices, dirty_suffix) = match item {
-        PickerItem::File { path, match_indices } => (path.as_str(), match_indices.as_slice(), ""),
-        PickerItem::Buffer { display, dirty, match_indices, .. } => {
-            (display.as_str(), match_indices.as_slice(), if *dirty { " [+]" } else { "" })
-        }
+        PickerItem::File {
+            path,
+            match_indices,
+        } => (path.as_str(), match_indices.as_slice(), ""),
+        PickerItem::Buffer {
+            display,
+            dirty,
+            match_indices,
+            ..
+        } => (
+            display.as_str(),
+            match_indices.as_slice(),
+            if *dirty { " [+]" } else { "" },
+        ),
     };
 
     let text_budget = max_width.saturating_sub(dirty_suffix.len());
@@ -436,7 +479,11 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let viewport_rows = area.height as usize;
     let viewport_cols = area.width;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
-    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) { state.editor().scroll_col } else { 0 };
+    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) {
+        state.editor().scroll_col
+    } else {
+        0
+    };
 
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
     let mut logical_line = top;
@@ -463,9 +510,8 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     // Empty line — paint a trailing cell when the selection continues past
                     // this line (the line's newline char is conceptually in the range).
                     let empty_newline_selected = is_last_vrow_of_line
-                        && selection.is_some_and(|(s, e)| {
-                            s.line <= logical_line && e.line > logical_line
-                        });
+                        && selection
+                            .is_some_and(|(s, e)| s.line <= logical_line && e.line > logical_line);
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     if empty_newline_selected {
                         spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
@@ -485,21 +531,29 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 && selection.is_some_and(|(s, e)| {
                     s.line <= logical_line
                         && (e.line > logical_line
-                            || (e.line == logical_line
-                                && e.col >= vrow.byte_offset + row_text_len))
+                            || (e.line == logical_line && e.col >= vrow.byte_offset + row_text_len))
                 });
             let sel_on_row = selection.and_then(|(s, e)| {
                 selection_on_visual_row(logical_line, vrow.byte_offset, row_text_len, s, e)
             });
             let matches_on_row =
                 matches_on_visual_row(vrow.byte_offset, row_text_len, &render.search_matches);
-            let brackets_on_row =
-                bracket_positions_on_visual_row(logical_line, vrow.byte_offset, row_text_len, state.editor().cursor.match_bracket);
+            let brackets_on_row = bracket_positions_on_visual_row(
+                logical_line,
+                vrow.byte_offset,
+                row_text_len,
+                state.editor().cursor.match_bracket,
+            );
 
             // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
             // bytes when scroll_col == 0 (the common case), so this is a no-op under soft wrap.
-            let (clipped_text, clipped_highlights, clipped_sel, clipped_matches) =
-                clip_horizontal(&segment.text, &segment.highlights, sel_on_row, &matches_on_row, scroll_col);
+            let (clipped_text, clipped_highlights, clipped_sel, clipped_matches) = clip_horizontal(
+                &segment.text,
+                &segment.highlights,
+                sel_on_row,
+                &matches_on_row,
+                scroll_col,
+            );
             let clipped_brackets: Vec<u32> = brackets_on_row
                 .iter()
                 .filter(|b| **b >= scroll_col)
@@ -509,9 +563,15 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             // Continuation row when byte_offset > 0. Prepend the marker; the server already
             // reserved this width when wrapping.
             let is_continuation = vrow.byte_offset > 0;
-            let marker_width = if is_continuation { CONTINUATION_MARKER_WIDTH } else { 0 };
+            let marker_width = if is_continuation {
+                CONTINUATION_MARKER_WIDTH
+            } else {
+                0
+            };
             let indent = vrow.continuation_indent;
-            let prefix_width = marker_width.saturating_add(indent).min(viewport_cols as u32) as u16;
+            let prefix_width = marker_width
+                .saturating_add(indent)
+                .min(viewport_cols as u32) as u16;
             let body_width = viewport_cols.saturating_sub(prefix_width);
 
             let mut spans: Vec<Span<'static>> = Vec::new();
@@ -524,7 +584,14 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if indent > 0 {
                 spans.push(Span::raw(" ".repeat(indent as usize)));
             }
-            spans.extend(build_spans(&clipped_text, &clipped_highlights, clipped_sel, &clipped_matches, &clipped_brackets, body_width));
+            spans.extend(build_spans(
+                &clipped_text,
+                &clipped_highlights,
+                clipped_sel,
+                &clipped_matches,
+                &clipped_brackets,
+                body_width,
+            ));
             if highlight_trailing_newline {
                 spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
             }
@@ -570,7 +637,11 @@ fn clip_horizontal(
                 return None;
             }
             let start = (h.start as usize).saturating_sub(skip);
-            Some(Highlight { start: start as u32, end: end as u32, kind: h.kind.clone() })
+            Some(Highlight {
+                start: start as u32,
+                end: end as u32,
+                kind: h.kind.clone(),
+            })
         })
         .collect();
     let shift_range = |(s, e): (u32, u32)| -> Option<(u32, u32)> {
@@ -620,7 +691,9 @@ fn bracket_positions_on_visual_row(
     row_text_len: u32,
     pair: Option<(LogicalPosition, LogicalPosition)>,
 ) -> Vec<u32> {
-    let Some((a, b)) = pair else { return Vec::new() };
+    let Some((a, b)) = pair else {
+        return Vec::new();
+    };
     let row_end = row_byte_offset + row_text_len;
     [a, b]
         .iter()
@@ -659,7 +732,11 @@ fn selection_on_visual_row(
     if logical_line < sel_start.line || logical_line > sel_end.line {
         return None;
     }
-    let line_sel_start = if logical_line == sel_start.line { sel_start.col } else { 0 };
+    let line_sel_start = if logical_line == sel_start.line {
+        sel_start.col
+    } else {
+        0
+    };
     let line_sel_end_excl = if logical_line == sel_end.line {
         sel_end.col + 1
     } else {
@@ -765,24 +842,58 @@ fn build_spans(
     for (byte_idx, c) in truncated.char_indices() {
         let style = style_at(byte_idx);
         let in_sel = sel.is_some_and(|(s, e)| byte_idx >= s as usize && byte_idx < e as usize);
-        let pad = if c == '\t' { TAB_WIDTH - (display_col % TAB_WIDTH) } else { 0 };
+        let pad = if c == '\t' {
+            TAB_WIDTH - (display_col % TAB_WIDTH)
+        } else {
+            0
+        };
         display_col += char_display_width(c, display_col);
         if c == '\t' {
             if in_sel {
-                push_text(&mut spans, &mut current_text, &mut current_style, "→", style.fg(NORD3));
+                push_text(
+                    &mut spans,
+                    &mut current_text,
+                    &mut current_style,
+                    "→",
+                    style.fg(NORD3),
+                );
                 if pad > 1 {
                     let pad_str = " ".repeat((pad - 1) as usize);
-                    push_text(&mut spans, &mut current_text, &mut current_style, &pad_str, style);
+                    push_text(
+                        &mut spans,
+                        &mut current_text,
+                        &mut current_style,
+                        &pad_str,
+                        style,
+                    );
                 }
             } else {
                 let pad_str = " ".repeat(pad as usize);
-                push_text(&mut spans, &mut current_text, &mut current_style, &pad_str, style);
+                push_text(
+                    &mut spans,
+                    &mut current_text,
+                    &mut current_style,
+                    &pad_str,
+                    style,
+                );
             }
         } else if c == ' ' && in_sel && byte_idx >= trailing_ws_start {
-            push_text(&mut spans, &mut current_text, &mut current_style, "·", style.fg(NORD3));
+            push_text(
+                &mut spans,
+                &mut current_text,
+                &mut current_style,
+                "·",
+                style.fg(NORD3),
+            );
         } else {
             let rendered = &truncated[byte_idx..byte_idx + c.len_utf8()];
-            push_text(&mut spans, &mut current_text, &mut current_style, rendered, style);
+            push_text(
+                &mut spans,
+                &mut current_text,
+                &mut current_style,
+                rendered,
+                style,
+            );
         }
     }
     if let Some(s) = current_style {
@@ -858,14 +969,14 @@ fn lookup_exact(name: &str) -> Option<Style> {
     })
 }
 
-
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     let line = if state.save_prompt.is_some() {
         // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
         match state.save_prompt.as_ref() {
-            Some(p) if p.pending_overwrite => {
-                Line::from(vec![Span::raw(format!(" overwrite {}? [y/N]", p.input.text))])
-            }
+            Some(p) if p.pending_overwrite => Line::from(vec![Span::raw(format!(
+                " overwrite {}? [y/N]",
+                p.input.text
+            ))]),
             Some(p) => Line::from(vec![Span::raw(format!(" save as: {}", p.input.text))]),
             None => Line::from(vec![Span::raw("")]),
         }
@@ -878,8 +989,15 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             Line::from(vec![Span::raw(format!(" {label}: {}", prompt.input.text))])
         } else {
             let rel = project_relative_path(&browsing.file_browser.path, &state.project_paths);
-            let suffix = if rel.is_empty() { String::new() } else { format!(" {rel}/") };
-            Line::from(vec![Span::raw(format!(" [{}]{}", state.project_name, suffix))])
+            let suffix = if rel.is_empty() {
+                String::new()
+            } else {
+                format!(" {rel}/")
+            };
+            Line::from(vec![Span::raw(format!(
+                " [{}]{}",
+                state.project_name, suffix
+            ))])
         }
     } else if matches!(state.editor().mode, EditorMode::Search) {
         let prompt = format!("/{}", state.editor().search.query.text);
@@ -961,35 +1079,54 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
     } else {
         None
     }) else {
-        return LogicalPosition { line: pos.line, col: pos.col + 1 };
+        return LogicalPosition {
+            line: pos.line,
+            col: pos.col + 1,
+        };
     };
     let last_vrow = match render.visual_rows.last() {
         Some(r) => r,
-        None => return LogicalPosition { line: pos.line, col: pos.col + 1 },
+        None => {
+            return LogicalPosition {
+                line: pos.line,
+                col: pos.col + 1,
+            }
+        }
     };
     let last_text = last_vrow.segments.first().map_or("", |s| s.text.as_str());
     let line_text_len = last_vrow.byte_offset + last_text.len() as u32;
     if pos.col >= line_text_len {
         // Cursor on the line's implicit newline → exclusive end is the next line's col 0.
-        return LogicalPosition { line: pos.line + 1, col: 0 };
+        return LogicalPosition {
+            line: pos.line + 1,
+            col: 0,
+        };
     }
     // Cursor on a real char — advance by that char's UTF-8 byte width.
     let row = render.visual_rows.iter().find(|r| {
         let row_len = r.segments.first().map_or(0, |s| s.text.len() as u32);
         pos.col >= r.byte_offset && pos.col < r.byte_offset + row_len
     });
-    let row_text = row.and_then(|r| r.segments.first()).map_or("", |s| s.text.as_str());
+    let row_text = row
+        .and_then(|r| r.segments.first())
+        .map_or("", |s| s.text.as_str());
     let row_local = pos.col.saturating_sub(row.map_or(0, |r| r.byte_offset)) as usize;
     let char_bytes = row_text[row_local..]
         .chars()
         .next()
         .map_or(1, |c| c.len_utf8() as u32);
-    LogicalPosition { line: pos.line, col: pos.col + char_bytes }
+    LogicalPosition {
+        line: pos.line,
+        col: pos.col + char_bytes,
+    }
 }
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
     if let Some(ed) = state.try_editor() {
-        if matches!(ed.mode, EditorMode::Search) && state.save_prompt.is_none() && !state.picker.open {
+        if matches!(ed.mode, EditorMode::Search)
+            && state.save_prompt.is_none()
+            && !state.picker.open
+        {
             // Park the terminal cursor on the status row, just past `/` + the typed query up
             // to the input cursor (so Left/Right navigate within the query, not always at the
             // end).
@@ -1018,17 +1155,25 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
     }
     if state.save_prompt.is_some() {
         if let Some(prompt) = state.save_prompt.as_ref() {
-            let max_col = status_area.x.saturating_add(status_area.width.saturating_sub(1));
+            let max_col = status_area
+                .x
+                .saturating_add(status_area.width.saturating_sub(1));
             let col = if prompt.pending_overwrite {
                 // Confirmation stage: park at the end of " overwrite <path>? [y/N]" so the
                 // I-beam sits past the prompt rather than mid-path.
                 let line = format!(" overwrite {}? [y/N]", prompt.input.text);
-                status_area.x.saturating_add(line.width() as u16).min(max_col)
+                status_area
+                    .x
+                    .saturating_add(line.width() as u16)
+                    .min(max_col)
             } else {
                 const PREFIX: &str = " save as: ";
                 let prefix_w = PREFIX.width() as u16;
                 let typed_w = prompt.input.width_to_cursor() as u16;
-                status_area.x.saturating_add(prefix_w.saturating_add(typed_w)).min(max_col)
+                status_area
+                    .x
+                    .saturating_add(prefix_w.saturating_add(typed_w))
+                    .min(max_col)
             };
             f.set_cursor_position((col, status_area.y));
         }
@@ -1047,7 +1192,11 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
             let col = status_area
                 .x
                 .saturating_add(prefix_width.saturating_add(prompt.input.width_to_cursor() as u16))
-                .min(status_area.x.saturating_add(status_area.width.saturating_sub(1)));
+                .min(
+                    status_area
+                        .x
+                        .saturating_add(status_area.width.saturating_sub(1)),
+                );
             f.set_cursor_position((col, status_area.y));
             return;
         }
@@ -1063,7 +1212,9 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         return; // cursor off-screen
     };
     let row = buffer_area.y + visual_row as u16;
-    let col = buffer_area.x.saturating_add(visual_col.min(buffer_area.width.saturating_sub(1)));
+    let col = buffer_area
+        .x
+        .saturating_add(visual_col.min(buffer_area.width.saturating_sub(1)));
     f.set_cursor_position((col, row));
 }
 
@@ -1076,7 +1227,11 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
     if cursor.line < top {
         return None;
     }
-    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) { state.editor().scroll_col } else { 0 };
+    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) {
+        state.editor().scroll_col
+    } else {
+        0
+    };
 
     let mut visual_offset: u32 = 0;
     for line_idx in top..=cursor.line {
@@ -1096,11 +1251,7 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
             // widths. The cursor lives in byte coordinates on the wire, but we render at display
             // columns — without this conversion a multi-byte char like `—` (3 bytes, 1 cell)
             // would push the cursor 2 columns past where the char visually ends.
-            let row_text = row
-                .segments
-                .first()
-                .map(|s| s.text.as_str())
-                .unwrap_or("");
+            let row_text = row.segments.first().map(|s| s.text.as_str()).unwrap_or("");
             let cursor_byte_in_row = cursor
                 .col
                 .saturating_sub(row.byte_offset)
@@ -1114,7 +1265,11 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
                 display_col_in_text += char_display_width(c, display_col_in_text);
                 byte_cursor += c.len_utf8();
             }
-            let marker = if row.byte_offset > 0 { CONTINUATION_MARKER_WIDTH } else { 0 };
+            let marker = if row.byte_offset > 0 {
+                CONTINUATION_MARKER_WIDTH
+            } else {
+                0
+            };
             let logical_visual_col = marker + row.continuation_indent + display_col_in_text;
             if logical_visual_col < scroll_col {
                 return None; // scrolled off the left
@@ -1166,7 +1321,10 @@ pub fn screen_to_logical(
         if local_idx < 0 || local_idx >= state.editor().lines.len() as i64 {
             // Click is past the last line we have rendered — clamp to the end of the buffer.
             let last_line = state.editor().line_count.saturating_sub(1);
-            return Some(LogicalPosition { line: last_line, col: u32::MAX });
+            return Some(LogicalPosition {
+                line: last_line,
+                col: u32::MAX,
+            });
         }
         let render = &state.editor().lines[local_idx as usize];
         let visual_rows_in_line = render.visual_rows.len() as u32;
@@ -1189,8 +1347,16 @@ pub fn screen_to_logical(
 /// that lines up with `screen_col`. Clicks on the marker / continuation indent map to the start
 /// of the row's text. Clicks past the end of the text map to the end of the text.
 fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u32 {
-    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) { state.editor().scroll_col } else { 0 };
-    let marker = if vrow.byte_offset > 0 { CONTINUATION_MARKER_WIDTH } else { 0 };
+    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) {
+        state.editor().scroll_col
+    } else {
+        0
+    };
+    let marker = if vrow.byte_offset > 0 {
+        CONTINUATION_MARKER_WIDTH
+    } else {
+        0
+    };
     let prefix = marker + vrow.continuation_indent;
     let target_display = (screen_col as u32).saturating_add(scroll_col);
     if target_display < prefix {

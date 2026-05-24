@@ -4,22 +4,21 @@ use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::SharedState;
 use aether_protocol::buffer::{BufferCopy, BufferCut, BufferOpen, BufferSave};
-use aether_protocol::directory::{DirectoryCreate, DirectoryList};
-use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerView};
-use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::cursor::{
     CursorContract, CursorExpand, CursorMove, CursorRedo, CursorSelectLine, CursorSet,
     CursorSwapAnchor, CursorUndo,
 };
+use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
 use aether_protocol::handshake::ClientHello;
 use aether_protocol::input::{
     InputDedent, InputDelete, InputIndent, InputJoinLines, InputMoveLines, InputNewlineAndIndent,
-    InputRedo, InputText, InputToggleComment,
-    InputUndo,
+    InputRedo, InputText, InputToggleComment, InputUndo,
 };
+use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerView};
+use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportSetWrap, ViewportSubscribe, ViewportUnsubscribe,
 };
@@ -41,7 +40,10 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
 
     let (mut writer, mut reader) = ws.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Notification>(OUTBOUND_CHANNEL_CAPACITY);
-    let mut ctx = ConnectionCtx { client_id: None, outbound_tx };
+    let mut ctx = ConnectionCtx {
+        client_id: None,
+        outbound_tx,
+    };
 
     loop {
         tokio::select! {
@@ -103,10 +105,18 @@ async fn process_text(text: &str, state: &SharedState, ctx: &mut ConnectionCtx) 
     let result = dispatch(state, ctx, &method, params).await;
 
     let envelope = match result {
-        Ok(value) => serde_json::to_string(&Response { jsonrpc: JsonRpc, id, result: value }),
+        Ok(value) => serde_json::to_string(&Response {
+            jsonrpc: JsonRpc,
+            id,
+            result: value,
+        }),
         Err(err) => {
             tracing::debug!(%method, code = err.code, msg = %err.message, "request returned error");
-            serde_json::to_string(&ErrorResponse { jsonrpc: JsonRpc, id, error: err.into() })
+            serde_json::to_string(&ErrorResponse {
+                jsonrpc: JsonRpc,
+                id,
+                error: err.into(),
+            })
         }
     };
 
@@ -180,7 +190,9 @@ async fn dispatch(
         InputMoveLines::NAME => run!(InputMoveLines, handlers::input_move_lines),
         InputIndent::NAME => run!(InputIndent, handlers::input_indent),
         InputDedent::NAME => run!(InputDedent, handlers::input_dedent),
-        InputNewlineAndIndent::NAME => run!(InputNewlineAndIndent, handlers::input_newline_and_indent),
+        InputNewlineAndIndent::NAME => {
+            run!(InputNewlineAndIndent, handlers::input_newline_and_indent)
+        }
         InputToggleComment::NAME => run!(InputToggleComment, handlers::input_toggle_comment),
         PickerView::NAME => run!(PickerView, handlers::picker_view),
         PickerQuery::NAME => run!(PickerQuery, handlers::picker_query),

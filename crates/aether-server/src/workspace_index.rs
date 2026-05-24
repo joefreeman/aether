@@ -54,7 +54,10 @@ pub struct WorkspaceIndex {
 
 impl WorkspaceIndex {
     pub fn new(roots: Vec<PathBuf>) -> Self {
-        Self { roots, files: OnceCell::new() }
+        Self {
+            roots,
+            files: OnceCell::new(),
+        }
     }
 
     /// Get the candidate cache, walking on first call. Subsequent calls hand back the same `Arc`.
@@ -90,7 +93,10 @@ fn walk(roots: &[PathBuf]) -> Vec<CachedFile> {
                 } else {
                     root_name.clone()
                 };
-                out.push(CachedFile { abs: abs.to_string(), display });
+                out.push(CachedFile {
+                    abs: abs.to_string(),
+                    display,
+                });
             }
             continue;
         }
@@ -110,7 +116,9 @@ fn walk(roots: &[PathBuf]) -> Vec<CachedFile> {
                 continue;
             }
             let abs_path = entry.path();
-            let Some(abs) = abs_path.to_str() else { continue };
+            let Some(abs) = abs_path.to_str() else {
+                continue;
+            };
             let rel = abs_path
                 .strip_prefix(root)
                 .ok()
@@ -121,7 +129,10 @@ fn walk(roots: &[PathBuf]) -> Vec<CachedFile> {
             } else {
                 rel.to_string()
             };
-            out.push(CachedFile { abs: abs.to_string(), display });
+            out.push(CachedFile {
+                abs: abs.to_string(),
+                display,
+            });
         }
     }
 

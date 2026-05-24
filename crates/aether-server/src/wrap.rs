@@ -36,11 +36,18 @@ pub fn render_line(
         WrapMode::None => vec![VisualRow {
             byte_offset: 0,
             continuation_indent: 0,
-            segments: vec![Segment { text: line_text.to_string(), highlights }],
+            segments: vec![Segment {
+                text: line_text.to_string(),
+                highlights,
+            }],
         }],
         WrapMode::Soft => wrap_line(line_text, cols, marker_width, tab_width, &highlights),
     };
-    LogicalLineRender { logical_line, visual_rows, search_matches: Vec::new() }
+    LogicalLineRender {
+        logical_line,
+        visual_rows,
+        search_matches: Vec::new(),
+    }
 }
 
 /// One physical row of wrapped output along with the byte range of the logical line it covers.
@@ -53,7 +60,13 @@ pub(crate) struct RowInfo {
     pub continuation_indent: u32,
 }
 
-fn wrap_line(line: &str, cols: u32, marker_width: u32, tab_width: u32, highlights: &[Highlight]) -> Vec<VisualRow> {
+fn wrap_line(
+    line: &str,
+    cols: u32,
+    marker_width: u32,
+    tab_width: u32,
+    highlights: &[Highlight],
+) -> Vec<VisualRow> {
     let row_infos = compute_rows(line, cols, marker_width, tab_width);
     row_infos
         .into_iter()
@@ -62,18 +75,34 @@ fn wrap_line(line: &str, cols: u32, marker_width: u32, tab_width: u32, highlight
             VisualRow {
                 byte_offset: info.byte_offset as u32,
                 continuation_indent: info.continuation_indent,
-                segments: vec![Segment { text: info.text, highlights: row_highlights }],
+                segments: vec![Segment {
+                    text: info.text,
+                    highlights: row_highlights,
+                }],
             }
         })
         .collect()
 }
 
-pub(crate) fn compute_rows(line: &str, cols: u32, marker_width: u32, tab_width: u32) -> Vec<RowInfo> {
+pub(crate) fn compute_rows(
+    line: &str,
+    cols: u32,
+    marker_width: u32,
+    tab_width: u32,
+) -> Vec<RowInfo> {
     if line.is_empty() {
-        return vec![RowInfo { byte_offset: 0, text: String::new(), continuation_indent: 0 }];
+        return vec![RowInfo {
+            byte_offset: 0,
+            text: String::new(),
+            continuation_indent: 0,
+        }];
     }
     if cols == 0 {
-        return vec![RowInfo { byte_offset: 0, text: line.to_string(), continuation_indent: 0 }];
+        return vec![RowInfo {
+            byte_offset: 0,
+            text: line.to_string(),
+            continuation_indent: 0,
+        }];
     }
 
     let lead: u32 = leading_whitespace_cols(line, tab_width);
@@ -81,7 +110,11 @@ pub(crate) fn compute_rows(line: &str, cols: u32, marker_width: u32, tab_width: 
     // there's no room for content on a continuation, so wrapping is meaningless — emit a single
     // row and let the client draw it (terminal will clip the overflow).
     if lead.saturating_add(marker_width) >= cols {
-        return vec![RowInfo { byte_offset: 0, text: line.to_string(), continuation_indent: 0 }];
+        return vec![RowInfo {
+            byte_offset: 0,
+            text: line.to_string(),
+            continuation_indent: 0,
+        }];
     }
 
     let mut rows: Vec<RowInfo> = Vec::new();
@@ -147,7 +180,11 @@ pub(crate) fn compute_rows(line: &str, cols: u32, marker_width: u32, tab_width: 
             continuation_indent: row_indent,
         });
     } else if rows.is_empty() {
-        rows.push(RowInfo { byte_offset: 0, text: String::new(), continuation_indent: 0 });
+        rows.push(RowInfo {
+            byte_offset: 0,
+            text: String::new(),
+            continuation_indent: 0,
+        });
     }
     rows
 }
@@ -264,7 +301,15 @@ mod tests {
 
     #[test]
     fn render_line_no_wrap_returns_single_row() {
-        let r = render_line("anything goes here at all", 0, 5, WrapMode::None, 0, 4, vec![]);
+        let r = render_line(
+            "anything goes here at all",
+            0,
+            5,
+            WrapMode::None,
+            0,
+            4,
+            vec![],
+        );
         assert_eq!(r.visual_rows.len(), 1);
         assert_eq!(row_text(&r.visual_rows[0]), "anything goes here at all");
         assert_eq!(r.visual_rows[0].byte_offset, 0);
@@ -284,7 +329,11 @@ mod tests {
         // "the quick brown fox" wraps at 10 → ["the quick", "brown fox"] with row[1] starting
         // at byte 10. A highlight on "brown" (bytes 10..15) should land entirely on row 1 with
         // row-relative offsets [0, 5).
-        let highlights = vec![Highlight { start: 10, end: 15, kind: "keyword".into() }];
+        let highlights = vec![Highlight {
+            start: 10,
+            end: 15,
+            kind: "keyword".into(),
+        }];
         let rows = wrap_line("the quick brown fox", 10, 0, 4, &highlights);
         let row0_hl = &rows[0].segments[0].highlights;
         let row1_hl = &rows[1].segments[0].highlights;
@@ -312,7 +361,13 @@ mod tests {
     fn tab_only_indent_advances_continuation_correctly() {
         // Two tabs of leading whitespace = 8 visual cols. Continuation rows should report
         // continuation_indent=8, matching where the rendered text would actually start.
-        let rows = wrap_line("\t\tthis is a longer body that needs wrapping", 30, 0, 4, &[]);
+        let rows = wrap_line(
+            "\t\tthis is a longer body that needs wrapping",
+            30,
+            0,
+            4,
+            &[],
+        );
         assert!(rows.len() >= 2);
         assert_eq!(rows[1].continuation_indent, 8);
     }
@@ -334,7 +389,11 @@ mod tests {
         // Highlight spans the wrap point: bytes 6..14 covers "uick" + " " + "bro".
         // Row 0 visible "the quick" (0..9), row 1 visible "brown fox" (starts at 10).
         // After clipping: row 0 highlight = [6, 9), row 1 highlight = [0, 4).
-        let highlights = vec![Highlight { start: 6, end: 14, kind: "string".into() }];
+        let highlights = vec![Highlight {
+            start: 6,
+            end: 14,
+            kind: "string".into(),
+        }];
         let rows = wrap_line("the quick brown fox", 10, 0, 4, &highlights);
         let row0_hl = &rows[0].segments[0].highlights;
         let row1_hl = &rows[1].segments[0].highlights;

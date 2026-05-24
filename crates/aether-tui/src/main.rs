@@ -10,8 +10,8 @@ mod ui;
 use clap::Parser;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -59,13 +59,14 @@ async fn main() -> anyhow::Result<()> {
     install_panic_hook();
 
     let (cols, rows) = crossterm::terminal::size()?;
-    let mut state = match app::bootstrap(&mut client, info.token, cli.file.as_deref(), cols, rows).await {
-        Ok(s) => s,
-        Err(e) => {
-            restore_terminal(&mut terminal).ok();
-            return Err(e);
-        }
-    };
+    let mut state =
+        match app::bootstrap(&mut client, info.token, cli.file.as_deref(), cols, rows).await {
+            Ok(s) => s,
+            Err(e) => {
+                restore_terminal(&mut terminal).ok();
+                return Err(e);
+            }
+        };
 
     let run_result = app::run(&mut terminal, &mut client, &mut state).await;
     restore_terminal(&mut terminal)?;
@@ -93,7 +94,11 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow
     disable_raw_mode()?;
     let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
-    execute!(terminal.backend_mut(), SetCursorStyle::DefaultUserShape, LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        SetCursorStyle::DefaultUserShape,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }

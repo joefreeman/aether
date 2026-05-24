@@ -4,18 +4,20 @@
 use aether_protocol::buffer::{
     BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
     BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferSaveResult,
-    BufferState, BufferStateParams,
-    CopyScope,
+    BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
     CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
     CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection, WordBoundary,
 };
-use aether_protocol::envelope::{
-    ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod,
-};
+use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::handshake::{ClientHello, ClientHelloParams, ClientHelloResult};
+use aether_protocol::input::{
+    BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
+    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
+    InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
+};
 use aether_protocol::picker::{
     PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,
     PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams,
@@ -24,11 +26,6 @@ use aether_protocol::picker::{
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
     SearchSet, SearchSetParams, SearchSetResult,
-};
-use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputDedent, InputDelete, InputDeleteParams, InputIndent,
-    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
-    InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
 };
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportScroll,
@@ -44,7 +41,9 @@ use tokio_tungstenite::tungstenite::Message;
 const TEST_TOKEN: &str = "test-token-xyz";
 
 async fn next_text(
-    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
 ) -> String {
     loop {
         let msg = ws.next().await.expect("ws closed").expect("ws error");
@@ -55,7 +54,9 @@ async fn next_text(
 }
 
 async fn send_request<M: RpcMethod>(
-    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
     id: u64,
     params: &M::Params,
 ) -> M::Result {
@@ -78,7 +79,9 @@ async fn send_request<M: RpcMethod>(
             ClientInbound::Error(e) if e.id == id => {
                 panic!("request {id} ({}) returned error: {:?}", M::NAME, e.error);
             }
-            ClientInbound::Notification(_) | ClientInbound::Response(_) | ClientInbound::Error(_) => {
+            ClientInbound::Notification(_)
+            | ClientInbound::Response(_)
+            | ClientInbound::Error(_) => {
                 // Skip unrelated frames; tests that care use `expect_notification` below.
             }
         }
@@ -88,7 +91,9 @@ async fn send_request<M: RpcMethod>(
 /// Like `send_request` but expects the RPC to return an error; returns the error message.
 /// Panics on a successful response.
 async fn send_request_expect_err<M: RpcMethod>(
-    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
     id: u64,
     params: &M::Params,
 ) -> String {
@@ -114,7 +119,9 @@ async fn send_request_expect_err<M: RpcMethod>(
 
 /// Read frames until one matching notification arrives. Panics if the stream ends first.
 async fn expect_notification<N: NotificationMethod>(
-    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
 ) -> N::Params {
     loop {
         let text = next_text(ws).await;
@@ -137,13 +144,18 @@ async fn hello_then_open_file() {
         .await
         .unwrap();
 
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
 
     // Handshake.
     let hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     assert_eq!(hello.project.name, "test-proj");
@@ -204,11 +216,16 @@ async fn buffer_open_restores_cursor_and_scroll() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
 
@@ -234,7 +251,10 @@ async fn buffer_open_restores_cursor_and_scroll() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -248,7 +268,11 @@ async fn buffer_open_restores_cursor_and_scroll() {
     let _: CursorState = send_request::<CursorSet>(
         &mut ws,
         4,
-        &CursorSetParams { buffer_id, position: cursor_target, anchor: None },
+        &CursorSetParams {
+            buffer_id,
+            position: cursor_target,
+            anchor: None,
+        },
     )
     .await;
     let _: ViewportWindowResult = send_request::<ViewportScroll>(
@@ -256,7 +280,10 @@ async fn buffer_open_restores_cursor_and_scroll() {
         5,
         &ViewportScrollParams {
             viewport_id,
-            scroll: ScrollPosition { logical_line: 8, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 8,
+                sub_row: 0.0,
+            },
         },
     )
     .await;
@@ -299,11 +326,16 @@ async fn buffer_open_isolates_scroll_per_client() {
         .unwrap();
 
     let connect = || async {
-        let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+            .await
+            .unwrap();
         let _: ClientHelloResult = send_request::<ClientHello>(
             &mut ws,
             1,
-            &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+            &ClientHelloParams {
+                token: TEST_TOKEN.into(),
+                client_version: "test".into(),
+            },
         )
         .await;
         let open: BufferOpenResult = send_request::<BufferOpen>(
@@ -326,7 +358,10 @@ async fn buffer_open_isolates_scroll_per_client() {
                 cols: 80,
                 rows: 10,
                 overscan_rows: 0,
-                scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+                scroll: ScrollPosition {
+                    logical_line: 0,
+                    sub_row: 0.0,
+                },
                 wrap: WrapMode::None,
                 continuation_marker_width: 0,
                 tab_width: 4,
@@ -345,7 +380,10 @@ async fn buffer_open_isolates_scroll_per_client() {
         10,
         &ViewportScrollParams {
             viewport_id: vp_a,
-            scroll: ScrollPosition { logical_line: 5, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 5,
+                sub_row: 0.0,
+            },
         },
     )
     .await;
@@ -354,7 +392,10 @@ async fn buffer_open_isolates_scroll_per_client() {
         10,
         &ViewportScrollParams {
             viewport_id: vp_b,
-            scroll: ScrollPosition { logical_line: 17, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 17,
+                sub_row: 0.0,
+            },
         },
     )
     .await;
@@ -395,7 +436,9 @@ async fn rejects_bad_token() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
 
     let req = Request {
         jsonrpc: JsonRpc,
@@ -409,7 +452,9 @@ async fn rejects_bad_token() {
             .unwrap(),
         ),
     };
-    ws.send(Message::text(serde_json::to_string(&req).unwrap())).await.unwrap();
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
 
     let text = next_text(&mut ws).await;
     let v: Value = serde_json::from_str(&text).unwrap();
@@ -426,12 +471,17 @@ async fn rejects_path_outside_project() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
 
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
 
@@ -451,7 +501,9 @@ async fn rejects_path_outside_project() {
             .unwrap(),
         ),
     };
-    ws.send(Message::text(serde_json::to_string(&req).unwrap())).await.unwrap();
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
 
     let text = next_text(&mut ws).await;
     let v: Value = serde_json::from_str(&text).unwrap();
@@ -470,12 +522,17 @@ async fn viewport_subscribe_renders_window() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
 
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
 
@@ -501,10 +558,14 @@ async fn viewport_subscribe_renders_window() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
@@ -530,11 +591,16 @@ async fn viewport_subscribe_wraps_long_line() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
@@ -558,10 +624,14 @@ async fn viewport_subscribe_wraps_long_line() {
             cols: 20,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
@@ -579,7 +649,12 @@ async fn viewport_subscribe_wraps_long_line() {
     let joined: String = line0
         .visual_rows
         .iter()
-        .map(|r| r.segments.iter().map(|s| s.text.as_str()).collect::<String>())
+        .map(|r| {
+            r.segments
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>()
+        })
         .collect::<Vec<_>>()
         .join(" ");
     assert_eq!(joined, "the quick brown fox jumps over the lazy dog");
@@ -598,11 +673,16 @@ async fn viewport_scroll_returns_new_window() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
@@ -625,10 +705,14 @@ async fn viewport_scroll_returns_new_window() {
             cols: 80,
             rows: 5,
             overscan_rows: 2,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
@@ -639,7 +723,10 @@ async fn viewport_scroll_returns_new_window() {
         4,
         &ViewportScrollParams {
             viewport_id: sub.viewport_id,
-            scroll: ScrollPosition { logical_line: 20, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 20,
+                sub_row: 0.0,
+            },
         },
     )
     .await;
@@ -651,7 +738,9 @@ async fn viewport_scroll_returns_new_window() {
 
 // -------- cursor + input ------------------------------------------------------------------------
 
-async fn setup_with_buffer(content: &str) -> (
+async fn setup_with_buffer(
+    content: &str,
+) -> (
     aether_server::ServerHandle,
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     u64, // buffer_id
@@ -664,18 +753,31 @@ async fn setup_with_buffer(content: &str) -> (
     // and the OS will clean up /tmp on reboot.
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { buffer_id: None, path_index: Some(0), relative_path: Some("buf.txt".into()), language: None, create_if_missing: false },
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("buf.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
     )
     .await;
     (server, ws, open.buffer_id)
@@ -690,7 +792,10 @@ async fn cursor_starts_at_origin_and_moves_by_char() {
         10,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Char { direction: Direction::Forward, count: 3 },
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 3,
+            },
             extend_selection: false,
         },
     )
@@ -704,7 +809,10 @@ async fn cursor_starts_at_origin_and_moves_by_char() {
         11,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Char { direction: Direction::Forward, count: 5 },
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 5,
+            },
             extend_selection: false,
         },
     )
@@ -739,7 +847,10 @@ async fn cursor_set_and_extend_selection() {
         11,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Char { direction: Direction::Forward, count: 3 },
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 3,
+            },
             extend_selection: true,
         },
     )
@@ -795,10 +906,14 @@ async fn input_text_inserts_and_pushes_notification() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
@@ -816,11 +931,20 @@ async fn input_text_inserts_and_pushes_notification() {
     )
     .await;
 
-    let result: EditResult =
-        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "XY".into(), select_pasted: false }).await;
+    let result: EditResult = send_request::<InputText>(
+        &mut ws,
+        12,
+        &InputTextParams {
+            buffer_id,
+            text: "XY".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
     assert_eq!(result.revision, 1);
 
-    let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(notif.viewport_id, sub.viewport_id);
     assert_eq!(notif.revision, 1);
     let first_line = &notif.replacement_lines[0];
@@ -852,10 +976,14 @@ async fn input_delete_backspace_removes_char_before_cursor() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
@@ -866,14 +994,21 @@ async fn input_delete_backspace_removes_char_before_cursor() {
         12,
         &InputDeleteParams {
             buffer_id,
-            motion: Motion::Char { direction: Direction::Backward, count: 1 },
+            motion: Motion::Char {
+                direction: Direction::Backward,
+                count: 1,
+            },
         },
     )
     .await;
     assert_eq!(result.revision, 1);
 
-    let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "hell");
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "hell"
+    );
 
     drop(server);
 }
@@ -887,17 +1022,28 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { buffer_id: None, path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false },
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
     )
     .await;
     assert_eq!(open.language.as_deref(), Some("rust"));
@@ -910,10 +1056,14 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
             cols: 80,
             rows: 5,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::None,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
@@ -921,7 +1071,10 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     let line0 = &sub.window.lines[0];
     let segs = &line0.visual_rows[0].segments;
     let highlights = &segs[0].highlights;
-    assert!(!highlights.is_empty(), "expected highlight spans on a Rust line");
+    assert!(
+        !highlights.is_empty(),
+        "expected highlight spans on a Rust line"
+    );
 
     // First two bytes should be the keyword 'fn'.
     let fn_kw = highlights.iter().find(|h| h.start == 0 && h.end == 2);
@@ -941,34 +1094,69 @@ async fn match_bracket_motion_jumps_to_pair() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Park on the `{` (col 9 on line 0).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 9 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::MatchBracket,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 9 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::MatchBracket,
+            extend_selection: false,
+        },
+    )
+    .await;
     // `}` lives at col 22 on the same line.
     assert_eq!(r.position, LogicalPosition { line: 0, col: 22 });
     assert!(r.anchor.is_none());
     // match_bracket is populated; positions are the same pair regardless of orientation.
     let pair = r.match_bracket.expect("match_bracket should be populated");
-    assert!(pair == (LogicalPosition { line: 0, col: 9 }, LogicalPosition { line: 0, col: 22 })
-         || pair == (LogicalPosition { line: 0, col: 22 }, LogicalPosition { line: 0, col: 9 }));
+    assert!(
+        pair == (
+            LogicalPosition { line: 0, col: 9 },
+            LogicalPosition { line: 0, col: 22 }
+        ) || pair
+            == (
+                LogicalPosition { line: 0, col: 22 },
+                LogicalPosition { line: 0, col: 9 }
+            )
+    );
 
     drop(server);
 }
@@ -979,26 +1167,53 @@ async fn match_bracket_with_extend_selects_to_pair() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 9 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::MatchBracket,
-        extend_selection: true,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 9 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::MatchBracket,
+            extend_selection: true,
+        },
+    )
+    .await;
     // Cursor lands on the `}`; anchor pinned at the original `{`. Together they cover the
     // whole `{...}` pair inclusive — that's the "select around brackets" gesture.
     assert_eq!(r.position, LogicalPosition { line: 0, col: 22 });
@@ -1013,27 +1228,54 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor on the `l` of `let` — inside the block, not on any bracket.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 11 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::MatchBracket,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 11 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::MatchBracket,
+            extend_selection: false,
+        },
+    )
+    .await;
     // Cursor jumps to the opening `{` (we pick the opener when cursor is between brackets).
     assert_eq!(r.position, LogicalPosition { line: 0, col: 9 });
 
@@ -1049,40 +1291,84 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor on the `fn` keyword of `fn one`. `}` jumps to the function's last char (the
     // closing `}`) and the anchor stays where we started.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 0 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::EndOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::EndOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     // `fn one() {}` is 11 chars; the closing `}` sits at col 10 of line 0.
     assert_eq!(r.position, LogicalPosition { line: 0, col: 10 });
     assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 0 }));
 
     // Delete the selection — the function should be removed exactly, leaving the trailing
     // newline (and the next two functions) intact.
-    let _: EditResult = send_request::<InputDelete>(&mut ws, 5, &InputDeleteParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::Char { direction: Direction::Forward, count: 1 },
-    }).await;
-    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 6, &BufferSaveParams {
-        buffer_id: open.buffer_id, path_index: None, relative_path: None, overwrite: false }).await;
+    let _: EditResult = send_request::<InputDelete>(
+        &mut ws,
+        5,
+        &InputDeleteParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 1,
+            },
+        },
+    )
+    .await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        6,
+        &BufferSaveParams {
+            buffer_id: open.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
     let disk = std::fs::read_to_string(&path).unwrap();
     assert_eq!(disk, "\nfn two() {}\nfn three() {}\n");
 
@@ -1098,27 +1384,54 @@ async fn end_of_unit_works_on_last_function() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn last() {}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor on `fn last` (line 1, col 0).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 1, col: 0 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::EndOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::EndOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     // `fn last() {}` is 12 chars; closing `}` at col 11.
     assert_eq!(r.position, LogicalPosition { line: 1, col: 11 });
     assert_eq!(r.anchor, Some(LogicalPosition { line: 1, col: 0 }));
@@ -1135,27 +1448,54 @@ async fn start_of_unit_extends_back_to_function_start() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() {\n    let x = 1;\n}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor inside the body, on the `x` (line 1, col 8).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 1, col: 8 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::StartOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 1, col: 8 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::StartOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 0, col: 0 });
     assert_eq!(r.anchor, Some(LogicalPosition { line: 1, col: 8 }));
 
@@ -1171,54 +1511,96 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 0 },
-        anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
     // First `}`: select to end of fn one.
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::EndOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::EndOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 0, col: 10 });
     assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 0 }));
 
     // Second `}`: cursor at end of fn one, fall through to end of fn two.
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 5, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::EndOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        5,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::EndOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 1, col: 10 });
     assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 0 }));
 
     // Third `}`: end of fn three.
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 6, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::EndOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        6,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::EndOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 2, col: 12 });
     assert_eq!(r.anchor, Some(LogicalPosition { line: 0, col: 0 }));
 
     // Fourth `}`: no more siblings, no-op.
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 7, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::EndOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        7,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::EndOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 2, col: 12 });
 
     drop(server);
@@ -1230,35 +1612,67 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor on the closing `}` of `fn three`.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 2, col: 12 },
-        anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 2, col: 12 },
+            anchor: None,
+        },
+    )
+    .await;
     // First `{`: select back to start of fn three.
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::StartOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::StartOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 2, col: 0 });
     // Second `{`: cursor at start of fn three, fall through to start of fn two.
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 5, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::StartOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        5,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::StartOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 1, col: 0 });
 
     drop(server);
@@ -1272,26 +1686,53 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\n\nfn two() {}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 1, col: 0 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::EndOfNavigationUnit,
-        extend_selection: true,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::EndOfNavigationUnit,
+            extend_selection: true,
+        },
+    )
+    .await;
     // Lands on the closing `}` of `fn two` (line 2, col 10).
     assert_eq!(r.position, LogicalPosition { line: 2, col: 10 });
     assert_eq!(r.anchor, Some(LogicalPosition { line: 1, col: 0 }));
@@ -1303,38 +1744,74 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
 async fn nav_motion_jumps_between_top_level_rust_items() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
-    std::fs::write(&path, "fn one() {\n    let x = 1;\n}\nfn two() {}\nfn three() {}\n").unwrap();
+    std::fs::write(
+        &path,
+        "fn one() {\n    let x = 1;\n}\nfn two() {}\nfn three() {}\n",
+    )
+    .unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // From inside `fn one`'s body — the body has no nav-kind children, so the motion walks
     // up to the source_file level and jumps to `fn two`.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 1, col: 8 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::NextNavigationUnit,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 1, col: 8 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::NextNavigationUnit,
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 3, col: 0 });
 
     // A second press jumps from `fn two` to `fn three`.
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 5, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::NextNavigationUnit,
-        extend_selection: false,
-    }).await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        5,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::NextNavigationUnit,
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 4, col: 0 });
 
     drop(server);
@@ -1346,27 +1823,54 @@ async fn nav_motion_prev_walks_backward() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor on `fn three` (line 2 col 0). `[` walks back to `fn two`.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 2, col: 0 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::PrevNavigationUnit,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 2, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::PrevNavigationUnit,
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 1, col: 0 });
 
     drop(server);
@@ -1379,26 +1883,53 @@ async fn nav_motion_noop_at_end_of_file() {
     // Single function — nothing to navigate to.
     std::fs::write(&path, "fn only() {}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 0 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::NextNavigationUnit,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::NextNavigationUnit,
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 0, col: 0 });
 
     drop(server);
@@ -1416,27 +1947,54 @@ async fn nav_motion_inside_python_class_finds_next_method() {
         "class Foo:\n    def method1(self):\n        pass\n    def method2(self):\n        pass\n\ndef top_level():\n    pass\n",
     ).unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.py".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor inside method1's body (the `pass` on line 2).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 2, col: 8 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::NextNavigationUnit,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 2, col: 8 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::NextNavigationUnit,
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 3, col: 4 });
 
     drop(server);
@@ -1453,28 +2011,55 @@ async fn nav_motion_from_last_method_stays_in_class() {
         "class Foo:\n    def method1(self):\n        pass\n    def method2(self):\n        pass\n\ndef top_level():\n    pass\n",
     ).unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.py".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor inside method2 (the `pass` on line 4). `]` should no-op rather than jump to
     // `def top_level` outside the class.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 4, col: 8 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::NextNavigationUnit,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 4, col: 8 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::NextNavigationUnit,
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 4, col: 8 });
 
     drop(server);
@@ -1490,28 +2075,56 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
     std::fs::write(
         &path,
         "class Foo:\n    def method1(self):\n        pass\n\ndef top_level():\n    pass\n",
-    ).unwrap();
+    )
+    .unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.py".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 0 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::NextNavigationUnit,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::NextNavigationUnit,
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 4, col: 0 });
 
     drop(server);
@@ -1526,28 +2139,55 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
         "<html>\n  <head>\n    <meta charset=\"utf-8\" />\n    <title>x</title>\n    <link href=\"a.css\" />\n  </head>\n</html>\n",
     ).unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.html".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.html".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor on `<meta ...>` (line 2, col 4). The meta is a self-closing element with no
     // nav-kind children of its own, so the walk-up reaches `<head>` and jumps to `<title>`.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 2, col: 4 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id: open.buffer_id,
-        motion: Motion::NextNavigationUnit,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 2, col: 4 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::NextNavigationUnit,
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 3, col: 4 });
 
     drop(server);
@@ -1557,16 +2197,26 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
 async fn nav_motion_with_no_syntax_is_noop() {
     // Plain `.txt` buffer — no language registered, so the motion has no nav-kinds to find.
     let (server, mut ws, buffer_id) = setup_with_buffer("hello\nworld\n").await;
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 0, col: 0 },
-        anchor: None,
-    }).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, 4, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::NextNavigationUnit,
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::NextNavigationUnit,
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(r.position, LogicalPosition { line: 0, col: 0 });
 
     drop(server);
@@ -1587,11 +2237,16 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
@@ -1616,9 +2271,13 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::None,
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
@@ -1647,17 +2306,28 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { buffer_id: None, path_index: Some(0), relative_path: Some("greet.txt".into()), language: None, create_if_missing: false },
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("greet.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
     )
     .await;
 
@@ -1670,10 +2340,14 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
@@ -1682,7 +2356,11 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let _ = send_request::<CursorMove>(
         &mut ws,
         4,
-        &CursorMoveParams { buffer_id: open.buffer_id, motion: Motion::BufferEnd, extend_selection: false },
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::BufferEnd,
+            extend_selection: false,
+        },
     )
     .await;
     // BufferEnd puts cursor on the trailing empty line; move it to end of first line instead.
@@ -1699,7 +2377,11 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let _edit: EditResult = send_request::<InputText>(
         &mut ws,
         6,
-        &InputTextParams { buffer_id: open.buffer_id, text: "!".into(), select_pasted: false },
+        &InputTextParams {
+            buffer_id: open.buffer_id,
+            text: "!".into(),
+            select_pasted: false,
+        },
     )
     .await;
     // Drain the viewport/lines_changed pushed by the edit so it doesn't leak into the next test step.
@@ -1708,7 +2390,12 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let save: BufferSaveResult = send_request::<BufferSave>(
         &mut ws,
         7,
-        &BufferSaveParams { buffer_id: open.buffer_id, path_index: None, relative_path: None, overwrite: false },
+        &BufferSaveParams {
+            buffer_id: open.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
     )
     .await;
     assert!(save.saved_at_unix_ms > 0);
@@ -1733,17 +2420,28 @@ async fn save_preserves_crlf_endings() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { buffer_id: None, path_index: Some(0), relative_path: Some("windows.txt".into()), language: None, create_if_missing: false },
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("windows.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
     )
     .await;
 
@@ -1751,13 +2449,23 @@ async fn save_preserves_crlf_endings() {
     let _save: BufferSaveResult = send_request::<BufferSave>(
         &mut ws,
         3,
-        &BufferSaveParams { buffer_id: open.buffer_id, path_index: None, relative_path: None, overwrite: false },
+        &BufferSaveParams {
+            buffer_id: open.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
     )
     .await;
     let bytes = std::fs::read(&path).unwrap();
-    assert!(bytes.windows(2).any(|w| w == b"\r\n"), "expected CRLF after save, got {bytes:?}");
-    assert!(!bytes.windows(2).any(|w| w[0] != b'\r' && w[1] == b'\n'),
-        "expected no bare LF after save");
+    assert!(
+        bytes.windows(2).any(|w| w == b"\r\n"),
+        "expected CRLF after save, got {bytes:?}"
+    );
+    assert!(
+        !bytes.windows(2).any(|w| w[0] != b'\r' && w[1] == b'\n'),
+        "expected no bare LF after save"
+    );
 
     drop(server);
 }
@@ -1768,17 +2476,28 @@ async fn save_scratch_returns_buffer_has_no_path() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
-        &BufferOpenParams { buffer_id: None, path_index: None, relative_path: None, language: None, create_if_missing: false },
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
     )
     .await;
 
@@ -1791,11 +2510,15 @@ async fn save_scratch_returns_buffer_has_no_path() {
             serde_json::to_value(BufferSaveParams {
                 buffer_id: open.buffer_id,
                 path_index: None,
-                relative_path: None, overwrite: false })
+                relative_path: None,
+                overwrite: false,
+            })
             .unwrap(),
         ),
     };
-    ws.send(Message::text(serde_json::to_string(&req).unwrap())).await.unwrap();
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
     let text = next_text(&mut ws).await;
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["error"]["code"], -32015, "expected BUFFER_HAS_NO_PATH");
@@ -1810,7 +2533,11 @@ async fn copy_selection_returns_inclusive_text() {
     send_request::<CursorSet>(
         &mut ws,
         10,
-        &CursorSetParams { buffer_id, position: LogicalPosition { line: 0, col: 6 }, anchor: None },
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 6 },
+            anchor: None,
+        },
     )
     .await;
     let _: CursorState = send_request::<CursorMove>(
@@ -1818,7 +2545,10 @@ async fn copy_selection_returns_inclusive_text() {
         11,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Char { direction: Direction::Forward, count: 3 },
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 3,
+            },
             extend_selection: true,
         },
     )
@@ -1826,7 +2556,10 @@ async fn copy_selection_returns_inclusive_text() {
     let r: BufferCopyResult = send_request::<BufferCopy>(
         &mut ws,
         12,
-        &BufferCopyParams { buffer_id, scope: CopyScope::Selection },
+        &BufferCopyParams {
+            buffer_id,
+            scope: CopyScope::Selection,
+        },
     )
     .await;
     assert_eq!(r.text, "beta");
@@ -1839,13 +2572,20 @@ async fn copy_line_returns_full_line_with_newline() {
     send_request::<CursorSet>(
         &mut ws,
         10,
-        &CursorSetParams { buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None },
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 2 },
+            anchor: None,
+        },
     )
     .await;
     let r: BufferCopyResult = send_request::<BufferCopy>(
         &mut ws,
         11,
-        &BufferCopyParams { buffer_id, scope: CopyScope::Line },
+        &BufferCopyParams {
+            buffer_id,
+            scope: CopyScope::Line,
+        },
     )
     .await;
     assert_eq!(r.text, "second\n");
@@ -1863,17 +2603,25 @@ async fn cut_selection_deletes_and_returns_text() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
     send_request::<CursorSet>(
         &mut ws,
         11,
-        &CursorSetParams { buffer_id, position: LogicalPosition { line: 0, col: 6 }, anchor: None },
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 6 },
+            anchor: None,
+        },
     )
     .await;
     let _: CursorState = send_request::<CursorMove>(
@@ -1881,7 +2629,10 @@ async fn cut_selection_deletes_and_returns_text() {
         12,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Char { direction: Direction::Forward, count: 3 },
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 3,
+            },
             extend_selection: true,
         },
     )
@@ -1889,15 +2640,22 @@ async fn cut_selection_deletes_and_returns_text() {
     let r: BufferCutResult = send_request::<BufferCut>(
         &mut ws,
         13,
-        &BufferCopyParams { buffer_id, scope: CopyScope::Selection },
+        &BufferCopyParams {
+            buffer_id,
+            scope: CopyScope::Selection,
+        },
     )
     .await;
     assert_eq!(r.text, "beta");
     // dirty is now derived client-side from revision vs saved_revision; just confirm the
     // revision advanced.
     assert!(r.revision > 0);
-    let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "alpha  gamma");
+    let notif =
+        expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "alpha  gamma"
+    );
     drop(server);
 }
 
@@ -1907,7 +2665,11 @@ async fn input_text_with_select_pasted_makes_selection() {
     send_request::<CursorSet>(
         &mut ws,
         10,
-        &CursorSetParams { buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None },
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
     )
     .await;
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
@@ -1918,21 +2680,32 @@ async fn input_text_with_select_pasted_makes_selection() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
     let edit: EditResult = send_request::<InputText>(
         &mut ws,
         12,
-        &InputTextParams { buffer_id, text: "XYZ".into(), select_pasted: true },
+        &InputTextParams {
+            buffer_id,
+            text: "XYZ".into(),
+            select_pasted: true,
+        },
     )
     .await;
     // Anchor at col 0 ('X'), position at col 2 (block on 'Z') — selection covers "XYZ".
-    assert_eq!(edit.cursor.anchor, Some(LogicalPosition { line: 0, col: 0 }));
+    assert_eq!(
+        edit.cursor.anchor,
+        Some(LogicalPosition { line: 0, col: 0 })
+    );
     assert_eq!(edit.cursor.position, LogicalPosition { line: 0, col: 2 });
     drop(server);
 }
@@ -1960,33 +2733,55 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
-    let edit: EditResult =
-        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "XY".into(), select_pasted: false }).await;
+    let edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        12,
+        &InputTextParams {
+            buffer_id,
+            text: "XY".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
     assert!(edit.revision > 0);
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     // Undo: should revert "XY", cursor back to col 3, and (since saved_revision is 0) the
     // revision drops to 0 — client derives `dirty == false` from that.
-    let undo: UndoResult = send_request::<InputUndo>(&mut ws, 13, &BufferOnlyParams { buffer_id }).await;
+    let undo: UndoResult =
+        send_request::<InputUndo>(&mut ws, 13, &BufferOnlyParams { buffer_id }).await;
     assert!(undo.applied);
     assert_eq!(undo.cursor.position, LogicalPosition { line: 0, col: 3 });
     assert_eq!(undo.revision, 0, "undo back to saved revision");
-    let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "abc");
+    let notif =
+        expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "abc"
+    );
 
     // Redo: re-applies "XY", revision advances past saved.
-    let redo: UndoResult = send_request::<InputRedo>(&mut ws, 14, &BufferOnlyParams { buffer_id }).await;
+    let redo: UndoResult =
+        send_request::<InputRedo>(&mut ws, 14, &BufferOnlyParams { buffer_id }).await;
     assert!(redo.applied);
     assert!(redo.revision > 0);
-    let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "abcXY");
+    let notif =
+        expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "abcXY"
+    );
 
     drop(server);
 }
@@ -2022,23 +2817,40 @@ async fn dirty_clears_when_undoing_back_past_save() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
     // Edit #1: insert "X"
-    let _e1: EditResult =
-        send_request::<InputText>(&mut ws, 12, &InputTextParams { buffer_id, text: "X".into(), select_pasted: false }).await;
+    let _e1: EditResult = send_request::<InputText>(
+        &mut ws,
+        12,
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     // Save.
     let save: BufferSaveResult = send_request::<BufferSave>(
         &mut ws,
         13,
-        &BufferSaveParams { buffer_id, path_index: None, relative_path: None, overwrite: false },
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
     )
     .await;
     let saved_state = expect_notification::<BufferState>(&mut ws).await;
@@ -2050,16 +2862,23 @@ async fn dirty_clears_when_undoing_back_past_save() {
         14,
         &InputDeleteParams {
             buffer_id,
-            motion: Motion::Char { direction: Direction::Backward, count: 1 },
+            motion: Motion::Char {
+                direction: Direction::Backward,
+                count: 1,
+            },
         },
     )
     .await;
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     // Undo: should put "X" back, taking us back to the saved revision → derived dirty == false.
-    let undo: UndoResult = send_request::<InputUndo>(&mut ws, 15, &BufferOnlyParams { buffer_id }).await;
+    let undo: UndoResult =
+        send_request::<InputUndo>(&mut ws, 15, &BufferOnlyParams { buffer_id }).await;
     assert!(undo.applied);
-    assert_eq!(undo.revision, save.revision, "undo should return to the saved revision");
+    assert_eq!(
+        undo.revision, save.revision,
+        "undo should return to the saved revision"
+    );
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     drop(server);
@@ -2075,7 +2894,12 @@ async fn word_motion_forward_and_back() {
         10,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word, exclusive: false },
+            motion: Motion::Word {
+                direction: Direction::Forward,
+                count: 1,
+                boundary: WordBoundary::Word,
+                exclusive: false,
+            },
             extend_selection: false,
         },
     )
@@ -2088,7 +2912,12 @@ async fn word_motion_forward_and_back() {
         11,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word, exclusive: false },
+            motion: Motion::Word {
+                direction: Direction::Forward,
+                count: 1,
+                boundary: WordBoundary::Word,
+                exclusive: false,
+            },
             extend_selection: false,
         },
     )
@@ -2096,17 +2925,27 @@ async fn word_motion_forward_and_back() {
     assert_eq!(st.position, LogicalPosition { line: 0, col: 11 });
 
     // `Alt-w` (WORD): from col 0, skip "hello" → " " then to "world-foo" (col 6)
-    send_request::<CursorSet>(&mut ws, 12, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 0, col: 0 },
-        anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        12,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
     let st: CursorState = send_request::<CursorMove>(
         &mut ws,
         13,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::BigWord, exclusive: false },
+            motion: Motion::Word {
+                direction: Direction::Forward,
+                count: 1,
+                boundary: WordBoundary::BigWord,
+                exclusive: false,
+            },
             extend_selection: false,
         },
     )
@@ -2118,7 +2957,12 @@ async fn word_motion_forward_and_back() {
         14,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Forward, count: 1, boundary: WordBoundary::BigWord, exclusive: false },
+            motion: Motion::Word {
+                direction: Direction::Forward,
+                count: 1,
+                boundary: WordBoundary::BigWord,
+                exclusive: false,
+            },
             extend_selection: false,
         },
     )
@@ -2131,7 +2975,12 @@ async fn word_motion_forward_and_back() {
         15,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::Word { direction: Direction::Backward, count: 1, boundary: WordBoundary::Word, exclusive: false },
+            motion: Motion::Word {
+                direction: Direction::Backward,
+                count: 1,
+                boundary: WordBoundary::Word,
+                exclusive: false,
+            },
             extend_selection: false,
         },
     )
@@ -2149,7 +2998,11 @@ async fn word_end_motion_lands_on_last_char() {
         10,
         &CursorMoveParams {
             buffer_id,
-            motion: Motion::WordEnd { direction: Direction::Forward, count: 1, boundary: WordBoundary::Word },
+            motion: Motion::WordEnd {
+                direction: Direction::Forward,
+                count: 1,
+                boundary: WordBoundary::Word,
+            },
             extend_selection: false,
         },
     )
@@ -2170,17 +3023,22 @@ async fn join_lines_collapses_lines_with_single_space() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
     let r: EditResult =
         send_request::<InputJoinLines>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
     assert!(r.revision > 0);
-    let notif = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
+    let notif =
+        expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
     // After join: "hello world\n" — trailing whitespace of line 0 removed, leading whitespace of
     // line 1 removed, single space inserted.
     assert_eq!(
@@ -2212,7 +3070,10 @@ async fn input_text_with_selection_replaces_it() {
             buffer_id,
             // Forward 3 from col 6 puts the block cursor on the 'a' of "beta"; with the cursor
             // char in the selection, the operational range covers all of "beta".
-            motion: Motion::Char { direction: Direction::Forward, count: 3 },
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 3,
+            },
             extend_selection: true,
         },
     )
@@ -2226,10 +3087,14 @@ async fn input_text_with_selection_replaces_it() {
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
 
-            continuation_marker_width: 0, tab_width: 4,
+            continuation_marker_width: 0,
+            tab_width: 4,
         },
     )
     .await;
@@ -2238,13 +3103,21 @@ async fn input_text_with_selection_replaces_it() {
     let result: EditResult = send_request::<InputText>(
         &mut ws,
         13,
-        &InputTextParams { buffer_id, text: "DELTA".into(), select_pasted: false },
+        &InputTextParams {
+            buffer_id,
+            text: "DELTA".into(),
+            select_pasted: false,
+        },
     )
     .await;
     assert_eq!(result.revision, 1);
 
-    let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.replacement_lines[0].visual_rows[0].segments[0].text, "alpha DELTA gamma");
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "alpha DELTA gamma"
+    );
 
     drop(server);
 }
@@ -2265,19 +3138,40 @@ async fn select_line_forward_picks_current_then_advances_at_end() {
     let (server, mut ws, buffer_id) = setup_lines().await;
 
     // Mid-line: selects current line.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 2 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
     // Whole-line selection exists → advances to the next line.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: false,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        12,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
@@ -2290,12 +3184,26 @@ async fn select_line_forward_at_end_of_line_no_anchor_picks_current_line() {
 
     // Cursor at end-of-line with no anchor (the natural state after typing on a line).
     // First press picks the current line, not the following one.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 4 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 4 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
@@ -2307,19 +3215,40 @@ async fn select_line_backward_picks_current_then_walks_up() {
     let (server, mut ws, buffer_id) = setup_lines().await;
 
     // No anchor, mid-line: first press picks the current line regardless of column.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 2, col: 2 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Backward, extend: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 2, col: 2 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Backward,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     // Second press: whole-line selection exists → walks up to the previous line.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Backward, extend: false,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        12,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Backward,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
@@ -2331,26 +3260,54 @@ async fn select_line_backward_walks_up_via_anchor_on_repeat() {
     let (server, mut ws, buffer_id) = setup_lines().await;
 
     // Start at end of "delta" — first press picks current line.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 3, col: 5 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Backward, extend: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 3, col: 5 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Backward,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 3, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
 
     // Second press: walks up via anchor-at-col-0 → line 2.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Backward, extend: false,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        12,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Backward,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     // Third press: → line 1.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Backward, extend: false,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        13,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Backward,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
@@ -2362,24 +3319,52 @@ async fn select_line_forward_extend_walks_cursor_down() {
     let (server, mut ws, buffer_id) = setup_lines().await;
 
     // x: line 0.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 2 }, anchor: None,
-    }).await;
-    send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+        },
+    )
+    .await;
 
     // Shift-x: lines 0–1.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: true,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        12,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 1, col: 4 });
 
     // Shift-x again: lines 0–2.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: true,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        13,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
@@ -2391,24 +3376,52 @@ async fn select_line_backward_extend_walks_anchor_up() {
     let (server, mut ws, buffer_id) = setup_lines().await;
 
     // x: line 3.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 3, col: 2 }, anchor: None,
-    }).await;
-    send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 3, col: 2 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+        },
+    )
+    .await;
 
     // Shift-Alt-x: lines 2–3.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Backward, extend: true,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        12,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Backward,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 2, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
 
     // Shift-Alt-x again: lines 1–3.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Backward, extend: true,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        13,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Backward,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
 
@@ -2420,22 +3433,42 @@ async fn select_line_after_swap_preserves_backward_orientation() {
     let (server, mut ws, buffer_id) = setup_lines().await;
 
     // x at start of line 0, then swap — backward selection of line 0.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None,
-    }).await;
-    send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: false,
-    }).await;
-    let st: CursorState = send_request::<CursorSwapAnchor>(&mut ws, 12, &CursorSwapAnchorParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+        },
+    )
+    .await;
+    let st: CursorState =
+        send_request::<CursorSwapAnchor>(&mut ws, 12, &CursorSwapAnchorParams { buffer_id }).await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 5 }));
 
     // Shift-x grows the *bottom* edge down (anchor moves), cursor stays at top.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 13, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: true,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        13,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 4 }));
 
@@ -2447,16 +3480,28 @@ async fn select_line_snaps_partial_selection_to_whole_lines() {
     let (server, mut ws, buffer_id) = setup_lines().await;
 
     // A partial, non-line-aligned selection (e.g. left over from Shift-arrow motion).
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 2, col: 3 },
-        anchor: Some(LogicalPosition { line: 0, col: 2 }),
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 2, col: 3 },
+            anchor: Some(LogicalPosition { line: 0, col: 2 }),
+        },
+    )
+    .await;
 
     // Shift-x snaps both ends to whole-line boundaries: anchor → col 0, cursor → line end.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: true,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
@@ -2470,22 +3515,41 @@ async fn select_line_snaps_partial_selection_when_cursor_at_line_end() {
     // Partial selection whose bottom edge happens to sit exactly at end-of-line.
     // The top edge is mid-line, so it's not a whole-line selection yet — x should
     // snap, not advance to the next line.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 2, col: 5 },
-        anchor: Some(LogicalPosition { line: 0, col: 2 }),
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 2, col: 5 },
+            anchor: Some(LogicalPosition { line: 0, col: 2 }),
+        },
+    )
+    .await;
 
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: true,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     // Now that the selection is whole-line, a second forward press advances.
-    let st: CursorState = send_request::<CursorSelectLine>(&mut ws, 12, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: true,
-    }).await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        12,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
     assert_eq!(st.position, LogicalPosition { line: 3, col: 5 });
 
@@ -2498,15 +3562,19 @@ async fn select_line_snaps_partial_selection_when_cursor_at_line_end() {
 async fn swap_anchor_swaps_position_and_anchor() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
 
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 1, col: 3 },
-        anchor: Some(LogicalPosition { line: 0, col: 1 }),
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 3 },
+            anchor: Some(LogicalPosition { line: 0, col: 1 }),
+        },
+    )
+    .await;
 
-    let st: CursorState = send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams {
-        buffer_id,
-    }).await;
+    let st: CursorState =
+        send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams { buffer_id }).await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 1 });
     assert_eq!(st.anchor, Some(LogicalPosition { line: 1, col: 3 }));
 
@@ -2517,12 +3585,18 @@ async fn swap_anchor_swaps_position_and_anchor() {
 async fn swap_anchor_with_no_selection_is_noop() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n").await;
 
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 3 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState =
+        send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams { buffer_id }).await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
     assert_eq!(st.anchor, None);
 
@@ -2536,31 +3610,41 @@ async fn word_motion_exclusive_progresses_across_boundaries() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hello world foo\n").await;
 
     // From 'h' (col 0), exclusive forward Word — lands on space before "world".
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 10, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::Word {
-            direction: Direction::Forward,
-            count: 1,
-            boundary: WordBoundary::Word,
-            exclusive: true,
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        10,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Word {
+                direction: Direction::Forward,
+                count: 1,
+                boundary: WordBoundary::Word,
+                exclusive: true,
+            },
+            extend_selection: true,
         },
-        extend_selection: true,
-    }).await;
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
     assert_eq!(st.anchor, Some(LogicalPosition { line: 0, col: 0 }));
 
     // Repeated press from the space — pre-advance kicks in so we skip "world" entirely and
     // land on the space before "foo" (col 11), rather than getting stuck.
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 11, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::Word {
-            direction: Direction::Forward,
-            count: 1,
-            boundary: WordBoundary::Word,
-            exclusive: true,
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        11,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Word {
+                direction: Direction::Forward,
+                count: 1,
+                boundary: WordBoundary::Word,
+                exclusive: true,
+            },
+            extend_selection: true,
         },
-        extend_selection: true,
-    }).await;
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 11 });
 
     drop(server);
@@ -2573,24 +3657,36 @@ async fn motion_undo_restores_previous_cursor() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
 
     // Two cursor moves: (0,0) → (1,2) → (2,3).
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None,
-    }).await;
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 2, col: 3 }, anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 2 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 2, col: 3 },
+            anchor: None,
+        },
+    )
+    .await;
 
     // Undo: back to (1,2).
-    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 12, &CursorUndoParams {
-        buffer_id,
-    }).await;
+    let r: CursorUndoResult =
+        send_request::<CursorUndo>(&mut ws, 12, &CursorUndoParams { buffer_id }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
 
     // Undo again: back to the initial (0, 0).
-    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams {
-        buffer_id,
-    }).await;
+    let r: CursorUndoResult =
+        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
 
@@ -2601,17 +3697,23 @@ async fn motion_undo_restores_previous_cursor() {
 async fn motion_undo_then_redo_round_trips() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
 
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 3 }, anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 3 },
+            anchor: None,
+        },
+    )
+    .await;
 
     // Undo → back to (0, 0).
     send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id }).await;
 
     // Redo → forward to (1, 3).
-    let r: CursorUndoResult = send_request::<CursorRedo>(&mut ws, 12, &CursorUndoParams {
-        buffer_id,
-    }).await;
+    let r: CursorUndoResult =
+        send_request::<CursorRedo>(&mut ws, 12, &CursorUndoParams { buffer_id }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 3 });
 
@@ -2622,9 +3724,8 @@ async fn motion_undo_then_redo_round_trips() {
 async fn motion_undo_returns_not_applied_when_stack_empty() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n").await;
 
-    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 10, &CursorUndoParams {
-        buffer_id,
-    }).await;
+    let r: CursorUndoResult =
+        send_request::<CursorUndo>(&mut ws, 10, &CursorUndoParams { buffer_id }).await;
     assert!(!r.applied);
     // Cursor unchanged.
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
@@ -2637,21 +3738,41 @@ async fn motion_undo_stack_cleared_by_mutation() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
 
     // Build up some motion history.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None,
-    }).await;
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 4 }, anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 2 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 4 },
+            anchor: None,
+        },
+    )
+    .await;
 
     // Mutation clears the motion stack.
-    send_request::<InputText>(&mut ws, 12, &InputTextParams {
-        buffer_id, text: "X".into(), select_pasted: false,
-    }).await;
+    send_request::<InputText>(
+        &mut ws,
+        12,
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
 
-    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams {
-        buffer_id,
-    }).await;
+    let r: CursorUndoResult =
+        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id }).await;
     assert!(!r.applied, "motion stack should be empty after a mutation");
 
     drop(server);
@@ -2661,20 +3782,36 @@ async fn motion_undo_stack_cleared_by_mutation() {
 async fn motion_redo_cleared_by_new_motion() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
 
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 3 }, anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 3 },
+            anchor: None,
+        },
+    )
+    .await;
     // Undo populates redo.
     send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id }).await;
     // New motion should clear the redo stack.
-    send_request::<CursorSet>(&mut ws, 12, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 2 }, anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        12,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: None,
+        },
+    )
+    .await;
 
-    let r: CursorUndoResult = send_request::<CursorRedo>(&mut ws, 13, &CursorUndoParams {
-        buffer_id,
-    }).await;
-    assert!(!r.applied, "redo stack should be empty after a fresh motion");
+    let r: CursorUndoResult =
+        send_request::<CursorRedo>(&mut ws, 13, &CursorUndoParams { buffer_id }).await;
+    assert!(
+        !r.applied,
+        "redo stack should be empty after a fresh motion"
+    );
 
     drop(server);
 }
@@ -2684,31 +3821,42 @@ async fn motion_undo_records_select_line_and_swap() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
 
     // Position at line 1 mid.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 2 }, anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 2 },
+            anchor: None,
+        },
+    )
+    .await;
     // x → selects line 1.
-    send_request::<CursorSelectLine>(&mut ws, 11, &CursorSelectLineParams {
-        buffer_id, direction: Direction::Forward, extend: false,
-    }).await;
+    send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+        },
+    )
+    .await;
     // s → swap.
-    let after_swap: CursorState = send_request::<CursorSwapAnchor>(&mut ws, 12, &CursorSwapAnchorParams {
-        buffer_id,
-    }).await;
+    let after_swap: CursorState =
+        send_request::<CursorSwapAnchor>(&mut ws, 12, &CursorSwapAnchorParams { buffer_id }).await;
     assert_eq!(after_swap.position, LogicalPosition { line: 1, col: 0 });
 
     // Undo the swap.
-    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams {
-        buffer_id,
-    }).await;
+    let r: CursorUndoResult =
+        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
     assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 1, col: 0 }));
 
     // Undo the select_line.
-    let r: CursorUndoResult = send_request::<CursorUndo>(&mut ws, 14, &CursorUndoParams {
-        buffer_id,
-    }).await;
+    let r: CursorUndoResult =
+        send_request::<CursorUndo>(&mut ws, 14, &CursorUndoParams { buffer_id }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
     assert_eq!(r.cursor.anchor, None);
@@ -2721,19 +3869,31 @@ async fn word_motion_exclusive_at_buffer_end_does_not_move_past() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hello").await;
 
     // Cursor on last char.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 4 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 11, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::Word {
-            direction: Direction::Forward,
-            count: 1,
-            boundary: WordBoundary::Word,
-            exclusive: true,
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 4 },
+            anchor: None,
         },
-        extend_selection: false,
-    }).await;
+    )
+    .await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        11,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Word {
+                direction: Direction::Forward,
+                count: 1,
+                boundary: WordBoundary::Word,
+                exclusive: true,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 4 });
 
     drop(server);
@@ -2745,21 +3905,42 @@ async fn word_motion_exclusive_at_buffer_end_does_not_move_past() {
 async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
     let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\n").await;
     // Subscribe with WrapMode::Soft at width 10 so the line wraps to ["the quick", "brown fox"].
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 10,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
 
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
     let viewport_id = sub.viewport_id;
 
     // Cursor at start of line — visual col 0 of row 0. Down should land on row 1's col 0 (byte 10).
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 11, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
-        extend_selection: false,
-    }).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        11,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Down,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 10 });
 
     drop(server);
@@ -2768,32 +3949,69 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
 #[tokio::test]
 async fn visual_line_preserves_visual_column() {
     let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\n").await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 10,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
 
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
     let viewport_id = sub.viewport_id;
 
     // Put cursor at byte 5 (visual col 5 of row 0). Down should land at byte 10+5=15 in row 1.
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 5 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 5 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        12,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Down,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 15 });
 
     // Up: back to visual col 5 of row 0 = byte 5.
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 13, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count: 1 },
-        extend_selection: false,
-    }).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        13,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Up,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
 
     drop(server);
@@ -2803,24 +4021,52 @@ async fn visual_line_preserves_visual_column() {
 async fn visual_line_crosses_logical_line_boundary() {
     let (server, mut ws, buffer_id) = setup_with_buffer("abc\ndef\n").await;
     // Width is large enough that no line wraps.
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 20, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 20,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
 
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
     let viewport_id = sub.viewport_id;
 
     // Cursor at (0, 1). Down → (1, 1).
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 1 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        12,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Down,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 1, col: 1 });
 
     drop(server);
@@ -2833,22 +4079,50 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
     // should land it at byte 5 on line 1 (display col 3, on 'c'). Pre-fix it would have landed
     // at byte 3 — inside / just past the em dash — which is display col 1.
     let (server, mut ws, buffer_id) = setup_with_buffer("abcdefg\n—abcdef\n").await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 80, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
-        continuation_marker_width: 2, tab_width: 4,
-    }).await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 2,
+            tab_width: 4,
+        },
+    )
+    .await;
     let viewport_id = sub.viewport_id;
 
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 3 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        12,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Down,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 1, col: 5 });
 
     drop(server);
@@ -2857,24 +4131,52 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
 #[tokio::test]
 async fn visual_line_with_wrap_none_falls_back_to_logical() {
     let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\nhi\n").await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::None,
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 10,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
 
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
     let viewport_id = sub.viewport_id;
 
     // Cursor at (0, 5). With wrap=None, Down → logical line + 1, col clamped to line 1's length.
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 5 }, anchor: None,
-    }).await;
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 5 },
+            anchor: None,
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        12,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Down,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 1, col: 2 }); // line 1 = "hi", len 2
 
     drop(server);
@@ -2885,23 +4187,43 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
 #[tokio::test]
 async fn viewport_set_wrap_changes_visible_rows() {
     let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\n").await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 10,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
 
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
     // Soft: line 0 wraps to 2 visual rows at cols=10.
     assert_eq!(sub.window.lines[0].visual_rows.len(), 2);
 
-    let r: ViewportWindowResult = send_request::<ViewportSetWrap>(&mut ws, 11, &ViewportSetWrapParams {
-        viewport_id: sub.viewport_id,
-        wrap: WrapMode::None,
-    }).await;
+    let r: ViewportWindowResult = send_request::<ViewportSetWrap>(
+        &mut ws,
+        11,
+        &ViewportSetWrapParams {
+            viewport_id: sub.viewport_id,
+            wrap: WrapMode::None,
+        },
+    )
+    .await;
     // None: one row, full line content.
     assert_eq!(r.window.lines[0].visual_rows.len(), 1);
-    assert_eq!(r.window.lines[0].visual_rows[0].segments[0].text, "the quick brown fox");
+    assert_eq!(
+        r.window.lines[0].visual_rows[0].segments[0].text,
+        "the quick brown fox"
+    );
 
     drop(server);
 }
@@ -2915,35 +4237,72 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
     //   row 0 byte 0..10 = "abcdefghij" (prefix 0)
     //   row 1 byte 10..18 = "klmnopqr"  (prefix 2 — continuation marker)
     //   row 2 byte 18..20 = "st"        (prefix 2)
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
-        continuation_marker_width: 2, tab_width: 4,
-    }).await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 10,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 2,
+            tab_width: 4,
+        },
+    )
+    .await;
     let viewport_id = sub.viewport_id;
 
     // Start at byte 1 (visual col 1 on row 0, prefix 0).
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 1 }, anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: None,
+        },
+    )
+    .await;
 
     // Alt-j: visual col 1 < prefix 2 on row 1, so cursor clamps to start of row 1's text (byte 10).
     // The remembered virtual col stays at 1.
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
-        extend_selection: false,
-    }).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        12,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Down,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 10 });
 
     // Alt-k: with virtual_col=1, target visual col is 1. On row 0 (prefix 0), byte = 1. We end
     // back where we started, not at byte 2 (which is what naive preserve-col would do).
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 13, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count: 1 },
-        extend_selection: false,
-    }).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        13,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Up,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 1 });
 
     drop(server);
@@ -2954,32 +4313,69 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
     // The classic vim virtual-col case: j down through an empty line should land you back at
     // your original column on the next non-empty line, not stick at col 0.
     let (server, mut ws, buffer_id) = setup_with_buffer("hello world\n\nanother line\n").await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 80, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
-        continuation_marker_width: 2, tab_width: 4,
-    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 2,
+            tab_width: 4,
+        },
+    )
+    .await;
 
     // Start at col 5 of line 0.
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 5 }, anchor: None,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 5 },
+            anchor: None,
+        },
+    )
+    .await;
 
     // j → empty line 1; col clamps to 0 but virtual_col holds 5.
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::LogicalLine { direction: Direction::Forward, count: 1, preserve_col: true },
-        extend_selection: false,
-    }).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        12,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::LogicalLine {
+                direction: Direction::Forward,
+                count: 1,
+                preserve_col: true,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 1, col: 0 });
 
     // j → line 2 with content; virtual_col restores col 5.
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 13, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::LogicalLine { direction: Direction::Forward, count: 1, preserve_col: true },
-        extend_selection: false,
-    }).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        13,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::LogicalLine {
+                direction: Direction::Forward,
+                count: 1,
+                preserve_col: true,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     drop(server);
@@ -2988,37 +4384,82 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
 #[tokio::test]
 async fn virtual_col_cleared_by_horizontal_motion() {
     let (server, mut ws, buffer_id) = setup_with_buffer("abcdefghijklmnopqrst\n").await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
-        continuation_marker_width: 2, tab_width: 4,
-    }).await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 10,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 2,
+            tab_width: 4,
+        },
+    )
+    .await;
     let viewport_id = sub.viewport_id;
 
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 1 }, anchor: None,
-    }).await;
-    send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<CursorMove>(
+        &mut ws,
+        12,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Down,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     // Cursor now at byte 10 (visual col 2 = prefix); virtual_col stashed = 1.
 
     // Char Forward (a horizontal motion) clears the virtual col. Cursor at byte 11, visual col 3.
-    send_request::<CursorMove>(&mut ws, 13, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::Char { direction: Direction::Forward, count: 1 },
-        extend_selection: false,
-    }).await;
+    send_request::<CursorMove>(
+        &mut ws,
+        13,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
 
     // Alt-k: without a virtual col, target is current visual col (3). Lands at byte 3 of row 0.
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 14, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count: 1 },
-        extend_selection: false,
-    }).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        14,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Up,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
 
     drop(server);
@@ -3027,36 +4468,80 @@ async fn virtual_col_cleared_by_horizontal_motion() {
 #[tokio::test]
 async fn virtual_col_cleared_by_mutation() {
     let (server, mut ws, buffer_id) = setup_with_buffer("abcdefghijklmnopqrst\n").await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
-        continuation_marker_width: 2, tab_width: 4,
-    }).await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 10,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 2,
+            tab_width: 4,
+        },
+    )
+    .await;
     let viewport_id = sub.viewport_id;
 
-    send_request::<CursorSet>(&mut ws, 11, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 1 }, anchor: None,
-    }).await;
-    send_request::<CursorMove>(&mut ws, 12, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Down, count: 1 },
-        extend_selection: false,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<CursorMove>(
+        &mut ws,
+        12,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Down,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     // virtual_col = 1, cursor at byte 10.
 
     // Insert "X" — the mutation clears the virtual col. Cursor advances to byte 11.
-    send_request::<InputText>(&mut ws, 13, &InputTextParams {
-        buffer_id, text: "X".into(), select_pasted: false,
-    }).await;
+    send_request::<InputText>(
+        &mut ws,
+        13,
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
 
     // Alt-k: target is current visual col (3, since cursor is on row 1 with prefix 2 at col 1
     // within the text). Lands at byte 3, not the original byte 1.
-    let st: CursorState = send_request::<CursorMove>(&mut ws, 14, &CursorMoveParams {
-        buffer_id,
-        motion: Motion::VisualLine { viewport_id, direction: VerticalDirection::Up, count: 1 },
-        extend_selection: false,
-    }).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        14,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::VisualLine {
+                viewport_id,
+                direction: VerticalDirection::Up,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
 
     drop(server);
@@ -3067,14 +4552,28 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
     let (server, mut ws, buffer_id) = setup_with_buffer("the quick brown fox\n").await;
     // With marker_width=2 the continuation rows have 8 cols of content room, so the line wraps
     // into 3 visual rows instead of 2.
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 10, &ViewportSubscribeParams {
-        buffer_id, cols: 10, rows: 5, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::Soft,
-        continuation_marker_width: 2, tab_width: 4,
-    }).await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 10,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 2,
+            tab_width: 4,
+        },
+    )
+    .await;
     assert_eq!(sub.window.lines[0].visual_rows.len(), 3);
-    let texts: Vec<&str> = sub.window.lines[0].visual_rows.iter()
+    let texts: Vec<&str> = sub.window.lines[0]
+        .visual_rows
+        .iter()
         .map(|r| r.segments[0].text.as_str())
         .collect();
     assert_eq!(texts, vec!["the quick", "brown", "fox"]);
@@ -3084,15 +4583,35 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
 
 // ---- input/move_lines ---------------------------------------------------------------------------
 
-async fn buffer_text(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, id: u64, buffer_id: u64) -> String {
+async fn buffer_text(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    buffer_id: u64,
+) -> String {
     // Subscribe to a wide-enough viewport and concatenate the visible-text lines.
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(ws, id, &ViewportSubscribeParams {
-        buffer_id, cols: 200, rows: 100, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
-        wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
-    sub.window.lines.iter()
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        ws,
+        id,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 200,
+            rows: 100,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    sub.window
+        .lines
+        .iter()
         .map(|l| l.visual_rows[0].segments[0].text.as_str().to_string())
         .collect::<Vec<_>>()
         .join("\n")
@@ -3102,12 +4621,25 @@ async fn buffer_text(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungsteni
 async fn move_lines_swaps_with_neighbor_below() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
     // Cursor on line 0 ("alpha").
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 2 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
-        buffer_id, direction: VerticalDirection::Down,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        11,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+        },
+    )
+    .await;
     // Cursor follows the line down.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
@@ -3120,12 +4652,25 @@ async fn move_lines_swaps_with_neighbor_below() {
 #[tokio::test]
 async fn move_lines_swaps_with_neighbor_above() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 1 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
-        buffer_id, direction: VerticalDirection::Up,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 1 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        11,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Up,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 1 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "beta\nalpha\ngamma\n");
@@ -3137,14 +4682,25 @@ async fn move_lines_swaps_with_neighbor_above() {
 async fn move_lines_moves_whole_selection() {
     let (server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\nd\ne\n").await;
     // Selection covers lines 1 and 2 ("b" and "c").
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 2, col: 0 },
-        anchor: Some(LogicalPosition { line: 1, col: 0 }),
-    }).await;
-    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
-        buffer_id, direction: VerticalDirection::Down,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 2, col: 0 },
+            anchor: Some(LogicalPosition { line: 1, col: 0 }),
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        11,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 3, col: 0 });
     assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 2, col: 0 }));
     let text = buffer_text(&mut ws, 12, buffer_id).await;
@@ -3156,9 +4712,15 @@ async fn move_lines_moves_whole_selection() {
 #[tokio::test]
 async fn move_lines_at_top_is_noop_up() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
-    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 10, &InputMoveLinesParams {
-        buffer_id, direction: VerticalDirection::Up,
-    }).await;
+    let r: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        10,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Up,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
     let text = buffer_text(&mut ws, 11, buffer_id).await;
     assert_eq!(text, "alpha\nbeta\n");
@@ -3169,12 +4731,25 @@ async fn move_lines_at_top_is_noop_up() {
 #[tokio::test]
 async fn move_lines_at_bottom_is_noop_down() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 0 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
-        buffer_id, direction: VerticalDirection::Down,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        11,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "alpha\nbeta\n");
@@ -3187,12 +4762,25 @@ async fn move_lines_preserves_missing_trailing_newline() {
     // Buffer with no trailing newline: moving the last line up should still produce a buffer
     // without a trailing newline (whichever line is now the last keeps that property).
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta").await;
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 1, col: 0 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputMoveLines>(&mut ws, 11, &InputMoveLinesParams {
-        buffer_id, direction: VerticalDirection::Up,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        11,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Up,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "beta\nalpha");
@@ -3205,12 +4793,18 @@ async fn move_lines_preserves_missing_trailing_newline() {
 #[tokio::test]
 async fn indent_single_line_adds_two_spaces() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 3 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputIndent>(&mut ws, 11, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputIndent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
     // Cursor follows the inserted indent.
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 5 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
@@ -3222,12 +4816,18 @@ async fn indent_single_line_adds_two_spaces() {
 #[tokio::test]
 async fn dedent_strips_two_spaces() {
     let (server, mut ws, buffer_id) = setup_with_buffer("  alpha\nbeta\n").await;
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 4 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputDedent>(&mut ws, 11, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 4 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputDedent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "alpha\nbeta\n");
@@ -3238,14 +4838,18 @@ async fn dedent_strips_two_spaces() {
 #[tokio::test]
 async fn indent_multi_line_selection() {
     let (server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\n").await;
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 2, col: 0 },
-        anchor: Some(LogicalPosition { line: 0, col: 0 }),
-    }).await;
-    let r: EditResult = send_request::<InputIndent>(&mut ws, 11, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 2, col: 0 },
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputIndent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
     // Anchor and cursor both shift +2 since both lines were indented.
     assert_eq!(r.cursor.position, LogicalPosition { line: 2, col: 2 });
     assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 2 }));
@@ -3259,14 +4863,18 @@ async fn indent_multi_line_selection() {
 async fn dedent_line_without_indent_is_noop_for_that_line() {
     let (server, mut ws, buffer_id) = setup_with_buffer("  alpha\nbeta\n").await;
     // Multi-line selection covering both lines.
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 1, col: 1 },
-        anchor: Some(LogicalPosition { line: 0, col: 4 }),
-    }).await;
-    let r: EditResult = send_request::<InputDedent>(&mut ws, 11, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 1 },
+            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputDedent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
     // Line 0 lost 2 chars, line 1 unchanged.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 1 });
     assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 2 }));
@@ -3279,9 +4887,8 @@ async fn dedent_line_without_indent_is_noop_for_that_line() {
 #[tokio::test]
 async fn dedent_with_single_leading_space_strips_one() {
     let (server, mut ws, buffer_id) = setup_with_buffer(" alpha\n").await;
-    let r: EditResult = send_request::<InputDedent>(&mut ws, 10, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    let r: EditResult =
+        send_request::<InputDedent>(&mut ws, 10, &BufferOnlyParams { buffer_id }).await;
     let text = buffer_text(&mut ws, 11, buffer_id).await;
     assert_eq!(text, "alpha\n");
     // Cursor was at (0, 0); dedent removes 1 char, cursor stays at 0 (saturated).
@@ -3295,12 +4902,18 @@ async fn dedent_with_single_leading_space_strips_one() {
 #[tokio::test]
 async fn newline_and_indent_copies_leading_whitespace() {
     let (server, mut ws, buffer_id) = setup_with_buffer("    foo\n").await;
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 7 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 11, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 7 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputNewlineAndIndent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "    foo\n    \n");
@@ -3317,24 +4930,47 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
     std::fs::write(&path, "fn foo() {\n").unwrap();
 
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
 
     // Cursor right after the opening brace.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 10 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 10 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
     // Rust defaults to 4-space indent; cursor lands at col 4 on the new line.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
     let text = buffer_text(&mut ws, 5, buffer_id).await;
@@ -3352,23 +4988,46 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
     std::fs::write(&path, "// note {\n").unwrap();
 
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
 
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 9 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 9 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
     let text = buffer_text(&mut ws, 5, buffer_id).await;
     assert_eq!(text, "// note {\n\n");
@@ -3379,9 +5038,8 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
 #[tokio::test]
 async fn newline_and_indent_on_empty_line_inserts_just_newline() {
     let (server, mut ws, buffer_id) = setup_with_buffer("\n").await;
-    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 10, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    let r: EditResult =
+        send_request::<InputNewlineAndIndent>(&mut ws, 10, &BufferOnlyParams { buffer_id }).await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
     let text = buffer_text(&mut ws, 11, buffer_id).await;
     assert_eq!(text, "\n\n");
@@ -3397,24 +5055,47 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() {\n  x;\n}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
 
     // Park cursor just past the closing `}` on line 2.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 2, col: 1 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 2, col: 1 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
     // No indent on the new line — we just left the function body.
     assert_eq!(r.cursor.position, LogicalPosition { line: 3, col: 0 });
 
@@ -3429,25 +5110,48 @@ async fn newline_and_indent_engine_python_def() {
     let path = dir.path().join("a.py");
     std::fs::write(&path, "def foo():\n    pass\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.py".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     assert_eq!(open.language.as_deref(), Some("python"));
     let buffer_id = open.buffer_id;
 
     // Cursor at end of `def foo():` (line 0 col 10).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 10 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 10 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
     // Python defaults to 4-space indent (PEP 8); cursor lands at col 4 on the new line.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
 
@@ -3462,24 +5166,47 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() {\n  let x = 1;\n  let y = 2;\n}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
 
     // Cursor at end of `let y = 2;` (line 2) — engine returns 1 level, unit is 2 spaces.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 2, col: 12 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 2, col: 12 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 3, col: 2 });
 
     drop(server);
@@ -3493,24 +5220,47 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
     let path = dir.path().join("a.go");
     std::fs::write(&path, "").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.go".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.go".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     assert_eq!(open.language.as_deref(), Some("go"));
     let buffer_id = open.buffer_id;
 
-    send_request::<InputText>(&mut ws, 3, &InputTextParams {
-        buffer_id, text: "func foo() {".into(), select_pasted: false,
-    }).await;
-    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id,
+            text: "func foo() {".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
     // One tab = col 1 (in byte columns). The opener-bonus heuristic fires because the parser
     // hasn't seen a closing brace yet; one indent level for Go is one tab character.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 1 });
@@ -3525,12 +5275,18 @@ async fn newline_and_indent_fallback_copies_previous_line() {
     // No indent query for `.txt` (no language detected) — fallback copies the previous line's
     // leading whitespace verbatim, without any brace heuristic magic.
     let (server, mut ws, buffer_id) = setup_with_buffer("    foo {\n").await;
-    send_request::<CursorSet>(&mut ws, 10, &CursorSetParams {
-        buffer_id, position: LogicalPosition { line: 0, col: 9 }, anchor: None,
-    }).await;
-    let r: EditResult = send_request::<InputNewlineAndIndent>(&mut ws, 11, &BufferOnlyParams {
-        buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 9 },
+            anchor: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputNewlineAndIndent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
     // Falls back to 4 spaces — the leading whitespace of line 0 — even though the line ends
     // in `{`. Plain text doesn't get the opener heuristic.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
@@ -3546,23 +5302,52 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "    let x = 1;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor on `let` (col 4, after the 4-space indent).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 4 }, anchor: None,
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 4 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "    // let x = 1;\n");
 
@@ -3575,22 +5360,51 @@ async fn toggle_comment_strips_when_already_commented() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "    // let x = 1;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None,
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "    let x = 1;\n");
 
@@ -3605,26 +5419,53 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
     let path = dir.path().join("a.py");
     std::fs::write(&path, "  a = 1\n    b = 2\n  c = 3\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.py".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.py".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     assert_eq!(open.language.as_deref(), Some("python"));
 
     // Selection covers all three lines.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 2, col: 0 },
-        anchor: Some(LogicalPosition { line: 0, col: 0 }),
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 2, col: 0 },
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "  # a = 1\n  #   b = 2\n  # c = 3\n");
 
@@ -3639,22 +5480,51 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
     let path = dir.path().join("a.md");
     std::fs::write(&path, "# Heading\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.md".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.md".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None,
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "<!-- # Heading -->\n");
 
@@ -3668,25 +5538,52 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = foo + bar;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.js".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Select `foo` (cols 10..=12 inclusive).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 12 },
-        anchor: Some(LogicalPosition { line: 0, col: 10 }),
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 12 },
+            anchor: Some(LogicalPosition { line: 0, col: 10 }),
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "const x = /* foo */ + bar;\n");
 
@@ -3700,25 +5597,52 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = /* foo */ + bar;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.js".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Select `/* foo */` (cols 10..=18 inclusive).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 18 },
-        anchor: Some(LogicalPosition { line: 0, col: 10 }),
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 18 },
+            anchor: Some(LogicalPosition { line: 0, col: 10 }),
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "const x = foo + bar;\n");
 
@@ -3734,25 +5658,52 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "let a = 1;\nlet b = 2;\nlet c = 3;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.rs".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Last char of `let c = 3;` is `;` at col 9.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 2, col: 9 },
-        anchor: Some(LogicalPosition { line: 0, col: 0 }),
-    }).await;
-    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 2, col: 9 },
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     // Anchor stays at line 0 col 0 (now on the `/` of `// let a = 1;`).
     assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 0 }));
     // Cursor shifts forward by `// `.len() = 3 to follow the `;` at col 12.
@@ -3770,25 +5721,52 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = foo + bar;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.js".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Select `foo` (cols 10..=12 inclusive).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 12 },
-        anchor: Some(LogicalPosition { line: 0, col: 10 }),
-    }).await;
-    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 12 },
+            anchor: Some(LogicalPosition { line: 0, col: 10 }),
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     // Selection now covers the entire `/* foo */` — anchor on the first `/`, cursor on the
     // last `/`. The wrap is 9 chars (`/* foo */`), so cols 10..=18.
     assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 10 }));
@@ -3806,26 +5784,53 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
     let path = dir.path().join("a.go");
     std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.go".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.go".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Selection from (0, 5) mid-line through (0, 10) — the newline. Single line in
     // (line, col), but selected text includes `\n`.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 10 },
-        anchor: Some(LogicalPosition { line: 0, col: 5 }),
-    }).await;
-    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 10 },
+            anchor: Some(LogicalPosition { line: 0, col: 5 }),
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     // The closing `*/` sits on line 1 (after the original `\n`).
     assert_eq!(text, "let a/*  = 1;\n */let b = 2;\n");
@@ -3835,9 +5840,14 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
 
     // Toggle again to uncomment. Round-trip must restore the original buffer *and* the
     // original selection — cursor back on the `\n` at line 0 col 10, not on line 1 col 0.
-    let r2: EditResult = send_request::<InputToggleComment>(&mut ws, 6, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    let r2: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        6,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text2 = buffer_text(&mut ws, 7, open.buffer_id).await;
     assert_eq!(text2, "let a = 1;\nlet b = 2;\n");
     assert_eq!(r2.cursor.anchor, Some(LogicalPosition { line: 0, col: 5 }));
@@ -3855,25 +5865,52 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
     let path = dir.path().join("a.ts");
     std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.ts".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.ts".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Multi-line partial selection: (0, 4) `a` through (1, 4) `b`.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 1, col: 4 },
-        anchor: Some(LogicalPosition { line: 0, col: 4 }),
-    }).await;
-    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 1, col: 4 },
+            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     // Anchor stays at (0, 4) — the opening `/` of `/*` lives there post-edit. Cursor lands
     // on the last `/` of `*/`, which is at col 7 of line 1 (`let b */ = 2;`).
     assert_eq!(r.cursor.anchor, Some(LogicalPosition { line: 0, col: 4 }));
@@ -3890,26 +5927,53 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
     let path = dir.path().join("a.js");
     std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.js".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Select from col 4 of line 0 (the `a`) to col 4 of line 1 (the `b`) — multi-line but
     // neither line is fully covered.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 1, col: 4 },
-        anchor: Some(LogicalPosition { line: 0, col: 4 }),
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 1, col: 4 },
+            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "let /* a = 1;\nlet b */ = 2;\n");
 
@@ -3925,33 +5989,65 @@ async fn toggle_comment_round_trip_partial_selection() {
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = foo + bar;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.js".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Select `foo` (cols 10..=12 inclusive).
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id,
-        position: LogicalPosition { line: 0, col: 12 },
-        anchor: Some(LogicalPosition { line: 0, col: 10 }),
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 12 },
+            anchor: Some(LogicalPosition { line: 0, col: 10 }),
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let after_wrap = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(after_wrap, "const x = /* foo */ + bar;\n");
 
     // Second toggle: the response from the first toggle moved the selection to the inner
     // `foo`. We don't manually re-set the cursor — just press toggle again.
-    send_request::<InputToggleComment>(&mut ws, 6, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        6,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let after_unwrap = buffer_text(&mut ws, 7, open.buffer_id).await;
     assert_eq!(after_unwrap, "const x = foo + bar;\n");
 
@@ -3966,23 +6062,52 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = /* foo */ + bar;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.js".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.js".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Cursor on the `f` of `foo` (col 13), inside the comment.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 13 }, anchor: None,
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 13 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "const x = foo + bar;\n");
 
@@ -3996,22 +6121,51 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
     let path = dir.path().join("a.css");
     std::fs::write(&path, "color: red;\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.css".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.css".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id: open.buffer_id, position: LogicalPosition { line: 0, col: 0 }, anchor: None,
-    }).await;
-    send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: None,
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "/* color: red; */\n");
 
@@ -4026,19 +6180,41 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
     let path = dir.path().join("a.md");
     std::fs::write(&path, "\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.md".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.md".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     // Revision unchanged (no edit), text unchanged.
     assert_eq!(r.revision, open.revision);
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
@@ -4053,19 +6229,41 @@ async fn toggle_comment_is_noop_for_json() {
     let path = dir.path().join("a.json");
     std::fs::write(&path, "{}\n").unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
-        .await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None,
-        path_index: Some(0), relative_path: Some("a.json".into()), language: None, create_if_missing: false,
-    }).await;
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _hello: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.json".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    let r: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &BufferOnlyParams {
-        buffer_id: open.buffer_id,
-    }).await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &BufferOnlyParams {
+            buffer_id: open.buffer_id,
+        },
+    )
+    .await;
     // Buffer revision unchanged (no edit); text unchanged.
     assert_eq!(r.revision, open.revision);
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
@@ -4079,11 +6277,16 @@ async fn toggle_comment_is_noop_for_json() {
 #[tokio::test]
 async fn search_set_returns_summary_and_jumps_to_first_match() {
     let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
-    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
-        buffer_id,
-        query: "foo".into(),
-        anchor: Some(LogicalPosition { line: 0, col: 0 }),
-    }).await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
     assert_eq!(r.summary.total, 3);
     assert!(!r.summary.truncated);
     assert_eq!(r.summary.current_index, 1);
@@ -4096,9 +6299,16 @@ async fn search_set_returns_summary_and_jumps_to_first_match() {
 #[tokio::test]
 async fn search_smartcase_lowercase_is_case_insensitive() {
     let (server, mut ws, buffer_id) = setup_with_buffer("Foo foo FOO\n").await;
-    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
-        buffer_id, query: "foo".into(), anchor: None,
-    }).await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: None,
+        },
+    )
+    .await;
     assert_eq!(r.summary.total, 3); // matches all three regardless of case
 
     drop(server);
@@ -4107,9 +6317,16 @@ async fn search_smartcase_lowercase_is_case_insensitive() {
 #[tokio::test]
 async fn search_smartcase_uppercase_is_case_sensitive() {
     let (server, mut ws, buffer_id) = setup_with_buffer("Foo foo FOO\n").await;
-    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
-        buffer_id, query: "Foo".into(), anchor: None,
-    }).await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "Foo".into(),
+            anchor: None,
+        },
+    )
+    .await;
     assert_eq!(r.summary.total, 1);
 
     drop(server);
@@ -4118,9 +6335,16 @@ async fn search_smartcase_uppercase_is_case_sensitive() {
 #[tokio::test]
 async fn search_regex_metacharacters() {
     let (server, mut ws, buffer_id) = setup_with_buffer("abc 123 def 4567\n").await;
-    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
-        buffer_id, query: r"\d+".into(), anchor: None,
-    }).await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: r"\d+".into(),
+            anchor: None,
+        },
+    )
+    .await;
     assert_eq!(r.summary.total, 2);
 
     drop(server);
@@ -4129,9 +6353,16 @@ async fn search_regex_metacharacters() {
 #[tokio::test]
 async fn search_no_matches_returns_zero_summary() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
-    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
-        buffer_id, query: "zzz".into(), anchor: None,
-    }).await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "zzz".into(),
+            anchor: None,
+        },
+    )
+    .await;
     assert_eq!(r.summary.total, 0);
     assert_eq!(r.summary.current_index, 0);
     assert!(!r.summary.truncated);
@@ -4142,12 +6373,26 @@ async fn search_no_matches_returns_zero_summary() {
 #[tokio::test]
 async fn search_empty_query_clears_active_search() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n").await;
-    let _: SearchSetResult = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
-        buffer_id, query: "alpha".into(), anchor: None,
-    }).await;
-    let r: SearchSetResult = send_request::<SearchSet>(&mut ws, 11, &SearchSetParams {
-        buffer_id, query: String::new(), anchor: None,
-    }).await;
+    let _: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "alpha".into(),
+            anchor: None,
+        },
+    )
+    .await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        11,
+        &SearchSetParams {
+            buffer_id,
+            query: String::new(),
+            anchor: None,
+        },
+    )
+    .await;
     assert_eq!(r.summary.total, 0);
 
     drop(server);
@@ -4156,16 +6401,26 @@ async fn search_empty_query_clears_active_search() {
 #[tokio::test]
 async fn search_next_cycles_forward_and_wraps() {
     let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
-    let _ = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
-        buffer_id, query: "foo".into(), anchor: Some(LogicalPosition { line: 0, col: 0 }),
-    }).await;
-    let r1: SearchNavResult = send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id }).await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
+    let r1: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id }).await;
     assert_eq!(r1.summary.current_index, 2);
     assert_eq!(r1.cursor.anchor, Some(LogicalPosition { line: 0, col: 8 }));
-    let r2: SearchNavResult = send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
+    let r2: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
     assert_eq!(r2.summary.current_index, 3);
     // Wrap.
-    let r3: SearchNavResult = send_request::<SearchNext>(&mut ws, 13, &SearchNavParams { buffer_id }).await;
+    let r3: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 13, &SearchNavParams { buffer_id }).await;
     assert_eq!(r3.summary.current_index, 1);
 
     drop(server);
@@ -4174,11 +6429,19 @@ async fn search_next_cycles_forward_and_wraps() {
 #[tokio::test]
 async fn search_prev_cycles_backward_with_wrap() {
     let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
-    let _ = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
-        buffer_id, query: "foo".into(), anchor: Some(LogicalPosition { line: 0, col: 0 }),
-    }).await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
     // From the first match, prev wraps to the last.
-    let r: SearchNavResult = send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id }).await;
+    let r: SearchNavResult =
+        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id }).await;
     assert_eq!(r.summary.current_index, 3);
 
     drop(server);
@@ -4187,12 +6450,20 @@ async fn search_prev_cycles_backward_with_wrap() {
 #[tokio::test]
 async fn search_clear_removes_active_search() {
     let (server, mut ws, buffer_id) = setup_with_buffer("foo\n").await;
-    let _ = send_request::<SearchSet>(&mut ws, 10, &SearchSetParams {
-        buffer_id, query: "foo".into(), anchor: None,
-    }).await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: None,
+        },
+    )
+    .await;
     let _: () = send_request::<SearchClear>(&mut ws, 11, &SearchClearParams { buffer_id }).await;
     // After clear, n/prev should report no matches.
-    let r: SearchNavResult = send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
+    let r: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
     assert_eq!(r.summary.total, 0);
 
     drop(server);
@@ -4215,12 +6486,19 @@ async fn setup_picker_workspace() -> (
     std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _hello: ClientHelloResult = send_request::<ClientHello>(
         &mut ws,
         1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
     )
     .await;
     (server, ws)
@@ -4232,23 +6510,38 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
     let view = send_request::<PickerView>(
         &mut ws,
         10,
-        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
+        &PickerViewParams {
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
     )
     .await;
     assert_eq!(view.query, "");
     assert_eq!(view.effective_offset, 0);
-    assert!(view.total_candidates >= 4, "expected >=4 candidates, got {}", view.total_candidates);
+    assert!(
+        view.total_candidates >= 4,
+        "expected >=4 candidates, got {}",
+        view.total_candidates
+    );
 
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.kind, PickerKind::Files);
     assert_eq!(update.offset, 0);
     assert_eq!(update.total_candidates, view.total_candidates);
-    assert_eq!(update.total_matches, view.total_candidates, "empty query matches all");
+    assert_eq!(
+        update.total_matches, view.total_candidates,
+        "empty query matches all"
+    );
     let names: Vec<&str> = update
         .items
         .iter()
         .map(|i| {
-            let PickerItem::File { path, .. } = i else { panic!("expected File item, got {i:?}") };
+            let PickerItem::File { path, .. } = i else {
+                panic!("expected File item, got {i:?}")
+            };
             path.as_str()
         })
         .collect();
@@ -4262,20 +6555,40 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
 async fn picker_query_ranks_matches_and_carries_indices() {
     let (server, mut ws) = setup_picker_workspace().await;
     let _ = send_request::<PickerView>(
-        &mut ws, 10,
-        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
-    ).await;
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await; // drain initial
 
     let _: () = send_request::<PickerQuery>(
-        &mut ws, 11,
-        &PickerQueryParams { kind: PickerKind::Files, query: "main".into(), generation: 1 },
-    ).await;
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Files,
+            query: "main".into(),
+            generation: 1,
+        },
+    )
+    .await;
 
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.generation, 1);
     let top = update.items.first().expect("at least one match");
-    let PickerItem::File { path, match_indices } = top else { panic!("expected File item, got {top:?}") };
+    let PickerItem::File {
+        path,
+        match_indices,
+    } = top
+    else {
+        panic!("expected File item, got {top:?}")
+    };
     assert_eq!(path, "src/main.rs", "best match for 'main' is src/main.rs");
     assert!(
         !match_indices.is_empty(),
@@ -4289,26 +6602,55 @@ async fn picker_query_ranks_matches_and_carries_indices() {
 async fn picker_select_returns_absolute_path() {
     let (server, mut ws) = setup_picker_workspace().await;
     let _ = send_request::<PickerView>(
-        &mut ws, 10,
-        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
-    ).await;
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
     let _: () = send_request::<PickerQuery>(
-        &mut ws, 11,
-        &PickerQueryParams { kind: PickerKind::Files, query: "lib".into(), generation: 1 },
-    ).await;
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Files,
+            query: "lib".into(),
+            generation: 1,
+        },
+    )
+    .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let item = update.items.first().expect("a match for 'lib'").clone();
-    let PickerItem::File { ref path, .. } = item else { panic!("expected File item, got {item:?}") };
+    let PickerItem::File { ref path, .. } = item else {
+        panic!("expected File item, got {item:?}")
+    };
     assert_eq!(path, "src/lib.rs");
 
     let result: PickerSelectResult = send_request::<PickerSelect>(
-        &mut ws, 12,
-        &PickerSelectParams { kind: PickerKind::Files, item },
-    ).await;
-    let PickerSelectResult::File { path: abs } = result else { panic!("expected File result, got {result:?}") };
-    assert!(abs.ends_with("src/lib.rs"), "abs path should end with relative: got {abs}");
-    assert!(std::path::Path::new(&abs).is_absolute(), "select must return an absolute path");
+        &mut ws,
+        12,
+        &PickerSelectParams {
+            kind: PickerKind::Files,
+            item,
+        },
+    )
+    .await;
+    let PickerSelectResult::File { path: abs } = result else {
+        panic!("expected File result, got {result:?}")
+    };
+    assert!(
+        abs.ends_with("src/lib.rs"),
+        "abs path should end with relative: got {abs}"
+    );
+    assert!(
+        std::path::Path::new(&abs).is_absolute(),
+        "select must return an absolute path"
+    );
 
     drop(server);
 }
@@ -4318,35 +6660,64 @@ async fn picker_resume_centers_on_remembered_item() {
     // Resume = view { reset: false, center_on } recovers query+ranking and frames the item.
     let (server, mut ws) = setup_picker_workspace().await;
     let _ = send_request::<PickerView>(
-        &mut ws, 10,
-        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
-    ).await;
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
     // Query "rs" — narrows to .rs files; query is persisted on hide.
     let _: () = send_request::<PickerQuery>(
-        &mut ws, 11,
-        &PickerQueryParams { kind: PickerKind::Files, query: "rs".into(), generation: 1 },
-    ).await;
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Files,
+            query: "rs".into(),
+            generation: 1,
+        },
+    )
+    .await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
     let _: () = send_request::<PickerHide>(
-        &mut ws, 12,
-        &PickerHideParams { kind: PickerKind::Files },
-    ).await;
+        &mut ws,
+        12,
+        &PickerHideParams {
+            kind: PickerKind::Files,
+        },
+    )
+    .await;
 
     // Resume with center_on pointing at a remembered item.
     let resume = send_request::<PickerView>(
-        &mut ws, 13,
+        &mut ws,
+        13,
         &PickerViewParams {
-            kind: PickerKind::Files, reset: false, offset: 0, limit: 30,
-            center_on: Some(PickerItem::File { path: "src/lib.rs".into(), match_indices: vec![] }),
+            kind: PickerKind::Files,
+            reset: false,
+            offset: 0,
+            limit: 30,
+            center_on: Some(PickerItem::File {
+                path: "src/lib.rs".into(),
+                match_indices: vec![],
+            }),
         },
-    ).await;
+    )
+    .await;
     assert_eq!(resume.query, "rs", "query persisted across hide");
     // Limit is larger than the result set so the window covers everything; effective_offset is 0.
     assert_eq!(resume.effective_offset, 0);
 
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    assert!(update.items.iter().any(|i| matches!(i, PickerItem::File { path, .. } if path == "src/lib.rs")));
+    assert!(update
+        .items
+        .iter()
+        .any(|i| matches!(i, PickerItem::File { path, .. } if path == "src/lib.rs")));
 
     drop(server);
 }
@@ -4355,22 +6726,51 @@ async fn picker_resume_centers_on_remembered_item() {
 async fn picker_reset_wipes_persisted_query() {
     let (server, mut ws) = setup_picker_workspace().await;
     let _ = send_request::<PickerView>(
-        &mut ws, 10,
-        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
-    ).await;
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
     let _: () = send_request::<PickerQuery>(
-        &mut ws, 11,
-        &PickerQueryParams { kind: PickerKind::Files, query: "main".into(), generation: 1 },
-    ).await;
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Files,
+            query: "main".into(),
+            generation: 1,
+        },
+    )
+    .await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
-    let _: () = send_request::<PickerHide>(&mut ws, 12, &PickerHideParams { kind: PickerKind::Files }).await;
+    let _: () = send_request::<PickerHide>(
+        &mut ws,
+        12,
+        &PickerHideParams {
+            kind: PickerKind::Files,
+        },
+    )
+    .await;
 
     // reset: true → query comes back empty even though we just typed one.
     let reopened = send_request::<PickerView>(
-        &mut ws, 13,
-        &PickerViewParams { kind: PickerKind::Files, reset: true, offset: 0, limit: 30, center_on: None },
-    ).await;
+        &mut ws,
+        13,
+        &PickerViewParams {
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     assert_eq!(reopened.query, "");
     assert_eq!(reopened.generation, 0);
 
@@ -4392,12 +6792,21 @@ async fn setup_buffer_picker_workspace() -> (
     std::fs::write(dir_path.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
     std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _: ClientHelloResult = send_request::<ClientHello>(
-        &mut ws, 1,
-        &ClientHelloParams { token: TEST_TOKEN.into(), client_version: "test".into() },
-    ).await;
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
     (server, ws)
 }
 
@@ -4406,27 +6815,66 @@ async fn setup_buffer_picker_workspace() -> (
 #[tokio::test]
 async fn buffers_picker_orders_by_mru_with_current_first() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("README.md".into()),
-        language: None, create_if_missing: false,
-    }).await;
-    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("src/lib.rs".into()),
-        language: None, create_if_missing: false,
-    }).await;
-    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 4, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
-        language: None, create_if_missing: false,
-    }).await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("README.md".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("src/lib.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        4,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("src/main.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
-    let _ = send_request::<PickerView>(&mut ws, 10, &PickerViewParams {
-        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
-    }).await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Buffers,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let displays: Vec<&str> = update.items.iter().map(|i| {
-        let PickerItem::Buffer { display, .. } = i else { panic!("expected Buffer, got {i:?}") };
-        display.as_str()
-    }).collect();
+    let displays: Vec<&str> = update
+        .items
+        .iter()
+        .map(|i| {
+            let PickerItem::Buffer { display, .. } = i else {
+                panic!("expected Buffer, got {i:?}")
+            };
+            display.as_str()
+        })
+        .collect();
     assert_eq!(displays, vec!["src/main.rs", "src/lib.rs", "README.md"]);
 
     drop(server);
@@ -4437,18 +6885,41 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
 #[tokio::test]
 async fn buffers_picker_select_returns_buffer_id() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
-        language: None, create_if_missing: false,
-    }).await;
-    let _ = send_request::<PickerView>(&mut ws, 10, &PickerViewParams {
-        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
-    }).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("src/main.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Buffers,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let item = update.items.first().expect("at least one buffer").clone();
-    let result: PickerSelectResult = send_request::<PickerSelect>(&mut ws, 11, &PickerSelectParams {
-        kind: PickerKind::Buffers, item,
-    }).await;
+    let result: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        11,
+        &PickerSelectParams {
+            kind: PickerKind::Buffers,
+            item,
+        },
+    )
+    .await;
     let PickerSelectResult::Buffer { buffer_id } = result else {
         panic!("expected Buffer result, got {result:?}");
     };
@@ -4463,23 +6934,50 @@ async fn buffers_picker_select_returns_buffer_id() {
 async fn buffer_open_by_id_attaches_to_scratch() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
     // Scratch buffer: no path fields.
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     assert!(scratch.path.is_none());
     // Open a file so the current buffer is different.
-    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("README.md".into()),
-        language: None, create_if_missing: false,
-    }).await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("README.md".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     // Now attach back to the scratch by id — no path fields needed.
-    let reattach: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 4, &BufferOpenParams {
-        buffer_id: Some(scratch.buffer_id), path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
+    let reattach: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        4,
+        &BufferOpenParams {
+            buffer_id: Some(scratch.buffer_id),
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     assert_eq!(reattach.buffer_id, scratch.buffer_id);
-    assert!(reattach.path.is_none(), "scratch buffer still has no path on reattach");
+    assert!(
+        reattach.path.is_none(),
+        "scratch buffer still has no path on reattach"
+    );
 
     drop(server);
 }
@@ -4488,18 +6986,39 @@ async fn buffer_open_by_id_attaches_to_scratch() {
 #[tokio::test]
 async fn buffers_picker_renders_scratch_placeholder() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
-    let _ = send_request::<PickerView>(&mut ws, 10, &PickerViewParams {
-        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
-    }).await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Buffers,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let expected = format!("[scratch {}]", scratch.buffer_id);
     assert!(
-        update.items.iter().any(|i| matches!(i, PickerItem::Buffer { display, .. } if display == &expected)),
-        "expected display {expected:?} in items: {:?}", update.items,
+        update
+            .items
+            .iter()
+            .any(|i| matches!(i, PickerItem::Buffer { display, .. } if display == &expected)),
+        "expected display {expected:?} in items: {:?}",
+        update.items,
     );
 
     drop(server);
@@ -4510,21 +7029,51 @@ async fn buffers_picker_renders_scratch_placeholder() {
 #[tokio::test]
 async fn buffers_picker_pushes_on_dirty_transition() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
-        language: None, create_if_missing: false,
-    }).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("src/main.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     // Subscribe a viewport so subsequent edits' lines_changed pushes are routed (they'd be
     // dropped otherwise, but the picker push lives on its own channel either way).
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
-        buffer_id: opened.buffer_id, cols: 80, rows: 24, overscan_rows: 24,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 1, tab_width: 4,
-    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: opened.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 24,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 1,
+            tab_width: 4,
+        },
+    )
+    .await;
     // Open the picker. Initial push shows dirty: false.
-    let _ = send_request::<PickerView>(&mut ws, 4, &PickerViewParams {
-        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
-    }).await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        4,
+        &PickerViewParams {
+            kind: PickerKind::Buffers,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let initial: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let initial_dirty = match initial.items.first().unwrap() {
         PickerItem::Buffer { dirty, .. } => *dirty,
@@ -4533,16 +7082,29 @@ async fn buffers_picker_pushes_on_dirty_transition() {
     assert!(!initial_dirty);
 
     // Type a char into the buffer — flips dirty true. Picker should push.
-    let _: EditResult = send_request::<InputText>(&mut ws, 5, &InputTextParams {
-        buffer_id: opened.buffer_id, text: "x".into(), select_pasted: false,
-    }).await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        5,
+        &InputTextParams {
+            buffer_id: opened.buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
     // Drain notifications until we get a picker update (other pushes — viewport lines, etc.
     // — may arrive first).
     let next: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let dirty_after = next.items.iter().find_map(|i| match i {
-        PickerItem::Buffer { buffer_id, dirty, .. } if *buffer_id == opened.buffer_id => Some(*dirty),
-        _ => None,
-    }).expect("buffer still in items");
+    let dirty_after = next
+        .items
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::Buffer {
+                buffer_id, dirty, ..
+            } if *buffer_id == opened.buffer_id => Some(*dirty),
+            _ => None,
+        })
+        .expect("buffer still in items");
     assert!(dirty_after, "dirty marker should flip after the first edit");
 
     drop(server);
@@ -4553,33 +7115,78 @@ async fn buffers_picker_pushes_on_dirty_transition() {
 #[tokio::test]
 async fn buffers_picker_no_push_on_subsequent_edits() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
-        language: None, create_if_missing: false,
-    }).await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
-        buffer_id: opened.buffer_id, cols: 80, rows: 24, overscan_rows: 24,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 1, tab_width: 4,
-    }).await;
-    let _ = send_request::<PickerView>(&mut ws, 4, &PickerViewParams {
-        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
-    }).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("src/main.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: opened.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 24,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 1,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        4,
+        &PickerViewParams {
+            kind: PickerKind::Buffers,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let _: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let _: EditResult = send_request::<InputText>(&mut ws, 5, &InputTextParams {
-        buffer_id: opened.buffer_id, text: "a".into(), select_pasted: false,
-    }).await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        5,
+        &InputTextParams {
+            buffer_id: opened.buffer_id,
+            text: "a".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
     let _: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await; // dirty flip
 
     // Second edit — dirty already true, no picker push expected. Drain frames for a short
     // window and assert none of them are picker/update notifications.
-    let _: EditResult = send_request::<InputText>(&mut ws, 6, &InputTextParams {
-        buffer_id: opened.buffer_id, text: "b".into(), select_pasted: false,
-    }).await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        6,
+        &InputTextParams {
+            buffer_id: opened.buffer_id,
+            text: "b".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
     let timed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
         loop {
             let text = next_text(&mut ws).await;
-            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text) {
+            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text)
+            {
                 if n.method == PickerUpdate::NAME {
                     return n;
                 }
@@ -4587,7 +7194,10 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
         }
     })
     .await;
-    assert!(timed.is_err(), "no picker/update should arrive after a same-dirty edit, got {timed:?}");
+    assert!(
+        timed.is_err(),
+        "no picker/update should arrive after a same-dirty edit, got {timed:?}"
+    );
 
     drop(server);
 }
@@ -4596,30 +7206,79 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
 #[tokio::test]
 async fn buffers_picker_pushes_on_save() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("src/main.rs".into()),
-        language: None, create_if_missing: false,
-    }).await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
-        buffer_id: opened.buffer_id, cols: 80, rows: 24, overscan_rows: 24,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 1, tab_width: 4,
-    }).await;
-    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
-        buffer_id: opened.buffer_id, text: "z".into(), select_pasted: false,
-    }).await;
-    let _ = send_request::<PickerView>(&mut ws, 5, &PickerViewParams {
-        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
-    }).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("src/main.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: opened.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 24,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 1,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: opened.buffer_id,
+            text: "z".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        5,
+        &PickerViewParams {
+            kind: PickerKind::Buffers,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let dirty_view: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let saw_dirty = dirty_view.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, dirty, .. } if *buffer_id == opened.buffer_id && *dirty));
     assert!(saw_dirty, "main.rs should be dirty after the edit");
 
-    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 6, &BufferSaveParams {
-        buffer_id: opened.buffer_id, path_index: None, relative_path: None, overwrite: false }).await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        6,
+        &BufferSaveParams {
+            buffer_id: opened.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
     let clean: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let saw_clean = clean.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, dirty, .. } if *buffer_id == opened.buffer_id && !*dirty));
-    assert!(saw_clean, "save should flip dirty back off and re-push the picker");
+    assert!(
+        saw_clean,
+        "save should flip dirty back off and re-push the picker"
+    );
 
     drop(server);
 }
@@ -4629,29 +7288,67 @@ async fn buffers_picker_pushes_on_save() {
 #[tokio::test]
 async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let first: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
-    let second: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
-        buffer_id: None, path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
+    let first: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let second: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     assert_ne!(first.buffer_id, second.buffer_id);
     assert!(first.path.is_none() && second.path.is_none());
 
     // Both should appear in the picker, second one first (MRU).
-    let _ = send_request::<PickerView>(&mut ws, 10, &PickerViewParams {
-        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
-    }).await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Buffers,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let ids: Vec<u64> = update.items.iter().filter_map(|i| match i {
-        PickerItem::Buffer { buffer_id, .. } => Some(*buffer_id),
-        _ => None,
-    }).collect();
-    let pos_first = ids.iter().position(|&id| id == first.buffer_id).expect("first scratch in items");
-    let pos_second = ids.iter().position(|&id| id == second.buffer_id).expect("second scratch in items");
-    assert!(pos_second < pos_first, "more recent scratch should be ranked above the older one");
+    let ids: Vec<u64> = update
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Buffer { buffer_id, .. } => Some(*buffer_id),
+            _ => None,
+        })
+        .collect();
+    let pos_first = ids
+        .iter()
+        .position(|&id| id == first.buffer_id)
+        .expect("first scratch in items");
+    let pos_second = ids
+        .iter()
+        .position(|&id| id == second.buffer_id)
+        .expect("second scratch in items");
+    assert!(
+        pos_second < pos_first,
+        "more recent scratch should be ranked above the older one"
+    );
 
     drop(server);
 }
@@ -4663,31 +7360,73 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
 async fn buffers_picker_mru_is_per_client() {
     let (server, mut ws_a) = setup_buffer_picker_workspace().await;
     // Client A opens two files in a specific order.
-    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws_a, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("README.md".into()),
-        language: None, create_if_missing: false,
-    }).await;
-    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws_a, 3, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("src/lib.rs".into()),
-        language: None, create_if_missing: false,
-    }).await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws_a,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("README.md".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws_a,
+        3,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("src/lib.rs".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Client B connects fresh — no touches yet. Buffers should appear in id order.
-    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws_b, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let _ = send_request::<PickerView>(&mut ws_b, 10, &PickerViewParams {
-        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
-    }).await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws_b,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws_b,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Buffers,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+        },
+    )
+    .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws_b).await;
-    let ids: Vec<u64> = update.items.iter().map(|i| {
-        let PickerItem::Buffer { buffer_id, .. } = i else { panic!("expected Buffer, got {i:?}") };
-        *buffer_id
-    }).collect();
+    let ids: Vec<u64> = update
+        .items
+        .iter()
+        .map(|i| {
+            let PickerItem::Buffer { buffer_id, .. } = i else {
+                panic!("expected Buffer, got {i:?}")
+            };
+            *buffer_id
+        })
+        .collect();
     let mut sorted = ids.clone();
     sorted.sort_unstable();
-    assert_eq!(ids, sorted, "client B should see buffers in id order (no MRU touches yet)");
+    assert_eq!(
+        ids, sorted,
+        "client B should see buffers in id order (no MRU touches yet)"
+    );
 
     drop(server);
 }
@@ -4701,41 +7440,99 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
 
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
-        buffer_id: scratch.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
-    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
-        buffer_id: scratch.buffer_id, text: "hello world\n".into(), select_pasted: false,
-    }).await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: scratch.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: scratch.buffer_id,
+            text: "hello world\n".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
 
     // Save-as to "notes.txt" under the project root.
-    let saved: BufferSaveResult = send_request::<BufferSave>(&mut ws, 5, &BufferSaveParams {
-        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("notes.txt".into()), overwrite: false }).await;
+    let saved: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        5,
+        &BufferSaveParams {
+            buffer_id: scratch.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("notes.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
 
     // File exists with the right contents.
     let on_disk = std::fs::read_to_string(dir_path.join("notes.txt")).expect("file written");
     assert_eq!(on_disk, "hello world\n");
 
     // Dirty cleared. Reopen the buffer by id to check its post-save state.
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 6, &BufferOpenParams {
-        buffer_id: Some(scratch.buffer_id), path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        6,
+        &BufferOpenParams {
+            buffer_id: Some(scratch.buffer_id),
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     assert_eq!(reopen.saved_revision, saved.revision);
     assert_eq!(reopen.revision, saved.revision);
-    assert!(reopen.path.as_deref().is_some_and(|p| p.ends_with("notes.txt")));
+    assert!(reopen
+        .path
+        .as_deref()
+        .is_some_and(|p| p.ends_with("notes.txt")));
 
     drop(server);
 }
@@ -4748,28 +7545,66 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("existing.txt"), "old content\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
 
     // Open the existing file (now claimed by buffer A).
-    let _: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("existing.txt".into()),
-        language: None, create_if_missing: false,
-    }).await;
+    let _: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("existing.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
     // Open a fresh scratch (buffer B).
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
-        buffer_id: None, path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
 
     // Try to save-as scratch -> existing.txt. Expect error, expect the on-disk content
     // untouched.
-    let msg = send_request_expect_err::<BufferSave>(&mut ws, 4, &BufferSaveParams {
-        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("existing.txt".into()), overwrite: false }).await;
-    assert!(msg.contains("already open"), "expected conflict message, got: {msg}");
+    let msg = send_request_expect_err::<BufferSave>(
+        &mut ws,
+        4,
+        &BufferSaveParams {
+            buffer_id: scratch.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("existing.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(
+        msg.contains("already open"),
+        "expected conflict message, got: {msg}"
+    );
 
     drop(server);
 }
@@ -4782,26 +7617,73 @@ async fn save_as_to_same_path_is_in_place_save() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("doc.txt"), "x\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("doc.txt".into()),
-        language: None, create_if_missing: false,
-    }).await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
-        buffer_id: opened.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
-    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
-        buffer_id: opened.buffer_id, text: "y".into(), select_pasted: false,
-    }).await;
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("doc.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: opened.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: opened.buffer_id,
+            text: "y".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
     // Same-path save-as. Should succeed.
-    let _saved: BufferSaveResult = send_request::<BufferSave>(&mut ws, 5, &BufferSaveParams {
-        buffer_id: opened.buffer_id, path_index: Some(0), relative_path: Some("doc.txt".into()), overwrite: false }).await;
+    let _saved: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        5,
+        &BufferSaveParams {
+            buffer_id: opened.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("doc.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
     let on_disk = std::fs::read_to_string(dir_path.join("doc.txt")).unwrap();
     assert!(on_disk.starts_with("y"));
 
@@ -4816,41 +7698,102 @@ async fn save_as_rejects_existing_file_without_overwrite() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("target.txt"), "original\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
 
     // Scratch buffer with some content.
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
-        buffer_id: scratch.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
-    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
-        buffer_id: scratch.buffer_id, text: "fresh\n".into(), select_pasted: false,
-    }).await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: scratch.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: scratch.buffer_id,
+            text: "fresh\n".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
 
     // First try: overwrite=false should bounce with WOULD_OVERWRITE.
-    let msg = send_request_expect_err::<BufferSave>(&mut ws, 5, &BufferSaveParams {
-        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("target.txt".into()),
-        overwrite: false,
-    }).await;
-    assert!(msg.contains("would overwrite"), "expected would-overwrite message, got: {msg}");
+    let msg = send_request_expect_err::<BufferSave>(
+        &mut ws,
+        5,
+        &BufferSaveParams {
+            buffer_id: scratch.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("target.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(
+        msg.contains("would overwrite"),
+        "expected would-overwrite message, got: {msg}"
+    );
     // On-disk unchanged.
-    assert_eq!(std::fs::read_to_string(dir_path.join("target.txt")).unwrap(), "original\n");
+    assert_eq!(
+        std::fs::read_to_string(dir_path.join("target.txt")).unwrap(),
+        "original\n"
+    );
 
     // Second try: overwrite=true succeeds.
-    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 6, &BufferSaveParams {
-        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("target.txt".into()),
-        overwrite: true,
-    }).await;
-    assert_eq!(std::fs::read_to_string(dir_path.join("target.txt")).unwrap(), "fresh\n");
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        6,
+        &BufferSaveParams {
+            buffer_id: scratch.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("target.txt".into()),
+            overwrite: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(dir_path.join("target.txt")).unwrap(),
+        "fresh\n"
+    );
 
     drop(server);
 }
@@ -4863,32 +7806,85 @@ async fn in_place_save_never_triggers_overwrite_check() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("file.txt"), "before\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("file.txt".into()),
-        language: None, create_if_missing: false,
-    }).await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
-        buffer_id: opened.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
-    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
-        buffer_id: opened.buffer_id, text: "x".into(), select_pasted: false,
-    }).await;
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("file.txt".into()),
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: opened.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: opened.buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
     // In-place save — overwrite=false, no path args. Must not error.
-    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 5, &BufferSaveParams {
-        buffer_id: opened.buffer_id, path_index: None, relative_path: None, overwrite: false,
-    }).await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        5,
+        &BufferSaveParams {
+            buffer_id: opened.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
     // Save-as to the same path — also fine with overwrite=false.
-    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 6, &BufferSaveParams {
-        buffer_id: opened.buffer_id, path_index: Some(0), relative_path: Some("file.txt".into()),
-        overwrite: false,
-    }).await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        6,
+        &BufferSaveParams {
+            buffer_id: opened.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("file.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
 
     drop(server);
 }
@@ -4900,35 +7896,95 @@ async fn in_place_save_after_save_as_targets_new_path() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: None, relative_path: None,
-        language: None, create_if_missing: false,
-    }).await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
-        buffer_id: scratch.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
-    let _: EditResult = send_request::<InputText>(&mut ws, 4, &InputTextParams {
-        buffer_id: scratch.buffer_id, text: "one\n".into(), select_pasted: false,
-    }).await;
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: scratch.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: scratch.buffer_id,
+            text: "one\n".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
     // Save-as to a fresh path.
-    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 5, &BufferSaveParams {
-        buffer_id: scratch.buffer_id, path_index: Some(0), relative_path: Some("named.txt".into()),
-        overwrite: false,
-    }).await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        5,
+        &BufferSaveParams {
+            buffer_id: scratch.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("named.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
     // Edit again, then plain in-place save (no path fields). Should write to named.txt.
-    let _: EditResult = send_request::<InputText>(&mut ws, 6, &InputTextParams {
-        buffer_id: scratch.buffer_id, text: "two\n".into(), select_pasted: false,
-    }).await;
-    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, 7, &BufferSaveParams {
-        buffer_id: scratch.buffer_id, path_index: None, relative_path: None, overwrite: false,
-    }).await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        6,
+        &InputTextParams {
+            buffer_id: scratch.buffer_id,
+            text: "two\n".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        7,
+        &BufferSaveParams {
+            buffer_id: scratch.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
     let on_disk = std::fs::read_to_string(dir_path.join("named.txt")).expect("file on disk");
     assert_eq!(on_disk, "one\ntwo\n");
 

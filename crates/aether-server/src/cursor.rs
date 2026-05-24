@@ -32,7 +32,10 @@ pub fn char_to_pos(buf: &Buffer, char_idx: usize) -> LogicalPosition {
     let char_offset = char_idx - line_start_char;
     let line_slice = buf.text.line(line_idx);
     let byte_offset = line_slice.char_to_byte(char_offset);
-    LogicalPosition { line: line_idx as u32, col: byte_offset as u32 }
+    LogicalPosition {
+        line: line_idx as u32,
+        col: byte_offset as u32,
+    }
 }
 
 pub fn line_byte_len_excl_newline(buf: &Buffer, line_idx: u32) -> u32 {
@@ -76,7 +79,11 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             };
             char_to_pos(buf, new_char)
         }
-        Motion::LogicalLine { direction, count, preserve_col } => {
+        Motion::LogicalLine {
+            direction,
+            count,
+            preserve_col,
+        } => {
             let line_count = buf.text.len_lines() as u32;
             let new_line = match direction {
                 Direction::Forward => current.line.saturating_add(*count),
@@ -88,9 +95,15 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             } else {
                 0
             };
-            LogicalPosition { line: new_line, col: new_col }
+            LogicalPosition {
+                line: new_line,
+                col: new_col,
+            }
         }
-        Motion::LineStart => LogicalPosition { line: current.line, col: 0 },
+        Motion::LineStart => LogicalPosition {
+            line: current.line,
+            col: 0,
+        },
         Motion::LineEnd => LogicalPosition {
             line: current.line,
             col: line_byte_len_excl_newline(buf, current.line),
@@ -104,12 +117,20 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
                 }
                 byte_offset += c.len_utf8();
             }
-            LogicalPosition { line: current.line, col: byte_offset as u32 }
+            LogicalPosition {
+                line: current.line,
+                col: byte_offset as u32,
+            }
         }
         Motion::BufferStart => LogicalPosition { line: 0, col: 0 },
         Motion::BufferEnd => char_to_pos(buf, buf.text.len_chars()),
         Motion::Goto { position } => clamp_position(buf, *position),
-        Motion::Word { direction, count, boundary, exclusive } => {
+        Motion::Word {
+            direction,
+            count,
+            boundary,
+            exclusive,
+        } => {
             let orig_start = pos_to_char(buf, current);
             let mut end = match direction {
                 Direction::Forward => {
@@ -126,7 +147,9 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
                     };
                     word_forward_start(&buf.text, s, *boundary, *count)
                 }
-                Direction::Backward => word_backward_start(&buf.text, orig_start, *boundary, *count),
+                Direction::Backward => {
+                    word_backward_start(&buf.text, orig_start, *boundary, *count)
+                }
             };
             // Exclusive forward stops one char before the destination word boundary, provided
             // the motion actually advanced.
@@ -135,7 +158,11 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             }
             char_to_pos(buf, end)
         }
-        Motion::WordEnd { direction, count, boundary } => {
+        Motion::WordEnd {
+            direction,
+            count,
+            boundary,
+        } => {
             let start = pos_to_char(buf, current);
             let end = match direction {
                 Direction::Forward => word_forward_end(&buf.text, start, *boundary, *count),
@@ -145,14 +172,17 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         }
         // Visual motions are resolved separately by the cursor/move handler (they need viewport
         // state for wrap mode + width). resolve_motion is for buffer-only motions.
-        Motion::VisualLine { .. } | Motion::VisualLineStart { .. } | Motion::VisualLineEnd { .. } => {
-            current
-        }
+        Motion::VisualLine { .. }
+        | Motion::VisualLineStart { .. }
+        | Motion::VisualLineEnd { .. } => current,
         Motion::MatchBracket => {
-            let Some(syntax) = buf.syntax.as_ref() else { return current };
+            let Some(syntax) = buf.syntax.as_ref() else {
+                return current;
+            };
             let source: String = buf.text.chunks().collect();
             let cursor_byte = buf.text.char_to_byte(pos_to_char(buf, current));
-            let Some((open, close)) = crate::brackets::find_match_bracket(&syntax.tree, cursor_byte)
+            let Some((open, close)) =
+                crate::brackets::find_match_bracket(&syntax.tree, cursor_byte)
             else {
                 return current;
             };
@@ -170,7 +200,9 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         }
         Motion::NextNavigationUnit | Motion::PrevNavigationUnit => {
             let forward = matches!(motion, Motion::NextNavigationUnit);
-            let Some(syntax) = buf.syntax.as_ref() else { return current };
+            let Some(syntax) = buf.syntax.as_ref() else {
+                return current;
+            };
             let cursor_byte = buf.text.char_to_byte(pos_to_char(buf, current));
             let nav_kinds = syntax.config.navigation_kinds;
             if nav_kinds.is_empty() {
@@ -183,7 +215,9 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         }
         Motion::EndOfNavigationUnit | Motion::StartOfNavigationUnit => {
             let to_end = matches!(motion, Motion::EndOfNavigationUnit);
-            let Some(syntax) = buf.syntax.as_ref() else { return current };
+            let Some(syntax) = buf.syntax.as_ref() else {
+                return current;
+            };
             let cursor_byte = buf.text.char_to_byte(pos_to_char(buf, current));
             let nav_kinds = syntax.config.navigation_kinds;
             if nav_kinds.is_empty() {
@@ -214,7 +248,12 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             };
             char_to_pos(buf, buf.text.byte_to_char(target_byte))
         }
-        Motion::FindChar { ch, direction, count, till } => {
+        Motion::FindChar {
+            ch,
+            direction,
+            count,
+            till,
+        } => {
             let cur_idx = pos_to_char(buf, current);
             let total = buf.text.len_chars();
             let target_idx = find_char(&buf.text, cur_idx, total, *ch, *direction, *count);
@@ -382,7 +421,11 @@ pub fn resolve_visual_line(
         // display cells (same currency as the wrap path), so multi-byte chars like `—` round-
         // trip correctly when moving across lines that contain them.
         let cur_text = line_text(buf, current.line);
-        let cur_row = RowInfo { byte_offset: 0, text: cur_text, continuation_indent: 0 };
+        let cur_row = RowInfo {
+            byte_offset: 0,
+            text: cur_text,
+            continuation_indent: 0,
+        };
         let target_display = virtual_col_in
             .unwrap_or_else(|| visual_col_of_byte(&cur_row, current.col as usize, 0, tab_width));
         let line_count = buf.text.len_lines() as u32;
@@ -392,17 +435,33 @@ pub fn resolve_visual_line(
         };
         let new_line = new_line.min(line_count.saturating_sub(1));
         let new_text = line_text(buf, new_line);
-        let new_row = RowInfo { byte_offset: 0, text: new_text, continuation_indent: 0 };
+        let new_row = RowInfo {
+            byte_offset: 0,
+            text: new_text,
+            continuation_indent: 0,
+        };
         let new_col = byte_at_visual_col(&new_row, target_display, 0, tab_width) as u32;
-        return (LogicalPosition { line: new_line, col: new_col }, target_display);
+        return (
+            LogicalPosition {
+                line: new_line,
+                col: new_col,
+            },
+            target_display,
+        );
     }
 
     let line_count = buf.text.len_lines() as u32;
     let mut current_line = current.line.min(line_count.saturating_sub(1));
     let mut rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width, tab_width);
     let mut row_idx = find_row_for_col(&rows, current.col as usize);
-    let target_visual_col = virtual_col_in
-        .unwrap_or_else(|| visual_col_of_byte(&rows[row_idx], current.col as usize, marker_width, tab_width));
+    let target_visual_col = virtual_col_in.unwrap_or_else(|| {
+        visual_col_of_byte(
+            &rows[row_idx],
+            current.col as usize,
+            marker_width,
+            tab_width,
+        )
+    });
 
     let mut remaining = count;
     while remaining > 0 {
@@ -413,7 +472,12 @@ pub fn resolve_visual_line(
                     true
                 } else if current_line + 1 < line_count {
                     current_line += 1;
-                    rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width, tab_width);
+                    rows = wrap::compute_rows(
+                        &line_text(buf, current_line),
+                        cols,
+                        marker_width,
+                        tab_width,
+                    );
                     row_idx = 0;
                     true
                 } else {
@@ -426,7 +490,12 @@ pub fn resolve_visual_line(
                     true
                 } else if current_line > 0 {
                     current_line -= 1;
-                    rows = wrap::compute_rows(&line_text(buf, current_line), cols, marker_width, tab_width);
+                    rows = wrap::compute_rows(
+                        &line_text(buf, current_line),
+                        cols,
+                        marker_width,
+                        tab_width,
+                    );
                     row_idx = rows.len().saturating_sub(1);
                     true
                 } else {
@@ -460,7 +529,10 @@ pub fn resolve_visual_line_start(
 ) -> LogicalPosition {
     let rows = wrap_rows_for_cursor(buf, wrap, cols, marker_width, tab_width, current);
     let row_idx = find_row_for_col(&rows, current.col as usize);
-    LogicalPosition { line: current.line, col: rows[row_idx].byte_offset as u32 }
+    LogicalPosition {
+        line: current.line,
+        col: rows[row_idx].byte_offset as u32,
+    }
 }
 
 /// Resolve VisualLineEnd: cursor to the last byte of its current visual row.
@@ -476,7 +548,10 @@ pub fn resolve_visual_line_end(
     let row_idx = find_row_for_col(&rows, current.col as usize);
     let row = &rows[row_idx];
     let end_byte = row.byte_offset + row.text.len();
-    LogicalPosition { line: current.line, col: end_byte as u32 }
+    LogicalPosition {
+        line: current.line,
+        col: end_byte as u32,
+    }
 }
 
 fn wrap_rows_for_cursor(
@@ -492,10 +567,17 @@ fn wrap_rows_for_cursor(
     if matches!(wrap, WrapMode::None) || cols == 0 {
         let text = line_text(buf, line_idx);
         let len = text.len();
-        vec![RowInfo { byte_offset: 0, text, continuation_indent: 0 }]
-            .into_iter()
-            .map(|mut r| { r.text.truncate(len); r })
-            .collect()
+        vec![RowInfo {
+            byte_offset: 0,
+            text,
+            continuation_indent: 0,
+        }]
+        .into_iter()
+        .map(|mut r| {
+            r.text.truncate(len);
+            r
+        })
+        .collect()
     } else {
         wrap::compute_rows(&line_text(buf, line_idx), cols, marker_width, tab_width)
     }
@@ -570,7 +652,11 @@ fn byte_at_visual_col(row: &RowInfo, visual_col: u32, marker_width: u32, tab_wid
 /// the cursor module stays self-contained.
 fn step_width(c: char, current_col: u32, tab_width: u32) -> u32 {
     if c == '\t' {
-        if tab_width == 0 { 0 } else { tab_width - (current_col % tab_width) }
+        if tab_width == 0 {
+            0
+        } else {
+            tab_width - (current_col % tab_width)
+        }
     } else {
         UnicodeWidthChar::width(c).unwrap_or(0) as u32
     }
@@ -602,7 +688,13 @@ pub fn resolve_logical_line(
     };
     let new_line = new_line.min(line_count.saturating_sub(1));
     if !preserve_col {
-        return (LogicalPosition { line: new_line, col: 0 }, None);
+        return (
+            LogicalPosition {
+                line: new_line,
+                col: 0,
+            },
+            None,
+        );
     }
     let cur_row = RowInfo {
         byte_offset: 0,
@@ -617,7 +709,13 @@ pub fn resolve_logical_line(
         continuation_indent: 0,
     };
     let new_col = byte_at_visual_col(&new_row, target_display, 0, tab_width) as u32;
-    (LogicalPosition { line: new_line, col: new_col }, Some(target_display))
+    (
+        LogicalPosition {
+            line: new_line,
+            col: new_col,
+        },
+        Some(target_display),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -644,7 +742,12 @@ fn char_cat(c: char, boundary: WordBoundary) -> CharCat {
     }
 }
 
-fn word_forward_start(rope: &ropey::Rope, start: usize, boundary: WordBoundary, count: u32) -> usize {
+fn word_forward_start(
+    rope: &ropey::Rope,
+    start: usize,
+    boundary: WordBoundary,
+    count: u32,
+) -> usize {
     let total = rope.len_chars();
     let mut i = start;
     for _ in 0..count {
@@ -666,7 +769,12 @@ fn word_forward_start(rope: &ropey::Rope, start: usize, boundary: WordBoundary, 
     i
 }
 
-fn word_backward_start(rope: &ropey::Rope, start: usize, boundary: WordBoundary, count: u32) -> usize {
+fn word_backward_start(
+    rope: &ropey::Rope,
+    start: usize,
+    boundary: WordBoundary,
+    count: u32,
+) -> usize {
     let mut i = start;
     for _ in 0..count {
         if i == 0 {
@@ -715,7 +823,12 @@ fn word_forward_end(rope: &ropey::Rope, start: usize, boundary: WordBoundary, co
     i
 }
 
-fn word_backward_end(rope: &ropey::Rope, start: usize, boundary: WordBoundary, count: u32) -> usize {
+fn word_backward_end(
+    rope: &ropey::Rope,
+    start: usize,
+    boundary: WordBoundary,
+    count: u32,
+) -> usize {
     // Vim's `ge` — back to end of previous word.
     let mut i = start;
     for _ in 0..count {
