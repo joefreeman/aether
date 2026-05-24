@@ -815,6 +815,9 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Char('w'), CTRL_ONLY) => toggle_wrap(client, state).await?,
         (KeyCode::Char('z'), m) if m == KeyModifiers::NONE => center_cursor(client, state).await?,
 
+        // ---- buffers ----
+        (KeyCode::Char('n'), CTRL_ONLY) => new_scratch(client, state).await?,
+
         // ---- edits ----
         (KeyCode::Char('s'), CTRL_ONLY) => save_buffer(client, state).await?,
         (KeyCode::Char('u'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT =>
@@ -1127,6 +1130,33 @@ async fn attach_buffer(client: &mut Client, state: &mut AppState, buffer_id: Buf
             create_if_missing: false,
         })
         .await?;
+    subscribe_to_buffer(client, state, open).await
+}
+
+/// Create a fresh scratch buffer and switch to it. Empty buffer with no path; saved as a new
+/// file when the user runs Save-As. MRU bumps server-side so it shows up at position 0 in the
+/// buffer picker.
+async fn new_scratch(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let open: BufferOpenResult = client
+        .rpc::<BufferOpen>(BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+        })
+        .await?;
+    subscribe_to_buffer(client, state, open).await
+}
+
+/// Shared post-`buffer/open` plumbing: subscribe a viewport and refresh AppState. Both
+/// `attach_buffer` and `new_scratch` route through this; the only difference is the
+/// `buffer/open` params they send.
+async fn subscribe_to_buffer(
+    client: &mut Client,
+    state: &mut AppState,
+    open: BufferOpenResult,
+) -> Result<()> {
     let initial_scroll = open.scroll.unwrap_or(ScrollPosition { logical_line: 0, sub_row: 0.0 });
     let sub: ViewportSubscribeResult = client
         .rpc::<ViewportSubscribe>(ViewportSubscribeParams {

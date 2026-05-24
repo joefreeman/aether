@@ -4600,6 +4600,38 @@ async fn buffers_picker_pushes_on_save() {
     drop(server);
 }
 
+/// Successive scratch opens allocate fresh buffer ids — the server doesn't dedupe scratches
+/// the way it dedupes path-backed buffers. Each one shows up independently in the picker.
+#[tokio::test]
+async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
+    let (server, mut ws) = setup_buffer_picker_workspace().await;
+    let first: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
+        buffer_id: None, path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    let second: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
+        buffer_id: None, path_index: None, relative_path: None,
+        language: None, create_if_missing: false,
+    }).await;
+    assert_ne!(first.buffer_id, second.buffer_id);
+    assert!(first.path.is_none() && second.path.is_none());
+
+    // Both should appear in the picker, second one first (MRU).
+    let _ = send_request::<PickerView>(&mut ws, 10, &PickerViewParams {
+        kind: PickerKind::Buffers, reset: true, offset: 0, limit: 30, center_on: None,
+    }).await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let ids: Vec<u64> = update.items.iter().filter_map(|i| match i {
+        PickerItem::Buffer { buffer_id, .. } => Some(*buffer_id),
+        _ => None,
+    }).collect();
+    let pos_first = ids.iter().position(|&id| id == first.buffer_id).expect("first scratch in items");
+    let pos_second = ids.iter().position(|&id| id == second.buffer_id).expect("second scratch in items");
+    assert!(pos_second < pos_first, "more recent scratch should be ranked above the older one");
+
+    drop(server);
+}
+
 /// MRU is per-client: a buffer that was open before disconnect doesn't sit forever in
 /// another client's MRU. Closing the connection drops MRU; reconnecting fresh shows the open
 /// buffers in id order (since this client hasn't touched any).
