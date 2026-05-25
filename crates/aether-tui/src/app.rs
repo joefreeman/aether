@@ -264,10 +264,9 @@ pub async fn bootstrap(
     let project_paths = hello.project.paths.clone();
 
     // Classify the file arg: file → open it; directory → open scratch + auto-show the Explorer
-    // popup pointed at that directory; missing → open scratch + auto-show the Explorer popup
-    // at the first project root.
+    // popup pointed at that directory; missing → open scratch with no Explorer.
     let (open_file, explorer_dir): (Option<String>, Option<String>) = match file {
-        None => (None, project_paths.first().cloned()),
+        None => (None, None),
         Some(f) => {
             let raw = std::path::Path::new(f);
             let abs = if raw.is_absolute() {
