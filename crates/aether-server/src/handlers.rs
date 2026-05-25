@@ -11,8 +11,8 @@ use crate::state::{
 use crate::wrap;
 use aether_protocol::buffer::{
     BufferCloseParams, BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams,
-    BufferOpenResult, BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams,
-    CopyScope,
+    BufferOpenResult, BufferReloadParams, BufferReloadResult, BufferSaveParams, BufferSaveResult,
+    BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState,
@@ -758,11 +758,11 @@ fn collect_cursor_search_update(
 }
 
 /// Build the `buffer/state` notification pushes for every client that has a viewport on this
-/// buffer. Only used by the save handler — mutations bump the buffer's `revision` (which clients
-/// already learn from `viewport/lines_changed`) and the client derives `dirty` as
-/// `revision != saved_revision`, so this notification is only needed when `saved_revision`
-/// itself changes.
-fn collect_buffer_state_pushes(
+/// buffer. Used by save, reload, and the file-watcher — mutations bump the buffer's `revision`
+/// (which clients already learn from `viewport/lines_changed`) and the client derives `dirty`
+/// as `revision != saved_revision`, so this notification is only needed when `saved_revision`
+/// changes or when the external-change flags flip.
+pub(crate) fn collect_buffer_state_pushes(
     s: &ServerState,
     buffer_id: BufferId,
 ) -> Vec<(mpsc::Sender<Notification>, Notification)> {
@@ -773,6 +773,8 @@ fn collect_buffer_state_pushes(
         buffer_id,
         saved_revision: buf.saved_revision(),
         saved_at_unix_ms: buf.last_modified_unix_ms,
+        externally_modified: buf.externally_modified,
+        externally_deleted: buf.externally_deleted,
     };
     let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
     let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
@@ -1146,6 +1148,28 @@ pub async fn buffer_save(
                 return Err(RpcError::would_overwrite(target.display()));
             }
         }
+        // External-change check: only applies when saving in-place (target matches the buffer's
+        // current path). Save-as to a different path is governed by the WOULD_OVERWRITE check
+        // above; the buffer's external-change state for its prior path is no longer relevant.
+        if !params.overwrite {
+            let buf = s
+                .buffers
+                .get(&params.buffer_id)
+                .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+            let saving_in_place = buf
+                .canonical_path
+                .as_deref()
+                .map(|p| p == target.as_path())
+                .unwrap_or(false);
+            if saving_in_place {
+                if buf.externally_deleted {
+                    return Err(RpcError::externally_deleted(params.buffer_id));
+                }
+                if buf.externally_modified {
+                    return Err(RpcError::externally_modified(params.buffer_id));
+                }
+            }
+        }
         let buf = s
             .buffers
             .get_mut(&params.buffer_id)
@@ -1174,6 +1198,116 @@ pub async fn buffer_save(
         saved_at_unix_ms,
         revision,
     })
+}
+
+pub async fn buffer_reload(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferReloadParams,
+) -> Result<BufferReloadResult, RpcError> {
+    let _client_id = ctx.require_hello()?;
+    let mut s = state.lock().await;
+    if !params.force {
+        let buf = s
+            .buffers
+            .get(&params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        if buf.dirty {
+            return Err(RpcError::would_discard_changes(params.buffer_id));
+        }
+    }
+    let (result, pushes) = reload_buffer_locked(&mut s, params.buffer_id)?;
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(result)
+}
+
+/// Re-read a buffer from disk inside the lock, returning the RPC result and the pushes the
+/// caller should emit after dropping the lock. Shared between the `buffer/reload` handler and
+/// the file-watcher's silent-reload path.
+pub(crate) fn reload_buffer_locked(
+    s: &mut ServerState,
+    buffer_id: BufferId,
+) -> Result<
+    (
+        BufferReloadResult,
+        Vec<(mpsc::Sender<Notification>, Notification)>,
+    ),
+    RpcError,
+> {
+    let was_dirty = s.buffers.get(&buffer_id).map(|b| b.dirty).unwrap_or(false);
+
+    let saved_at_unix_ms = {
+        let buf = s
+            .buffers
+            .get_mut(&buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+        if buf.canonical_path.is_none() {
+            return Err(RpcError::buffer_has_no_path());
+        }
+        buf.reload_from_disk().map_err(RpcError::file_io)?
+    };
+
+    // Clamp every cursor on this buffer to the new bounds — rope was swapped wholesale.
+    let cursor_ids: Vec<ClientId> = s
+        .cursors
+        .keys()
+        .filter_map(|(c, b)| if *b == buffer_id { Some(*c) } else { None })
+        .collect();
+    {
+        let buf = &s.buffers[&buffer_id];
+        let clamped: Vec<(ClientId, CursorState)> = cursor_ids
+            .iter()
+            .filter_map(|cid| {
+                let cursor = s.cursors.get(&(*cid, buffer_id)).copied()?;
+                Some((*cid, clamp_cursor(buf, cursor)))
+            })
+            .collect();
+        for (cid, cursor) in clamped {
+            s.cursors.insert((cid, buffer_id), cursor);
+        }
+    }
+    s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_tree_selection_history_for_buffer(buffer_id);
+    s.clear_virtual_col_for_buffer(buffer_id);
+
+    let search_summary_pushes = refresh_searches_for_buffer(s, buffer_id);
+    let new_line_count = s.buffers[&buffer_id].line_count();
+    refresh_viewport_ranges_for_buffer(s, buffer_id, new_line_count);
+
+    let revision = s.buffers[&buffer_id].revision;
+    let buf_ref = &s.buffers[&buffer_id];
+    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    for vp in s.viewports.values() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        let search = s.searches.get(&(vp.client_id, buffer_id));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(buf_ref, vp, revision, search),
+        ));
+    }
+
+    let state_pushes = collect_buffer_state_pushes(s, buffer_id);
+    let picker_pushes = maybe_refresh_dirty(s, buffer_id, was_dirty);
+
+    pushes.extend(search_summary_pushes);
+    pushes.extend(state_pushes);
+    pushes.extend(picker_pushes);
+
+    Ok((
+        BufferReloadResult {
+            revision,
+            saved_at_unix_ms: Some(saved_at_unix_ms),
+        },
+        pushes,
+    ))
 }
 
 // ---- viewport handlers -------------------------------------------------------------------------
@@ -4209,18 +4343,28 @@ async fn build_explorer_candidates(
     let canonical = std::fs::canonicalize(&raw_path).map_err(|e| {
         RpcError::invalid_path(format!("canonicalizing {}: {e}", raw_path.display()))
     })?;
+    build_explorer_candidates_for_canonical(&canonical, &project_paths)
+}
+
+/// Sync variant: build `ExplorerCandidates` for an already-canonicalized directory path. Used
+/// by the async `build_explorer_candidates` (after it has resolved the requested path) and by
+/// the file-watcher's explorer refresh path (which iterates over already-canonical paths).
+pub(crate) fn build_explorer_candidates_for_canonical(
+    canonical: &std::path::Path,
+    project_paths: &[std::path::PathBuf],
+) -> Result<picker_state::ExplorerCandidates, RpcError> {
     let in_project = |p: &std::path::Path| -> bool {
         project_paths
             .iter()
             .any(|root| p == root.as_path() || p.starts_with(root))
     };
-    if !in_project(&canonical) {
+    if !in_project(canonical) {
         return Err(RpcError::invalid_path(format!(
             "{} is outside the project's access boundary",
             canonical.display()
         )));
     }
-    let metadata = std::fs::metadata(&canonical).map_err(RpcError::file_io)?;
+    let metadata = std::fs::metadata(canonical).map_err(RpcError::file_io)?;
     if !metadata.is_dir() {
         return Err(RpcError::invalid_path(format!(
             "{} is not a directory",
@@ -4235,7 +4379,7 @@ async fn build_explorer_candidates(
         }
     });
     let mut entries: Vec<picker_state::ExplorerEntry> = Vec::new();
-    let read = std::fs::read_dir(&canonical).map_err(RpcError::file_io)?;
+    let read = std::fs::read_dir(canonical).map_err(RpcError::file_io)?;
     for ent in read {
         let ent = match ent {
             Ok(e) => e,
@@ -4259,6 +4403,74 @@ async fn build_explorer_candidates(
         parent,
         entries,
     })
+}
+
+/// Walk every subscribed Explorer picker; if its current path matches one of `affected_dirs`,
+/// re-list the directory, re-rank under the existing query, and emit a `picker/update` push.
+/// Called by the file-watcher event handler. Does sync I/O under the `ServerState` lock —
+/// `read_dir` on a single directory is fast enough for a single-user editor.
+pub(crate) fn refresh_explorers_for_dirs(
+    s: &mut ServerState,
+    affected_dirs: &std::collections::HashSet<std::path::PathBuf>,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    if affected_dirs.is_empty() {
+        return Vec::new();
+    }
+    // Snapshot which (client, picker_path) pairs need refresh before we mutate.
+    let to_refresh: Vec<(ClientId, std::path::PathBuf)> = s
+        .pickers
+        .iter()
+        .filter_map(|((cid, kind), picker)| {
+            if *kind != PickerKind::Explorer || picker.subscribed.is_none() {
+                return None;
+            }
+            let path = match &picker.candidates {
+                picker_state::PickerCandidates::Explorer(e) => std::path::PathBuf::from(&e.path),
+                _ => return None,
+            };
+            if affected_dirs.contains(&path) {
+                Some((*cid, path))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if to_refresh.is_empty() {
+        return Vec::new();
+    }
+    let project_paths = s.project_paths.clone();
+    let mut pushes = Vec::new();
+    for (client_id, path) in to_refresh {
+        let new_candidates = match build_explorer_candidates_for_canonical(&path, &project_paths) {
+            Ok(c) => c,
+            Err(_) => continue, // dir removed or no longer in project; skip silently
+        };
+        let ServerState {
+            pickers,
+            matcher,
+            clients,
+            ..
+        } = &mut *s;
+        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Explorer)) else {
+            continue;
+        };
+        picker.candidates = picker_state::PickerCandidates::Explorer(new_candidates);
+        picker.rerank(matcher);
+        if let Some(window) = picker.subscribed.as_mut() {
+            let total = picker.ranked.len() as u32;
+            if window.offset >= total {
+                window.offset = total.saturating_sub(window.limit);
+            }
+        }
+        let Some(update) = picker_state::build_update(picker, matcher) else {
+            continue;
+        };
+        let Some(sender) = clients.get(&client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        pushes.push((sender, picker_update_notif(update)));
+    }
+    pushes
 }
 
 pub async fn picker_view(

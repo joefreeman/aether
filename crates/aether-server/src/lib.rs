@@ -12,6 +12,7 @@ mod picker;
 mod server;
 mod state;
 mod syntax;
+mod watcher;
 mod workspace_index;
 mod wrap;
 

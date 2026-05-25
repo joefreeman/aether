@@ -604,3 +604,76 @@ fn buffer_open_params_jump_to_round_trips() {
     let v = to_value(&p).unwrap();
     assert_eq!(v["jump_to"], json!({"line": 7, "col": 13}));
 }
+
+// ---- file-watcher / external-change additions --------------------------------------------------
+
+#[test]
+fn buffer_state_params_external_flags_default_false_when_missing() {
+    use aether_protocol::buffer::BufferStateParams;
+    let v = json!({
+        "buffer_id": 5,
+        "saved_revision": 7,
+        "saved_at_unix_ms": null
+    });
+    let p: BufferStateParams = from_value(v).unwrap();
+    assert_eq!(p.buffer_id, 5);
+    assert_eq!(p.saved_revision, 7);
+    assert!(!p.externally_modified);
+    assert!(!p.externally_deleted);
+}
+
+#[test]
+fn buffer_state_params_external_flags_round_trip() {
+    use aether_protocol::buffer::BufferStateParams;
+    let p = BufferStateParams {
+        buffer_id: 5,
+        saved_revision: 7,
+        saved_at_unix_ms: Some(123),
+        externally_modified: true,
+        externally_deleted: false,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["externally_modified"], true);
+    assert_eq!(v["externally_deleted"], false);
+    let p2: BufferStateParams = from_value(v).unwrap();
+    assert!(p2.externally_modified);
+    assert!(!p2.externally_deleted);
+}
+
+#[test]
+fn buffer_reload_shape() {
+    use aether_protocol::buffer::{BufferReload, BufferReloadParams, BufferReloadResult};
+    assert_eq!(BufferReload::NAME, "buffer/reload");
+    let p = BufferReloadParams {
+        buffer_id: 11,
+        force: false,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["buffer_id"], 11);
+    assert_eq!(v["force"], false);
+
+    // `force` defaults to false when missing on the wire.
+    let parsed: BufferReloadParams = from_value(json!({"buffer_id": 11})).unwrap();
+    assert_eq!(parsed.buffer_id, 11);
+    assert!(!parsed.force);
+
+    let r = BufferReloadResult {
+        revision: 4,
+        saved_at_unix_ms: Some(999),
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["revision"], 4);
+    assert_eq!(v["saved_at_unix_ms"], 999);
+}
+
+#[test]
+fn external_change_error_codes_distinct() {
+    use aether_protocol::error::ErrorCode;
+    let codes = [
+        ErrorCode::WOULD_OVERWRITE.code(),
+        ErrorCode::EXTERNALLY_MODIFIED.code(),
+        ErrorCode::EXTERNALLY_DELETED.code(),
+    ];
+    let unique: std::collections::HashSet<_> = codes.iter().collect();
+    assert_eq!(unique.len(), codes.len());
+}

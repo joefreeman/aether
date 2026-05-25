@@ -280,6 +280,12 @@ pub struct Buffer {
     /// Detected (or defaulted) once on load; stable for the buffer's lifetime so further edits
     /// don't make the unit drift.
     pub indent_style: IndentStyle,
+    /// Disk diverged while the buffer was dirty — the watcher couldn't silently reload. Set by
+    /// the watcher, cleared by a successful save or a `buffer/reload`.
+    pub externally_modified: bool,
+    /// Buffer's on-disk file was removed externally. Set by the watcher, cleared by a save
+    /// (which recreates the file) or by the file being recreated externally.
+    pub externally_deleted: bool,
 
     /// Revision at the most recent successful save. `None` only for a never-saved scratch
     /// buffer in its initial empty state — see `Buffer::scratch`.
@@ -376,6 +382,8 @@ impl Buffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active_group: None,
+            externally_modified: false,
+            externally_deleted: false,
         })
     }
 
@@ -405,6 +413,8 @@ impl Buffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active_group: None,
+            externally_modified: false,
+            externally_deleted: false,
         }
     }
 
@@ -431,6 +441,8 @@ impl Buffer {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active_group: None,
+            externally_modified: false,
+            externally_deleted: false,
         }
     }
 
@@ -606,7 +618,54 @@ impl Buffer {
         self.last_modified_unix_ms = Some(mtime_ms);
         self.saved_revision = Some(self.revision);
         self.active_group = None;
+        self.externally_modified = false;
+        self.externally_deleted = false;
         self.recompute_dirty();
+        Ok(mtime_ms)
+    }
+
+    /// Re-read this buffer's `canonical_path` from disk, replacing the rope, bumping the
+    /// revision, and clearing undo/redo + external-change flags. The buffer comes back clean
+    /// (saved_revision == revision). Indent style is preserved (stable for buffer lifetime).
+    ///
+    /// Errors if the buffer has no path or the file is unreadable.
+    pub fn reload_from_disk(&mut self) -> std::io::Result<u64> {
+        let path = self.canonical_path.clone().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "buffer has no path")
+        })?;
+        let content = std::fs::read_to_string(&path)?;
+        let line_ending = if content.contains("\r\n") {
+            LineEnding::Crlf
+        } else {
+            LineEnding::Lf
+        };
+        let normalized = if line_ending == LineEnding::Crlf {
+            content.replace("\r\n", "\n")
+        } else {
+            content
+        };
+        let mtime_ms = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        self.text = ropey::Rope::from_str(&normalized);
+        self.line_ending = line_ending;
+        self.revision = self.next_revision_id;
+        self.next_revision_id += 1;
+        self.saved_revision = Some(self.revision);
+        self.last_modified_unix_ms = Some(mtime_ms);
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.active_group = None;
+        self.externally_modified = false;
+        self.externally_deleted = false;
+        self.recompute_dirty();
+        // Re-parse from scratch — the incremental InputEdit path can't help when the whole rope
+        // is replaced. Matches what undo/redo do.
+        self.reparse_full();
         Ok(mtime_ms)
     }
 

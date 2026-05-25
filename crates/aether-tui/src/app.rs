@@ -7,8 +7,8 @@ use crate::text_input::PromptKeyOutcome;
 use crate::ui;
 use aether_protocol::buffer::{
     BufferClose, BufferCloseParams, BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut,
-    BufferCutResult, BufferOpen, BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams,
-    BufferState, BufferStateParams, CopyScope,
+    BufferCutResult, BufferOpen, BufferOpenParams, BufferOpenResult, BufferReload,
+    BufferReloadParams, BufferSave, BufferSaveParams, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams, CursorRedo,
@@ -166,6 +166,12 @@ pub enum ConfirmAction {
     /// Close `buffer_id` despite it being dirty. After closing, the client picks the next
     /// MRU buffer or spawns a scratch.
     CloseBuffer { buffer_id: BufferId },
+    /// Retry `Ctrl-s` (in-place save) with `overwrite: true` after the server reported the
+    /// file changed or was removed on disk. Routes through `save_buffer_force`.
+    OverwriteExternalChange,
+    /// Retry `buffer/reload` with `force: true` after the server reported the buffer was
+    /// dirty. The user has accepted that the local edits will be discarded.
+    ReloadDiscardChanges,
 }
 
 pub struct EditorState {
@@ -196,6 +202,13 @@ pub struct EditorState {
     /// Revision at the most recent successful save. `dirty` is derived as
     /// `revision != saved_revision`.
     pub saved_revision: u64,
+    /// Set when the server's file-watcher detected a disk change while this buffer was dirty
+    /// (clean buffers reload silently). The user must `Ctrl-s` (and confirm overwrite) or
+    /// `buffer/reload` to clear it. Updated from `BufferState` notifications.
+    pub externally_modified: bool,
+    /// Set when the server's file-watcher detected the buffer's file was removed on disk.
+    /// Cleared by a save (which recreates the file) or by the file being recreated externally.
+    pub externally_deleted: bool,
     /// Digit-prefix count for the next motion. Reset after consumption.
     pub pending_count: u32,
     /// Set after `f`/`t`/`F`/`T` (and Alt variants); the next keystroke is interpreted as the
@@ -418,6 +431,8 @@ async fn build_editor_state_from_open(
         drag_anchor: None,
         revision: open.revision,
         saved_revision: open.saved_revision,
+        externally_modified: false,
+        externally_deleted: false,
         pending_count: 0,
         pending_find: None,
         last_motion: None,
@@ -533,11 +548,18 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
         match serde_json::from_value::<BufferStateParams>(n.params) {
             Ok(p) if state.editor.buffer_id == p.buffer_id => {
                 let ed = &mut state.editor;
+                let was_synced = ed.revision == ed.saved_revision
+                    && !ed.externally_modified
+                    && !ed.externally_deleted;
                 ed.saved_revision = p.saved_revision;
-                let synced = ed.revision == ed.saved_revision;
-                let saved_rev = ed.saved_revision;
-                if synced {
-                    state.status = format!("saved (rev {})", saved_rev);
+                ed.externally_modified = p.externally_modified;
+                ed.externally_deleted = p.externally_deleted;
+                if p.externally_deleted {
+                    state.status = "file removed on disk — save to recreate, or close buffer".into();
+                } else if p.externally_modified {
+                    state.status = "file changed on disk — Ctrl-s to overwrite, or reload".into();
+                } else if !was_synced && ed.revision == ed.saved_revision {
+                    state.status = format!("saved (rev {})", ed.saved_revision);
                 }
             }
             Ok(_) => {}
@@ -1229,6 +1251,12 @@ async fn handle_leader_key(
         }
         (PendingLeader::Space, KeyCode::Char('s'), m) if m == alt_only => {
             begin_save_prompt(state);
+        }
+        // `Space r` — reload the current buffer from disk. Discards local changes; used to
+        // pick up an external modification (paired with the `[!]` indicator and the save
+        // conflict prompt).
+        (PendingLeader::Space, KeyCode::Char('r'), m) if m == KeyModifiers::NONE => {
+            reload_buffer(client, state).await?;
         }
         // `Space n` — open a "new file" prompt pre-filled with the current directory. Same
         // current-directory rule as `-` (file browser entry): parent of the current file, or
@@ -3294,6 +3322,17 @@ fn apply_undo_result(state: &mut AppState, r: UndoResult, label: &str) {
 }
 
 async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
+    save_buffer_with(client, state, false).await
+}
+
+/// In-place save (`Ctrl-s`) with explicit overwrite flag. `overwrite: false` is the default
+/// path; `overwrite: true` is the retry after a user-confirmed `EXTERNALLY_MODIFIED` /
+/// `EXTERNALLY_DELETED` conflict. (Save-as has its own flow — see `send_save_prompt`.)
+async fn save_buffer_with(
+    client: &mut Client,
+    state: &mut AppState,
+    overwrite: bool,
+) -> Result<()> {
     if state.editor.file_path.is_none() {
         // Scratch buffer — no path to save to. Don't auto-prompt: the user has to be explicit
         // about creating a file with Ctrl-Alt-s. This keeps `Ctrl-s` semantics uniform: it only
@@ -3306,17 +3345,73 @@ async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
             buffer_id: state.editor.buffer_id,
             path_index: None,
             relative_path: None,
-            overwrite: false,
+            overwrite,
         })
         .await;
     match result {
         Ok(r) => {
             state.editor.revision = r.revision;
             state.editor.saved_revision = r.revision;
+            state.editor.externally_modified = false;
+            state.editor.externally_deleted = false;
             state.status = format!("saved (rev {})", r.revision);
+        }
+        Err(e) if is_externally_modified(&e) => {
+            state.confirm_prompt = Some(ConfirmPrompt {
+                message: "file changed on disk — overwrite".into(),
+                action: ConfirmAction::OverwriteExternalChange,
+            });
+        }
+        Err(e) if is_externally_deleted(&e) => {
+            state.confirm_prompt = Some(ConfirmPrompt {
+                message: "file removed on disk — recreate".into(),
+                action: ConfirmAction::OverwriteExternalChange,
+            });
         }
         Err(e) => {
             state.status = format!("save failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+async fn reload_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
+    reload_buffer_with(client, state, false).await
+}
+
+/// Send `buffer/reload` with explicit `force`. `force: false` is the default `Space r` path;
+/// `force: true` is the retry after a user-confirmed `WOULD_DISCARD_CHANGES`.
+async fn reload_buffer_with(
+    client: &mut Client,
+    state: &mut AppState,
+    force: bool,
+) -> Result<()> {
+    if state.editor.file_path.is_none() {
+        state.status = "scratch buffer has no path to reload".into();
+        return Ok(());
+    }
+    let result = client
+        .rpc::<BufferReload>(BufferReloadParams {
+            buffer_id: state.editor.buffer_id,
+            force,
+        })
+        .await;
+    match result {
+        Ok(r) => {
+            state.editor.revision = r.revision;
+            state.editor.saved_revision = r.revision;
+            state.editor.externally_modified = false;
+            state.editor.externally_deleted = false;
+            state.status = format!("reloaded (rev {})", r.revision);
+        }
+        Err(e) if is_would_discard_changes(&e) => {
+            state.confirm_prompt = Some(ConfirmPrompt {
+                message: "discard local changes and reload".into(),
+                action: ConfirmAction::ReloadDiscardChanges,
+            });
+        }
+        Err(e) => {
+            state.status = format!("reload failed: {e}");
         }
     }
     Ok(())
@@ -3526,6 +3621,21 @@ fn is_would_overwrite(e: &anyhow::Error) -> bool {
         .is_some_and(|r| r.code == ErrorCode::WOULD_OVERWRITE.code())
 }
 
+fn is_externally_modified(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::client::RpcError>()
+        .is_some_and(|r| r.code == ErrorCode::EXTERNALLY_MODIFIED.code())
+}
+
+fn is_externally_deleted(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::client::RpcError>()
+        .is_some_and(|r| r.code == ErrorCode::EXTERNALLY_DELETED.code())
+}
+
+fn is_would_discard_changes(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::client::RpcError>()
+        .is_some_and(|r| r.code == ErrorCode::WOULD_DISCARD_CHANGES.code())
+}
+
 async fn handle_confirm_prompt_key(
     client: &mut Client,
     state: &mut AppState,
@@ -3548,6 +3658,12 @@ async fn handle_confirm_prompt_key(
                 }
                 ConfirmAction::CloseBuffer { buffer_id } => {
                     finalize_close_buffer(client, state, buffer_id).await?;
+                }
+                ConfirmAction::OverwriteExternalChange => {
+                    save_buffer_with(client, state, true).await?;
+                }
+                ConfirmAction::ReloadDiscardChanges => {
+                    reload_buffer_with(client, state, true).await?;
                 }
             }
             apply_cursor_style(state);

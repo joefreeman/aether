@@ -77,10 +77,15 @@ pub struct BufferSaveParams {
     pub buffer_id: BufferId,
     pub path_index: Option<u32>,
     pub relative_path: Option<String>,
-    /// When the resolved target points at an on-disk file that isn't this buffer's current
-    /// path, the server rejects with `WOULD_OVERWRITE` unless this is `true`. The client uses
-    /// it as a two-step "ask, then confirm" handshake: first attempt with `false`, and on the
-    /// specific error retry with `true` after the user confirms.
+    /// Confirms the user has acknowledged a divergence between buffer state and disk. The
+    /// server rejects in three cases unless this is `true`:
+    /// - `WOULD_OVERWRITE`: the resolved target points at an on-disk file that isn't this
+    ///   buffer's current path.
+    /// - `EXTERNALLY_MODIFIED`: the buffer's own file changed on disk since it was last loaded
+    ///   or saved.
+    /// - `EXTERNALLY_DELETED`: the buffer's own file was removed on disk.
+    /// In each case, the client uses a two-step "ask, then confirm" handshake: attempt with
+    /// `false`, present the appropriate prompt for the specific error code, retry with `true`.
     #[serde(default)]
     pub overwrite: bool,
 }
@@ -111,6 +116,33 @@ pub struct BufferCloseResult {
     /// no buffers remain — the client should open a fresh scratch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_buffer_id: Option<BufferId>,
+}
+
+// ---- buffer/reload ------------------------------------------------------------------------------
+
+pub struct BufferReload;
+impl RpcMethod for BufferReload {
+    const NAME: &'static str = "buffer/reload";
+    type Params = BufferReloadParams;
+    type Result = BufferReloadResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferReloadParams {
+    pub buffer_id: BufferId,
+    /// Confirms the user is willing to discard pending edits. The server rejects with
+    /// `WOULD_DISCARD_CHANGES` when the buffer is dirty unless this is `true`. Clean buffers
+    /// reload regardless. Two-step handshake mirrors the save-conflict pattern.
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferReloadResult {
+    /// The revision after reload — always strictly greater than the prior revision.
+    pub revision: Revision,
+    /// Mtime of the file the reload read from, in unix milliseconds.
+    pub saved_at_unix_ms: Option<u64>,
 }
 
 // ---- buffer/copy & buffer/cut -------------------------------------------------------------------
@@ -170,7 +202,15 @@ pub struct BufferStateParams {
     pub buffer_id: BufferId,
     /// Revision at the most recent successful save. The client derives `dirty` as `revision !=
     /// saved_revision`, so this notification only needs to fire when the saved point changes
-    /// (i.e. on save / load), not on every mutation.
+    /// (i.e. on save / load / external reload), not on every mutation.
     pub saved_revision: Revision,
     pub saved_at_unix_ms: Option<u64>,
+    /// True when the on-disk file changed externally and the buffer is dirty (so the server
+    /// couldn't silently reload). Cleared by a successful save or a `buffer/reload`.
+    #[serde(default)]
+    pub externally_modified: bool,
+    /// True when the on-disk file was removed externally. Cleared by a successful save (which
+    /// recreates the file) or by the file being recreated externally.
+    #[serde(default)]
+    pub externally_deleted: bool,
 }

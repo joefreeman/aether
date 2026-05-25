@@ -3,7 +3,9 @@
 use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::SharedState;
-use aether_protocol::buffer::{BufferClose, BufferCopy, BufferCut, BufferOpen, BufferSave};
+use aether_protocol::buffer::{
+    BufferClose, BufferCopy, BufferCut, BufferOpen, BufferReload, BufferSave,
+};
 use aether_protocol::cursor::{
     CursorContract, CursorExpand, CursorMove, CursorRedo, CursorSelectLine, CursorSet,
     CursorSwapAnchor, CursorUndo,
@@ -161,6 +163,7 @@ async fn dispatch(
         ClientHello::NAME => run!(ClientHello, handlers::client_hello),
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
+        BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),
         BufferClose::NAME => run!(BufferClose, handlers::buffer_close),
         SearchSet::NAME => run!(SearchSet, handlers::search_set),
         SearchClear::NAME => run!(SearchClear, handlers::search_clear),

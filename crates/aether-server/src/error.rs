@@ -80,6 +80,27 @@ impl RpcError {
             format!("buffer {buffer_id} is already open at this path"),
         )
     }
+
+    pub fn externally_modified(buffer_id: aether_protocol::BufferId) -> Self {
+        Self::new(
+            ErrorCode::EXTERNALLY_MODIFIED,
+            format!("buffer {buffer_id} has been modified on disk since it was loaded"),
+        )
+    }
+
+    pub fn externally_deleted(buffer_id: aether_protocol::BufferId) -> Self {
+        Self::new(
+            ErrorCode::EXTERNALLY_DELETED,
+            format!("buffer {buffer_id}'s file has been removed from disk"),
+        )
+    }
+
+    pub fn would_discard_changes(buffer_id: aether_protocol::BufferId) -> Self {
+        Self::new(
+            ErrorCode::WOULD_DISCARD_CHANGES,
+            format!("buffer {buffer_id} has unsaved changes; reload would discard them"),
+        )
+    }
 }
 
 impl From<RpcError> for ErrorObject {

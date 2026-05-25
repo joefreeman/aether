@@ -7,8 +7,9 @@
 //! `Arc`. The cache survives `hide`, so reopening a picker doesn't re-walk.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 
 /// Format an absolute path as the picker display string: project-relative, prefixed with the
 /// root's basename for multi-root projects. Returns `None` if `abs` is outside every root —
@@ -49,29 +50,46 @@ pub struct CachedFile {
 
 pub struct WorkspaceIndex {
     roots: Vec<PathBuf>,
-    files: OnceCell<Arc<Vec<CachedFile>>>,
+    cache: Mutex<Option<Arc<Vec<CachedFile>>>>,
+    /// Set by the file-watcher when files are created or removed under a root. Consumed by
+    /// the next `files()` call, which drops the cache and re-walks. Cheap to set (atomic),
+    /// no-op for the common "no FS activity since last access" case.
+    invalidated: AtomicBool,
 }
 
 impl WorkspaceIndex {
     pub fn new(roots: Vec<PathBuf>) -> Self {
         Self {
             roots,
-            files: OnceCell::new(),
+            cache: Mutex::new(None),
+            invalidated: AtomicBool::new(false),
         }
     }
 
-    /// Get the candidate cache, walking on first call. Subsequent calls hand back the same `Arc`.
+    /// Get the candidate cache, walking on first call or after an invalidation. Concurrent
+    /// callers wait on the mutex — we don't want two simultaneous walks.
     pub async fn files(&self) -> Arc<Vec<CachedFile>> {
-        self.files
-            .get_or_init(|| async {
-                let roots = self.roots.clone();
-                let walked = tokio::task::spawn_blocking(move || walk(&roots))
-                    .await
-                    .unwrap_or_default();
-                Arc::new(walked)
-            })
+        let mut guard = self.cache.lock().await;
+        if self.invalidated.swap(false, Ordering::AcqRel) {
+            *guard = None;
+        }
+        if let Some(arc) = guard.as_ref() {
+            return arc.clone();
+        }
+        let roots = self.roots.clone();
+        let walked = tokio::task::spawn_blocking(move || walk(&roots))
             .await
-            .clone()
+            .unwrap_or_default();
+        let arc = Arc::new(walked);
+        *guard = Some(arc.clone());
+        arc
+    }
+
+    /// Mark the cache stale. The next `files()` call re-walks. Sync so it's callable from any
+    /// context (in particular the file-watcher event handler, which already holds the
+    /// `ServerState` lock and shouldn't take more `await` points than necessary).
+    pub fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::Release);
     }
 }
 

@@ -28,7 +28,17 @@ impl ErrorCode {
     /// Save-as target is already the canonical path of another open buffer. The client could
     /// (eventually) react by offering to switch to that buffer.
     pub const PATH_OWNED_BY_BUFFER: Self = Self(-32017);
+    /// The buffer's on-disk file changed externally since it was last loaded or saved. The
+    /// client should confirm with the user and retry the save with `overwrite: true`, or call
+    /// `buffer/reload` to discard local changes and pick up the disk version.
+    pub const EXTERNALLY_MODIFIED: Self = Self(-32018);
+    /// The buffer's on-disk file was removed externally. The client should confirm with the
+    /// user and retry the save with `overwrite: true` to recreate it, or close the buffer.
+    pub const EXTERNALLY_DELETED: Self = Self(-32019);
     pub const FILE_IO: Self = Self(-32020);
+    /// `buffer/reload` called on a dirty buffer without `force: true`. The client should
+    /// confirm with the user and retry with `force: true` to discard the local edits.
+    pub const WOULD_DISCARD_CHANGES: Self = Self(-32021);
     pub const LANGUAGE_NOT_FOUND: Self = Self(-32030);
 
     pub fn code(self) -> i32 {

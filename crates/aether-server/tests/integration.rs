@@ -9467,3 +9467,307 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
 
     drop(server);
 }
+
+// ---- file watcher ------------------------------------------------------------------------------
+
+use aether_protocol::buffer::{BufferReload, BufferReloadParams, BufferReloadResult};
+
+/// Wait up to `max` for a matching notification; panics with a useful message on timeout.
+async fn expect_notification_within<N: NotificationMethod>(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    max: std::time::Duration,
+) -> N::Params {
+    match tokio::time::timeout(max, expect_notification::<N>(ws)).await {
+        Ok(p) => p,
+        Err(_) => panic!("timed out waiting for notification {}", N::NAME),
+    }
+}
+
+/// Spin up the server with one buffer subscribed to a viewport — the minimum setup for the
+/// watcher to fire `buffer/state` pushes on file-change events. Returns the canonical disk
+/// path so the test can write to it externally.
+async fn setup_watched_buffer(
+    initial: &str,
+) -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u64,                  // buffer_id
+    std::path::PathBuf,   // file path
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("watched.txt");
+    std::fs::write(&path, initial).unwrap();
+    // Sleep briefly so subsequent external writes have a strictly-greater mtime than the one
+    // the buffer records on load. Without this, fast back-to-back writes can produce an
+    // identical mtime, which the watcher's self-save filter would mistake for our own write.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("watched.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    (server, ws, open.buffer_id, path)
+}
+
+#[tokio::test]
+async fn watcher_reloads_clean_buffer_on_external_write() {
+    let (server, mut ws, buffer_id, path) = setup_watched_buffer("hello\n").await;
+
+    // External edit. Buffer was clean, so the server should silently reload + push state.
+    std::fs::write(&path, "hello world\n").unwrap();
+
+    let state_push = expect_notification_within::<BufferState>(
+        &mut ws,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(state_push.buffer_id, buffer_id);
+    assert!(
+        !state_push.externally_modified,
+        "clean buffer should silently reload, not flag"
+    );
+    assert!(!state_push.externally_deleted);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn watcher_flags_dirty_buffer_on_external_write() {
+    let (server, mut ws, buffer_id, path) = setup_watched_buffer("hello\n").await;
+
+    // Dirty the buffer: insert at start.
+    let _edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        10,
+        &InputTextParams {
+            buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    // Drain the edit's lines_changed push so the next expect_notification gets the watcher's.
+    let _ = expect_notification::<ViewportLinesChanged>(&mut ws).await;
+
+    // External write while dirty: server should flag externally_modified, not silently reload.
+    std::fs::write(&path, "external content\n").unwrap();
+
+    let state_push = expect_notification_within::<BufferState>(
+        &mut ws,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(state_push.buffer_id, buffer_id);
+    assert!(state_push.externally_modified, "expected externally_modified=true");
+    assert!(!state_push.externally_deleted);
+
+    // Save without overwrite should be rejected.
+    let err = send_request_expect_err::<BufferSave>(
+        &mut ws,
+        20,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(
+        err.to_lowercase().contains("modified") || err.to_lowercase().contains("disk"),
+        "expected external-mod error, got: {err}"
+    );
+
+    // Retry with overwrite: succeeds. We may still receive the `buffer/state` push from
+    // earlier or other intermediate frames; `send_request` drains them and returns on the
+    // matching response.
+    let save: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        21,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: true,
+        },
+    )
+    .await;
+    assert!(save.saved_at_unix_ms > 0);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "xhello\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn watcher_flags_deleted_file() {
+    let (server, mut ws, buffer_id, path) = setup_watched_buffer("hello\n").await;
+
+    std::fs::remove_file(&path).unwrap();
+
+    // First state push: externally_deleted = true. The watcher may also fire other events
+    // depending on the OS (e.g. modify on the parent dir); loop until we see the deleted flag.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut seen_deleted = false;
+    while tokio::time::Instant::now() < deadline {
+        let p = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            expect_notification::<BufferState>(&mut ws),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if p.externally_deleted && p.buffer_id == buffer_id {
+            seen_deleted = true;
+            break;
+        }
+    }
+    assert!(seen_deleted, "no buffer/state with externally_deleted=true");
+
+    // Save (with overwrite) recreates the file.
+    let _save: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        20,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: true,
+        },
+    )
+    .await;
+    assert!(path.exists(), "save should recreate the deleted file");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn buffer_reload_discards_local_changes() {
+    let (server, mut ws, buffer_id, path) = setup_watched_buffer("original\n").await;
+
+    // Dirty the buffer with a local edit.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        10,
+        &InputTextParams {
+            buffer_id,
+            text: "local-edit-".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+
+    // Change the file externally so reload picks up something visibly different.
+    std::fs::write(&path, "from-disk\n").unwrap();
+
+    // First try without force — server should reject with WOULD_DISCARD_CHANGES since the
+    // buffer is dirty.
+    let err = send_request_expect_err::<BufferReload>(
+        &mut ws,
+        20,
+        &BufferReloadParams {
+            buffer_id,
+            force: false,
+        },
+    )
+    .await;
+    assert!(
+        err.to_lowercase().contains("unsaved") || err.to_lowercase().contains("discard"),
+        "expected would-discard-changes error, got: {err}"
+    );
+
+    // Retry with force: succeeds, bumps the revision, clears flags.
+    let r: BufferReloadResult = send_request::<BufferReload>(
+        &mut ws,
+        21,
+        &BufferReloadParams {
+            buffer_id,
+            force: true,
+        },
+    )
+    .await;
+    assert!(r.revision > 0);
+
+    // Subsequent save (no overwrite) must succeed — flags cleared, content is now "from-disk\n".
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        22,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "from-disk\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn buffer_reload_clean_buffer_does_not_require_force() {
+    let (server, mut ws, buffer_id, _path) = setup_watched_buffer("clean content\n").await;
+
+    // No edits — buffer is clean. Reload without force should succeed.
+    let r: BufferReloadResult = send_request::<BufferReload>(
+        &mut ws,
+        10,
+        &BufferReloadParams {
+            buffer_id,
+            force: false,
+        },
+    )
+    .await;
+    assert!(r.revision > 0);
+
+    drop(server);
+}

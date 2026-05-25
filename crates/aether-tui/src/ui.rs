@@ -1274,7 +1274,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         };
         Line::from(vec![Span::raw(text)])
     } else {
-        let dirty_marker = if state.dirty() { "[+]" } else { "" };
+        let dirty_marker = buffer_status_markers(state);
         let counter = search_counter_label(state)
             .map(|c| format!("  {c}"))
             .unwrap_or_default();
@@ -1294,6 +1294,24 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     };
     let p = Paragraph::new(line).style(Style::default().bg(NORD1).fg(NORD4));
     f.render_widget(p, area);
+}
+
+/// Status-bar indicator for buffer state. Single-character, highest-precedence wins — the
+/// operational safety net (can't silently lose work) is enforced by the save and reload
+/// error codes, so the status bar just flags the most-urgent condition.
+///   `[x]` = file removed on disk
+///   `[!]` = file modified on disk
+///   `[+]` = unsaved local edits
+fn buffer_status_markers(state: &AppState) -> &'static str {
+    if state.editor.externally_deleted {
+        "[x]"
+    } else if state.editor.externally_modified {
+        "[!]"
+    } else if state.dirty() {
+        "[+]"
+    } else {
+        ""
+    }
 }
 
 /// In insert mode: `A:B` (just the cursor). In normal mode: `A:B-C:D` (half-open) — A:B is the

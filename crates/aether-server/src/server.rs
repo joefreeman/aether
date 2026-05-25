@@ -4,6 +4,7 @@
 use crate::config::{self, RuntimeInfo};
 use crate::connection;
 use crate::state::{ServerState, SharedState};
+use crate::watcher;
 use anyhow::{bail, Context};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +57,10 @@ pub async fn run(project_name: &str) -> anyhow::Result<()> {
 pub async fn run_with_listener(listener: TcpListener, state: SharedState) -> anyhow::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate())?;
+
+    if let Err(e) = watcher::spawn(state.clone()).await {
+        tracing::warn!(error = %e, "file watcher failed to start; continuing without it");
+    }
 
     loop {
         tokio::select! {
