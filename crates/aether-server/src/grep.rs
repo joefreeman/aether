@@ -176,9 +176,7 @@ fn walk_and_search(
     matcher: &RegexMatcher,
     batch_tx: &mpsc::Sender<Vec<GrepHitCandidate>>,
 ) {
-    let mut searcher = SearcherBuilder::new()
-        .line_number(true)
-        .build();
+    let mut searcher = SearcherBuilder::new().line_number(true).build();
     let mut batch: Vec<GrepHitCandidate> = Vec::with_capacity(BATCH_SIZE);
     for f in files {
         if batch_tx.is_closed() {
@@ -221,11 +219,7 @@ struct HitCollector<'a> {
 impl<'a> Sink for HitCollector<'a> {
     type Error = std::io::Error;
 
-    fn matched(
-        &mut self,
-        _searcher: &Searcher,
-        mat: &SinkMatch<'_>,
-    ) -> Result<bool, Self::Error> {
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         let line_bytes = mat.bytes();
         // `line_number` is 1-based; we use 0-based internally.
         let line_num = mat.line_number().unwrap_or(1).saturating_sub(1) as u32;

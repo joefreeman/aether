@@ -19,10 +19,6 @@ use aether_protocol::cursor::{
     CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, Motion,
     VerticalDirection,
 };
-use aether_protocol::directory::{
-    DirEntry, DirectoryCreateParams, DirectoryCreateResult, DirectoryListParams,
-    DirectoryListResult,
-};
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::handshake::{ClientHelloParams, ClientHelloResult, ProjectInfo};
@@ -346,140 +342,6 @@ pub async fn buffer_open(
 }
 
 // ---- buffer/search ------------------------------------------------------------------------------
-
-/// Stateless regex search. Returns up to `MAX_MATCHES` matches; the client is responsible for
-/// stashing them and re-issuing the RPC after edits. Smartcase: case-insensitive unless the
-/// query has any uppercase character. An empty query returns an empty list.
-// ---- directory/* -------------------------------------------------------------------------------
-
-pub async fn directory_list(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: DirectoryListParams,
-) -> Result<DirectoryListResult, RpcError> {
-    let _ = ctx.require_hello()?;
-    let s = state.lock().await;
-
-    // Resolve the requested path. `None` means "first project path".
-    let raw_path = match params.path.as_deref() {
-        Some(p) => std::path::PathBuf::from(p),
-        None => s
-            .project_paths
-            .first()
-            .ok_or_else(|| RpcError::invalid_path("no project paths configured"))?
-            .clone(),
-    };
-    let canonical = std::fs::canonicalize(&raw_path).map_err(|e| {
-        RpcError::invalid_path(format!("canonicalizing {}: {e}", raw_path.display()))
-    })?;
-    if !s.path_is_in_project(&canonical) {
-        return Err(RpcError::invalid_path(format!(
-            "{} is outside the project's access boundary",
-            canonical.display()
-        )));
-    }
-    let metadata = std::fs::metadata(&canonical).map_err(RpcError::file_io)?;
-    if !metadata.is_dir() {
-        return Err(RpcError::invalid_path(format!(
-            "{} is not a directory",
-            canonical.display()
-        )));
-    }
-
-    // The parent is allowed only if it's still inside the project.
-    let parent = canonical.parent().and_then(|p| {
-        let p = p.to_path_buf();
-        if s.path_is_in_project(&p) {
-            Some(p.display().to_string())
-        } else {
-            None
-        }
-    });
-
-    let mut entries: Vec<DirEntry> = Vec::new();
-    let read = std::fs::read_dir(&canonical).map_err(RpcError::file_io)?;
-    for ent in read {
-        let ent = match ent {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let name = match ent.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => continue, // non-UTF8 filename — skip
-        };
-        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        entries.push(DirEntry { name, is_dir });
-    }
-    // Directories first, then files, each alphabetical.
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.cmp(&b.name),
-    });
-
-    Ok(DirectoryListResult {
-        path: canonical.display().to_string(),
-        parent,
-        entries,
-    })
-}
-
-pub async fn directory_create(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: DirectoryCreateParams,
-) -> Result<DirectoryCreateResult, RpcError> {
-    let _ = ctx.require_hello()?;
-    let raw = std::path::PathBuf::from(&params.path);
-
-    // The target itself may not exist yet; canonicalize the nearest existing ancestor so we can
-    // validate the path is in the project even before creation.
-    let mut anchor = raw.clone();
-    loop {
-        if anchor.exists() {
-            break;
-        }
-        match anchor.parent() {
-            Some(p) if !p.as_os_str().is_empty() => anchor = p.to_path_buf(),
-            _ => {
-                return Err(RpcError::invalid_path(format!(
-                    "no existing ancestor for {}",
-                    raw.display()
-                )))
-            }
-        }
-    }
-    let anchor_canonical = std::fs::canonicalize(&anchor)
-        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", anchor.display())))?;
-    {
-        let s = state.lock().await;
-        if !s.path_is_in_project(&anchor_canonical) {
-            return Err(RpcError::invalid_path(format!(
-                "{} is outside the project's access boundary",
-                anchor_canonical.display()
-            )));
-        }
-    }
-
-    // Build the final target by suffixing the relative remainder onto the canonical anchor.
-    let suffix = raw
-        .strip_prefix(&anchor)
-        .unwrap_or_else(|_| std::path::Path::new(""))
-        .to_path_buf();
-    let target = anchor_canonical.join(&suffix);
-
-    if target.exists() && !target.is_dir() {
-        return Err(RpcError::invalid_path(format!(
-            "{} exists and is not a directory",
-            target.display()
-        )));
-    }
-    std::fs::create_dir_all(&target).map_err(RpcError::file_io)?;
-    let canonical = std::fs::canonicalize(&target).map_err(RpcError::file_io)?;
-    Ok(DirectoryCreateResult {
-        path: canonical.display().to_string(),
-    })
-}
 
 // ---- search/* ----------------------------------------------------------------------------------
 
@@ -1016,7 +878,8 @@ pub async fn buffer_close(
     s.cursors.retain(|(_, b), _| *b != params.buffer_id);
     s.motion_history.retain(|(_, b), _| *b != params.buffer_id);
     s.virtual_col.retain(|(_, b), _| *b != params.buffer_id);
-    s.tree_selection_history.retain(|(_, b), _| *b != params.buffer_id);
+    s.tree_selection_history
+        .retain(|(_, b), _| *b != params.buffer_id);
     s.searches.retain(|(_, b), _| *b != params.buffer_id);
     s.last_scroll.retain(|(_, b), _| *b != params.buffer_id);
     for mru in s.mru_buffers.values_mut() {
@@ -2298,7 +2161,13 @@ pub async fn input_replace_line(
     params: aether_protocol::input::InputReplaceLineParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.require_hello()?;
-    apply_edit(state, client_id, params.buffer_id, EditKind::ReplaceLine { text: params.text }).await
+    apply_edit(
+        state,
+        client_id,
+        params.buffer_id,
+        EditKind::ReplaceLine { text: params.text },
+    )
+    .await
 }
 
 pub async fn input_undo(
@@ -3937,26 +3806,48 @@ async fn apply_edit(
             } else {
                 let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
                 let sc = motion::pos_to_char(buf, lo);
-                let ec = motion::pos_to_char(buf, hi).saturating_add(1).min(buf.text.len_chars());
-                EditRange { start_char: sc, end_char: ec, first_line: lo.line, last_line: hi.line }
+                let ec = motion::pos_to_char(buf, hi)
+                    .saturating_add(1)
+                    .min(buf.text.len_chars());
+                EditRange {
+                    start_char: sc,
+                    end_char: ec,
+                    first_line: lo.line,
+                    last_line: hi.line,
+                }
             }
         }
         EditKind::DeleteSelection => {
             let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
             let sc = motion::pos_to_char(buf, lo);
-            let ec = motion::pos_to_char(buf, hi).saturating_add(1).min(buf.text.len_chars());
-            EditRange { start_char: sc, end_char: ec, first_line: lo.line, last_line: hi.line }
+            let ec = motion::pos_to_char(buf, hi)
+                .saturating_add(1)
+                .min(buf.text.len_chars());
+            EditRange {
+                start_char: sc,
+                end_char: ec,
+                first_line: lo.line,
+                last_line: hi.line,
+            }
         }
         EditKind::Backspace => {
             let prev = motion::resolve_motion(
                 buf,
                 cursor.position,
-                &Motion::Char { direction: Direction::Backward, count: 1 },
+                &Motion::Char {
+                    direction: Direction::Backward,
+                    count: 1,
+                },
             );
             let (lo, hi) = motion::ordered(cursor.position, prev);
             let sc = motion::pos_to_char(buf, lo);
             let ec = motion::pos_to_char(buf, hi);
-            EditRange { start_char: sc, end_char: ec, first_line: lo.line, last_line: hi.line }
+            EditRange {
+                start_char: sc,
+                end_char: ec,
+                first_line: lo.line,
+                last_line: hi.line,
+            }
         }
         EditKind::DeleteLine | EditKind::ReplaceLine { .. } => {
             let line = cursor.position.line as usize;
@@ -3967,7 +3858,12 @@ async fn apply_edit(
             } else {
                 buf.text.len_chars()
             };
-            EditRange { start_char: sc, end_char: ec, first_line: line as u32, last_line: line as u32 }
+            EditRange {
+                start_char: sc,
+                end_char: ec,
+                first_line: line as u32,
+                last_line: line as u32,
+            }
         }
         EditKind::ChangeLine => {
             let line = cursor.position.line as usize;
@@ -3976,12 +3872,24 @@ async fn apply_edit(
             let line_slice = buf.text.line(line);
             let len_chars = line_slice.len_chars();
             let has_trailing_nl = len_chars > 0 && line_slice.char(len_chars - 1) == '\n';
-            let content_chars = if has_trailing_nl { len_chars - 1 } else { len_chars };
-            EditRange { start_char: sc, end_char: sc + content_chars, first_line: line as u32, last_line: line as u32 }
+            let content_chars = if has_trailing_nl {
+                len_chars - 1
+            } else {
+                len_chars
+            };
+            EditRange {
+                start_char: sc,
+                end_char: sc + content_chars,
+                first_line: line as u32,
+                last_line: line as u32,
+            }
         }
     };
     let (insert_text, select_pasted): (&str, bool) = match &edit {
-        EditKind::ReplaceWith { text, select_pasted } => (text.as_str(), *select_pasted),
+        EditKind::ReplaceWith {
+            text,
+            select_pasted,
+        } => (text.as_str(), *select_pasted),
         EditKind::ReplaceLine { text } => (text.as_str(), false),
         EditKind::DeleteSelection
         | EditKind::Backspace
@@ -4266,6 +4174,93 @@ fn maybe_refresh_dirty(
     }
 }
 
+/// Build a fresh `ExplorerCandidates` for the requested directory. Honors the same project-
+/// boundary rules as `directory_list`. Used by `picker_view` for `PickerKind::Explorer`. Takes
+/// the requested path *or* falls back to the picker's last directory (when the client omitted
+/// the path on a resume), *or* the first project root (first ever open).
+async fn build_explorer_candidates(
+    state: &SharedState,
+    client_id: ClientId,
+    requested: Option<&str>,
+) -> Result<picker_state::ExplorerCandidates, RpcError> {
+    // Grab everything we need from the lock in one pass: project roots + the explorer's
+    // currently-listed path (if any), so we can resolve the fallback without re-locking.
+    let (project_paths, existing_path) = {
+        let s = state.lock().await;
+        let existing = s
+            .pickers
+            .get(&(client_id, PickerKind::Explorer))
+            .and_then(|p| match &p.candidates {
+                picker_state::PickerCandidates::Explorer(e) => Some(e.path.clone()),
+                _ => None,
+            });
+        (s.project_paths.clone(), existing)
+    };
+    let raw_path: std::path::PathBuf = if let Some(p) = requested {
+        std::path::PathBuf::from(p)
+    } else if let Some(p) = existing_path {
+        std::path::PathBuf::from(p)
+    } else {
+        project_paths
+            .first()
+            .cloned()
+            .ok_or_else(|| RpcError::invalid_path("no project paths configured"))?
+    };
+    let canonical = std::fs::canonicalize(&raw_path).map_err(|e| {
+        RpcError::invalid_path(format!("canonicalizing {}: {e}", raw_path.display()))
+    })?;
+    let in_project = |p: &std::path::Path| -> bool {
+        project_paths
+            .iter()
+            .any(|root| p == root.as_path() || p.starts_with(root))
+    };
+    if !in_project(&canonical) {
+        return Err(RpcError::invalid_path(format!(
+            "{} is outside the project's access boundary",
+            canonical.display()
+        )));
+    }
+    let metadata = std::fs::metadata(&canonical).map_err(RpcError::file_io)?;
+    if !metadata.is_dir() {
+        return Err(RpcError::invalid_path(format!(
+            "{} is not a directory",
+            canonical.display()
+        )));
+    }
+    let parent = canonical.parent().and_then(|p| {
+        if in_project(p) {
+            Some(p.display().to_string())
+        } else {
+            None
+        }
+    });
+    let mut entries: Vec<picker_state::ExplorerEntry> = Vec::new();
+    let read = std::fs::read_dir(&canonical).map_err(RpcError::file_io)?;
+    for ent in read {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = match ent.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        entries.push(picker_state::ExplorerEntry { name, is_dir });
+    }
+    // Directories first, then files, each alphabetical — same order the file browser used.
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
+    });
+    Ok(picker_state::ExplorerCandidates {
+        path: canonical.display().to_string(),
+        parent,
+        entries,
+    })
+}
+
 pub async fn picker_view(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -4275,7 +4270,8 @@ pub async fn picker_view(
 
     // Build candidates outside the mutation phase. Files needs an async workspace walk;
     // Buffers reads ServerState directly. Grep starts empty — the candidate set is generated
-    // on demand by `picker/query`'s spawned search.
+    // on demand by `picker/query`'s spawned search. Explorer re-lists the requested directory
+    // (or the previously-listed one on resume) every call, like Buffers — directories change.
     let candidates = match params.kind {
         PickerKind::Files => {
             // Walk the workspace outside the global lock — on first call it can take seconds.
@@ -4291,6 +4287,9 @@ pub async fn picker_view(
             picker_state::PickerCandidates::Buffers(build_buffer_candidates(&s, client_id))
         }
         PickerKind::Grep => picker_state::PickerCandidates::Grep(Vec::new()),
+        PickerKind::Explorer => picker_state::PickerCandidates::Explorer(
+            build_explorer_candidates(state, client_id, params.directory_path.as_deref()).await?,
+        ),
     };
 
     let mut s = state.lock().await;
@@ -4313,7 +4312,8 @@ pub async fn picker_view(
         // rerank in that case. Buffers: the candidate set is fresh each call, always re-bind.
         // Grep: the persisted candidates *are* the prior search results — keep them on resume
         // (the caller passed an empty placeholder). Discard them only on `reset`, which was
-        // handled by the `pickers.remove(&key)` call above.
+        // handled by the `pickers.remove(&key)` call above. Explorer: fresh listing every call
+        // (directory contents may have changed), so always re-bind and rerank.
         let preserve_existing = match (&p.candidates, &candidates) {
             (
                 picker_state::PickerCandidates::Files(a),
@@ -4354,11 +4354,17 @@ pub async fn picker_view(
     // Build the initial push so the client doesn't have to wait for an async update to arrive
     // before it can render. Caller will treat the response and the notification as redundant.
     let update = picker_state::build_update(picker, matcher);
+    let (directory_path, directory_parent) = match &picker.candidates {
+        picker_state::PickerCandidates::Explorer(e) => (Some(e.path.clone()), e.parent.clone()),
+        _ => (None, None),
+    };
     let result = PickerViewResult {
         query: picker.query.clone(),
         generation: picker.generation,
         total_candidates: picker.total_candidates(),
         effective_offset,
+        directory_path,
+        directory_parent,
     };
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
     drop(s);
@@ -4466,7 +4472,9 @@ pub async fn picker_select(
         )
     })?;
     picker_state::resolve_select(picker, &params.item).ok_or_else(|| {
-        RpcError::invalid_params("selected item is not in the picker's candidate set")
+        RpcError::invalid_params(
+            "selected item is not in the picker's candidate set, or is not selectable",
+        )
     })
 }
 

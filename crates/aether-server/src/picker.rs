@@ -26,6 +26,25 @@ pub struct BufferCandidate {
     pub dirty: bool,
 }
 
+/// One explorer-picker entry. Children of the picker's `current_path` directory; rebuilt by
+/// each `picker/view` (Explorer always re-lists, like Buffers always rebuilds — directories
+/// can change underneath us and there's no point caching them).
+#[derive(Debug, Clone)]
+pub struct ExplorerEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// The directory listing the explorer picker is currently matching against. `path` is the
+/// canonical absolute path of the listing; `parent` is the parent's canonical path *if it's
+/// still inside the project boundary* (otherwise `None`, meaning Alt-h is a no-op).
+#[derive(Debug, Clone)]
+pub struct ExplorerCandidates {
+    pub path: String,
+    pub parent: Option<String>,
+    pub entries: Vec<ExplorerEntry>,
+}
+
 /// One grep-picker candidate. One per *match* (a line with N matches yields N candidates), in
 /// the order ripgrep emitted them — walker order, then line order within each file.
 #[derive(Debug, Clone)]
@@ -47,6 +66,21 @@ pub struct GrepHitCandidate {
     pub match_indices: Vec<u32>,
 }
 
+/// How a candidate set turns a non-empty query into a ranked subset. Each `PickerCandidates`
+/// variant picks one; `rerank` and `build_window_items` dispatch on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchStrategy {
+    /// Nucleo fuzzy match. Ranking is by score descending; match indices are the char
+    /// positions nucleo highlighted. Used by Files and Buffers.
+    Fuzzy,
+    /// Smart-case prefix match. Natural candidate order preserved; match indices are the
+    /// first N chars of the haystack (where N = query char count). Used by Explorer.
+    PrefixSmartcase,
+    /// No client-driven filter — the candidate set itself *is* the match set, in whatever
+    /// order it was assembled. Used by Grep, where ripgrep filters server-side.
+    Preserved,
+}
+
 /// The candidate set a `PickerState` is matching against. Per-kind variant keeps the candidate
 /// data shape strict — selecting an item of the wrong kind out of a Files picker is a type
 /// error, not a runtime branch.
@@ -60,6 +94,9 @@ pub enum PickerCandidates {
     /// Grep matches in walker + line order. Grows as the streaming search runs; rerank is a
     /// no-op (the query is the search, so the candidate set already *is* the match set).
     Grep(Vec<GrepHitCandidate>),
+    /// Filesystem entries of the picker's current directory. Re-listed on every `picker/view`
+    /// (directories can mutate underneath us; no point caching).
+    Explorer(ExplorerCandidates),
 }
 
 impl PickerCandidates {
@@ -68,6 +105,7 @@ impl PickerCandidates {
             PickerCandidates::Files(v) => v.len(),
             PickerCandidates::Buffers(v) => v.len(),
             PickerCandidates::Grep(v) => v.len(),
+            PickerCandidates::Explorer(e) => e.entries.len(),
         }
     }
 
@@ -76,6 +114,7 @@ impl PickerCandidates {
             PickerCandidates::Files(_) => PickerKind::Files,
             PickerCandidates::Buffers(_) => PickerKind::Buffers,
             PickerCandidates::Grep(_) => PickerKind::Grep,
+            PickerCandidates::Explorer(_) => PickerKind::Explorer,
         }
     }
 
@@ -86,12 +125,13 @@ impl PickerCandidates {
             PickerCandidates::Files(v) => &v[idx].display,
             PickerCandidates::Buffers(v) => &v[idx].display,
             PickerCandidates::Grep(v) => &v[idx].preview,
+            PickerCandidates::Explorer(e) => &e.entries[idx].name,
         }
     }
 
     /// Build the protocol-level `PickerItem` for candidate `idx`. `match_indices` is supplied by
-    /// the fuzzy matcher for Files/Buffers and ignored for Grep (the candidate already carries
-    /// the ripgrep-computed match positions, which we use verbatim).
+    /// the fuzzy matcher for Files/Buffers/Explorer and ignored for Grep (the candidate already
+    /// carries the ripgrep-computed match positions, which we use verbatim).
     pub fn make_item(&self, idx: usize, match_indices: Vec<u32>) -> PickerItem {
         match self {
             PickerCandidates::Files(v) => PickerItem::File {
@@ -117,6 +157,14 @@ impl PickerCandidates {
                     match_indices: c.match_indices.clone(),
                 }
             }
+            PickerCandidates::Explorer(e) => {
+                let entry = &e.entries[idx];
+                PickerItem::DirEntry {
+                    name: entry.name.clone(),
+                    is_dir: entry.is_dir,
+                    match_indices,
+                }
+            }
         }
     }
 
@@ -135,30 +183,60 @@ impl PickerCandidates {
                 PickerItem::GrepHit {
                     path, line, col, ..
                 },
-            ) => v.iter().position(|c| {
-                c.display_path == *path && c.line == *line && c.col == *col
-            }),
+            ) => v
+                .iter()
+                .position(|c| c.display_path == *path && c.line == *line && c.col == *col),
+            (PickerCandidates::Explorer(e), PickerItem::DirEntry { name, .. }) => {
+                e.entries.iter().position(|c| c.name == *name)
+            }
             _ => None,
         }
     }
 
-    /// Produce the per-kind result of `picker/select` for candidate `idx`.
-    pub fn select_result(&self, idx: usize) -> PickerSelectResult {
+    /// How the matcher should turn a non-empty query into a ranked subset for this candidate
+    /// set. Centralises the per-variant decision so `rerank` and `build_window_items` can
+    /// dispatch through one switch instead of scattered `matches!(..., Grep|Explorer)` checks.
+    pub fn match_strategy(&self) -> MatchStrategy {
         match self {
-            PickerCandidates::Files(v) => PickerSelectResult::File {
+            PickerCandidates::Files(_) | PickerCandidates::Buffers(_) => MatchStrategy::Fuzzy,
+            PickerCandidates::Explorer(_) => MatchStrategy::PrefixSmartcase,
+            // Grep's candidates *are* the matches (ripgrep already filtered + ordered them),
+            // so query changes don't re-rank — they trigger a fresh walk elsewhere.
+            PickerCandidates::Grep(_) => MatchStrategy::Preserved,
+        }
+    }
+
+    /// Produce the per-kind result of `picker/select` for candidate `idx`. `None` when the item
+    /// is not a "selectable" leaf — currently only the Explorer picker's directory entries,
+    /// which the client should navigate into (via `picker/view`) instead of selecting.
+    pub fn select_result(&self, idx: usize) -> Option<PickerSelectResult> {
+        match self {
+            PickerCandidates::Files(v) => Some(PickerSelectResult::File {
                 path: v[idx].abs.clone(),
-            },
-            PickerCandidates::Buffers(v) => PickerSelectResult::Buffer {
+            }),
+            PickerCandidates::Buffers(v) => Some(PickerSelectResult::Buffer {
                 buffer_id: v[idx].buffer_id,
-            },
+            }),
             PickerCandidates::Grep(v) => {
                 let c = &v[idx];
-                PickerSelectResult::FileAt {
+                Some(PickerSelectResult::FileAt {
                     path: c.abs_path.clone(),
                     position: LogicalPosition {
                         line: c.line,
                         col: c.col,
                     },
+                })
+            }
+            PickerCandidates::Explorer(e) => {
+                let entry = &e.entries[idx];
+                if entry.is_dir {
+                    None
+                } else {
+                    let abs = std::path::Path::new(&e.path)
+                        .join(&entry.name)
+                        .display()
+                        .to_string();
+                    Some(PickerSelectResult::File { path: abs })
                 }
             }
         }
@@ -211,31 +289,52 @@ impl PickerState {
     /// "small" workspaces (< ~50k files in benchmarks); revisit if we ever need to stream.
     pub fn rerank(&mut self, matcher: &mut Matcher) {
         self.ranked.clear();
-        // Grep: candidates *are* the matches (ripgrep already ranked them by walker + line
-        // order). Preserve that order regardless of query.
-        if matches!(self.candidates, PickerCandidates::Grep(_)) {
+        let strategy = self.candidates.match_strategy();
+        // Two paths converge on "preserve natural order": Grep's strategy is always Preserved,
+        // and the other strategies short-circuit to natural order on an empty query.
+        if strategy == MatchStrategy::Preserved || self.query.is_empty() {
             self.ranked.extend(0..self.candidates.len() as u32);
             return;
         }
-        if self.query.is_empty() {
-            // Empty query → preserve the candidate set's natural order. For Files that's
-            // alphabetical (set by the walker); for Buffers it's MRU (set by the rebuild).
-            self.ranked.extend(0..self.candidates.len() as u32);
-            return;
-        }
-        let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
-        let mut buf = Vec::new();
-        let n = self.candidates.len();
-        let mut scored: Vec<(u32, u32)> = Vec::with_capacity(n);
-        for i in 0..n {
-            let haystack = Utf32Str::new(self.candidates.display_at(i), &mut buf);
-            if let Some(score) = pattern.score(haystack, matcher) {
-                scored.push((score, i as u32));
+        match strategy {
+            MatchStrategy::Fuzzy => {
+                let pattern =
+                    Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+                let mut buf = Vec::new();
+                let n = self.candidates.len();
+                let mut scored: Vec<(u32, u32)> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let haystack = Utf32Str::new(self.candidates.display_at(i), &mut buf);
+                    if let Some(score) = pattern.score(haystack, matcher) {
+                        scored.push((score, i as u32));
+                    }
+                }
+                // Higher score first; ties fall back to candidate order for determinism.
+                scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                self.ranked.extend(scored.into_iter().map(|(_, i)| i));
             }
+            MatchStrategy::PrefixSmartcase => {
+                // Shell-tab-completion style: the typed query is a literal prefix of the entry
+                // name. Natural candidate order preserved (dirs-then-files, alphabetical
+                // within each, as the listing builder produced it).
+                let (qc, case_insensitive) = smartcase_query(&self.query);
+                let mut buf = String::new();
+                for i in 0..self.candidates.len() {
+                    let name = self.candidates.display_at(i);
+                    let starts = if case_insensitive {
+                        buf.clear();
+                        buf.extend(name.chars().flat_map(char::to_lowercase));
+                        buf.starts_with(qc.as_str())
+                    } else {
+                        name.starts_with(qc.as_str())
+                    };
+                    if starts {
+                        self.ranked.push(i as u32);
+                    }
+                }
+            }
+            MatchStrategy::Preserved => unreachable!("handled above"),
         }
-        // Higher score first; on ties, fall back to candidate order so results are deterministic.
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        self.ranked.extend(scored.into_iter().map(|(_, i)| i));
     }
 
     /// Locate a ranked index for `item` (used by `view { center_on }`). Returns `None` if the
@@ -259,17 +358,17 @@ impl PickerState {
         let total = self.ranked.len() as u32;
         let start = offset.min(total);
         let end = start.saturating_add(limit).min(total);
-        // Grep candidates carry their own match indices (ripgrep-computed) — bypass the fuzzy
-        // matcher and let `make_item` clone them straight through.
-        let is_grep = matches!(self.candidates, PickerCandidates::Grep(_));
-        let pattern = if !is_grep && !self.query.is_empty() {
-            Some(Pattern::parse(
-                &self.query,
-                CaseMatching::Smart,
-                Normalization::Smart,
-            ))
+        // Match-indices source depends on the strategy: fuzzy → nucleo's `indices` helper;
+        // prefix → the leading N chars of the name; preserved → none (Grep candidates carry
+        // their own ripgrep-computed indices, applied inside `make_item`).
+        let strategy = self.candidates.match_strategy();
+        let query_active = !self.query.is_empty();
+        let pattern = (query_active && strategy == MatchStrategy::Fuzzy)
+            .then(|| Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart));
+        let prefix_len: u32 = if query_active && strategy == MatchStrategy::PrefixSmartcase {
+            self.query.chars().count() as u32
         } else {
-            None
+            0
         };
         let mut buf = Vec::new();
         let mut items: Vec<PickerItem> = Vec::with_capacity((end - start) as usize);
@@ -282,6 +381,9 @@ impl PickerState {
                 indices.sort_unstable();
                 indices.dedup();
                 indices
+            } else if prefix_len > 0 {
+                let name_chars = self.candidates.display_at(idx).chars().count() as u32;
+                (0..prefix_len.min(name_chars)).collect()
             } else {
                 Vec::new()
             };
@@ -318,9 +420,23 @@ pub fn make_matcher() -> Matcher {
     Matcher::new(Config::DEFAULT.match_paths())
 }
 
+/// Smartcase normalization for the Explorer picker's prefix matcher. Returns the query the
+/// caller should compare against and whether comparisons need a lowercased haystack. The
+/// query is lowercased iff it contains no uppercase letters — matching the convention nucleo
+/// uses for the other pickers (`CaseMatching::Smart`).
+fn smartcase_query(query: &str) -> (String, bool) {
+    let has_upper = query.chars().any(|c| c.is_uppercase());
+    if has_upper {
+        (query.to_string(), false)
+    } else {
+        (query.chars().flat_map(char::to_lowercase).collect(), true)
+    }
+}
+
 /// Resolve a `picker/select` item to its per-kind result. Returns `None` if the item is no
-/// longer in the candidate set the picker last ranked against.
+/// longer in the candidate set the picker last ranked against, *or* if the item exists but
+/// isn't selectable (e.g. an Explorer directory entry — those navigate via `picker/view`).
 pub fn resolve_select(state: &PickerState, item: &PickerItem) -> Option<PickerSelectResult> {
     let idx = state.candidates.position_of(item)?;
-    Some(state.candidates.select_result(idx))
+    state.candidates.select_result(idx)
 }

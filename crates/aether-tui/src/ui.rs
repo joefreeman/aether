@@ -59,13 +59,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(f.area());
-    // The picker overlays whichever screen is underneath. Render the screen first, then the
-    // overlay on top.
-    if state.is_browsing() {
-        draw_file_browser(f, state, chunks[0]);
-    } else {
-        draw_buffer(f, state, chunks[0]);
-    }
+    draw_buffer(f, state, chunks[0]);
     if state.picker.open {
         draw_picker_overlay(f, state, chunks[0]);
     }
@@ -237,18 +231,30 @@ fn pad_horizontal(area: Rect) -> Rect {
 }
 
 /// Query left-aligned, `N/M` (with a trailing `…` while ticking) right-aligned. When the query
-/// is empty we render a dim placeholder describing what the picker matches against. If the row
-/// is too narrow to hold both, the counts get dropped first so the query stays visible.
+/// is empty we render a dim placeholder describing what the picker matches against. For the
+/// Explorer picker, an immutable dim prefix shows the directory the listing is for, sitting
+/// flush with the typed query (cursor lands just after the prefix). If the row is too narrow
+/// to hold the counts, they get dropped first so the query stays visible.
 fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     let base_style = Style::default().fg(NORD4).bg(NORD0);
     let placeholder_style = Style::default()
         .fg(NORD3)
         .bg(NORD0)
         .add_modifier(Modifier::ITALIC);
+    let prefix_style = Style::default().fg(NORD8).bg(NORD0);
+
+    let total_width = area.width as usize;
+    let (prefix_text, prefix_w) = explorer_input_prefix(state, total_width);
 
     let (left_text, left_style, left_w) = if state.picker.query.is_empty() {
-        let ph = picker_placeholder(state.picker.kind);
-        (ph.to_string(), placeholder_style, ph.width())
+        // Suppress the placeholder when the explorer prefix is already telling the user where
+        // they are — the path *is* the context. Other pickers keep their placeholder.
+        if !prefix_text.is_empty() {
+            (String::new(), base_style, 0)
+        } else {
+            let ph = picker_placeholder(state.picker.kind);
+            (ph.to_string(), placeholder_style, ph.width())
+        }
     } else {
         let q = state.picker.query.text.clone();
         let w = q.width();
@@ -265,16 +271,73 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         let position = position.min(state.picker.total_matches as u64);
         format!("{}/{}{}", position, state.picker.total_matches, suffix)
     };
-    let total_width = area.width as usize;
     let counts_w = counts.width();
 
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(left_text, left_style)];
-    if !counts.is_empty() && left_w + counts_w + 1 <= total_width {
-        let pad = total_width.saturating_sub(left_w + counts_w);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if !prefix_text.is_empty() {
+        spans.push(Span::styled(prefix_text, prefix_style));
+    }
+    spans.push(Span::styled(left_text, left_style));
+    let used = prefix_w + left_w;
+    if !counts.is_empty() && used + counts_w + 1 <= total_width {
+        let pad = total_width.saturating_sub(used + counts_w);
         spans.push(Span::styled(" ".repeat(pad), base_style));
         spans.push(Span::styled(counts, base_style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(base_style), area);
+}
+
+/// The immutable dir-context prefix for the Explorer picker. Returns the rendered string and
+/// its display width. Truncated from the left (preserving the leaf) with `…` when it would
+/// take more than half the input row; capped at `available - 1` so there's always at least one
+/// cell for the query cursor. Returns `(empty, 0)` for non-Explorer pickers.
+fn explorer_input_prefix(state: &AppState, available: usize) -> (String, usize) {
+    if !matches!(
+        state.picker.kind,
+        Some(aether_protocol::picker::PickerKind::Explorer)
+    ) {
+        return (String::new(), 0);
+    }
+    let Some(dir) = state.picker.explorer_dir.as_deref() else {
+        return (String::new(), 0);
+    };
+    let rel = project_relative_path(dir, &state.project_paths);
+    // At the project root there's no path-context worth showing — fall back to the empty
+    // prefix so the input row degrades to the regular placeholder ("Filter entries…").
+    // Inside a subdirectory the prefix sits flush with the typed query (no trailing space),
+    // so `src/ma` reads as a single path expression with `src/` locked and `ma` live.
+    if rel.is_empty() {
+        return (String::new(), 0);
+    }
+    let raw = format!("{rel}/");
+    if available == 0 {
+        return (String::new(), 0);
+    }
+    // Half the row, but always leave room for the cursor on the typed query side.
+    let max = (available / 2).max(1).min(available.saturating_sub(1));
+    let raw_w = raw.width();
+    if raw_w <= max {
+        return (raw, raw_w);
+    }
+    // Keep characters from the right (preserving the leaf + trailing space) until the budget
+    // — minus 1 for the leading `…` — is full. Same trim-from-left strategy as the file
+    // truncation helper, but on a plain (no match-indices) string.
+    let chars: Vec<char> = raw.chars().collect();
+    let budget = max.saturating_sub(1);
+    let mut kept_w = 0;
+    let mut kept_start = chars.len();
+    for (i, c) in chars.iter().enumerate().rev() {
+        let cw = UnicodeWidthChar::width(*c).unwrap_or(0);
+        if kept_w + cw > budget {
+            break;
+        }
+        kept_w += cw;
+        kept_start = i;
+    }
+    let kept: String = chars[kept_start..].iter().collect();
+    let truncated = format!("…{kept}");
+    let truncated_w = truncated.width();
+    (truncated, truncated_w)
 }
 
 fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'static str {
@@ -282,6 +345,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Files) => "Search files…",
         Some(aether_protocol::picker::PickerKind::Buffers) => "Switch buffer…",
         Some(aether_protocol::picker::PickerKind::Grep) => "Grep workspace…",
+        Some(aether_protocol::picker::PickerKind::Explorer) => "Filter entries…",
         None => "Search…",
     }
 }
@@ -345,7 +409,10 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         let i = visible_start + offset_in_slice;
         if let PickerItem::GrepHit { path, .. } = item {
             if prev_grep_path != Some(path.as_str()) {
-                lines.push(Line::from(grep_file_header_spans(path, text_width as usize)));
+                lines.push(Line::from(grep_file_header_spans(
+                    path,
+                    text_width as usize,
+                )));
                 prev_grep_path = Some(path.as_str());
             }
         }
@@ -416,6 +483,14 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
     {
         return grep_hit_spans(*line, preview, match_indices, highlighted, max_width);
     }
+    if let PickerItem::DirEntry {
+        name,
+        is_dir,
+        match_indices,
+    } = item
+    {
+        return dir_entry_spans(name, *is_dir, match_indices, highlighted, max_width);
+    }
 
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
@@ -438,7 +513,7 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
             match_indices.as_slice(),
             if *dirty { " [+]" } else { "" },
         ),
-        PickerItem::GrepHit { .. } => unreachable!("handled above"),
+        PickerItem::GrepHit { .. } | PickerItem::DirEntry { .. } => unreachable!("handled above"),
     };
 
     let text_budget = max_width.saturating_sub(dirty_suffix.len());
@@ -483,7 +558,10 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
 /// Header row above each file's hits in the Grep picker. Path in NORD8 (frost blue, distinct
 /// from regular item rows) — non-selectable; the picker cursor lives on the GrepHit rows.
 fn grep_file_header_spans(path: &str, max_width: usize) -> Vec<Span<'static>> {
-    let style = Style::default().fg(NORD8).bg(NORD0).add_modifier(Modifier::BOLD);
+    let style = Style::default()
+        .fg(NORD8)
+        .bg(NORD0)
+        .add_modifier(Modifier::BOLD);
     let (display, _) = truncate_path_with_indices(path, &[], max_width);
     vec![Span::styled(display, style)]
 }
@@ -565,6 +643,59 @@ fn grep_hit_spans(
     spans
 }
 
+/// One Explorer entry row: leaf name with a trailing `/` for directories, NORD8 (frost blue)
+/// for directories, fuzzy-match highlights overlaid the same way the Files picker does. The
+/// `/` suffix is appended *after* the name proper so `match_indices` (which index into the
+/// name) don't have to know about it.
+fn dir_entry_spans(
+    name: &str,
+    is_dir: bool,
+    match_indices: &[u32],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let fg = if is_dir { NORD8 } else { NORD4 };
+    let base = Style::default().fg(fg).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let suffix = if is_dir { "/" } else { "" };
+    let text_budget = max_width.saturating_sub(suffix.len());
+    let (display, indices) = truncate_path_with_indices(name, match_indices, text_budget);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if indices.is_empty() {
+        spans.push(Span::styled(display, base));
+    } else {
+        let mut current = String::new();
+        let mut current_is_match = false;
+        let mut idx_iter = indices.iter().copied().peekable();
+        for (ci, ch) in display.chars().enumerate() {
+            let is_match = idx_iter.peek().copied() == Some(ci as u32);
+            if is_match {
+                idx_iter.next();
+            }
+            if is_match != current_is_match && !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    if current_is_match { match_style } else { base },
+                ));
+            }
+            current_is_match = is_match;
+            current.push(ch);
+        }
+        if !current.is_empty() {
+            spans.push(Span::styled(
+                current,
+                if current_is_match { match_style } else { base },
+            ));
+        }
+    }
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix.to_string(), base));
+    }
+    spans
+}
+
 /// Trim `path` from the left (preserving the filename) when it overflows `max_width`, prefixing
 /// the trimmed result with `…`. Match indices that fall inside the dropped prefix are removed;
 /// surviving ones are shifted to reflect their new position in the displayed string.
@@ -606,26 +737,6 @@ fn truncate_path_with_indices(
     (truncated, new_indices)
 }
 
-fn draw_file_browser(f: &mut Frame, state: &AppState, area: Rect) {
-    let mut lines: Vec<Line> = Vec::with_capacity(state.browsing().file_browser.entries.len());
-    for (i, entry) in state.browsing().file_browser.entries.iter().enumerate() {
-        let highlighted = i == state.browsing().file_browser.selected;
-        let label = if entry.is_dir {
-            format!("{}/", entry.name)
-        } else {
-            entry.name.clone()
-        };
-        lines.push(Line::from(vec![Span::styled(
-            label,
-            entry_style(entry.is_dir, highlighted),
-        )]));
-    }
-    f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
-        area,
-    );
-}
-
 /// Strip the longest matching project-path prefix from `abs` and return what's left (or `abs`
 /// unchanged if no project path matches). Returns an empty string when the path *is* a project
 /// root — the caller decides how to render that.
@@ -644,25 +755,14 @@ fn project_relative_path(abs: &str, project_paths: &[String]) -> String {
     }
 }
 
-fn entry_style(is_dir: bool, highlighted: bool) -> Style {
-    let mut style = Style::default();
-    if is_dir {
-        style = style.fg(NORD8);
-    }
-    if highlighted {
-        style = style.bg(NORD2);
-    }
-    style
-}
-
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
-    let top = state.editor().scroll_logical_line;
-    let selection = ordered_selection(&state.editor().cursor);
+    let top = state.editor.scroll_logical_line;
+    let selection = ordered_selection(&state.editor.cursor);
     let viewport_rows = area.height as usize;
     let viewport_cols = area.width;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
-    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) {
-        state.editor().scroll_col
+    let scroll_col = if matches!(state.editor.wrap, WrapMode::None) {
+        state.editor.scroll_col
     } else {
         0
     };
@@ -674,11 +774,11 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         if lines.len() >= viewport_rows {
             break;
         }
-        let local_idx = (logical_line as i64) - (state.editor().window_first_logical_line as i64);
-        if local_idx < 0 || local_idx >= state.editor().lines.len() as i64 {
+        let local_idx = (logical_line as i64) - (state.editor.window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.editor.lines.len() as i64 {
             break;
         }
-        let render = &state.editor().lines[local_idx as usize];
+        let render = &state.editor.lines[local_idx as usize];
 
         let last_vrow_idx = render.visual_rows.len().saturating_sub(1);
         for (vrow_idx, vrow) in render.visual_rows.iter().enumerate() {
@@ -724,7 +824,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 logical_line,
                 vrow.byte_offset,
                 row_text_len,
-                state.editor().cursor.match_bracket,
+                state.editor.cursor.match_bracket,
             );
 
             // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
@@ -1166,27 +1266,8 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![Span::raw(format!(" save as: {}", prompt.input.text))])
     } else if let Some(prompt) = state.new_file_prompt.as_ref() {
         Line::from(vec![Span::raw(format!(" new file: {}", prompt.input.text))])
-    } else if let Some(browsing) = state.try_browsing() {
-        if let Some(prompt) = browsing.file_browser.prompt.as_ref() {
-            let label = match prompt.kind {
-                crate::app::FileBrowserPromptKind::NewFile => "new file",
-                crate::app::FileBrowserPromptKind::NewDirectory => "new directory",
-            };
-            Line::from(vec![Span::raw(format!(" {label}: {}", prompt.input.text))])
-        } else {
-            let rel = project_relative_path(&browsing.file_browser.path, &state.project_paths);
-            let suffix = if rel.is_empty() {
-                String::new()
-            } else {
-                format!(" {rel}/")
-            };
-            Line::from(vec![Span::raw(format!(
-                " [{}]{}",
-                state.project_name, suffix
-            ))])
-        }
-    } else if matches!(state.editor().mode, EditorMode::Search) {
-        let prompt = format!("/{}", state.editor().search.query.text);
+    } else if matches!(state.editor.mode, EditorMode::Search) {
+        let prompt = format!("/{}", state.editor.search.query.text);
         let text = match search_match_count_label(state) {
             Some(count) => format!("{prompt}    {count}"),
             None => prompt,
@@ -1200,7 +1281,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         let main = format!(
             " [{project}] {file} {dirty}  {pos}{counter}",
             project = state.project_name,
-            file = state.editor().file_label,
+            file = state.editor.file_label,
             dirty = dirty_marker,
             pos = format_position(state),
         );
@@ -1224,12 +1305,12 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 fn format_position(state: &AppState) -> String {
     // Only called from the default status-bar branch which already guarantees Editing screen
     // with no save_prompt active.
-    let ed = state.editor();
+    let ed = &state.editor;
     let pos = ed.cursor.position;
     match ed.mode {
         EditorMode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
         EditorMode::Normal | EditorMode::Search => {
-            let anchor = state.editor().cursor.anchor;
+            let anchor = state.editor.cursor.anchor;
             let (start, end_inclusive) = if (pos.line, pos.col) <= (anchor.line, anchor.col) {
                 (pos, anchor)
             } else {
@@ -1255,9 +1336,9 @@ fn format_position(state: &AppState) -> String {
 /// at the end of its line. Falls back to a +1 approximation when the line isn't in the
 /// pushed window (which makes the cursor off-screen anyway).
 fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
-    let local_idx = (pos.line as i64) - (state.editor().window_first_logical_line as i64);
+    let local_idx = (pos.line as i64) - (state.editor.window_first_logical_line as i64);
     let Some(render) = (if local_idx >= 0 {
-        state.editor().lines.get(local_idx as usize)
+        state.editor.lines.get(local_idx as usize)
     } else {
         None
     }) else {
@@ -1304,34 +1385,38 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
 }
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
-    if let Some(ed) = state.try_editor() {
-        if matches!(ed.mode, EditorMode::Search)
-            && state.save_prompt.is_none()
-            && state.new_file_prompt.is_none()
-            && !state.picker.open
-        {
-            // Park the terminal cursor on the status row, just past `/` + the typed query up
-            // to the input cursor (so Left/Right navigate within the query, not always at the
-            // end).
-            let typed_w = ed.search.query.width_to_cursor() as u16;
-            let col = status_area
-                .x
-                .saturating_add((1 + typed_w).min(status_area.width.saturating_sub(1)));
-            f.set_cursor_position((col, status_area.y));
-            return;
-        }
+    let ed = &state.editor;
+    if matches!(ed.mode, EditorMode::Search)
+        && state.save_prompt.is_none()
+        && state.new_file_prompt.is_none()
+        && !state.picker.open
+    {
+        // Park the terminal cursor on the status row, just past `/` + the typed query up
+        // to the input cursor (so Left/Right navigate within the query, not always at the
+        // end).
+        let typed_w = ed.search.query.width_to_cursor() as u16;
+        let col = status_area
+            .x
+            .saturating_add((1 + typed_w).min(status_area.width.saturating_sub(1)));
+        f.set_cursor_position((col, status_area.y));
+        return;
     }
     if state.picker.open {
         // Place the cursor inside the picker overlay's input row, at the current insertion
-        // point within the query (or at the start, on the placeholder, when empty).
+        // point within the query (or at the start, on the placeholder, when empty). For the
+        // Explorer picker we offset by the dir-context prefix width — the prefix sits before
+        // the typed query and the cursor needs to land after it.
         let box_area = picker_box_rect(buffer_area);
         if box_area.width >= 4 && box_area.height >= 4 {
             // Inner = inside the borders; inner padding adds another column on each side.
             let text_x = box_area.x + 2;
             let text_y = box_area.y + 1;
             let text_w = box_area.width.saturating_sub(4);
+            let (_, prefix_w) = explorer_input_prefix(state, text_w as usize);
             let typed_w = state.picker.query.width_to_cursor() as u16;
-            let col = text_x.saturating_add(typed_w.min(text_w.saturating_sub(1)));
+            let col = text_x
+                .saturating_add(prefix_w as u16)
+                .saturating_add(typed_w.min(text_w.saturating_sub(1)));
             f.set_cursor_position((col, text_y));
         }
         return;
@@ -1377,34 +1462,6 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         f.set_cursor_position((col, status_area.y));
         return;
     }
-    if let Some(browsing) = state.try_browsing() {
-        if let Some(prompt) = browsing.file_browser.prompt.as_ref() {
-            // Cursor sits at the prompt's current insertion point on the status row. Label
-            // width matches the string built in `draw_status`: " <label>: " is `label.len() + 3`
-            // chars.
-            let label_len = match prompt.kind {
-                crate::app::FileBrowserPromptKind::NewFile => "new file".len(),
-                crate::app::FileBrowserPromptKind::NewDirectory => "new directory".len(),
-            };
-            let prefix_width = (label_len + 3) as u16; // " " + label + ": "
-            let col = status_area
-                .x
-                .saturating_add(prefix_width.saturating_add(prompt.input.width_to_cursor() as u16))
-                .min(
-                    status_area
-                        .x
-                        .saturating_add(status_area.width.saturating_sub(1)),
-                );
-            f.set_cursor_position((col, status_area.y));
-            return;
-        }
-        // Park the cursor at the highlighted listing entry. Entries start at row 0.
-        let row = buffer_area
-            .y
-            .saturating_add(browsing.file_browser.selected as u16);
-        f.set_cursor_position((buffer_area.x, row));
-        return;
-    }
     let Some((visual_row, visual_col)) = cursor_visual_position(state, buffer_area.height as u32)
     else {
         return; // cursor off-screen
@@ -1420,24 +1477,24 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
 /// Returns `None` if the cursor is off-screen (above the top, below the bottom, off-screen left
 /// after horizontal scroll, or its logical line hasn't been pushed into the window yet).
 pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u16, u16)> {
-    let top = state.editor().scroll_logical_line;
-    let cursor = state.editor().cursor.position;
+    let top = state.editor.scroll_logical_line;
+    let cursor = state.editor.cursor.position;
     if cursor.line < top {
         return None;
     }
-    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) {
-        state.editor().scroll_col
+    let scroll_col = if matches!(state.editor.wrap, WrapMode::None) {
+        state.editor.scroll_col
     } else {
         0
     };
 
     let mut visual_offset: u32 = 0;
     for line_idx in top..=cursor.line {
-        let local_idx = (line_idx as i64) - (state.editor().window_first_logical_line as i64);
-        if local_idx < 0 || local_idx >= state.editor().lines.len() as i64 {
+        let local_idx = (line_idx as i64) - (state.editor.window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.editor.lines.len() as i64 {
             return None;
         }
-        let render = &state.editor().lines[local_idx as usize];
+        let render = &state.editor.lines[local_idx as usize];
         if line_idx == cursor.line {
             let row_idx = find_row_idx_for_col(&render.visual_rows, cursor.col);
             visual_offset += row_idx as u32;
@@ -1513,18 +1570,18 @@ pub fn screen_to_logical(
         return None;
     }
     let mut rows_remaining = screen_row as u32;
-    let mut logical_line = state.editor().scroll_logical_line;
+    let mut logical_line = state.editor.scroll_logical_line;
     loop {
-        let local_idx = (logical_line as i64) - (state.editor().window_first_logical_line as i64);
-        if local_idx < 0 || local_idx >= state.editor().lines.len() as i64 {
+        let local_idx = (logical_line as i64) - (state.editor.window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.editor.lines.len() as i64 {
             // Click is past the last line we have rendered — clamp to the end of the buffer.
-            let last_line = state.editor().line_count.saturating_sub(1);
+            let last_line = state.editor.line_count.saturating_sub(1);
             return Some(LogicalPosition {
                 line: last_line,
                 col: u32::MAX,
             });
         }
-        let render = &state.editor().lines[local_idx as usize];
+        let render = &state.editor.lines[local_idx as usize];
         let visual_rows_in_line = render.visual_rows.len() as u32;
         if rows_remaining < visual_rows_in_line {
             let vrow = &render.visual_rows[rows_remaining as usize];
@@ -1545,8 +1602,8 @@ pub fn screen_to_logical(
 /// that lines up with `screen_col`. Clicks on the marker / continuation indent map to the start
 /// of the row's text. Clicks past the end of the text map to the end of the text.
 fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u32 {
-    let scroll_col = if matches!(state.editor().wrap, WrapMode::None) {
-        state.editor().scroll_col
+    let scroll_col = if matches!(state.editor.wrap, WrapMode::None) {
+        state.editor.scroll_col
     } else {
         0
     };

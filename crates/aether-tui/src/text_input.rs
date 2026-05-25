@@ -275,8 +275,14 @@ mod tests {
     #[test]
     fn apply_prompt_key_routes_enter_and_esc() {
         let mut t = TextInput::new("abc");
-        assert_eq!(apply_prompt_key(&mut t, key(KeyCode::Enter)), PromptKeyOutcome::Commit);
-        assert_eq!(apply_prompt_key(&mut t, key(KeyCode::Esc)), PromptKeyOutcome::Cancel);
+        assert_eq!(
+            apply_prompt_key(&mut t, key(KeyCode::Enter)),
+            PromptKeyOutcome::Commit
+        );
+        assert_eq!(
+            apply_prompt_key(&mut t, key(KeyCode::Esc)),
+            PromptKeyOutcome::Cancel
+        );
         assert_eq!(t.text, "abc"); // untouched on Enter/Esc
     }
 

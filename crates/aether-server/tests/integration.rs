@@ -6614,6 +6614,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -6661,6 +6662,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -6708,6 +6710,7 @@ async fn picker_select_returns_absolute_path() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -6766,6 +6769,7 @@ async fn picker_resume_centers_on_remembered_item() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -6804,6 +6808,7 @@ async fn picker_resume_centers_on_remembered_item() {
                 path: "src/lib.rs".into(),
                 match_indices: vec![],
             }),
+            directory_path: None,
         },
     )
     .await;
@@ -6832,6 +6837,7 @@ async fn picker_reset_wipes_persisted_query() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -6866,6 +6872,7 @@ async fn picker_reset_wipes_persisted_query() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -6962,6 +6969,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -7008,6 +7016,7 @@ async fn buffers_picker_select_returns_buffer_id() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -7113,6 +7122,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -7178,6 +7188,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -7262,6 +7273,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -7364,6 +7376,7 @@ async fn buffers_picker_pushes_on_save() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -7436,6 +7449,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -7520,6 +7534,7 @@ async fn buffers_picker_mru_is_per_client() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -8124,30 +8139,75 @@ async fn buffer_close_drops_buffer() {
     std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
     std::fs::write(dir_path.join("b.txt"), "beta\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let a: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("a.txt".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
-    let b: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 3, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("b.txt".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let a: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let b: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("b.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
     // MRU is [b, a]; closing b should return next = a.
-    let r: BufferCloseResult = send_request::<BufferClose>(&mut ws, 4, &BufferCloseParams {
-        buffer_id: b.buffer_id,
-    }).await;
+    let r: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        4,
+        &BufferCloseParams {
+            buffer_id: b.buffer_id,
+        },
+    )
+    .await;
     assert_eq!(r.next_buffer_id, Some(a.buffer_id));
     // Trying to attach to the closed buffer is an error.
-    let err = send_request_expect_err::<BufferOpen>(&mut ws, 5, &BufferOpenParams {
-        buffer_id: Some(b.buffer_id), path_index: None, relative_path: None,
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
-    assert!(err.contains("unknown buffer_id"), "expected buffer-not-found, got: {err}");
+    let err = send_request_expect_err::<BufferOpen>(
+        &mut ws,
+        5,
+        &BufferOpenParams {
+            buffer_id: Some(b.buffer_id),
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("unknown buffer_id"),
+        "expected buffer-not-found, got: {err}"
+    );
 
     drop(server);
 }
@@ -8160,18 +8220,42 @@ async fn buffer_close_last_buffer_returns_none() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("only.txt"), "x\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("only.txt".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
-    let r: BufferCloseResult = send_request::<BufferClose>(&mut ws, 3, &BufferCloseParams {
-        buffer_id: opened.buffer_id,
-    }).await;
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("only.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let r: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        3,
+        &BufferCloseParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
     assert_eq!(r.next_buffer_id, None);
 
     drop(server);
@@ -8185,54 +8269,123 @@ async fn buffer_close_drops_viewports() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(&mut ws, 1, &ClientHelloParams {
-        token: TEST_TOKEN.into(), client_version: "test".into(),
-    }).await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 2, &BufferOpenParams {
-        buffer_id: None, path_index: Some(0), relative_path: Some("a.txt".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 3, &ViewportSubscribeParams {
-        buffer_id: opened.buffer_id, cols: 80, rows: 10, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
-    let _: BufferCloseResult = send_request::<BufferClose>(&mut ws, 4, &BufferCloseParams {
-        buffer_id: opened.buffer_id,
-    }).await;
+    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: opened.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let _: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        4,
+        &BufferCloseParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
     // Resizing the now-dangling viewport should fail rather than return stale data.
-    let err = send_request_expect_err::<ViewportResize>(&mut ws, 5, &ViewportResizeParams {
-        viewport_id: sub.viewport_id, cols: 100, rows: 20,
-    }).await;
-    let _ = err;  // exact message isn't important; just that it's an error.
+    let err = send_request_expect_err::<ViewportResize>(
+        &mut ws,
+        5,
+        &ViewportResizeParams {
+            viewport_id: sub.viewport_id,
+            cols: 100,
+            rows: 20,
+        },
+    )
+    .await;
+    let _ = err; // exact message isn't important; just that it's an error.
 
     drop(server);
 }
 
 // -------- line operations (input/delete_line, input/change_line, input/replace_line) -------------
 
-use aether_protocol::input::{InputChangeLine, InputDeleteLine, InputReplaceLine, InputReplaceLineParams};
+use aether_protocol::input::{
+    InputChangeLine, InputDeleteLine, InputReplaceLine, InputReplaceLineParams,
+};
 
 /// `input/delete_line` removes the cursor's line including the trailing newline.
 #[tokio::test]
 async fn input_delete_line_removes_line_with_newline() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 2, &ViewportSubscribeParams {
-        buffer_id, cols: 80, rows: 10, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        2,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
     // Park on line 1 ("beta"), then delete-line.
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 1, col: 2 },
-        anchor: LogicalPosition { line: 1, col: 2 },
-    }).await;
-    let _: EditResult = send_request::<InputDeleteLine>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
-    let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.line_count, 3, "buffer drops from 4 lines (incl trailing empty) to 3");
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 2 },
+            anchor: LogicalPosition { line: 1, col: 2 },
+        },
+    )
+    .await;
+    let _: EditResult =
+        send_request::<InputDeleteLine>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.line_count, 3,
+        "buffer drops from 4 lines (incl trailing empty) to 3"
+    );
 
     drop(server);
 }
@@ -8242,21 +8395,41 @@ async fn input_delete_line_removes_line_with_newline() {
 #[tokio::test]
 async fn input_change_line_blanks_content_keeps_newline() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 2, &ViewportSubscribeParams {
-        buffer_id, cols: 80, rows: 10, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 1, col: 2 },
-        anchor: LogicalPosition { line: 1, col: 2 },
-    }).await;
-    let r: EditResult = send_request::<InputChangeLine>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        2,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 2 },
+            anchor: LogicalPosition { line: 1, col: 2 },
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputChangeLine>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
     // Cursor lands at col 0 of the (now-empty) line.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 0 });
-    let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
     // Line count stays at 4 (alpha, empty, gamma, trailing empty).
     assert_eq!(notif.line_count, 4);
 
@@ -8268,20 +8441,43 @@ async fn input_change_line_blanks_content_keeps_newline() {
 #[tokio::test]
 async fn input_replace_line_swaps_content() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(&mut ws, 2, &ViewportSubscribeParams {
-        buffer_id, cols: 80, rows: 10, overscan_rows: 0,
-        scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 }, wrap: WrapMode::None,
-        continuation_marker_width: 0, tab_width: 4,
-    }).await;
-    send_request::<CursorSet>(&mut ws, 3, &CursorSetParams {
-        buffer_id,
-        position: LogicalPosition { line: 1, col: 0 },
-        anchor: LogicalPosition { line: 1, col: 0 },
-    }).await;
-    let _: EditResult = send_request::<InputReplaceLine>(&mut ws, 4, &InputReplaceLineParams {
-        buffer_id,
-        text: "replaced\n".into(),
-    }).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        2,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: LogicalPosition { line: 1, col: 0 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputReplaceLine>(
+        &mut ws,
+        4,
+        &InputReplaceLineParams {
+            buffer_id,
+            text: "replaced\n".into(),
+        },
+    )
+    .await;
     let _ = expect_notification::<ViewportLinesChanged>(&mut ws).await;
     // Save the buffer to disk, then read back, to verify the content via a side channel.
     // (Easier than asserting via line-state notifications which we'd have to reconstruct.)
@@ -8391,10 +8587,7 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
             relative_path: Some("a.txt".into()),
             language: None,
             create_if_missing: false,
-            jump_to: Some(LogicalPosition {
-                line: 99,
-                col: 99,
-            }),
+            jump_to: Some(LogicalPosition { line: 99, col: 99 }),
         },
     )
     .await;
@@ -8472,6 +8665,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -8500,10 +8694,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
         .expect("lib.rs hit present");
     let (line, col, preview) = match hit {
         PickerItem::GrepHit {
-            line,
-            col,
-            preview,
-            ..
+            line, col, preview, ..
         } => (*line, *col, preview.clone()),
         _ => unreachable!(),
     };
@@ -8546,6 +8737,7 @@ async fn picker_grep_short_query_yields_empty_result() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -8586,6 +8778,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -8624,12 +8817,16 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
     assert_eq!(resume.query, "needle", "query persists across hide/show");
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    assert_eq!(update.total_matches, before_hits, "hits preserved on resume");
+    assert_eq!(
+        update.total_matches, before_hits,
+        "hits preserved on resume"
+    );
 
     drop(server);
 }
@@ -8648,6 +8845,7 @@ async fn picker_grep_treats_query_as_regex() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -8688,6 +8886,7 @@ async fn picker_grep_caches_completed_query() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;
@@ -8730,6 +8929,507 @@ async fn picker_grep_caches_completed_query() {
     drop(server);
 }
 
+// ---- explorer picker -----------------------------------------------------------------------------
+
+/// Spin up a small workspace for the explorer tests: `src/`, `src/lib.rs`, `src/main.rs`,
+/// `tests/`, `tests/it.rs`, `README.md`. Returns a (server, ws) pair past the handshake.
+async fn setup_explorer_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    std::path::PathBuf,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(root.join("tests/it.rs"), "// integration\n").unwrap();
+    std::fs::write(root.join("README.md"), "hi\n").unwrap();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![root], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ClientHelloResult = send_request::<ClientHello>(
+        &mut ws,
+        1,
+        &ClientHelloParams {
+            token: TEST_TOKEN.into(),
+            client_version: "test".into(),
+        },
+    )
+    .await;
+    (server, ws, canonical_root)
+}
+
+/// Opening the Explorer picker without a `directory_path` lists the first project root: the
+/// result echoes the canonical path, sets `directory_parent` to `None` (we're *at* a root), and
+/// the push carries one `DirEntry` per child with directories sorted before files.
+#[tokio::test]
+async fn picker_explorer_default_lists_project_root() {
+    let (server, mut ws, root) = setup_explorer_workspace().await;
+    let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: None,
+        },
+    )
+    .await;
+    assert_eq!(view.directory_path.as_deref(), Some(root.to_str().unwrap()));
+    assert!(
+        view.directory_parent.is_none(),
+        "at project root → no parent"
+    );
+
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    let names: Vec<(String, bool)> = update
+        .items
+        .iter()
+        .map(|it| match it {
+            PickerItem::DirEntry { name, is_dir, .. } => (name.clone(), *is_dir),
+            other => panic!("expected DirEntry, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("src".into(), true),
+            ("tests".into(), true),
+            ("README.md".into(), false),
+        ]
+    );
+
+    drop(server);
+}
+
+/// Passing an explicit `directory_path` lists that directory, and `directory_parent` is the
+/// (in-project) parent so the client can render Alt-h navigation.
+#[tokio::test]
+async fn picker_explorer_navigate_into_subdirectory() {
+    let (server, mut ws, root) = setup_explorer_workspace().await;
+    let target = root.join("src");
+    let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: Some(target.display().to_string()),
+        },
+    )
+    .await;
+    assert_eq!(
+        view.directory_path.as_deref(),
+        Some(target.to_str().unwrap())
+    );
+    assert_eq!(
+        view.directory_parent.as_deref(),
+        Some(root.to_str().unwrap()),
+        "parent should be the project root"
+    );
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    let names: Vec<String> = update
+        .items
+        .iter()
+        .map(|it| match it {
+            PickerItem::DirEntry { name, .. } => name.clone(),
+            other => panic!("expected DirEntry, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["lib.rs", "main.rs"]);
+    drop(server);
+}
+
+/// A `picker/query` over the explorer prefix-matches entry names (smartcase). `match_indices`
+/// covers the prefix chars the user typed so the renderer can underline the matched prefix.
+#[tokio::test]
+async fn picker_explorer_query_filters_by_prefix() {
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Explorer,
+            query: "sr".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    let kept: Vec<(String, Vec<u32>)> = update
+        .items
+        .iter()
+        .map(|it| match it {
+            PickerItem::DirEntry {
+                name,
+                match_indices,
+                ..
+            } => (name.clone(), match_indices.clone()),
+            other => panic!("expected DirEntry, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kept.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["src"],
+        "prefix match `sr` should keep only `src`"
+    );
+    assert_eq!(
+        kept[0].1,
+        vec![0, 1],
+        "match_indices should cover the prefix the user typed"
+    );
+
+    drop(server);
+}
+
+/// Non-prefix substrings don't match — `rc` would survive under fuzzy (since `src` contains
+/// `r` then `c` in order) but must not under prefix semantics.
+#[tokio::test]
+async fn picker_explorer_query_rejects_non_prefix_substring() {
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Explorer,
+            query: "rc".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(
+        update.total_matches, 0,
+        "non-prefix `rc` should not match `src`"
+    );
+    assert!(update.items.is_empty());
+    drop(server);
+}
+
+/// Clearing the explorer query (Alt-Backspace on the client) sends a `picker/query` with an
+/// empty string and the bumped generation; the server reranks and the push restores the full
+/// directory listing.
+#[tokio::test]
+async fn picker_explorer_empty_query_restores_full_listing() {
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: None,
+        },
+    )
+    .await;
+    let initial = expect_notification::<PickerUpdate>(&mut ws).await;
+    let total_unfiltered = initial.total_matches;
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Explorer,
+            query: "sr".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let filtered = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert!(
+        filtered.total_matches < total_unfiltered,
+        "filter should narrow the listing"
+    );
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        12,
+        &PickerQueryParams {
+            kind: PickerKind::Explorer,
+            query: String::new(),
+            generation: 2,
+        },
+    )
+    .await;
+    let restored = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(
+        restored.total_matches, total_unfiltered,
+        "empty query should restore the full unfiltered listing"
+    );
+    assert_eq!(restored.generation, 2);
+
+    drop(server);
+}
+
+/// Smartcase: an all-lowercase query matches case-insensitively (so `re` finds `README.md`),
+/// but any uppercase letter in the query flips to case-sensitive (so `RE` keeps the match
+/// while `Re` is the explicit-mixed-case form most users expect to also match).
+#[tokio::test]
+async fn picker_explorer_query_is_smartcase() {
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    // Lowercase query → case-insensitive → matches README.md.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Explorer,
+            query: "re".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let lower = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(lower.total_matches, 1);
+    match &lower.items[0] {
+        PickerItem::DirEntry { name, .. } => assert_eq!(name, "README.md"),
+        other => panic!("expected DirEntry, got {other:?}"),
+    }
+
+    // Uppercase letter → case-sensitive → `Re` no longer matches the all-uppercase `README.md`.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        12,
+        &PickerQueryParams {
+            kind: PickerKind::Explorer,
+            query: "Re".into(),
+            generation: 2,
+        },
+    )
+    .await;
+    let mixed = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(
+        mixed.total_matches, 0,
+        "`Re` is case-sensitive under smartcase, README.md starts with `RE`"
+    );
+
+    drop(server);
+}
+
+/// Selecting a file in the explorer returns `PickerSelectResult::File { path }` with the
+/// absolute path the client should feed into `buffer/open`.
+#[tokio::test]
+async fn picker_explorer_select_file_returns_absolute_path() {
+    let (server, mut ws, root) = setup_explorer_workspace().await;
+    let target = root.join("src");
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: Some(target.display().to_string()),
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let result: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        11,
+        &PickerSelectParams {
+            kind: PickerKind::Explorer,
+            item: PickerItem::DirEntry {
+                name: "lib.rs".into(),
+                is_dir: false,
+                match_indices: vec![],
+            },
+        },
+    )
+    .await;
+    match result {
+        PickerSelectResult::File { path } => {
+            assert_eq!(path, target.join("lib.rs").display().to_string());
+        }
+        other => panic!("expected File select result, got {other:?}"),
+    }
+
+    drop(server);
+}
+
+/// Selecting a directory entry in the explorer is an error — navigation is the client's job
+/// (it sends a fresh `picker/view` with the new `directory_path`). The contract makes
+/// `picker/select` mean "this is the final answer, here you go", which doesn't apply to a
+/// directory.
+#[tokio::test]
+async fn picker_explorer_select_directory_errors() {
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let err = send_request_expect_err::<PickerSelect>(
+        &mut ws,
+        11,
+        &PickerSelectParams {
+            kind: PickerKind::Explorer,
+            item: PickerItem::DirEntry {
+                name: "src".into(),
+                is_dir: true,
+                match_indices: vec![],
+            },
+        },
+    )
+    .await;
+    assert!(
+        err.contains("not selectable") || err.contains("not in the picker"),
+        "unexpected error message: {err}"
+    );
+    drop(server);
+}
+
+/// Asking the explorer to list a directory outside the project boundary is rejected by the
+/// same access-boundary check `directory/list` uses.
+#[tokio::test]
+async fn picker_explorer_rejects_path_outside_project() {
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+    let err = send_request_expect_err::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: Some("/etc".into()),
+        },
+    )
+    .await;
+    assert!(
+        err.contains("outside the project") || err.contains("canonicalizing"),
+        "unexpected error message: {err}"
+    );
+    drop(server);
+}
+
+/// Resuming the explorer (omitting `directory_path` on a follow-up `picker/view`) keeps it
+/// pointed at the directory the prior call established — that's what makes "Space e" re-enter
+/// the same dir across hide/show.
+#[tokio::test]
+async fn picker_explorer_resumes_last_directory() {
+    let (server, mut ws, root) = setup_explorer_workspace().await;
+    let target = root.join("src");
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: Some(target.display().to_string()),
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let _: () = send_request::<PickerHide>(
+        &mut ws,
+        11,
+        &PickerHideParams {
+            kind: PickerKind::Explorer,
+        },
+    )
+    .await;
+
+    let view2: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        12,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: false,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            directory_path: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        view2.directory_path.as_deref(),
+        Some(target.to_str().unwrap()),
+        "second view without directory_path should resume the prior dir"
+    );
+    drop(server);
+}
+
 /// Mid-typing invalid regex (e.g. trailing `[`) is treated as a transient "no matches" rather
 /// than an error — the picker stays responsive. The RPC succeeds; the streaming search emits one
 /// final non-ticking, zero-hit update and exits.
@@ -8745,6 +9445,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
             offset: 0,
             limit: 30,
             center_on: None,
+            directory_path: None,
         },
     )
     .await;

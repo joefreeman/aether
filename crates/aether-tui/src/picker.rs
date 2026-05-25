@@ -63,6 +63,15 @@ pub struct PickerState {
     /// or `pending_offset` and shifting `visible_start` / `selected` so the user's spot is
     /// preserved across the cache swap.
     pub pending_offset: Option<u32>,
+    /// Explorer only. The canonical absolute path of the directory the picker is currently
+    /// listing. Set by `open_picker(Explorer)` / `picker_navigate_to_dir` from the
+    /// `PickerViewResult::directory_path` the server returns. Persisted across hide/show so the
+    /// next `Space e` resumes in the same directory; `None` outside the Explorer picker.
+    pub explorer_dir: Option<String>,
+    /// Explorer only. The parent of `explorer_dir`, or `None` when the picker is at (or above)
+    /// a project root (Alt-h is then a no-op). Carried alongside `explorer_dir` for the same
+    /// reasons.
+    pub explorer_parent: Option<String>,
 }
 
 impl PickerState {
@@ -152,16 +161,14 @@ impl PickerState {
 /// pushed window after re-rank or resume. For files this is the path; for buffers it's the id
 /// (stable across rename/Save-As, where the display string changes); for grep hits it's the
 /// triple (path, line, col), which keeps a specific match identifiable across resume even if
-/// the line text drifts after editing.
+/// the line text drifts after editing. For explorer entries it's the leaf name — valid only
+/// inside one directory listing, which is exactly the lifetime resume needs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ItemKey<'a> {
     File(&'a str),
     Buffer(aether_protocol::BufferId),
-    Grep {
-        path: &'a str,
-        line: u32,
-        col: u32,
-    },
+    Grep { path: &'a str, line: u32, col: u32 },
+    DirEntry(&'a str),
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -175,5 +182,6 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             line: *line,
             col: *col,
         },
+        PickerItem::DirEntry { name, .. } => ItemKey::DirEntry(name.as_str()),
     }
 }

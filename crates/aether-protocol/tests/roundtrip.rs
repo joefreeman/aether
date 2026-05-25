@@ -291,6 +291,7 @@ fn picker_view_params_omit_center_on_when_none() {
         offset: 0,
         limit: 30,
         center_on: None,
+        directory_path: None,
     };
     let v = to_value(&p).unwrap();
     assert!(
@@ -313,6 +314,7 @@ fn picker_view_params_center_on_serialized() {
             path: "x".into(),
             match_indices: vec![],
         }),
+        directory_path: None,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["center_on"]["kind"], "file");
@@ -445,6 +447,101 @@ fn picker_select_result_file_at_is_tagged() {
             "position": {"line": 3, "col": 7},
         })
     );
+}
+
+#[test]
+fn picker_kind_explorer_is_snake_case() {
+    use aether_protocol::picker::PickerKind;
+    assert_eq!(to_value(PickerKind::Explorer).unwrap(), json!("explorer"));
+    assert_eq!(
+        from_value::<PickerKind>(json!("explorer")).unwrap(),
+        PickerKind::Explorer,
+    );
+}
+
+#[test]
+fn picker_item_dir_entry_is_tagged() {
+    use aether_protocol::picker::PickerItem;
+    let item = PickerItem::DirEntry {
+        name: "src".into(),
+        is_dir: true,
+        match_indices: vec![0, 1],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "kind": "dir_entry",
+            "name": "src",
+            "is_dir": true,
+            "match_indices": [0, 1],
+        })
+    );
+}
+
+#[test]
+fn picker_view_params_directory_path_skipped_when_none() {
+    use aether_protocol::picker::{PickerKind, PickerViewParams};
+    let p = PickerViewParams {
+        kind: PickerKind::Explorer,
+        reset: false,
+        offset: 0,
+        limit: 30,
+        center_on: None,
+        directory_path: None,
+    };
+    let v = to_value(&p).unwrap();
+    assert!(
+        v.get("directory_path").is_none(),
+        "None directory_path should be skipped from the wire"
+    );
+}
+
+#[test]
+fn picker_view_params_directory_path_serialized() {
+    use aether_protocol::picker::{PickerKind, PickerViewParams};
+    let p = PickerViewParams {
+        kind: PickerKind::Explorer,
+        reset: true,
+        offset: 0,
+        limit: 30,
+        center_on: None,
+        directory_path: Some("/home/x/proj/src".into()),
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["directory_path"], "/home/x/proj/src");
+}
+
+#[test]
+fn picker_view_result_directory_fields_skipped_when_none() {
+    use aether_protocol::picker::PickerViewResult;
+    let r = PickerViewResult {
+        query: String::new(),
+        generation: 0,
+        total_candidates: 5,
+        effective_offset: 0,
+        directory_path: None,
+        directory_parent: None,
+    };
+    let v = to_value(&r).unwrap();
+    assert!(v.get("directory_path").is_none());
+    assert!(v.get("directory_parent").is_none());
+}
+
+#[test]
+fn picker_view_result_directory_fields_serialized() {
+    use aether_protocol::picker::PickerViewResult;
+    let r = PickerViewResult {
+        query: String::new(),
+        generation: 0,
+        total_candidates: 3,
+        effective_offset: 0,
+        directory_path: Some("/proj/src".into()),
+        directory_parent: Some("/proj".into()),
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["directory_path"], "/proj/src");
+    assert_eq!(v["directory_parent"], "/proj");
 }
 
 #[test]

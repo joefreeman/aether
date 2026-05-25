@@ -29,6 +29,24 @@ pub enum PickerKind {
     /// `hide`/`view` so the user can step through results — they may be stale relative to the
     /// file on disk after editing, and that's accepted (jumps clamp to the current line bounds).
     Grep,
+    /// Filesystem explorer. Entries are the children of one directory (re-listed on each
+    /// `picker/view`). The query fuzzy-matches entry names within that directory. Navigation
+    /// (parent / enter subdirectory) is driven by the client sending `picker/view` with a new
+    /// `directory_path`; the result + push carry the canonical path the listing is for.
+    Explorer,
+}
+
+impl PickerKind {
+    /// Whether this picker saves its highlight + query on hide/select so the next open
+    /// resumes the prior state. Only Grep does — its candidate set is the result of a
+    /// (potentially slow) workspace scan and dropping it on every reopen would be wasteful.
+    /// The others reset on each open so the picker stays contextual: Files and Buffers reset
+    /// the query so each open is a fresh search; Explorer resets back to the active buffer's
+    /// directory so it acts like "show me where I am" rather than a persistent file-manager
+    /// session.
+    pub fn preserves_state(self) -> bool {
+        matches!(self, PickerKind::Grep)
+    }
 }
 
 /// A pickable item. Tagged enum so different pickers can carry the data they need; match-index
@@ -73,6 +91,18 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
+    /// One entry (file or directory) inside the explorer picker's current directory. Identity
+    /// is `name` within the active listing; the absolute path lives only on the server.
+    DirEntry {
+        /// Leaf name (no path separators).
+        name: String,
+        /// True for subdirectories, false for files. The client uses this to gate the
+        /// "Enter / Alt-l enters directory" vs. "Enter opens file" routing.
+        is_dir: bool,
+        /// Char offsets into `name` covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
 }
 
 // ---- picker/view --------------------------------------------------------------------------------
@@ -105,6 +135,11 @@ pub struct PickerViewParams {
     /// in the results, the server falls back to `offset: 0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center_on: Option<PickerItem>,
+    /// Explorer only: absolute path of the directory to list. `None` means "keep whatever
+    /// directory the picker last listed; default to the first project root on first open".
+    /// Ignored for other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,6 +155,15 @@ pub struct PickerViewResult {
     /// The offset the server actually used (matters when the client passed `center_on`). The
     /// follow-up `picker/update` push carries the same offset.
     pub effective_offset: u32,
+    /// Explorer only: the canonical absolute path of the directory the picker is listing. `None`
+    /// for the other picker kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_path: Option<String>,
+    /// Explorer only: the canonical absolute path of the parent directory, if it's still inside
+    /// the project's access boundary. `None` when at (or above) a project root, and `None` for
+    /// the other picker kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_parent: Option<String>,
 }
 
 // ---- picker/query -------------------------------------------------------------------------------

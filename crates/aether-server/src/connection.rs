@@ -8,15 +8,14 @@ use aether_protocol::cursor::{
     CursorContract, CursorExpand, CursorMove, CursorRedo, CursorSelectLine, CursorSet,
     CursorSwapAnchor, CursorUndo,
 };
-use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
 use aether_protocol::handshake::ClientHello;
 use aether_protocol::input::{
     InputBackspace, InputChangeLine, InputDedent, InputDelete, InputDeleteLine, InputIndent,
-    InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine,
-    InputText, InputToggleComment, InputUndo,
+    InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine, InputText,
+    InputToggleComment, InputUndo,
 };
 use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerView};
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
@@ -163,8 +162,6 @@ async fn dispatch(
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         BufferClose::NAME => run!(BufferClose, handlers::buffer_close),
-        DirectoryList::NAME => run!(DirectoryList, handlers::directory_list),
-        DirectoryCreate::NAME => run!(DirectoryCreate, handlers::directory_create),
         SearchSet::NAME => run!(SearchSet, handlers::search_set),
         SearchClear::NAME => run!(SearchClear, handlers::search_clear),
         SearchNext::NAME => run!(SearchNext, handlers::search_next),
