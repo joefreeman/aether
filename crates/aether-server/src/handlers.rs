@@ -16,7 +16,7 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState,
-    CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, Motion,
+    CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, GrepPosition, Motion,
     VerticalDirection,
 };
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
@@ -26,8 +26,9 @@ use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputMoveLinesParams, InputTextParams, UndoResult,
 };
 use aether_protocol::picker::{
-    PickerHideParams, PickerKind, PickerQueryParams, PickerSelectParams, PickerSelectResult,
-    PickerUpdate, PickerUpdateParams, PickerViewParams, PickerViewResult,
+    PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHideParams, PickerItem, PickerKind,
+    PickerQueryParams, PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams,
+    PickerViewParams, PickerViewResult,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
@@ -128,6 +129,7 @@ fn resolve_open_cursor(
             position: clamped,
             anchor: clamped,
             match_bracket: None,
+            grep_position: None,
         };
         if let Some(c) = client_id {
             s.cursors.insert((c, buffer_id), new);
@@ -283,6 +285,10 @@ pub async fn buffer_open(
             let saved_revision = buf.saved_revision();
             let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
             let cursor = resolve_open_cursor(&mut s, client_id, existing, clamped_jump);
+            let cursor = match client_id {
+                Some(c) => wrap_for_response(&s, c, existing, cursor),
+                None => cursor,
+            };
             let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, existing)).copied());
             let result = BufferOpenResult {
                 buffer_id: existing,
@@ -318,6 +324,12 @@ pub async fn buffer_open(
     // already have one if a previous server-side session allocated state. Look it up anyway for
     // consistency with the reopen path.
     let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump);
+    s.buffers.insert(id, buf);
+    let cursor = match client_id {
+        Some(c) => wrap_for_response(&s, c, id, cursor),
+        None => cursor,
+    };
+    let buf = &s.buffers[&id];
     let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, id)).copied());
     let result = BufferOpenResult {
         buffer_id: id,
@@ -330,7 +342,6 @@ pub async fn buffer_open(
         cursor,
         scroll,
     };
-    s.buffers.insert(id, buf);
     s.touch_mru(client_id, id);
     let pushes = refresh_buffer_pickers(&mut s);
     drop(s);
@@ -440,6 +451,7 @@ pub async fn search_set(
                     position,
                     anchor: anchor_p,
                     match_bracket: None,
+                    grep_position: None,
                 };
                 let prev_cursor = cursor;
                 s.cursors.insert(key, new_cursor);
@@ -456,6 +468,9 @@ pub async fn search_set(
         let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
         (summary, pushes)
     };
+    // Stamp `match_bracket` + `grep_position` before sending — without this, the freshly-jumped
+    // cursor would arrive at the client missing the status-bar indicators that derive from it.
+    let cursor = wrap_for_response(&s, client_id, params.buffer_id, cursor);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -583,6 +598,7 @@ async fn search_navigate(
         position,
         anchor: anchor_pos,
         match_bracket: None,
+        grep_position: None,
     };
     let prev_cursor = s.cursors.get(&key).copied().unwrap_or_default();
     s.cursors.insert(key, new_cursor);
@@ -599,6 +615,7 @@ async fn search_navigate(
         .get_mut(&key)
         .expect("active search just confirmed");
     entry_mut.last_pushed_index = summary.current_index;
+    let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
     Ok(SearchNavResult {
         cursor: new_cursor,
         summary,
@@ -979,6 +996,7 @@ pub async fn buffer_cut(
         position: new_pos,
         anchor: new_pos,
         match_bracket: None,
+        grep_position: None,
     };
     s.cursors.insert((client_id, params.buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(params.buffer_id);
@@ -1846,6 +1864,7 @@ pub async fn cursor_move(
         position: new_pos,
         anchor: new_anchor,
         match_bracket: None,
+        grep_position: None,
     };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
@@ -1859,7 +1878,7 @@ pub async fn cursor_move(
         }
     }
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let response = wrap_for_response(&s, params.buffer_id, new_state);
+    let response = wrap_for_response(&s, client_id, params.buffer_id, new_state);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -1959,13 +1978,14 @@ pub async fn cursor_select_line(
         position: cursor_pos,
         anchor: anchor_pos,
         match_bracket: None,
+        grep_position: None,
     };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let response = wrap_for_response(&s, params.buffer_id, new_state);
+    let response = wrap_for_response(&s, client_id, params.buffer_id, new_state);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -1990,13 +2010,14 @@ pub async fn cursor_swap_anchor(
         position: current.anchor,
         anchor: current.position,
         match_bracket: None,
+        grep_position: None,
     };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let response = wrap_for_response(&s, params.buffer_id, new_state);
+    let response = wrap_for_response(&s, client_id, params.buffer_id, new_state);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -2023,13 +2044,14 @@ pub async fn cursor_set(
         position,
         anchor,
         match_bracket: None,
+        grep_position: None,
     };
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let response = wrap_for_response(&s, params.buffer_id, result);
+    let response = wrap_for_response(&s, client_id, params.buffer_id, result);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -2068,7 +2090,7 @@ pub async fn cursor_undo(
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let prev = wrap_for_response(&s, params.buffer_id, prev);
+    let prev = wrap_for_response(&s, client_id, params.buffer_id, prev);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -2109,7 +2131,7 @@ pub async fn cursor_redo(
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let next = wrap_for_response(&s, params.buffer_id, next);
+    let next = wrap_for_response(&s, client_id, params.buffer_id, next);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -2172,6 +2194,7 @@ pub async fn cursor_expand(
         position,
         anchor,
         match_bracket: None,
+        grep_position: None,
     };
 
     s.cursors.insert(key, new_cursor);
@@ -2182,7 +2205,7 @@ pub async fn cursor_expand(
         .or_default()
         .push(current);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let new_cursor = wrap_for_response(&s, params.buffer_id, new_cursor);
+    let new_cursor = wrap_for_response(&s, client_id, params.buffer_id, new_cursor);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -2208,14 +2231,14 @@ pub async fn cursor_contract(
     let Some(prev) = prev else {
         // Nothing to contract back to.
         let cur = s.cursors.get(&key).copied().unwrap_or_default();
-        return Ok(wrap_for_response(&s, params.buffer_id, cur));
+        return Ok(wrap_for_response(&s, client_id, params.buffer_id, cur));
     };
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     s.cursors.insert(key, prev);
     s.record_motion(key, current, prev);
     s.virtual_col.remove(&key);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let prev = wrap_for_response(&s, params.buffer_id, prev);
+    let prev = wrap_for_response(&s, client_id, params.buffer_id, prev);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -2513,7 +2536,7 @@ async fn apply_toggle_comment(
         .unwrap_or((None, None));
     if line_tok.is_none() && block_tok.is_none() {
         let revision = buf.revision;
-        let response = wrap_for_response(&s, buffer_id, cursor);
+        let response = wrap_for_response(&s, client_id, buffer_id, cursor);
         return Ok(EditResult {
             revision,
             cursor: response,
@@ -2729,12 +2752,14 @@ async fn apply_toggle_comment(
                     position: new_position,
                     anchor: new_position,
                     match_bracket: None,
+                    grep_position: None,
                 }
             } else {
                 CursorState {
                     position: new_position,
                     anchor: start_pos,
                     match_bracket: None,
+                    grep_position: None,
                 }
             };
             let last_line = motion::char_to_pos(buf, end_char_excl.saturating_sub(1)).line;
@@ -2784,12 +2809,14 @@ async fn apply_toggle_comment(
                     position: new_position,
                     anchor: new_position,
                     match_bracket: None,
+                    grep_position: None,
                 }
             } else {
                 CursorState {
                     position: new_position,
                     anchor: start_pos,
                     match_bracket: None,
+                    grep_position: None,
                 }
             };
             let last_touched_line = start_pos.line + newlines;
@@ -2807,7 +2834,7 @@ async fn apply_toggle_comment(
     let Some((start_char, end_char, new_text, new_cursor, edit_first, edit_last_incl)) = edit
     else {
         let revision = buf.revision;
-        let response = wrap_for_response(&s, buffer_id, cursor);
+        let response = wrap_for_response(&s, client_id, buffer_id, cursor);
         return Ok(EditResult {
             revision,
             cursor: response,
@@ -2881,7 +2908,7 @@ async fn apply_toggle_comment(
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
-    let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
+    let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -3171,6 +3198,7 @@ fn shift_cursor_by_line_map(
         position,
         anchor,
         match_bracket: None,
+        grep_position: None,
     }
 }
 
@@ -3295,6 +3323,7 @@ async fn apply_indent_or_dedent(
             position: motion::clamp_position(buf_mut, shift_pos(cursor.position)),
             anchor: motion::clamp_position(buf_mut, shift_pos(cursor.anchor)),
             match_bracket: None,
+            grep_position: None,
         };
         (revision, new_cursor)
     };
@@ -3334,7 +3363,7 @@ async fn apply_indent_or_dedent(
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
-    let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
+    let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -3468,6 +3497,7 @@ pub async fn input_move_lines(
             position: motion::clamp_position(buf_mut, shift(cursor.position)),
             anchor: motion::clamp_position(buf_mut, shift(cursor.anchor)),
             match_bracket: None,
+            grep_position: None,
         };
         (revision, new_cursor)
     };
@@ -3511,7 +3541,7 @@ pub async fn input_move_lines(
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
-    let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
+    let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -3671,6 +3701,7 @@ pub async fn input_join_lines(
             position: new_pos,
             anchor: new_pos,
             match_bracket: None,
+            grep_position: None,
         };
         s.cursors.insert((client_id, buffer_id), new_cursor);
         s.clear_motion_history_for_buffer(buffer_id);
@@ -3698,7 +3729,7 @@ pub async fn input_join_lines(
             pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search)));
         }
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
-        let new_cursor = wrap_for_response(&s, buffer_id, new_cursor);
+        let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
         (pushes, search_summary_pushes, picker_pushes, new_cursor)
     };
 
@@ -3853,6 +3884,7 @@ fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
         position,
         anchor,
         match_bracket: None,
+        grep_position: None,
     }
 }
 
@@ -3875,14 +3907,84 @@ fn with_match_bracket(buf: &Buffer, mut cursor: CursorState) -> CursorState {
     cursor
 }
 
+/// Populate `grep_position` on a cursor that's about to cross the wire. The cursor counts as
+/// "on" a hit when its selection covers *exactly* the match — `anchor` at the match's first
+/// char and `position` at its last char (orientation-agnostic) — same strictness as
+/// `match_index_for_cursor` uses to gate the in-buffer `A/B` counter. Any motion that grows,
+/// shrinks, or shifts the selection drops the indicator on the next response.
+fn with_grep_position(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    mut cursor: CursorState,
+) -> CursorState {
+    let Some(picker) = s.pickers.get(&(client_id, PickerKind::Grep)) else {
+        return cursor;
+    };
+    let picker_state::PickerCandidates::Grep(ref hits) = picker.candidates else {
+        return cursor;
+    };
+    if hits.is_empty() {
+        return cursor;
+    }
+    let Some(buf) = s.buffers.get(&buffer_id) else {
+        return cursor;
+    };
+    let Some(current_path) = buf
+        .canonical_path
+        .as_deref()
+        .and_then(|p| crate::workspace_index::project_relative_display(p, &s.project_paths))
+    else {
+        return cursor;
+    };
+    // Compare in char-index space so multi-byte content stays on char boundaries (mirrors
+    // `match_index_for_cursor`).
+    let anchor_char = motion::pos_to_char(buf, cursor.anchor);
+    let pos_char = motion::pos_to_char(buf, cursor.position);
+    let sel_start_char = anchor_char.min(pos_char);
+    let sel_end_char = anchor_char.max(pos_char);
+    let total = hits.len() as u32;
+    if let Some(idx) = hits.iter().position(|h| {
+        if h.display_path != current_path {
+            return false;
+        }
+        let hit_start_pos = LogicalPosition {
+            line: h.line,
+            col: h.col,
+        };
+        let hit_end_excl_pos = LogicalPosition {
+            line: h.line,
+            col: h.col + h.match_byte_len,
+        };
+        let m_start_char = motion::pos_to_char(buf, hit_start_pos);
+        let m_end_char_excl = motion::pos_to_char(buf, hit_end_excl_pos);
+        let m_last_char = m_end_char_excl.saturating_sub(1).max(m_start_char);
+        sel_start_char == m_start_char && sel_end_char == m_last_char
+    }) {
+        cursor.grep_position = Some(GrepPosition {
+            current: (idx as u32).saturating_add(1),
+            total,
+        });
+    }
+    cursor
+}
+
 /// Same as `with_match_bracket` but starts from a `ServerState`: a one-liner for the many
 /// handlers that need to populate the field just before returning. Safe if the buffer was
-/// already dropped (returns the cursor unchanged).
-fn wrap_for_response(s: &ServerState, buffer_id: BufferId, cursor: CursorState) -> CursorState {
-    s.buffers
+/// already dropped (returns the cursor unchanged). Also stamps `grep_position` if the client
+/// has cached grep hits and the cursor is on one.
+fn wrap_for_response(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    cursor: CursorState,
+) -> CursorState {
+    let with_brackets = s
+        .buffers
         .get(&buffer_id)
         .map(|buf| with_match_bracket(buf, cursor))
-        .unwrap_or(cursor)
+        .unwrap_or(cursor);
+    with_grep_position(s, client_id, buffer_id, with_brackets)
 }
 
 enum EditKind {
@@ -4081,6 +4183,7 @@ async fn apply_edit(
             position: position_pos,
             anchor: anchor_pos,
             match_bracket: None,
+            grep_position: None,
         }
     } else {
         let post_pos = motion::char_to_pos(buf_mut, start_char + inserted_char_count);
@@ -4088,6 +4191,7 @@ async fn apply_edit(
             position: post_pos,
             anchor: post_pos,
             match_bracket: None,
+            grep_position: None,
         }
     };
     s.cursors.insert((client_id, buffer_id), new_cursor_state);
@@ -4134,7 +4238,7 @@ async fn apply_edit(
     // mid-burst don't need pushes.
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
-    let new_cursor_state = wrap_for_response(&s, buffer_id, new_cursor_state);
+    let new_cursor_state = wrap_for_response(&s, client_id, buffer_id, new_cursor_state);
     drop(s);
 
     for (sender, notif) in pushes {
@@ -4516,6 +4620,33 @@ pub async fn picker_view(
     let mut s = state.lock().await;
     let key = (client_id, params.kind);
 
+    // Pre-resolve cursor info if we'll use it for Grep centering. Done before borrowing
+    // `pickers` out of `s` so we don't have to juggle conflicting borrows after the split.
+    let cursor_centering_info: Option<(LogicalPosition, Option<String>)> =
+        match (params.kind, params.center_on_cursor_grep_hit) {
+            (PickerKind::Grep, Some(buffer_id)) => {
+                let cursor = s
+                    .cursors
+                    .get(&(client_id, buffer_id))
+                    .copied()
+                    .unwrap_or_default();
+                let leading_edge = if (cursor.anchor.line, cursor.anchor.col)
+                    <= (cursor.position.line, cursor.position.col)
+                {
+                    cursor.anchor
+                } else {
+                    cursor.position
+                };
+                let current_path = s.buffers.get(&buffer_id).and_then(|b| {
+                    b.canonical_path.as_deref().and_then(|p| {
+                        crate::workspace_index::project_relative_display(p, &s.project_paths)
+                    })
+                });
+                Some((leading_edge, current_path))
+            }
+            _ => None,
+        };
+
     // (Re-)hydrate picker state. `reset` always wipes; otherwise we keep whatever was persisted
     // from a prior `view`/`query`/`hide` cycle. Split-borrow `pickers` and `matcher` from `s`
     // so we can hold mutable references to both at once.
@@ -4552,12 +4683,39 @@ pub async fn picker_view(
     }
     let picker = pickers.get_mut(&key).expect("populated above");
 
+    // Cursor-derived centering for Grep: resolve the nearest cached hit at-or-after the
+    // cursor's leading selection edge and use it as the effective center_on (overriding any
+    // client-passed item). Lets `Space g` land on the user's spot in the result list even when
+    // the cursor isn't sitting on a hit exactly. The resolution is echoed back via
+    // `effective_center_on` so the client knows what to highlight.
+    let cursor_resolved_item: Option<PickerItem> = match (
+        cursor_centering_info.as_ref(),
+        &picker.candidates,
+    ) {
+        (Some((leading_edge, current_path)), picker_state::PickerCandidates::Grep(hits))
+            if !hits.is_empty() =>
+        {
+            find_nearest_grep_hit(hits, current_path.as_deref(), *leading_edge).map(|c| {
+                PickerItem::GrepHit {
+                    path: c.display_path.clone(),
+                    line: c.line,
+                    col: c.col,
+                    preview: c.preview.clone(),
+                    match_indices: c.match_indices.clone(),
+                }
+            })
+        }
+        _ => None,
+    };
+
     // Resolve the window. `center_on` wins over `offset` and picks a frame containing the item;
     // we centre it (roughly) so a small navigation away keeps it on screen. Falls through to
-    // `offset` if the item isn't currently ranked.
+    // `offset` if the item isn't currently ranked. The cursor-resolved item, when present,
+    // takes precedence over the client-passed `center_on`.
     let limit = params.limit.max(1);
     let mut effective_offset = params.offset;
-    if let Some(item) = params.center_on.as_ref() {
+    let effective_center_on = cursor_resolved_item.or_else(|| params.center_on.clone());
+    if let Some(item) = effective_center_on.as_ref() {
         if let Some(rank) = picker.rank_of(item) {
             let half = limit / 2;
             effective_offset = rank.saturating_sub(half);
@@ -4584,6 +4742,7 @@ pub async fn picker_view(
         generation: picker.generation,
         total_candidates: picker.total_candidates(),
         effective_offset,
+        effective_center_on,
         directory_path,
         directory_parent,
     };
@@ -4710,4 +4869,133 @@ pub async fn picker_hide(
         picker.subscribed = None;
     }
     Ok(())
+}
+
+/// Step through the client's cached grep hits without re-opening the picker. See the protocol
+/// doc on `PickerGrepNavigate` for the directional + virtual-insert rules. Returns `None` when
+/// there are no cached hits or the cursor is past the last (or before the first) hit with no
+/// further file in the requested direction — the client treats `None` as a no-op.
+pub async fn picker_grep_navigate(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: PickerGrepNavigateParams,
+) -> Result<Option<PickerGrepNavigateTarget>, RpcError> {
+    let client_id = ctx.require_hello()?;
+    let s = state.lock().await;
+    let buffer = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    // None for scratch buffers; otherwise the project-relative display path the grep candidates
+    // are keyed by.
+    let current_path: Option<String> = buffer
+        .canonical_path
+        .as_deref()
+        .and_then(|p| crate::workspace_index::project_relative_display(p, &s.project_paths));
+
+    let Some(picker) = s.pickers.get(&(client_id, PickerKind::Grep)) else {
+        return Ok(None);
+    };
+    let picker_state::PickerCandidates::Grep(ref hits) = picker.candidates else {
+        return Ok(None);
+    };
+    if hits.is_empty() {
+        return Ok(None);
+    }
+
+    // Use the outer edge of the cursor's selection so a hit the cursor currently sits on is
+    // treated as "current" and skipped. Without this, `<` from a freshly-jumped grep result
+    // (where the selection covers the whole match) would land back on the same hit because
+    // the hit's stored start position is < the cursor's end position.
+    let cursor = s
+        .cursors
+        .get(&(client_id, params.buffer_id))
+        .copied()
+        .unwrap_or_default();
+    let (min_edge, max_edge) =
+        if (cursor.anchor.line, cursor.anchor.col) < (cursor.position.line, cursor.position.col) {
+            (cursor.anchor, cursor.position)
+        } else {
+            (cursor.position, cursor.anchor)
+        };
+    let target = match params.direction {
+        Direction::Forward => find_next_grep_hit(hits, current_path.as_deref(), max_edge),
+        Direction::Backward => find_prev_grep_hit(hits, current_path.as_deref(), min_edge),
+    };
+    let query = picker.query.clone();
+    Ok(target.map(|c| PickerGrepNavigateTarget {
+        path: c.abs_path.clone(),
+        position: LogicalPosition {
+            line: c.line,
+            col: c.col,
+        },
+        query: query.clone(),
+    }))
+}
+
+/// First grep hit "after" the cursor. Within the same file: the first hit whose `(line, col)` is
+/// past the cursor's. Across files: the first hit whose `display_path` sorts after `current`. If
+/// the current buffer has no path (scratch), every hit counts as "after" and we return the
+/// first.
+///
+/// Assumes `hits` are roughly in `(display_path, line, col)` order — true in practice because
+/// ripgrep walks files in path order via the `ignore` crate, and emits per-file matches in line
+/// order.
+fn find_next_grep_hit<'a>(
+    hits: &'a [picker_state::GrepHitCandidate],
+    current_path: Option<&str>,
+    cursor: LogicalPosition,
+) -> Option<&'a picker_state::GrepHitCandidate> {
+    use std::cmp::Ordering;
+    let Some(current) = current_path else {
+        return hits.first();
+    };
+    hits.iter().find(|h| {
+        match h.display_path.as_str().cmp(current) {
+            Ordering::Greater => true,
+            Ordering::Equal => (h.line, h.col) > (cursor.line, cursor.col),
+            Ordering::Less => false,
+        }
+    })
+}
+
+fn find_prev_grep_hit<'a>(
+    hits: &'a [picker_state::GrepHitCandidate],
+    current_path: Option<&str>,
+    cursor: LogicalPosition,
+) -> Option<&'a picker_state::GrepHitCandidate> {
+    use std::cmp::Ordering;
+    let Some(current) = current_path else {
+        return hits.last();
+    };
+    hits.iter().rev().find(|h| {
+        match h.display_path.as_str().cmp(current) {
+            Ordering::Less => true,
+            Ordering::Equal => (h.line, h.col) < (cursor.line, cursor.col),
+            Ordering::Greater => false,
+        }
+    })
+}
+
+/// First grep hit "at or after" the cursor in walker order, wrapping to the first hit overall
+/// when nothing matches. Used by `picker/view`'s `center_on_cursor_grep_hit` to land the picker
+/// on "where you are" in the result list even when the cursor isn't sitting on a match
+/// exactly. Inclusive (a hit at exactly the cursor's position is the answer), unlike
+/// `find_next_grep_hit` which is strict (`>` skips past the current).
+fn find_nearest_grep_hit<'a>(
+    hits: &'a [picker_state::GrepHitCandidate],
+    current_path: Option<&str>,
+    cursor: LogicalPosition,
+) -> Option<&'a picker_state::GrepHitCandidate> {
+    use std::cmp::Ordering;
+    let Some(current) = current_path else {
+        return hits.first();
+    };
+    hits.iter()
+        .find(|h| match h.display_path.as_str().cmp(current) {
+            Ordering::Greater => true,
+            Ordering::Equal => (h.line, h.col) >= (cursor.line, cursor.col),
+            Ordering::Less => false,
+        })
+        .or_else(|| hits.first())
 }

@@ -9,6 +9,7 @@
 //! confirms a choice, `picker/hide` unsubscribes. The server pushes `picker/update` whenever the
 //! subscribed window's contents change or the matcher snapshot ticks.
 
+use crate::cursor::Direction;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::{BufferId, LogicalPosition};
 use serde::{Deserialize, Serialize};
@@ -135,6 +136,16 @@ pub struct PickerViewParams {
     /// in the results, the server falls back to `offset: 0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center_on: Option<PickerItem>,
+    /// Grep-only convenience: when set, the server resolves the buffer's cursor to the
+    /// nearest cached hit (at-or-after the cursor's leading selection edge, walker order,
+    /// wrapping to the first hit) and uses that as the effective `center_on` — overriding any
+    /// explicit `center_on` the client passed. The resolved item is echoed back in
+    /// `effective_center_on` so the client can use it as its resume highlight. This is what
+    /// makes `Space g` open with the picker landing on "where you are" in the result list
+    /// even when the cursor isn't sitting on a match exactly. No-op when there are no cached
+    /// hits or `kind != Grep`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center_on_cursor_grep_hit: Option<BufferId>,
     /// Explorer only: absolute path of the directory to list. `None` means "keep whatever
     /// directory the picker last listed; default to the first project root on first open".
     /// Ignored for other kinds.
@@ -155,6 +166,12 @@ pub struct PickerViewResult {
     /// The offset the server actually used (matters when the client passed `center_on`). The
     /// follow-up `picker/update` push carries the same offset.
     pub effective_offset: u32,
+    /// The item the server framed `effective_offset` around. Equals what the client passed in
+    /// `center_on` unless `center_on_cursor_grep_hit` resolved (and overrode it) — in which
+    /// case this is the resolved hit, so the client can set its local highlight to match.
+    /// `None` when no centering happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_center_on: Option<PickerItem>,
     /// Explorer only: the canonical absolute path of the directory the picker is listing. `None`
     /// for the other picker kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,6 +259,56 @@ impl RpcMethod for PickerHide {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PickerHideParams {
     pub kind: PickerKind,
+}
+
+// ---- picker/grep_navigate -----------------------------------------------------------------------
+
+/// Step through the cached grep hits from the cursor's current location without re-opening the
+/// picker. Bound to `<` / `>` in Normal mode.
+///
+/// The server looks up the cursor's selection from its own state and uses the selection's
+/// *outer* edges to skip past any match the cursor currently overlaps: Backward compares
+/// against `min(anchor, position)` (so a hit at exactly the selection's start is skipped),
+/// Forward against `max(anchor, position)`. This is what makes `<` go back a *real* step when
+/// the cursor was just placed on a match (e.g. via `>` or via picker selection, where the
+/// cursor's selection covers the entire match).
+///
+/// Direction: Forward = next hit, Backward = previous hit. Resolved against the cached
+/// `PickerKind::Grep` candidates:
+///
+/// - If the current buffer's project-relative path is in the hits, find the next/previous match
+///   *after* / *before* the cursor within the file. When the cursor is past the last (or before
+///   the first) hit in the file, fall through to the first / last hit of the next / previous
+///   file in walker order.
+/// - If the current buffer's path is *not* in the hits (or the buffer has no path), virtually
+///   insert it by path comparison and jump to the first / last hit of the file that would sit
+///   immediately after / before it in walker order. For a buffer with no path (scratch), the
+///   fallback is the first / last hit overall.
+///
+/// Returns `None` when there are no cached grep hits at all, or when navigation would walk past
+/// the end of the list (no wraparound).
+pub struct PickerGrepNavigate;
+impl RpcMethod for PickerGrepNavigate {
+    const NAME: &'static str = "picker/grep_navigate";
+    type Params = PickerGrepNavigateParams;
+    type Result = Option<PickerGrepNavigateTarget>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PickerGrepNavigateParams {
+    pub direction: Direction,
+    pub buffer_id: BufferId,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PickerGrepNavigateTarget {
+    /// Absolute canonical path of the target file — feed into `buffer/open`.
+    pub path: String,
+    /// Position to jump to in the target file.
+    pub position: LogicalPosition,
+    /// The grep query the cached hits came from. Echoed so the client can prime the opened
+    /// buffer's search state for `n` / `Alt-n` follow-on, the same way picker selection does.
+    pub query: String,
 }
 
 // ---- picker/update (notification) ---------------------------------------------------------------

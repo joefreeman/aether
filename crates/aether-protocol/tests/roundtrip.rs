@@ -291,6 +291,7 @@ fn picker_view_params_omit_center_on_when_none() {
         offset: 0,
         limit: 30,
         center_on: None,
+        center_on_cursor_grep_hit: None,
         directory_path: None,
     };
     let v = to_value(&p).unwrap();
@@ -314,6 +315,7 @@ fn picker_view_params_center_on_serialized() {
             path: "x".into(),
             match_indices: vec![],
         }),
+        center_on_cursor_grep_hit: None,
         directory_path: None,
     };
     let v = to_value(&p).unwrap();
@@ -488,6 +490,7 @@ fn picker_view_params_directory_path_skipped_when_none() {
         offset: 0,
         limit: 30,
         center_on: None,
+        center_on_cursor_grep_hit: None,
         directory_path: None,
     };
     let v = to_value(&p).unwrap();
@@ -506,6 +509,7 @@ fn picker_view_params_directory_path_serialized() {
         offset: 0,
         limit: 30,
         center_on: None,
+        center_on_cursor_grep_hit: None,
         directory_path: Some("/home/x/proj/src".into()),
     };
     let v = to_value(&p).unwrap();
@@ -520,12 +524,14 @@ fn picker_view_result_directory_fields_skipped_when_none() {
         generation: 0,
         total_candidates: 5,
         effective_offset: 0,
+        effective_center_on: None,
         directory_path: None,
         directory_parent: None,
     };
     let v = to_value(&r).unwrap();
     assert!(v.get("directory_path").is_none());
     assert!(v.get("directory_parent").is_none());
+    assert!(v.get("effective_center_on").is_none());
 }
 
 #[test]
@@ -536,6 +542,7 @@ fn picker_view_result_directory_fields_serialized() {
         generation: 0,
         total_candidates: 3,
         effective_offset: 0,
+        effective_center_on: None,
         directory_path: Some("/proj/src".into()),
         directory_parent: Some("/proj".into()),
     };

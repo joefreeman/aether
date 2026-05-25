@@ -1,6 +1,8 @@
 //! Ratatui rendering. The buffer fills the screen except for the bottom status row.
 
-use crate::app::{search_counter_label, search_match_count_label, AppState, EditorMode};
+use crate::app::{
+    grep_counter_label, search_counter_label, search_match_count_label, AppState, EditorMode,
+};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::picker::PickerItem;
 use aether_protocol::search::SearchMatchRange;
@@ -1275,9 +1277,18 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![Span::raw(text)])
     } else {
         let dirty_marker = buffer_status_markers(state);
-        let counter = search_counter_label(state)
-            .map(|c| format!("  {c}"))
-            .unwrap_or_default();
+        // Search counter ("3/47") and grep counter ("(2/12)") are independent — either or both
+        // can be present. Joined with a single space so the segment reads naturally when only
+        // one is shown.
+        let counter_parts: Vec<String> = [search_counter_label(state), grep_counter_label(state)]
+            .into_iter()
+            .flatten()
+            .collect();
+        let counter = if counter_parts.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", counter_parts.join(" "))
+        };
         let main = format!(
             " [{project}] {file} {dirty}  {pos}{counter}",
             project = state.project_name,

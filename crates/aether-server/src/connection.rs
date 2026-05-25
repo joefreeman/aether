@@ -19,7 +19,9 @@ use aether_protocol::input::{
     InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine, InputText,
     InputToggleComment, InputUndo,
 };
-use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerView};
+use aether_protocol::picker::{
+    PickerGrepNavigate, PickerHide, PickerQuery, PickerSelect, PickerView,
+};
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportSetWrap, ViewportSubscribe, ViewportUnsubscribe,
@@ -204,6 +206,7 @@ async fn dispatch(
         PickerQuery::NAME => run!(PickerQuery, handlers::picker_query),
         PickerSelect::NAME => run!(PickerSelect, handlers::picker_select),
         PickerHide::NAME => run!(PickerHide, handlers::picker_hide),
+        PickerGrepNavigate::NAME => run!(PickerGrepNavigate, handlers::picker_grep_navigate),
         other => Err(RpcError::method_not_found(other)),
     }
 }

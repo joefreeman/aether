@@ -59,6 +59,9 @@ pub struct GrepHitCandidate {
     pub line: u32,
     /// 0-based byte offset of the match's first byte within the line.
     pub col: u32,
+    /// Byte length of the match within the line. Needed alongside `col` so the server can
+    /// reconstruct the match's end position for "is the cursor exactly on this match?" checks.
+    pub match_byte_len: u32,
     /// The full text of the matching line (trailing newline trimmed). Used as the haystack for
     /// match-indices and as the preview shown in the picker row.
     pub preview: String,

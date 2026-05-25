@@ -19,9 +19,10 @@ use aether_protocol::input::{
     InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
 };
 use aether_protocol::picker::{
-    PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,
-    PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams,
-    PickerView, PickerViewParams,
+    PickerGrepNavigate, PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHide,
+    PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerSelect,
+    PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
+    PickerViewParams,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
@@ -6927,6 +6928,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -6975,6 +6977,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7023,6 +7026,7 @@ async fn picker_select_returns_absolute_path() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7082,6 +7086,7 @@ async fn picker_resume_centers_on_remembered_item() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7121,6 +7126,7 @@ async fn picker_resume_centers_on_remembered_item() {
                 path: "src/lib.rs".into(),
                 match_indices: vec![],
             }),
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7150,6 +7156,7 @@ async fn picker_reset_wipes_persisted_query() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7185,6 +7192,7 @@ async fn picker_reset_wipes_persisted_query() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7282,6 +7290,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7329,6 +7338,7 @@ async fn buffers_picker_select_returns_buffer_id() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7435,6 +7445,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7501,6 +7512,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7586,6 +7598,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7689,6 +7702,7 @@ async fn buffers_picker_pushes_on_save() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7762,6 +7776,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -7847,6 +7862,7 @@ async fn buffers_picker_mru_is_per_client() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -8978,6 +8994,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9050,6 +9067,7 @@ async fn picker_grep_short_query_yields_empty_result() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9091,6 +9109,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9130,6 +9149,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9158,6 +9178,7 @@ async fn picker_grep_treats_query_as_regex() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9199,6 +9220,7 @@ async fn picker_grep_caches_completed_query() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9238,6 +9260,452 @@ async fn picker_grep_caches_completed_query() {
         !cached.ticking,
         "cache hit must not mark the picker as ticking — no new search was spawned"
     );
+
+    drop(server);
+}
+
+/// Open a buffer at `relative_path` against an established (server, ws) handshake. Used by the
+/// grep_navigate tests to put a buffer in scope before calling the RPC.
+async fn open_test_buffer(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    request_id: u64,
+    relative_path: &str,
+) -> u64 {
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        ws,
+        request_id,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some(relative_path.into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    open.buffer_id
+}
+
+/// Run a grep query against `setup_grep_workspace`'s "needle" pattern and return (server, ws,
+/// final picker update). Shared setup for the navigation tests.
+async fn setup_grep_with_needle_query() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let _ = drain_grep_until_done(&mut ws).await;
+    (server, ws)
+}
+
+/// Park the client's cursor at `position` (anchor == position, a point cursor) on the buffer.
+/// Used by the grep_navigate tests to set up the cursor position the handler will look up.
+async fn set_point_cursor(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    request_id: u64,
+    buffer_id: u64,
+    position: LogicalPosition,
+) {
+    let _: CursorState = send_request::<CursorSet>(
+        ws,
+        request_id,
+        &CursorSetParams {
+            buffer_id,
+            position,
+            anchor: position,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn grep_navigate_forward_within_file_then_falls_through_to_next_file() {
+    // Workspace has needle hits at src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4. The walker
+    // visits files in path order, so the cached candidates list is in (path, line, col) order.
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+
+    // Cursor at the top of main.rs (before any hit) — forward jumps to the first hit in this file.
+    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+        &mut ws,
+        22,
+        &PickerGrepNavigateParams {
+            direction: Direction::Forward,
+            buffer_id,
+        },
+    )
+    .await;
+    let target = target.expect("hit in current file");
+    assert!(target.path.ends_with("src/main.rs"));
+    assert_eq!(target.position, LogicalPosition { line: 1, col: 4 });
+    assert_eq!(target.query, "needle");
+
+    // Cursor sitting on the second hit (line 2) — forward falls off the end of main.rs and we
+    // stop (no file alphabetically after src/main.rs has a hit).
+    set_point_cursor(&mut ws, 23, buffer_id, LogicalPosition { line: 2, col: 4 }).await;
+    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+        &mut ws,
+        24,
+        &PickerGrepNavigateParams {
+            direction: Direction::Forward,
+            buffer_id,
+        },
+    )
+    .await;
+    assert!(target.is_none());
+
+    // Backward from inside main.rs falls through to lib.rs after exhausting main.rs's hits.
+    set_point_cursor(&mut ws, 25, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
+    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+        &mut ws,
+        26,
+        &PickerGrepNavigateParams {
+            direction: Direction::Backward,
+            buffer_id,
+        },
+    )
+    .await;
+    let target = target.expect("hit in earlier file");
+    assert!(target.path.ends_with("src/lib.rs"));
+    assert_eq!(target.position, LogicalPosition { line: 0, col: 3 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn grep_navigate_virtual_insert_when_current_file_has_no_hits() {
+    // README.md isn't in the result set. Forward should jump to the first hit alphabetically
+    // *after* it (src/lib.rs, since 'R' < 's'). Backward returns None — no file is before
+    // README.md alphabetically.
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "README.md").await;
+    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+
+    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+        &mut ws,
+        22,
+        &PickerGrepNavigateParams {
+            direction: Direction::Forward,
+            buffer_id,
+        },
+    )
+    .await;
+    let target = target.expect("forward jumps to next-file hit");
+    assert!(target.path.ends_with("src/lib.rs"));
+    assert_eq!(target.position, LogicalPosition { line: 0, col: 3 });
+
+    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+        &mut ws,
+        23,
+        &PickerGrepNavigateParams {
+            direction: Direction::Backward,
+            buffer_id,
+        },
+    )
+    .await;
+    assert!(
+        target.is_none(),
+        "nothing in the workspace sorts before README.md"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn grep_navigate_returns_none_when_no_cached_grep() {
+    // No `picker/view` for Grep + no `picker/query` → there's no Grep picker state for this
+    // client. The handler should return None without erroring, so `<` / `>` is a clean no-op.
+    let (server, mut ws) = setup_grep_workspace().await;
+    let buffer_id = open_test_buffer(&mut ws, 10, "src/main.rs").await;
+    set_point_cursor(&mut ws, 11, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+
+    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+        &mut ws,
+        12,
+        &PickerGrepNavigateParams {
+            direction: Direction::Forward,
+            buffer_id,
+        },
+    )
+    .await;
+    assert!(target.is_none());
+
+    drop(server);
+}
+
+/// `grep_position` is `Some` on `CursorState` when the cursor's selection covers a cached
+/// grep hit *exactly* (anchor at match start, position at match's last char), and `None`
+/// otherwise — the same strict endpoint check `match_index_for_cursor` uses for `A/B`.
+#[tokio::test]
+async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+
+    // Hits across the workspace are: src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4.
+    // "needle" is 6 bytes, so the main.rs:1 match covers cols 4..=9 — the cursor must select
+    // exactly that range to count as "on" it. This is the post-`<`/`>` shape (anchor at the
+    // match start, position at its last char).
+    let st: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        21,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 9 },
+            anchor: LogicalPosition { line: 1, col: 4 },
+        },
+    )
+    .await;
+    let gp = st
+        .grep_position
+        .expect("selection covers the hit exactly");
+    assert_eq!(gp.current, 2);
+    assert_eq!(gp.total, 3);
+
+    // Orientation-agnostic: swapping anchor/position still counts as "on" the hit.
+    let st: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        22,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 4 },
+            anchor: LogicalPosition { line: 1, col: 9 },
+        },
+    )
+    .await;
+    assert!(st.grep_position.is_some());
+
+    // A point cursor at the hit's start (anchor == position == match start) doesn't cover the
+    // whole match — indicator clears, matching how A/B drops a partial selection.
+    let st: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        23,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 4 },
+            anchor: LogicalPosition { line: 1, col: 4 },
+        },
+    )
+    .await;
+    assert!(st.grep_position.is_none());
+
+    // A larger selection that contains the match but extends past it also doesn't count.
+    let st: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        24,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 10 },
+            anchor: LogicalPosition { line: 1, col: 4 },
+        },
+    )
+    .await;
+    assert!(st.grep_position.is_none());
+
+    drop(server);
+}
+
+/// `picker/view`'s `center_on_cursor_grep_hit` resolves to the nearest cached hit at-or-after
+/// the cursor — not just exact-on-a-match like `cursor.grep_position`. Lets `Space g` open on
+/// "where you are" in the result list even when the cursor is between matches.
+#[tokio::test]
+async fn picker_view_centers_on_cursor_nearest_grep_hit() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    // Cursor on line 1 col 0 — between the start of file and the first hit (line 1 col 4).
+    // The nearest at-or-after hit in src/main.rs is the line-1 match (hit #2 of 3).
+    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
+    // First view to hydrate the picker against the cached grep cache (the candidates from the
+    // earlier `setup_grep_with_needle_query` are reused on the second view below).
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        22,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: false,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor_grep_hit: Some(buffer_id),
+            directory_path: None,
+        },
+    )
+    .await;
+    let update = drain_grep_until_done(&mut ws).await;
+    // Resolved hit is src/main.rs:1:4.
+    let item = update
+        .items
+        .iter()
+        .find(|i| matches!(i, PickerItem::GrepHit { path, line, col, .. } if path == "src/main.rs" && *line == 1 && *col == 4))
+        .expect("main.rs:1:4 should be in the pushed window");
+    let _ = item;
+
+    // Cursor past the last hit in src/main.rs — the nearest at-or-after walks off the file
+    // and wraps to the first hit overall (src/lib.rs:0:3, hit #1 of 3).
+    set_point_cursor(&mut ws, 23, buffer_id, LogicalPosition { line: 3, col: 0 }).await;
+    let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        24,
+        &PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: false,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor_grep_hit: Some(buffer_id),
+            directory_path: None,
+        },
+    )
+    .await;
+    let resolved = view
+        .effective_center_on
+        .expect("server should echo back the wrapped-to-first hit");
+    match resolved {
+        PickerItem::GrepHit { path, line, col, .. } => {
+            assert_eq!(path, "src/lib.rs");
+            assert_eq!(line, 0);
+            assert_eq!(col, 3);
+        }
+        other => panic!("expected GrepHit, got {other:?}"),
+    }
+
+    drop(server);
+}
+
+/// The cursor that comes back from `search_set` (used by `<`/`>` to prime in-buffer search)
+/// must carry `grep_position` — without `wrap_for_response` being called on the response, the
+/// status bar would only see the indicator on the next motion.
+#[tokio::test]
+async fn search_set_response_carries_grep_position() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+
+    // Park the cursor before any hit, then SearchSet with anchor at the first match position —
+    // this mirrors what the TUI's grep_navigate flow does after `<` / `>`.
+    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        22,
+        &SearchSetParams {
+            buffer_id,
+            query: "needle".into(),
+            anchor: Some(LogicalPosition { line: 1, col: 4 }),
+        },
+    )
+    .await;
+    // search_set parked us on the match — selection covers cols 4..=9, which is the hit.
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 4 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 9 });
+    let gp = r
+        .cursor
+        .grep_position
+        .expect("search_set response should be wrapped");
+    assert_eq!(gp.current, 2);
+    assert_eq!(gp.total, 3);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn cursor_grep_position_is_none_without_cached_grep() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let buffer_id = open_test_buffer(&mut ws, 10, "src/lib.rs").await;
+    let st: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: LogicalPosition { line: 0, col: 3 },
+        },
+    )
+    .await;
+    assert!(st.grep_position.is_none());
+
+    drop(server);
+}
+
+/// Regression: when the cursor's selection covers a grep match (e.g. after picker selection
+/// primes the search, leaving anchor at the match start and position at the match end), `<`
+/// should skip *past* the current match rather than landing back on it. The server compares
+/// against the selection's leading edge for Backward, not the trailing edge.
+#[tokio::test]
+async fn grep_navigate_backward_skips_currently_selected_match() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+
+    // Simulate the post-jump cursor: selection covers the "needle" match on line 1 (cols 4–9,
+    // since "needle" is 6 chars; inclusive cursor lands on the last char, col 9; anchor at
+    // the start of the match, col 4).
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        21,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 9 },
+            anchor: LogicalPosition { line: 1, col: 4 },
+        },
+    )
+    .await;
+
+    // Backward must walk past this match (start at col 4 == selection's leading edge) and land
+    // on the previous hit in src/lib.rs:0:3.
+    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+        &mut ws,
+        22,
+        &PickerGrepNavigateParams {
+            direction: Direction::Backward,
+            buffer_id,
+        },
+    )
+    .await;
+    let target = target.expect("backward should step past the current match");
+    assert!(target.path.ends_with("src/lib.rs"));
+    assert_eq!(target.position, LogicalPosition { line: 0, col: 3 });
+
+    // Forward from the same selection skips past the trailing edge (col 9) and lands on the
+    // next hit at line 2 col 4.
+    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+        &mut ws,
+        23,
+        &PickerGrepNavigateParams {
+            direction: Direction::Forward,
+            buffer_id,
+        },
+    )
+    .await;
+    let target = target.expect("forward should step past the current match");
+    assert!(target.path.ends_with("src/main.rs"));
+    assert_eq!(target.position, LogicalPosition { line: 2, col: 4 });
 
     drop(server);
 }
@@ -9295,6 +9763,7 @@ async fn picker_explorer_default_lists_project_root() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9341,6 +9810,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: Some(target.display().to_string()),
         },
     )
@@ -9381,6 +9851,7 @@ async fn picker_explorer_query_filters_by_prefix() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9438,6 +9909,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9478,6 +9950,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9536,6 +10009,7 @@ async fn picker_explorer_query_is_smartcase() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9595,6 +10069,7 @@ async fn picker_explorer_select_file_returns_absolute_path() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: Some(target.display().to_string()),
         },
     )
@@ -9640,6 +10115,7 @@ async fn picker_explorer_select_directory_errors() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9680,6 +10156,7 @@ async fn picker_explorer_rejects_path_outside_project() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: Some("/etc".into()),
         },
     )
@@ -9707,6 +10184,7 @@ async fn picker_explorer_resumes_last_directory() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: Some(target.display().to_string()),
         },
     )
@@ -9731,6 +10209,7 @@ async fn picker_explorer_resumes_last_directory() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )
@@ -9758,6 +10237,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
             offset: 0,
             limit: 30,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         },
     )

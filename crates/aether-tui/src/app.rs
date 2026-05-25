@@ -25,9 +25,9 @@ use aether_protocol::input::{
     InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
 };
 use aether_protocol::picker::{
-    PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,
-    PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams,
-    PickerView, PickerViewParams,
+    PickerGrepNavigate, PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem,
+    PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
+    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNext, SearchPrev, SearchSet,
@@ -1265,7 +1265,53 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             search_cycle(client, state, Direction::Forward, count).await?
         }
 
+        // ---- grep navigation ----
+        // `>` / `<` step through the last grep query's hits without re-opening the picker. The
+        // server resolves the next/previous hit against the cursor's position (within-file
+        // first, falling through to the next/previous file in path order). Silently no-op when
+        // there are no cached hits or we're past the list ends.
+        (KeyCode::Char('>'), _) => grep_navigate(client, state, Direction::Forward).await?,
+        (KeyCode::Char('<'), _) => grep_navigate(client, state, Direction::Backward).await?,
+
         _ => {}
+    }
+    Ok(())
+}
+
+/// Implementation of `<` / `>`. Asks the server for the next/previous grep hit relative to the
+/// current cursor and, if any, opens the target file at that position. Primes the new buffer's
+/// search state with the picker's query so `n` / `Alt-n` follow-through works — mirrors what
+/// picker selection of a grep hit does.
+async fn grep_navigate(
+    client: &mut Client,
+    state: &mut AppState,
+    direction: Direction,
+) -> Result<()> {
+    let target = client
+        .rpc::<PickerGrepNavigate>(PickerGrepNavigateParams {
+            direction,
+            buffer_id: state.editor.buffer_id,
+        })
+        .await?;
+    let Some(target) = target else {
+        return Ok(());
+    };
+    open_file_at_path(client, state, target.path, false, Some(target.position)).await?;
+    if !target.query.is_empty() {
+        let buffer_id = state.editor.buffer_id;
+        let r = client
+            .rpc::<SearchSet>(SearchSetParams {
+                buffer_id,
+                query: target.query.clone(),
+                anchor: Some(target.position),
+            })
+            .await?;
+        let ed = &mut state.editor;
+        ed.cursor = r.cursor;
+        ed.search.summary = Some(r.summary);
+        ed.search.query.set(target.query.clone());
+        ed.search.active = true;
+        push_history(state, target.query);
     }
     Ok(())
 }
@@ -1367,8 +1413,10 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
     let pane_rows = picker_pane_rows(state);
     let limit = picker_fetch_limit(state);
     // Pre-selection / centring policy per kind:
-    //   - Grep: resume the previously highlighted hit (its candidate set is expensive — a
-    //     workspace scan — so reopening shouldn't throw it away).
+    //   - Grep: the server centres on the cursor's nearest hit via `center_on_cursor_grep_hit`
+    //     below — keeps the picker in sync with where the user is in the buffer even when the
+    //     cursor isn't sitting on a match exactly. Local `last_selected` is the fallback for
+    //     the empty-cache / no-hits-after-cursor case.
     //   - Explorer: anchor on the active buffer's filename so the listing lands on the user's
     //     current file, regardless of where the user last navigated to.
     //   - Files / Buffers: no pre-selection, open at the top.
@@ -1392,6 +1440,11 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
     } else {
         None
     };
+    // For Grep, ask the server to centre on the cursor's nearest hit (overriding our local
+    // `center_on` when it resolves). This lets the picker open on "where you are" in the
+    // result list even when the cursor isn't sitting on a match exactly — `cursor_grep_hit_item`
+    // alone only covers the strict-on-a-match case.
+    let center_on_cursor_grep_hit = (kind == PickerKind::Grep).then_some(state.editor.buffer_id);
     let view = client
         .rpc::<PickerView>(PickerViewParams {
             kind,
@@ -1399,6 +1452,7 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
             offset: 0,
             limit,
             center_on: center_on.clone(),
+            center_on_cursor_grep_hit,
             directory_path: explorer_path_for_view,
         })
         .await?;
@@ -1427,7 +1481,9 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
     state.picker.total_candidates = view.total_candidates;
     state.picker.ticking = true;
     state.picker.selected = 0;
-    state.picker.resume_target = center_on;
+    // Prefer the server-resolved centre item (set when `center_on_cursor_grep_hit` resolved)
+    // so `apply_update` snaps the highlight to the same row the server framed.
+    state.picker.resume_target = view.effective_center_on.clone().or(center_on);
     state.picker.resume_row_offset = resume_row_offset;
     state.picker.pending_offset = None;
     // Explorer: the server returns the canonical path + parent. Stash them so navigation
@@ -1521,6 +1577,7 @@ async fn picker_navigate_to_dir(
             offset: 0,
             limit,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: Some(directory_path),
         })
         .await?;
@@ -1757,6 +1814,7 @@ async fn flush_pending_picker_scroll(client: &mut Client, state: &mut AppState) 
             offset: target,
             limit,
             center_on: None,
+            center_on_cursor_grep_hit: None,
             directory_path: None,
         })
         .await?;
@@ -2467,6 +2525,15 @@ fn format_total(s: &SearchSummary) -> String {
     }
 }
 
+/// `Some("(3/12)")` when the server reports the cursor is currently on a cached grep hit, paired
+/// with the total hit count across the workspace. `None` whenever there's no cached grep or the
+/// cursor isn't on a hit — the status bar then renders nothing for the grep slot, matching the
+/// "hide when not on a match" treatment for the in-buffer search counter.
+pub fn grep_counter_label(state: &AppState) -> Option<String> {
+    let gp = state.editor.cursor.grep_position?;
+    Some(format!("({}/{})", gp.current, gp.total))
+}
+
 /// Summary line for the search prompt: "3/47", "3/10000+", or "no matches". `None` when the
 /// query is empty (the bare `/` already conveys "no search yet").
 pub fn search_match_count_label(state: &AppState) -> Option<String> {
@@ -2634,6 +2701,7 @@ async fn handle_resize(
                     offset: state.picker.offset,
                     limit: new_limit,
                     center_on: None,
+                    center_on_cursor_grep_hit: None,
                     directory_path: None,
                 })
                 .await?;

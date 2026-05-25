@@ -243,6 +243,7 @@ impl<'a> Sink for HitCollector<'a> {
                 abs_path: self.abs_path.to_string(),
                 line: line_num,
                 col,
+                match_byte_len: (byte_end - byte_start) as u32,
                 preview: preview.clone(),
                 match_indices,
             });

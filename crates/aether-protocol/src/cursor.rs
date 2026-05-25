@@ -150,6 +150,23 @@ pub struct CursorState {
     /// client's match-bracket highlight overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_bracket: Option<(LogicalPosition, LogicalPosition)>,
+    /// `Some` when the cursor is currently sitting on a grep hit from this client's cached
+    /// grep results. Carries the 1-based index of the hit (across the whole workspace, not
+    /// just the current file) and the total hit count, so the status bar can render `(C/D)`
+    /// alongside the in-buffer search counter. `None` when the cursor isn't on any hit or
+    /// there are no cached grep results. Derived per-response like `match_bracket`; never
+    /// stored in `state.cursors`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grep_position: Option<GrepPosition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrepPosition {
+    /// 1-based index of the hit the cursor is currently on, within the full ordered list of
+    /// cached grep hits.
+    pub current: u32,
+    /// Total number of cached grep hits across the workspace.
+    pub total: u32,
 }
 
 impl CursorState {
