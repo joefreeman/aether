@@ -195,27 +195,43 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         Motion::VisualLine { .. }
         | Motion::VisualLineStart { .. }
         | Motion::VisualLineEnd { .. } => current,
-        Motion::MatchBracket => {
+        Motion::MatchBracket { inner } => {
             let Some(syntax) = buf.syntax.as_ref() else {
                 return current;
             };
-            let source: String = buf.text.chunks().collect();
             let cursor_byte = buf.text.char_to_byte(pos_to_char(buf, current));
             let Some((open, close)) =
                 crate::brackets::find_match_bracket(&syntax.tree, cursor_byte)
             else {
                 return current;
             };
-            // Jump to whichever bracket isn't under the cursor. If the cursor isn't on either
-            // (i.e. inside the pair), default to the opener — Vim's `%` does the same.
-            let target_byte = if cursor_byte == open {
+            // Outer: jump to whichever bracket isn't under the cursor; default to the opener
+            // when the cursor sits between them (Vim's `%`).
+            //
+            // Inner: jump *one char inside* the matching bracket so the brackets themselves
+            // can be excluded from any extend-selection that follows. Toggle when the cursor
+            // already sits at one inner side (open+1 or close-1) so a repeat press lands on
+            // the opposite side — that's what makes `Alt-m Shift-Alt-m` produce the inside
+            // selection. For empty pairs (`()`) the inner positions collapse to the brackets
+            // themselves, so the motion is a no-op.
+            let target_byte = if *inner {
+                let inner_open = open + 1;
+                let inner_close = close.saturating_sub(1);
+                if inner_open >= close {
+                    return current;
+                }
+                if cursor_byte == open || cursor_byte == inner_open {
+                    inner_close
+                } else {
+                    inner_open
+                }
+            } else if cursor_byte == open {
                 close
             } else if cursor_byte == close {
                 open
             } else {
                 open
             };
-            let _ = source; // (kept for future predicate work)
             char_to_pos(buf, buf.text.byte_to_char(target_byte))
         }
         Motion::NextNavigationUnit | Motion::PrevNavigationUnit => {

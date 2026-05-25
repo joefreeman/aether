@@ -1871,10 +1871,16 @@ pub async fn cursor_move(
 /// of one line, cursor at the end byte of another); orientation (forward / backward) is whatever
 /// the input was.
 ///
-/// Forward always grows the *bottom-most* edge of the selection downward; backward always grows
-/// the *top-most* edge upward. This means the operation looks the same to the user regardless of
-/// which end the cursor sits on — useful after `cursor/swap_anchor`. The cursor stays at the end
-/// it was already on; the anchor occupies the other end.
+/// Forward grows the *bottom-most* edge of the selection downward; backward grows the *top-most*
+/// edge upward. This means edge-extension stays orientation-independent of which end the cursor
+/// sits on — useful after `cursor/swap_anchor`. The cursor stays at the end it was already on;
+/// the anchor occupies the other end.
+///
+/// First-press, point-cursor asymmetry: when there's no selection, Forward selects the cursor's
+/// line, while Backward (extend or not) selects the line *above* the cursor. That keeps the two
+/// bindings distinct on the very first press (otherwise both would just select the current line)
+/// and matches a "go up" mental model for Backward. Subsequent presses behave the same as
+/// before: Backward + extend then widens upward from there.
 pub async fn cursor_select_line(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -1905,14 +1911,17 @@ pub async fn cursor_select_line(
     // Advance the relevant edge only when the selection is already snapped to whole lines;
     // otherwise snap it without advancing. A point cursor (anchor == position) on an empty
     // line is trivially whole — there's nothing within the line to extend over, so we
-    // advance on the first press rather than getting stuck.
+    // advance on the first press rather than getting stuck. Backward on any point cursor
+    // (extend or not) also advances upward, so Alt-x and Alt-Shift-x both jump to the line
+    // above on the first press (see the doc comment).
     let bottom_len = motion::line_byte_len_excl_newline(buf, bottom_edge.line);
     let already_whole = if has_range {
         top_edge.col == 0 && bottom_edge.col >= bottom_len
     } else {
         bottom_len == 0 && cur.col == 0
     };
-    let new_top = if already_whole && params.direction == Direction::Backward {
+    let advance_top_for_backward = already_whole || !has_range;
+    let new_top = if advance_top_for_backward && params.direction == Direction::Backward {
         top_edge.line.saturating_sub(1)
     } else {
         top_edge.line

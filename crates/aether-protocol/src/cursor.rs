@@ -92,7 +92,14 @@ pub enum Motion {
     /// bracket, the bracket that encloses the cursor's position). With `extend_selection`,
     /// produces a selection from the cursor's original position to the matching bracket — the
     /// natural "select around brackets" gesture (Vim's `v%`).
-    MatchBracket,
+    ///
+    /// `inner: true` shifts the target one char *inside* the bracket (so the brackets
+    /// themselves are excluded). The handler also toggles direction when the cursor already
+    /// sits at one inner side, so `MatchBracket { inner: true }` followed by extend lands on
+    /// the opposite inner side — the "select inside brackets" gesture.
+    MatchBracket {
+        inner: bool,
+    },
     /// Jump to the next per-language "navigation unit" past the cursor (functions, structs,
     /// HTML elements, CSS rule sets, etc. — see `LanguageConfig::navigation_kinds` on the
     /// server). The cursor's position implicitly determines the level: inside a method, `]`

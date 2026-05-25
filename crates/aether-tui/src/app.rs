@@ -804,9 +804,9 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             state.editor.search.active = false;
             state.editor.search.summary = None;
         }
-        // `d` collapses any multi-char selection to a 1-char point at the cursor. No-op if
+        // `c` collapses any multi-char selection to a 1-char point at the cursor. No-op if
         // already a point. Visually unchanged: the block cursor stays where it was.
-        (KeyCode::Char('d'), m) if m == KeyModifiers::NONE => {
+        (KeyCode::Char('c'), m) if m == KeyModifiers::NONE => {
             if !state.editor.cursor.is_point() {
                 clear_selection(client, state).await?;
             }
@@ -921,6 +921,71 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
                     direction: Direction::Forward,
                     count,
                     preserve_col: true,
+                },
+                extend,
+            )
+            .await?
+        }
+
+        // ---- motions: page / half-page ----
+        // `u`/`d` move the cursor by a full viewport's worth of visual rows; `Alt-u`/`Alt-d` move
+        // by half. Measured in visual rows so wrapped content steps consistently. Count prefix
+        // multiplies (e.g. `3d` = three pages). The viewport follows the cursor on re-render.
+        (KeyCode::Char('d'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            let viewport_id = state.editor.viewport_id;
+            let lines = count.saturating_mul(state.viewport_rows.max(1));
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction: VerticalDirection::Down,
+                    count: lines,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('u'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
+            let viewport_id = state.editor.viewport_id;
+            let lines = count.saturating_mul(state.viewport_rows.max(1));
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction: VerticalDirection::Up,
+                    count: lines,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::ALT) => {
+            let viewport_id = state.editor.viewport_id;
+            let lines = count.saturating_mul((state.viewport_rows / 2).max(1));
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction: VerticalDirection::Down,
+                    count: lines,
+                },
+                extend,
+            )
+            .await?
+        }
+        (KeyCode::Char('u'), m) if m.contains(KeyModifiers::ALT) => {
+            let viewport_id = state.editor.viewport_id;
+            let lines = count.saturating_mul((state.viewport_rows / 2).max(1));
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction: VerticalDirection::Up,
+                    count: lines,
                 },
                 extend,
             )
@@ -1060,8 +1125,14 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // `m` jumps to the bracket that matches the one under (or enclosing) the cursor.
         // `Shift-m` does the same with `extend=true`, producing a selection from the original
         // position to the match — a natural "select around brackets" gesture (Vim's `v%`).
+        // `Alt-m` is the "inner" counterpart: it jumps one char inside the matching bracket
+        // and toggles sides on repeat, so `Alt-m Shift-Alt-m` selects everything *inside*
+        // the bracket pair (excluding the brackets themselves).
         (KeyCode::Char('m'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            move_motion(client, state, Motion::MatchBracket, extend).await?
+            move_motion(client, state, Motion::MatchBracket { inner: false }, extend).await?
+        }
+        (KeyCode::Char('m'), m) if m == ALT_ONLY || m == (ALT_ONLY | SHIFT_ONLY) => {
+            move_motion(client, state, Motion::MatchBracket { inner: true }, extend).await?
         }
 
         // ---- motions: navigation units ----
@@ -1124,19 +1195,19 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // edge, so a subsequent `Shift-*` motion extends from the other side.
         (KeyCode::Char('o'), m) if m == KeyModifiers::NONE => swap_anchor(client, state).await?,
 
-        // Tree-sitter selection expansion / contraction. `,` grows the selection to the smallest
-        // enclosing syntax node; `.` reverses one step. With `N` prefix, applied N times.
-        (KeyCode::Char(','), m) if m == KeyModifiers::NONE => {
+        // Tree-sitter selection expansion / contraction. `y` grows the selection to the smallest
+        // enclosing syntax node; `Alt-y` reverses one step. With `N` prefix, applied N times.
+        (KeyCode::Char('y'), m) if m == KeyModifiers::NONE => {
             tree_expand(client, state, count).await?
         }
-        (KeyCode::Char('.'), m) if m == KeyModifiers::NONE => {
+        (KeyCode::Char('y'), m) if m == ALT_ONLY => {
             tree_contract(client, state, count).await?
         }
 
         // Motion undo / redo — per-client history of cursor/selection changes, capped at the
-        // last buffer mutation. Distinct from `Ctrl-u`/`Ctrl-Alt-u` which rewind buffer edits.
-        (KeyCode::Char('u'), m) if m == ALT_ONLY => motion_redo(client, state, count).await?,
-        (KeyCode::Char('u'), m) if m == KeyModifiers::NONE => {
+        // last buffer mutation. Distinct from `Ctrl-z`/`Ctrl-Alt-z` which rewind buffer edits.
+        (KeyCode::Char('z'), m) if m == ALT_ONLY => motion_redo(client, state, count).await?,
+        (KeyCode::Char('z'), m) if m == KeyModifiers::NONE => {
             motion_undo(client, state, count).await?
         }
 
@@ -1168,7 +1239,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // ---- viewport ----
         // `Ctrl-p` (toggle wrap) goes through the shared Ctrl handler below; only the
         // non-Ctrl viewport bindings (centre-cursor) live here.
-        (KeyCode::Char('z'), m) if m == KeyModifiers::NONE => center_cursor(client, state).await?,
+        (KeyCode::Char('-'), m) if m == KeyModifiers::NONE => center_cursor(client, state).await?,
 
         // ---- delete (also bound to Delete key) ----
         // The plain `Delete` key shares semantics with `Ctrl-d` in Normal mode (delete-
@@ -2615,7 +2686,7 @@ fn is_repeatable_motion(motion: &Motion) -> bool {
         | Motion::Goto { .. }
         | Motion::VisualLineStart { .. }
         | Motion::VisualLineEnd { .. }
-        | Motion::MatchBracket
+        | Motion::MatchBracket { .. }
         | Motion::EndOfNavigationUnit
         | Motion::StartOfNavigationUnit => false,
     }
@@ -3036,8 +3107,8 @@ async fn handle_ctrl_binding(
         // ---- viewport ----
         (KeyCode::Char('p'), CTRL_ONLY) => toggle_wrap(client, state).await?,
         // ---- undo / redo ----
-        (KeyCode::Char('u'), CTRL_ONLY) => undo(client, state, count).await?,
-        (KeyCode::Char('u'), m) if m == ctrl_alt => redo(client, state, count).await?,
+        (KeyCode::Char('z'), CTRL_ONLY) => undo(client, state, count).await?,
+        (KeyCode::Char('z'), m) if m == ctrl_alt => redo(client, state, count).await?,
         // ---- line manipulation (count-taking in Normal; count=1 in Insert) ----
         (KeyCode::Char('j'), CTRL_ONLY) => {
             move_lines(client, state, VerticalDirection::Down, count).await?
