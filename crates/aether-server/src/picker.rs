@@ -26,6 +26,14 @@ pub struct BufferCandidate {
     pub dirty: bool,
 }
 
+/// One project-picker candidate. Built fresh per `picker/view` from
+/// `config::list_project_names()` — the configured-projects set changes only via the user
+/// editing `~/.config/aether/projects/*.toml` and we re-list on each open anyway.
+#[derive(Debug, Clone)]
+pub struct ProjectCandidate {
+    pub name: String,
+}
+
 /// One explorer-picker entry. Children of the picker's `current_path` directory; rebuilt by
 /// each `picker/view` (Explorer always re-lists, like Buffers always rebuilds — directories
 /// can change underneath us and there's no point caching them).
@@ -100,6 +108,9 @@ pub enum PickerCandidates {
     /// Filesystem entries of the picker's current directory. Re-listed on every `picker/view`
     /// (directories can mutate underneath us; no point caching).
     Explorer(ExplorerCandidates),
+    /// Configured project names. Re-listed on each `picker/view` — small N, no caching needed,
+    /// and the user may have edited `~/.config/aether/projects/` between opens.
+    Projects(Vec<ProjectCandidate>),
 }
 
 impl PickerCandidates {
@@ -109,6 +120,7 @@ impl PickerCandidates {
             PickerCandidates::Buffers(v) => v.len(),
             PickerCandidates::Grep(v) => v.len(),
             PickerCandidates::Explorer(e) => e.entries.len(),
+            PickerCandidates::Projects(v) => v.len(),
         }
     }
 
@@ -118,6 +130,7 @@ impl PickerCandidates {
             PickerCandidates::Buffers(_) => PickerKind::Buffers,
             PickerCandidates::Grep(_) => PickerKind::Grep,
             PickerCandidates::Explorer(_) => PickerKind::Explorer,
+            PickerCandidates::Projects(_) => PickerKind::Projects,
         }
     }
 
@@ -129,12 +142,13 @@ impl PickerCandidates {
             PickerCandidates::Buffers(v) => &v[idx].display,
             PickerCandidates::Grep(v) => &v[idx].preview,
             PickerCandidates::Explorer(e) => &e.entries[idx].name,
+            PickerCandidates::Projects(v) => &v[idx].name,
         }
     }
 
     /// Build the protocol-level `PickerItem` for candidate `idx`. `match_indices` is supplied by
-    /// the fuzzy matcher for Files/Buffers/Explorer and ignored for Grep (the candidate already
-    /// carries the ripgrep-computed match positions, which we use verbatim).
+    /// the fuzzy matcher for Files/Buffers/Explorer/Projects and ignored for Grep (the candidate
+    /// already carries the ripgrep-computed match positions, which we use verbatim).
     pub fn make_item(&self, idx: usize, match_indices: Vec<u32>) -> PickerItem {
         match self {
             PickerCandidates::Files(v) => PickerItem::File {
@@ -168,6 +182,10 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::Projects(v) => PickerItem::Project {
+                name: v[idx].name.clone(),
+                match_indices,
+            },
         }
     }
 
@@ -192,6 +210,9 @@ impl PickerCandidates {
             (PickerCandidates::Explorer(e), PickerItem::DirEntry { name, .. }) => {
                 e.entries.iter().position(|c| c.name == *name)
             }
+            (PickerCandidates::Projects(v), PickerItem::Project { name, .. }) => {
+                v.iter().position(|c| c.name == *name)
+            }
             _ => None,
         }
     }
@@ -201,7 +222,9 @@ impl PickerCandidates {
     /// dispatch through one switch instead of scattered `matches!(..., Grep|Explorer)` checks.
     pub fn match_strategy(&self) -> MatchStrategy {
         match self {
-            PickerCandidates::Files(_) | PickerCandidates::Buffers(_) => MatchStrategy::Fuzzy,
+            PickerCandidates::Files(_)
+            | PickerCandidates::Buffers(_)
+            | PickerCandidates::Projects(_) => MatchStrategy::Fuzzy,
             PickerCandidates::Explorer(_) => MatchStrategy::PrefixSmartcase,
             // Grep's candidates *are* the matches (ripgrep already filtered + ordered them),
             // so query changes don't re-rank — they trigger a fresh walk elsewhere.
@@ -242,6 +265,9 @@ impl PickerCandidates {
                     Some(PickerSelectResult::File { path: abs })
                 }
             }
+            PickerCandidates::Projects(v) => Some(PickerSelectResult::Project {
+                name: v[idx].name.clone(),
+            }),
         }
     }
 }

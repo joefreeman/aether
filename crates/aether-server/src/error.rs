@@ -56,6 +56,20 @@ impl RpcError {
         Self::new(ErrorCode::INVALID_TOKEN, "invalid handshake token")
     }
 
+    pub fn no_active_project() -> Self {
+        Self::new(
+            ErrorCode::NO_ACTIVE_PROJECT,
+            "no active project — call project/activate first",
+        )
+    }
+
+    pub fn unknown_project(name: impl std::fmt::Display) -> Self {
+        Self::new(
+            ErrorCode::UNKNOWN_PROJECT,
+            format!("no configured project named {name}"),
+        )
+    }
+
     pub fn file_io(detail: impl std::fmt::Display) -> Self {
         Self::new(ErrorCode::FILE_IO, format!("file I/O error: {detail}"))
     }

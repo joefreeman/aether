@@ -1,11 +1,15 @@
 //! Project configuration and runtime discovery files.
 //!
 //! - Durable config: `$XDG_CONFIG_HOME/aether/projects/<name>.toml`
-//! - Runtime info:   `$XDG_RUNTIME_DIR/aether/<name>.json` (created on startup, removed on shutdown)
+//! - Runtime info:   `$XDG_RUNTIME_DIR/aether/server.json` (one file per running server, not per
+//!   project — a single server now hosts many projects, picked per-client via `project/activate`).
 
 use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Fixed loopback port. Single-instance: only one server can bind it. Clients hard-code this.
+pub const SERVER_PORT: u16 = 2384;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectConfig {
@@ -48,13 +52,49 @@ pub fn project_config_path(name: &str) -> anyhow::Result<PathBuf> {
         .join(format!("{name}.toml")))
 }
 
-pub fn runtime_info_path(name: &str) -> anyhow::Result<PathBuf> {
+/// Directory containing the per-project `.toml` configs. Used by `list_project_names`.
+pub fn projects_dir() -> anyhow::Result<PathBuf> {
+    let base = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
+    Ok(base.config_dir().join("aether").join("projects"))
+}
+
+/// Enumerate the configured project names by scanning `*.toml` files in `projects_dir`. The
+/// file *name* (without extension) is authoritative; the body's `name` field is validated on
+/// load. Returns an empty list (not an error) when the directory doesn't exist yet — a fresh
+/// install with no projects configured shouldn't be a server-side fatal.
+pub fn list_project_names() -> anyhow::Result<Vec<String>> {
+    let dir = projects_dir()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading projects dir {}", dir.display()))
+        }
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+pub fn runtime_info_path() -> anyhow::Result<PathBuf> {
     let base = directories::BaseDirs::new()
         .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
     let runtime = base
         .runtime_dir()
         .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is not set"))?;
-    Ok(runtime.join("aether").join(format!("{name}.json")))
+    Ok(runtime.join("aether").join("server.json"))
 }
 
 pub fn write_runtime_info(path: &Path, info: &RuntimeInfo) -> anyhow::Result<()> {

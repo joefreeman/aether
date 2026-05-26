@@ -24,11 +24,13 @@ use std::io::{stdout, Stdout};
 #[derive(Parser, Debug)]
 #[command(name = "ae", version, about = "Aether editor — terminal client")]
 struct Cli {
-    /// Project name (looks up the running server in $XDG_RUNTIME_DIR/aether/)
-    project: String,
+    /// Project name. Optional — omit to start with the project picker open. The named project
+    /// must have a config at `$XDG_CONFIG_HOME/aether/projects/<name>.toml`; the daemon loads
+    /// it on first activation.
+    project: Option<String>,
     /// File or directory to open, relative to the first project path. A directory opens the
     /// file browser at that location with a scratch buffer underneath. Omit to start in a
-    /// scratch buffer with no file browser.
+    /// scratch buffer with no file browser. Ignored when no project is selected.
     file: Option<String>,
 }
 
@@ -51,22 +53,29 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let info = discovery::read(&cli.project)?;
-    let url = format!("ws://127.0.0.1:{}", info.port);
-    let mut client = client::Client::connect(&url).await?;
+    let info = discovery::read()?;
+    let base_url = format!("ws://127.0.0.1:{}", info.port);
+    let mut client = client::Client::connect(&base_url, &info.token, env!("CARGO_PKG_VERSION")).await?;
 
     let mut terminal = setup_terminal()?;
     install_panic_hook();
 
     let (cols, rows) = crossterm::terminal::size()?;
-    let mut state =
-        match app::bootstrap(&mut client, info.token, cli.file.as_deref(), cols, rows).await {
-            Ok(s) => s,
-            Err(e) => {
-                restore_terminal(&mut terminal).ok();
-                return Err(e);
-            }
-        };
+    let mut state = match app::bootstrap(
+        &mut client,
+        cli.project.as_deref(),
+        cli.file.as_deref(),
+        cols,
+        rows,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            restore_terminal(&mut terminal).ok();
+            return Err(e);
+        }
+    };
 
     let run_result = app::run(&mut terminal, &mut client, &mut state).await;
     restore_terminal(&mut terminal)?;

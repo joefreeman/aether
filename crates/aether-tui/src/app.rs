@@ -18,7 +18,7 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
-use aether_protocol::handshake::ClientHelloResult;
+use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
@@ -121,7 +121,10 @@ pub struct SearchSnapshot {
 /// `AppState`. They don't change which screen is underneath, so opening/closing them needs no
 /// "return mode" bookkeeping.
 pub struct AppState {
+    /// Active project name. Empty string before a project is activated — the no-project view
+    /// shows the project picker instead of the editor in that state.
     pub project_name: String,
+    /// Active project's root paths (absolute, server-canonical). Empty before activation.
     pub project_paths: Vec<String>,
     pub viewport_cols: u32,
     pub viewport_rows: u32,
@@ -144,7 +147,10 @@ pub struct AppState {
     /// `save_prompt`, e.g. for the save-as overwrite confirm). Holds the question text and the
     /// action to run on `y`.
     pub confirm_prompt: Option<ConfirmPrompt>,
-    pub editor: EditorState,
+    /// `None` before a project is activated, or transiently while switching. Most key handlers
+    /// early-return without touching state in that case; the no-project view (project picker)
+    /// is rendered instead by `ui::draw`.
+    pub editor: Option<EditorState>,
 }
 
 /// Generic `[y/N]` confirmation overlay. The save-as overwrite confirm and the close-with-
@@ -238,14 +244,36 @@ pub struct NewFilePromptState {
 }
 
 impl AppState {
+    /// `true` while a buffer is open. False during the no-project view and the brief window
+    /// between switching projects (old editor torn down, new one not yet built).
+    pub fn has_editor(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// Read access to the active editor. Panics if called without an active editor — handlers
+    /// that touch it must gate on [`Self::has_editor`] (the dispatch layer does this for the
+    /// editor-bound key handlers).
+    pub fn ed(&self) -> &EditorState {
+        self.editor
+            .as_ref()
+            .expect("BUG: AppState::ed() called without an active editor")
+    }
+
+    /// Mutable access to the active editor. Same gating contract as [`Self::ed`].
+    pub fn ed_mut(&mut self) -> &mut EditorState {
+        self.editor
+            .as_mut()
+            .expect("BUG: AppState::ed_mut() called without an active editor")
+    }
+
     pub fn dirty(&self) -> bool {
-        self.editor.revision != self.editor.saved_revision
+        self.ed().revision != self.ed().saved_revision
     }
 }
 
 pub async fn bootstrap(
     client: &mut Client,
-    token: String,
+    project_name: Option<&str>,
     file: Option<&str>,
     cols: u16,
     rows: u16,
@@ -253,15 +281,19 @@ pub async fn bootstrap(
     let viewport_rows = rows.saturating_sub(1) as u32;
     let viewport_cols = cols as u32;
 
-    let hello: ClientHelloResult = client
-        .rpc::<aether_protocol::handshake::ClientHello>(
-            aether_protocol::handshake::ClientHelloParams {
-                token,
-                client_version: env!("CARGO_PKG_VERSION").into(),
-            },
-        )
+    // No project named on the CLI: return an empty AppState with the Projects picker open. The
+    // event loop will draw the picker and accept input until the user activates a project.
+    let Some(project_name) = project_name else {
+        let mut state = empty_app_state(viewport_cols, viewport_rows);
+        open_picker(client, &mut state, PickerKind::Projects).await?;
+        return Ok(state);
+    };
+    let activated: ProjectActivateResult = client
+        .rpc::<ProjectActivate>(ProjectActivateParams {
+            name: project_name.to_string(),
+        })
         .await?;
-    let project_paths = hello.project.paths.clone();
+    let project_paths = activated.project.paths.clone();
 
     // Classify the file arg: file → open it; directory → open scratch + auto-show the Explorer
     // popup pointed at that directory; missing → open scratch with no Explorer.
@@ -285,6 +317,11 @@ pub async fn bootstrap(
         }
     };
 
+    // Pick what to land on:
+    //   1. Explicit file arg → open it.
+    //   2. No file arg + the project has a most-recent buffer (from a prior session) → attach
+    //      to that buffer rather than spawning a fresh scratch every launch.
+    //   3. Otherwise → fresh scratch.
     let editor = match open_file.as_deref() {
         Some(f) => {
             open_buffer_and_subscribe(
@@ -310,7 +347,7 @@ pub async fn bootstrap(
                 viewport_rows,
                 &project_paths,
                 aether_protocol::buffer::BufferOpenParams {
-                    buffer_id: None,
+                    buffer_id: activated.last_buffer_id,
                     path_index: None,
                     relative_path: None,
                     language: None,
@@ -323,7 +360,7 @@ pub async fn bootstrap(
     };
 
     let mut state = AppState {
-        project_name: hello.project.name,
+        project_name: activated.project.name,
         project_paths,
         viewport_cols,
         viewport_rows,
@@ -335,7 +372,7 @@ pub async fn bootstrap(
         save_prompt: None,
         new_file_prompt: None,
         confirm_prompt: None,
-        editor,
+        editor: Some(editor),
     };
 
     // Seed the Explorer picker's remembered directory before the auto-open so it lists the
@@ -348,6 +385,81 @@ pub async fn bootstrap(
     }
 
     Ok(state)
+}
+
+/// AppState with no project active. The editor field is `None`; project name/paths are empty.
+/// Used by [`bootstrap`] when no `--project` was given, and as the carrier for the project
+/// picker overlay before activation.
+fn empty_app_state(viewport_cols: u32, viewport_rows: u32) -> AppState {
+    AppState {
+        project_name: String::new(),
+        project_paths: Vec::new(),
+        viewport_cols,
+        viewport_rows,
+        should_quit: false,
+        status: String::new(),
+        clipboard: clipboard::new_handle(),
+        pending_leader: None,
+        picker: crate::picker::PickerState::default(),
+        save_prompt: None,
+        new_file_prompt: None,
+        confirm_prompt: None,
+        editor: None,
+    }
+}
+
+/// Activate `project_name`. Selecting the currently active project is a no-op (just closes the
+/// picker). For a different project, sends `project/activate` and either reattaches to the
+/// client's most-recently-used buffer in that project (returned in the response) or, if there's
+/// no prior history, spawns a fresh scratch buffer so the user always lands in *some* editor.
+async fn activate_project_and_rebuild_editor(
+    client: &mut Client,
+    state: &mut AppState,
+    project_name: &str,
+) -> Result<()> {
+    state.picker.open = false;
+
+    // Same-project re-select: nothing to tear down or rebuild. The picker closure above is the
+    // entire effect.
+    if project_name == state.project_name && state.has_editor() {
+        state.status = format!("already in project {project_name}");
+        return Ok(());
+    }
+
+    // Drop the local editor handle so we don't push notifications at a viewport the server is
+    // about to tear down. `project/activate` does the server-side teardown for us.
+    state.editor = None;
+
+    let activated: ProjectActivateResult = client
+        .rpc::<ProjectActivate>(ProjectActivateParams {
+            name: project_name.to_string(),
+        })
+        .await?;
+    state.project_name = activated.project.name;
+    state.project_paths = activated.project.paths;
+
+    // Reattach to the last buffer the user had open in this project, if any. The server's MRU
+    // survives project switches, so coming back to a project drops you on the buffer you left.
+    // First visit (or every prior buffer is gone) → spawn a scratch.
+    let open_params = aether_protocol::buffer::BufferOpenParams {
+        buffer_id: activated.last_buffer_id,
+        path_index: None,
+        relative_path: None,
+        language: None,
+        create_if_missing: false,
+        jump_to: None,
+    };
+    let editor = open_buffer_and_subscribe(
+        client,
+        state.viewport_cols,
+        state.viewport_rows,
+        &state.project_paths,
+        open_params,
+    )
+    .await?;
+    state.editor = Some(editor);
+    state.status = format!("activated project {}", state.project_name);
+    Ok(())
 }
 
 /// Construct an `EditorState` by running `buffer/open` followed by `viewport/subscribe`. Used
@@ -510,16 +622,17 @@ async fn dispatch_terminal_event(
 }
 
 fn apply_cursor_style(state: &AppState) {
-    // Overlays always use the bar cursor (they're text-prompt UIs). Otherwise editor mode
-    // decides: block in Normal, bar in Insert / Search.
+    // Overlays always use the bar cursor (they're text-prompt UIs). With no editor and no
+    // overlay, fall back to the bar — there's nothing for the block cursor to sit on.
     let style = if state.picker.open
         || state.save_prompt.is_some()
         || state.new_file_prompt.is_some()
         || state.confirm_prompt.is_some()
+        || !state.has_editor()
     {
         SetCursorStyle::SteadyBar
     } else {
-        match state.editor.mode {
+        match state.ed().mode {
             EditorMode::Normal => SetCursorStyle::SteadyBlock,
             EditorMode::Insert | EditorMode::Search => SetCursorStyle::SteadyBar,
         }
@@ -534,10 +647,15 @@ fn apply_pending_notifications(state: &mut AppState, client: &mut Client) {
 }
 
 fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notification) {
-    // Editor-bound notifications: ignore unless the ids match.
+    // Editor-bound notifications: drop them entirely when there's no active editor (e.g. mid-
+    // project-switch, or before the first activation). The picker/* notification is the only
+    // one that still applies — pickers can outlive an editor (project picker, in particular).
+    if !state.has_editor() && n.method != PickerUpdate::NAME {
+        return;
+    }
     if n.method == ViewportLinesChanged::NAME {
         match serde_json::from_value::<ViewportLinesChangedParams>(n.params) {
-            Ok(p) if state.editor.viewport_id == p.viewport_id => {
+            Ok(p) if state.ed_mut().viewport_id == p.viewport_id => {
                 splice_lines(state, p);
             }
             Ok(_) => {}
@@ -545,8 +663,8 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
         }
     } else if n.method == BufferState::NAME {
         match serde_json::from_value::<BufferStateParams>(n.params) {
-            Ok(p) if state.editor.buffer_id == p.buffer_id => {
-                let ed = &mut state.editor;
+            Ok(p) if state.ed_mut().buffer_id == p.buffer_id => {
+                let ed = state.ed_mut();
                 let was_synced = ed.revision == ed.saved_revision
                     && !ed.externally_modified
                     && !ed.externally_deleted;
@@ -566,8 +684,8 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
         }
     } else if n.method == SearchStateChanged::NAME {
         match serde_json::from_value::<SearchSummary>(n.params) {
-            Ok(s) if state.editor.buffer_id == s.buffer_id => {
-                state.editor.search.summary = Some(s);
+            Ok(s) if state.ed_mut().buffer_id == s.buffer_id => {
+                state.ed_mut().search.summary = Some(s);
             }
             Ok(_) => {}
             Err(e) => state.status = format!("bad search/state_changed params: {e}"),
@@ -597,31 +715,57 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
 }
 
 fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
-    state.editor.revision = p.revision;
-    state.editor.line_count = p.line_count;
-    state.editor.max_scroll_logical_line = p.max_scroll_logical_line;
+    state.ed_mut().revision = p.revision;
+    state.ed_mut().line_count = p.line_count;
+    state.ed_mut().max_scroll_logical_line = p.max_scroll_logical_line;
     let local_start =
-        (p.range.start_logical_line as i64) - (state.editor.window_first_logical_line as i64);
+        (p.range.start_logical_line as i64) - (state.ed_mut().window_first_logical_line as i64);
     let local_end = (p.range.end_logical_line_exclusive as i64)
-        - (state.editor.window_first_logical_line as i64);
-    if local_end < 0 || local_start > state.editor.lines.len() as i64 {
+        - (state.ed_mut().window_first_logical_line as i64);
+    if local_end < 0 || local_start > state.ed_mut().lines.len() as i64 {
         return;
     }
     let lo = local_start.max(0) as usize;
-    let hi = (local_end as usize).min(state.editor.lines.len());
+    let hi = (local_end as usize).min(state.ed_mut().lines.len());
     let replacement_len = p.replacement_lines.len();
-    state.editor.lines.splice(lo..hi, p.replacement_lines);
+    state.ed_mut().lines.splice(lo..hi, p.replacement_lines);
     // The server's notification covers the *current* (post-edit) viewport range. If the edit
-    // shrank the buffer, the OLD `state.editor.lines` could extend past the new range — truncate any
+    // shrank the buffer, the OLD `state.ed_mut().lines` could extend past the new range — truncate any
     // stale tail so subsequent draws never read a line that no longer exists.
-    state.editor.lines.truncate(lo + replacement_len);
+    state.ed_mut().lines.truncate(lo + replacement_len);
 }
 
 async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> Result<()> {
+    // No active editor: route through whichever overlay is on top, otherwise allow Space-leader
+    // chords that don't need an editor (Space p / Space q) plus Ctrl-c. The full Normal-mode
+    // keymap is gated behind `has_editor` because most bindings (motions, edits, save, etc.)
+    // assume a buffer to act on.
+    if !state.has_editor() {
+        if let Event::Key(k) = ev {
+            if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
+                return Ok(());
+            }
+            if state.picker.open {
+                return handle_picker_key(client, state, k).await;
+            }
+            // Pending Space-leader: resolve it the same way the editor branch does. The
+            // editor-requiring arms inside `handle_leader_key` early-return harmlessly when
+            // there's no editor (see the `has_editor` guards there).
+            if let Some(leader) = state.pending_leader.take() {
+                return handle_leader_key(client, state, leader, k).await;
+            }
+            if k.code == KeyCode::Char(' ') && k.modifiers.is_empty() {
+                state.pending_leader = Some(PendingLeader::Space);
+            } else if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                state.should_quit = true;
+            }
+        }
+        return Ok(());
+    }
     // Track whether the cursor moved during this event. Pure-scroll bindings leave it alone, so
     // the viewport stays where the user scrolled; any binding that actually moves the cursor
     // triggers `ensure_cursor_in_window` to snap the view back to it.
-    let cursor_before = state.editor.cursor.position;
+    let cursor_before = state.ed_mut().cursor.position;
     match ev {
         Event::Key(k) => {
             if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
@@ -643,7 +787,7 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
             } else if state.picker.open {
                 handle_picker_key(client, state, k).await?;
             } else {
-                match state.editor.mode {
+                match state.ed_mut().mode {
                     EditorMode::Normal => handle_normal_key(client, state, k).await?,
                     EditorMode::Insert => handle_insert_key(client, state, k).await?,
                     EditorMode::Search => handle_search_key(client, state, k).await?,
@@ -659,7 +803,7 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
         }
         _ => return Ok(()),
     }
-    if state.editor.cursor.position != cursor_before {
+    if state.ed_mut().cursor.position != cursor_before {
         ensure_cursor_in_window(client, state).await?;
     }
     Ok(())
@@ -681,31 +825,31 @@ async fn handle_mouse_event(
             if let Some(pos) = ui::screen_to_logical(state, m.row, m.column) {
                 let new = client
                     .rpc::<CursorSet>(CursorSetParams {
-                        buffer_id: state.editor.buffer_id,
+                        buffer_id: state.ed_mut().buffer_id,
                         position: pos,
                         anchor: pos,
                     })
                     .await?;
-                state.editor.cursor = new;
-                state.editor.drag_anchor = Some(new.position);
+                state.ed_mut().cursor = new;
+                state.ed_mut().drag_anchor = Some(new.position);
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(anchor) = state.editor.drag_anchor {
+            if let Some(anchor) = state.ed_mut().drag_anchor {
                 if let Some(pos) = ui::screen_to_logical(state, m.row, m.column) {
                     let new = client
                         .rpc::<CursorSet>(CursorSetParams {
-                            buffer_id: state.editor.buffer_id,
+                            buffer_id: state.ed_mut().buffer_id,
                             position: pos,
                             anchor: anchor,
                         })
                         .await?;
-                    state.editor.cursor = new;
+                    state.ed_mut().cursor = new;
                 }
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            state.editor.drag_anchor = None;
+            state.ed_mut().drag_anchor = None;
         }
         _ => {}
     }
@@ -733,7 +877,7 @@ const CTRL_ONLY: KeyModifiers = KeyModifiers::CONTROL;
 async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
     // Pending `f`/`t`: the next keystroke names the target character. Use the raw key (skipping
     // `normalize_key`) so `f X` is case-sensitive. Any non-`Char` key (Esc, arrow, etc.) cancels.
-    if let Some(pending) = state.editor.pending_find.take() {
+    if let Some(pending) = state.ed_mut().pending_find.take() {
         if let KeyCode::Char(ch) = k.code {
             move_motion(
                 client,
@@ -756,7 +900,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
     // Digit accumulation for counts. `0` is the line-start motion unless we're already mid-count.
     if let KeyCode::Char(c @ '1'..='9') = code {
         if mods == KeyModifiers::NONE {
-            let ed = &mut state.editor;
+            let ed = state.ed_mut();
             ed.pending_count = ed
                 .pending_count
                 .saturating_mul(10)
@@ -765,19 +909,19 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         }
     }
     if let KeyCode::Char('0') = code {
-        if mods == KeyModifiers::NONE && state.editor.pending_count > 0 {
-            state.editor.pending_count = state.editor.pending_count.saturating_mul(10);
+        if mods == KeyModifiers::NONE && state.ed_mut().pending_count > 0 {
+            state.ed_mut().pending_count = state.ed_mut().pending_count.saturating_mul(10);
             return Ok(());
         }
     }
 
     // Whatever this command consumes for `count`, reset after.
-    let count = if state.editor.pending_count == 0 {
+    let count = if state.ed_mut().pending_count == 0 {
         1
     } else {
-        state.editor.pending_count
+        state.ed_mut().pending_count
     };
-    state.editor.pending_count = 0;
+    state.ed_mut().pending_count = 0;
 
     let extend = mods.contains(KeyModifiers::SHIFT);
 
@@ -793,20 +937,20 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         (KeyCode::Esc, _) => {
             // Drop the active search (clears highlights, disables n/Alt-n). Use `d` to drop the
             // current selection instead.
-            if state.editor.search.active || state.editor.search.summary.is_some() {
+            if state.ed_mut().search.active || state.ed_mut().search.summary.is_some() {
                 let _ = client
                     .rpc::<SearchClear>(SearchClearParams {
-                        buffer_id: state.editor.buffer_id,
+                        buffer_id: state.ed_mut().buffer_id,
                     })
                     .await;
             }
-            state.editor.search.active = false;
-            state.editor.search.summary = None;
+            state.ed_mut().search.active = false;
+            state.ed_mut().search.summary = None;
         }
         // `c` collapses any multi-char selection to a 1-char point at the cursor. No-op if
         // already a point. Visually unchanged: the block cursor stays where it was.
         (KeyCode::Char('c'), m) if m == KeyModifiers::NONE => {
-            if !state.editor.cursor.is_point() {
+            if !state.ed_mut().cursor.is_point() {
                 clear_selection(client, state).await?;
             }
         }
@@ -872,7 +1016,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             .await?
         }
         (KeyCode::Char('k'), m) if m.contains(KeyModifiers::ALT) => {
-            let viewport_id = state.editor.viewport_id;
+            let viewport_id = state.ed_mut().viewport_id;
             move_motion(
                 client,
                 state,
@@ -899,7 +1043,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             .await?
         }
         (KeyCode::Char('j'), m) if m.contains(KeyModifiers::ALT) => {
-            let viewport_id = state.editor.viewport_id;
+            let viewport_id = state.ed_mut().viewport_id;
             move_motion(
                 client,
                 state,
@@ -931,7 +1075,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // by half. Measured in visual rows so wrapped content steps consistently. Count prefix
         // multiplies (e.g. `3d` = three pages). The viewport follows the cursor on re-render.
         (KeyCode::Char('d'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            let viewport_id = state.editor.viewport_id;
+            let viewport_id = state.ed_mut().viewport_id;
             let lines = count.saturating_mul(state.viewport_rows.max(1));
             move_motion(
                 client,
@@ -946,7 +1090,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             .await?
         }
         (KeyCode::Char('u'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            let viewport_id = state.editor.viewport_id;
+            let viewport_id = state.ed_mut().viewport_id;
             let lines = count.saturating_mul(state.viewport_rows.max(1));
             move_motion(
                 client,
@@ -961,7 +1105,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             .await?
         }
         (KeyCode::Char('d'), m) if m.contains(KeyModifiers::ALT) => {
-            let viewport_id = state.editor.viewport_id;
+            let viewport_id = state.ed_mut().viewport_id;
             let lines = count.saturating_mul((state.viewport_rows / 2).max(1));
             move_motion(
                 client,
@@ -976,7 +1120,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             .await?
         }
         (KeyCode::Char('u'), m) if m.contains(KeyModifiers::ALT) => {
-            let viewport_id = state.editor.viewport_id;
+            let viewport_id = state.ed_mut().viewport_id;
             let lines = count.saturating_mul((state.viewport_rows / 2).max(1));
             move_motion(
                 client,
@@ -1088,7 +1232,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // After pressing one of these, the *next* keystroke is interpreted as the target
         // character (see the `pending_find` block at the top of this handler).
         (KeyCode::Char('f'), m) if m.contains(KeyModifiers::ALT) => {
-            state.editor.pending_find = Some(PendingFind {
+            state.ed_mut().pending_find = Some(PendingFind {
                 direction: Direction::Backward,
                 till: false,
                 extend,
@@ -1096,7 +1240,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             })
         }
         (KeyCode::Char('f'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            state.editor.pending_find = Some(PendingFind {
+            state.ed_mut().pending_find = Some(PendingFind {
                 direction: Direction::Forward,
                 till: false,
                 extend,
@@ -1104,7 +1248,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             })
         }
         (KeyCode::Char('t'), m) if m.contains(KeyModifiers::ALT) => {
-            state.editor.pending_find = Some(PendingFind {
+            state.ed_mut().pending_find = Some(PendingFind {
                 direction: Direction::Backward,
                 till: true,
                 extend,
@@ -1112,7 +1256,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
             })
         }
         (KeyCode::Char('t'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            state.editor.pending_find = Some(PendingFind {
+            state.ed_mut().pending_find = Some(PendingFind {
                 direction: Direction::Forward,
                 till: true,
                 extend,
@@ -1162,7 +1306,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // Shift extends the selection. The server clamps line numbers past EOF.
         (KeyCode::Char('g'), m) if m.contains(KeyModifiers::ALT) => {
             let target = LogicalPosition {
-                line: state.editor.line_count.saturating_sub(1),
+                line: state.ed_mut().line_count.saturating_sub(1),
                 col: 0,
             };
             move_motion(client, state, Motion::Goto { position: target }, extend).await?
@@ -1214,7 +1358,7 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // plain cursor move; `Shift-r` runs it extending the current selection. `Nr` loops the
         // motion N times — so e.g. after `f x`, `5r` jumps to the 5th next `x`.
         (KeyCode::Char('r'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            if let Some(motion) = state.editor.last_motion.clone() {
+            if let Some(motion) = state.ed_mut().last_motion.clone() {
                 for _ in 0..count.max(1) {
                     move_motion(client, state, motion.clone(), extend).await?;
                 }
@@ -1289,7 +1433,7 @@ async fn grep_navigate(
     let target = client
         .rpc::<PickerGrepNavigate>(PickerGrepNavigateParams {
             direction,
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
         })
         .await?;
     let Some(target) = target else {
@@ -1297,7 +1441,7 @@ async fn grep_navigate(
     };
     open_file_at_path(client, state, target.path, false, Some(target.position)).await?;
     if !target.query.is_empty() {
-        let buffer_id = state.editor.buffer_id;
+        let buffer_id = state.ed_mut().buffer_id;
         let r = client
             .rpc::<SearchSet>(SearchSetParams {
                 buffer_id,
@@ -1305,7 +1449,7 @@ async fn grep_navigate(
                 anchor: Some(target.position),
             })
             .await?;
-        let ed = &mut state.editor;
+        let ed = state.ed_mut();
         ed.cursor = r.cursor;
         ed.search.summary = Some(r.summary);
         ed.search.query.set(target.query.clone());
@@ -1326,6 +1470,39 @@ async fn handle_leader_key(
 ) -> Result<()> {
     let (code, mods) = normalize_key(k);
     let alt_only: KeyModifiers = KeyModifiers::ALT;
+    // Bindings that act on the current buffer (or the project's file index) need both an active
+    // editor and an active project. Without those, fall through to the chord-cancel branch — the
+    // pre-activation event loop only surfaces Space p / Space q to the user. We could also error,
+    // but silently dropping matches the existing "Esc cancels" cancellation behaviour for chords
+    // the user composed and changed their mind on.
+    let needs_editor = matches!(
+        (leader, code, mods),
+        (PendingLeader::Space, KeyCode::Char('f'), m) if m == KeyModifiers::NONE
+    ) || matches!(
+        (leader, code, mods),
+        (PendingLeader::Space, KeyCode::Char('b'), m) if m == KeyModifiers::NONE
+    ) || matches!(
+        (leader, code, mods),
+        (PendingLeader::Space, KeyCode::Char('g'), m) if m == KeyModifiers::NONE
+    ) || matches!(
+        (leader, code, mods),
+        (PendingLeader::Space, KeyCode::Char('e'), m) if m == KeyModifiers::NONE
+    ) || matches!(
+        (leader, code, mods),
+        (PendingLeader::Space, KeyCode::Char('w'), m) if m == KeyModifiers::NONE
+    ) || matches!(
+        (leader, code, mods),
+        (PendingLeader::Space, KeyCode::Char('s'), _)
+    ) || matches!(
+        (leader, code, mods),
+        (PendingLeader::Space, KeyCode::Char('r'), m) if m == KeyModifiers::NONE
+    ) || matches!(
+        (leader, code, mods),
+        (PendingLeader::Space, KeyCode::Char('n'), _)
+    );
+    if needs_editor && !state.has_editor() {
+        return Ok(());
+    }
     match (leader, code, mods) {
         // `Space f` — open the file picker. Resumes the prior query + highlight + scroll
         // position; first-ever open is empty.
@@ -1352,6 +1529,12 @@ async fn handle_leader_key(
         // highlighted file or descends into the highlighted directory.
         (PendingLeader::Space, KeyCode::Char('e'), m) if m == KeyModifiers::NONE => {
             open_picker(client, state, PickerKind::Explorer).await?;
+        }
+        // `Space p` — open the project picker overlay. Lists every project under
+        // `$XDG_CONFIG_HOME/aether/projects/`; selecting one calls `project/activate` and
+        // rebuilds the editor on that project.
+        (PendingLeader::Space, KeyCode::Char('p'), m) if m == KeyModifiers::NONE => {
+            open_picker(client, state, PickerKind::Projects).await?;
         }
         // ---- app-level meta actions ----
         // These used to live under Ctrl-, but `Ctrl` is reserved for buffer-content edits.
@@ -1442,8 +1625,10 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
     // For Grep, ask the server to centre on the cursor's nearest hit (overriding our local
     // `center_on` when it resolves). This lets the picker open on "where you are" in the
     // result list even when the cursor isn't sitting on a match exactly — `cursor_grep_hit_item`
-    // alone only covers the strict-on-a-match case.
-    let center_on_cursor_grep_hit = (kind == PickerKind::Grep).then_some(state.editor.buffer_id);
+    // alone only covers the strict-on-a-match case. `.then(|| …)` (not `then_some`) so we don't
+    // evaluate `state.ed_mut().buffer_id` for non-Grep kinds — Projects opens before any editor
+    // exists.
+    let center_on_cursor_grep_hit = (kind == PickerKind::Grep).then(|| state.ed_mut().buffer_id);
     let view = client
         .rpc::<PickerView>(PickerViewParams {
             kind,
@@ -1511,7 +1696,7 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
 /// Compute the prefill string for `Space g` from the active buffer's committed search query.
 /// Returns `None` when no search is active.
 fn compute_grep_prefill(state: &AppState) -> Option<String> {
-    let ed = &state.editor;
+    let ed = state.ed();
     if !ed.search.active || ed.search.query.is_empty() {
         return None;
     }
@@ -1521,7 +1706,7 @@ fn compute_grep_prefill(state: &AppState) -> Option<String> {
 /// Initial directory for a freshly-opened Explorer picker: parent of the active buffer's
 /// file, or the first project root for scratch buffers.
 fn default_explorer_dir(state: &AppState) -> Option<String> {
-    if let Some(p) = state.editor.file_path.as_deref() {
+    if let Some(p) = state.ed().file_path.as_deref() {
         if let Some(parent) = std::path::Path::new(p).parent() {
             return Some(parent.display().to_string());
         }
@@ -1534,7 +1719,7 @@ fn default_explorer_dir(state: &AppState) -> Option<String> {
 /// (no file to anchor on); also returns harmlessly to the server's offset-0 fallback when the
 /// file isn't in the starting directory (e.g. multi-root edge cases).
 fn default_explorer_center_on(state: &AppState) -> Option<PickerItem> {
-    let p = state.editor.file_path.as_deref()?;
+    let p = state.ed().file_path.as_deref()?;
     let name = std::path::Path::new(p)
         .file_name()
         .and_then(|os| os.to_str())?
@@ -1916,7 +2101,7 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
             // matches are highlighted and `n` / `Alt-n` step through them. Anchor at the grep
             // hit's position so the server resolves `current_index` to this match.
             if let Some(query) = grep_query {
-                let buffer_id = state.editor.buffer_id;
+                let buffer_id = state.ed_mut().buffer_id;
                 let r = client
                     .rpc::<SearchSet>(SearchSetParams {
                         buffer_id,
@@ -1924,7 +2109,7 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
                         anchor: Some(position),
                     })
                     .await?;
-                let ed = &mut state.editor;
+                let ed = state.ed_mut();
                 ed.cursor = r.cursor;
                 ed.search.summary = Some(r.summary);
                 ed.search.query.set(query.clone());
@@ -1932,9 +2117,20 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
                 push_history(state, query);
             }
         }
+        PickerSelectResult::Project { name } => {
+            // Project selection: switch active project + bootstrap a fresh editor. Returns
+            // early so the post-select tail (which assumes an active editor for mode/cursor
+            // adjustments) doesn't run on the not-yet-replaced state.
+            activate_project_and_rebuild_editor(client, state, &name).await?;
+            return Ok(());
+        }
     }
-    // Whatever the selection did (file open / buffer switch), we land in Normal mode.
-    state.editor.mode = EditorMode::Normal;
+    // Whatever the selection did (file open / buffer switch), we land in Normal mode. Guarded
+    // because PickerSelectResult::Project early-returned above, but defensive in case future
+    // result variants rebuild the editor inline.
+    if state.has_editor() {
+        state.ed_mut().mode = EditorMode::Normal;
+    }
     apply_cursor_style(state);
     Ok(())
 }
@@ -1948,7 +2144,7 @@ async fn attach_buffer(
     state: &mut AppState,
     buffer_id: BufferId,
 ) -> Result<()> {
-    if state.editor.buffer_id == buffer_id {
+    if state.ed_mut().buffer_id == buffer_id {
         // Already attached. Skip the round-trip; the picker's "current at position 0" feature
         // makes selecting the current buffer a frequent no-op.
         return Ok(());
@@ -1986,7 +2182,7 @@ async fn new_scratch(client: &mut Client, state: &mut AppState) -> Result<()> {
 /// Close the active buffer. If it's dirty, opens a confirm prompt first; the user's `y`
 /// answer routes through `handle_confirm_prompt_key` back to `finalize_close_buffer`.
 async fn close_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let ed = &state.editor;
+    let ed = state.ed();
     let buffer_id = ed.buffer_id;
     let dirty = ed.revision != ed.saved_revision;
     let label = ed.file_label.clone();
@@ -2010,8 +2206,8 @@ async fn finalize_close_buffer(
     buffer_id: BufferId,
 ) -> Result<()> {
     // Capture the display name before the buffer's gone so the status message can refer to it.
-    let closed_label = if state.editor.buffer_id == buffer_id {
-        state.editor.file_label.clone()
+    let closed_label = if state.ed_mut().buffer_id == buffer_id {
+        state.ed_mut().file_label.clone()
     } else {
         format!("buffer {buffer_id}")
     };
@@ -2036,16 +2232,18 @@ async fn subscribe_to_buffer(
     open: BufferOpenResult,
 ) -> Result<()> {
     // Inherit wrap from the current editor so switching buffers keeps the user's wrap setting.
-    let wrap = state.editor.wrap;
-    state.editor = build_editor_state_from_open(
-        client,
-        state.viewport_cols,
-        state.viewport_rows,
-        &state.project_paths,
-        open,
-        wrap,
-    )
-    .await?;
+    let wrap = state.ed_mut().wrap;
+    state.editor = Some(
+        build_editor_state_from_open(
+            client,
+            state.viewport_cols,
+            state.viewport_rows,
+            &state.project_paths,
+            open,
+            wrap,
+        )
+        .await?,
+    );
     apply_cursor_style(state);
     // Cover the case where the restored scroll disagrees with the cursor (e.g. a `jump_to`
     // override on a buffer we've already opened before, so the stored scroll wasn't computed
@@ -2136,7 +2334,7 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
             .await?
         }
         (KeyCode::Up, _) => {
-            let viewport_id = state.editor.viewport_id;
+            let viewport_id = state.ed_mut().viewport_id;
             move_motion(
                 client,
                 state,
@@ -2150,7 +2348,7 @@ async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEven
             .await?
         }
         (KeyCode::Down, _) => {
-            let viewport_id = state.editor.viewport_id;
+            let viewport_id = state.ed_mut().viewport_id;
             move_motion(
                 client,
                 state,
@@ -2236,18 +2434,18 @@ async fn handle_search_key(client: &mut Client, state: &mut AppState, k: KeyEven
             history_down(state);
             run_incremental_search(client, state).await?;
         }
-        (KeyCode::Left, _) => state.editor.search.query.move_left(),
-        (KeyCode::Right, _) => state.editor.search.query.move_right(),
+        (KeyCode::Left, _) => state.ed_mut().search.query.move_left(),
+        (KeyCode::Right, _) => state.ed_mut().search.query.move_right(),
         (KeyCode::Backspace, _) => {
-            state.editor.search.query.backspace();
-            state.editor.search.history_cursor = None;
+            state.ed_mut().search.query.backspace();
+            state.ed_mut().search.history_cursor = None;
             run_incremental_search(client, state).await?;
         }
         (KeyCode::Char(c), m)
             if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
         {
-            state.editor.search.query.insert_char(c);
-            state.editor.search.history_cursor = None;
+            state.ed_mut().search.query.insert_char(c);
+            state.ed_mut().search.history_cursor = None;
             run_incremental_search(client, state).await?;
         }
         _ => {}
@@ -2256,23 +2454,23 @@ async fn handle_search_key(client: &mut Client, state: &mut AppState, k: KeyEven
 }
 
 async fn enter_search_mode(client: &mut Client, state: &mut AppState) -> Result<()> {
-    state.editor.search.snapshot = Some(SearchSnapshot {
-        cursor: state.editor.cursor,
-        scroll_logical_line: state.editor.scroll_logical_line,
-        query: state.editor.search.query.take_text(),
-        active: state.editor.search.active,
+    state.ed_mut().search.snapshot = Some(SearchSnapshot {
+        cursor: state.ed_mut().cursor,
+        scroll_logical_line: state.ed_mut().scroll_logical_line,
+        query: state.ed_mut().search.query.take_text(),
+        active: state.ed_mut().search.active,
     });
-    state.editor.search.active = false;
-    state.editor.search.summary = None;
+    state.ed_mut().search.active = false;
+    state.ed_mut().search.summary = None;
     {
-        let ed = &mut state.editor;
+        let ed = state.ed_mut();
         ed.search.history_cursor = None;
         ed.search.history_draft.clear();
         ed.mode = EditorMode::Search;
     }
     apply_cursor_style(state);
     // Clear the server-side search so highlights disappear immediately. Restored on Esc.
-    let buffer_id = state.editor.buffer_id;
+    let buffer_id = state.ed_mut().buffer_id;
     let _ = client
         .rpc::<SearchClear>(SearchClearParams { buffer_id })
         .await;
@@ -2281,7 +2479,7 @@ async fn enter_search_mode(client: &mut Client, state: &mut AppState) -> Result<
 
 fn commit_search(state: &mut AppState) {
     let committed_query = {
-        let ed = &mut state.editor;
+        let ed = state.ed_mut();
         ed.search.snapshot = None;
         if !ed.search.query.is_empty() {
             ed.search.active = true;
@@ -2295,7 +2493,7 @@ fn commit_search(state: &mut AppState) {
     if let Some(q) = committed_query {
         push_history(state, q);
     }
-    let ed = &mut state.editor;
+    let ed = state.ed_mut();
     ed.search.history_cursor = None;
     ed.search.history_draft.clear();
     ed.mode = EditorMode::Normal;
@@ -2308,7 +2506,7 @@ fn push_history(state: &mut AppState, query: String) {
     if query.is_empty() {
         return;
     }
-    let ed = &mut state.editor;
+    let ed = state.ed_mut();
     if ed.search.history.last() == Some(&query) {
         return; // dedup consecutive duplicates
     }
@@ -2320,7 +2518,7 @@ fn push_history(state: &mut AppState, query: String) {
 }
 
 fn history_up(state: &mut AppState) {
-    let ed = &mut state.editor;
+    let ed = state.ed_mut();
     if ed.search.history.is_empty() {
         return;
     }
@@ -2338,7 +2536,7 @@ fn history_up(state: &mut AppState) {
 }
 
 fn history_down(state: &mut AppState) {
-    let ed = &mut state.editor;
+    let ed = state.ed_mut();
     match ed.search.history_cursor {
         None => {} // already past the newest entry
         Some(i) if i + 1 < ed.search.history.len() => {
@@ -2355,8 +2553,8 @@ fn history_down(state: &mut AppState) {
 }
 
 async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let Some(snap) = state.editor.search.snapshot.take() else {
-        state.editor.mode = EditorMode::Normal;
+    let Some(snap) = state.ed_mut().search.snapshot.take() else {
+        state.ed_mut().mode = EditorMode::Normal;
         apply_cursor_style(state);
         return Ok(());
     };
@@ -2365,36 +2563,36 @@ async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
     if snap.active && !snap.query.is_empty() {
         let r = client
             .rpc::<SearchSet>(SearchSetParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
                 query: snap.query.clone(),
                 anchor: None,
             })
             .await?;
-        state.editor.search.summary = Some(r.summary);
+        state.ed_mut().search.summary = Some(r.summary);
     } else {
         let _ = client
             .rpc::<SearchClear>(SearchClearParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await;
-        state.editor.search.summary = None;
+        state.ed_mut().search.summary = None;
     }
-    state.editor.search.query.set(snap.query);
-    state.editor.search.active = snap.active;
+    state.ed_mut().search.query.set(snap.query);
+    state.ed_mut().search.active = snap.active;
     // Restore cursor + selection.
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             position: snap.cursor.position,
             anchor: snap.cursor.anchor,
         })
         .await?;
-    state.editor.cursor = new;
+    state.ed_mut().cursor = new;
     // Restore scroll if it moved during incremental search.
-    if snap.scroll_logical_line != state.editor.scroll_logical_line {
+    if snap.scroll_logical_line != state.ed_mut().scroll_logical_line {
         scroll_to(client, state, snap.scroll_logical_line).await?;
     }
-    state.editor.mode = EditorMode::Normal;
+    state.ed_mut().mode = EditorMode::Normal;
     apply_cursor_style(state);
     Ok(())
 }
@@ -2403,39 +2601,39 @@ async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
 /// the first match at-or-after where `/` was pressed. The server's response carries the new
 /// cursor + summary; per-viewport highlight notifications follow asynchronously.
 async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Result<()> {
-    if state.editor.search.query.is_empty() {
+    if state.ed_mut().search.query.is_empty() {
         let _ = client
             .rpc::<SearchClear>(SearchClearParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await;
-        state.editor.search.summary = None;
+        state.ed_mut().search.summary = None;
         // No matches — revert the cursor to the pre-search position so the user sees where
         // they started rather than wherever the previous query stranded them.
-        if let Some(snap_cursor) = state.editor.search.snapshot.as_ref().map(|s| s.cursor) {
-            if state.editor.cursor.position != snap_cursor.position
-                || state.editor.cursor.anchor != snap_cursor.anchor
+        if let Some(snap_cursor) = state.ed_mut().search.snapshot.as_ref().map(|s| s.cursor) {
+            if state.ed_mut().cursor.position != snap_cursor.position
+                || state.ed_mut().cursor.anchor != snap_cursor.anchor
             {
                 let new = client
                     .rpc::<CursorSet>(CursorSetParams {
-                        buffer_id: state.editor.buffer_id,
+                        buffer_id: state.ed_mut().buffer_id,
                         position: snap_cursor.position,
                         anchor: snap_cursor.anchor,
                     })
                     .await?;
-                state.editor.cursor = new;
+                state.ed_mut().cursor = new;
             }
         }
         return Ok(());
     }
     let anchor = state
-        .editor
+        .ed()
         .search
         .snapshot
         .as_ref()
         .map(|s| selection_start(&s.cursor));
     let (buffer_id, query) = {
-        let ed = &mut state.editor;
+        let ed = state.ed_mut();
         (ed.buffer_id, ed.search.query.text.clone())
     };
     let result = client
@@ -2447,8 +2645,8 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
         .await;
     let revert_needed = match result {
         Ok(r) => {
-            state.editor.cursor = r.cursor;
-            state.editor.search.summary = Some(r.summary.clone());
+            state.ed_mut().cursor = r.cursor;
+            state.ed_mut().search.summary = Some(r.summary.clone());
             // Zero matches: revert below so a failed keystroke doesn't strand the user.
             r.summary.total == 0
         }
@@ -2456,8 +2654,8 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
             // Most commonly an invalid regex while the user is mid-type (e.g. a trailing `\`).
             // Treat it as a transient "no matches" state — empty highlights, cursor reverted,
             // a short note in the status so the user knows why their search isn't matching.
-            state.editor.search.summary = Some(SearchSummary {
-                buffer_id: state.editor.buffer_id,
+            state.ed_mut().search.summary = Some(SearchSummary {
+                buffer_id: state.ed_mut().buffer_id,
                 total: 0,
                 truncated: false,
                 current_index: 0,
@@ -2467,18 +2665,18 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
         }
     };
     if revert_needed {
-        if let Some(snap_cursor) = state.editor.search.snapshot.as_ref().map(|s| s.cursor) {
-            if state.editor.cursor.position != snap_cursor.position
-                || state.editor.cursor.anchor != snap_cursor.anchor
+        if let Some(snap_cursor) = state.ed_mut().search.snapshot.as_ref().map(|s| s.cursor) {
+            if state.ed_mut().cursor.position != snap_cursor.position
+                || state.ed_mut().cursor.anchor != snap_cursor.anchor
             {
                 let new = client
                     .rpc::<CursorSet>(CursorSetParams {
-                        buffer_id: state.editor.buffer_id,
+                        buffer_id: state.ed_mut().buffer_id,
                         position: snap_cursor.position,
                         anchor: snap_cursor.anchor,
                     })
                     .await?;
-                state.editor.cursor = new;
+                state.ed_mut().cursor = new;
             }
         }
     }
@@ -2501,7 +2699,7 @@ fn pos_tuple(p: LogicalPosition) -> (u32, u32) {
 /// (i.e., `current_index != 0`). The status bar only shows the counter when the cursor is
 /// meaningfully "on" a result. The total gets a trailing `+` if the server truncated.
 pub fn search_counter_label(state: &AppState) -> Option<String> {
-    let ed = &state.editor;
+    let ed = state.ed();
     if !ed.search.active {
         return None;
     }
@@ -2529,14 +2727,14 @@ fn format_total(s: &SearchSummary) -> String {
 /// cursor isn't on a hit — the status bar then renders nothing for the grep slot, matching the
 /// "hide when not on a match" treatment for the in-buffer search counter.
 pub fn grep_counter_label(state: &AppState) -> Option<String> {
-    let gp = state.editor.cursor.grep_position?;
+    let gp = state.ed().cursor.grep_position?;
     Some(format!("({}/{})", gp.current, gp.total))
 }
 
 /// Summary line for the search prompt: "3/47", "3/10000+", or "no matches". `None` when the
 /// query is empty (the bare `/` already conveys "no search yet").
 pub fn search_match_count_label(state: &AppState) -> Option<String> {
-    let ed = &state.editor;
+    let ed = state.ed();
     if ed.search.query.is_empty() {
         return None;
     }
@@ -2557,7 +2755,7 @@ pub fn search_match_count_label(state: &AppState) -> Option<String> {
 async fn search_from_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: BufferCopyResult = client
         .rpc::<BufferCopy>(BufferCopyParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             scope: CopyScope::Selection,
         })
         .await?;
@@ -2565,13 +2763,13 @@ async fn search_from_selection(client: &mut Client, state: &mut AppState) -> Res
         return Ok(());
     }
     let query = {
-        let ed = &mut state.editor;
+        let ed = state.ed_mut();
         ed.search.query.set(regex_escape(&r.text));
         ed.search.active = true;
         ed.search.query.text.clone()
     };
     push_history(state, query.clone());
-    let buffer_id = state.editor.buffer_id;
+    let buffer_id = state.ed_mut().buffer_id;
     let result = client
         .rpc::<SearchSet>(SearchSetParams {
             buffer_id,
@@ -2579,8 +2777,8 @@ async fn search_from_selection(client: &mut Client, state: &mut AppState) -> Res
             anchor: None,
         })
         .await?;
-    state.editor.search.summary = Some(result.summary);
-    // search/set with anchor=None doesn't move the cursor server-side, so state.editor.cursor is still
+    state.ed_mut().search.summary = Some(result.summary);
+    // search/set with anchor=None doesn't move the cursor server-side, so state.ed_mut().cursor is still
     // valid (mirrors the selection that prompted the search).
     Ok(())
 }
@@ -2623,25 +2821,25 @@ async fn search_cycle(
     direction: Direction,
     count: u32,
 ) -> Result<()> {
-    if !state.editor.search.active {
+    if !state.ed_mut().search.active {
         // No active search: revive the most recent history entry server-side, then cycle.
-        let Some(last) = state.editor.search.history.last().cloned() else {
+        let Some(last) = state.ed_mut().search.history.last().cloned() else {
             return Ok(());
         };
-        state.editor.search.query.set(last.clone());
+        state.ed_mut().search.query.set(last.clone());
         let r = client
             .rpc::<SearchSet>(SearchSetParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
                 query: last,
                 anchor: None,
             })
             .await?;
-        state.editor.cursor = r.cursor;
-        state.editor.search.summary = Some(r.summary);
-        state.editor.search.active = true;
+        state.ed_mut().cursor = r.cursor;
+        state.ed_mut().search.summary = Some(r.summary);
+        state.ed_mut().search.active = true;
     }
     let summary_total = state
-        .editor
+        .ed()
         .search
         .summary
         .as_ref()
@@ -2652,14 +2850,14 @@ async fn search_cycle(
     }
     for _ in 0..count.max(1) {
         let params = SearchNavParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
         };
         let result = match direction {
             Direction::Forward => client.rpc::<SearchNext>(params).await?,
             Direction::Backward => client.rpc::<SearchPrev>(params).await?,
         };
-        state.editor.cursor = result.cursor;
-        state.editor.search.summary = Some(result.summary);
+        state.ed_mut().cursor = result.cursor;
+        state.ed_mut().search.summary = Some(result.summary);
     }
     Ok(())
 }
@@ -2673,7 +2871,7 @@ async fn handle_resize(
     let viewport_rows = rows.saturating_sub(1) as u32;
     state.viewport_cols = cols as u32;
     state.viewport_rows = viewport_rows;
-    let viewport_id = state.editor.viewport_id;
+    let viewport_id = state.ed_mut().viewport_id;
     let r = client
         .rpc::<ViewportResize>(ViewportResizeParams {
             viewport_id,
@@ -2681,7 +2879,7 @@ async fn handle_resize(
             rows: viewport_rows,
         })
         .await?;
-    let ed = &mut state.editor;
+    let ed = state.ed_mut();
     ed.window_first_logical_line = r.window.first_logical_line;
     ed.line_count = r.window.line_count;
     ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
@@ -2720,14 +2918,14 @@ async fn move_motion(
 ) -> Result<()> {
     let new: CursorState = client
         .rpc::<CursorMove>(CursorMoveParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             motion: motion.clone(),
             extend_selection: extend,
         })
         .await?;
-    state.editor.cursor = new;
+    state.ed_mut().cursor = new;
     if is_repeatable_motion(&motion) {
-        state.editor.last_motion = Some(motion);
+        state.ed_mut().last_motion = Some(motion);
     }
     Ok(())
 }
@@ -2769,12 +2967,12 @@ async fn select_line(
     for _ in 0..count.max(1) {
         let new = client
             .rpc::<CursorSelectLine>(CursorSelectLineParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
                 direction,
                 extend,
             })
             .await?;
-        state.editor.cursor = new;
+        state.ed_mut().cursor = new;
     }
     Ok(())
 }
@@ -2783,13 +2981,13 @@ async fn tree_expand(client: &mut Client, state: &mut AppState, count: u32) -> R
     for _ in 0..count.max(1) {
         let new = client
             .rpc::<CursorExpand>(CursorBufferOnlyParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await?;
-        if new == state.editor.cursor {
+        if new == state.ed_mut().cursor {
             break; // already at root
         }
-        state.editor.cursor = new;
+        state.ed_mut().cursor = new;
     }
     Ok(())
 }
@@ -2798,13 +2996,13 @@ async fn tree_contract(client: &mut Client, state: &mut AppState, count: u32) ->
     for _ in 0..count.max(1) {
         let new = client
             .rpc::<CursorContract>(CursorBufferOnlyParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await?;
-        if new == state.editor.cursor {
+        if new == state.ed_mut().cursor {
             break; // history empty
         }
-        state.editor.cursor = new;
+        state.ed_mut().cursor = new;
     }
     Ok(())
 }
@@ -2812,10 +3010,10 @@ async fn tree_contract(client: &mut Client, state: &mut AppState, count: u32) ->
 async fn swap_anchor(client: &mut Client, state: &mut AppState) -> Result<()> {
     let new = client
         .rpc::<CursorSwapAnchor>(CursorSwapAnchorParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
         })
         .await?;
-    state.editor.cursor = new;
+    state.ed_mut().cursor = new;
     Ok(())
 }
 
@@ -2823,7 +3021,7 @@ async fn motion_undo(client: &mut Client, state: &mut AppState, count: u32) -> R
     for _ in 0..count.max(1) {
         let r: CursorUndoResult = client
             .rpc::<CursorUndo>(CursorUndoParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await?;
         let applied = r.applied;
@@ -2839,7 +3037,7 @@ async fn motion_redo(client: &mut Client, state: &mut AppState, count: u32) -> R
     for _ in 0..count.max(1) {
         let r: CursorUndoResult = client
             .rpc::<CursorRedo>(CursorUndoParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await?;
         let applied = r.applied;
@@ -2853,7 +3051,7 @@ async fn motion_redo(client: &mut Client, state: &mut AppState, count: u32) -> R
 
 fn apply_motion_undo_result(state: &mut AppState, r: CursorUndoResult, label: &str) {
     if r.applied {
-        state.editor.cursor = r.cursor;
+        state.ed_mut().cursor = r.cursor;
     } else {
         state.status = format!("nothing to {label}");
     }
@@ -2862,15 +3060,15 @@ fn apply_motion_undo_result(state: &mut AppState, r: CursorUndoResult, label: &s
 async fn clear_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
     // "Clear selection" now means "collapse to a 1-char point at the current position" since
     // the data model always has an anchor. Visually unchanged: the block cursor stays put.
-    let pos = state.editor.cursor.position;
+    let pos = state.ed_mut().cursor.position;
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             position: pos,
             anchor: pos,
         })
         .await?;
-    state.editor.cursor = new;
+    state.ed_mut().cursor = new;
     Ok(())
 }
 
@@ -2894,7 +3092,7 @@ async fn enter_insert_at(
     // model invariant is that Insert mode never has a multi-char selection — typing inserts at
     // `position`, motion-based deletes (Backspace/Delete) ignore the anchor.
     let (pos, cursor, buffer_id) = {
-        let ed = &mut state.editor;
+        let ed = state.ed_mut();
         (ed.cursor.position, ed.cursor, ed.buffer_id)
     };
     let target = match where_ {
@@ -2920,7 +3118,7 @@ async fn enter_insert_at(
                     extend_selection: false,
                 })
                 .await?;
-            state.editor.cursor = new;
+            state.ed_mut().cursor = new;
             enter_insert_mode(state);
             return Ok(());
         }
@@ -2943,18 +3141,18 @@ async fn enter_insert_at(
             anchor: target,
         })
         .await?;
-    state.editor.cursor = new;
+    state.ed_mut().cursor = new;
     enter_insert_mode(state);
     Ok(())
 }
 
 fn enter_insert_mode(state: &mut AppState) {
-    state.editor.mode = EditorMode::Insert;
+    state.ed_mut().mode = EditorMode::Insert;
     apply_cursor_style(state);
 }
 
 fn leave_insert(state: &mut AppState) {
-    state.editor.mode = EditorMode::Normal;
+    state.ed_mut().mode = EditorMode::Normal;
     apply_cursor_style(state);
 }
 
@@ -2984,11 +3182,11 @@ async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> R
 async fn newline_and_indent(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
         .rpc::<InputNewlineAndIndent>(BufferOnlyParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
         })
         .await?;
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
@@ -3000,13 +3198,13 @@ async fn insert_text_inner(
 ) -> Result<()> {
     let r: EditResult = client
         .rpc::<InputText>(InputTextParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             text: text.into(),
             select_pasted,
         })
         .await?;
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
@@ -3021,44 +3219,44 @@ async fn change_selection(client: &mut Client, state: &mut AppState) -> Result<(
 async fn delete_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
         .rpc::<InputDelete>(BufferOnlyParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
         })
         .await?;
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
 async fn backspace(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
         .rpc::<InputBackspace>(BufferOnlyParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
         })
         .await?;
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
 async fn delete_line(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
         .rpc::<aether_protocol::input::InputDeleteLine>(BufferOnlyParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
         })
         .await?;
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
 async fn change_line(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
         .rpc::<aether_protocol::input::InputChangeLine>(BufferOnlyParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
         })
         .await?;
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
@@ -3073,13 +3271,13 @@ async fn replace_line_with_clipboard(client: &mut Client, state: &mut AppState) 
     let r: EditResult = client
         .rpc::<aether_protocol::input::InputReplaceLine>(
             aether_protocol::input::InputReplaceLineParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
                 text,
             },
         )
         .await?;
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
@@ -3087,7 +3285,7 @@ async fn replace_line_with_clipboard(client: &mut Client, state: &mut AppState) 
 //
 // `handle_ctrl_binding` covers every Ctrl-modified shortcut that Normal and Insert mode share.
 // Mode-dependent commands (copy/cut/paste/change/delete/replace) get thin wrappers below that
-// branch on `state.editor.mode` to pick the right scope/behavior. This lets both mode
+// branch on `state.ed_mut().mode` to pick the right scope/behavior. This lets both mode
 // handlers delegate to one dispatcher instead of carrying ~22 duplicated arms each.
 
 /// Ctrl-y in Normal: copy selection. In Insert: copy current line.
@@ -3106,7 +3304,7 @@ async fn handle_cut(client: &mut Client, state: &mut AppState) -> Result<()> {
 /// In Insert: paste at cursor (no selection of the inserted text — the bar cursor sits past it
 /// ready to keep typing).
 async fn handle_paste(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    match state.editor.mode {
+    match state.ed_mut().mode {
         EditorMode::Insert => paste_at_cursor(client, state).await,
         _ => paste_before(client, state, count).await,
     }
@@ -3115,7 +3313,7 @@ async fn handle_paste(client: &mut Client, state: &mut AppState, count: u32) -> 
 /// Ctrl-c. In Normal: delete the selection and enter Insert. In Insert: blank the current line
 /// (we're already in Insert).
 async fn handle_change(client: &mut Client, state: &mut AppState) -> Result<()> {
-    match state.editor.mode {
+    match state.ed_mut().mode {
         EditorMode::Insert => change_line(client, state).await,
         _ => change_selection(client, state).await,
     }
@@ -3124,7 +3322,7 @@ async fn handle_change(client: &mut Client, state: &mut AppState) -> Result<()> 
 /// Ctrl-d. In Normal: delete the selection (looped `count` times). In Insert: delete the
 /// current line (count ignored — Insert has no count accumulator).
 async fn handle_delete(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    match state.editor.mode {
+    match state.ed_mut().mode {
         EditorMode::Insert => delete_line(client, state).await,
         _ => {
             for _ in 0..count.max(1) {
@@ -3142,14 +3340,14 @@ async fn handle_replace_with_clipboard(
     state: &mut AppState,
     count: u32,
 ) -> Result<()> {
-    match state.editor.mode {
+    match state.ed_mut().mode {
         EditorMode::Insert => replace_line_with_clipboard(client, state).await,
         _ => paste_replace(client, state, count).await,
     }
 }
 
 fn scope_for_mode(state: &AppState) -> CopyScope {
-    match state.editor.mode {
+    match state.ed().mode {
         EditorMode::Insert => CopyScope::Line,
         _ => CopyScope::Selection,
     }
@@ -3207,11 +3405,11 @@ async fn join_lines(client: &mut Client, state: &mut AppState, count: u32) -> Re
     for _ in 0..count.max(1) {
         let r: EditResult = client
             .rpc::<InputJoinLines>(BufferOnlyParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await?;
-        state.editor.revision = r.revision;
-        state.editor.cursor = r.cursor;
+        state.ed_mut().revision = r.revision;
+        state.ed_mut().cursor = r.cursor;
     }
     Ok(())
 }
@@ -3220,11 +3418,11 @@ async fn indent(client: &mut Client, state: &mut AppState, count: u32) -> Result
     for _ in 0..count.max(1) {
         let r: EditResult = client
             .rpc::<InputIndent>(BufferOnlyParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await?;
-        state.editor.revision = r.revision;
-        state.editor.cursor = r.cursor;
+        state.ed_mut().revision = r.revision;
+        state.ed_mut().cursor = r.cursor;
     }
     Ok(())
 }
@@ -3233,11 +3431,11 @@ async fn dedent(client: &mut Client, state: &mut AppState, count: u32) -> Result
     for _ in 0..count.max(1) {
         let r: EditResult = client
             .rpc::<InputDedent>(BufferOnlyParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await?;
-        state.editor.revision = r.revision;
-        state.editor.cursor = r.cursor;
+        state.ed_mut().revision = r.revision;
+        state.ed_mut().cursor = r.cursor;
     }
     Ok(())
 }
@@ -3247,11 +3445,11 @@ async fn dedent(client: &mut Client, state: &mut AppState, count: u32) -> Result
 async fn toggle_comment(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
         .rpc::<InputToggleComment>(BufferOnlyParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
         })
         .await?;
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
@@ -3260,19 +3458,19 @@ async fn toggle_comment(client: &mut Client, state: &mut AppState) -> Result<()>
 /// the line's leading whitespace and adds one level if the line ends in an opener). The newline
 /// pushes the cursor onto the new line at the indent column.
 async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let line = state.editor.cursor.position.line;
+    let line = state.ed_mut().cursor.position.line;
     let target = LogicalPosition {
         line,
         col: u32::MAX,
     };
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             position: target,
             anchor: target,
         })
         .await?;
-    state.editor.cursor = new;
+    state.ed_mut().cursor = new;
     newline_and_indent(client, state).await?;
     enter_insert_mode(state);
     Ok(())
@@ -3282,16 +3480,16 @@ async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()
 /// Park at col 0 of the current line, insert "\n" (which pushes the original line down a row
 /// and lands the cursor at its new start), then step back up onto the freshly-blank line.
 async fn open_line_above(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let line = state.editor.cursor.position.line;
+    let line = state.ed_mut().cursor.position.line;
     let target = LogicalPosition { line, col: 0 };
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             position: target,
             anchor: target,
         })
         .await?;
-    state.editor.cursor = new;
+    state.ed_mut().cursor = new;
     insert_text(client, state, "\n").await?;
     move_motion(
         client,
@@ -3317,12 +3515,12 @@ async fn move_lines(
     for _ in 0..count.max(1) {
         let r: EditResult = client
             .rpc::<InputMoveLines>(InputMoveLinesParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
                 direction,
             })
             .await?;
-        state.editor.revision = r.revision;
-        state.editor.cursor = r.cursor;
+        state.ed_mut().revision = r.revision;
+        state.ed_mut().cursor = r.cursor;
     }
     Ok(())
 }
@@ -3334,7 +3532,7 @@ async fn copy_to_clipboard(
 ) -> Result<()> {
     let r: BufferCopyResult = client
         .rpc::<BufferCopy>(BufferCopyParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             scope,
         })
         .await?;
@@ -3353,12 +3551,12 @@ async fn cut_to_clipboard(
 ) -> Result<()> {
     let r: BufferCutResult = client
         .rpc::<BufferCut>(BufferCopyParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             scope,
         })
         .await?;
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     let len = r.text.len();
     match clipboard::copy(&mut state.clipboard, r.text) {
         Ok(()) => state.status = format!("cut {len} bytes"),
@@ -3379,15 +3577,15 @@ async fn paste_before(client: &mut Client, state: &mut AppState, count: u32) -> 
     };
     let text = text.repeat(count.max(1) as usize);
     // Collapse to the start of the selection (no-op for a point cursor).
-    let start = min_pos(state.editor.cursor.position, state.editor.cursor.anchor);
+    let start = min_pos(state.ed_mut().cursor.position, state.ed_mut().cursor.anchor);
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             position: start,
             anchor: start,
         })
         .await?;
-    state.editor.cursor = new;
+    state.ed_mut().cursor = new;
     insert_text_inner(client, state, &text, true).await
 }
 
@@ -3421,7 +3619,7 @@ async fn undo(client: &mut Client, state: &mut AppState, count: u32) -> Result<(
     for _ in 0..count.max(1) {
         let r: UndoResult = client
             .rpc::<InputUndo>(BufferOnlyParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await?;
         let applied = r.applied;
@@ -3437,7 +3635,7 @@ async fn redo(client: &mut Client, state: &mut AppState, count: u32) -> Result<(
     for _ in 0..count.max(1) {
         let r: UndoResult = client
             .rpc::<InputRedo>(BufferOnlyParams {
-                buffer_id: state.editor.buffer_id,
+                buffer_id: state.ed_mut().buffer_id,
             })
             .await?;
         let applied = r.applied;
@@ -3454,8 +3652,8 @@ fn apply_undo_result(state: &mut AppState, r: UndoResult, label: &str) {
         state.status = format!("nothing to {label}");
         return;
     }
-    state.editor.revision = r.revision;
-    state.editor.cursor = r.cursor;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     state.status = format!("{label} (rev {})", r.revision);
 }
 
@@ -3471,7 +3669,7 @@ async fn save_buffer_with(
     state: &mut AppState,
     overwrite: bool,
 ) -> Result<()> {
-    if state.editor.file_path.is_none() {
+    if state.ed_mut().file_path.is_none() {
         // Scratch buffer — no path to save to. Don't auto-prompt: the user has to be explicit
         // about creating a file with Ctrl-Alt-s. This keeps `Ctrl-s` semantics uniform: it only
         // ever writes to an already-known path.
@@ -3480,7 +3678,7 @@ async fn save_buffer_with(
     }
     let result = client
         .rpc::<BufferSave>(BufferSaveParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             path_index: None,
             relative_path: None,
             overwrite,
@@ -3488,10 +3686,10 @@ async fn save_buffer_with(
         .await;
     match result {
         Ok(r) => {
-            state.editor.revision = r.revision;
-            state.editor.saved_revision = r.revision;
-            state.editor.externally_modified = false;
-            state.editor.externally_deleted = false;
+            state.ed_mut().revision = r.revision;
+            state.ed_mut().saved_revision = r.revision;
+            state.ed_mut().externally_modified = false;
+            state.ed_mut().externally_deleted = false;
             state.status = format!("saved (rev {})", r.revision);
         }
         Err(e) if is_externally_modified(&e) => {
@@ -3524,22 +3722,22 @@ async fn reload_buffer_with(
     state: &mut AppState,
     force: bool,
 ) -> Result<()> {
-    if state.editor.file_path.is_none() {
+    if state.ed_mut().file_path.is_none() {
         state.status = "scratch buffer has no path to reload".into();
         return Ok(());
     }
     let result = client
         .rpc::<BufferReload>(BufferReloadParams {
-            buffer_id: state.editor.buffer_id,
+            buffer_id: state.ed_mut().buffer_id,
             force,
         })
         .await;
     match result {
         Ok(r) => {
-            state.editor.revision = r.revision;
-            state.editor.saved_revision = r.revision;
-            state.editor.externally_modified = false;
-            state.editor.externally_deleted = false;
+            state.ed_mut().revision = r.revision;
+            state.ed_mut().saved_revision = r.revision;
+            state.ed_mut().externally_modified = false;
+            state.ed_mut().externally_deleted = false;
             state.status = format!("reloaded (rev {})", r.revision);
         }
         Err(e) if is_would_discard_changes(&e) => {
@@ -3560,7 +3758,7 @@ async fn reload_buffer_with(
 /// lands at the end of the pre-fill.
 fn begin_save_prompt(state: &mut AppState) {
     let initial = state
-        .editor
+        .ed()
         .file_path
         .as_deref()
         .map(|p| project_relative_label(p, &state.project_paths))
@@ -3592,7 +3790,7 @@ fn begin_new_file_prompt(state: &mut AppState) {
 /// it's open (the user was probably about to drop a new file in there); otherwise project root.
 /// The returned dir is always project-relative — empty string means "at the project root".
 fn current_directory_for_new_file(state: &AppState) -> (u32, String) {
-    if let Some(p) = state.editor.file_path.as_deref() {
+    if let Some(p) = state.ed().file_path.as_deref() {
         if let Some(parent) = std::path::Path::new(p).parent() {
             if let Some(found) = relative_to_project(parent, &state.project_paths) {
                 return found;
@@ -3707,7 +3905,7 @@ async fn send_save_prompt(
         None => return Ok(()),
     };
 
-    let buffer_id = state.editor.buffer_id;
+    let buffer_id = state.ed_mut().buffer_id;
 
     // TODO: multi-root support — when `project_paths.len() > 1` we should let the user pick a
     // root (or accept absolute paths in the prompt and infer the root) rather than silently
@@ -3725,7 +3923,7 @@ async fn send_save_prompt(
             state.save_prompt = None;
             apply_cursor_style(state);
             let project_paths = state.project_paths.clone();
-            let ed = &mut state.editor;
+            let ed = state.ed_mut();
             ed.revision = r.revision;
             ed.saved_revision = r.revision;
             ed.file_label = path.clone();
@@ -3818,17 +4016,17 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
 
     // Horizontal dimension first — only matters when wrap is off. Adjust `scroll_col` so the
     // cursor's column is within `[scroll_col, scroll_col + viewport_cols)`. Pure client-side.
-    if matches!(state.editor.wrap, WrapMode::None) && state.viewport_cols > 0 {
-        let col = state.editor.cursor.position.col;
-        if col < state.editor.scroll_col {
-            state.editor.scroll_col = col;
-        } else if col >= state.editor.scroll_col.saturating_add(state.viewport_cols) {
-            state.editor.scroll_col = col.saturating_sub(state.viewport_cols.saturating_sub(1));
+    if matches!(state.ed_mut().wrap, WrapMode::None) && state.viewport_cols > 0 {
+        let col = state.ed_mut().cursor.position.col;
+        if col < state.ed_mut().scroll_col {
+            state.ed_mut().scroll_col = col;
+        } else if col >= state.ed_mut().scroll_col.saturating_add(state.viewport_cols) {
+            state.ed_mut().scroll_col = col.saturating_sub(state.viewport_cols.saturating_sub(1));
         }
     }
 
-    let cursor_line = state.editor.cursor.position.line;
-    let top = state.editor.scroll_logical_line;
+    let cursor_line = state.ed_mut().cursor.position.line;
+    let top = state.ed_mut().scroll_logical_line;
 
     // Above the top: scroll up so the cursor's line is the new top.
     if cursor_line < top {
@@ -3842,7 +4040,7 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
     // an otherwise-empty viewport.
     let cursor_visible = ui::cursor_visual_position(state, state.viewport_rows).is_some();
     if !cursor_visible {
-        let target = cursor_line.min(state.editor.max_scroll_logical_line);
+        let target = cursor_line.min(state.ed_mut().max_scroll_logical_line);
         scroll_to(client, state, target).await?;
     }
     Ok(())
@@ -3853,31 +4051,31 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
 /// the line's first visual row lands near center, which is close enough for a quick `zz`.
 async fn center_cursor(client: &mut Client, state: &mut AppState) -> Result<()> {
     let half = state.viewport_rows / 2;
-    let target = state.editor.cursor.position.line.saturating_sub(half);
-    let target = target.min(state.editor.max_scroll_logical_line);
-    if target != state.editor.scroll_logical_line {
+    let target = state.ed_mut().cursor.position.line.saturating_sub(half);
+    let target = target.min(state.ed_mut().max_scroll_logical_line);
+    if target != state.ed_mut().scroll_logical_line {
         scroll_to(client, state, target).await?;
     }
     Ok(())
 }
 
 async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let new_wrap = match state.editor.wrap {
+    let new_wrap = match state.ed_mut().wrap {
         WrapMode::Soft => WrapMode::None,
         WrapMode::None => WrapMode::Soft,
     };
     let r = client
         .rpc::<ViewportSetWrap>(ViewportSetWrapParams {
-            viewport_id: state.editor.viewport_id,
+            viewport_id: state.ed_mut().viewport_id,
             wrap: new_wrap,
         })
         .await?;
-    state.editor.wrap = new_wrap;
-    state.editor.window_first_logical_line = r.window.first_logical_line;
-    state.editor.lines = r.window.lines;
+    state.ed_mut().wrap = new_wrap;
+    state.ed_mut().window_first_logical_line = r.window.first_logical_line;
+    state.ed_mut().lines = r.window.lines;
     // Horizontal scroll is meaningless under soft wrap — content never overflows right.
     if matches!(new_wrap, WrapMode::Soft) {
-        state.editor.scroll_col = 0;
+        state.ed_mut().scroll_col = 0;
     }
     state.status = format!(
         "wrap: {}",
@@ -3894,14 +4092,17 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
 /// at the start of `ensure_cursor_in_window`). This lets a trackpad burst of N scroll events
 /// collapse into one server round-trip.
 fn scroll_lines(state: &mut AppState, delta: i64) {
-    state.editor.pending_scroll_lines = state.editor.pending_scroll_lines.saturating_add(delta);
+    state.ed_mut().pending_scroll_lines = state.ed_mut().pending_scroll_lines.saturating_add(delta);
 }
 
 /// Apply any accumulated `pending_scroll_lines` to the server via one `viewport/scroll` call.
 /// No-op if zero. Called before every draw and from inside `ensure_cursor_in_window` so the
 /// cursor-visibility check sees the user's intended scroll position.
 async fn flush_pending_scroll(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let ed = &mut state.editor;
+    if !state.has_editor() {
+        return Ok(());
+    }
+    let ed = state.ed_mut();
     if ed.pending_scroll_lines == 0 {
         return Ok(());
     }
@@ -3925,30 +4126,30 @@ async fn flush_pending_scroll(client: &mut Client, state: &mut AppState) -> Resu
 /// Scroll the viewport horizontally by `delta` columns. Only meaningful under `WrapMode::None`;
 /// no-op when soft wrap is on (wrapped content never overflows right).
 fn scroll_cols(state: &mut AppState, delta: i64) {
-    if !matches!(state.editor.wrap, WrapMode::None) {
+    if !matches!(state.ed_mut().wrap, WrapMode::None) {
         return;
     }
-    state.editor.scroll_col = if delta >= 0 {
-        state.editor.scroll_col.saturating_add(delta as u32)
+    state.ed_mut().scroll_col = if delta >= 0 {
+        state.ed_mut().scroll_col.saturating_add(delta as u32)
     } else {
-        state.editor.scroll_col.saturating_sub((-delta) as u32)
+        state.ed_mut().scroll_col.saturating_sub((-delta) as u32)
     };
 }
 
 async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) -> Result<()> {
     let r = client
         .rpc::<ViewportScroll>(ViewportScrollParams {
-            viewport_id: state.editor.viewport_id,
+            viewport_id: state.ed_mut().viewport_id,
             scroll: ScrollPosition {
                 logical_line: target_line,
                 sub_row: 0.0,
             },
         })
         .await?;
-    state.editor.scroll_logical_line = target_line;
-    state.editor.window_first_logical_line = r.window.first_logical_line;
-    state.editor.line_count = r.window.line_count;
-    state.editor.max_scroll_logical_line = r.window.max_scroll_logical_line;
-    state.editor.lines = r.window.lines;
+    state.ed_mut().scroll_logical_line = target_line;
+    state.ed_mut().window_first_logical_line = r.window.first_logical_line;
+    state.ed_mut().line_count = r.window.line_count;
+    state.ed_mut().max_scroll_logical_line = r.window.max_scroll_logical_line;
+    state.ed_mut().lines = r.window.lines;
     Ok(())
 }

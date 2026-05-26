@@ -22,11 +22,22 @@ use tokio::sync::{mpsc, Mutex};
 pub type SharedState = Arc<Mutex<ServerState>>;
 
 pub struct ServerState {
-    pub project_name: String,
-    /// Canonicalized project paths. Each is either a file or a directory.
-    pub project_paths: Vec<PathBuf>,
+    /// Loaded projects, keyed by project name. Populated lazily by `project/activate` — a project
+    /// the user has configured but never activated is *not* here. Each entry owns the project's
+    /// canonical paths and workspace index. Never removed at runtime (no project/unload concept);
+    /// dropped only with the server.
+    pub projects: HashMap<String, ProjectEntry>,
+    /// File-system watcher for this server. `None` until [`crate::watcher::spawn`] runs — that
+    /// happens during `run_with_listener`. `project/activate` reaches in to add new project roots
+    /// once a project gets loaded. Per-server (not a global) so tests can spin up multiple servers
+    /// in the same process without sharing watcher state.
+    pub watcher: Option<Arc<std::sync::Mutex<notify::RecommendedWatcher>>>,
     pub token: String,
     pub buffers: HashMap<BufferId, Buffer>,
+    /// Which project each open buffer belongs to. Populated when a buffer is created
+    /// (`buffer/open`) and looked up when scoping per-buffer state to a project (e.g. on
+    /// `project/activate`, when tearing down a client's state for the previously active project).
+    pub buffer_projects: HashMap<BufferId, String>,
     pub clients: HashMap<ClientId, ClientSession>,
     pub viewports: HashMap<ViewportId, Viewport>,
     pub cursors: HashMap<(ClientId, BufferId), CursorState>,
@@ -52,16 +63,9 @@ pub struct ServerState {
     /// restore the view when it reopens the buffer (e.g. navigating away and back via the file
     /// browser). Cleared on disconnect.
     pub last_scroll: HashMap<(ClientId, BufferId), ScrollPosition>,
-    /// Workspace-wide candidate cache shared by all pickers. Walked lazily on first picker
-    /// access; survives picker hide/show.
-    pub workspace_index: Arc<WorkspaceIndex>,
     /// Per-`(client, kind)` picker state. Survives `picker/hide` (so resume restores query +
     /// ranking); cleared on disconnect.
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
-    /// Per-client buffer most-recently-used order. Front = most recent. Pushed on every
-    /// `buffer/open` (whether opening fresh, reopening an existing buffer, or attaching by id);
-    /// drives the empty-query order of the buffer picker. Cleared on disconnect.
-    pub mru_buffers: HashMap<ClientId, VecDeque<BufferId>>,
     /// Single shared fuzzy matcher. `nucleo_matcher::Matcher` reuses scratch buffers across
     /// calls, so it's cheaper to share one than construct per RPC. Not `Sync`, so the global
     /// lock around `ServerState` is what serializes access.
@@ -104,14 +108,42 @@ impl MotionHistory {
     }
 }
 
+/// One configured project, loaded and ready to serve. Owns its canonical roots and workspace
+/// index (the picker file cache). One per active project; lives in `ServerState::projects`.
+pub struct ProjectEntry {
+    pub name: String,
+    /// Canonicalized project paths. Each is either a file or a directory.
+    pub paths: Vec<PathBuf>,
+    /// Workspace-wide candidate cache for this project. Walked lazily on first picker access;
+    /// survives picker hide/show.
+    pub workspace_index: Arc<WorkspaceIndex>,
+    /// Most-recently-used buffers in this project, front = most-recent. Bumped on every
+    /// `buffer/open` (fresh open, reopen, or attach-by-id). Drives the buffer picker's empty-
+    /// query ordering, and the `last_buffer_id` returned by `project/activate` (so re-attaching
+    /// to a project drops the user on the buffer they last had).
+    ///
+    /// Lives on the project — not on the client — so it persists across client disconnects.
+    /// A new TUI invocation gets a fresh `ClientId` but inherits the project's MRU.
+    pub mru_buffers: VecDeque<BufferId>,
+}
+
+impl ProjectEntry {
+    /// True iff the given canonical path falls under one of this project's roots.
+    pub fn contains(&self, canonical: &Path) -> bool {
+        self.paths
+            .iter()
+            .any(|p| canonical == p || canonical.starts_with(p))
+    }
+}
+
 impl ServerState {
-    pub fn new(project_name: String, project_paths: Vec<PathBuf>, token: String) -> Self {
-        let workspace_index = Arc::new(WorkspaceIndex::new(project_paths.clone()));
+    pub fn new(token: String) -> Self {
         Self {
-            project_name,
-            project_paths,
+            projects: HashMap::new(),
+            watcher: None,
             token,
             buffers: HashMap::new(),
+            buffer_projects: HashMap::new(),
             clients: HashMap::new(),
             viewports: HashMap::new(),
             cursors: HashMap::new(),
@@ -120,13 +152,41 @@ impl ServerState {
             tree_selection_history: HashMap::new(),
             searches: HashMap::new(),
             last_scroll: HashMap::new(),
-            workspace_index,
             pickers: HashMap::new(),
-            mru_buffers: HashMap::new(),
             matcher: picker_state::make_matcher(),
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
+    }
+
+    /// Look up a loaded project by name. Returns `None` if the project hasn't been activated by
+    /// any client yet (or doesn't exist).
+    pub fn project(&self, name: &str) -> Option<&ProjectEntry> {
+        self.projects.get(name)
+    }
+
+    /// The project the given client currently has activated, if any.
+    pub fn active_project(&self, client_id: ClientId) -> Option<&ProjectEntry> {
+        let session = self.clients.get(&client_id)?;
+        let name = session.active_project.as_deref()?;
+        self.projects.get(name)
+    }
+
+    /// Same as [`Self::active_project`] but surfaces a `NO_ACTIVE_PROJECT` `RpcError` for the
+    /// common handler pattern of "require an active project or bail." Most non-`project/*`
+    /// handlers want this.
+    pub fn active_project_or_err(
+        &self,
+        client_id: ClientId,
+    ) -> Result<&ProjectEntry, crate::error::RpcError> {
+        self.active_project(client_id)
+            .ok_or_else(crate::error::RpcError::no_active_project)
+    }
+
+    /// Name of the project a buffer belongs to. `None` if the buffer is unknown or somehow
+    /// untagged (shouldn't happen for live buffers but the lookup is defensive).
+    pub fn project_for_buffer(&self, buffer_id: BufferId) -> Option<&str> {
+        self.buffer_projects.get(&buffer_id).map(|s| s.as_str())
     }
 
     pub fn allocate_buffer_id(&mut self) -> BufferId {
@@ -210,19 +270,26 @@ impl ServerState {
         self.pickers.retain(|(c, _), _| *c != client_id);
     }
 
-    /// Remove the MRU buffer ordering for the given client. Used on disconnect.
-    pub fn drop_mru_for_client(&mut self, client_id: ClientId) {
-        self.mru_buffers.remove(&client_id);
+    /// Bump `buffer_id` to the front of its project's MRU. Called from `buffer/open` every time
+    /// any client lands on a buffer — fresh open, reopen, or attach-by-id. No-op if the buffer
+    /// has no recorded project (shouldn't happen for live buffers but the lookup is defensive).
+    pub fn touch_mru(&mut self, buffer_id: BufferId) {
+        let Some(project_name) = self.buffer_projects.get(&buffer_id).cloned() else {
+            return;
+        };
+        let Some(project) = self.projects.get_mut(&project_name) else {
+            return;
+        };
+        project.mru_buffers.retain(|&b| b != buffer_id);
+        project.mru_buffers.push_front(buffer_id);
     }
 
-    /// Bump `buffer_id` to the front of the client's MRU list. No-op when `client_id` is
-    /// `None` (handler invoked before `client/hello`). Called from `buffer/open` every time
-    /// the client lands on a buffer — fresh open, reopen, or attach-by-id.
-    pub fn touch_mru(&mut self, client_id: Option<ClientId>, buffer_id: BufferId) {
-        let Some(cid) = client_id else { return };
-        let mru = self.mru_buffers.entry(cid).or_default();
-        mru.retain(|&b| b != buffer_id);
-        mru.push_front(buffer_id);
+    /// Drop `buffer_id` from every project's MRU. Called from `buffer/close` so a closed buffer
+    /// doesn't reappear at the top of the picker on the next open.
+    pub fn drop_buffer_from_mru(&mut self, buffer_id: BufferId) {
+        for project in self.projects.values_mut() {
+            project.mru_buffers.retain(|&b| b != buffer_id);
+        }
     }
 
     /// Drop the selection-expansion history for one client+buffer. Called from every cursor RPC
@@ -250,19 +317,68 @@ impl ServerState {
         self.virtual_col.retain(|(_, b), _| *b != buffer_id);
     }
 
-    /// Locate an already-open buffer for the given canonical path, if any.
-    pub fn buffer_for_path(&self, canonical: &Path) -> Option<BufferId> {
+    /// Locate an already-open buffer for the given canonical path, if any. Scoped to a project —
+    /// two projects can independently open the same file as separate buffers, and a path lookup
+    /// during `buffer/open` for project A shouldn't latch onto project B's existing buffer.
+    pub fn buffer_for_path_in_project(
+        &self,
+        project_name: &str,
+        canonical: &Path,
+    ) -> Option<BufferId> {
+        self.buffers.iter().find_map(|(id, b)| {
+            if b.canonical_path.as_deref() == Some(canonical)
+                && self.buffer_projects.get(id).map(|s| s.as_str()) == Some(project_name)
+            {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Locate an already-open buffer for the given canonical path, in any project. Used by the
+    /// file watcher, which has a path but not a project context — the watcher fires per
+    /// (path, event) pair and the project is recovered from the buffer itself.
+    pub fn buffer_for_path_any_project(&self, canonical: &Path) -> Option<BufferId> {
         self.buffers
             .iter()
             .find(|(_, b)| b.canonical_path.as_deref() == Some(canonical))
             .map(|(id, _)| *id)
     }
 
-    /// True iff the given canonical path is allowed by the project's access boundary.
-    pub fn path_is_in_project(&self, canonical: &Path) -> bool {
-        self.project_paths
+    /// Tear down all per-`(client, buffer)` state for buffers that belong to `project_name`,
+    /// limited to one client. Used when the client switches its active project: the buffers
+    /// themselves stay alive (other clients may have them open), but this client's viewports,
+    /// cursors, history, searches, scroll, and pickers/mru are reset.
+    pub fn teardown_client_state_for_project(
+        &mut self,
+        client_id: ClientId,
+        project_name: &str,
+    ) {
+        // Snapshot the buffer ids belonging to the project; we'll filter all the per-(client,
+        // buffer) maps against this set. Avoids borrowing `buffers` while mutating the maps.
+        let project_buffers: std::collections::HashSet<BufferId> = self
+            .buffer_projects
             .iter()
-            .any(|p| canonical == p || canonical.starts_with(p))
+            .filter_map(|(id, name)| (name == project_name).then_some(*id))
+            .collect();
+
+        self.viewports
+            .retain(|_, v| !(v.client_id == client_id && project_buffers.contains(&v.buffer_id)));
+        let in_proj =
+            |c: &ClientId, b: &BufferId| *c == client_id && project_buffers.contains(b);
+        // Viewports + the live search state get torn down (they're transient view-layer
+        // bookkeeping). Cursors / motion history / tree-selection / virtual-col / scroll are
+        // *preserved* — they're the user's place-in-the-buffer memory, and re-attaching to a
+        // buffer on project re-entry should restore them. The MRU is preserved for the same
+        // reason: the buffer picker filters by active project, so cross-project MRU entries
+        // don't leak into the UI, but they still let us reattach to "the buffer you last had"
+        // when you come back.
+        self.searches.retain(|(c, b), _| !in_proj(c, b));
+
+        // Pickers are per-session UI state — their candidate sets/queries reference the prior
+        // project so wipe them all on switch.
+        self.pickers.retain(|(c, _), _| *c != client_id);
     }
 }
 
@@ -799,6 +915,9 @@ pub struct ClientSession {
     pub client_id: ClientId,
     /// Channel for sending notifications to this client's connection task.
     pub outbound: mpsc::Sender<Notification>,
+    /// The project this client is currently working in. `None` between connect and the first
+    /// successful `project/activate`. Updated on every `project/activate`.
+    pub active_project: Option<String>,
 }
 
 pub struct Viewport {

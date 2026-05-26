@@ -5,9 +5,7 @@ use crate::error::RpcError;
 use crate::grep;
 use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
-use crate::state::{
-    Buffer, ClientSession, EditKindTag, SearchEntry, ServerState, SharedState, Viewport,
-};
+use crate::state::{Buffer, EditKindTag, SearchEntry, ServerState, SharedState, Viewport};
 use crate::wrap;
 use aether_protocol::buffer::{
     BufferCloseParams, BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams,
@@ -21,7 +19,6 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
-use aether_protocol::handshake::{ClientHelloParams, ClientHelloResult, ProjectInfo};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputMoveLinesParams, InputTextParams, UndoResult,
 };
@@ -29,6 +26,10 @@ use aether_protocol::picker::{
     PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHideParams, PickerItem, PickerKind,
     PickerQueryParams, PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams,
     PickerViewParams, PickerViewResult,
+};
+use aether_protocol::project::{
+    ProjectActivateParams, ProjectActivateResult, ProjectInfo, ProjectListParams,
+    ProjectListResult, ProjectSummary,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
@@ -44,72 +45,139 @@ use aether_protocol::{BufferId, ClientId, Revision};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 /// Per-connection context handed to handlers. Mutable bits live here; the durable state is in
 /// [`SharedState`].
 pub struct ConnectionCtx {
-    /// `Some` once `client/hello` has succeeded.
-    pub client_id: Option<ClientId>,
-    /// Cloned into [`ClientSession::outbound`] so other tasks can push to this connection.
-    pub outbound_tx: mpsc::Sender<Notification>,
+    /// Assigned at WebSocket-accept time, after the query-string token check. Always set by the
+    /// time a handler runs.
+    pub client_id: ClientId,
 }
 
-impl ConnectionCtx {
-    pub fn require_hello(&self) -> Result<ClientId, RpcError> {
-        self.client_id.ok_or_else(|| {
-            RpcError::new(
-                ErrorCode::INVALID_REQUEST,
-                "client/hello must be sent first",
-            )
-        })
-    }
+// ---- project/* --------------------------------------------------------------------------------
+
+/// Enumerate the projects configured on disk under `$XDG_CONFIG_HOME/aether/projects/`. The
+/// caller uses this to populate the project picker. Doesn't indicate which project (if any) the
+/// caller has active — the client tracks that locally.
+pub async fn project_list(
+    _state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    _params: ProjectListParams,
+) -> Result<ProjectListResult, RpcError> {
+    let names = crate::config::list_project_names()
+        .map_err(|e| RpcError::internal(format!("listing projects: {e}")))?;
+    Ok(ProjectListResult {
+        projects: names
+            .into_iter()
+            .map(|name| ProjectSummary { name })
+            .collect(),
+    })
 }
 
-// ---- handshake ---------------------------------------------------------------------------------
-
-pub async fn client_hello(
+/// Activate a project for this client. Loads the project's config from disk if no client has it
+/// active yet (lazy load). If the client already has a different project active, tears down the
+/// client's per-buffer state for the prior project before switching. Returns the resolved
+/// project info (name + canonical paths) so the client can present buffers relative to those
+/// roots.
+pub async fn project_activate(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: ClientHelloParams,
-) -> Result<ClientHelloResult, RpcError> {
-    let (project_name, project_paths, server_token) = {
-        let s = state.lock().await;
-        (
-            s.project_name.clone(),
-            s.project_paths.clone(),
-            s.token.clone(),
-        )
+    params: ProjectActivateParams,
+) -> Result<ProjectActivateResult, RpcError> {
+    let client_id = ctx.client_id;
+
+    // Cheap path: if the project is already loaded (some other client activated it earlier, or
+    // it was pre-registered for tests), skip the disk read.
+    let already_loaded = state.lock().await.projects.contains_key(&params.name);
+
+    // Cold path: read the project's config from disk *outside* the state lock — file I/O and
+    // canonicalization can be slow on cold caches, and we hold the lock for many concurrent
+    // operations.
+    let cold_load: Option<(String, Vec<std::path::PathBuf>)> = if already_loaded {
+        None
+    } else {
+        let cfg = match crate::config::load_project(&params.name) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(name = %params.name, error = %e, "project/activate: project not found");
+                return Err(RpcError::unknown_project(&params.name));
+            }
+        };
+        let canonical_paths: Vec<std::path::PathBuf> = cfg
+            .paths
+            .iter()
+            .map(|p| crate::config::canonicalize_project_path(p))
+            .collect::<Result<_, _>>()
+            .map_err(|e| RpcError::invalid_path(format!("canonicalizing project path: {e}")))?;
+        Some((cfg.name, canonical_paths))
     };
-    if params.token != server_token {
-        return Err(RpcError::invalid_token());
+
+    let mut s = state.lock().await;
+
+    // If the client had a different project active, tear down its prior per-buffer state.
+    let prior = s
+        .clients
+        .get(&client_id)
+        .and_then(|c| c.active_project.clone());
+    if let Some(prior_name) = &prior {
+        if prior_name != &params.name {
+            s.teardown_client_state_for_project(client_id, prior_name);
+        }
     }
-    if ctx.client_id.is_some() {
-        return Err(RpcError::new(
-            ErrorCode::INVALID_REQUEST,
-            "client/hello already sent for this connection",
+
+    // Install the project entry on the cold path. Reuse the existing entry (and its shared
+    // `WorkspaceIndex`) on the hot path.
+    if let Some((name, canonical_paths)) = cold_load {
+        let workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
+            canonical_paths.clone(),
         ));
+        s.projects.insert(
+            params.name.clone(),
+            crate::state::ProjectEntry {
+                name,
+                paths: canonical_paths.clone(),
+                workspace_index,
+                mru_buffers: std::collections::VecDeque::new(),
+            },
+        );
+        // Hand the new roots to the watcher so its events flow for this project too. Best-effort
+        // — a watcher failure shouldn't refuse activation. `watcher` is `None` only when the
+        // server skipped initializing it (failed at startup); we just skip registration in that
+        // case.
+        if let Some(w) = s.watcher.clone() {
+            crate::watcher::watch_project_paths(&w, &canonical_paths);
+        }
     }
-    let client_id = Uuid::new_v4();
-    ctx.client_id = Some(client_id);
 
-    let session = ClientSession {
-        client_id,
-        outbound: ctx.outbound_tx.clone(),
-    };
-    state.lock().await.clients.insert(client_id, session);
-    tracing::info!(%client_id, client_version = %params.client_version, "client registered");
+    let entry_paths: Vec<String> = s
+        .projects
+        .get(&params.name)
+        .map(|p| p.paths.iter().map(|p| p.display().to_string()).collect())
+        .unwrap_or_default();
 
-    Ok(ClientHelloResult {
-        client_id,
-        server_version: env!("CARGO_PKG_VERSION").into(),
+    if let Some(session) = s.clients.get_mut(&client_id) {
+        session.active_project = Some(params.name.clone());
+    }
+
+    // Most-recently-used buffer in the newly-active project. The MRU lives on `ProjectEntry`
+    // (not per-client) so it survives client disconnects — a fresh TUI invocation sees the same
+    // top-of-MRU buffer the prior session left there. The client uses this to reattach instead
+    // of spawning a fresh scratch on every switch.
+    let last_buffer_id = s.projects.get(&params.name).and_then(|p| {
+        p.mru_buffers
+            .iter()
+            .find(|id| s.buffers.contains_key(id))
+            .copied()
+    });
+
+    tracing::info!(%client_id, project = %params.name, "client activated project");
+
+    Ok(ProjectActivateResult {
         project: ProjectInfo {
-            name: project_name,
-            paths: project_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
+            name: params.name,
+            paths: entry_paths,
         },
+        last_buffer_id,
     })
 }
 
@@ -147,10 +215,14 @@ pub async fn buffer_open(
     ctx: &mut ConnectionCtx,
     params: BufferOpenParams,
 ) -> Result<BufferOpenResult, RpcError> {
-    // Used to surface this client's prior cursor + scroll for the buffer on reopen. `None` when
-    // the client hasn't sent `client/hello` yet — in that case there's no per-client state to
-    // restore, and the result's `cursor` / `scroll` fields fall back to defaults.
-    let client_id = ctx.client_id;
+    // `Option` wrapping is vestigial — every connected client has an id now (assigned at WS
+    // accept). Kept locally so the surrounding code (which threads cursor/scroll lookups through
+    // `Option<ClientId>`) stays unchanged.
+    let client_id = Some(ctx.client_id);
+    let active_project_name: String = {
+        let s = state.lock().await;
+        s.active_project_or_err(ctx.client_id)?.name.clone()
+    };
 
     // Attach-by-id: shortcut path used by the buffer picker (which needs to switch to scratch
     // buffers too, where there's no path to feed the path-keyed open flow). Ignores the path
@@ -181,7 +253,7 @@ pub async fn buffer_open(
             cursor,
             scroll,
         };
-        s.touch_mru(client_id, buffer_id);
+        s.touch_mru(buffer_id);
         let pushes = refresh_buffer_pickers(&mut s);
         drop(s);
         for (sender, notif) in pushes {
@@ -210,7 +282,8 @@ pub async fn buffer_open(
                 scroll,
             };
             s.buffers.insert(id, buf);
-            s.touch_mru(client_id, id);
+            s.buffer_projects.insert(id, active_project_name.clone());
+            s.touch_mru(id);
             let pushes = refresh_buffer_pickers(&mut s);
             drop(s);
             for (sender, notif) in pushes {
@@ -221,7 +294,8 @@ pub async fn buffer_open(
         (Some(idx), rel) => {
             let s = state.lock().await;
             let base = s
-                .project_paths
+                .active_project_or_err(ctx.client_id)?
+                .paths
                 .get(idx as usize)
                 .ok_or_else(|| RpcError::invalid_path(format!("path_index {idx} out of range")))?
                 .clone();
@@ -270,13 +344,16 @@ pub async fn buffer_open(
 
     {
         let mut s = state.lock().await;
-        if !s.path_is_in_project(&canonical) {
+        if !s
+            .active_project_or_err(ctx.client_id)?
+            .contains(&canonical)
+        {
             return Err(RpcError::invalid_path(format!(
                 "{} is outside the project's access boundary",
                 canonical.display()
             )));
         }
-        if let Some(existing) = s.buffer_for_path(&canonical) {
+        if let Some(existing) = s.buffer_for_path_in_project(&active_project_name, &canonical) {
             let buf = &s.buffers[&existing];
             let language = buf.language.clone();
             let line_count = buf.line_count();
@@ -301,7 +378,7 @@ pub async fn buffer_open(
                 cursor,
                 scroll,
             };
-            s.touch_mru(client_id, existing);
+            s.touch_mru(existing);
             let pushes = refresh_buffer_pickers(&mut s);
             drop(s);
             for (sender, notif) in pushes {
@@ -325,6 +402,7 @@ pub async fn buffer_open(
     // consistency with the reopen path.
     let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump);
     s.buffers.insert(id, buf);
+    s.buffer_projects.insert(id, active_project_name.clone());
     let cursor = match client_id {
         Some(c) => wrap_for_response(&s, c, id, cursor),
         None => cursor,
@@ -342,7 +420,7 @@ pub async fn buffer_open(
         cursor,
         scroll,
     };
-    s.touch_mru(client_id, id);
+    s.touch_mru(id);
     let pushes = refresh_buffer_pickers(&mut s);
     drop(s);
     for (sender, notif) in pushes {
@@ -416,7 +494,7 @@ pub async fn search_set(
     ctx: &mut ConnectionCtx,
     params: SearchSetParams,
 ) -> Result<SearchSetResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
         .buffers
@@ -495,7 +573,7 @@ pub async fn search_clear(
     ctx: &mut ConnectionCtx,
     params: SearchClearParams,
 ) -> Result<(), RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if !s.buffers.contains_key(&params.buffer_id) {
         return Err(RpcError::buffer_not_found(params.buffer_id));
@@ -531,7 +609,7 @@ async fn search_navigate(
     buffer_id: BufferId,
     direction: Direction,
 ) -> Result<SearchNavResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let key = (client_id, buffer_id);
     let buf = s
@@ -887,12 +965,13 @@ pub async fn buffer_close(
     ctx: &mut ConnectionCtx,
     params: BufferCloseParams,
 ) -> Result<aether_protocol::buffer::BufferCloseResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if !s.buffers.contains_key(&params.buffer_id) {
         return Err(RpcError::buffer_not_found(params.buffer_id));
     }
     s.buffers.remove(&params.buffer_id);
+    s.buffer_projects.remove(&params.buffer_id);
     s.viewports.retain(|_, v| v.buffer_id != params.buffer_id);
     s.cursors.retain(|(_, b), _| *b != params.buffer_id);
     s.motion_history.retain(|(_, b), _| *b != params.buffer_id);
@@ -901,17 +980,24 @@ pub async fn buffer_close(
         .retain(|(_, b), _| *b != params.buffer_id);
     s.searches.retain(|(_, b), _| *b != params.buffer_id);
     s.last_scroll.retain(|(_, b), _| *b != params.buffer_id);
-    for mru in s.mru_buffers.values_mut() {
-        mru.retain(|&id| id != params.buffer_id);
-    }
-    // Pick the next buffer for the requesting client: top of their MRU after cleanup, or
-    // — if their MRU is empty — any remaining buffer (some other client may have it open).
-    // The client uses this to attach without an extra RPC round-trip.
+    s.drop_buffer_from_mru(params.buffer_id);
+    // Pick the next buffer for the requesting client: top of the active project's MRU after
+    // cleanup, or — if that's empty — any remaining buffer in the project. The client uses this
+    // to attach without an extra RPC round-trip.
+    let project_name = s
+        .active_project(client_id)
+        .map(|p| p.name.clone());
     let next_buffer_id = s
-        .mru_buffers
-        .get(&client_id)
-        .and_then(|mru| mru.front().copied())
-        .or_else(|| s.buffers.keys().next().copied());
+        .active_project(client_id)
+        .and_then(|p| p.mru_buffers.front().copied())
+        .or_else(|| {
+            project_name.as_deref().and_then(|name| {
+                s.buffer_projects
+                    .iter()
+                    .find(|(_, pname)| pname.as_str() == name)
+                    .map(|(id, _)| *id)
+            })
+        });
     let pushes = refresh_buffer_pickers(&mut s);
     drop(s);
     for (sender, notif) in pushes {
@@ -928,7 +1014,7 @@ pub async fn buffer_copy(
     ctx: &mut ConnectionCtx,
     params: BufferCopyParams,
 ) -> Result<BufferCopyResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let s = state.lock().await;
     let buf = s
         .buffers
@@ -949,7 +1035,7 @@ pub async fn buffer_cut(
     ctx: &mut ConnectionCtx,
     params: BufferCopyParams,
 ) -> Result<BufferCutResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
 
     // Extract the text and compute the range while holding the lock; then apply the deletion via
     // `Buffer::apply_edit` (which handles the undo entry and tree update) and broadcast.
@@ -1080,7 +1166,7 @@ pub async fn buffer_save(
     ctx: &mut ConnectionCtx,
     params: BufferSaveParams,
 ) -> Result<BufferSaveResult, RpcError> {
-    let _client_id = ctx.require_hello()?;
+    let _client_id = ctx.client_id;
 
     // Resolve the target absolute path.
     let target: std::path::PathBuf = match (params.path_index, params.relative_path.as_deref()) {
@@ -1097,7 +1183,8 @@ pub async fn buffer_save(
         (Some(idx), rel) => {
             let s = state.lock().await;
             let base = s
-                .project_paths
+                .active_project_or_err(ctx.client_id)?
+                .paths
                 .get(idx as usize)
                 .ok_or_else(|| RpcError::invalid_path(format!("path_index {idx} out of range")))?
                 .clone();
@@ -1122,7 +1209,7 @@ pub async fn buffer_save(
             let resolved = parent_canonical.join(file_name);
 
             let s = state.lock().await;
-            if !s.path_is_in_project(&resolved) {
+            if !s.active_project_or_err(ctx.client_id)?.contains(&resolved) {
                 return Err(RpcError::invalid_path(format!(
                     "{} is outside the project's access boundary",
                     resolved.display()
@@ -1152,7 +1239,8 @@ pub async fn buffer_save(
     // we'd clone the rope, drop the lock, write, then re-lock to update state.
     let (saved_at_unix_ms, revision) = {
         let mut s = state.lock().await;
-        if let Some(existing) = s.buffer_for_path(&target) {
+        let active_project_name = s.active_project_or_err(ctx.client_id)?.name.clone();
+        if let Some(existing) = s.buffer_for_path_in_project(&active_project_name, &target) {
             if existing != params.buffer_id {
                 return Err(RpcError::path_owned_by_buffer(existing));
             }
@@ -1223,7 +1311,7 @@ pub async fn buffer_reload(
     ctx: &mut ConnectionCtx,
     params: BufferReloadParams,
 ) -> Result<BufferReloadResult, RpcError> {
-    let _client_id = ctx.require_hello()?;
+    let _client_id = ctx.client_id;
     let mut s = state.lock().await;
     if !params.force {
         let buf = s
@@ -1335,7 +1423,7 @@ pub async fn viewport_subscribe(
     ctx: &mut ConnectionCtx,
     params: ViewportSubscribeParams,
 ) -> Result<ViewportSubscribeResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
 
     let mut s = state.lock().await;
     let buf = s
@@ -1396,7 +1484,7 @@ pub async fn viewport_resize(
     ctx: &mut ConnectionCtx,
     params: ViewportResizeParams,
 ) -> Result<ViewportWindowResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.cols = params.cols;
@@ -1446,7 +1534,7 @@ pub async fn viewport_set_wrap(
     ctx: &mut ConnectionCtx,
     params: ViewportSetWrapParams,
 ) -> Result<ViewportWindowResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.wrap = params.wrap;
@@ -1495,7 +1583,7 @@ pub async fn viewport_scroll(
     ctx: &mut ConnectionCtx,
     params: ViewportScrollParams,
 ) -> Result<ViewportWindowResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.scroll_logical_line = params.scroll.logical_line;
@@ -1546,7 +1634,7 @@ pub async fn viewport_unsubscribe(
     ctx: &mut ConnectionCtx,
     params: ViewportUnsubscribeParams,
 ) -> Result<(), RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let vp = s.viewports.get(&params.viewport_id).ok_or_else(|| {
         RpcError::new(
@@ -1750,7 +1838,7 @@ pub async fn cursor_move(
     ctx: &mut ConnectionCtx,
     params: CursorMoveParams,
 ) -> Result<CursorState, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
         .buffers
@@ -1905,7 +1993,7 @@ pub async fn cursor_select_line(
     ctx: &mut ConnectionCtx,
     params: CursorSelectLineParams,
 ) -> Result<CursorState, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
         .buffers
@@ -1998,7 +2086,7 @@ pub async fn cursor_swap_anchor(
     ctx: &mut ConnectionCtx,
     params: CursorSwapAnchorParams,
 ) -> Result<CursorState, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if !s.buffers.contains_key(&params.buffer_id) {
         return Err(RpcError::buffer_not_found(params.buffer_id));
@@ -2030,7 +2118,7 @@ pub async fn cursor_set(
     ctx: &mut ConnectionCtx,
     params: CursorSetParams,
 ) -> Result<CursorState, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
         .buffers
@@ -2065,7 +2153,7 @@ pub async fn cursor_undo(
     ctx: &mut ConnectionCtx,
     params: CursorUndoParams,
 ) -> Result<CursorUndoResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if !s.buffers.contains_key(&params.buffer_id) {
         return Err(RpcError::buffer_not_found(params.buffer_id));
@@ -2106,7 +2194,7 @@ pub async fn cursor_redo(
     ctx: &mut ConnectionCtx,
     params: CursorUndoParams,
 ) -> Result<CursorUndoResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if !s.buffers.contains_key(&params.buffer_id) {
         return Err(RpcError::buffer_not_found(params.buffer_id));
@@ -2149,7 +2237,7 @@ pub async fn cursor_expand(
     ctx: &mut ConnectionCtx,
     params: CursorBufferOnlyParams,
 ) -> Result<CursorState, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
         .buffers
@@ -2218,7 +2306,7 @@ pub async fn cursor_contract(
     ctx: &mut ConnectionCtx,
     params: CursorBufferOnlyParams,
 ) -> Result<CursorState, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if !s.buffers.contains_key(&params.buffer_id) {
         return Err(RpcError::buffer_not_found(params.buffer_id));
@@ -2266,7 +2354,7 @@ pub async fn input_text(
     ctx: &mut ConnectionCtx,
     params: InputTextParams,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     apply_edit(
         state,
         client_id,
@@ -2284,7 +2372,7 @@ pub async fn input_delete(
     ctx: &mut ConnectionCtx,
     params: BufferOnlyParams,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     apply_edit(
         state,
         client_id,
@@ -2299,7 +2387,7 @@ pub async fn input_backspace(
     ctx: &mut ConnectionCtx,
     params: BufferOnlyParams,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     apply_edit(state, client_id, params.buffer_id, EditKind::Backspace).await
 }
 
@@ -2308,7 +2396,7 @@ pub async fn input_delete_line(
     ctx: &mut ConnectionCtx,
     params: BufferOnlyParams,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     apply_edit(state, client_id, params.buffer_id, EditKind::DeleteLine).await
 }
 
@@ -2317,7 +2405,7 @@ pub async fn input_change_line(
     ctx: &mut ConnectionCtx,
     params: BufferOnlyParams,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     apply_edit(state, client_id, params.buffer_id, EditKind::ChangeLine).await
 }
 
@@ -2326,7 +2414,7 @@ pub async fn input_replace_line(
     ctx: &mut ConnectionCtx,
     params: aether_protocol::input::InputReplaceLineParams,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     apply_edit(
         state,
         client_id,
@@ -2365,7 +2453,7 @@ pub async fn input_newline_and_indent(
     ctx: &mut ConnectionCtx,
     params: BufferOnlyParams,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let indent = {
         let s = state.lock().await;
         let buf = s
@@ -2517,7 +2605,7 @@ async fn apply_toggle_comment(
     ctx: &mut ConnectionCtx,
     buffer_id: BufferId,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
         .buffers
@@ -3225,7 +3313,7 @@ async fn apply_indent_or_dedent(
     buffer_id: BufferId,
     kind: IndentKind,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
         .buffers
@@ -3385,7 +3473,7 @@ pub async fn input_move_lines(
     ctx: &mut ConnectionCtx,
     params: InputMoveLinesParams,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let buffer_id = params.buffer_id;
 
     // Phase 1: read state and compute the edit while holding the lock.
@@ -3583,7 +3671,7 @@ pub async fn input_join_lines(
     ctx: &mut ConnectionCtx,
     params: BufferOnlyParams,
 ) -> Result<EditResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let buffer_id = params.buffer_id;
 
     // Figure out which line(s) we're joining. If the cursor has a selection that spans multiple
@@ -3760,7 +3848,7 @@ async fn apply_undo_or_redo(
     buffer_id: BufferId,
     direction: UndoDirection,
 ) -> Result<UndoResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
 
     // Snapshot current cursors so the *other* direction's stack can restore them later.
@@ -3930,10 +4018,13 @@ fn with_grep_position(
     let Some(buf) = s.buffers.get(&buffer_id) else {
         return cursor;
     };
+    let Some(project) = s.active_project(client_id) else {
+        return cursor;
+    };
     let Some(current_path) = buf
         .canonical_path
         .as_deref()
-        .and_then(|p| crate::workspace_index::project_relative_display(p, &s.project_paths))
+        .and_then(|p| crate::workspace_index::project_relative_display(p, &project.paths))
     else {
         return cursor;
     };
@@ -4305,36 +4396,46 @@ fn build_lines_changed_notif(
 
 // ---- picker/* ----------------------------------------------------------------------------------
 
-/// Build the buffer-picker candidate list for `client_id`: every live buffer, MRU first,
-/// then any buffers the client hasn't touched yet (e.g. opened by another client) in
-/// buffer-id order. `[scratch N]` placeholder display for buffers without a path.
+/// Build the buffer-picker candidate list for `client_id`: every buffer belonging to the
+/// client's active project, MRU first, then any project buffers the client hasn't touched yet
+/// (e.g. opened by another client of the same project) in buffer-id order. `[scratch N]`
+/// placeholder display for buffers without a path. Returns an empty list if the client has no
+/// active project (the picker shouldn't be reachable without one, but the lookup stays defensive).
 fn build_buffer_candidates(
     s: &ServerState,
     client_id: ClientId,
 ) -> Vec<picker_state::BufferCandidate> {
+    let Some(project) = s.active_project(client_id) else {
+        return Vec::new();
+    };
+    let project_name = project.name.clone();
+    let roots = project.paths.clone();
+    let belongs = |id: &BufferId| s.buffer_projects.get(id).map(|s| s.as_str()) == Some(&project_name);
+
     let mut out: Vec<picker_state::BufferCandidate> = Vec::with_capacity(s.buffers.len());
     let mut seen: std::collections::HashSet<BufferId> = std::collections::HashSet::new();
 
-    if let Some(mru) = s.mru_buffers.get(&client_id) {
-        for &id in mru {
-            let Some(buf) = s.buffers.get(&id) else {
-                continue;
-            };
-            out.push(buffer_candidate(buf, &s.project_paths));
-            seen.insert(id);
+    for &id in &project.mru_buffers {
+        if !belongs(&id) {
+            continue;
         }
+        let Some(buf) = s.buffers.get(&id) else {
+            continue;
+        };
+        out.push(buffer_candidate(buf, &roots));
+        seen.insert(id);
     }
-    // Append any buffers not in the MRU yet so the picker still surfaces them. Stable order
-    // (by id) so the tail is deterministic.
+    // Append any project buffers not in the MRU yet so the picker still surfaces them. Stable
+    // order (by id) so the tail is deterministic.
     let mut leftovers: Vec<BufferId> = s
         .buffers
         .keys()
         .copied()
-        .filter(|id| !seen.contains(id))
+        .filter(|id| belongs(id) && !seen.contains(id))
         .collect();
     leftovers.sort_unstable();
     for id in leftovers {
-        out.push(buffer_candidate(&s.buffers[&id], &s.project_paths));
+        out.push(buffer_candidate(&s.buffers[&id], &roots));
     }
     out
 }
@@ -4441,7 +4542,7 @@ async fn build_explorer_candidates(
                 picker_state::PickerCandidates::Explorer(e) => Some(e.path.clone()),
                 _ => None,
             });
-        (s.project_paths.clone(), existing)
+        (s.active_project_or_err(client_id)?.paths.clone(), existing)
     };
     let raw_path: std::path::PathBuf = if let Some(p) = requested {
         std::path::PathBuf::from(p)
@@ -4551,9 +4652,13 @@ pub(crate) fn refresh_explorers_for_dirs(
     if to_refresh.is_empty() {
         return Vec::new();
     }
-    let project_paths = s.project_paths.clone();
     let mut pushes = Vec::new();
     for (client_id, path) in to_refresh {
+        // Each picker's project may differ — re-fetch per client. Skip silently if the client
+        // somehow lost its active project between subscribe and refresh.
+        let Some(project_paths) = s.active_project(client_id).map(|p| p.paths.clone()) else {
+            continue;
+        };
         let new_candidates = match build_explorer_candidates_for_canonical(&path, &project_paths) {
             Ok(c) => c,
             Err(_) => continue, // dir removed or no longer in project; skip silently
@@ -4591,19 +4696,27 @@ pub async fn picker_view(
     ctx: &mut ConnectionCtx,
     params: PickerViewParams,
 ) -> Result<PickerViewResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
 
     // Build candidates outside the mutation phase. Files needs an async workspace walk;
     // Buffers reads ServerState directly. Grep starts empty — the candidate set is generated
     // on demand by `picker/query`'s spawned search. Explorer re-lists the requested directory
     // (or the previously-listed one on resume) every call, like Buffers — directories change.
+    // Per-kind active-project gating. Projects is the *only* kind that's allowed before
+    // activation — it's how the user gets a project active in the first place. Files / Buffers /
+    // Grep / Explorer require an active project; their candidate builders all hit project-scoped
+    // data and would error or return nothing without one.
+    if !matches!(params.kind, PickerKind::Projects) {
+        let s = state.lock().await;
+        s.active_project_or_err(client_id)?;
+    }
     let candidates = match params.kind {
         PickerKind::Files => {
             // Walk the workspace outside the global lock — on first call it can take seconds.
             // The `Arc<WorkspaceIndex>` clone is cheap; the walk itself is memoized inside.
             let workspace_index = {
                 let s = state.lock().await;
-                s.workspace_index.clone()
+                s.active_project_or_err(client_id)?.workspace_index.clone()
             };
             picker_state::PickerCandidates::Files(workspace_index.files().await)
         }
@@ -4615,6 +4728,18 @@ pub async fn picker_view(
         PickerKind::Explorer => picker_state::PickerCandidates::Explorer(
             build_explorer_candidates(state, client_id, params.directory_path.as_deref()).await?,
         ),
+        PickerKind::Projects => {
+            // Configured-project enumeration is a synchronous read of one directory under
+            // `$XDG_CONFIG_HOME/aether/projects/`. No active-project check; works pre-activation.
+            let names = crate::config::list_project_names()
+                .map_err(|e| RpcError::internal(format!("listing projects: {e}")))?;
+            picker_state::PickerCandidates::Projects(
+                names
+                    .into_iter()
+                    .map(|name| picker_state::ProjectCandidate { name })
+                    .collect(),
+            )
+        }
     };
 
     let mut s = state.lock().await;
@@ -4638,8 +4763,9 @@ pub async fn picker_view(
                     cursor.position
                 };
                 let current_path = s.buffers.get(&buffer_id).and_then(|b| {
+                    let project = s.active_project(client_id)?;
                     b.canonical_path.as_deref().and_then(|p| {
-                        crate::workspace_index::project_relative_display(p, &s.project_paths)
+                        crate::workspace_index::project_relative_display(p, &project.paths)
                     })
                 });
                 Some((leading_edge, current_path))
@@ -4761,7 +4887,7 @@ pub async fn picker_query(
     ctx: &mut ConnectionCtx,
     params: PickerQueryParams,
 ) -> Result<(), RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let key = (client_id, params.kind);
     let ServerState {
@@ -4819,7 +4945,10 @@ pub async fn picker_query(
     }
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
     let workspace_index_for_grep = if matches!(params.kind, PickerKind::Grep) {
-        Some(s.workspace_index.clone())
+        // Active-project lookup can fail in the (defensively-handled) case where the client
+        // somehow lost its active project between opening the picker and querying it. Skip the
+        // grep spawn in that case — there's nothing meaningful to search.
+        s.active_project(client_id).map(|p| p.workspace_index.clone())
     } else {
         None
     };
@@ -4830,9 +4959,10 @@ pub async fn picker_query(
     }
 
     if will_spawn_grep_search {
-        let workspace_index = workspace_index_for_grep.expect("set when kind == Grep");
-        let files = workspace_index.files().await;
-        grep::spawn_search(state.clone(), files, client_id, query_for_grep, generation);
+        if let Some(workspace_index) = workspace_index_for_grep {
+            let files = workspace_index.files().await;
+            grep::spawn_search(state.clone(), files, client_id, query_for_grep, generation);
+        }
     }
     Ok(())
 }
@@ -4842,7 +4972,7 @@ pub async fn picker_select(
     ctx: &mut ConnectionCtx,
     params: PickerSelectParams,
 ) -> Result<PickerSelectResult, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let s = state.lock().await;
     let key = (client_id, params.kind);
     let picker = s.pickers.get(&key).ok_or_else(|| {
@@ -4863,7 +4993,7 @@ pub async fn picker_hide(
     ctx: &mut ConnectionCtx,
     params: PickerHideParams,
 ) -> Result<(), RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if let Some(picker) = s.pickers.get_mut(&(client_id, params.kind)) {
         picker.subscribed = None;
@@ -4880,18 +5010,22 @@ pub async fn picker_grep_navigate(
     ctx: &mut ConnectionCtx,
     params: PickerGrepNavigateParams,
 ) -> Result<Option<PickerGrepNavigateTarget>, RpcError> {
-    let client_id = ctx.require_hello()?;
+    let client_id = ctx.client_id;
     let s = state.lock().await;
     let buffer = s
         .buffers
         .get(&params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     // None for scratch buffers; otherwise the project-relative display path the grep candidates
-    // are keyed by.
-    let current_path: Option<String> = buffer
-        .canonical_path
-        .as_deref()
-        .and_then(|p| crate::workspace_index::project_relative_display(p, &s.project_paths));
+    // are keyed by. Falls back to None if the client somehow lost its active project — the
+    // navigate handler then treats this as "no anchor in the file list" the same way scratch
+    // buffers do.
+    let current_path: Option<String> = s.active_project(client_id).and_then(|project| {
+        buffer
+            .canonical_path
+            .as_deref()
+            .and_then(|p| crate::workspace_index::project_relative_display(p, &project.paths))
+    });
 
     let Some(picker) = s.pickers.get(&(client_id, PickerKind::Grep)) else {
         return Ok(None);

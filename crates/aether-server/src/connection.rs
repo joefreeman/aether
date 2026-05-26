@@ -1,8 +1,16 @@
 //! Per-connection task: WebSocket framing, JSON-RPC frame dispatch.
+//!
+//! Authentication: the client passes `?token=<>&client_version=<>` on the WebSocket URL.
+//! Token mismatch fails the upgrade with HTTP 401 *before* any JSON-RPC traffic flows; valid
+//! tokens get an allocated `ClientId` immediately, so handlers can rely on it being set.
+//!
+//! Project selection: a connected client has no buffer-level capabilities until it calls
+//! `project/activate`. The only RPCs that work without an active project are `project/list` and
+//! `project/activate` itself; everything else returns `NO_ACTIVE_PROJECT`.
 
 use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
-use crate::state::SharedState;
+use crate::state::{ClientSession, SharedState};
 use aether_protocol::buffer::{
     BufferClose, BufferCopy, BufferCut, BufferOpen, BufferReload, BufferSave,
 };
@@ -13,7 +21,6 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
-use aether_protocol::handshake::ClientHello;
 use aether_protocol::input::{
     InputBackspace, InputChangeLine, InputDedent, InputDelete, InputDeleteLine, InputIndent,
     InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine, InputText,
@@ -22,32 +29,100 @@ use aether_protocol::input::{
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerHide, PickerQuery, PickerSelect, PickerView,
 };
+use aether_protocol::project::{ProjectActivate, ProjectList};
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportSetWrap, ViewportSubscribe, ViewportUnsubscribe,
 };
+use aether_protocol::ClientId;
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse as HsErr, Request as HsReq, Response as HsResp};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
 const OUTBOUND_CHANNEL_CAPACITY: usize = 64;
 
+/// Extracted from the WebSocket upgrade request's query string.
+#[derive(Default)]
+struct ConnectQuery {
+    token: Option<String>,
+    client_version: Option<String>,
+}
+
+impl ConnectQuery {
+    /// Parse `?token=...&client_version=...` (and tolerate missing/extra params). URL-decoding
+    /// is intentionally minimal — these values are produced by our own TUI, which doesn't put
+    /// special characters in either field.
+    fn parse(query: &str) -> Self {
+        let mut out = Self::default();
+        for kv in query.split('&') {
+            let Some((k, v)) = kv.split_once('=') else {
+                continue;
+            };
+            match k {
+                "token" => out.token = Some(v.to_string()),
+                "client_version" => out.client_version = Some(v.to_string()),
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
 pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
     let peer = stream.peer_addr().ok();
-    let ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .with_context(|| format!("WebSocket handshake from {peer:?}"))?;
-    tracing::debug!(?peer, "WebSocket established");
+    // Pull the expected token once; the handshake callback compares against it. Cloning out of
+    // the lock keeps the upgrade synchronous.
+    let server_token = state.lock().await.token.clone();
+
+    let mut query = ConnectQuery::default();
+    let ws = tokio_tungstenite::accept_hdr_async(
+        stream,
+        |req: &HsReq, resp: HsResp| -> Result<HsResp, HsErr> {
+            let q = req.uri().query().unwrap_or("");
+            query = ConnectQuery::parse(q);
+            match &query.token {
+                Some(t) if *t == server_token => Ok(resp),
+                _ => {
+                    tracing::warn!(?peer, "rejecting connection: missing or invalid token");
+                    let mut err = HsErr::new(Some("invalid token".into()));
+                    *err.status_mut() = StatusCode::UNAUTHORIZED;
+                    Err(err)
+                }
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("WebSocket handshake from {peer:?}"))?;
+    let client_version = query.client_version.clone().unwrap_or_default();
+    tracing::debug!(?peer, %client_version, "WebSocket established");
 
     let (mut writer, mut reader) = ws.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Notification>(OUTBOUND_CHANNEL_CAPACITY);
-    let mut ctx = ConnectionCtx {
-        client_id: None,
-        outbound_tx,
-    };
+
+    let client_id: ClientId = Uuid::new_v4();
+    {
+        let mut s = state.lock().await;
+        s.clients.insert(
+            client_id,
+            ClientSession {
+                client_id,
+                outbound: outbound_tx.clone(),
+                active_project: None,
+            },
+        );
+    }
+    tracing::info!(%client_id, %client_version, "client registered");
+
+    // `outbound_tx` stays in scope so the channel has a live sender for the lifetime of the
+    // connection task — handlers push through the cloned sender we stashed on the session.
+    let _outbound_tx = outbound_tx;
+    let mut ctx = ConnectionCtx { client_id };
 
     loop {
         tokio::select! {
@@ -76,7 +151,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         }
     }
 
-    if let Some(client_id) = ctx.client_id {
+    {
         let mut s = state.lock().await;
         s.clients.remove(&client_id);
         s.drop_viewports_for_client(client_id);
@@ -87,7 +162,6 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_tree_selection_history_for_client(client_id);
         s.drop_last_scroll_for_client(client_id);
         s.drop_pickers_for_client(client_id);
-        s.drop_mru_for_client(client_id);
         tracing::debug!(%client_id, "client session removed");
     }
     Ok(())
@@ -162,7 +236,8 @@ async fn dispatch(
     }
 
     match method {
-        ClientHello::NAME => run!(ClientHello, handlers::client_hello),
+        ProjectList::NAME => run!(ProjectList, handlers::project_list),
+        ProjectActivate::NAME => run!(ProjectActivate, handlers::project_activate),
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),

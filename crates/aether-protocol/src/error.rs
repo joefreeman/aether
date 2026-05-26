@@ -16,6 +16,13 @@ impl ErrorCode {
 
     // Aether application errors
     pub const INVALID_TOKEN: Self = Self(-32001);
+    /// The connecting client has not yet activated a project via `project/activate`. Every
+    /// buffer/cursor/viewport/picker/search/input RPC requires an active project; only
+    /// `project/list` and `project/activate` work before activation.
+    pub const NO_ACTIVE_PROJECT: Self = Self(-32002);
+    /// `project/activate` named a project that has no config file under
+    /// `$XDG_CONFIG_HOME/aether/projects/`.
+    pub const UNKNOWN_PROJECT: Self = Self(-32003);
     pub const INVALID_PATH: Self = Self(-32010);
     pub const BUFFER_NOT_FOUND: Self = Self(-32011);
     pub const VIEWPORT_NOT_FOUND: Self = Self(-32012);

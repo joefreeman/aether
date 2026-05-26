@@ -1,5 +1,6 @@
-//! File-system watcher. One global `notify::RecommendedWatcher` covers every project root
-//! recursively; an async task drains events and routes them to buffers and pickers:
+//! File-system watcher. One `notify::RecommendedWatcher` per server (lives in `ServerState`)
+//! covers every loaded project's roots recursively; an async task drains events and routes them
+//! to buffers and pickers:
 //!
 //! - A buffer whose canonical path was modified gets either a silent reload (if clean) or
 //!   the `externally_modified` flag (if dirty).
@@ -10,6 +11,9 @@
 //!
 //! Self-writes (the server's own `buffer/save`) are filtered out by comparing on-disk mtime
 //! against the buffer's recorded `last_modified_unix_ms`.
+//!
+//! Roots are watched lazily: `project/activate` calls [`watch_project_paths`] for each new
+//! project's roots, so cold projects don't waste an inotify slot.
 
 use crate::handlers::{
     collect_buffer_state_pushes, refresh_explorers_for_dirs, reload_buffer_locked,
@@ -17,34 +21,30 @@ use crate::handlers::{
 use crate::state::{ServerState, SharedState};
 use aether_protocol::envelope::Notification;
 use aether_protocol::BufferId;
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-/// Spawn the watcher task. Reads `project_paths` from `state`, sets up a recursive watch on
-/// each, and starts an async loop that processes events until the channel closes (when the
-/// `Watcher` is dropped on shutdown).
+/// Spawn the per-server watcher task. Stashes the watcher handle in `ServerState::watcher` so
+/// `project/activate` can register new roots, and starts an async loop that processes events
+/// until the channel closes (when the watcher is dropped on shutdown).
+///
+/// At startup the watcher has no roots — projects register theirs in `project/activate`.
 pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
 
-    let mut watcher = notify::recommended_watcher(move |res| {
+    let watcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
     })?;
-
-    let project_paths = {
-        let s = state.lock().await;
-        s.project_paths.clone()
-    };
-    for path in &project_paths {
-        if let Err(e) = watcher.watch(path, RecursiveMode::Recursive) {
-            tracing::warn!(path = %path.display(), error = %e, "failed to watch path");
-        }
+    let handle = Arc::new(Mutex::new(watcher));
+    {
+        let mut s = state.lock().await;
+        s.watcher = Some(handle);
     }
 
     tokio::spawn(async move {
-        // Keep the watcher alive for the lifetime of this task.
-        let _watcher = watcher;
         while let Some(res) = rx.recv().await {
             match res {
                 Ok(event) => handle_event(&state, event).await,
@@ -55,6 +55,28 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+/// Register a project's roots with the server's live watcher. Called from `project/activate` the
+/// first time a project is loaded. Each root gets a recursive watch. Errors are logged, not
+/// propagated — losing the watcher on one root shouldn't fail the whole activation; the project
+/// just won't receive external-change notifications for that root.
+pub fn watch_project_paths(
+    watcher: &Arc<Mutex<RecommendedWatcher>>,
+    paths: &[PathBuf],
+) {
+    let mut watcher = match watcher.lock() {
+        Ok(g) => g,
+        Err(p) => {
+            tracing::warn!("watcher mutex poisoned; skipping registration");
+            p.into_inner()
+        }
+    };
+    for path in paths {
+        if let Err(e) = watcher.watch(path, RecursiveMode::Recursive) {
+            tracing::warn!(path = %path.display(), error = %e, "failed to watch path");
+        }
+    }
 }
 
 async fn handle_event(state: &SharedState, event: Event) {
@@ -98,7 +120,16 @@ async fn handle_event(state: &SharedState, event: Event) {
         }
 
         if index_should_invalidate {
-            s.workspace_index.invalidate();
+            // Invalidate the workspace index for any project whose roots contain one of the
+            // affected paths. Cheap — we only have a handful of projects loaded at most.
+            for project in s.projects.values() {
+                if paths
+                    .iter()
+                    .any(|p| project.paths.iter().any(|root| p.starts_with(root)))
+                {
+                    project.workspace_index.invalidate();
+                }
+            }
         }
         let picker_pushes = refresh_explorers_for_dirs(&mut s, &affected_dirs);
         pushes.extend(picker_pushes);
@@ -117,13 +148,7 @@ enum Category {
 }
 
 fn buffer_for_path(s: &ServerState, path: &Path) -> Option<BufferId> {
-    s.buffers.iter().find_map(|(id, b)| {
-        if b.canonical_path.as_deref() == Some(path) {
-            Some(*id)
-        } else {
-            None
-        }
-    })
+    s.buffer_for_path_any_project(path)
 }
 
 fn handle_buffer_event(
@@ -184,4 +209,3 @@ fn handle_buffer_event(
         }
     }
 }
-

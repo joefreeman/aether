@@ -2,14 +2,11 @@ use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(name = "aether", version, about = "Aether editor server daemon")]
-struct Cli {
-    /// Project name (must match a file in $XDG_CONFIG_HOME/aether/projects/<name>.toml)
-    project: String,
-}
+struct Cli {}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let _cli = Cli::parse();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -18,5 +15,5 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    aether_server::run(&cli.project).await
+    aether_server::run().await
 }

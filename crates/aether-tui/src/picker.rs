@@ -169,6 +169,7 @@ pub enum ItemKey<'a> {
     Buffer(aether_protocol::BufferId),
     Grep { path: &'a str, line: u32, col: u32 },
     DirEntry(&'a str),
+    Project(&'a str),
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -183,5 +184,6 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             col: *col,
         },
         PickerItem::DirEntry { name, .. } => ItemKey::DirEntry(name.as_str()),
+        PickerItem::Project { name, .. } => ItemKey::Project(name.as_str()),
     }
 }

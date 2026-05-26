@@ -35,6 +35,11 @@ pub enum PickerKind {
     /// (parent / enter subdirectory) is driven by the client sending `picker/view` with a new
     /// `directory_path`; the result + push carry the canonical path the listing is for.
     Explorer,
+    /// Configured projects under `$XDG_CONFIG_HOME/aether/projects/`. Fuzzy-matched on name.
+    /// Selecting one triggers the client to send `project/activate`. Distinct from the other
+    /// kinds in that this picker is usable *before* a project is active (it's how the user
+    /// gets one active in the first place) — every other picker requires `active_project`.
+    Projects,
 }
 
 impl PickerKind {
@@ -89,6 +94,15 @@ pub enum PickerItem {
         /// at the client side to fit the picker pane.
         preview: String,
         /// Char offsets into `preview` covered by the match.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One configured project. Identity is `name` (the file stem of the project's TOML config).
+    /// Selecting a `Project` returns a `PickerSelectResult::Project` and the client follows up
+    /// with `project/activate`.
+    Project {
+        name: String,
+        /// Char offsets into `name` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
     },
@@ -242,6 +256,8 @@ pub enum PickerSelectResult {
         /// hit was recorded; the server clamps in `buffer/open` when applying.
         position: LogicalPosition,
     },
+    /// A project was selected. The client follows up with `project/activate` to switch.
+    Project { name: String },
 }
 
 // ---- picker/hide --------------------------------------------------------------------------------

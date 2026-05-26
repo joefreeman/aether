@@ -8,8 +8,10 @@ use aether_protocol::envelope::{
     ClientInbound, ErrorObject, ErrorResponse, JsonRpc, Notification, NotificationMethod, Request,
     RpcMethod,
 };
-use aether_protocol::handshake::{ClientHello, ClientHelloParams, ProjectInfo};
 use aether_protocol::input::{InputText, InputTextParams};
+use aether_protocol::project::{
+    ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
+};
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::LogicalPosition;
 use serde_json::{from_str, from_value, json, to_value};
@@ -25,20 +27,14 @@ fn request_roundtrip() {
     let req = Request {
         jsonrpc: JsonRpc,
         id: 7,
-        method: ClientHello::NAME.into(),
-        params: Some(
-            to_value(ClientHelloParams {
-                token: "abc".into(),
-                client_version: "0.1.0".into(),
-            })
-            .unwrap(),
-        ),
+        method: ProjectActivate::NAME.into(),
+        params: Some(to_value(ProjectActivateParams { name: "aether".into() }).unwrap()),
     };
     let s = serde_json::to_string(&req).unwrap();
     let v: serde_json::Value = from_str(&s).unwrap();
     assert_eq!(v["jsonrpc"], "2.0");
-    assert_eq!(v["method"], "client/hello");
-    assert_eq!(v["params"]["token"], "abc");
+    assert_eq!(v["method"], "project/activate");
+    assert_eq!(v["params"]["name"], "aether");
 }
 
 #[test]
@@ -201,7 +197,8 @@ fn error_response_shape() {
 
 #[test]
 fn method_name_constants() {
-    assert_eq!(ClientHello::NAME, "client/hello");
+    assert_eq!(ProjectList::NAME, "project/list");
+    assert_eq!(ProjectActivate::NAME, "project/activate");
     assert_eq!(BufferOpen::NAME, "buffer/open");
     assert_eq!(CursorMove::NAME, "cursor/move");
     assert_eq!(InputText::NAME, "input/text");
@@ -229,6 +226,52 @@ fn project_info_shape() {
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v, json!({"name": "aether", "paths": ["/home/joe/x"]}));
+}
+
+#[test]
+fn project_list_result_shape() {
+    use aether_protocol::project::ProjectListResult;
+    let r = ProjectListResult {
+        projects: vec![
+            ProjectSummary { name: "a".into() },
+            ProjectSummary { name: "b".into() },
+        ],
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v, json!({"projects": [{"name": "a"}, {"name": "b"}]}));
+}
+
+#[test]
+fn project_activate_result_wraps_info() {
+    use aether_protocol::project::ProjectActivateResult;
+    let r = ProjectActivateResult {
+        project: ProjectInfo {
+            name: "aether".into(),
+            paths: vec!["/p".into()],
+        },
+        last_buffer_id: None,
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["project"]["name"], "aether");
+    assert_eq!(v["project"]["paths"][0], "/p");
+    assert!(
+        v.get("last_buffer_id").is_none(),
+        "None last_buffer_id should be skipped"
+    );
+}
+
+#[test]
+fn project_activate_result_includes_last_buffer_id_when_set() {
+    use aether_protocol::project::ProjectActivateResult;
+    let r = ProjectActivateResult {
+        project: ProjectInfo {
+            name: "aether".into(),
+            paths: vec!["/p".into()],
+        },
+        last_buffer_id: Some(7),
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["last_buffer_id"], 7);
 }
 
 #[test]
@@ -458,6 +501,42 @@ fn picker_kind_explorer_is_snake_case() {
     assert_eq!(
         from_value::<PickerKind>(json!("explorer")).unwrap(),
         PickerKind::Explorer,
+    );
+}
+
+#[test]
+fn picker_kind_projects_is_snake_case() {
+    use aether_protocol::picker::PickerKind;
+    assert_eq!(to_value(PickerKind::Projects).unwrap(), json!("projects"));
+    assert_eq!(
+        from_value::<PickerKind>(json!("projects")).unwrap(),
+        PickerKind::Projects,
+    );
+}
+
+#[test]
+fn picker_item_project_is_tagged() {
+    use aether_protocol::picker::PickerItem;
+    let item = PickerItem::Project {
+        name: "aether".into(),
+        match_indices: vec![0, 4],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(
+        v,
+        json!({"kind": "project", "name": "aether", "match_indices": [0, 4]})
+    );
+}
+
+#[test]
+fn picker_select_result_project_is_tagged() {
+    use aether_protocol::picker::PickerSelectResult;
+    let r = PickerSelectResult::Project {
+        name: "aether".into(),
+    };
+    assert_eq!(
+        to_value(&r).unwrap(),
+        json!({"kind": "project", "name": "aether"})
     );
 }
 

@@ -8,9 +8,9 @@ pub mod buffer;
 pub mod cursor;
 pub mod envelope;
 pub mod error;
-pub mod handshake;
 pub mod input;
 pub mod picker;
+pub mod project;
 pub mod search;
 pub mod viewport;
 

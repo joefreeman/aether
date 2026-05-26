@@ -12,7 +12,7 @@ use aether_protocol::cursor::{
     CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
-use aether_protocol::handshake::{ClientHello, ClientHelloParams, ClientHelloResult};
+use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
@@ -150,18 +150,18 @@ async fn hello_then_open_file() {
         .await
         .unwrap();
 
-    // Handshake.
-    let hello: ClientHelloResult = send_request::<ClientHello>(
+    // Activate the project (replaces the old client/hello handshake — auth is now in the
+    // WebSocket query string).
+    let activated: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
-    assert_eq!(hello.project.name, "test-proj");
-    assert_eq!(hello.project.paths.len(), 1);
+    assert_eq!(activated.project.name, "test-proj");
+    assert_eq!(activated.project.paths.len(), 1);
 
     // Open the file.
     let open: BufferOpenResult = send_request::<BufferOpen>(
@@ -223,12 +223,11 @@ async fn buffer_open_restores_cursor_and_scroll() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -335,12 +334,11 @@ async fn buffer_open_isolates_scroll_per_client() {
         let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
             .await
             .unwrap();
-        let _: ClientHelloResult = send_request::<ClientHello>(
+        let _: ProjectActivateResult = send_request::<ProjectActivate>(
             &mut ws,
             1,
-            &ClientHelloParams {
-                token: TEST_TOKEN.into(),
-                client_version: "test".into(),
+            &ProjectActivateParams {
+                name: "test-proj".into(),
             },
         )
         .await;
@@ -445,29 +443,17 @@ async fn rejects_bad_token() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
-        .await
-        .unwrap();
-
-    let req = Request {
-        jsonrpc: JsonRpc,
-        id: 1,
-        method: ClientHello::NAME.into(),
-        params: Some(
-            serde_json::to_value(ClientHelloParams {
-                token: "not-the-real-token".into(),
-                client_version: "test".into(),
-            })
-            .unwrap(),
-        ),
-    };
-    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
-        .await
-        .unwrap();
-
-    let text = next_text(&mut ws).await;
-    let v: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["error"]["code"], -32001, "expected INVALID_TOKEN");
+    // Token now lives in the URL query string; a bad token fails the WebSocket upgrade itself
+    // (HTTP 401), not via a JSON-RPC error frame.
+    let bad_url = format!(
+        "{}/?token=not-the-real-token&client_version=test",
+        server.ws_url_no_auth()
+    );
+    let result = tokio_tungstenite::connect_async(&bad_url).await;
+    assert!(
+        result.is_err(),
+        "connect should fail when token is invalid, got Ok"
+    );
 }
 
 #[tokio::test]
@@ -484,12 +470,11 @@ async fn rejects_path_outside_project() {
         .await
         .unwrap();
 
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -536,12 +521,11 @@ async fn viewport_subscribe_renders_window() {
         .await
         .unwrap();
 
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -605,12 +589,11 @@ async fn viewport_subscribe_wraps_long_line() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -688,12 +671,11 @@ async fn viewport_scroll_returns_new_window() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -772,12 +754,11 @@ async fn setup_with_buffer(
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1030,12 +1011,11 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1105,12 +1085,11 @@ async fn match_bracket_motion_jumps_to_pair() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1179,12 +1158,11 @@ async fn match_bracket_with_extend_selects_to_pair() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1241,12 +1219,11 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1302,12 +1279,11 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1379,12 +1355,11 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1440,12 +1415,11 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1504,12 +1478,11 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1594,12 +1567,11 @@ async fn end_of_unit_works_on_last_function() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1659,12 +1631,11 @@ async fn start_of_unit_extends_back_to_function_start() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1723,12 +1694,11 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1825,12 +1795,11 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1900,12 +1869,11 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -1965,12 +1933,11 @@ async fn nav_motion_jumps_between_top_level_rust_items() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2039,12 +2006,11 @@ async fn nav_motion_prev_walks_backward() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2100,12 +2066,11 @@ async fn nav_motion_noop_at_end_of_file() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2165,12 +2130,11 @@ async fn nav_motion_inside_python_class_finds_next_method() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2230,12 +2194,11 @@ async fn nav_motion_from_last_method_stays_in_class() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2298,12 +2261,11 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2360,12 +2322,11 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2457,12 +2418,11 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2527,12 +2487,11 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2642,12 +2601,11 @@ async fn save_preserves_crlf_endings() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -2699,12 +2657,11 @@ async fn save_scratch_returns_buffer_has_no_path() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5325,12 +5282,11 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5384,12 +5340,11 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5452,12 +5407,11 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5508,12 +5462,11 @@ async fn newline_and_indent_engine_python_def() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5565,12 +5518,11 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5620,12 +5572,11 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5703,12 +5654,11 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5762,12 +5712,11 @@ async fn toggle_comment_strips_when_already_commented() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5822,12 +5771,11 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5884,12 +5832,11 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -5943,12 +5890,11 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6003,12 +5949,11 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6065,12 +6010,11 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6129,12 +6073,11 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6193,12 +6136,11 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6275,12 +6217,11 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6338,12 +6279,11 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6401,12 +6341,11 @@ async fn toggle_comment_round_trip_partial_selection() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6475,12 +6414,11 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6535,12 +6473,11 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6595,12 +6532,11 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6645,12 +6581,11 @@ async fn toggle_comment_is_noop_for_json() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -6904,12 +6839,11 @@ async fn setup_picker_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _hello: ClientHelloResult = send_request::<ClientHello>(
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -7224,12 +7158,11 @@ async fn setup_buffer_picker_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -7806,13 +7739,14 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
     drop(server);
 }
 
-/// MRU is per-client: a buffer that was open before disconnect doesn't sit forever in
-/// another client's MRU. Closing the connection drops MRU; reconnecting fresh shows the open
-/// buffers in id order (since this client hasn't touched any).
+/// MRU is per-project (not per-client): a fresh client connecting to a project sees the
+/// project's MRU order populated by any prior session. The MRU survives client disconnects so
+/// reopening the TUI lands on the buffer the user last had open, rather than resetting to id
+/// order every time.
 #[tokio::test]
-async fn buffers_picker_mru_is_per_client() {
+async fn buffers_picker_mru_is_per_project_across_clients() {
     let (server, mut ws_a) = setup_buffer_picker_workspace().await;
-    // Client A opens two files in a specific order.
+    // Client A opens README first, then lib.rs — lib.rs is now most-recent in the project MRU.
     let _: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws_a,
         2,
@@ -7826,7 +7760,7 @@ async fn buffers_picker_mru_is_per_client() {
         },
     )
     .await;
-    let _: BufferOpenResult = send_request::<BufferOpen>(
+    let lib_open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws_a,
         3,
         &BufferOpenParams {
@@ -7840,16 +7774,15 @@ async fn buffers_picker_mru_is_per_client() {
     )
     .await;
 
-    // Client B connects fresh — no touches yet. Buffers should appear in id order.
+    // Client B connects fresh — should inherit the project's MRU, so lib.rs comes first.
     let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws_b,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -7878,11 +7811,10 @@ async fn buffers_picker_mru_is_per_client() {
             *buffer_id
         })
         .collect();
-    let mut sorted = ids.clone();
-    sorted.sort_unstable();
     assert_eq!(
-        ids, sorted,
-        "client B should see buffers in id order (no MRU touches yet)"
+        ids.first().copied(),
+        Some(lib_open.buffer_id),
+        "client B should see project MRU (lib.rs first, since it was opened most recently)"
     );
 
     drop(server);
@@ -7903,12 +7835,11 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8010,12 +7941,11 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8084,12 +8014,11 @@ async fn save_as_to_same_path_is_in_place_save() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8166,12 +8095,11 @@ async fn save_as_rejects_existing_file_without_overwrite() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8275,12 +8203,11 @@ async fn in_place_save_never_triggers_overwrite_check() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8366,12 +8293,11 @@ async fn in_place_save_after_save_as_targets_new_path() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8474,12 +8400,11 @@ async fn buffer_close_drops_buffer() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8555,12 +8480,11 @@ async fn buffer_close_last_buffer_returns_none() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8604,12 +8528,11 @@ async fn buffer_close_drops_viewports() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8836,12 +8759,11 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8896,12 +8818,11 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -8955,12 +8876,11 @@ async fn setup_grep_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -9736,12 +9656,11 @@ async fn setup_explorer_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -10305,12 +10224,11 @@ async fn setup_watched_buffer(
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ClientHelloResult = send_request::<ClientHello>(
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ClientHelloParams {
-            token: TEST_TOKEN.into(),
-            client_version: "test".into(),
+        &ProjectActivateParams {
+            name: "test-proj".into(),
         },
     )
     .await;
@@ -10561,6 +10479,159 @@ async fn buffer_reload_clean_buffer_does_not_require_force() {
     )
     .await;
     assert!(r.revision > 0);
+
+    drop(server);
+}
+
+// -------- project/activate + switching ---------------------------------------------------------
+
+/// `project/activate` returns the project's name + paths and lets buffer ops work afterwards.
+/// (Already covered indirectly by every other test, but pinned explicitly here.)
+#[tokio::test]
+async fn project_activate_returns_info_and_unlocks_buffer_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+
+    // Before activation, buffer/open should fail with NO_ACTIVE_PROJECT (-32002).
+    let pre_err = send_request_expect_err::<BufferOpen>(
+        &mut ws,
+        1,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert!(
+        pre_err.contains("no active project"),
+        "expected NO_ACTIVE_PROJECT before activate, got: {pre_err}"
+    );
+
+    let activated: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        2,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    assert_eq!(activated.project.name, "test-proj");
+    assert_eq!(activated.project.paths.len(), 1);
+
+    // Scratch buffer now works.
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert!(open.buffer_id > 0);
+
+    drop(server);
+}
+
+/// Activating an unknown project name returns UNKNOWN_PROJECT (-32003).
+#[tokio::test]
+async fn project_activate_rejects_unknown_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let msg = send_request_expect_err::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "no-such-project-12345".into(),
+        },
+    )
+    .await;
+    assert!(
+        msg.contains("no configured project"),
+        "expected UNKNOWN_PROJECT, got: {msg}"
+    );
+    drop(server);
+}
+
+/// Re-activating the *same* project is idempotent — no error, returns the same paths, and the
+/// client's per-buffer state survives (no teardown when the name doesn't change).
+#[tokio::test]
+async fn project_activate_same_project_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("buf.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("buf.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+
+    // Activate the same project again — should succeed and not destroy the buffer state.
+    let again: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        3,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    assert_eq!(again.project.name, "test-proj");
+
+    // Re-opening the same path returns the same buffer (state preserved).
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        4,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("buf.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert_eq!(reopen.buffer_id, open.buffer_id);
 
     drop(server);
 }

@@ -57,16 +57,60 @@ const NORD14: Color = Color::Rgb(163, 190, 140); // Aurora green — strings
 const NORD15: Color = Color::Rgb(180, 142, 173); // Aurora purple — numbers, constants
 
 pub fn draw(f: &mut Frame, state: &AppState) {
+    // Reserve a row for the status bar only when there's an active editor — the no-project view
+    // already shows the relevant hints front-and-centre, so a redundant status line just steals
+    // vertical space.
+    let constraints: &[Constraint] = if state.has_editor() {
+        &[Constraint::Min(1), Constraint::Length(1)]
+    } else {
+        &[Constraint::Min(1)]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints(constraints)
         .split(f.area());
-    draw_buffer(f, state, chunks[0]);
+    if state.has_editor() {
+        draw_buffer(f, state, chunks[0]);
+    } else {
+        draw_no_project_view(f, state, chunks[0]);
+    }
+    // The unified picker overlay sits on top of either screen — same renderer for Files /
+    // Buffers / Grep / Explorer / Projects.
     if state.picker.open {
         draw_picker_overlay(f, state, chunks[0]);
     }
-    draw_status(f, state, chunks[1]);
-    place_terminal_cursor(f, state, chunks[0], chunks[1]);
+    if state.has_editor() {
+        draw_status(f, state, chunks[1]);
+        place_terminal_cursor(f, state, chunks[0], chunks[1]);
+    }
+}
+
+/// Empty no-project view: a centered hint telling the user how to open the project picker.
+/// Drawn instead of the buffer pane when `state.editor` is `None`.
+fn draw_no_project_view(f: &mut Frame, _state: &AppState, area: Rect) {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    let hint = vec![
+        Line::from(Span::styled(
+            "no project active",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Space p   pick a project"),
+        Line::from("Space q   quit"),
+    ];
+    let para = Paragraph::new(hint).alignment(ratatui::layout::Alignment::Center);
+    // Vertically centre by inserting blank top padding.
+    let inner_height = 4u16;
+    let top_pad = area.height.saturating_sub(inner_height) / 2;
+    let target = Rect {
+        x: area.x,
+        y: area.y + top_pad,
+        width: area.width,
+        height: inner_height.min(area.height.saturating_sub(top_pad)),
+    };
+    f.render_widget(para, target);
 }
 
 // ---- picker overlay ----------------------------------------------------------------------------
@@ -348,6 +392,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Buffers) => "Switch buffer…",
         Some(aether_protocol::picker::PickerKind::Grep) => "Grep workspace…",
         Some(aether_protocol::picker::PickerKind::Explorer) => "Filter entries…",
+        Some(aether_protocol::picker::PickerKind::Projects) => "Switch project…",
         None => "Search…",
     }
 }
@@ -515,6 +560,10 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
             match_indices.as_slice(),
             if *dirty { " [+]" } else { "" },
         ),
+        PickerItem::Project {
+            name,
+            match_indices,
+        } => (name.as_str(), match_indices.as_slice(), ""),
         PickerItem::GrepHit { .. } | PickerItem::DirEntry { .. } => unreachable!("handled above"),
     };
 
@@ -758,13 +807,13 @@ fn project_relative_path(abs: &str, project_paths: &[String]) -> String {
 }
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
-    let top = state.editor.scroll_logical_line;
-    let selection = ordered_selection(&state.editor.cursor);
+    let top = state.ed().scroll_logical_line;
+    let selection = ordered_selection(&state.ed().cursor);
     let viewport_rows = area.height as usize;
     let viewport_cols = area.width;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
-    let scroll_col = if matches!(state.editor.wrap, WrapMode::None) {
-        state.editor.scroll_col
+    let scroll_col = if matches!(state.ed().wrap, WrapMode::None) {
+        state.ed().scroll_col
     } else {
         0
     };
@@ -776,11 +825,11 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         if lines.len() >= viewport_rows {
             break;
         }
-        let local_idx = (logical_line as i64) - (state.editor.window_first_logical_line as i64);
-        if local_idx < 0 || local_idx >= state.editor.lines.len() as i64 {
+        let local_idx = (logical_line as i64) - (state.ed().window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.ed().lines.len() as i64 {
             break;
         }
-        let render = &state.editor.lines[local_idx as usize];
+        let render = &state.ed().lines[local_idx as usize];
 
         let last_vrow_idx = render.visual_rows.len().saturating_sub(1);
         for (vrow_idx, vrow) in render.visual_rows.iter().enumerate() {
@@ -826,7 +875,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 logical_line,
                 vrow.byte_offset,
                 row_text_len,
-                state.editor.cursor.match_bracket,
+                state.ed().cursor.match_bracket,
             );
 
             // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
@@ -1268,8 +1317,8 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![Span::raw(format!(" save as: {}", prompt.input.text))])
     } else if let Some(prompt) = state.new_file_prompt.as_ref() {
         Line::from(vec![Span::raw(format!(" new file: {}", prompt.input.text))])
-    } else if matches!(state.editor.mode, EditorMode::Search) {
-        let prompt = format!("/{}", state.editor.search.query.text);
+    } else if matches!(state.ed().mode, EditorMode::Search) {
+        let prompt = format!("/{}", state.ed().search.query.text);
         let text = match search_match_count_label(state) {
             Some(count) => format!("{prompt}    {count}"),
             None => prompt,
@@ -1292,7 +1341,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         let main = format!(
             " [{project}] {file} {dirty}  {pos}{counter}",
             project = state.project_name,
-            file = state.editor.file_label,
+            file = state.ed().file_label,
             dirty = dirty_marker,
             pos = format_position(state),
         );
@@ -1314,9 +1363,9 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 ///   `[!]` = file modified on disk
 ///   `[+]` = unsaved local edits
 fn buffer_status_markers(state: &AppState) -> &'static str {
-    if state.editor.externally_deleted {
+    if state.ed().externally_deleted {
         "[x]"
-    } else if state.editor.externally_modified {
+    } else if state.ed().externally_modified {
         "[!]"
     } else if state.dirty() {
         "[+]"
@@ -1334,12 +1383,12 @@ fn buffer_status_markers(state: &AppState) -> &'static str {
 fn format_position(state: &AppState) -> String {
     // Only called from the default status-bar branch which already guarantees Editing screen
     // with no save_prompt active.
-    let ed = &state.editor;
+    let ed = state.ed();
     let pos = ed.cursor.position;
     match ed.mode {
         EditorMode::Insert => format!("{}:{}", pos.line + 1, pos.col + 1),
         EditorMode::Normal | EditorMode::Search => {
-            let anchor = state.editor.cursor.anchor;
+            let anchor = state.ed().cursor.anchor;
             let (start, end_inclusive) = if (pos.line, pos.col) <= (anchor.line, anchor.col) {
                 (pos, anchor)
             } else {
@@ -1365,9 +1414,9 @@ fn format_position(state: &AppState) -> String {
 /// at the end of its line. Falls back to a +1 approximation when the line isn't in the
 /// pushed window (which makes the cursor off-screen anyway).
 fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
-    let local_idx = (pos.line as i64) - (state.editor.window_first_logical_line as i64);
+    let local_idx = (pos.line as i64) - (state.ed().window_first_logical_line as i64);
     let Some(render) = (if local_idx >= 0 {
-        state.editor.lines.get(local_idx as usize)
+        state.ed().lines.get(local_idx as usize)
     } else {
         None
     }) else {
@@ -1414,7 +1463,7 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
 }
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
-    let ed = &state.editor;
+    let ed = state.ed();
     if matches!(ed.mode, EditorMode::Search)
         && state.save_prompt.is_none()
         && state.new_file_prompt.is_none()
@@ -1506,24 +1555,24 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
 /// Returns `None` if the cursor is off-screen (above the top, below the bottom, off-screen left
 /// after horizontal scroll, or its logical line hasn't been pushed into the window yet).
 pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u16, u16)> {
-    let top = state.editor.scroll_logical_line;
-    let cursor = state.editor.cursor.position;
+    let top = state.ed().scroll_logical_line;
+    let cursor = state.ed().cursor.position;
     if cursor.line < top {
         return None;
     }
-    let scroll_col = if matches!(state.editor.wrap, WrapMode::None) {
-        state.editor.scroll_col
+    let scroll_col = if matches!(state.ed().wrap, WrapMode::None) {
+        state.ed().scroll_col
     } else {
         0
     };
 
     let mut visual_offset: u32 = 0;
     for line_idx in top..=cursor.line {
-        let local_idx = (line_idx as i64) - (state.editor.window_first_logical_line as i64);
-        if local_idx < 0 || local_idx >= state.editor.lines.len() as i64 {
+        let local_idx = (line_idx as i64) - (state.ed().window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.ed().lines.len() as i64 {
             return None;
         }
-        let render = &state.editor.lines[local_idx as usize];
+        let render = &state.ed().lines[local_idx as usize];
         if line_idx == cursor.line {
             let row_idx = find_row_idx_for_col(&render.visual_rows, cursor.col);
             visual_offset += row_idx as u32;
@@ -1599,18 +1648,18 @@ pub fn screen_to_logical(
         return None;
     }
     let mut rows_remaining = screen_row as u32;
-    let mut logical_line = state.editor.scroll_logical_line;
+    let mut logical_line = state.ed().scroll_logical_line;
     loop {
-        let local_idx = (logical_line as i64) - (state.editor.window_first_logical_line as i64);
-        if local_idx < 0 || local_idx >= state.editor.lines.len() as i64 {
+        let local_idx = (logical_line as i64) - (state.ed().window_first_logical_line as i64);
+        if local_idx < 0 || local_idx >= state.ed().lines.len() as i64 {
             // Click is past the last line we have rendered — clamp to the end of the buffer.
-            let last_line = state.editor.line_count.saturating_sub(1);
+            let last_line = state.ed().line_count.saturating_sub(1);
             return Some(LogicalPosition {
                 line: last_line,
                 col: u32::MAX,
             });
         }
-        let render = &state.editor.lines[local_idx as usize];
+        let render = &state.ed().lines[local_idx as usize];
         let visual_rows_in_line = render.visual_rows.len() as u32;
         if rows_remaining < visual_rows_in_line {
             let vrow = &render.visual_rows[rows_remaining as usize];
@@ -1631,8 +1680,8 @@ pub fn screen_to_logical(
 /// that lines up with `screen_col`. Clicks on the marker / continuation indent map to the start
 /// of the row's text. Clicks past the end of the text map to the end of the text.
 fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u32 {
-    let scroll_col = if matches!(state.editor.wrap, WrapMode::None) {
-        state.editor.scroll_col
+    let scroll_col = if matches!(state.ed().wrap, WrapMode::None) {
+        state.ed().scroll_col
     } else {
         0
     };
