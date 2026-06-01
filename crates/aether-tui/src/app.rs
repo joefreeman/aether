@@ -569,6 +569,10 @@ async fn activate_project_and_rebuild_editor(
     .await?;
     state.editor = Some(editor);
     state.status = StatusMessage::success(format!("activated project {}", state.project_name));
+    // The picker was open when we entered (cursor = bar); now an editor's attached in normal
+    // mode, so the cursor needs to flip back to block. Without this, the bar persists after the
+    // switch and looks like we're stuck in insert mode.
+    apply_cursor_style(state);
     Ok(())
 }
 
