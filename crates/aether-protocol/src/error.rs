@@ -23,6 +23,11 @@ impl ErrorCode {
     /// `project/activate` named a project that has no config file under
     /// `$XDG_CONFIG_HOME/aether/projects/`.
     pub const UNKNOWN_PROJECT: Self = Self(-32003);
+    /// `project/remove_root` rejected because at least one buffer under the root being removed
+    /// has unsaved changes. The error's `data` field carries `{ "dirty_buffer_ids": [u64] }` so
+    /// the client can name them in a prompt. The user has to save or revert those buffers
+    /// before retrying.
+    pub const DIRTY_BUFFERS_PREVENT_REMOVE: Self = Self(-32004);
     pub const INVALID_PATH: Self = Self(-32010);
     pub const BUFFER_NOT_FOUND: Self = Self(-32011);
     pub const VIEWPORT_NOT_FOUND: Self = Self(-32012);

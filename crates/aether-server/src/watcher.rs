@@ -58,9 +58,10 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
 }
 
 /// Register a project's roots with the server's live watcher. Called from `project/activate` the
-/// first time a project is loaded. Each root gets a recursive watch. Errors are logged, not
-/// propagated — losing the watcher on one root shouldn't fail the whole activation; the project
-/// just won't receive external-change notifications for that root.
+/// first time a project is loaded, and from `project/add_root` for newly-added roots. Each root
+/// gets a recursive watch. Errors are logged, not propagated — losing the watcher on one root
+/// shouldn't fail the whole activation; the project just won't receive external-change
+/// notifications for that root.
 pub fn watch_project_paths(
     watcher: &Arc<Mutex<RecommendedWatcher>>,
     paths: &[PathBuf],
@@ -75,6 +76,27 @@ pub fn watch_project_paths(
     for path in paths {
         if let Err(e) = watcher.watch(path, RecursiveMode::Recursive) {
             tracing::warn!(path = %path.display(), error = %e, "failed to watch path");
+        }
+    }
+}
+
+/// Stop watching the given paths. Used by `project/remove_root`. Errors are logged but
+/// otherwise ignored — if the watcher had already lost the path (e.g. the directory was deleted
+/// out from under us), there's nothing for the caller to recover from.
+pub fn unwatch_project_paths(
+    watcher: &Arc<Mutex<RecommendedWatcher>>,
+    paths: &[PathBuf],
+) {
+    let mut watcher = match watcher.lock() {
+        Ok(g) => g,
+        Err(p) => {
+            tracing::warn!("watcher mutex poisoned; skipping unregistration");
+            p.into_inner()
+        }
+    };
+    for path in paths {
+        if let Err(e) = watcher.unwatch(path) {
+            tracing::warn!(path = %path.display(), error = %e, "failed to unwatch path");
         }
     }
 }

@@ -18,6 +18,7 @@ use aether_protocol::cursor::{
     CursorContract, CursorExpand, CursorMove, CursorRedo, CursorSelectLine, CursorSet,
     CursorSwapAnchor, CursorUndo,
 };
+use aether_protocol::directory::DirectoryList;
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
@@ -29,7 +30,9 @@ use aether_protocol::input::{
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerHide, PickerQuery, PickerSelect, PickerView,
 };
-use aether_protocol::project::{ProjectActivate, ProjectList};
+use aether_protocol::project::{
+    ProjectActivate, ProjectAddRoot, ProjectCreate, ProjectList, ProjectRemoveRoot,
+};
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportSetWrap, ViewportSubscribe, ViewportUnsubscribe,
@@ -238,6 +241,9 @@ async fn dispatch(
     match method {
         ProjectList::NAME => run!(ProjectList, handlers::project_list),
         ProjectActivate::NAME => run!(ProjectActivate, handlers::project_activate),
+        ProjectCreate::NAME => run!(ProjectCreate, handlers::project_create),
+        ProjectAddRoot::NAME => run!(ProjectAddRoot, handlers::project_add_root),
+        ProjectRemoveRoot::NAME => run!(ProjectRemoveRoot, handlers::project_remove_root),
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),
@@ -282,6 +288,7 @@ async fn dispatch(
         PickerSelect::NAME => run!(PickerSelect, handlers::picker_select),
         PickerHide::NAME => run!(PickerHide, handlers::picker_hide),
         PickerGrepNavigate::NAME => run!(PickerGrepNavigate, handlers::picker_grep_navigate),
+        DirectoryList::NAME => run!(DirectoryList, handlers::directory_list),
         other => Err(RpcError::method_not_found(other)),
     }
 }

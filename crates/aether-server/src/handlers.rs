@@ -17,6 +17,9 @@ use aether_protocol::cursor::{
     CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, GrepPosition, Motion,
     VerticalDirection,
 };
+use aether_protocol::directory::{
+    DirectoryEntry, DirectoryListParams, DirectoryListResult,
+};
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::input::{
@@ -28,8 +31,9 @@ use aether_protocol::picker::{
     PickerViewParams, PickerViewResult,
 };
 use aether_protocol::project::{
-    ProjectActivateParams, ProjectActivateResult, ProjectInfo, ProjectListParams,
-    ProjectListResult, ProjectSummary,
+    ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
+    ProjectInfo, ProjectListParams, ProjectListResult, ProjectRemoveRootParams,
+    ProjectRemoveRootResult, ProjectSummary,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
@@ -178,6 +182,266 @@ pub async fn project_activate(
             paths: entry_paths,
         },
         last_buffer_id,
+    })
+}
+
+/// Create a fresh project with no roots. Writes an empty-`paths` TOML to disk, registers the
+/// project in memory, and activates it for the calling client. Refuses if a project of that
+/// name already exists, or if the name is empty / contains path separators.
+pub async fn project_create(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: ProjectCreateParams,
+) -> Result<ProjectActivateResult, RpcError> {
+    let client_id = ctx.client_id;
+    let name = params.name.trim().to_string();
+    if name.is_empty() {
+        return Err(RpcError::invalid_params("project name must not be empty"));
+    }
+    if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        return Err(RpcError::invalid_params(
+            "project name must not contain path separators",
+        ));
+    }
+    let exists = crate::config::project_config_exists(&name)
+        .map_err(|e| RpcError::internal(format!("checking project config: {e}")))?;
+    if exists {
+        return Err(RpcError::invalid_params(format!(
+            "project {name} already exists"
+        )));
+    }
+    // Write the TOML outside the state lock — file I/O.
+    crate::config::write_project_config(&crate::config::ProjectConfig {
+        name: name.clone(),
+        paths: Vec::new(),
+    })
+    .map_err(|e| RpcError::internal(format!("writing project config: {e}")))?;
+
+    let mut s = state.lock().await;
+
+    // Tear down the client's prior project state (same flow as project_activate).
+    let prior = s
+        .clients
+        .get(&client_id)
+        .and_then(|c| c.active_project.clone());
+    if let Some(prior_name) = &prior {
+        if prior_name != &name {
+            s.teardown_client_state_for_project(client_id, prior_name);
+        }
+    }
+
+    // Register the empty project. No paths → no workspace_index walk to do; the empty Arc
+    // returns an empty file list on access.
+    let workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(Vec::new()));
+    s.projects.insert(
+        name.clone(),
+        crate::state::ProjectEntry {
+            name: name.clone(),
+            paths: Vec::new(),
+            workspace_index,
+            mru_buffers: std::collections::VecDeque::new(),
+        },
+    );
+    if let Some(session) = s.clients.get_mut(&client_id) {
+        session.active_project = Some(name.clone());
+    }
+
+    tracing::info!(%client_id, project = %name, "client created project");
+    Ok(ProjectActivateResult {
+        project: ProjectInfo {
+            name,
+            paths: Vec::new(),
+        },
+        last_buffer_id: None,
+    })
+}
+
+/// Add a root path to an existing project. Canonicalizes, refuses duplicates, writes the TOML,
+/// registers with the watcher, rebuilds the workspace index. Returns the updated project info.
+pub async fn project_add_root(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: ProjectAddRootParams,
+) -> Result<ProjectInfo, RpcError> {
+    let canonical = crate::config::canonicalize_project_path(std::path::Path::new(&params.path))
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing root: {e}")))?;
+
+    let mut s = state.lock().await;
+    let project = s
+        .projects
+        .get_mut(&params.project)
+        .ok_or_else(|| RpcError::unknown_project(&params.project))?;
+    if project.paths.iter().any(|p| p == &canonical) {
+        return Err(RpcError::invalid_params(format!(
+            "{} is already a root of project {}",
+            canonical.display(),
+            params.project
+        )));
+    }
+    project.paths.push(canonical.clone());
+    // Rebuild workspace_index with the new path list. The old Arc remains alive only for any
+    // in-flight reader; subsequent picker opens see the fresh one.
+    project.workspace_index =
+        Arc::new(crate::workspace_index::WorkspaceIndex::new(project.paths.clone()));
+    let updated = crate::config::ProjectConfig {
+        name: project.name.clone(),
+        paths: project.paths.clone(),
+    };
+    let entry_paths: Vec<String> = project.paths.iter().map(|p| p.display().to_string()).collect();
+    let watcher = s.watcher.clone();
+    drop(s);
+
+    // TOML write + watcher registration happen outside the lock.
+    crate::config::write_project_config(&updated)
+        .map_err(|e| RpcError::internal(format!("writing project config: {e}")))?;
+    if let Some(w) = watcher {
+        crate::watcher::watch_project_paths(&w, &[canonical]);
+    }
+    Ok(ProjectInfo {
+        name: params.project,
+        paths: entry_paths,
+    })
+}
+
+/// Remove a root path from a project. Closes any file-backed buffers under this root that
+/// aren't covered by another remaining root; refuses with `DIRTY_BUFFERS_PREVENT_REMOVE` if any
+/// such buffer is dirty. Scratch buffers in the project are unaffected.
+pub async fn project_remove_root(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: ProjectRemoveRootParams,
+) -> Result<ProjectRemoveRootResult, RpcError> {
+    let client_id = ctx.client_id;
+    let canonical = crate::config::canonicalize_project_path(std::path::Path::new(&params.path))
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing root: {e}")))?;
+
+    let mut s = state.lock().await;
+    let project = s
+        .projects
+        .get_mut(&params.project)
+        .ok_or_else(|| RpcError::unknown_project(&params.project))?;
+    if !project.paths.iter().any(|p| p == &canonical) {
+        return Err(RpcError::invalid_params(format!(
+            "{} is not a root of project {}",
+            canonical.display(),
+            params.project
+        )));
+    }
+    let remaining_paths: Vec<std::path::PathBuf> = project
+        .paths
+        .iter()
+        .filter(|p| **p != canonical)
+        .cloned()
+        .collect();
+    let project_name = project.name.clone();
+
+    // Find file-backed buffers under the removed root that aren't covered by any remaining
+    // root. Scratch buffers (no path) are exempt; they stay alive.
+    let under_removed = |buf: &Buffer| -> bool {
+        let Some(p) = buf.canonical_path.as_deref() else {
+            return false;
+        };
+        p == canonical || p.starts_with(&canonical)
+    };
+    let still_covered = |buf: &Buffer| -> bool {
+        let Some(p) = buf.canonical_path.as_deref() else {
+            return true;
+        };
+        remaining_paths
+            .iter()
+            .any(|root| p == root || p.starts_with(root))
+    };
+    let affected: Vec<BufferId> = s
+        .buffers
+        .iter()
+        .filter(|(id, buf)| {
+            s.buffer_projects.get(id).map(|s| s.as_str()) == Some(&project_name)
+                && under_removed(buf)
+                && !still_covered(buf)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let dirty: Vec<BufferId> = affected
+        .iter()
+        .filter(|id| s.buffers.get(id).map(|b| b.dirty).unwrap_or(false))
+        .copied()
+        .collect();
+    if !dirty.is_empty() {
+        let mut err = RpcError::new(
+            ErrorCode::DIRTY_BUFFERS_PREVENT_REMOVE,
+            format!(
+                "{} buffer(s) under {} have unsaved changes",
+                dirty.len(),
+                canonical.display()
+            ),
+        );
+        err.data = Some(serde_json::json!({ "dirty_buffer_ids": dirty }));
+        return Err(err);
+    }
+
+    // Close the affected buffers (clean ones). Same teardown as buffer/close.
+    for &id in &affected {
+        s.buffers.remove(&id);
+        s.buffer_projects.remove(&id);
+        s.viewports.retain(|_, v| v.buffer_id != id);
+        s.cursors.retain(|(_, b), _| *b != id);
+        s.motion_history.retain(|(_, b), _| *b != id);
+        s.virtual_col.retain(|(_, b), _| *b != id);
+        s.tree_selection_history.retain(|(_, b), _| *b != id);
+        s.searches.retain(|(_, b), _| *b != id);
+        s.last_scroll.retain(|(_, b), _| *b != id);
+        s.drop_buffer_from_mru(id);
+    }
+
+    // Persist the updated path list. Re-grab the project mutably for the write.
+    let project = s
+        .projects
+        .get_mut(&params.project)
+        .expect("project still loaded — we held it above");
+    project.paths.retain(|p| *p != canonical);
+    project.workspace_index =
+        Arc::new(crate::workspace_index::WorkspaceIndex::new(project.paths.clone()));
+    let updated = crate::config::ProjectConfig {
+        name: project.name.clone(),
+        paths: project.paths.clone(),
+    };
+    let entry_paths: Vec<String> = project.paths.iter().map(|p| p.display().to_string()).collect();
+
+    // Next buffer for the requesting client: top of project MRU, else any remaining buffer in
+    // the project. Mirrors buffer/close.
+    let next_buffer_id = s
+        .active_project(client_id)
+        .and_then(|p| p.mru_buffers.front().copied())
+        .or_else(|| {
+            s.buffer_projects
+                .iter()
+                .find(|(_, name)| name.as_str() == project_name)
+                .map(|(id, _)| *id)
+        });
+    let watcher = s.watcher.clone();
+    let pushes = refresh_buffer_pickers(&mut s);
+    drop(s);
+
+    crate::config::write_project_config(&updated)
+        .map_err(|e| RpcError::internal(format!("writing project config: {e}")))?;
+    if let Some(w) = watcher {
+        crate::watcher::unwatch_project_paths(&w, &[canonical]);
+    }
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    tracing::info!(
+        project = %params.project,
+        closed = affected.len(),
+        "root removed"
+    );
+    Ok(ProjectRemoveRootResult {
+        project: ProjectInfo {
+            name: params.project,
+            paths: entry_paths,
+        },
+        closed_buffer_ids: affected,
+        next_buffer_id,
     })
 }
 
@@ -1161,6 +1425,42 @@ fn scope_range(buf: &Buffer, cursor: &CursorState, scope: CopyScope) -> (usize, 
     }
 }
 
+/// Canonicalize a path that may not fully exist on disk: walk up to the deepest existing
+/// ancestor, canonicalize that, then re-attach the not-yet-created tail components. Used by
+/// `buffer_save`'s save-as path so we can boundary-check a yet-to-be-created subdirectory
+/// before actually creating it.
+///
+/// Symlinks in the existing portion are resolved (standard `canonicalize` behaviour); the tail
+/// is appended verbatim. Errors only on I/O other than `NotFound`, or when we walk all the way
+/// up to a path with no parent.
+fn canonicalize_partial(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&cursor) {
+            Ok(canon) => {
+                let mut out = canon;
+                // suffix was accumulated tail-first; reverse on attach.
+                for component in suffix.iter().rev() {
+                    out.push(component);
+                }
+                return Ok(out);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cursor.file_name().map(|n| n.to_os_string()) else {
+                    return Err(e);
+                };
+                let Some(parent) = cursor.parent().map(|p| p.to_path_buf()) else {
+                    return Err(e);
+                };
+                suffix.push(name);
+                cursor = parent;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 pub async fn buffer_save(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -1195,12 +1495,15 @@ pub async fn buffer_save(
                 Some(r) => base.join(r),
             };
 
-            // The target file may not exist yet (creating); canonicalize the parent and join
-            // the file name so the access-boundary check is meaningful.
+            // The target file may not exist yet (creating). Neither may some of its parent
+            // directories — `save-as foo/bar/baz.txt` should `mkdir -p foo/bar` rather than
+            // erroring. So: resolve the parent by canonicalizing the deepest *existing*
+            // ancestor and re-attaching the not-yet-created tail; boundary-check that
+            // resolved path *before* any I/O; then create the missing intermediate dirs.
             let parent = target.parent().ok_or_else(|| {
                 RpcError::invalid_path(format!("{} has no parent directory", target.display()))
             })?;
-            let parent_canonical = std::fs::canonicalize(parent).map_err(|e| {
+            let parent_canonical = canonicalize_partial(parent).map_err(|e| {
                 RpcError::invalid_path(format!("canonicalizing {}: {e}", parent.display()))
             })?;
             let file_name = target
@@ -1214,6 +1517,13 @@ pub async fn buffer_save(
                     "{} is outside the project's access boundary",
                     resolved.display()
                 )));
+            }
+            drop(s);
+
+            // Boundary check passed — safe to create the missing parent dirs now. No-op when
+            // the parent already exists.
+            if !parent_canonical.exists() {
+                std::fs::create_dir_all(&parent_canonical).map_err(RpcError::file_io)?;
             }
             resolved
         }
@@ -4021,10 +4331,10 @@ fn with_grep_position(
     let Some(project) = s.active_project(client_id) else {
         return cursor;
     };
-    let Some(current_path) = buf
+    let Some((current_idx, current_rel)) = buf
         .canonical_path
         .as_deref()
-        .and_then(|p| crate::workspace_index::project_relative_display(p, &project.paths))
+        .and_then(|p| crate::workspace_index::project_relative_parts(std::path::Path::new(p), &project.paths))
     else {
         return cursor;
     };
@@ -4036,7 +4346,7 @@ fn with_grep_position(
     let sel_end_char = anchor_char.max(pos_char);
     let total = hits.len() as u32;
     if let Some(idx) = hits.iter().position(|h| {
-        if h.display_path != current_path {
+        if h.path_index != current_idx || h.relative_path != current_rel {
             return false;
         }
         let hit_start_pos = LogicalPosition {
@@ -4560,6 +4870,33 @@ async fn build_explorer_candidates(
     build_explorer_candidates_for_canonical(&canonical, &project_paths)
 }
 
+/// Build the Roots-mode candidate list — one row per project root, sorted by basename. The
+/// matcher haystack is the basename alone (the disambiguator the client renders is purely
+/// presentational).
+async fn build_explorer_roots(
+    state: &SharedState,
+    client_id: ClientId,
+) -> Result<Vec<picker_state::RootCandidate>, RpcError> {
+    let s = state.lock().await;
+    let project = s.active_project_or_err(client_id)?;
+    let mut out: Vec<picker_state::RootCandidate> = project
+        .paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| picker_state::RootCandidate {
+            path_index: i as u32,
+            absolute_path: p.display().to_string(),
+            basename: p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.basename.cmp(&b.basename));
+    Ok(out)
+}
+
 /// Sync variant: build `ExplorerCandidates` for an already-canonicalized directory path. Used
 /// by the async `build_explorer_candidates` (after it has resolved the requested path) and by
 /// the file-watcher's explorer refresh path (which iterates over already-canonical paths).
@@ -4616,6 +4953,36 @@ pub(crate) fn build_explorer_candidates_for_canonical(
         path: canonical.display().to_string(),
         parent,
         entries,
+    })
+}
+
+/// One-shot directory listing for status-line prompts (save-as cycling). Same boundary rules and
+/// sort order as the Explorer picker, but without any per-client state — just canonicalize, read,
+/// return. The client filters/cycles locally.
+pub async fn directory_list(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: DirectoryListParams,
+) -> Result<DirectoryListResult, RpcError> {
+    let project_paths = {
+        let s = state.lock().await;
+        s.active_project_or_err(ctx.client_id)?.paths.clone()
+    };
+    let raw = std::path::PathBuf::from(&params.path);
+    let canonical = std::fs::canonicalize(&raw)
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
+    let candidates = build_explorer_candidates_for_canonical(&canonical, &project_paths)?;
+    Ok(DirectoryListResult {
+        path: candidates.path,
+        parent: candidates.parent,
+        entries: candidates
+            .entries
+            .into_iter()
+            .map(|e| DirectoryEntry {
+                name: e.name,
+                is_dir: e.is_dir,
+            })
+            .collect(),
     })
 }
 
@@ -4725,9 +5092,15 @@ pub async fn picker_view(
             picker_state::PickerCandidates::Buffers(build_buffer_candidates(&s, client_id))
         }
         PickerKind::Grep => picker_state::PickerCandidates::Grep(Vec::new()),
-        PickerKind::Explorer => picker_state::PickerCandidates::Explorer(
-            build_explorer_candidates(state, client_id, params.directory_path.as_deref()).await?,
-        ),
+        PickerKind::Explorer => {
+            if params.explorer_roots {
+                picker_state::PickerCandidates::ExplorerRoots(build_explorer_roots(state, client_id).await?)
+            } else {
+                picker_state::PickerCandidates::Explorer(
+                    build_explorer_candidates(state, client_id, params.directory_path.as_deref()).await?,
+                )
+            }
+        }
         PickerKind::Projects => {
             // Configured-project enumeration is a synchronous read of one directory under
             // `$XDG_CONFIG_HOME/aether/projects/`. No active-project check; works pre-activation.
@@ -4747,7 +5120,7 @@ pub async fn picker_view(
 
     // Pre-resolve cursor info if we'll use it for Grep centering. Done before borrowing
     // `pickers` out of `s` so we don't have to juggle conflicting borrows after the split.
-    let cursor_centering_info: Option<(LogicalPosition, Option<String>)> =
+    let cursor_centering_info: Option<(LogicalPosition, Option<(u32, String)>)> =
         match (params.kind, params.center_on_cursor_grep_hit) {
             (PickerKind::Grep, Some(buffer_id)) => {
                 let cursor = s
@@ -4762,13 +5135,16 @@ pub async fn picker_view(
                 } else {
                     cursor.position
                 };
-                let current_path = s.buffers.get(&buffer_id).and_then(|b| {
+                let current_key = s.buffers.get(&buffer_id).and_then(|b| {
                     let project = s.active_project(client_id)?;
                     b.canonical_path.as_deref().and_then(|p| {
-                        crate::workspace_index::project_relative_display(p, &project.paths)
+                        crate::workspace_index::project_relative_parts(
+                            std::path::Path::new(p),
+                            &project.paths,
+                        )
                     })
                 });
-                Some((leading_edge, current_path))
+                Some((leading_edge, current_key))
             }
             _ => None,
         };
@@ -4818,12 +5194,18 @@ pub async fn picker_view(
         cursor_centering_info.as_ref(),
         &picker.candidates,
     ) {
-        (Some((leading_edge, current_path)), picker_state::PickerCandidates::Grep(hits))
+        (Some((leading_edge, current_key)), picker_state::PickerCandidates::Grep(hits))
             if !hits.is_empty() =>
         {
-            find_nearest_grep_hit(hits, current_path.as_deref(), *leading_edge).map(|c| {
+            find_nearest_grep_hit(
+                hits,
+                current_key.as_ref().map(|(i, r)| (*i, r.as_str())),
+                *leading_edge,
+            )
+            .map(|c| {
                 PickerItem::GrepHit {
-                    path: c.display_path.clone(),
+                    path_index: c.path_index,
+                    relative_path: c.relative_path.clone(),
                     line: c.line,
                     col: c.col,
                     preview: c.preview.clone(),
@@ -5020,11 +5402,10 @@ pub async fn picker_grep_navigate(
     // are keyed by. Falls back to None if the client somehow lost its active project — the
     // navigate handler then treats this as "no anchor in the file list" the same way scratch
     // buffers do.
-    let current_path: Option<String> = s.active_project(client_id).and_then(|project| {
-        buffer
-            .canonical_path
-            .as_deref()
-            .and_then(|p| crate::workspace_index::project_relative_display(p, &project.paths))
+    let current_key: Option<(u32, String)> = s.active_project(client_id).and_then(|project| {
+        buffer.canonical_path.as_deref().and_then(|p| {
+            crate::workspace_index::project_relative_parts(std::path::Path::new(p), &project.paths)
+        })
     });
 
     let Some(picker) = s.pickers.get(&(client_id, PickerKind::Grep)) else {
@@ -5052,9 +5433,10 @@ pub async fn picker_grep_navigate(
         } else {
             (cursor.position, cursor.anchor)
         };
+    let current_key_ref = current_key.as_ref().map(|(i, r)| (*i, r.as_str()));
     let target = match params.direction {
-        Direction::Forward => find_next_grep_hit(hits, current_path.as_deref(), max_edge),
-        Direction::Backward => find_prev_grep_hit(hits, current_path.as_deref(), min_edge),
+        Direction::Forward => find_next_grep_hit(hits, current_key_ref, max_edge),
+        Direction::Backward => find_prev_grep_hit(hits, current_key_ref, min_edge),
     };
     let query = picker.query.clone();
     Ok(target.map(|c| PickerGrepNavigateTarget {
@@ -5068,24 +5450,24 @@ pub async fn picker_grep_navigate(
 }
 
 /// First grep hit "after" the cursor. Within the same file: the first hit whose `(line, col)` is
-/// past the cursor's. Across files: the first hit whose `display_path` sorts after `current`. If
-/// the current buffer has no path (scratch), every hit counts as "after" and we return the
-/// first.
+/// past the cursor's. Across files: the first hit whose `(path_index, relative_path)` sorts after
+/// `current`. If the current buffer has no path (scratch or outside every root), every hit counts
+/// as "after" and we return the first.
 ///
-/// Assumes `hits` are roughly in `(display_path, line, col)` order — true in practice because
-/// ripgrep walks files in path order via the `ignore` crate, and emits per-file matches in line
+/// Assumes `hits` are roughly in `(path_index, relative_path, line, col)` order — true in
+/// practice because the walker sorts files that way and ripgrep emits matches per file in line
 /// order.
 fn find_next_grep_hit<'a>(
     hits: &'a [picker_state::GrepHitCandidate],
-    current_path: Option<&str>,
+    current: Option<(u32, &str)>,
     cursor: LogicalPosition,
 ) -> Option<&'a picker_state::GrepHitCandidate> {
     use std::cmp::Ordering;
-    let Some(current) = current_path else {
+    let Some((cur_idx, cur_rel)) = current else {
         return hits.first();
     };
     hits.iter().find(|h| {
-        match h.display_path.as_str().cmp(current) {
+        match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
             Ordering::Greater => true,
             Ordering::Equal => (h.line, h.col) > (cursor.line, cursor.col),
             Ordering::Less => false,
@@ -5095,15 +5477,15 @@ fn find_next_grep_hit<'a>(
 
 fn find_prev_grep_hit<'a>(
     hits: &'a [picker_state::GrepHitCandidate],
-    current_path: Option<&str>,
+    current: Option<(u32, &str)>,
     cursor: LogicalPosition,
 ) -> Option<&'a picker_state::GrepHitCandidate> {
     use std::cmp::Ordering;
-    let Some(current) = current_path else {
+    let Some((cur_idx, cur_rel)) = current else {
         return hits.last();
     };
     hits.iter().rev().find(|h| {
-        match h.display_path.as_str().cmp(current) {
+        match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
             Ordering::Less => true,
             Ordering::Equal => (h.line, h.col) < (cursor.line, cursor.col),
             Ordering::Greater => false,
@@ -5118,15 +5500,15 @@ fn find_prev_grep_hit<'a>(
 /// `find_next_grep_hit` which is strict (`>` skips past the current).
 fn find_nearest_grep_hit<'a>(
     hits: &'a [picker_state::GrepHitCandidate],
-    current_path: Option<&str>,
+    current: Option<(u32, &str)>,
     cursor: LogicalPosition,
 ) -> Option<&'a picker_state::GrepHitCandidate> {
     use std::cmp::Ordering;
-    let Some(current) = current_path else {
+    let Some((cur_idx, cur_rel)) = current else {
         return hits.first();
     };
     hits.iter()
-        .find(|h| match h.display_path.as_str().cmp(current) {
+        .find(|h| match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
             Ordering::Greater => true,
             Ordering::Equal => (h.line, h.col) >= (cursor.line, cursor.col),
             Ordering::Less => false,

@@ -184,7 +184,8 @@ fn walk_and_search(
         }
         let mut sink = HitCollector {
             matcher,
-            display_path: &f.display,
+            path_index: f.path_index,
+            relative_path: &f.relative_path,
             abs_path: &f.abs,
             batch: &mut batch,
             batch_tx,
@@ -207,7 +208,8 @@ fn walk_and_search(
 /// position on that line. Holds a `&mut Vec` we own; when it grows past `BATCH_SIZE` we ship it.
 struct HitCollector<'a> {
     matcher: &'a RegexMatcher,
-    display_path: &'a str,
+    path_index: u32,
+    relative_path: &'a str,
     abs_path: &'a str,
     batch: &'a mut Vec<GrepHitCandidate>,
     batch_tx: &'a mpsc::Sender<Vec<GrepHitCandidate>>,
@@ -239,7 +241,8 @@ impl<'a> Sink for HitCollector<'a> {
         for (col, byte_start, byte_end) in hits_on_line {
             let match_indices = byte_range_to_char_offsets(&preview, byte_start, byte_end);
             self.batch.push(GrepHitCandidate {
-                display_path: self.display_path.to_string(),
+                path_index: self.path_index,
+                relative_path: self.relative_path.to_string(),
                 abs_path: self.abs_path.to_string(),
                 line: line_num,
                 col,

@@ -6864,6 +6864,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -6887,10 +6888,10 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
         .items
         .iter()
         .map(|i| {
-            let PickerItem::File { path, .. } = i else {
+            let PickerItem::File { relative_path, .. } = i else {
                 panic!("expected File item, got {i:?}")
             };
-            path.as_str()
+            relative_path.as_str()
         })
         .collect();
     assert!(names.contains(&"src/main.rs"));
@@ -6913,6 +6914,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -6933,13 +6935,17 @@ async fn picker_query_ranks_matches_and_carries_indices() {
     assert_eq!(update.generation, 1);
     let top = update.items.first().expect("at least one match");
     let PickerItem::File {
-        path,
+        relative_path,
         match_indices,
+        ..
     } = top
     else {
         panic!("expected File item, got {top:?}")
     };
-    assert_eq!(path, "src/main.rs", "best match for 'main' is src/main.rs");
+    assert_eq!(
+        relative_path, "src/main.rs",
+        "best match for 'main' is src/main.rs"
+    );
     assert!(
         !match_indices.is_empty(),
         "match indices should highlight where 'main' lines up"
@@ -6962,6 +6968,7 @@ async fn picker_select_returns_absolute_path() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -6978,10 +6985,13 @@ async fn picker_select_returns_absolute_path() {
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let item = update.items.first().expect("a match for 'lib'").clone();
-    let PickerItem::File { ref path, .. } = item else {
+    let PickerItem::File {
+        ref relative_path, ..
+    } = item
+    else {
         panic!("expected File item, got {item:?}")
     };
-    assert_eq!(path, "src/lib.rs");
+    assert_eq!(relative_path, "src/lib.rs");
 
     let result: PickerSelectResult = send_request::<PickerSelect>(
         &mut ws,
@@ -7022,6 +7032,7 @@ async fn picker_resume_centers_on_remembered_item() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7057,11 +7068,13 @@ async fn picker_resume_centers_on_remembered_item() {
             offset: 0,
             limit: 30,
             center_on: Some(PickerItem::File {
-                path: "src/lib.rs".into(),
+                path_index: 0,
+                relative_path: "src/lib.rs".into(),
                 match_indices: vec![],
             }),
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7073,7 +7086,7 @@ async fn picker_resume_centers_on_remembered_item() {
     assert!(update
         .items
         .iter()
-        .any(|i| matches!(i, PickerItem::File { path, .. } if path == "src/lib.rs")));
+        .any(|i| matches!(i, PickerItem::File { relative_path, .. } if relative_path == "src/lib.rs")));
 
     drop(server);
 }
@@ -7092,6 +7105,7 @@ async fn picker_reset_wipes_persisted_query() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7128,6 +7142,7 @@ async fn picker_reset_wipes_persisted_query() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7225,6 +7240,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7273,6 +7289,7 @@ async fn buffers_picker_select_returns_buffer_id() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7380,6 +7397,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7447,6 +7465,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7533,6 +7552,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7637,6 +7657,7 @@ async fn buffers_picker_pushes_on_save() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7711,6 +7732,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7797,6 +7819,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -7924,6 +7947,239 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
         .as_deref()
         .is_some_and(|p| p.ends_with("notes.txt")));
 
+    drop(server);
+}
+
+/// Save-as into a *non-zero* project root writes the file under that root and the saved
+/// buffer's canonical path lands under it (not under root 0). Covers the multi-root case the
+/// TUI's save prompt now exposes via root-cycling.
+#[tokio::test]
+async fn save_as_to_non_zero_root_writes_under_that_root() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a_path = dir_a.path().to_path_buf();
+    let b_path = dir_b.path().to_path_buf();
+    std::mem::forget(dir_a);
+    std::mem::forget(dir_b);
+    let server = spawn_for_test(
+        "test-proj",
+        vec![a_path.clone(), b_path.clone()],
+        TEST_TOKEN,
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id: scratch.buffer_id,
+            text: "in B\n".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+
+    // Save-as with path_index = 1 — the second project root.
+    let saved: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        4,
+        &BufferSaveParams {
+            buffer_id: scratch.buffer_id,
+            path_index: Some(1),
+            relative_path: Some("notes.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
+
+    // The file should be on disk under root B, not root A.
+    let on_disk_b = std::fs::read_to_string(b_path.join("notes.txt")).expect("file under root B");
+    assert_eq!(on_disk_b, "in B\n");
+    assert!(
+        std::fs::metadata(a_path.join("notes.txt")).is_err(),
+        "must not have written under root A"
+    );
+
+    // Reopen by id and confirm the buffer's path is under root B.
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        5,
+        &BufferOpenParams {
+            buffer_id: Some(scratch.buffer_id),
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let canon_b = std::fs::canonicalize(&b_path).unwrap();
+    let canon_b_str = canon_b.to_str().unwrap();
+    assert!(
+        reopen
+            .path
+            .as_deref()
+            .is_some_and(|p| p.starts_with(canon_b_str)),
+        "buffer path should be under root B; got {:?}",
+        reopen.path
+    );
+    assert_eq!(reopen.saved_revision, saved.revision);
+
+    drop(server);
+}
+
+/// Save-as into a not-yet-existing subdirectory creates the directory tree on the fly — same
+/// `mkdir -p` semantics you'd get from a shell. Covers the common "I want to save into a new
+/// folder I haven't made yet" flow without making the user pre-create the dir.
+#[tokio::test]
+async fn save_as_creates_missing_parent_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id: scratch.buffer_id,
+            text: "deep\n".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    // Save-as into a two-deep, not-yet-existing path: `a/b/c.txt`.
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        4,
+        &BufferSaveParams {
+            buffer_id: scratch.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("a/b/c.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
+    // The intermediate dirs and the file should all exist on disk.
+    assert!(dir_path.join("a").is_dir(), "intermediate dir `a` was not created");
+    assert!(dir_path.join("a/b").is_dir(), "intermediate dir `a/b` was not created");
+    let written = std::fs::read_to_string(dir_path.join("a/b/c.txt")).expect("file written");
+    assert_eq!(written, "deep\n");
+    drop(server);
+}
+
+/// Save-as into a path *outside* the project boundary is still rejected, even when the missing
+/// dirs are within the project. The boundary check must run before any directory creation —
+/// otherwise a save-as into `../escape/x.txt` could silently create dirs above the project root.
+#[tokio::test]
+async fn save_as_does_not_create_dirs_outside_project() {
+    let outer = tempfile::tempdir().unwrap();
+    let project = outer.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_canonical = std::fs::canonicalize(&project).unwrap();
+    std::mem::forget(outer);
+
+    let server = spawn_for_test("test-proj", vec![project_canonical.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let err = send_request_expect_err::<BufferSave>(
+        &mut ws,
+        3,
+        &BufferSaveParams {
+            buffer_id: scratch.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("../escape/x.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("outside the project"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !project_canonical
+            .parent()
+            .unwrap()
+            .join("escape")
+            .exists(),
+        "must not have created an `escape` dir alongside the project"
+    );
     drop(server);
 }
 
@@ -8916,6 +9172,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -8940,7 +9197,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
     let hit = final_update
         .items
         .iter()
-        .find(|i| matches!(i, PickerItem::GrepHit { path, .. } if path == "src/lib.rs"))
+        .find(|i| matches!(i, PickerItem::GrepHit { relative_path, .. } if relative_path == "src/lib.rs"))
         .expect("lib.rs hit present");
     let (line, col, preview) = match hit {
         PickerItem::GrepHit {
@@ -8989,6 +9246,7 @@ async fn picker_grep_short_query_yields_empty_result() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9031,6 +9289,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9071,6 +9330,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9100,6 +9360,7 @@ async fn picker_grep_treats_query_as_regex() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9142,6 +9403,7 @@ async fn picker_grep_caches_completed_query() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9227,6 +9489,7 @@ async fn setup_grep_with_needle_query() -> (
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9477,6 +9740,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
             center_on: None,
             center_on_cursor_grep_hit: Some(buffer_id),
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9485,7 +9749,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
     let item = update
         .items
         .iter()
-        .find(|i| matches!(i, PickerItem::GrepHit { path, line, col, .. } if path == "src/main.rs" && *line == 1 && *col == 4))
+        .find(|i| matches!(i, PickerItem::GrepHit { relative_path, line, col, .. } if relative_path == "src/main.rs" && *line == 1 && *col == 4))
         .expect("main.rs:1:4 should be in the pushed window");
     let _ = item;
 
@@ -9503,6 +9767,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
             center_on: None,
             center_on_cursor_grep_hit: Some(buffer_id),
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9510,8 +9775,8 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
         .effective_center_on
         .expect("server should echo back the wrapped-to-first hit");
     match resolved {
-        PickerItem::GrepHit { path, line, col, .. } => {
-            assert_eq!(path, "src/lib.rs");
+        PickerItem::GrepHit { relative_path, line, col, .. } => {
+            assert_eq!(relative_path, "src/lib.rs");
             assert_eq!(line, 0);
             assert_eq!(col, 3);
         }
@@ -9684,6 +9949,7 @@ async fn picker_explorer_default_lists_project_root() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9731,6 +9997,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some(target.display().to_string()),
+            explorer_roots: false,
         },
     )
     .await;
@@ -9772,6 +10039,7 @@ async fn picker_explorer_query_filters_by_prefix() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9830,6 +10098,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9871,6 +10140,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9930,6 +10200,7 @@ async fn picker_explorer_query_is_smartcase() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -9990,6 +10261,7 @@ async fn picker_explorer_select_file_returns_absolute_path() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some(target.display().to_string()),
+            explorer_roots: false,
         },
     )
     .await;
@@ -10036,6 +10308,7 @@ async fn picker_explorer_select_directory_errors() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -10077,12 +10350,123 @@ async fn picker_explorer_rejects_path_outside_project() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some("/etc".into()),
+            explorer_roots: false,
         },
     )
     .await;
     assert!(
         err.contains("outside the project") || err.contains("canonicalizing"),
         "unexpected error message: {err}"
+    );
+    drop(server);
+}
+
+/// `directory/list` returns the canonical directory path, every immediate child, and the parent
+/// when it's still inside the project. The entries are dirs-then-files, alphabetical within each
+/// — same sort the Explorer picker uses.
+#[tokio::test]
+async fn directory_list_returns_children_and_parent() {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams, DirectoryListResult};
+    let (server, mut ws, root) = setup_explorer_workspace().await;
+    let target = root.join("src");
+    let result: DirectoryListResult = send_request::<DirectoryList>(
+        &mut ws,
+        20,
+        &DirectoryListParams {
+            path: target.display().to_string(),
+        },
+    )
+    .await;
+    assert_eq!(result.path, target.to_str().unwrap());
+    assert_eq!(
+        result.parent.as_deref(),
+        Some(root.to_str().unwrap()),
+        "parent should be the project root"
+    );
+    let entries: Vec<(String, bool)> = result
+        .entries
+        .into_iter()
+        .map(|e| (e.name, e.is_dir))
+        .collect();
+    assert_eq!(
+        entries,
+        vec![("lib.rs".into(), false), ("main.rs".into(), false)]
+    );
+    drop(server);
+}
+
+/// At a project root, `directory/list` returns no parent (the root has no in-project ancestor).
+/// Dirs come before files in the response.
+#[tokio::test]
+async fn directory_list_at_root_omits_parent_and_sorts_dirs_first() {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams, DirectoryListResult};
+    let (server, mut ws, root) = setup_explorer_workspace().await;
+    let result: DirectoryListResult = send_request::<DirectoryList>(
+        &mut ws,
+        20,
+        &DirectoryListParams {
+            path: root.display().to_string(),
+        },
+    )
+    .await;
+    assert!(
+        result.parent.is_none(),
+        "at the project root, parent should be omitted"
+    );
+    let entries: Vec<(String, bool)> = result
+        .entries
+        .into_iter()
+        .map(|e| (e.name, e.is_dir))
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            ("src".into(), true),
+            ("tests".into(), true),
+            ("README.md".into(), false),
+        ]
+    );
+    drop(server);
+}
+
+/// Paths outside the project's access boundary are refused — same rule as the Explorer picker.
+#[tokio::test]
+async fn directory_list_rejects_path_outside_project() {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams};
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+    let err = send_request_expect_err::<DirectoryList>(
+        &mut ws,
+        20,
+        &DirectoryListParams {
+            path: "/etc".into(),
+        },
+    )
+    .await;
+    assert!(
+        err.contains("outside the project") || err.contains("canonicalizing"),
+        "unexpected error message: {err}"
+    );
+    drop(server);
+}
+
+/// Non-existent paths fail to canonicalize and return an error; the message names the path so the
+/// client can route it into a useful prompt.
+#[tokio::test]
+async fn directory_list_rejects_missing_path() {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams};
+    let (server, mut ws, root) = setup_explorer_workspace().await;
+    let missing = root.join("no-such-dir");
+    let err = send_request_expect_err::<DirectoryList>(
+        &mut ws,
+        20,
+        &DirectoryListParams {
+            path: missing.display().to_string(),
+        },
+    )
+    .await;
+    assert!(
+        err.contains("canonicalizing"),
+        "missing path should fail canonicalization; got: {err}"
     );
     drop(server);
 }
@@ -10105,6 +10489,7 @@ async fn picker_explorer_resumes_last_directory() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some(target.display().to_string()),
+            explorer_roots: false,
         },
     )
     .await;
@@ -10130,6 +10515,7 @@ async fn picker_explorer_resumes_last_directory() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;
@@ -10158,6 +10544,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         },
     )
     .await;

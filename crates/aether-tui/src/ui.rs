@@ -51,16 +51,20 @@ const NORD7: Color = Color::Rgb(143, 188, 187); // Frost — types
 const NORD8: Color = Color::Rgb(136, 192, 208); // Frost — functions, accents
 const NORD9: Color = Color::Rgb(129, 161, 193); // Frost — keywords, operators
 const NORD10: Color = Color::Rgb(94, 129, 172); // Frost — deep blue (active selection bg)
+const NORD11: Color = Color::Rgb(191, 97, 106); // Aurora red — error text
 const NORD12: Color = Color::Rgb(208, 135, 112); // Aurora orange — attributes, macros
 const NORD13: Color = Color::Rgb(235, 203, 139); // Aurora yellow — string escapes
 const NORD14: Color = Color::Rgb(163, 190, 140); // Aurora green — strings
 const NORD15: Color = Color::Rgb(180, 142, 173); // Aurora purple — numbers, constants
 
 pub fn draw(f: &mut Frame, state: &AppState) {
-    // Reserve a row for the status bar only when there's an active editor — the no-project view
-    // already shows the relevant hints front-and-centre, so a redundant status line just steals
-    // vertical space.
-    let constraints: &[Constraint] = if state.has_editor() {
+    // The status row carries activation feedback, save-as / new-file prompts, and the dirty +
+    // cursor indicator for an active editor. The add-root prompt lives *inside* the settings
+    // overlay, not here. We show the row when an editor exists, or when a transient status
+    // message is up (e.g. after activating a project) — otherwise hide so the no-project view
+    // gets full vertical space.
+    let show_status = state.has_editor() || !state.status.is_empty();
+    let constraints: &[Constraint] = if show_status {
         &[Constraint::Min(1), Constraint::Length(1)]
     } else {
         &[Constraint::Min(1)]
@@ -79,29 +83,365 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     if state.picker.open {
         draw_picker_overlay(f, state, chunks[0]);
     }
-    if state.has_editor() {
+    // Project settings overlay (Space P): centered modal listing the active project's roots.
+    if state.project_settings.is_some() {
+        draw_project_settings_overlay(f, state, chunks[0]);
+    }
+    if show_status {
         draw_status(f, state, chunks[1]);
-        place_terminal_cursor(f, state, chunks[0], chunks[1]);
+    }
+    // The settings overlay needs a caret on its input row even when no editor exists (e.g. right
+    // after `project/create`). Fall back to a zero Rect for the status area in that case — the
+    // settings branch in `place_terminal_cursor` doesn't read it.
+    if state.has_editor() || state.project_settings.is_some() {
+        let buffer_area = chunks[0];
+        let status_area = chunks.get(1).copied().unwrap_or(Rect::default());
+        place_terminal_cursor(f, state, buffer_area, status_area);
     }
 }
 
+/// Project-settings overlay. A bordered modal (no border title) holding, top-to-bottom:
+/// a `Project Settings (<name>)` heading, a blank row, a `Project roots:` section label, the
+/// list of roots, an always-present "Add root..." input row, and — when the last add/remove
+/// attempt failed — a red error footer. Selection highlights the path text (bold + accent) on
+/// root rows only; the input row carries no highlight (its terminal caret is the focus cue).
+fn draw_project_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+    let Some(settings) = state.project_settings.as_ref() else {
+        return;
+    };
+    let box_area = picker_box_rect(area);
+    let Some(layout) = settings_layout(box_area, settings.error.is_some()) else {
+        return;
+    };
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(NORD4))
+        .style(Style::default().bg(NORD0).fg(NORD4));
+    f.render_widget(block, box_area);
+
+    draw_settings_header(f, settings, layout.header);
+    draw_settings_rows(f, state, settings, layout.rows);
+    if let (Some(err_area), Some(msg)) = (layout.error, settings.error.as_deref()) {
+        let style = Style::default().fg(NORD11).bg(NORD0);
+        let text = truncate_right(msg, err_area.width as usize);
+        f.render_widget(Paragraph::new(Span::styled(text, style)), err_area);
+    }
+}
+
+/// Header block: `Project Settings (<name>)` heading, a blank row, `Project roots:` label.
+/// Degrades gracefully when the header area is shorter than 3 rows.
+fn draw_settings_header(
+    f: &mut Frame,
+    settings: &crate::app::ProjectSettingsState,
+    area: Rect,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let heading_style = Style::default()
+        .fg(NORD8)
+        .bg(NORD0)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default()
+        .fg(NORD4)
+        .bg(NORD0)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line> = Vec::with_capacity(3);
+    if area.height >= 1 {
+        let heading = format!("Project Settings ({})", settings.project_name);
+        let heading = truncate_right(&heading, area.width as usize);
+        lines.push(Line::from(Span::styled(heading, heading_style)));
+    }
+    if area.height >= 2 {
+        lines.push(Line::from(""));
+    }
+    if area.height >= 3 {
+        lines.push(Line::from(Span::styled("Project roots:", label_style)));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(NORD4).bg(NORD0)),
+        area,
+    );
+}
+
+/// Geometry of the settings overlay subareas. Computed once per draw and reused by the cursor
+/// placement so they can't drift out of sync.
+struct SettingsLayout {
+    header: Rect,
+    rows: Rect,
+    error: Option<Rect>,
+}
+
+fn settings_layout(box_area: Rect, has_error: bool) -> Option<SettingsLayout> {
+    if box_area.width < 4 || box_area.height < 4 {
+        return None;
+    }
+    let inner = Rect {
+        x: box_area.x + 1,
+        y: box_area.y + 1,
+        width: box_area.width - 2,
+        height: box_area.height - 2,
+    };
+    let content = pad_horizontal(inner);
+    if content.height == 0 || content.width == 0 {
+        return None;
+    }
+    let header_h = 3u16.min(content.height);
+    let remaining = content.height - header_h;
+    let error_h = if has_error { 1u16.min(remaining) } else { 0u16 };
+    let rows_h = remaining - error_h;
+    let header = Rect {
+        x: content.x,
+        y: content.y,
+        width: content.width,
+        height: header_h,
+    };
+    let rows = Rect {
+        x: content.x,
+        y: content.y + header_h,
+        width: content.width,
+        height: rows_h,
+    };
+    let error = if error_h > 0 {
+        Some(Rect {
+            x: content.x,
+            y: content.y + header_h + rows_h,
+            width: content.width,
+            height: error_h,
+        })
+    } else {
+        None
+    };
+    Some(SettingsLayout {
+        header,
+        rows,
+        error,
+    })
+}
+
+/// Render the roots + input row list. On a root row the path text is bolded in the accent color
+/// when selected (no row-spanning bg bar — keeps the highlight subtle and consistent with the
+/// project picker); the pending-delete row swaps the path for a red `remove "<path>"? [y/N]`
+/// prompt. The input row carries no selection styling — its visible terminal caret is the focus
+/// cue. Each list item is indented one column past the section label.
+fn draw_settings_rows(
+    f: &mut Frame,
+    state: &AppState,
+    settings: &crate::app::ProjectSettingsState,
+    area: Rect,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let base_style = Style::default().fg(NORD4).bg(NORD0);
+    let total_items = settings.roots.len() + 1;
+    let max = (area.height as usize).max(1);
+    let start = settings
+        .selected
+        .saturating_sub(max.saturating_sub(1))
+        .min(total_items.saturating_sub(max));
+    let area_w = area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for i in start..(start + max).min(total_items) {
+        let highlighted = i == settings.selected;
+        // 1-col indent so list items sit visually under the section label.
+        let leading = Span::styled(" ", base_style);
+        let text_budget = area_w.saturating_sub(1);
+        if i < settings.roots.len() {
+            let root = &settings.roots[i];
+            let pending = settings.pending_delete && i == settings.selected;
+            if pending {
+                const PREFIX: &str = "remove \"";
+                const SUFFIX: &str = "\"? [y/N]";
+                let fixed_w = PREFIX.width() + SUFFIX.width();
+                let path_budget = text_budget.saturating_sub(fixed_w);
+                let path = truncate_middle(root, path_budget);
+                let warn_style = Style::default()
+                    .fg(NORD11)
+                    .bg(NORD0)
+                    .add_modifier(Modifier::BOLD);
+                let body = Span::styled(format!("{PREFIX}{path}{SUFFIX}"), warn_style);
+                lines.push(Line::from(vec![leading, body]));
+                continue;
+            }
+            let dirty_marker = if root_has_dirty_buffer(state, root) {
+                " [+]"
+            } else {
+                ""
+            };
+            let body = format!("{root}{dirty_marker}");
+            let truncated = truncate_middle(&body, text_budget);
+            let bg = if highlighted { NORD2 } else { NORD0 };
+            let path_style = Style::default().fg(NORD4).bg(bg);
+            lines.push(Line::from(vec![leading, Span::styled(truncated, path_style)]));
+        } else {
+            // Input row: no highlight regardless of selection. Placeholder when empty, plain
+            // text otherwise; ratatui clips past the right edge for very long inputs.
+            let (text, style) = if settings.add_input.text.is_empty() {
+                (
+                    "Add root...".to_string(),
+                    Style::default()
+                        .fg(NORD3)
+                        .bg(NORD0)
+                        .add_modifier(Modifier::ITALIC),
+                )
+            } else {
+                (
+                    settings.add_input.text.clone(),
+                    Style::default().fg(NORD4).bg(NORD0),
+                )
+            };
+            lines.push(Line::from(vec![leading, Span::styled(text, style)]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).style(base_style), area);
+}
+
+/// Place the terminal caret on the settings overlay's input row. Mirrors the layout math in
+/// `draw_project_settings_overlay`: same inner padding, same error-footer split, same scroll
+/// slide. Only places the caret when the input row is currently visible (with a small list and
+/// a tall box this is almost always true; if it scrolled off, we just leave the caret unset and
+/// ratatui hides it for the frame).
+fn place_settings_input_cursor(
+    f: &mut Frame,
+    settings: &crate::app::ProjectSettingsState,
+    buffer_area: Rect,
+) {
+    let box_area = picker_box_rect(buffer_area);
+    let Some(layout) = settings_layout(box_area, settings.error.is_some()) else {
+        return;
+    };
+    let rows = layout.rows;
+    if rows.height == 0 || rows.width == 0 {
+        return;
+    }
+    let total_items = settings.roots.len() + 1;
+    let max = (rows.height as usize).max(1);
+    let start = settings
+        .selected
+        .saturating_sub(max.saturating_sub(1))
+        .min(total_items.saturating_sub(max));
+    let input_idx = settings.roots.len();
+    if input_idx < start || input_idx >= start + max {
+        return;
+    }
+    let row_y = rows.y + (input_idx - start) as u16;
+    // +1 for the leading " " indent each list item carries.
+    let typed_w = settings.add_input.width_to_cursor() as u16;
+    let max_x = rows.x + rows.width.saturating_sub(1);
+    let col = rows.x.saturating_add(1).saturating_add(typed_w).min(max_x);
+    f.set_cursor_position((col, row_y));
+}
+
+/// Middle-ellipsize `s` so it fits in `max_w` display columns. Preserves head and tail; collapses
+/// the middle into a single `…`. Falls back to a bare `…` when there isn't even room for one
+/// character on each side. Operates on display widths so wide chars don't break the budget.
+fn truncate_middle(s: &str, max_w: usize) -> String {
+    let total = s.width();
+    if total <= max_w {
+        return s.to_string();
+    }
+    if max_w == 0 {
+        return String::new();
+    }
+    if max_w == 1 {
+        return "…".to_string();
+    }
+    let budget = max_w - 1;
+    let left_target = budget / 2;
+    let right_target = budget - left_target;
+    let mut left = String::new();
+    let mut acc = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if acc + cw > left_target {
+            break;
+        }
+        left.push(c);
+        acc += cw;
+    }
+    let mut right_rev: Vec<char> = Vec::new();
+    let mut acc = 0usize;
+    for c in s.chars().rev() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if acc + cw > right_target {
+            break;
+        }
+        right_rev.push(c);
+        acc += cw;
+    }
+    let right: String = right_rev.into_iter().rev().collect();
+    format!("{left}…{right}")
+}
+
+/// Right-truncate `s` to `max_w` display columns, appending `…`. Used for error messages where
+/// the prefix carries the diagnostic.
+fn truncate_right(s: &str, max_w: usize) -> String {
+    let total = s.width();
+    if total <= max_w {
+        return s.to_string();
+    }
+    if max_w == 0 {
+        return String::new();
+    }
+    if max_w == 1 {
+        return "…".to_string();
+    }
+    let target = max_w - 1;
+    let mut out = String::new();
+    let mut acc = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if acc + cw > target {
+            break;
+        }
+        out.push(c);
+        acc += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Mirror of the editor's `[+]` marker, applied per-root: a root has a dirty buffer if any
+/// open editor (any client, since AppState only sees its own — but file_path is informative
+/// enough) has a path under it and unsaved changes. This client only knows about its own
+/// active editor, so the marker reflects "your active buffer is under this root and is dirty."
+/// Server-side dirty buffers from other clients won't show. Acceptable for v1.
+fn root_has_dirty_buffer(state: &AppState, root: &str) -> bool {
+    let Some(ed) = state.editor.as_ref() else {
+        return false;
+    };
+    if !ed.dirty_marker_visible() {
+        return false;
+    }
+    let Some(path) = ed.file_path.as_deref() else {
+        return false;
+    };
+    let root_path = std::path::Path::new(root);
+    let buf_path = std::path::Path::new(path);
+    buf_path == root_path || buf_path.starts_with(root_path)
+}
+
 /// Empty no-project view: a centered hint telling the user how to open the project picker.
-/// Drawn instead of the buffer pane when `state.editor` is `None`.
+/// Drawn instead of the buffer pane when `state.editor` is `None`. Fills the full pane in the
+/// editor's NORD0 background so the no-project state visually matches an open editor instead of
+/// falling through to the terminal's default colors.
 fn draw_no_project_view(f: &mut Frame, _state: &AppState, area: Rect) {
-    use ratatui::style::{Modifier, Style};
-    use ratatui::text::{Line, Span};
-    use ratatui::widgets::Paragraph;
+    let base = Style::default().bg(NORD0).fg(NORD4);
+    f.render_widget(Paragraph::new("").style(base), area);
     let hint = vec![
         Line::from(Span::styled(
             "no project active",
-            Style::default().add_modifier(Modifier::BOLD),
+            base.add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
-        Line::from("Space p   pick a project"),
-        Line::from("Space q   quit"),
+        Line::from(Span::styled("", base)),
+        Line::from(Span::styled("Space p   pick a project", base)),
+        Line::from(Span::styled("Space q   quit", base)),
     ];
-    let para = Paragraph::new(hint).alignment(ratatui::layout::Alignment::Center);
-    // Vertically centre by inserting blank top padding.
+    let para = Paragraph::new(hint)
+        .alignment(ratatui::layout::Alignment::Center)
+        .style(base);
     let inner_height = 4u16;
     let top_pad = area.height.saturating_sub(inner_height) / 2;
     let target = Rect {
@@ -196,12 +536,20 @@ pub fn grep_visible_item_count_from(
         return 0;
     }
     let mut rows_used: usize = 0;
-    let mut prev_path: Option<&str> = None;
+    let mut prev_key: Option<(u32, &str)> = None;
     let mut visible: usize = 0;
     for item in &items[start..] {
-        let needs_header = match item {
-            PickerItem::GrepHit { path, .. } => prev_path != Some(path.as_str()),
-            _ => false,
+        let cur_key = match item {
+            PickerItem::GrepHit {
+                path_index,
+                relative_path,
+                ..
+            } => Some((*path_index, relative_path.as_str())),
+            _ => None,
+        };
+        let needs_header = match cur_key {
+            Some(k) => prev_key != Some(k),
+            None => false,
         };
         let cost = if needs_header { 2 } else { 1 };
         if rows_used + cost > pane_height {
@@ -209,8 +557,8 @@ pub fn grep_visible_item_count_from(
         }
         rows_used += cost;
         visible += 1;
-        if let PickerItem::GrepHit { path, .. } = item {
-            prev_path = Some(path.as_str());
+        if let Some(k) = cur_key {
+            prev_key = Some(k);
         }
     }
     visible
@@ -287,15 +635,21 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         .fg(NORD3)
         .bg(NORD0)
         .add_modifier(Modifier::ITALIC);
-    let prefix_style = Style::default().fg(NORD8).bg(NORD0);
+    // Both the root label and the relative-path portion are *committed* parts of the prefix —
+    // colour them the same blue so the contrast in the row reads as "committed prefix" (blue)
+    // vs "editable query" (default fg). Mirrored in the save-as prompt renderer.
+    let label_style = Style::default().fg(NORD8).bg(NORD0);
+    let path_style = Style::default().fg(NORD8).bg(NORD0);
 
     let total_width = area.width as usize;
-    let (prefix_text, prefix_w) = explorer_input_prefix(state, total_width);
+    let (label_text, path_text) = explorer_input_prefix(state, total_width);
+    let prefix_w = label_text.width() + path_text.width();
+    let prefix_has_content = prefix_w > 0;
 
     let (left_text, left_style, left_w) = if state.picker.query.is_empty() {
         // Suppress the placeholder when the explorer prefix is already telling the user where
         // they are — the path *is* the context. Other pickers keep their placeholder.
-        if !prefix_text.is_empty() {
+        if prefix_has_content {
             (String::new(), base_style, 0)
         } else {
             let ph = picker_placeholder(state.picker.kind);
@@ -320,8 +674,11 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     let counts_w = counts.width();
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    if !prefix_text.is_empty() {
-        spans.push(Span::styled(prefix_text, prefix_style));
+    if !label_text.is_empty() {
+        spans.push(Span::styled(label_text, label_style));
+    }
+    if !path_text.is_empty() {
+        spans.push(Span::styled(path_text, path_style));
     }
     spans.push(Span::styled(left_text, left_style));
     let used = prefix_w + left_w;
@@ -333,43 +690,61 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).style(base_style), area);
 }
 
-/// The immutable dir-context prefix for the Explorer picker. Returns the rendered string and
-/// its display width. Truncated from the left (preserving the leaf) with `…` when it would
-/// take more than half the input row; capped at `available - 1` so there's always at least one
-/// cell for the query cursor. Returns `(empty, 0)` for non-Explorer pickers.
-fn explorer_input_prefix(state: &AppState, available: usize) -> (String, usize) {
+/// The immutable dir-context prefix for the Explorer picker, split into two segments so the
+/// renderer can colour them differently: a `{label}: ` segment (rendered in white, identifies
+/// the root in multi-root projects) and a `{relative}/` segment (rendered in blue). Either may
+/// be empty: the label segment is empty in single-root projects and at the top of a root with no
+/// label; the path segment is empty at the top of any root. Both empty means no prefix at all
+/// (Roots mode, or the explorer dir is outside every root).
+///
+/// Combined width is capped at half the row (and always leaves at least one cell for the query
+/// cursor). When the natural prefix overflows, we drop the label and left-truncate the path
+/// with a leading `…` — the leaf and trailing slash stay visible.
+fn explorer_input_prefix(state: &AppState, available: usize) -> (String, String) {
     if !matches!(
         state.picker.kind,
         Some(aether_protocol::picker::PickerKind::Explorer)
     ) {
-        return (String::new(), 0);
+        return (String::new(), String::new());
     }
     let Some(dir) = state.picker.explorer_dir.as_deref() else {
-        return (String::new(), 0);
+        // Roots mode — rows already communicate "picking a root"; no breadcrumb needed.
+        return (String::new(), String::new());
     };
-    let rel = project_relative_path(dir, &state.project_paths);
-    // At the project root there's no path-context worth showing — fall back to the empty
-    // prefix so the input row degrades to the regular placeholder ("Filter entries…").
-    // Inside a subdirectory the prefix sits flush with the typed query (no trailing space),
-    // so `src/ma` reads as a single path expression with `src/` locked and `ma` live.
-    if rel.is_empty() {
-        return (String::new(), 0);
-    }
-    let raw = format!("{rel}/");
+    let (label_part, path_part) = match crate::app::strip_longest_root(dir, &state.project_paths) {
+        Some((idx, rel)) => {
+            let label = state.root_labels.get(idx).map(String::as_str).unwrap_or("");
+            let label_part = if label.is_empty() {
+                String::new()
+            } else {
+                format!("{label}: ")
+            };
+            let path_part = if rel.is_empty() {
+                String::new()
+            } else {
+                format!("{rel}/")
+            };
+            (label_part, path_part)
+        }
+        None => return (String::new(), String::new()),
+    };
     if available == 0 {
-        return (String::new(), 0);
+        return (String::new(), String::new());
     }
     // Half the row, but always leave room for the cursor on the typed query side.
     let max = (available / 2).max(1).min(available.saturating_sub(1));
-    let raw_w = raw.width();
-    if raw_w <= max {
-        return (raw, raw_w);
+    let total_w = label_part.width() + path_part.width();
+    if total_w <= max {
+        return (label_part, path_part);
     }
-    // Keep characters from the right (preserving the leaf + trailing space) until the budget
-    // — minus 1 for the leading `…` — is full. Same trim-from-left strategy as the file
-    // truncation helper, but on a plain (no match-indices) string.
-    let chars: Vec<char> = raw.chars().collect();
-    let budget = max.saturating_sub(1);
+    // Over budget. Sacrifice the label first (the path is more useful), then left-truncate the
+    // path with a leading `…` if it's still over budget on its own.
+    let path_w = path_part.width();
+    if path_w <= max {
+        return (String::new(), path_part);
+    }
+    let chars: Vec<char> = path_part.chars().collect();
+    let budget = max.saturating_sub(1); // 1 cell for the leading `…`
     let mut kept_w = 0;
     let mut kept_start = chars.len();
     for (i, c) in chars.iter().enumerate().rev() {
@@ -381,9 +756,7 @@ fn explorer_input_prefix(state: &AppState, available: usize) -> (String, usize) 
         kept_start = i;
     }
     let kept: String = chars[kept_start..].iter().collect();
-    let truncated = format!("…{kept}");
-    let truncated_w = truncated.width();
-    (truncated, truncated_w)
+    (String::new(), format!("…{kept}"))
 }
 
 fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'static str {
@@ -448,24 +821,33 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     // For Grep, insert a non-selectable file header above the first hit of each new file path.
     // Headers eat into the visible row budget; the visible-count math above already accounts
     // for them, so what we render here will fit in `pane_height` rows.
-    let mut prev_grep_path: Option<&str> = None;
+    let mut prev_grep_key: Option<(u32, &str)> = None;
     for (offset_in_slice, item) in state.picker.items[visible_start..visible_end]
         .iter()
         .enumerate()
     {
         let i = visible_start + offset_in_slice;
-        if let PickerItem::GrepHit { path, .. } = item {
-            if prev_grep_path != Some(path.as_str()) {
+        if let PickerItem::GrepHit {
+            path_index,
+            relative_path,
+            ..
+        } = item
+        {
+            let key = (*path_index, relative_path.as_str());
+            if prev_grep_key != Some(key) {
                 lines.push(Line::from(grep_file_header_spans(
-                    path,
+                    *path_index,
+                    relative_path,
+                    &state.root_labels,
                     text_width as usize,
                 )));
-                prev_grep_path = Some(path.as_str());
+                prev_grep_key = Some(key);
             }
         }
         let highlighted = i == state.picker.selected;
         lines.push(Line::from(picker_item_spans(
             item,
+            &state.root_labels,
             highlighted,
             text_width as usize,
         )));
@@ -520,7 +902,12 @@ fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
     }
 }
 
-fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> Vec<Span<'static>> {
+fn picker_item_spans(
+    item: &PickerItem,
+    root_labels: &[String],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
     if let PickerItem::GrepHit {
         line,
         preview,
@@ -538,6 +925,30 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
     {
         return dir_entry_spans(name, *is_dir, match_indices, highlighted, max_width);
     }
+    // File rows get a leading dim `{label}: ` prefix; everything else falls through with the
+    // legacy single-string display.
+    if let PickerItem::File {
+        path_index,
+        relative_path,
+        match_indices,
+    } = item
+    {
+        return file_item_spans(
+            *path_index,
+            relative_path,
+            match_indices,
+            root_labels,
+            highlighted,
+            max_width,
+        );
+    }
+    if let PickerItem::Root {
+        path_index,
+        match_indices,
+    } = item
+    {
+        return root_item_spans(*path_index, match_indices, root_labels, highlighted, max_width);
+    }
 
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
@@ -546,10 +957,6 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
     // Trailing dirty marker for buffer items — matches the status bar's `[+]` indicator. Goes
     // after the display so it doesn't shift `match_indices` (which index into the display).
     let (display_raw, match_indices, dirty_suffix) = match item {
-        PickerItem::File {
-            path,
-            match_indices,
-        } => (path.as_str(), match_indices.as_slice(), ""),
         PickerItem::Buffer {
             display,
             dirty,
@@ -564,7 +971,10 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
             name,
             match_indices,
         } => (name.as_str(), match_indices.as_slice(), ""),
-        PickerItem::GrepHit { .. } | PickerItem::DirEntry { .. } => unreachable!("handled above"),
+        PickerItem::File { .. }
+        | PickerItem::GrepHit { .. }
+        | PickerItem::DirEntry { .. }
+        | PickerItem::Root { .. } => unreachable!("handled above"),
     };
 
     let text_budget = max_width.saturating_sub(dirty_suffix.len());
@@ -606,15 +1016,144 @@ fn picker_item_spans(item: &PickerItem, highlighted: bool, max_width: usize) -> 
     spans
 }
 
-/// Header row above each file's hits in the Grep picker. Path in NORD8 (frost blue, distinct
-/// from regular item rows) — non-selectable; the picker cursor lives on the GrepHit rows.
-fn grep_file_header_spans(path: &str, max_width: usize) -> Vec<Span<'static>> {
-    let style = Style::default()
+/// Header row above each file's hits in the Grep picker. Renders as `{label}: {relative}` with
+/// the label in NORD4 (white, matches the label style on File rows) and the separator + path in
+/// NORD8 (frost blue) so the file path stays the dominant visual element. Non-selectable; the
+/// picker cursor lives on the GrepHit rows below.
+fn grep_file_header_spans(
+    path_index: u32,
+    relative_path: &str,
+    root_labels: &[String],
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let label_style = Style::default()
+        .fg(NORD4)
+        .bg(NORD0)
+        .add_modifier(Modifier::BOLD);
+    let path_style = Style::default()
         .fg(NORD8)
         .bg(NORD0)
         .add_modifier(Modifier::BOLD);
-    let (display, _) = truncate_path_with_indices(path, &[], max_width);
-    vec![Span::styled(display, style)]
+    let label = root_label_or_blank(root_labels, path_index);
+    if label.is_empty() {
+        let (display, _) = truncate_path_with_indices(relative_path, &[], max_width);
+        return vec![Span::styled(display, path_style)];
+    }
+    // Reserve space for `{label}: ` first; whatever remains goes to the path.
+    let prefix = format!("{label}: ");
+    let prefix_w = prefix.width();
+    if prefix_w >= max_width {
+        // Box is too narrow to hold even the label — fall back to truncating the combined form.
+        let display_raw = format!("{prefix}{relative_path}");
+        let (display, _) = truncate_path_with_indices(&display_raw, &[], max_width);
+        return vec![Span::styled(display, label_style)];
+    }
+    let path_budget = max_width - prefix_w;
+    let (path_display, _) = truncate_path_with_indices(relative_path, &[], path_budget);
+    vec![
+        Span::styled(prefix, label_style),
+        Span::styled(path_display, path_style),
+    ]
+}
+
+/// File picker row: `{label}: {relative}` with the label in a dim foreground (NORD3) and the
+/// relative path styled like other picker items, including the fuzzy-match highlight. The
+/// label is plain text — match indices in the protocol always index into `relative_path` only.
+fn file_item_spans(
+    path_index: u32,
+    relative_path: &str,
+    match_indices: &[u32],
+    root_labels: &[String],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let base = Style::default().fg(NORD4).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(NORD3).bg(bg);
+    let label = root_label_or_blank(root_labels, path_index);
+    let prefix = if label.is_empty() {
+        String::new()
+    } else {
+        format!("{label}: ")
+    };
+    let prefix_w = prefix.width();
+    let relative_budget = max_width.saturating_sub(prefix_w);
+    let (display, indices) =
+        truncate_path_with_indices(relative_path, match_indices, relative_budget);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix, label_style));
+    }
+    push_styled_with_match_indices(&mut spans, &display, &indices, base, match_style);
+    spans
+}
+
+/// Root row in the Explorer's Roots mode. Renders the disambiguated label as a single span;
+/// match indices from the server index into the root's *basename* — which is always the start
+/// of the label under option-B disambiguation — so we can apply them directly to the label
+/// string. Selected row gets the standard NORD2 background, like other pickers.
+fn root_item_spans(
+    path_index: u32,
+    match_indices: &[u32],
+    root_labels: &[String],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let base = Style::default().fg(NORD4).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let label = root_label_or_blank(root_labels, path_index).to_string();
+    let (display, indices) = truncate_path_with_indices(&label, match_indices, max_width);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    push_styled_with_match_indices(&mut spans, &display, &indices, base, match_style);
+    spans
+}
+
+/// Lookup helper: returns `root_labels[idx]` or an empty string when the index is out of bounds
+/// (defensive — shouldn't happen in normal flow but degrades gracefully if the labels lag a
+/// freshly-pushed picker frame).
+fn root_label_or_blank(root_labels: &[String], idx: u32) -> &str {
+    root_labels
+        .get(idx as usize)
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
+/// Push `display` into `spans`, breaking it where `match_indices` (char offsets into `display`)
+/// indicate a match so those chars get `match_style` and everything else gets `base`. Factored
+/// out so the file picker and any future highlighted single-string row can share the same
+/// rendering loop.
+fn push_styled_with_match_indices(
+    spans: &mut Vec<Span<'static>>,
+    display: &str,
+    match_indices: &[u32],
+    base: Style,
+    match_style: Style,
+) {
+    let mut idx_iter = match_indices.iter().copied().peekable();
+    let mut current = String::new();
+    let mut current_is_match = false;
+    for (ci, c) in display.chars().enumerate() {
+        let is_match = idx_iter.peek().copied() == Some(ci as u32);
+        if is_match {
+            idx_iter.next();
+        }
+        if is_match != current_is_match && !current.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut current),
+                if current_is_match { match_style } else { base },
+            ));
+        }
+        current.push(c);
+        current_is_match = is_match;
+    }
+    if !current.is_empty() {
+        spans.push(Span::styled(
+            current,
+            if current_is_match { match_style } else { base },
+        ));
+    }
 }
 
 /// One Grep hit row: indented under the file header, line number left-padded to a small fixed
@@ -786,24 +1325,6 @@ fn truncate_path_with_indices(
         .map(|i| ((i as usize - kept_start_char) + 1) as u32)
         .collect();
     (truncated, new_indices)
-}
-
-/// Strip the longest matching project-path prefix from `abs` and return what's left (or `abs`
-/// unchanged if no project path matches). Returns an empty string when the path *is* a project
-/// root — the caller decides how to render that.
-fn project_relative_path(abs: &str, project_paths: &[String]) -> String {
-    let abs_path = std::path::Path::new(abs);
-    let best = project_paths
-        .iter()
-        .filter_map(|p| {
-            let root = std::path::Path::new(p);
-            abs_path.strip_prefix(root).ok().map(|rel| (root, rel))
-        })
-        .max_by_key(|(root, _)| root.as_os_str().len());
-    match best {
-        Some((_, rel)) => rel.display().to_string(),
-        None => abs.to_string(),
-    }
 }
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
@@ -1314,9 +1835,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![Span::raw(format!(" {}? [y/N]", confirm.message))])
     } else if let Some(prompt) = state.save_prompt.as_ref() {
         // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
-        Line::from(vec![Span::raw(format!(" save as: {}", prompt.input.text))])
-    } else if let Some(prompt) = state.new_file_prompt.as_ref() {
-        Line::from(vec![Span::raw(format!(" new file: {}", prompt.input.text))])
+        Line::from(draw_save_prompt_spans(prompt, state, area.width as usize))
+    } else if !state.has_editor() {
+        // No editor: status row only shows transient feedback (project activation, errors).
+        Line::from(vec![Span::raw(format!(" {}", state.status))])
     } else if matches!(state.ed().mode, EditorMode::Search) {
         let prompt = format!("/{}", state.ed().search.query.text);
         let text = match search_match_count_label(state) {
@@ -1354,6 +1876,105 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     };
     let p = Paragraph::new(line).style(Style::default().bg(NORD1).fg(NORD4));
     f.render_widget(p, area);
+}
+
+/// Display width of the save-prompt's committed root prefix. Only non-zero in multi-root
+/// `Editing` mode (where we render `{label}: ` before the input). In SelectingRoot we show no
+/// label — the input itself carries the typed root filter / cycled-root suggestion. Used by
+/// the terminal-cursor placement to land in sync with the rendered text.
+fn save_prompt_prefix_width(
+    prompt: &crate::save_prompt::SavePromptState,
+    state: &AppState,
+) -> usize {
+    use crate::save_prompt::PromptMode;
+    match &prompt.mode {
+        PromptMode::Editing(e) => {
+            let label = state
+                .root_labels
+                .get(e.path_index as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            if label.is_empty() {
+                0
+            } else {
+                label.width() + ": ".width()
+            }
+        }
+        PromptMode::SelectingRoot(_) => 0,
+    }
+}
+
+/// Build the save-prompt's status-row spans. In multi-root projects we render a blue committed
+/// root label to the left of the input (e.g. `proj_a: `); in single-root we skip it. After the
+/// input, when the prompt has a ghost suggestion to offer (cursor at end, at least one match),
+/// the dim suffix completing the user's partial leaf is appended in gray. A right-aligned
+/// `[N/M]` counter appears when the filtered match set has more than one entry.
+fn draw_save_prompt_spans(
+    prompt: &crate::save_prompt::SavePromptState,
+    state: &AppState,
+    total_width: usize,
+) -> Vec<Span<'static>> {
+    use crate::save_prompt::PromptMode;
+    let base_style = Style::default().bg(NORD1).fg(NORD4);
+    // The committed root prefix (multi-root only) shares the explorer's blue treatment.
+    let prefix_style = Style::default().bg(NORD1).fg(NORD8);
+    // Ghost / suggestion text. We can't use NORD3 — it's only ~17 brightness off NORD1 and
+    // reads as invisible on the status bar. We also can't rely on the `DIM` modifier — some
+    // terminals ignore it for bright foregrounds. So we explicitly pick a mid-tone that's
+    // clearly readable on NORD1 yet plainly dimmer than NORD4.
+    let dim_style = Style::default().bg(NORD1).fg(Color::Rgb(140, 150, 165));
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(" save as: ".to_string(), base_style));
+
+    // Root label, in multi-root projects only. In SelectingRoot mode the label has been peeled
+    // — we show nothing to the left of the input; the input itself carries the typed root-
+    // filter or the cycled-root suggestion.
+    let label_text = match &prompt.mode {
+        PromptMode::Editing(e) => {
+            let label = state
+                .root_labels
+                .get(e.path_index as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            if label.is_empty() {
+                String::new()
+            } else {
+                format!("{label}: ")
+            }
+        }
+        PromptMode::SelectingRoot(_) => String::new(),
+    };
+    let label_w = label_text.width();
+    if !label_text.is_empty() {
+        spans.push(Span::styled(label_text, prefix_style));
+    }
+
+    // The input itself, always in the base (white) style — the user's typed text never gets
+    // dimmed. The committed/uncommitted contrast lives in the prefix (blue) and the ghost
+    // (dim) instead.
+    spans.push(Span::styled(prompt.input.text.clone(), base_style));
+
+    // Ghost suggestion: gray suffix after the cursor when one's available.
+    let ghost = prompt.ghost_suffix(&state.project_paths).unwrap_or_default();
+    let ghost_w = ghost.width();
+    if !ghost.is_empty() {
+        spans.push(Span::styled(ghost, dim_style));
+    }
+
+    // Right-aligned cycle counter (`N/M`) — only meaningful when the user has more than one
+    // candidate to choose between.
+    if let Some((pos, total)) = prompt.cycle_position(&state.project_paths) {
+        let counter = format!("[{pos}/{total}]");
+        let counter_w = counter.width();
+        let used = " save as: ".width() + label_w + prompt.input.text.width() + ghost_w;
+        if used + counter_w + 1 <= total_width {
+            let pad = total_width.saturating_sub(used + counter_w);
+            spans.push(Span::styled(" ".repeat(pad), base_style));
+            spans.push(Span::styled(counter, base_style));
+        }
+    }
+    spans
 }
 
 /// Status-bar indicator for buffer state. Single-character, highest-precedence wins — the
@@ -1463,10 +2084,18 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
 }
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
+    // Settings overlay takes precedence over every other cursor target. We only place the caret
+    // when the input row is focused; on a root row the cursor is hidden (no `set_cursor_position`
+    // call → ratatui hides it for this frame).
+    if let Some(settings) = state.project_settings.as_ref() {
+        if settings.selected == settings.roots.len() {
+            place_settings_input_cursor(f, settings, buffer_area);
+        }
+        return;
+    }
     let ed = state.ed();
     if matches!(ed.mode, EditorMode::Search)
         && state.save_prompt.is_none()
-        && state.new_file_prompt.is_none()
         && !state.picker.open
     {
         // Park the terminal cursor on the status row, just past `/` + the typed query up
@@ -1490,10 +2119,11 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
             let text_x = box_area.x + 2;
             let text_y = box_area.y + 1;
             let text_w = box_area.width.saturating_sub(4);
-            let (_, prefix_w) = explorer_input_prefix(state, text_w as usize);
+            let (label_text, path_text) = explorer_input_prefix(state, text_w as usize);
+            let prefix_w = (label_text.width() + path_text.width()) as u16;
             let typed_w = state.picker.query.width_to_cursor() as u16;
             let col = text_x
-                .saturating_add(prefix_w as u16)
+                .saturating_add(prefix_w)
                 .saturating_add(typed_w.min(text_w.saturating_sub(1)));
             f.set_cursor_position((col, text_y));
         }
@@ -1513,29 +2143,16 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         return;
     }
     if let Some(prompt) = state.save_prompt.as_ref() {
-        const PREFIX: &str = " save as: ";
-        let prefix_w = PREFIX.width() as u16;
+        const PROMPT: &str = " save as: ";
+        let prompt_w = PROMPT.width() as u16;
+        let dir_w = save_prompt_prefix_width(prompt, state) as u16;
         let typed_w = prompt.input.width_to_cursor() as u16;
         let max_col = status_area
             .x
             .saturating_add(status_area.width.saturating_sub(1));
         let col = status_area
             .x
-            .saturating_add(prefix_w.saturating_add(typed_w))
-            .min(max_col);
-        f.set_cursor_position((col, status_area.y));
-        return;
-    }
-    if let Some(prompt) = state.new_file_prompt.as_ref() {
-        const PREFIX: &str = " new file: ";
-        let prefix_w = PREFIX.width() as u16;
-        let typed_w = prompt.input.width_to_cursor() as u16;
-        let max_col = status_area
-            .x
-            .saturating_add(status_area.width.saturating_sub(1));
-        let col = status_area
-            .x
-            .saturating_add(prefix_w.saturating_add(typed_w))
+            .saturating_add(prompt_w.saturating_add(dir_w).saturating_add(typed_w))
             .min(max_col);
         f.set_cursor_position((col, status_area.y));
         return;

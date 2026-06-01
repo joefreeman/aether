@@ -64,3 +64,79 @@ pub struct ProjectInfo {
     pub name: String,
     pub paths: Vec<String>,
 }
+
+/// Create a fresh project with no roots. The client uses the project picker's "create new" row
+/// to invoke this; the server writes an empty-`paths` TOML to
+/// `$XDG_CONFIG_HOME/aether/projects/<name>.toml`, registers the project in memory, and
+/// activates it for the calling client. The follow-up is normally `project/add_root` (via the
+/// project settings overlay, which the TUI auto-opens after create).
+///
+/// Refuses if a project of that name already exists on disk. Name must be non-empty and contain
+/// no path separators.
+pub struct ProjectCreate;
+impl RpcMethod for ProjectCreate {
+    const NAME: &'static str = "project/create";
+    type Params = ProjectCreateParams;
+    type Result = ProjectActivateResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectCreateParams {
+    pub name: String,
+}
+
+/// Add a root path to an existing project. Server canonicalizes the path, refuses duplicates,
+/// updates the TOML, watches the new path for external changes, and invalidates the project's
+/// workspace index (so the next picker open re-walks).
+pub struct ProjectAddRoot;
+impl RpcMethod for ProjectAddRoot {
+    const NAME: &'static str = "project/add_root";
+    type Params = ProjectAddRootParams;
+    type Result = ProjectInfo;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectAddRootParams {
+    /// Project to modify. Doesn't have to be the caller's active project (the TUI only uses it
+    /// for the active project today, but the protocol stays general).
+    pub project: String,
+    /// Path on disk. Must exist and be canonicalizable. Leading `~/` is expanded server-side.
+    pub path: String,
+}
+
+/// Remove a root path from a project. The server closes any file-backed buffers under this root
+/// that aren't covered by another remaining root, and refuses the whole operation if any such
+/// buffer is dirty (with error code `DIRTY_BUFFERS_PREVENT_REMOVE`). Scratch buffers in the
+/// project are unaffected (they have no path and aren't tied to any root).
+///
+/// The `next_buffer_id` field follows the same convention as `buffer/close`: when the client's
+/// currently-displayed buffer is one of the closed ones, attach to this next id (or spawn a
+/// scratch if `None`).
+pub struct ProjectRemoveRoot;
+impl RpcMethod for ProjectRemoveRoot {
+    const NAME: &'static str = "project/remove_root";
+    type Params = ProjectRemoveRootParams;
+    type Result = ProjectRemoveRootResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectRemoveRootParams {
+    pub project: String,
+    /// The root to remove. Server matches against the project's stored canonical paths after
+    /// canonicalizing this value too — so callers can pass either the canonical form (what they
+    /// got back from `ProjectInfo.paths`) or a user-typed equivalent.
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectRemoveRootResult {
+    pub project: ProjectInfo,
+    /// File-backed buffers that were closed as part of this remove. Scratch buffers and buffers
+    /// still covered by other roots are not in this list.
+    #[serde(default)]
+    pub closed_buffer_ids: Vec<crate::BufferId>,
+    /// Buffer for the requesting client to attach to if its current buffer was one of the
+    /// closed ones. `None` means "no buffers left for you in this project — spawn a scratch."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_buffer_id: Option<crate::BufferId>,
+}

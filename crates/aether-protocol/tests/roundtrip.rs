@@ -4,6 +4,9 @@
 
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::{CursorMove, CursorMoveParams, Direction, Motion, WordBoundary};
+use aether_protocol::directory::{
+    DirectoryEntry, DirectoryList, DirectoryListParams, DirectoryListResult,
+};
 use aether_protocol::envelope::{
     ClientInbound, ErrorObject, ErrorResponse, JsonRpc, Notification, NotificationMethod, Request,
     RpcMethod,
@@ -203,6 +206,54 @@ fn method_name_constants() {
     assert_eq!(CursorMove::NAME, "cursor/move");
     assert_eq!(InputText::NAME, "input/text");
     assert_eq!(ViewportLinesChanged::NAME, "viewport/lines_changed");
+    assert_eq!(DirectoryList::NAME, "directory/list");
+}
+
+#[test]
+fn directory_list_params_shape() {
+    let v = to_value(DirectoryListParams {
+        path: "/home/foo/proj/src".into(),
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "path": "/home/foo/proj/src" }));
+}
+
+#[test]
+fn directory_list_result_shape() {
+    let v = to_value(DirectoryListResult {
+        path: "/home/foo/proj/src".into(),
+        parent: Some("/home/foo/proj".into()),
+        entries: vec![
+            DirectoryEntry {
+                name: "lib".into(),
+                is_dir: true,
+            },
+            DirectoryEntry {
+                name: "main.rs".into(),
+                is_dir: false,
+            },
+        ],
+    })
+    .unwrap();
+    assert_eq!(v["path"], "/home/foo/proj/src");
+    assert_eq!(v["parent"], "/home/foo/proj");
+    assert_eq!(v["entries"][0], json!({"name": "lib", "is_dir": true}));
+    assert_eq!(v["entries"][1], json!({"name": "main.rs", "is_dir": false}));
+}
+
+#[test]
+fn directory_list_result_skips_none_parent() {
+    let v = to_value(DirectoryListResult {
+        path: "/proj".into(),
+        parent: None,
+        entries: Vec::new(),
+    })
+    .unwrap();
+    assert!(
+        v.get("parent").is_none(),
+        "parent: None should be skipped on the wire"
+    );
+    assert_eq!(v["entries"], json!([]));
 }
 
 #[test]
@@ -261,6 +312,62 @@ fn project_activate_result_wraps_info() {
 }
 
 #[test]
+fn project_create_params_round_trip() {
+    use aether_protocol::project::{ProjectCreate, ProjectCreateParams};
+    assert_eq!(ProjectCreate::NAME, "project/create");
+    let p = ProjectCreateParams {
+        name: "newproj".into(),
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v, json!({"name": "newproj"}));
+}
+
+#[test]
+fn project_add_root_params_round_trip() {
+    use aether_protocol::project::{ProjectAddRoot, ProjectAddRootParams};
+    assert_eq!(ProjectAddRoot::NAME, "project/add_root");
+    let p = ProjectAddRootParams {
+        project: "aether".into(),
+        path: "~/src/aether".into(),
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v, json!({"project": "aether", "path": "~/src/aether"}));
+}
+
+#[test]
+fn project_remove_root_result_shape() {
+    use aether_protocol::project::{ProjectRemoveRoot, ProjectRemoveRootResult};
+    assert_eq!(ProjectRemoveRoot::NAME, "project/remove_root");
+    let r = ProjectRemoveRootResult {
+        project: ProjectInfo {
+            name: "aether".into(),
+            paths: vec!["/p".into()],
+        },
+        closed_buffer_ids: vec![3, 5],
+        next_buffer_id: Some(7),
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["project"]["name"], "aether");
+    assert_eq!(v["closed_buffer_ids"], json!([3, 5]));
+    assert_eq!(v["next_buffer_id"], 7);
+}
+
+#[test]
+fn project_remove_root_result_skips_none_next_buffer() {
+    use aether_protocol::project::ProjectRemoveRootResult;
+    let r = ProjectRemoveRootResult {
+        project: ProjectInfo {
+            name: "aether".into(),
+            paths: vec![],
+        },
+        closed_buffer_ids: vec![],
+        next_buffer_id: None,
+    };
+    let v = to_value(&r).unwrap();
+    assert!(v.get("next_buffer_id").is_none());
+}
+
+#[test]
 fn project_activate_result_includes_last_buffer_id_when_set() {
     use aether_protocol::project::ProjectActivateResult;
     let r = ProjectActivateResult {
@@ -315,13 +422,19 @@ fn picker_kind_serializes_snake_case() {
 fn picker_item_file_is_tagged() {
     use aether_protocol::picker::PickerItem;
     let item = PickerItem::File {
-        path: "src/main.rs".into(),
+        path_index: 0,
+        relative_path: "src/main.rs".into(),
         match_indices: vec![0, 4],
     };
     let v = to_value(&item).unwrap();
     assert_eq!(
         v,
-        json!({"kind": "file", "path": "src/main.rs", "match_indices": [0, 4]})
+        json!({
+            "kind": "file",
+            "path_index": 0,
+            "relative_path": "src/main.rs",
+            "match_indices": [0, 4],
+        })
     );
 }
 
@@ -336,6 +449,7 @@ fn picker_view_params_omit_center_on_when_none() {
         center_on: None,
         center_on_cursor_grep_hit: None,
         directory_path: None,
+        explorer_roots: false,
     };
     let v = to_value(&p).unwrap();
     assert!(
@@ -355,15 +469,18 @@ fn picker_view_params_center_on_serialized() {
         offset: 0,
         limit: 30,
         center_on: Some(PickerItem::File {
-            path: "x".into(),
+            path_index: 0,
+            relative_path: "x".into(),
             match_indices: vec![],
         }),
         center_on_cursor_grep_hit: None,
         directory_path: None,
+        explorer_roots: false,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["center_on"]["kind"], "file");
-    assert_eq!(v["center_on"]["path"], "x");
+    assert_eq!(v["center_on"]["relative_path"], "x");
+    assert_eq!(v["center_on"]["path_index"], 0);
 }
 
 #[test]
@@ -374,7 +491,8 @@ fn picker_update_round_trips_through_notification() {
         generation: 7,
         offset: 0,
         items: vec![PickerItem::File {
-            path: "a".into(),
+            path_index: 0,
+            relative_path: "a".into(),
             match_indices: vec![0],
         }],
         total_matches: 1,
@@ -390,7 +508,8 @@ fn picker_update_round_trips_through_notification() {
     let v: serde_json::Value = from_str(&s).unwrap();
     assert_eq!(v["method"], "picker/update");
     assert_eq!(v["params"]["generation"], 7);
-    assert_eq!(v["params"]["items"][0]["path"], "a");
+    assert_eq!(v["params"]["items"][0]["relative_path"], "a");
+    assert_eq!(v["params"]["items"][0]["path_index"], 0);
 }
 
 #[test]
@@ -457,7 +576,8 @@ fn picker_kind_grep_is_snake_case() {
 fn picker_item_grep_hit_is_tagged() {
     use aether_protocol::picker::PickerItem;
     let item = PickerItem::GrepHit {
-        path: "src/main.rs".into(),
+        path_index: 0,
+        relative_path: "src/main.rs".into(),
         line: 12,
         col: 4,
         preview: "    let foo = 1;".into(),
@@ -468,7 +588,8 @@ fn picker_item_grep_hit_is_tagged() {
         v,
         json!({
             "kind": "grep_hit",
-            "path": "src/main.rs",
+            "path_index": 0,
+            "relative_path": "src/main.rs",
             "line": 12,
             "col": 4,
             "preview": "    let foo = 1;",
@@ -571,6 +692,7 @@ fn picker_view_params_directory_path_skipped_when_none() {
         center_on: None,
         center_on_cursor_grep_hit: None,
         directory_path: None,
+        explorer_roots: false,
     };
     let v = to_value(&p).unwrap();
     assert!(
@@ -590,6 +712,7 @@ fn picker_view_params_directory_path_serialized() {
         center_on: None,
         center_on_cursor_grep_hit: None,
         directory_path: Some("/home/x/proj/src".into()),
+        explorer_roots: false,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["directory_path"], "/home/x/proj/src");

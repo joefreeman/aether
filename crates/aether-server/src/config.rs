@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 /// Fixed loopback port. Single-instance: only one server can bind it. Clients hard-code this.
 pub const SERVER_PORT: u16 = 2384;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub name: String,
     pub paths: Vec<PathBuf>,
@@ -149,4 +149,26 @@ pub fn canonicalize_project_path(p: &Path) -> anyhow::Result<PathBuf> {
     let expanded = expand_home(p);
     std::fs::canonicalize(&expanded)
         .with_context(|| format!("canonicalizing project path {}", expanded.display()))
+}
+
+/// Write (or overwrite) a project's TOML config. Creates the projects directory if it doesn't
+/// yet exist. Caller is responsible for refusing to overwrite when not desired (see
+/// `project_config_exists`).
+pub fn write_project_config(config: &ProjectConfig) -> anyhow::Result<()> {
+    let path = project_config_path(&config.name)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating projects dir {}", parent.display()))?;
+    }
+    let body = toml::to_string_pretty(config)
+        .with_context(|| format!("serializing project config {}", config.name))?;
+    std::fs::write(&path, body)
+        .with_context(|| format!("writing project config at {}", path.display()))?;
+    Ok(())
+}
+
+/// True if `<projects_dir>/<name>.toml` already exists. Used by `project/create` to refuse
+/// overwriting an existing config.
+pub fn project_config_exists(name: &str) -> anyhow::Result<bool> {
+    Ok(project_config_path(name)?.exists())
 }

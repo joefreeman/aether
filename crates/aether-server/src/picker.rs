@@ -57,9 +57,11 @@ pub struct ExplorerCandidates {
 /// the order ripgrep emitted them — walker order, then line order within each file.
 #[derive(Debug, Clone)]
 pub struct GrepHitCandidate {
-    /// Project-relative display path. Stored separately from `abs` so the picker can render
-    /// without re-resolving against project roots on every push.
-    pub display_path: String,
+    /// Index into the project's root list this file lives under.
+    pub path_index: u32,
+    /// Path relative to `roots[path_index]`. Stored separately from `abs_path` so the picker can
+    /// render without re-resolving against project roots on every push.
+    pub relative_path: String,
     /// Absolute canonical path. Returned via `PickerSelectResult::FileAt` for the client to feed
     /// into `buffer/open`.
     pub abs_path: String,
@@ -108,9 +110,23 @@ pub enum PickerCandidates {
     /// Filesystem entries of the picker's current directory. Re-listed on every `picker/view`
     /// (directories can mutate underneath us; no point caching).
     Explorer(ExplorerCandidates),
+    /// The project's roots, shown by the Explorer when the client requests Roots mode (via
+    /// `picker/view { explorer_roots: true }`). One row per root; selecting one transitions the
+    /// explorer back into `Explorer` mode at that root's top.
+    ExplorerRoots(Vec<RootCandidate>),
     /// Configured project names. Re-listed on each `picker/view` — small N, no caching needed,
     /// and the user may have edited `~/.config/aether/projects/` between opens.
     Projects(Vec<ProjectCandidate>),
+}
+
+/// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
+/// select; `basename` is the matcher haystack (the disambiguator the client shows alongside is
+/// derived client-side from `path_index` + the project's root list).
+#[derive(Debug, Clone)]
+pub struct RootCandidate {
+    pub path_index: u32,
+    pub absolute_path: String,
+    pub basename: String,
 }
 
 impl PickerCandidates {
@@ -120,6 +136,7 @@ impl PickerCandidates {
             PickerCandidates::Buffers(v) => v.len(),
             PickerCandidates::Grep(v) => v.len(),
             PickerCandidates::Explorer(e) => e.entries.len(),
+            PickerCandidates::ExplorerRoots(v) => v.len(),
             PickerCandidates::Projects(v) => v.len(),
         }
     }
@@ -130,18 +147,22 @@ impl PickerCandidates {
             PickerCandidates::Buffers(_) => PickerKind::Buffers,
             PickerCandidates::Grep(_) => PickerKind::Grep,
             PickerCandidates::Explorer(_) => PickerKind::Explorer,
+            PickerCandidates::ExplorerRoots(_) => PickerKind::Explorer,
             PickerCandidates::Projects(_) => PickerKind::Projects,
         }
     }
 
-    /// Haystack string used for fuzzy matching at index `idx`. For Grep this is the preview but
+    /// Haystack string used for fuzzy matching at index `idx`. For Files this is the relative
+    /// path alone — root identity is *not* part of the fuzzy match (the user disambiguates roots
+    /// via the explorer's Roots mode, not the fuzzy filter). For Grep this is the preview but
     /// it's only consulted by the fuzzy matcher, which we skip for Grep.
     pub fn display_at(&self, idx: usize) -> &str {
         match self {
-            PickerCandidates::Files(v) => &v[idx].display,
+            PickerCandidates::Files(v) => &v[idx].relative_path,
             PickerCandidates::Buffers(v) => &v[idx].display,
             PickerCandidates::Grep(v) => &v[idx].preview,
             PickerCandidates::Explorer(e) => &e.entries[idx].name,
+            PickerCandidates::ExplorerRoots(v) => &v[idx].basename,
             PickerCandidates::Projects(v) => &v[idx].name,
         }
     }
@@ -152,7 +173,8 @@ impl PickerCandidates {
     pub fn make_item(&self, idx: usize, match_indices: Vec<u32>) -> PickerItem {
         match self {
             PickerCandidates::Files(v) => PickerItem::File {
-                path: v[idx].display.clone(),
+                path_index: v[idx].path_index,
+                relative_path: v[idx].relative_path.clone(),
                 match_indices,
             },
             PickerCandidates::Buffers(v) => {
@@ -167,7 +189,8 @@ impl PickerCandidates {
             PickerCandidates::Grep(v) => {
                 let c = &v[idx];
                 PickerItem::GrepHit {
-                    path: c.display_path.clone(),
+                    path_index: c.path_index,
+                    relative_path: c.relative_path.clone(),
                     line: c.line,
                     col: c.col,
                     preview: c.preview.clone(),
@@ -182,6 +205,10 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::ExplorerRoots(v) => PickerItem::Root {
+                path_index: v[idx].path_index,
+                match_indices,
+            },
             PickerCandidates::Projects(v) => PickerItem::Project {
                 name: v[idx].name.clone(),
                 match_indices,
@@ -193,22 +220,39 @@ impl PickerCandidates {
     /// Used by `view { center_on }` and `select` to round-trip an item to its candidate slot.
     pub fn position_of(&self, item: &PickerItem) -> Option<usize> {
         match (self, item) {
-            (PickerCandidates::Files(v), PickerItem::File { path, .. }) => {
-                v.iter().position(|c| c.display == *path)
-            }
+            (
+                PickerCandidates::Files(v),
+                PickerItem::File {
+                    path_index,
+                    relative_path,
+                    ..
+                },
+            ) => v
+                .iter()
+                .position(|c| c.path_index == *path_index && c.relative_path == *relative_path),
             (PickerCandidates::Buffers(v), PickerItem::Buffer { buffer_id, .. }) => {
                 v.iter().position(|c| c.buffer_id == *buffer_id)
             }
             (
                 PickerCandidates::Grep(v),
                 PickerItem::GrepHit {
-                    path, line, col, ..
+                    path_index,
+                    relative_path,
+                    line,
+                    col,
+                    ..
                 },
-            ) => v
-                .iter()
-                .position(|c| c.display_path == *path && c.line == *line && c.col == *col),
+            ) => v.iter().position(|c| {
+                c.path_index == *path_index
+                    && c.relative_path == *relative_path
+                    && c.line == *line
+                    && c.col == *col
+            }),
             (PickerCandidates::Explorer(e), PickerItem::DirEntry { name, .. }) => {
                 e.entries.iter().position(|c| c.name == *name)
+            }
+            (PickerCandidates::ExplorerRoots(v), PickerItem::Root { path_index, .. }) => {
+                v.iter().position(|c| c.path_index == *path_index)
             }
             (PickerCandidates::Projects(v), PickerItem::Project { name, .. }) => {
                 v.iter().position(|c| c.name == *name)
@@ -225,7 +269,9 @@ impl PickerCandidates {
             PickerCandidates::Files(_)
             | PickerCandidates::Buffers(_)
             | PickerCandidates::Projects(_) => MatchStrategy::Fuzzy,
-            PickerCandidates::Explorer(_) => MatchStrategy::PrefixSmartcase,
+            PickerCandidates::Explorer(_) | PickerCandidates::ExplorerRoots(_) => {
+                MatchStrategy::PrefixSmartcase
+            }
             // Grep's candidates *are* the matches (ripgrep already filtered + ordered them),
             // so query changes don't re-rank — they trigger a fresh walk elsewhere.
             PickerCandidates::Grep(_) => MatchStrategy::Preserved,
@@ -265,6 +311,9 @@ impl PickerCandidates {
                     Some(PickerSelectResult::File { path: abs })
                 }
             }
+            // Roots are always "navigate, don't select" — the client looks up the root's
+            // absolute path from its project_paths and fires `picker/view` to enter it.
+            PickerCandidates::ExplorerRoots(_) => None,
             PickerCandidates::Projects(v) => Some(PickerSelectResult::Project {
                 name: v[idx].name.clone(),
             }),

@@ -60,10 +60,15 @@ impl PickerKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PickerItem {
-    /// A file from the workspace walk. `path` is project-relative (forward-slash separated).
+    /// A file from the workspace walk. `relative_path` is path-relative to the root at
+    /// `path_index` in the project's root list. The client formats the row by joining its own
+    /// disambiguated root label with the relative path; the server stays out of presentation.
     File {
-        path: String,
-        /// Indices into `path` (char offsets) covered by fuzzy matches. Empty on empty query.
+        path_index: u32,
+        relative_path: String,
+        /// Indices into `relative_path` (char offsets) covered by fuzzy matches. Empty on empty
+        /// query. Note that the matcher haystack is `relative_path` alone — root labels are not
+        /// part of the fuzzy match.
         #[serde(default)]
         match_indices: Vec<u32>,
     },
@@ -80,12 +85,15 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
-    /// One match found by the grep picker. Identity is `(path, line, col)`. One row per match
-    /// (a line with N matches produces N hits) — keeps `match_indices` a flat list within the
-    /// preview, same as the other variants.
+    /// One match found by the grep picker. Identity is `(path_index, relative_path, line, col)`.
+    /// One row per match (a line with N matches produces N hits) — keeps `match_indices` a flat
+    /// list within the preview, same as the other variants.
     GrepHit {
-        /// Project-relative path of the file the match lives in (forward-slash separated).
-        path: String,
+        /// Index into the project's root list — pairs with `relative_path` to recover the
+        /// absolute path.
+        path_index: u32,
+        /// Path relative to root `path_index` (forward-slash separated).
+        relative_path: String,
         /// 0-based line number within the file.
         line: u32,
         /// 0-based byte offset of the match's first byte within the line.
@@ -115,6 +123,15 @@ pub enum PickerItem {
         /// "Enter / Alt-l enters directory" vs. "Enter opens file" routing.
         is_dir: bool,
         /// Char offsets into `name` covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One of the project's roots, shown in the Explorer's Roots mode (entered by `Alt-Backspace`
+    /// at the top of a root). Identity is `path_index`; the client knows the absolute path via
+    /// its own copy of `project_paths`. Match indices index into the root's basename — the
+    /// disambiguator is client-derived and not part of the haystack.
+    Root {
+        path_index: u32,
         #[serde(default)]
         match_indices: Vec<u32>,
     },
@@ -162,9 +179,18 @@ pub struct PickerViewParams {
     pub center_on_cursor_grep_hit: Option<BufferId>,
     /// Explorer only: absolute path of the directory to list. `None` means "keep whatever
     /// directory the picker last listed; default to the first project root on first open".
-    /// Ignored for other kinds.
+    /// Ignored when `explorer_roots` is set, and for other kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_path: Option<String>,
+    /// Explorer only: when true, list the project's roots instead of a filesystem directory.
+    /// Wins over `directory_path` when both are set. The client uses this to enter "Roots
+    /// mode" by pressing `Alt-Backspace` at the top of a root.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explorer_roots: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Serialize, Deserialize)]

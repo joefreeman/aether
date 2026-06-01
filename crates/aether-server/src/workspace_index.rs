@@ -11,41 +11,55 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Format an absolute path as the picker display string: project-relative, prefixed with the
-/// root's basename for multi-root projects. Returns `None` if `abs` is outside every root —
-/// callers should treat that as "no display available" rather than fall back to the absolute
-/// path, since that would be inconsistent with the file walker's output.
+/// Resolve `abs` to `(root_index, relative_path)` against the project's roots. Returns `None`
+/// when `abs` is outside every root. The relative path uses forward slashes — UTF-8 only, which
+/// matches every other place we ferry paths over the wire.
 ///
-/// Kept here so the file walker and the buffer-picker candidate builder produce identical
-/// display strings for the same on-disk file.
-pub fn project_relative_display(abs: &Path, roots: &[PathBuf]) -> Option<String> {
-    let multi_root = roots.len() > 1;
-    for root in roots {
-        let root_name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
+/// Kept here so the file walker and the buffer-picker candidate builder agree on the shape they
+/// hand to the picker for the same on-disk file.
+pub fn project_relative_parts(abs: &Path, roots: &[PathBuf]) -> Option<(u32, String)> {
+    for (i, root) in roots.iter().enumerate() {
         if abs == root {
-            return Some(root_name.to_string());
+            return Some((i as u32, String::new()));
         }
         if let Ok(rel) = abs.strip_prefix(root) {
-            let rel = rel.to_str()?;
-            return Some(if multi_root && !root_name.is_empty() {
-                format!("{root_name}/{rel}")
-            } else {
-                rel.to_string()
-            });
+            return Some((i as u32, rel.to_str()?.to_string()));
         }
     }
     None
 }
 
-/// One file found by the workspace walk.
+/// Legacy multi-root display string used by the Buffers picker (its protocol still sends a
+/// flattened `display`, unlike Files/Grep which now ferry `path_index` + `relative_path`). For
+/// multi-root projects, prefixes with the root's basename so two roots' `lib.rs`es don't
+/// collide visually; for single-root, returns the bare relative path. Returns `None` if `abs`
+/// is outside every root.
+pub fn project_relative_display(abs: &Path, roots: &[PathBuf]) -> Option<String> {
+    let (idx, rel) = project_relative_parts(abs, roots)?;
+    let root = &roots[idx as usize];
+    let root_name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if rel.is_empty() {
+        return Some(root_name.to_string());
+    }
+    if roots.len() > 1 && !root_name.is_empty() {
+        Some(format!("{root_name}/{rel}"))
+    } else {
+        Some(rel)
+    }
+}
+
+/// One file found by the workspace walk. Stores the root index + relative path separately so
+/// the client can format the row with its own (disambiguated) root label. The matcher haystack
+/// is `relative_path` alone — root identity is not part of the fuzzy match.
 #[derive(Debug, Clone)]
 pub struct CachedFile {
     /// Canonical absolute path on disk. The `picker/select` action returns this.
     pub abs: String,
-    /// Display string used for both rendering and fuzzy matching. Project-relative; for
-    /// multi-root projects, prefixed with the root's last path component so two roots'
-    /// `lib.rs`es don't collide visually.
-    pub display: String,
+    /// Index into the project's root list this file lives under.
+    pub path_index: u32,
+    /// Path relative to `roots[path_index]`, forward-slash separated. Used as both the picker
+    /// row's display tail and the matcher haystack.
+    pub relative_path: String,
 }
 
 pub struct WorkspaceIndex {
@@ -94,26 +108,18 @@ impl WorkspaceIndex {
 }
 
 fn walk(roots: &[PathBuf]) -> Vec<CachedFile> {
-    let multi_root = roots.len() > 1;
     let mut out: Vec<CachedFile> = Vec::new();
 
-    for root in roots {
-        let root_name = root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
+    for (path_index, root) in roots.iter().enumerate() {
+        let path_index = path_index as u32;
+        let root_basename = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
         if root.is_file() {
             if let Some(abs) = root.to_str() {
-                let display = if multi_root && !root_name.is_empty() {
-                    root_name.clone()
-                } else {
-                    root_name.clone()
-                };
                 out.push(CachedFile {
                     abs: abs.to_string(),
-                    display,
+                    path_index,
+                    relative_path: root_basename.to_string(),
                 });
             }
             continue;
@@ -137,23 +143,24 @@ fn walk(roots: &[PathBuf]) -> Vec<CachedFile> {
             let Some(abs) = abs_path.to_str() else {
                 continue;
             };
-            let rel = abs_path
-                .strip_prefix(root)
-                .ok()
-                .and_then(|p| p.to_str())
-                .unwrap_or(abs);
-            let display = if multi_root && !root_name.is_empty() {
-                format!("{root_name}/{rel}")
-            } else {
-                rel.to_string()
+            let Some(rel) = abs_path.strip_prefix(root).ok().and_then(|p| p.to_str()) else {
+                continue;
             };
             out.push(CachedFile {
                 abs: abs.to_string(),
-                display,
+                path_index,
+                relative_path: rel.to_string(),
             });
         }
     }
 
-    out.sort_by(|a, b| a.display.cmp(&b.display));
+    // Sort by (path_index, relative_path) so rows for the same root cluster together. The
+    // matcher then ranks within the haystack-by-relative-path; this just makes the empty-query
+    // initial view deterministic and groupable.
+    out.sort_by(|a, b| {
+        a.path_index
+            .cmp(&b.path_index)
+            .then_with(|| a.relative_path.cmp(&b.relative_path))
+    });
     out
 }

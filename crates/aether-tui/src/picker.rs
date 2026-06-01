@@ -72,6 +72,12 @@ pub struct PickerState {
     /// a project root (Alt-h is then a no-op). Carried alongside `explorer_dir` for the same
     /// reasons.
     pub explorer_parent: Option<String>,
+    /// Projects-picker only. When `Some(idx)`, `items[idx]` is a *synthetic* row added
+    /// client-side to offer "create a new project named <query>" — it isn't part of the
+    /// server's candidate set. Selecting it routes through `project/create` instead of
+    /// `picker/select`. `None` when no synthetic row is present (kind isn't Projects, query is
+    /// empty, or an existing project matches the query exactly).
+    pub synthetic_create_idx: Option<usize>,
 }
 
 impl PickerState {
@@ -148,7 +154,49 @@ impl PickerState {
                 self.resume_row_offset = None;
             }
         }
+        self.recompute_synthetic_create_row();
         true
+    }
+
+    /// Recompute the synthetic "create new project" row for the Projects picker. Called after
+    /// any change to `items` or `query`. Appends a row labeled `+ create "<query>"` to `items`
+    /// when the query is non-empty and doesn't exactly match a real project name. Idempotent:
+    /// strips any prior synthetic row first.
+    pub fn recompute_synthetic_create_row(&mut self) {
+        // Strip prior synthetic row if present.
+        if let Some(idx) = self.synthetic_create_idx.take() {
+            if idx < self.items.len() {
+                self.items.remove(idx);
+            }
+        }
+        if self.kind != Some(PickerKind::Projects) {
+            return;
+        }
+        let q = self.query.text.trim();
+        if q.is_empty() {
+            return;
+        }
+        let already_exists = self.items.iter().any(|item| match item {
+            PickerItem::Project { name, .. } => name == q,
+            _ => false,
+        });
+        if already_exists {
+            return;
+        }
+        let synthetic = PickerItem::Project {
+            name: format!("+ create \"{q}\""),
+            match_indices: Vec::new(),
+        };
+        let idx = self.items.len();
+        self.items.push(synthetic);
+        self.synthetic_create_idx = Some(idx);
+    }
+
+    /// True if the highlighted row is the synthetic "create" row (the Projects picker's
+    /// "create new project" affordance). The selector uses this to route to `project/create`
+    /// instead of the normal `picker/select` flow.
+    pub fn highlighted_is_synthetic_create(&self) -> bool {
+        Some(self.selected) == self.synthetic_create_idx
     }
 
     /// The item currently under the highlight, if any.
@@ -165,25 +213,49 @@ impl PickerState {
 /// inside one directory listing, which is exactly the lifetime resume needs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ItemKey<'a> {
-    File(&'a str),
+    File {
+        path_index: u32,
+        relative_path: &'a str,
+    },
     Buffer(aether_protocol::BufferId),
-    Grep { path: &'a str, line: u32, col: u32 },
+    Grep {
+        path_index: u32,
+        relative_path: &'a str,
+        line: u32,
+        col: u32,
+    },
     DirEntry(&'a str),
     Project(&'a str),
+    Root { path_index: u32 },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
     match item {
-        PickerItem::File { path, .. } => ItemKey::File(path.as_str()),
+        PickerItem::File {
+            path_index,
+            relative_path,
+            ..
+        } => ItemKey::File {
+            path_index: *path_index,
+            relative_path: relative_path.as_str(),
+        },
         PickerItem::Buffer { buffer_id, .. } => ItemKey::Buffer(*buffer_id),
         PickerItem::GrepHit {
-            path, line, col, ..
+            path_index,
+            relative_path,
+            line,
+            col,
+            ..
         } => ItemKey::Grep {
-            path: path.as_str(),
+            path_index: *path_index,
+            relative_path: relative_path.as_str(),
             line: *line,
             col: *col,
         },
         PickerItem::DirEntry { name, .. } => ItemKey::DirEntry(name.as_str()),
         PickerItem::Project { name, .. } => ItemKey::Project(name.as_str()),
+        PickerItem::Root { path_index, .. } => ItemKey::Root {
+            path_index: *path_index,
+        },
     }
 }

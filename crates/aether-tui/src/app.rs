@@ -40,7 +40,7 @@ use aether_protocol::viewport::{
     WrapMode,
 };
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -126,6 +126,11 @@ pub struct AppState {
     pub project_name: String,
     /// Active project's root paths (absolute, server-canonical). Empty before activation.
     pub project_paths: Vec<String>,
+    /// One disambiguated label per entry in `project_paths`, aligned by index. Computed by
+    /// `labels::root_labels` and refreshed via `refresh_root_labels` whenever `project_paths`
+    /// changes. Used for UI rendering (status bar, picker prefixes, explorer breadcrumb) — the
+    /// protocol is unaware.
+    pub root_labels: Vec<String>,
     pub viewport_cols: u32,
     pub viewport_rows: u32,
     pub should_quit: bool,
@@ -139,10 +144,6 @@ pub struct AppState {
     pub picker: crate::picker::PickerState,
     /// Active save-as prompt. Overlays on top of the buffer; bound to the active editor.
     pub save_prompt: Option<SavePromptState>,
-    /// Active "new file" prompt opened by `Space n`. Pre-filled with the current directory so
-    /// the user just types the filename to append. Commits via `create_if_missing`, leaving the
-    /// new buffer attached.
-    pub new_file_prompt: Option<NewFilePromptState>,
     /// Active binary y/N confirmation prompt. Layers on top of any other overlay (including
     /// `save_prompt`, e.g. for the save-as overwrite confirm). Holds the question text and the
     /// action to run on `y`.
@@ -151,6 +152,34 @@ pub struct AppState {
     /// early-return without touching state in that case; the no-project view (project picker)
     /// is rendered instead by `ui::draw`.
     pub editor: Option<EditorState>,
+    /// Active project-settings overlay (`Space ,`). When `Some`, draws a centered modal listing
+    /// the project's roots, with a permanent add-root input row at the bottom. Closed by Esc.
+    pub project_settings: Option<ProjectSettingsState>,
+}
+
+/// Project-settings overlay. Shows the active project's roots plus an always-present "add root"
+/// input row at the bottom; `selected` is the row highlight. Source of truth for `roots` is the
+/// server (synced via `sync_project_paths`).
+///
+/// Selection model: `selected` indexes `roots` when `< roots.len()`; the special value
+/// `roots.len()` selects the input row. The input row is always reachable, which is why we focus
+/// it on open — most overlay opens are to add a root.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectSettingsState {
+    pub project_name: String,
+    pub roots: Vec<String>,
+    pub selected: usize,
+    /// Text being typed into the add-root input row.
+    pub add_input: crate::text_input::TextInput,
+    /// In-dialog error from the last add or remove attempt. Rendered as the bottom line of the
+    /// overlay. Cleared when the user edits `add_input` or initiates another action.
+    pub error: Option<String>,
+    /// `true` when a delete is awaiting confirmation on the currently-selected root row. The row
+    /// renders as `remove "<path>"? [y/N]`; key handling is restricted to confirm/cancel until
+    /// resolved (so a stray arrow press can't silently drop the pending state). The pending row
+    /// is always `selected` — there's no separate index because navigation is locked while this
+    /// is set.
+    pub pending_delete: bool,
 }
 
 /// Generic `[y/N]` confirmation overlay. The save-as overwrite confirm and the close-with-
@@ -165,8 +194,8 @@ pub struct ConfirmPrompt {
 
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
-    /// Retry the save-as RPC with `overwrite: true`. The path is read from
-    /// `state.save_prompt.input.text` (the save-prompt stays open beneath the confirm), so
+    /// Retry the save-as RPC with `overwrite: true`. The path is read from the open save-prompt
+    /// (via `SavePromptState::save_target`) — the prompt stays open beneath the confirm — so
     /// nothing is carried in this variant.
     OverwriteSaveAs,
     /// Close `buffer_id` despite it being dirty. After closing, the client picks the next
@@ -229,18 +258,15 @@ pub struct EditorState {
     pub file_label: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct SavePromptState {
-    pub input: crate::text_input::TextInput,
-}
+pub use crate::save_prompt::SavePromptState;
 
-#[derive(Debug, Clone)]
-pub struct NewFilePromptState {
-    pub input: crate::text_input::TextInput,
-    /// The project root the typed path is relative to. Captured at prompt-open from the current
-    /// file's containing root (or first root, when nothing is open). On commit we send this to
-    /// the server alongside the typed relative path.
-    pub path_index: u32,
+impl EditorState {
+    /// Mirror of the status bar's dirty indicator. `true` when the buffer has unsaved local
+    /// changes (`revision != saved_revision`) or the server flagged it as externally-changed
+    /// in a way the user needs to address.
+    pub fn dirty_marker_visible(&self) -> bool {
+        self.revision != self.saved_revision || self.externally_modified || self.externally_deleted
+    }
 }
 
 impl AppState {
@@ -296,23 +322,26 @@ pub async fn bootstrap(
     let project_paths = activated.project.paths.clone();
 
     // Classify the file arg: file → open it; directory → open scratch + auto-show the Explorer
-    // popup pointed at that directory; missing → open scratch with no Explorer.
-    let (open_file, explorer_dir): (Option<String>, Option<String>) = match file {
+    // popup pointed at that directory; outside every project root → error. Relative paths are
+    // resolved against the *current working directory* (shell-conventional), not blindly joined
+    // with root 0 — in a multi-root project the user may well be in a sub-tree of root 1.
+    let (open_file, explorer_dir): (Option<(u32, String)>, Option<String>) = match file {
         None => (None, None),
         Some(f) => {
-            let raw = std::path::Path::new(f);
-            let abs = if raw.is_absolute() {
-                raw.to_path_buf()
-            } else {
-                project_paths
-                    .first()
-                    .map(|root| std::path::Path::new(root).join(raw))
-                    .unwrap_or_else(|| raw.to_path_buf())
-            };
+            let abs = resolve_cli_path(f)?;
             if abs.is_dir() {
                 (None, Some(abs.display().to_string()))
             } else {
-                (Some(f.to_string()), None)
+                let abs_str = abs.display().to_string();
+                let (path_index, relative_path) = strip_longest_root(&abs_str, &project_paths)
+                    .map(|(i, r)| (i as u32, r))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{} is outside the project's roots",
+                            abs.display()
+                        )
+                    })?;
+                (Some((path_index, relative_path)), None)
             }
         }
     };
@@ -322,17 +351,19 @@ pub async fn bootstrap(
     //   2. No file arg + the project has a most-recent buffer (from a prior session) → attach
     //      to that buffer rather than spawning a fresh scratch every launch.
     //   3. Otherwise → fresh scratch.
-    let editor = match open_file.as_deref() {
-        Some(f) => {
+    let root_labels = crate::labels::root_labels(&project_paths);
+    let editor = match open_file {
+        Some((path_index, relative_path)) => {
             open_buffer_and_subscribe(
                 client,
                 viewport_cols,
                 viewport_rows,
                 &project_paths,
+                &root_labels,
                 aether_protocol::buffer::BufferOpenParams {
                     buffer_id: None,
-                    path_index: Some(0),
-                    relative_path: Some(f.into()),
+                    path_index: Some(path_index),
+                    relative_path: Some(relative_path),
                     language: None,
                     create_if_missing: false,
                     jump_to: None,
@@ -346,6 +377,7 @@ pub async fn bootstrap(
                 viewport_cols,
                 viewport_rows,
                 &project_paths,
+                &root_labels,
                 aether_protocol::buffer::BufferOpenParams {
                     buffer_id: activated.last_buffer_id,
                     path_index: None,
@@ -362,6 +394,7 @@ pub async fn bootstrap(
     let mut state = AppState {
         project_name: activated.project.name,
         project_paths,
+        root_labels,
         viewport_cols,
         viewport_rows,
         should_quit: false,
@@ -370,9 +403,9 @@ pub async fn bootstrap(
         pending_leader: None,
         picker: crate::picker::PickerState::default(),
         save_prompt: None,
-        new_file_prompt: None,
         confirm_prompt: None,
         editor: Some(editor),
+        project_settings: None,
     };
 
     // Seed the Explorer picker's remembered directory before the auto-open so it lists the
@@ -394,6 +427,7 @@ fn empty_app_state(viewport_cols: u32, viewport_rows: u32) -> AppState {
     AppState {
         project_name: String::new(),
         project_paths: Vec::new(),
+        root_labels: Vec::new(),
         viewport_cols,
         viewport_rows,
         should_quit: false,
@@ -402,9 +436,9 @@ fn empty_app_state(viewport_cols: u32, viewport_rows: u32) -> AppState {
         pending_leader: None,
         picker: crate::picker::PickerState::default(),
         save_prompt: None,
-        new_file_prompt: None,
         confirm_prompt: None,
         editor: None,
+        project_settings: None,
     }
 }
 
@@ -437,6 +471,7 @@ async fn activate_project_and_rebuild_editor(
         .await?;
     state.project_name = activated.project.name;
     state.project_paths = activated.project.paths;
+    refresh_root_labels(state);
 
     // Reattach to the last buffer the user had open in this project, if any. The server's MRU
     // survives project switches, so coming back to a project drops you on the buffer you left.
@@ -449,11 +484,14 @@ async fn activate_project_and_rebuild_editor(
         create_if_missing: false,
         jump_to: None,
     };
+    let project_paths = state.project_paths.clone();
+    let root_labels = state.root_labels.clone();
     let editor = open_buffer_and_subscribe(
         client,
         state.viewport_cols,
         state.viewport_rows,
-        &state.project_paths,
+        &project_paths,
+        &root_labels,
         open_params,
     )
     .await?;
@@ -470,6 +508,7 @@ async fn open_buffer_and_subscribe(
     viewport_cols: u32,
     viewport_rows: u32,
     project_paths: &[String],
+    root_labels: &[String],
     open_params: aether_protocol::buffer::BufferOpenParams,
 ) -> Result<EditorState> {
     let open: BufferOpenResult = client
@@ -480,6 +519,7 @@ async fn open_buffer_and_subscribe(
         viewport_cols,
         viewport_rows,
         project_paths,
+        root_labels,
         open,
         WrapMode::Soft,
     )
@@ -495,6 +535,7 @@ async fn build_editor_state_from_open(
     viewport_cols: u32,
     viewport_rows: u32,
     project_paths: &[String],
+    root_labels: &[String],
     open: BufferOpenResult,
     wrap: WrapMode,
 ) -> Result<EditorState> {
@@ -523,7 +564,7 @@ async fn build_editor_state_from_open(
         })
         .await?;
     let file_label = match open.path.as_deref() {
-        Some(p) => project_relative_label(p, project_paths),
+        Some(p) => project_relative_label(p, project_paths, root_labels),
         None => format!("[scratch {}]", open.buffer_id),
     };
     Ok(EditorState {
@@ -626,8 +667,8 @@ fn apply_cursor_style(state: &AppState) {
     // overlay, fall back to the bar — there's nothing for the block cursor to sit on.
     let style = if state.picker.open
         || state.save_prompt.is_some()
-        || state.new_file_prompt.is_some()
         || state.confirm_prompt.is_some()
+        || state.project_settings.is_some()
         || !state.has_editor()
     {
         SetCursorStyle::SteadyBar
@@ -736,6 +777,17 @@ fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
 }
 
 async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> Result<()> {
+    // Project-settings overlay (and its add-root sub-prompt) take priority over everything
+    // else — they're modal and can be reached from both the editor view and the no-editor
+    // view, so route them up here before any has_editor branching.
+    if let Event::Key(k) = &ev {
+        if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat {
+            if state.project_settings.is_some() {
+                return handle_project_settings_key(client, state, *k).await;
+            }
+        }
+    }
+
     // No active editor: route through whichever overlay is on top, otherwise allow Space-leader
     // chords that don't need an editor (Space p / Space q) plus Ctrl-c. The full Normal-mode
     // keymap is gated behind `has_editor` because most bindings (motions, edits, save, etc.)
@@ -782,8 +834,6 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
                 handle_confirm_prompt_key(client, state, k).await?;
             } else if state.save_prompt.is_some() {
                 handle_save_prompt_key(client, state, k).await?;
-            } else if state.new_file_prompt.is_some() {
-                handle_new_file_prompt_key(client, state, k).await?;
             } else if state.picker.open {
                 handle_picker_key(client, state, k).await?;
             } else {
@@ -1536,6 +1586,13 @@ async fn handle_leader_key(
         (PendingLeader::Space, KeyCode::Char('p'), m) if m == KeyModifiers::NONE => {
             open_picker(client, state, PickerKind::Projects).await?;
         }
+        // `Space ,` — open the project settings overlay. Lists the active project's roots;
+        // `a` adds, `d` removes. Only meaningful when a project is active.
+        (PendingLeader::Space, KeyCode::Char(','), m) if m == KeyModifiers::NONE => {
+            if !state.project_name.is_empty() {
+                open_project_settings(state);
+            }
+        }
         // ---- app-level meta actions ----
         // These used to live under Ctrl-, but `Ctrl` is reserved for buffer-content edits.
         // Quit / close buffer / save / save-as / new file / new scratch all sit under `Space`.
@@ -1549,7 +1606,7 @@ async fn handle_leader_key(
             save_buffer(client, state).await?;
         }
         (PendingLeader::Space, KeyCode::Char('s'), m) if m == alt_only => {
-            begin_save_prompt(state);
+            begin_save_prompt(client, state).await?;
         }
         // `Space r` — reload the current buffer from disk. Discards local changes; used to
         // pick up an external modification (paired with the `[!]` indicator and the save
@@ -1557,14 +1614,12 @@ async fn handle_leader_key(
         (PendingLeader::Space, KeyCode::Char('r'), m) if m == KeyModifiers::NONE => {
             reload_buffer(client, state).await?;
         }
-        // `Space n` — open a "new file" prompt pre-filled with the current directory. Same
-        // current-directory rule as `-` (file browser entry): parent of the current file, or
-        // the first project root when there's no current file.
+        // `Space n` — spawn a fresh scratch buffer. The path is chosen at save time via the
+        // save-as prompt (which handles roots / parent dirs / mkdir -p), so we don't ask up
+        // front. Replaces the older two-chord setup (`Space n` opening a new-file prompt and
+        // `Space Alt-n` for scratch) — the prompt's pre-fill never really earned its keep over
+        // "just save-as when you're ready".
         (PendingLeader::Space, KeyCode::Char('n'), m) if m == KeyModifiers::NONE => {
-            begin_new_file_prompt(state);
-        }
-        // `Space Alt-n` — fresh scratch buffer.
-        (PendingLeader::Space, KeyCode::Char('n'), m) if m == alt_only => {
             new_scratch(client, state).await?;
         }
         // Esc or any other key cancels the chord without further action.
@@ -1638,6 +1693,7 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
             center_on: center_on.clone(),
             center_on_cursor_grep_hit,
             directory_path: explorer_path_for_view,
+            explorer_roots: false,
         })
         .await?;
     // For grep, prefer the active buffer's search query as the input prefill. The server already
@@ -1742,6 +1798,41 @@ fn explorer_leaving_name(state: &AppState) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Switch the Explorer picker into Roots mode: one row per project root, with the disambiguated
+/// label rendered client-side. Resets query / highlight / scroll like `picker_navigate_to_dir`.
+/// Clears `explorer_dir` and `explorer_parent` so the next Alt-Backspace recognises "we're
+/// already in Roots" and becomes a no-op.
+async fn picker_enter_roots_mode(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let limit = state.picker.limit.max(1);
+    let view = client
+        .rpc::<PickerView>(PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            explorer_roots: true,
+        })
+        .await?;
+    state.picker.query.clear();
+    state.picker.generation = view.generation;
+    state.picker.offset = view.effective_offset;
+    state.picker.items.clear();
+    state.picker.visible_start = 0;
+    state.picker.total_matches = 0;
+    state.picker.total_candidates = view.total_candidates;
+    state.picker.ticking = true;
+    state.picker.selected = 0;
+    state.picker.pending_offset = None;
+    state.picker.explorer_dir = None;
+    state.picker.explorer_parent = None;
+    state.picker.resume_target = None;
+    state.picker.resume_row_offset = None;
+    Ok(())
+}
+
 /// Issue a fresh `picker/view` for the Explorer picker with a new `directory_path`. Resets the
 /// query (a filter that made sense in the old directory is rarely meaningful in the new one),
 /// the highlight, and the scroll. If `pre_select_name` is set, the corresponding entry is
@@ -1763,6 +1854,7 @@ async fn picker_navigate_to_dir(
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some(directory_path),
+            explorer_roots: false,
         })
         .await?;
     state.picker.query.clear();
@@ -1812,10 +1904,11 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
             let step = state.picker.pane_rows as i64;
             picker_move_selection(client, state, step).await?;
         }
-        // `Alt-Backspace` — two-step "back". With text in the filter it wipes the filter
-        // (preserving the highlighted item as a resume anchor so the cursor stays on it once
-        // the broader empty-query listing re-pushes); with the filter empty *and* the picker
-        // in Explorer mode, it steps up to the parent directory (no-op at the project root).
+        // `Alt-Backspace` — multi-step "back" inside the Explorer picker:
+        //   1. Non-empty filter → clear the filter (preserving the highlight as a resume anchor).
+        //   2. Filter empty + inside a subdirectory → step up to the parent directory.
+        //   3. Filter empty + at the top of a root → switch to Roots mode (list all project roots).
+        //   4. Filter empty + already in Roots mode → no-op (no further "back" to take).
         // We deliberately leave `resume_row_offset` as `None` on the clear path — a filtered
         // listing usually has the highlight near the top of the visible window, and pinning
         // that offset onto the larger unfiltered listing scrolls items off the top, making it
@@ -1830,6 +1923,12 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
                 if let Some(parent) = state.picker.explorer_parent.clone() {
                     let leaving = explorer_leaving_name(state);
                     picker_navigate_to_dir(client, state, parent, leaving.as_deref()).await?;
+                } else if state.picker.explorer_dir.is_some() && state.project_paths.len() > 1 {
+                    // At the top of a root (no parent inside the project) — escape into the
+                    // Roots view. Single-root projects skip this: there's only one root, so
+                    // there's nothing to pick between. Already-in-Roots case falls through
+                    // (the `explorer_dir.is_none()` arm).
+                    picker_enter_roots_mode(client, state).await?;
                 }
             }
         }
@@ -2000,6 +2099,7 @@ async fn flush_pending_picker_scroll(client: &mut Client, state: &mut AppState) 
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            explorer_roots: false,
         })
         .await?;
     // The server may have clamped `target` (e.g. past EOF). Update `pending_offset` so the
@@ -2021,6 +2121,9 @@ async fn send_picker_query(client: &mut Client, state: &mut AppState) -> Result<
     // Query changes invalidate the resume anchor — the user is steering somewhere new.
     state.picker.resume_target = None;
     state.picker.resume_row_offset = None;
+    // Recompute the synthetic "create" row immediately so the user gets feedback before the
+    // server's response arrives. `apply_update` will reconcile it once the push lands.
+    state.picker.recompute_synthetic_create_row();
     client
         .rpc::<PickerQuery>(PickerQueryParams {
             kind,
@@ -2035,6 +2138,21 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
     let Some(kind) = state.picker.kind else {
         return Ok(());
     };
+    // Synthetic "create new project" row in the Projects picker: route to project/create with
+    // the picker's current query, then auto-open the settings overlay so the user can add roots
+    // immediately. Bypasses picker/select entirely (the server doesn't know about this row).
+    if kind == PickerKind::Projects && state.picker.highlighted_is_synthetic_create() {
+        let name = state.picker.query.text.trim().to_string();
+        if name.is_empty() {
+            return Ok(());
+        }
+        let _ = client
+            .rpc::<PickerHide>(PickerHideParams { kind })
+            .await;
+        state.picker.open = false;
+        create_project_and_open_settings(client, state, &name).await?;
+        return Ok(());
+    }
     let Some(item) = state.picker.highlighted().cloned() else {
         return Ok(());
     };
@@ -2051,6 +2169,14 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
                 .display()
                 .to_string();
             picker_navigate_to_dir(client, state, target, None).await?;
+            return Ok(());
+        }
+        // Roots mode: Enter on a Root row navigates to that root's top. The client looks up the
+        // absolute path from project_paths — the server stays out of presentation.
+        if let aether_protocol::picker::PickerItem::Root { path_index, .. } = &item {
+            if let Some(target) = state.project_paths.get(*path_index as usize).cloned() {
+                picker_navigate_to_dir(client, state, target, None).await?;
+            }
             return Ok(());
         }
     }
@@ -2233,12 +2359,17 @@ async fn subscribe_to_buffer(
 ) -> Result<()> {
     // Inherit wrap from the current editor so switching buffers keeps the user's wrap setting.
     let wrap = state.ed_mut().wrap;
+    // Snapshot labels before passing into the builder so we can hand the builder pure slices —
+    // it doesn't need (and shouldn't borrow) the full AppState.
+    let project_paths = state.project_paths.clone();
+    let root_labels = state.root_labels.clone();
     state.editor = Some(
         build_editor_state_from_open(
             client,
             state.viewport_cols,
             state.viewport_rows,
-            &state.project_paths,
+            &project_paths,
+            &root_labels,
             open,
             wrap,
         )
@@ -2252,21 +2383,62 @@ async fn subscribe_to_buffer(
     Ok(())
 }
 
-/// Strip the longest matching project path off `abs`, or fall back to the raw absolute path.
-/// Mirrors the server's display rule for buffer-picker items.
-fn project_relative_label(abs: &str, project_paths: &[String]) -> String {
-    let abs_path = std::path::Path::new(abs);
-    let best = project_paths
-        .iter()
-        .filter_map(|p| {
-            let root = std::path::Path::new(p);
-            abs_path.strip_prefix(root).ok().map(|rel| (root, rel))
-        })
-        .max_by_key(|(root, _)| root.as_os_str().len());
-    match best {
-        Some((_, rel)) => rel.display().to_string(),
+/// Format `abs` as `"{root_label}: {relative}"` against the longest-matching project root, or
+/// fall back to the raw absolute path when nothing matches. `root_labels` must be aligned by
+/// index with `project_paths`. The label is always included (even single-root) so the format is
+/// consistent across surfaces. Use this for display — see `project_relative_path` for the
+/// typeable-path variant that the save-as prefill needs.
+fn project_relative_label(abs: &str, project_paths: &[String], root_labels: &[String]) -> String {
+    match strip_longest_root(abs, project_paths) {
+        Some((i, rel)) => {
+            let label = root_labels.get(i).map(String::as_str).unwrap_or("");
+            if rel.is_empty() {
+                label.to_string()
+            } else if label.is_empty() {
+                rel
+            } else {
+                format!("{label}: {rel}")
+            }
+        }
         None => abs.to_string(),
     }
+}
+
+/// Resolve a CLI-supplied file/dir argument to an absolute, canonical path. Relative args are
+/// resolved against the *current working directory* (shell convention), then canonicalized so
+/// any `..` / symlinks line up with the project's canonical roots — without that, prefix
+/// matching against the roots in `strip_longest_root` would miss when the user CDs through a
+/// symlink. Errors surface verbatim (e.g. "No such file or directory") with the original arg
+/// for context — keeps the CLI's failure mode readable.
+fn resolve_cli_path(arg: &str) -> Result<std::path::PathBuf> {
+    let raw = std::path::Path::new(arg);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        let cwd = std::env::current_dir()
+            .context("could not read current directory to resolve a relative CLI path")?;
+        cwd.join(raw)
+    };
+    std::fs::canonicalize(&joined)
+        .with_context(|| format!("could not resolve {arg}"))
+}
+
+/// Strip the longest matching project root off `abs`. Returns `(root_index, relative_path)`,
+/// where `relative_path` is empty if `abs` *is* the root itself.
+pub(crate) fn strip_longest_root(abs: &str, project_paths: &[String]) -> Option<(usize, String)> {
+    let abs_path = std::path::Path::new(abs);
+    project_paths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let root = std::path::Path::new(p);
+            abs_path
+                .strip_prefix(root)
+                .ok()
+                .map(|rel| (i, root.as_os_str().len(), rel.display().to_string()))
+        })
+        .max_by_key(|(_, root_len, _)| *root_len)
+        .map(|(i, _, rel)| (i, rel))
 }
 
 async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
@@ -2900,6 +3072,7 @@ async fn handle_resize(
                     center_on: None,
                     center_on_cursor_grep_hit: None,
                     directory_path: None,
+                    explorer_roots: false,
                 })
                 .await?;
             state.picker.limit = new_limit;
@@ -3671,9 +3844,10 @@ async fn save_buffer_with(
 ) -> Result<()> {
     if state.ed_mut().file_path.is_none() {
         // Scratch buffer — no path to save to. Don't auto-prompt: the user has to be explicit
-        // about creating a file with Ctrl-Alt-s. This keeps `Ctrl-s` semantics uniform: it only
-        // ever writes to an already-known path.
-        state.status = "scratch buffer has no path — use Ctrl-Alt-s to save as".into();
+        // about using save-as. Keeps `Ctrl-s` semantics uniform: it only ever writes to an
+        // already-known path. We don't echo the specific save-as chord because it keeps
+        // drifting; the user already knows their own keymap.
+        state.status = "scratch buffer has no path — use save-as".into();
         return Ok(());
     }
     let result = client
@@ -3753,115 +3927,328 @@ async fn reload_buffer_with(
     Ok(())
 }
 
-/// Open the status-bar save-as prompt. Pre-filled with the current file's project-relative
-/// path so a small rename is one Backspace + a few keys; empty for scratch buffers. Cursor
-/// lands at the end of the pre-fill.
-fn begin_save_prompt(state: &mut AppState) {
-    let initial = state
-        .ed()
-        .file_path
-        .as_deref()
-        .map(|p| project_relative_label(p, &state.project_paths))
-        .unwrap_or_default();
-    state.save_prompt = Some(SavePromptState {
-        input: crate::text_input::TextInput::new(initial),
-    });
-    apply_cursor_style(state);
-}
-
-/// Open the `Space n` "new file" prompt. Pre-filled with the project-relative directory the
-/// user is currently working in (parent of the current file, or the explorer's last dir),
-/// plus a trailing `/` so the user just types the filename and Enter. The relative path is
-/// resolved against `path_index` on commit.
-fn begin_new_file_prompt(state: &mut AppState) {
-    let (path_index, mut initial) = current_directory_for_new_file(state);
-    if !initial.is_empty() && !initial.ends_with('/') {
-        initial.push('/');
-    }
-    state.new_file_prompt = Some(NewFilePromptState {
-        input: crate::text_input::TextInput::new(initial),
-        path_index,
-    });
-    apply_cursor_style(state);
-}
-
-/// Best-effort `(path_index, dir_relative_to_root)` for the new-file prompt. Prefers the
-/// current buffer's parent directory; falls back to the Explorer picker's current directory if
-/// it's open (the user was probably about to drop a new file in there); otherwise project root.
-/// The returned dir is always project-relative — empty string means "at the project root".
-fn current_directory_for_new_file(state: &AppState) -> (u32, String) {
-    if let Some(p) = state.ed().file_path.as_deref() {
-        if let Some(parent) = std::path::Path::new(p).parent() {
-            if let Some(found) = relative_to_project(parent, &state.project_paths) {
-                return found;
-            }
-        }
-    }
-    if let Some(dir) = state.picker.explorer_dir.as_deref() {
-        if let Some(found) = relative_to_project(std::path::Path::new(dir), &state.project_paths) {
-            return found;
-        }
-    }
-    (0, String::new())
-}
-
-/// Find the longest project root containing `abs` and return `(path_index, relative)`. `None`
-/// when `abs` lies outside every root.
-fn relative_to_project(abs: &std::path::Path, project_paths: &[String]) -> Option<(u32, String)> {
-    project_paths
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| {
-            let root = std::path::Path::new(p);
-            abs.strip_prefix(root)
-                .ok()
-                .map(|rel| (i as u32, root, rel.display().to_string()))
-        })
-        .max_by_key(|(_, root, _)| root.as_os_str().len())
-        .map(|(i, _, rel)| (i, rel))
-}
-
-async fn handle_new_file_prompt_key(
-    client: &mut Client,
-    state: &mut AppState,
-    k: KeyEvent,
-) -> Result<()> {
-    let Some(p) = state.new_file_prompt.as_mut() else {
-        return Ok(());
+/// Open the status-bar save-as prompt. Pre-filled with the current file's parent directory as
+/// the immutable prefix and the leaf filename as the editable input, so a small rename is one
+/// or two keystrokes. Scratch buffers land at the first project root with an empty input. Kicks
+/// off a `directory/list` to populate the cycle cache; until that response lands, Alt-j/k cycle
+/// over an empty listing (i.e. no-ops).
+async fn begin_save_prompt(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let (prompt, hint) = match state.ed().file_path.clone() {
+        Some(abs) => SavePromptState::open_for_existing(&abs, &state.project_paths),
+        None => SavePromptState::open_for_scratch(&state.project_paths),
     };
-    match crate::text_input::apply_prompt_key(&mut p.input, k) {
-        PromptKeyOutcome::Cancel => {
-            state.new_file_prompt = None;
-            apply_cursor_style(state);
-        }
-        PromptKeyOutcome::Commit => commit_new_file_prompt(client, state).await?,
-        PromptKeyOutcome::Edited => {}
+    state.save_prompt = Some(prompt);
+    apply_cursor_style(state);
+    if matches!(hint, crate::save_prompt::TransitionHint::RefreshListing) {
+        refresh_save_prompt_listing(client, state).await?;
     }
     Ok(())
 }
 
-async fn commit_new_file_prompt(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let (path_index, relative) = match state.new_file_prompt.as_ref() {
-        Some(p) if !p.input.trim().is_empty() => (p.path_index, p.input.text.clone()),
-        _ => {
-            state.new_file_prompt = None;
-            apply_cursor_style(state);
-            return Ok(());
-        }
+/// Fire `directory/list` for the save-prompt's current prefix and stash the response. No-op in
+/// SelectingRoot mode (no committed dir to list). Errors are swallowed onto the status line —
+/// the prompt stays usable, just without cycle-suggestions until the next prefix change.
+async fn refresh_save_prompt_listing(client: &mut Client, state: &mut AppState) -> Result<()> {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams};
+    let Some(prompt) = state.save_prompt.as_ref() else {
+        return Ok(());
     };
-    state.new_file_prompt = None;
-    apply_cursor_style(state);
-    let open: BufferOpenResult = client
-        .rpc::<BufferOpen>(BufferOpenParams {
-            buffer_id: None,
-            path_index: Some(path_index),
-            relative_path: Some(relative),
-            language: None,
-            create_if_missing: true,
-            jump_to: None,
+    let Some(path) = prompt.listing_path(&state.project_paths) else {
+        return Ok(());
+    };
+    let result = client
+        .rpc::<DirectoryList>(DirectoryListParams { path })
+        .await;
+    match result {
+        Ok(r) => {
+            if let Some(prompt) = state.save_prompt.as_mut() {
+                prompt.set_listing(r.entries);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("directory/list for save prompt failed: {e:#}");
+        }
+    }
+    Ok(())
+}
+
+/// Create a new project (server writes its TOML, activates it for this client), tear down any
+/// existing editor, and open the project-settings overlay so the user can add roots straight
+/// away. Used by the "+ create" row in the Projects picker.
+async fn create_project_and_open_settings(
+    client: &mut Client,
+    state: &mut AppState,
+    name: &str,
+) -> Result<()> {
+    use aether_protocol::project::{ProjectCreate, ProjectCreateParams};
+    let activated = client
+        .rpc::<ProjectCreate>(ProjectCreateParams {
+            name: name.to_string(),
         })
         .await?;
-    subscribe_to_buffer(client, state, open).await
+    state.editor = None;
+    state.project_name = activated.project.name.clone();
+    state.project_paths = activated.project.paths.clone();
+    refresh_root_labels(state);
+    state.status = format!("created project {}", state.project_name);
+    open_project_settings(state);
+    Ok(())
+}
+
+// ---- project settings -------------------------------------------------------------------------
+
+/// Hydrate the project-settings overlay from the currently-active project's roots and open it.
+/// Cheap (just clones the roots vec); no RPC. Focus lands on the always-present input row at the
+/// bottom — most overlay opens (especially the post-create flow) are to add a root, and this
+/// avoids an extra keypress for that case.
+fn open_project_settings(state: &mut AppState) {
+    let roots = state.project_paths.clone();
+    let selected = roots.len();
+    state.project_settings = Some(ProjectSettingsState {
+        project_name: state.project_name.clone(),
+        roots,
+        selected,
+        add_input: crate::text_input::TextInput::default(),
+        error: None,
+        pending_delete: false,
+    });
+    apply_cursor_style(state);
+}
+
+/// Selection model: `selected ∈ 0..=roots.len()`, where `roots.len()` is the input row. Alt-j/k
+/// move between fields (mirroring the picker's chord, so Alt-j/k means "navigate" everywhere in
+/// the app). Left/Right stay free to move the caret inside the input. Delete or Ctrl-d on a root
+/// row stages a remove (which `y`/Enter/Delete/Ctrl-d then confirm); Enter on the input row
+/// commits the add. Esc always closes (or first cancels a pending delete).
+async fn handle_project_settings_key(
+    client: &mut Client,
+    state: &mut AppState,
+    k: KeyEvent,
+) -> Result<()> {
+    let code = k.code;
+    let mods = k.modifiers;
+    // Ctrl-d is accepted alongside the Delete key for both staging and confirming a removal —
+    // easier to reach on keyboards where Delete is awkward (or absent on small layouts).
+    let is_delete_chord = code == KeyCode::Delete
+        || (code == KeyCode::Char('d') && mods == KeyModifiers::CONTROL);
+
+    // Pending-delete confirmation takes precedence over every other key. While set, only
+    // y/Y/Enter/Delete/Ctrl-d commit and n/N/Esc cancel; everything else is swallowed so the
+    // user can't silently drop the pending state. Esc cancels the pending *first*; a subsequent
+    // Esc then closes the overlay.
+    if state
+        .project_settings
+        .as_ref()
+        .is_some_and(|s| s.pending_delete)
+    {
+        if is_delete_chord
+            || code == KeyCode::Enter
+            || matches!(code, KeyCode::Char('y') | KeyCode::Char('Y'))
+        {
+            let Some(s) = state.project_settings.as_mut() else {
+                return Ok(());
+            };
+            let Some(path) = s.roots.get(s.selected).cloned() else {
+                s.pending_delete = false;
+                return Ok(());
+            };
+            let project_name = s.project_name.clone();
+            s.pending_delete = false;
+            s.error = None;
+            remove_root(client, state, &project_name, &path).await?;
+        } else if matches!(code, KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc) {
+            if let Some(s) = state.project_settings.as_mut() {
+                s.pending_delete = false;
+            }
+        }
+        return Ok(());
+    }
+
+    if code == KeyCode::Esc {
+        state.project_settings = None;
+        apply_cursor_style(state);
+        return Ok(());
+    }
+
+    let Some(settings) = state.project_settings.as_mut() else {
+        return Ok(());
+    };
+    let on_input = settings.selected == settings.roots.len();
+
+    // Alt-j / Alt-k navigation. Check before the input-row text-routing block so the chord
+    // works whether the caret is in the input or on a root row.
+    if mods == KeyModifiers::ALT {
+        match code {
+            KeyCode::Char('k') => {
+                settings.selected = settings.selected.saturating_sub(1);
+                return Ok(());
+            }
+            KeyCode::Char('j') => {
+                settings.selected = (settings.selected + 1).min(settings.roots.len());
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    if is_delete_chord && !on_input {
+        // Stage the confirm — actual removal happens in the pending-delete branch above.
+        settings.pending_delete = true;
+        settings.error = None;
+        return Ok(());
+    }
+
+    match code {
+        KeyCode::Enter if on_input => {
+            commit_add_root(client, state).await?;
+            return Ok(());
+        }
+        _ if on_input => {
+            // Esc/Enter already handled above; everything else (chars, Backspace, Left/Right)
+            // edits the input. apply_prompt_key returns Cancel/Commit only for Esc/Enter — which
+            // we've intercepted — so we only ever see Edited here.
+            let outcome = crate::text_input::apply_prompt_key(&mut settings.add_input, k);
+            if let PromptKeyOutcome::Edited = outcome {
+                settings.error = None;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn commit_add_root(client: &mut Client, state: &mut AppState) -> Result<()> {
+    use aether_protocol::project::{ProjectAddRoot, ProjectAddRootParams};
+    let Some(settings) = state.project_settings.as_mut() else {
+        return Ok(());
+    };
+    let path = settings.add_input.text.trim().to_string();
+    if path.is_empty() {
+        return Ok(());
+    }
+    let project_name = settings.project_name.clone();
+    settings.error = None;
+    let result = client
+        .rpc::<ProjectAddRoot>(ProjectAddRootParams {
+            project: project_name.clone(),
+            path,
+        })
+        .await;
+    match result {
+        Ok(info) => {
+            sync_project_paths(state, info);
+            if let Some(s) = state.project_settings.as_mut() {
+                s.add_input.clear();
+                s.selected = s.roots.len();
+            }
+            state.status = format!("added root to {project_name}");
+        }
+        Err(e) => {
+            if let Some(s) = state.project_settings.as_mut() {
+                s.error = Some(if let Some(rpc_err) = e.downcast_ref::<crate::client::RpcError>() {
+                    rpc_err.message.clone()
+                } else {
+                    e.to_string()
+                });
+            }
+        }
+    }
+    apply_cursor_style(state);
+    Ok(())
+}
+
+async fn remove_root(
+    client: &mut Client,
+    state: &mut AppState,
+    project_name: &str,
+    path: &str,
+) -> Result<()> {
+    use aether_protocol::project::{ProjectRemoveRoot, ProjectRemoveRootParams};
+    let result = client
+        .rpc::<ProjectRemoveRoot>(ProjectRemoveRootParams {
+            project: project_name.to_string(),
+            path: path.to_string(),
+        })
+        .await;
+    match result {
+        Ok(r) => {
+            let closed = r.closed_buffer_ids.clone();
+            sync_project_paths(state, r.project);
+            // If the active editor's buffer just got closed, attach to next_buffer_id or spawn
+            // a scratch so the user lands on something usable.
+            let current_buffer = state.editor.as_ref().map(|e| e.buffer_id);
+            if let Some(cur) = current_buffer {
+                if closed.contains(&cur) {
+                    match r.next_buffer_id {
+                        Some(next) => attach_buffer(client, state, next).await?,
+                        None => new_scratch(client, state).await?,
+                    }
+                }
+            }
+            state.status = if closed.is_empty() {
+                format!("removed root from {project_name}")
+            } else {
+                format!(
+                    "removed root from {project_name}; closed {} buffer(s)",
+                    closed.len()
+                )
+            };
+        }
+        Err(e) => {
+            // Surface the failure inside the overlay when it's open (the common case — `remove_root`
+            // is only invoked from there today). Fall back to the status line otherwise.
+            let msg = if let Some(rpc_err) = e.downcast_ref::<crate::client::RpcError>() {
+                if rpc_err.code
+                    == aether_protocol::error::ErrorCode::DIRTY_BUFFERS_PREVENT_REMOVE.code()
+                {
+                    rpc_err.message.clone()
+                } else {
+                    format!("remove root failed: {}", rpc_err.message)
+                }
+            } else {
+                format!("remove root failed: {e}")
+            };
+            if let Some(s) = state.project_settings.as_mut() {
+                s.error = Some(msg);
+            } else {
+                state.status = msg;
+            }
+        }
+    }
+    apply_cursor_style(state);
+    Ok(())
+}
+
+/// Recompute `root_labels` from the current `project_paths`, then refresh any cached display
+/// strings derived from them. Called from every site that mutates `project_paths`, so the
+/// cached labels never drift out of sync after add/remove root.
+fn refresh_root_labels(state: &mut AppState) {
+    state.root_labels = crate::labels::root_labels(&state.project_paths);
+    // Re-derive the active editor's `file_label` since it embeds the root label.
+    if let Some(ed) = state.editor.as_mut() {
+        if let Some(path) = ed.file_path.clone() {
+            ed.file_label = project_relative_label(&path, &state.project_paths, &state.root_labels);
+        }
+    }
+}
+
+/// Reflect a server-returned `ProjectInfo` into `AppState`. Updates `project_paths`, and — if
+/// the settings overlay is open for this project — refreshes its visible root list. After a
+/// successful remove the selection can land past the new end of `roots`; snap it to the input
+/// row (`roots.len()`) so focus lands somewhere usable.
+fn sync_project_paths(state: &mut AppState, info: aether_protocol::project::ProjectInfo) {
+    if state.project_name == info.name {
+        state.project_paths = info.paths.clone();
+        refresh_root_labels(state);
+    }
+    if let Some(settings) = state.project_settings.as_mut() {
+        if settings.project_name == info.name {
+            settings.roots = info.paths;
+            if settings.selected > settings.roots.len() {
+                settings.selected = settings.roots.len();
+            }
+        }
+    }
 }
 
 async fn handle_save_prompt_key(
@@ -3869,13 +4256,75 @@ async fn handle_save_prompt_key(
     state: &mut AppState,
     k: KeyEvent,
 ) -> Result<()> {
-    let Some(p) = state.save_prompt.as_mut() else {
+    use crate::save_prompt::{EnterAction, TransitionHint};
+    let code = k.code;
+    let mods = k.modifiers;
+    // Esc cancels; Enter routes through `enter_action` so it never silently closes the prompt —
+    // see EnterAction for the per-state breakdown (Tab semantics in SelectingRoot and on
+    // trailing-slash input; no-op on empty input; save otherwise).
+    match code {
+        KeyCode::Esc => {
+            abort_save_prompt(state);
+            return Ok(());
+        }
+        KeyCode::Enter => {
+            let action = state
+                .save_prompt
+                .as_ref()
+                .map(|p| p.enter_action())
+                .unwrap_or(EnterAction::Nothing);
+            match action {
+                EnterAction::Save => return send_save_prompt(client, state, false).await,
+                EnterAction::Tab => {
+                    let project_paths = state.project_paths.clone();
+                    let hint = state
+                        .save_prompt
+                        .as_mut()
+                        .map(|p| p.tab(&project_paths))
+                        .unwrap_or(TransitionHint::None);
+                    if matches!(hint, TransitionHint::RefreshListing) {
+                        refresh_save_prompt_listing(client, state).await?;
+                    }
+                    return Ok(());
+                }
+                EnterAction::Nothing => return Ok(()),
+            }
+        }
+        _ => {}
+    }
+    let Some(prompt) = state.save_prompt.as_mut() else {
         return Ok(());
     };
-    match crate::text_input::apply_prompt_key(&mut p.input, k) {
-        PromptKeyOutcome::Cancel => abort_save_prompt(state),
-        PromptKeyOutcome::Commit => send_save_prompt(client, state, false).await?,
-        PromptKeyOutcome::Edited => {}
+    let project_paths = state.project_paths.clone();
+    let hint = match (code, mods) {
+        (KeyCode::Char('j'), m) if m == KeyModifiers::ALT => {
+            prompt.alt_j(&project_paths);
+            TransitionHint::None
+        }
+        (KeyCode::Char('k'), m) if m == KeyModifiers::ALT => {
+            prompt.alt_k(&project_paths);
+            TransitionHint::None
+        }
+        (KeyCode::Char('l'), m) if m == KeyModifiers::ALT => prompt.tab(&project_paths),
+        (KeyCode::Backspace, m) if m == KeyModifiers::ALT => prompt.alt_backspace(&project_paths),
+        (KeyCode::Backspace, _) => prompt.backspace(&project_paths),
+        (KeyCode::Left, _) => {
+            prompt.input.move_left();
+            TransitionHint::None
+        }
+        (KeyCode::Right, _) => {
+            prompt.input.move_right();
+            TransitionHint::None
+        }
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            prompt.type_char(c, &project_paths)
+        }
+        _ => TransitionHint::None,
+    };
+    if matches!(hint, TransitionHint::RefreshListing) {
+        refresh_save_prompt_listing(client, state).await?;
     }
     Ok(())
 }
@@ -3894,26 +4343,25 @@ async fn send_save_prompt(
     state: &mut AppState,
     overwrite: bool,
 ) -> Result<()> {
-    let path = match state.save_prompt.as_ref() {
-        Some(p) if !p.input.trim().is_empty() => p.input.text.clone(),
-        Some(_) => {
-            // Empty input — treat as cancel.
+    let (path_index, path) = match state
+        .save_prompt
+        .as_ref()
+        .and_then(crate::save_prompt::SavePromptState::save_target)
+    {
+        Some((idx, p)) => (idx, p),
+        None => {
+            // Empty input or root-selection mode without a committed name — treat as cancel.
             state.save_prompt = None;
             apply_cursor_style(state);
             return Ok(());
         }
-        None => return Ok(()),
     };
 
     let buffer_id = state.ed_mut().buffer_id;
-
-    // TODO: multi-root support — when `project_paths.len() > 1` we should let the user pick a
-    // root (or accept absolute paths in the prompt and infer the root) rather than silently
-    // saving under the first project root.
     let result = client
         .rpc::<BufferSave>(BufferSaveParams {
             buffer_id,
-            path_index: Some(0),
+            path_index: Some(path_index),
             relative_path: Some(path.clone()),
             overwrite,
         })
@@ -3923,12 +4371,19 @@ async fn send_save_prompt(
             state.save_prompt = None;
             apply_cursor_style(state);
             let project_paths = state.project_paths.clone();
+            let root_labels = state.root_labels.clone();
+            let new_abs = project_paths
+                .get(path_index as usize)
+                .map(|root| std::path::Path::new(root).join(&path).display().to_string());
             let ed = state.ed_mut();
             ed.revision = r.revision;
             ed.saved_revision = r.revision;
-            ed.file_label = path.clone();
-            if let Some(root) = project_paths.first() {
-                ed.file_path = Some(std::path::Path::new(root).join(&path).display().to_string());
+            if let Some(abs) = new_abs {
+                ed.file_label = project_relative_label(&abs, &project_paths, &root_labels);
+                ed.file_path = Some(abs);
+            } else {
+                // No project root configured — fall back to the typed path verbatim.
+                ed.file_label = path.clone();
             }
             state.status = format!("saved as {} (rev {})", path, r.revision);
         }
@@ -4152,4 +4607,84 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
     state.ed_mut().max_scroll_logical_line = r.window.max_scroll_logical_line;
     state.ed_mut().lines = r.window.lines;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `resolve_cli_path` resolves a relative arg against CWD, not against an arbitrary base.
+    /// Tested here because the old (buggy) behaviour joined relative args with `project_paths[0]`
+    /// — the regression we're guarding against is "user is CD'd into root B but `ae` resolves
+    /// their relative arg under root A".
+    #[test]
+    fn resolve_cli_path_resolves_relative_against_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("hello.txt");
+        std::fs::write(&file_path, "hi").unwrap();
+        let prior_cwd = std::env::current_dir().ok();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let resolved = resolve_cli_path("hello.txt").unwrap();
+        // Restore CWD before any asserts (so a failure doesn't strand later tests).
+        if let Some(cwd) = prior_cwd {
+            let _ = std::env::set_current_dir(cwd);
+        }
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&file_path).unwrap(),
+            "relative CLI path should resolve under the process CWD"
+        );
+    }
+
+    #[test]
+    fn resolve_cli_path_canonicalizes_absolute_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("abs.txt");
+        std::fs::write(&file_path, "hi").unwrap();
+        let resolved = resolve_cli_path(file_path.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&file_path).unwrap());
+    }
+
+    #[test]
+    fn resolve_cli_path_errors_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-file.txt");
+        let err = resolve_cli_path(missing.to_str().unwrap()).unwrap_err();
+        // The chained context should name the original arg so the CLI error is useful.
+        assert!(
+            format!("{err:#}").contains(missing.to_str().unwrap()),
+            "error chain should mention the requested path: {err:#}"
+        );
+    }
+
+    /// The actual bug-fix property: a file living under a *non-zero* root must classify to that
+    /// root, not to root 0. Pairs `resolve_cli_path` with `strip_longest_root` the way
+    /// `bootstrap` does.
+    #[test]
+    fn cli_path_under_non_zero_root_classifies_to_that_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let root_a = outer.path().join("a");
+        let root_b = outer.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let file_in_b = root_b.join("sub/file.rs");
+        std::fs::create_dir_all(file_in_b.parent().unwrap()).unwrap();
+        std::fs::write(&file_in_b, "in b").unwrap();
+
+        let project_paths = vec![
+            std::fs::canonicalize(&root_a)
+                .unwrap()
+                .display()
+                .to_string(),
+            std::fs::canonicalize(&root_b)
+                .unwrap()
+                .display()
+                .to_string(),
+        ];
+        let abs = resolve_cli_path(file_in_b.to_str().unwrap()).unwrap();
+        let (idx, rel) = strip_longest_root(&abs.display().to_string(), &project_paths)
+            .expect("file must classify under one of the roots");
+        assert_eq!(idx, 1, "should classify under root B (index 1), not root 0");
+        assert_eq!(rel, "sub/file.rs");
+    }
 }
