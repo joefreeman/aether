@@ -2153,6 +2153,17 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
         create_project_and_open_settings(client, state, &name).await?;
         return Ok(());
     }
+    // Synthetic "+ create" row in the Explorer picker: create a new file at the picker's
+    // current directory using the typed name. Routes through `buffer/open { create_if_missing }`
+    // so the server allocates a fresh buffer pre-bound to the not-yet-existing path; the user's
+    // first save writes it to disk (with mkdir-p of any missing intermediate dirs).
+    if kind == PickerKind::Explorer && state.picker.highlighted_is_synthetic_create() {
+        let name = state.picker.query.text.trim().to_string();
+        if name.is_empty() {
+            return Ok(());
+        }
+        return create_file_in_explorer_dir(client, state, &name).await;
+    }
     let Some(item) = state.picker.highlighted().cloned() else {
         return Ok(());
     };
@@ -3993,6 +4004,45 @@ async fn create_project_and_open_settings(
     state.status = format!("created project {}", state.project_name);
     open_project_settings(state);
     Ok(())
+}
+
+/// Handle the Explorer's "+ create" synthetic row: open a fresh buffer at
+/// `<explorer_dir>/<name>` with `create_if_missing: true`. Closes the picker, attaches the new
+/// buffer in the editor. The server allocates the buffer without writing to disk; the file
+/// hits the filesystem on the user's next save.
+async fn create_file_in_explorer_dir(
+    client: &mut Client,
+    state: &mut AppState,
+    name: &str,
+) -> Result<()> {
+    let Some(dir_abs) = state.picker.explorer_dir.clone() else {
+        // Roots mode (or no explorer state) — nothing meaningful to create against.
+        return Ok(());
+    };
+    let Some((path_index, rel_dir)) = strip_longest_root(&dir_abs, &state.project_paths) else {
+        state.status = format!("can't create file in {dir_abs}: outside the project");
+        return Ok(());
+    };
+    let relative_path = if rel_dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{rel_dir}/{name}")
+    };
+    // Hide the picker before the RPC so the new buffer view replaces it cleanly.
+    let kind = PickerKind::Explorer;
+    let _ = client.rpc::<PickerHide>(PickerHideParams { kind }).await;
+    state.picker.open = false;
+    let open: BufferOpenResult = client
+        .rpc::<BufferOpen>(BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(path_index as u32),
+            relative_path: Some(relative_path),
+            language: None,
+            create_if_missing: true,
+            jump_to: None,
+        })
+        .await?;
+    subscribe_to_buffer(client, state, open).await
 }
 
 // ---- project settings -------------------------------------------------------------------------

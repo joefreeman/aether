@@ -113,6 +113,11 @@ impl PickerState {
             return false;
         };
         self.items = items;
+        // The server's push never contains our client-side synthetic row, so any cached
+        // `synthetic_create_idx` is stale relative to the new `items` Vec. Drop it before the
+        // recompute below decides whether to re-add — otherwise the strip-by-index logic could
+        // remove a real entry at the same position.
+        self.synthetic_create_idx = None;
         self.total_matches = total_matches;
         self.total_candidates = total_candidates;
         self.ticking = ticking;
@@ -158,10 +163,11 @@ impl PickerState {
         true
     }
 
-    /// Recompute the synthetic "create new project" row for the Projects picker. Called after
-    /// any change to `items` or `query`. Appends a row labeled `+ create "<query>"` to `items`
-    /// when the query is non-empty and doesn't exactly match a real project name. Idempotent:
-    /// strips any prior synthetic row first.
+    /// Recompute the synthetic "+ create" row. Called after any change to `items` or `query`.
+    /// Appends a row labeled `+ create "<query>"` to `items` when the query is non-empty and
+    /// doesn't exactly match an existing entry — Projects use it to create new projects, and
+    /// Explorer uses it to create a new file at the current directory. Idempotent: strips any
+    /// prior synthetic row first.
     pub fn recompute_synthetic_create_row(&mut self) {
         // Strip prior synthetic row if present.
         if let Some(idx) = self.synthetic_create_idx.take() {
@@ -169,23 +175,48 @@ impl PickerState {
                 self.items.remove(idx);
             }
         }
-        if self.kind != Some(PickerKind::Projects) {
-            return;
-        }
         let q = self.query.text.trim();
         if q.is_empty() {
             return;
         }
-        let already_exists = self.items.iter().any(|item| match item {
-            PickerItem::Project { name, .. } => name == q,
-            _ => false,
-        });
-        if already_exists {
-            return;
-        }
-        let synthetic = PickerItem::Project {
-            name: format!("+ create \"{q}\""),
-            match_indices: Vec::new(),
+        let synthetic = match self.kind {
+            Some(PickerKind::Projects) => {
+                let already_exists = self.items.iter().any(|item| match item {
+                    PickerItem::Project { name, .. } => name == q,
+                    _ => false,
+                });
+                if already_exists {
+                    return;
+                }
+                PickerItem::Project {
+                    name: format!("+ create \"{q}\""),
+                    match_indices: Vec::new(),
+                }
+            }
+            Some(PickerKind::Explorer) => {
+                // Don't offer "+ create" while a real entry exactly matches the typed name —
+                // that's an existing file/dir the user can just Enter on. Slashes in `q` are
+                // also rejected: file creation here is single-segment within the current dir
+                // (mkdir-p flows live in save-as, not here).
+                if q.contains('/') {
+                    return;
+                }
+                let already_exists = self.items.iter().any(|item| match item {
+                    PickerItem::DirEntry { name, .. } => name == q,
+                    _ => false,
+                });
+                if already_exists {
+                    return;
+                }
+                PickerItem::DirEntry {
+                    name: format!("+ create \"{q}\""),
+                    // Synthetic is always a leaf-file affordance: routing through buffer/open
+                    // with create_if_missing creates the file, not a directory.
+                    is_dir: false,
+                    match_indices: Vec::new(),
+                }
+            }
+            _ => return,
         };
         let idx = self.items.len();
         self.items.push(synthetic);
@@ -257,5 +288,131 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::Root { path_index, .. } => ItemKey::Root {
             path_index: *path_index,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text_input::TextInput;
+
+    fn dir_entry(name: &str, is_dir: bool) -> PickerItem {
+        PickerItem::DirEntry {
+            name: name.into(),
+            is_dir,
+            match_indices: Vec::new(),
+        }
+    }
+
+    fn empty_state(kind: PickerKind, query: &str) -> PickerState {
+        let mut s = PickerState::default();
+        s.open = true;
+        s.kind = Some(kind);
+        s.query = TextInput::new(query);
+        s
+    }
+
+    #[test]
+    fn explorer_synthetic_appears_when_query_has_no_exact_match() {
+        let mut s = empty_state(PickerKind::Explorer, "newfile.rs");
+        s.items = vec![dir_entry("README.md", false), dir_entry("src", true)];
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 3);
+        let last = s.items.last().unwrap();
+        match last {
+            PickerItem::DirEntry { name, is_dir, .. } => {
+                assert_eq!(name, "+ create \"newfile.rs\"");
+                assert!(!is_dir, "synthetic create row is always a file affordance");
+            }
+            other => panic!("expected DirEntry, got {other:?}"),
+        }
+        assert_eq!(s.synthetic_create_idx, Some(2));
+    }
+
+    #[test]
+    fn explorer_synthetic_suppressed_when_exact_match_exists() {
+        let mut s = empty_state(PickerKind::Explorer, "README.md");
+        s.items = vec![dir_entry("README.md", false)];
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 1, "no synthetic when entry already exists");
+        assert!(s.synthetic_create_idx.is_none());
+    }
+
+    #[test]
+    fn explorer_synthetic_suppressed_when_query_contains_slash() {
+        // Cross-directory creation lives in save-as, not here — the picker is single-segment.
+        let mut s = empty_state(PickerKind::Explorer, "subdir/newfile.rs");
+        s.items = vec![dir_entry("src", true)];
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 1);
+        assert!(s.synthetic_create_idx.is_none());
+    }
+
+    #[test]
+    fn explorer_synthetic_suppressed_when_query_empty() {
+        let mut s = empty_state(PickerKind::Explorer, "");
+        s.items = vec![dir_entry("src", true)];
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 1);
+        assert!(s.synthetic_create_idx.is_none());
+    }
+
+    #[test]
+    fn recompute_strips_stale_synthetic_before_re_adding() {
+        // Round 1: synthetic added.
+        let mut s = empty_state(PickerKind::Explorer, "newfile.rs");
+        s.items = vec![dir_entry("README.md", false)];
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 2);
+        // Round 2: query changes, recompute. Old synthetic must be stripped before the new one
+        // is appended — otherwise `items` grows unboundedly.
+        s.query = TextInput::new("other.rs");
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 2);
+        match s.items.last().unwrap() {
+            PickerItem::DirEntry { name, .. } => assert_eq!(name, "+ create \"other.rs\""),
+            other => panic!("expected DirEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_update_invalidates_stale_synthetic_idx() {
+        // The pre-existing bug: after a wholesale items replacement (server push), the cached
+        // synthetic_create_idx points into the old items vec. If a real item lands at that
+        // position in the new vec, the strip-by-index logic would silently remove it.
+        let mut s = empty_state(PickerKind::Explorer, "ne");
+        s.items = vec![dir_entry("README.md", false)];
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.synthetic_create_idx, Some(1));
+        // Simulate a fresh server push: send the same generation, offset, etc., with new
+        // entries. `apply_update` must clear synthetic_create_idx so the recompute treats the
+        // items as synthetic-free.
+        s.generation = 7;
+        let ok = s.apply_update(
+            PickerKind::Explorer,
+            7,
+            0,
+            vec![
+                dir_entry("a.rs", false),
+                dir_entry("b.rs", false),
+                dir_entry("c.rs", false),
+            ],
+            3,
+            3,
+            false,
+        );
+        assert!(ok);
+        // Items should be [a.rs, b.rs, c.rs, "+ create"] — the synthetic re-added without
+        // having removed `b.rs` (which would happen if the stale idx=1 was used).
+        assert_eq!(s.items.len(), 4);
+        let names: Vec<&str> = s
+            .items
+            .iter()
+            .map(|i| match i {
+                PickerItem::DirEntry { name, .. } => name.as_str(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(names, vec!["a.rs", "b.rs", "c.rs", "+ create \"ne\""]);
     }
 }
