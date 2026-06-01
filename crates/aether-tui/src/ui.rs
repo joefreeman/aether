@@ -1838,7 +1838,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(draw_save_prompt_spans(prompt, state, area.width as usize))
     } else if !state.has_editor() {
         // No editor: status row only shows transient feedback (project activation, errors).
-        Line::from(vec![Span::raw(format!(" {}", state.status))])
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(state.status.text.clone(), status_message_style(&state.status)),
+        ])
     } else if matches!(state.ed().mode, EditorMode::Search) {
         let prompt = format!("/{}", state.ed().search.query.text);
         let text = match search_match_count_label(state) {
@@ -1848,31 +1851,35 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![Span::raw(text)])
     } else {
         let dirty_marker = buffer_status_markers(state);
-        // Search counter ("3/47") and grep counter ("(2/12)") are independent — either or both
-        // can be present. Joined with a single space so the segment reads naturally when only
-        // one is shown.
-        let counter_parts: Vec<String> = [search_counter_label(state), grep_counter_label(state)]
-            .into_iter()
-            .flatten()
-            .collect();
-        let counter = if counter_parts.is_empty() {
-            String::new()
+        // Project / file / dirty / transient status sit on the left; counter (search and/or
+        // grep, in that order) and cursor position sit on the right, with the counter to the
+        // left of the position. When the row is narrow we truncate the right edge of the left
+        // segment with `…` so the right segment stays whole and the position never gets
+        // painted over.
+        let counter_parts: Vec<String> =
+            [search_counter_label(state), grep_counter_label(state)]
+                .into_iter()
+                .flatten()
+                .collect();
+        let pos = format_position(state);
+        let right = if counter_parts.is_empty() {
+            pos
         } else {
-            format!("  {}", counter_parts.join(" "))
+            format!("{}  {}", counter_parts.join(" "), pos)
         };
-        let main = format!(
-            " [{project}] {file} {dirty}  {pos}{counter}",
-            project = state.project_name,
-            file = state.ed().file_label,
-            dirty = dirty_marker,
-            pos = format_position(state),
-        );
-        let status_span = if state.status.is_empty() {
-            Span::raw(main)
-        } else {
-            Span::raw(format!("{main}    {}", state.status))
-        };
-        Line::from(vec![status_span])
+
+        let mut left_pre = format!("[{}] {}", state.project_name, state.ed().file_label);
+        if !dirty_marker.is_empty() {
+            left_pre.push(' ');
+            left_pre.push_str(dirty_marker);
+        }
+
+        Line::from(build_editor_status_spans(
+            &left_pre,
+            &state.status,
+            &right,
+            area.width as usize,
+        ))
     };
     let p = Paragraph::new(line).style(Style::default().bg(NORD1).fg(NORD4));
     f.render_widget(p, area);
@@ -1975,6 +1982,98 @@ fn draw_save_prompt_spans(
         }
     }
     spans
+}
+
+/// Style for a `StatusMessage` based on its kind: success → blue (matches the committed-prefix
+/// blue elsewhere in the UI), warning → yellow, error → red, info → default white. Background
+/// stays NORD1 to blend with the surrounding status bar.
+fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
+    use crate::app::StatusKind;
+    let fg = match msg.kind {
+        StatusKind::Info => NORD4,
+        StatusKind::Success => NORD8,
+        StatusKind::Warning => NORD13,
+        StatusKind::Error => NORD11,
+    };
+    Style::default().bg(NORD1).fg(fg)
+}
+
+/// Build the spans for the default editor status row: `left_pre` on the left in the base
+/// style, optional colored status message after a `    ` separator, then padding pushing the
+/// right segment flush to the row edge. When the row is too narrow:
+///   - the status text truncates first (`…`), preserving the project/file/dirty bit;
+///   - if even `left_pre` can't fit, that gets truncated and the status is dropped entirely.
+/// The right segment is never truncated — the cursor position is more useful than the message.
+fn build_editor_status_spans(
+    left_pre: &str,
+    status: &crate::app::StatusMessage,
+    right: &str,
+    total_width: usize,
+) -> Vec<Span<'static>> {
+    let base_style = Style::default().bg(NORD1).fg(NORD4);
+    let right_w = right.width();
+    // Always keep at least one cell of gap between the left content and the right segment.
+    let left_max = total_width.saturating_sub(right_w + 1);
+
+    let left_pre_w = left_pre.width();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    if left_pre_w >= left_max {
+        // Even the pre-status segment overflows — truncate it and drop the status.
+        spans.push(Span::styled(truncate_to_width(left_pre, left_max), base_style));
+    } else if status.is_empty() {
+        spans.push(Span::styled(left_pre.to_string(), base_style));
+    } else {
+        // Pre-status fits; budget the rest for the status text + its leading separator.
+        let separator = "    ";
+        let separator_w = separator.width();
+        let remaining = left_max.saturating_sub(left_pre_w + separator_w);
+        let status_text = if status.text.width() <= remaining {
+            status.text.clone()
+        } else {
+            truncate_to_width(&status.text, remaining)
+        };
+        spans.push(Span::styled(left_pre.to_string(), base_style));
+        spans.push(Span::styled(separator.to_string(), base_style));
+        spans.push(Span::styled(status_text, status_message_style(status)));
+    }
+
+    let used_w: usize = spans.iter().map(|s| s.content.width()).sum();
+    let pad_w = total_width.saturating_sub(used_w + right_w);
+    spans.push(Span::styled(" ".repeat(pad_w), base_style));
+    spans.push(Span::styled(right.to_string(), base_style));
+    spans
+}
+
+/// Truncate `s` so its display width is at most `max`, appending `…` when the input was longer.
+/// Width-aware: handles double-wide CJK / emoji glyphs by skipping any char that wouldn't fit.
+/// When `max` is too small to hold the ellipsis itself, falls back to a bare ellipsis (truncating
+/// past the budget); when `max == 0`, returns empty.
+fn truncate_to_width(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let ellipsis = "…";
+    let ellipsis_w = ellipsis.width();
+    if max <= ellipsis_w {
+        return ellipsis.to_string();
+    }
+    let budget = max - ellipsis_w;
+    let mut out = String::new();
+    let mut acc = 0;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if acc + cw > budget {
+            break;
+        }
+        out.push(c);
+        acc += cw;
+    }
+    out.push_str(ellipsis);
+    out
 }
 
 /// Status-bar indicator for buffer state. Single-character, highest-precedence wins — the
@@ -2325,4 +2424,114 @@ fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u3
         byte += c.len_utf8() as u32;
     }
     vrow.byte_offset + byte
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- truncate_to_width ----
+
+    #[test]
+    fn truncate_no_op_when_within_budget() {
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+        assert_eq!(truncate_to_width("hello", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_when_over_budget() {
+        // "hello world" is 11 cells; budget of 8 → 7 chars + `…`.
+        assert_eq!(truncate_to_width("hello world", 8), "hello w…");
+    }
+
+    #[test]
+    fn truncate_empty_when_max_is_zero() {
+        assert_eq!(truncate_to_width("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_to_bare_ellipsis_when_budget_is_one() {
+        // No room for even a single content char alongside the ellipsis.
+        assert_eq!(truncate_to_width("hello", 1), "…");
+    }
+
+    #[test]
+    fn truncate_respects_double_wide_chars() {
+        // "あ" is 2 cells. "あabc" is 5 cells. With max 4, we'd ideally fit "あa" + `…` (4
+        // cells). The greedy fill stops once adding the next char would overshoot.
+        let s = "あabc";
+        let out = truncate_to_width(s, 4);
+        assert_eq!(out.width(), 4);
+        assert!(out.ends_with('…'));
+    }
+
+    // ---- build_editor_status_spans ----
+
+    fn spans_text(spans: &[Span<'_>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+    }
+
+    fn spans_total_width(spans: &[Span<'_>]) -> usize {
+        spans.iter().map(|s| s.content.width()).sum()
+    }
+
+    #[test]
+    fn editor_status_spans_no_status_pads_to_right_edge() {
+        let status = crate::app::StatusMessage::default();
+        let spans = build_editor_status_spans("[proj] file.rs", &status, "12:5", 30);
+        let text = spans_text(&spans);
+        assert!(text.starts_with("[proj] file.rs"));
+        assert!(text.ends_with("12:5"));
+        assert_eq!(spans_total_width(&spans), 30);
+    }
+
+    #[test]
+    fn editor_status_spans_renders_status_with_color() {
+        let status = crate::app::StatusMessage::success("saved (rev 1)");
+        let spans = build_editor_status_spans("[proj] file.rs", &status, "12:5", 60);
+        // Status text should appear, sandwiched between the left bit and the padding/right.
+        let text = spans_text(&spans);
+        assert!(text.contains("[proj] file.rs"));
+        assert!(text.contains("saved (rev 1)"));
+        assert!(text.ends_with("12:5"));
+        // The span containing the status text must carry the success colour.
+        let status_span = spans
+            .iter()
+            .find(|s| s.content.contains("saved (rev 1)"))
+            .expect("status span present");
+        assert_eq!(status_span.style.fg, Some(NORD8));
+    }
+
+    #[test]
+    fn editor_status_spans_truncates_status_first_when_narrow() {
+        // total=30, right="12:5" (4) + gap(1) = 5 reserved; left_max=25. left_pre="[proj] file.rs" (14)
+        // + separator(4) = 18 used. Status budget = 25 - 18 = 7. So a long status truncates.
+        let status = crate::app::StatusMessage::info("a much longer status message");
+        let spans = build_editor_status_spans("[proj] file.rs", &status, "12:5", 30);
+        let status_span = spans
+            .iter()
+            .find(|s| s.style.fg == Some(NORD4) && s.content.contains('…'))
+            .expect("truncated status span present");
+        // Truncated text width should fit within the remaining budget.
+        assert!(status_span.content.width() <= 7);
+        assert!(status_span.content.ends_with('…'));
+        assert_eq!(spans_total_width(&spans), 30);
+    }
+
+    #[test]
+    fn editor_status_spans_drops_status_when_left_pre_alone_overflows() {
+        // total=12, right=4, gap=1 → left_max=7. left_pre="[proj] file.rs" (14) > 7, so it
+        // gets truncated and the status is dropped entirely.
+        let status = crate::app::StatusMessage::error("save failed: disk full");
+        let spans = build_editor_status_spans("[proj] file.rs", &status, "12:5", 12);
+        let text = spans_text(&spans);
+        // No part of the status text should make it into the rendered line.
+        assert!(
+            !text.contains("save failed"),
+            "status should have been dropped: {text:?}"
+        );
+        assert!(text.contains('…'));
+        assert!(text.ends_with("12:5"));
+        assert_eq!(spans_total_width(&spans), 12);
+    }
 }

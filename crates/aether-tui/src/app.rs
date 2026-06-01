@@ -114,6 +114,53 @@ pub struct SearchSnapshot {
     pub active: bool,
 }
 
+/// Severity tag on a transient status-row message. Drives the colour the renderer uses so the
+/// user can read the meaning of a message at a glance — success in blue (matching the
+/// committed-prefix palette), warnings in yellow, errors in red, neutral info in the default
+/// foreground. Default = `Info` so an unconfigured default-constructed [`StatusMessage`] reads
+/// as plain text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatusKind {
+    #[default]
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+/// Status-row message body + its kind. Use the `info`/`success`/`warning`/`error` constructors
+/// at call sites — those name the semantic so a quick scan of the code reveals what the
+/// message means without having to read the text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusMessage {
+    pub text: String,
+    pub kind: StatusKind,
+}
+
+impl StatusMessage {
+    pub fn info(text: impl Into<String>) -> Self {
+        Self { text: text.into(), kind: StatusKind::Info }
+    }
+    pub fn success(text: impl Into<String>) -> Self {
+        Self { text: text.into(), kind: StatusKind::Success }
+    }
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self { text: text.into(), kind: StatusKind::Warning }
+    }
+    pub fn error(text: impl Into<String>) -> Self {
+        Self { text: text.into(), kind: StatusKind::Error }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+impl std::fmt::Display for StatusMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// Top-level UI state. Anything that exists regardless of whether a buffer is open lives on
 /// `AppState`; anything that's per-screen (editor vs file browser) lives inside `Screen`.
 ///
@@ -134,7 +181,10 @@ pub struct AppState {
     pub viewport_cols: u32,
     pub viewport_rows: u32,
     pub should_quit: bool,
-    pub status: String,
+    /// Transient feedback rendered on the status row. Carries a `StatusKind` so the renderer
+    /// can colour the message — "saved" reads as success, "save failed" reads as error, etc.
+    /// Constructed via `StatusMessage::info` / `::success` / `::warning` / `::error`.
+    pub status: StatusMessage,
     /// System clipboard handle. Held for the app's lifetime so the X11 selection isn't
     /// abandoned every operation. `None` if the clipboard couldn't be initialised (e.g. headless).
     pub clipboard: Option<arboard::Clipboard>,
@@ -398,7 +448,7 @@ pub async fn bootstrap(
         viewport_cols,
         viewport_rows,
         should_quit: false,
-        status: String::new(),
+        status: StatusMessage::default(),
         clipboard: clipboard::new_handle(),
         pending_leader: None,
         picker: crate::picker::PickerState::default(),
@@ -431,7 +481,7 @@ fn empty_app_state(viewport_cols: u32, viewport_rows: u32) -> AppState {
         viewport_cols,
         viewport_rows,
         should_quit: false,
-        status: String::new(),
+        status: StatusMessage::default(),
         clipboard: clipboard::new_handle(),
         pending_leader: None,
         picker: crate::picker::PickerState::default(),
@@ -456,7 +506,7 @@ async fn activate_project_and_rebuild_editor(
     // Same-project re-select: nothing to tear down or rebuild. The picker closure above is the
     // entire effect.
     if project_name == state.project_name && state.has_editor() {
-        state.status = format!("already in project {project_name}");
+        state.status = StatusMessage::info(format!("already in project {project_name}"));
         return Ok(());
     }
 
@@ -496,7 +546,7 @@ async fn activate_project_and_rebuild_editor(
     )
     .await?;
     state.editor = Some(editor);
-    state.status = format!("activated project {}", state.project_name);
+    state.status = StatusMessage::success(format!("activated project {}", state.project_name));
     Ok(())
 }
 
@@ -654,7 +704,7 @@ async fn dispatch_terminal_event(
     // Each user-driven event clears the ephemeral status line before being processed. Anything
     // the event itself sets (save/copy feedback, search truncation, etc.) stays visible until
     // the *next* event.
-    state.status.clear();
+    state.status = StatusMessage::default();
     if let Event::Resize(cols, rows) = &ev {
         handle_resize(client, state, *cols, *rows).await
     } else {
@@ -700,7 +750,7 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
                 splice_lines(state, p);
             }
             Ok(_) => {}
-            Err(e) => state.status = format!("bad notif params: {e}"),
+            Err(e) => state.status = StatusMessage::error(format!("bad notif params: {e}")),
         }
     } else if n.method == BufferState::NAME {
         match serde_json::from_value::<BufferStateParams>(n.params) {
@@ -713,15 +763,20 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
                 ed.externally_modified = p.externally_modified;
                 ed.externally_deleted = p.externally_deleted;
                 if p.externally_deleted {
-                    state.status = "file removed on disk — save to recreate, or close buffer".into();
+                    state.status = StatusMessage::warning(
+                        "file removed on disk — save to recreate, or close buffer",
+                    );
                 } else if p.externally_modified {
-                    state.status = "file changed on disk — Ctrl-s to overwrite, or reload".into();
+                    state.status = StatusMessage::warning(
+                        "file changed on disk — Ctrl-s to overwrite, or reload",
+                    );
                 } else if !was_synced && ed.revision == ed.saved_revision {
-                    state.status = format!("saved (rev {})", ed.saved_revision);
+                    state.status =
+                        StatusMessage::success(format!("saved (rev {})", ed.saved_revision));
                 }
             }
             Ok(_) => {}
-            Err(e) => state.status = format!("bad buffer/state params: {e}"),
+            Err(e) => state.status = StatusMessage::error(format!("bad buffer/state params: {e}")),
         }
     } else if n.method == SearchStateChanged::NAME {
         match serde_json::from_value::<SearchSummary>(n.params) {
@@ -729,7 +784,9 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
                 state.ed_mut().search.summary = Some(s);
             }
             Ok(_) => {}
-            Err(e) => state.status = format!("bad search/state_changed params: {e}"),
+            Err(e) => {
+                state.status = StatusMessage::error(format!("bad search/state_changed params: {e}"))
+            }
         }
     } else if n.method == PickerUpdate::NAME {
         match serde_json::from_value::<PickerUpdateParams>(n.params) {
@@ -750,7 +807,7 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
                     ensure_picker_selected_visible(state);
                 }
             }
-            Err(e) => state.status = format!("bad picker/update params: {e}"),
+            Err(e) => state.status = StatusMessage::error(format!("bad picker/update params: {e}")),
         }
     }
 }
@@ -2351,7 +2408,7 @@ async fn finalize_close_buffer(
     let result: aether_protocol::buffer::BufferCloseResult = client
         .rpc::<BufferClose>(BufferCloseParams { buffer_id })
         .await?;
-    state.status = format!("closed {closed_label}");
+    state.status = StatusMessage::success(format!("closed {closed_label}"));
     if let Some(next) = result.next_buffer_id {
         attach_buffer(client, state, next).await?;
     } else {
@@ -2843,7 +2900,7 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
                 truncated: false,
                 current_index: 0,
             });
-            state.status = "invalid regex".into();
+            state.status = StatusMessage::warning("invalid regex");
             true
         }
     };
@@ -3237,7 +3294,7 @@ fn apply_motion_undo_result(state: &mut AppState, r: CursorUndoResult, label: &s
     if r.applied {
         state.ed_mut().cursor = r.cursor;
     } else {
-        state.status = format!("nothing to {label}");
+        state.status = StatusMessage::info(format!("nothing to {label}"));
     }
 }
 
@@ -3448,7 +3505,7 @@ async fn replace_line_with_clipboard(client: &mut Client, state: &mut AppState) 
     let text = match clipboard::paste(&mut state.clipboard) {
         Ok(t) => t,
         Err(e) => {
-            state.status = format!("clipboard read failed: {e}");
+            state.status = StatusMessage::error(format!("clipboard read failed: {e}"));
             return Ok(());
         }
     };
@@ -3722,8 +3779,8 @@ async fn copy_to_clipboard(
         .await?;
     let len = r.text.len();
     match clipboard::copy(&mut state.clipboard, r.text) {
-        Ok(()) => state.status = format!("copied {len} bytes"),
-        Err(e) => state.status = format!("copy failed: {e}"),
+        Ok(()) => state.status = StatusMessage::success(format!("copied {len} bytes")),
+        Err(e) => state.status = StatusMessage::error(format!("copy failed: {e}")),
     }
     Ok(())
 }
@@ -3743,8 +3800,8 @@ async fn cut_to_clipboard(
     state.ed_mut().cursor = r.cursor;
     let len = r.text.len();
     match clipboard::copy(&mut state.clipboard, r.text) {
-        Ok(()) => state.status = format!("cut {len} bytes"),
-        Err(e) => state.status = format!("cut to clipboard failed: {e}"),
+        Ok(()) => state.status = StatusMessage::success(format!("cut {len} bytes")),
+        Err(e) => state.status = StatusMessage::error(format!("cut to clipboard failed: {e}")),
     }
     Ok(())
 }
@@ -3755,7 +3812,7 @@ async fn paste_before(client: &mut Client, state: &mut AppState, count: u32) -> 
     let text = match clipboard::paste(&mut state.clipboard) {
         Ok(t) => t,
         Err(e) => {
-            state.status = format!("paste failed: {e}");
+            state.status = StatusMessage::error(format!("paste failed: {e}"));
             return Ok(());
         }
     };
@@ -3779,7 +3836,7 @@ async fn paste_replace(client: &mut Client, state: &mut AppState, count: u32) ->
     let text = match clipboard::paste(&mut state.clipboard) {
         Ok(t) => t,
         Err(e) => {
-            state.status = format!("paste failed: {e}");
+            state.status = StatusMessage::error(format!("paste failed: {e}"));
             return Ok(());
         }
     };
@@ -3792,7 +3849,7 @@ async fn paste_at_cursor(client: &mut Client, state: &mut AppState) -> Result<()
     let text = match clipboard::paste(&mut state.clipboard) {
         Ok(t) => t,
         Err(e) => {
-            state.status = format!("paste failed: {e}");
+            state.status = StatusMessage::error(format!("paste failed: {e}"));
             return Ok(());
         }
     };
@@ -3833,12 +3890,12 @@ async fn redo(client: &mut Client, state: &mut AppState, count: u32) -> Result<(
 
 fn apply_undo_result(state: &mut AppState, r: UndoResult, label: &str) {
     if !r.applied {
-        state.status = format!("nothing to {label}");
+        state.status = StatusMessage::info(format!("nothing to {label}"));
         return;
     }
     state.ed_mut().revision = r.revision;
     state.ed_mut().cursor = r.cursor;
-    state.status = format!("{label} (rev {})", r.revision);
+    state.status = StatusMessage::success(format!("{label} (rev {})", r.revision));
 }
 
 async fn save_buffer(client: &mut Client, state: &mut AppState) -> Result<()> {
@@ -3858,7 +3915,7 @@ async fn save_buffer_with(
         // about using save-as. Keeps `Ctrl-s` semantics uniform: it only ever writes to an
         // already-known path. We don't echo the specific save-as chord because it keeps
         // drifting; the user already knows their own keymap.
-        state.status = "scratch buffer has no path — use save-as".into();
+        state.status = StatusMessage::warning("scratch buffer has no path — use save-as");
         return Ok(());
     }
     let result = client
@@ -3875,7 +3932,7 @@ async fn save_buffer_with(
             state.ed_mut().saved_revision = r.revision;
             state.ed_mut().externally_modified = false;
             state.ed_mut().externally_deleted = false;
-            state.status = format!("saved (rev {})", r.revision);
+            state.status = StatusMessage::success(format!("saved (rev {})", r.revision));
         }
         Err(e) if is_externally_modified(&e) => {
             state.confirm_prompt = Some(ConfirmPrompt {
@@ -3890,7 +3947,7 @@ async fn save_buffer_with(
             });
         }
         Err(e) => {
-            state.status = format!("save failed: {e}");
+            state.status = StatusMessage::error(format!("save failed: {e}"));
         }
     }
     Ok(())
@@ -3908,7 +3965,7 @@ async fn reload_buffer_with(
     force: bool,
 ) -> Result<()> {
     if state.ed_mut().file_path.is_none() {
-        state.status = "scratch buffer has no path to reload".into();
+        state.status = StatusMessage::warning("scratch buffer has no path to reload");
         return Ok(());
     }
     let result = client
@@ -3923,7 +3980,7 @@ async fn reload_buffer_with(
             state.ed_mut().saved_revision = r.revision;
             state.ed_mut().externally_modified = false;
             state.ed_mut().externally_deleted = false;
-            state.status = format!("reloaded (rev {})", r.revision);
+            state.status = StatusMessage::success(format!("reloaded (rev {})", r.revision));
         }
         Err(e) if is_would_discard_changes(&e) => {
             state.confirm_prompt = Some(ConfirmPrompt {
@@ -3932,7 +3989,7 @@ async fn reload_buffer_with(
             });
         }
         Err(e) => {
-            state.status = format!("reload failed: {e}");
+            state.status = StatusMessage::error(format!("reload failed: {e}"));
         }
     }
     Ok(())
@@ -4001,7 +4058,7 @@ async fn create_project_and_open_settings(
     state.project_name = activated.project.name.clone();
     state.project_paths = activated.project.paths.clone();
     refresh_root_labels(state);
-    state.status = format!("created project {}", state.project_name);
+    state.status = StatusMessage::success(format!("created project {}", state.project_name));
     open_project_settings(state);
     Ok(())
 }
@@ -4020,7 +4077,8 @@ async fn create_file_in_explorer_dir(
         return Ok(());
     };
     let Some((path_index, rel_dir)) = strip_longest_root(&dir_abs, &state.project_paths) else {
-        state.status = format!("can't create file in {dir_abs}: outside the project");
+        state.status =
+            StatusMessage::error(format!("can't create file in {dir_abs}: outside the project"));
         return Ok(());
     };
     let relative_path = if rel_dir.is_empty() {
@@ -4191,7 +4249,7 @@ async fn commit_add_root(client: &mut Client, state: &mut AppState) -> Result<()
                 s.add_input.clear();
                 s.selected = s.roots.len();
             }
-            state.status = format!("added root to {project_name}");
+            state.status = StatusMessage::success(format!("added root to {project_name}"));
         }
         Err(e) => {
             if let Some(s) = state.project_settings.as_mut() {
@@ -4235,14 +4293,14 @@ async fn remove_root(
                     }
                 }
             }
-            state.status = if closed.is_empty() {
+            state.status = StatusMessage::success(if closed.is_empty() {
                 format!("removed root from {project_name}")
             } else {
                 format!(
                     "removed root from {project_name}; closed {} buffer(s)",
                     closed.len()
                 )
-            };
+            });
         }
         Err(e) => {
             // Surface the failure inside the overlay when it's open (the common case — `remove_root`
@@ -4261,7 +4319,7 @@ async fn remove_root(
             if let Some(s) = state.project_settings.as_mut() {
                 s.error = Some(msg);
             } else {
-                state.status = msg;
+                state.status = StatusMessage::error(msg);
             }
         }
     }
@@ -4435,7 +4493,8 @@ async fn send_save_prompt(
                 // No project root configured — fall back to the typed path verbatim.
                 ed.file_label = path.clone();
             }
-            state.status = format!("saved as {} (rev {})", path, r.revision);
+            state.status =
+                StatusMessage::success(format!("saved as {} (rev {})", path, r.revision));
         }
         Err(e) if is_would_overwrite(&e) => {
             // Keep the save-prompt open and overlay a confirm prompt on top. If the user
@@ -4449,7 +4508,7 @@ async fn send_save_prompt(
         Err(e) => {
             state.save_prompt = None;
             apply_cursor_style(state);
-            state.status = format!("save failed: {e}");
+            state.status = StatusMessage::error(format!("save failed: {e}"));
         }
     }
     Ok(())
@@ -4582,13 +4641,13 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
     if matches!(new_wrap, WrapMode::Soft) {
         state.ed_mut().scroll_col = 0;
     }
-    state.status = format!(
+    state.status = StatusMessage::info(format!(
         "wrap: {}",
         match new_wrap {
             WrapMode::Soft => "on",
             WrapMode::None => "off",
         }
-    );
+    ));
     Ok(())
 }
 
