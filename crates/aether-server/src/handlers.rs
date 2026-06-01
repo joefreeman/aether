@@ -18,7 +18,8 @@ use aether_protocol::cursor::{
     VerticalDirection,
 };
 use aether_protocol::directory::{
-    DirectoryEntry, DirectoryListParams, DirectoryListResult,
+    DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryListParams,
+    DirectoryListResult,
 };
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
@@ -574,22 +575,22 @@ pub async fn buffer_open(
                 }
                 Some(r) => base.join(r),
             };
-            // Canonicalize the parent (which must exist) and then re-attach the file name. This
-            // lets us resolve the absolute path even when `create_if_missing` is set and the
-            // file itself doesn't exist yet.
+            // Resolve to a canonical-shaped path. When the target file already exists,
+            // straight canonicalize. When `create_if_missing` is set and the file (or even
+            // some of its parents — multi-segment paths like `foo/bar/baz.rs`) doesn't
+            // exist, walk up to the deepest existing ancestor via `canonicalize_partial`
+            // and re-attach the not-yet-existing tail. The file (and any missing parents)
+            // is written to disk at the first save; the boundary check below runs against
+            // the resolved path either way.
             match std::fs::canonicalize(&candidate) {
                 Ok(p) => p,
                 Err(_) if params.create_if_missing => {
-                    let parent = candidate.parent().ok_or_else(|| {
-                        RpcError::invalid_path(format!("no parent for {}", candidate.display()))
-                    })?;
-                    let parent_canonical = std::fs::canonicalize(parent).map_err(|e| {
-                        RpcError::invalid_path(format!("canonicalizing {}: {e}", parent.display()))
-                    })?;
-                    let file_name = candidate.file_name().ok_or_else(|| {
-                        RpcError::invalid_path(format!("no file name in {}", candidate.display()))
-                    })?;
-                    parent_canonical.join(file_name)
+                    canonicalize_partial(&candidate).map_err(|e| {
+                        RpcError::invalid_path(format!(
+                            "canonicalizing {}: {e}",
+                            candidate.display()
+                        ))
+                    })?
                 }
                 Err(e) => {
                     return Err(RpcError::invalid_path(format!(
@@ -1499,7 +1500,9 @@ pub async fn buffer_save(
             // directories — `save-as foo/bar/baz.txt` should `mkdir -p foo/bar` rather than
             // erroring. So: resolve the parent by canonicalizing the deepest *existing*
             // ancestor and re-attaching the not-yet-created tail; boundary-check that
-            // resolved path *before* any I/O; then create the missing intermediate dirs.
+            // resolved path *before* any I/O. The actual mkdir-p happens just before the
+            // write below (which also covers the in-place save case where the buffer was
+            // bound to a multi-segment path via `buffer/open { create_if_missing }`).
             let parent = target.parent().ok_or_else(|| {
                 RpcError::invalid_path(format!("{} has no parent directory", target.display()))
             })?;
@@ -1519,12 +1522,6 @@ pub async fn buffer_save(
                 )));
             }
             drop(s);
-
-            // Boundary check passed — safe to create the missing parent dirs now. No-op when
-            // the parent already exists.
-            if !parent_canonical.exists() {
-                std::fs::create_dir_all(&parent_canonical).map_err(RpcError::file_io)?;
-            }
             resolved
         }
         (None, Some(_)) => {
@@ -1584,6 +1581,17 @@ pub async fn buffer_save(
                 if buf.externally_modified {
                     return Err(RpcError::externally_modified(params.buffer_id));
                 }
+            }
+        }
+        // Ensure the target's parent dir exists right before the write. Covers both:
+        //   - save-as into a new subdir (`save-as foo/bar/baz.txt` with `foo/bar` missing);
+        //   - in-place save of a buffer that was bound to a multi-segment path via
+        //     `buffer/open { create_if_missing }` (the parent dirs deferred from open).
+        // Idempotent when the parent already exists. Boundary check ran earlier — this
+        // never creates dirs outside the project.
+        if let Some(parent) = target.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(RpcError::file_io)?;
             }
         }
         let buf = s
@@ -4983,6 +4991,34 @@ pub async fn directory_list(
                 is_dir: e.is_dir,
             })
             .collect(),
+    })
+}
+
+/// Create a directory (and any missing intermediates), enforcing the project boundary first so
+/// a `../escape/newdir` request can't produce dirs above the project root. Returns the
+/// canonical absolute path of the created dir — clients use it to navigate into the new dir.
+pub async fn directory_create(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: DirectoryCreateParams,
+) -> Result<DirectoryCreateResult, RpcError> {
+    let raw = std::path::PathBuf::from(&params.path);
+    // Resolve against the deepest existing ancestor so a not-yet-existing target is still a
+    // canonical-shaped path we can boundary-check before any I/O.
+    let resolved = canonicalize_partial(&raw)
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
+    {
+        let s = state.lock().await;
+        if !s.active_project_or_err(ctx.client_id)?.contains(&resolved) {
+            return Err(RpcError::invalid_path(format!(
+                "{} is outside the project's access boundary",
+                resolved.display()
+            )));
+        }
+    }
+    std::fs::create_dir_all(&resolved).map_err(RpcError::file_io)?;
+    Ok(DirectoryCreateResult {
+        path: resolved.display().to_string(),
     })
 }
 

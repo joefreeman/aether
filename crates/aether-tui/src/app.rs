@@ -1887,11 +1887,18 @@ fn compute_grep_prefill(state: &AppState) -> Option<String> {
 }
 
 /// Initial directory for a freshly-opened Explorer picker: parent of the active buffer's
-/// file, or the first project root for scratch buffers.
+/// file, or the first project root for scratch buffers. Walks up to the deepest *existing*
+/// ancestor — a buffer attached via `create_if_missing` for a multi-segment path (e.g.
+/// `foo/bar.rs` where `foo/` doesn't exist yet) would otherwise hand the server a
+/// not-yet-existing dir to canonicalize, which fails the open.
 fn default_explorer_dir(state: &AppState) -> Option<String> {
     if let Some(p) = state.ed().file_path.as_deref() {
-        if let Some(parent) = std::path::Path::new(p).parent() {
-            return Some(parent.display().to_string());
+        let mut cursor = std::path::Path::new(p).parent();
+        while let Some(dir) = cursor {
+            if dir.is_dir() {
+                return Some(dir.display().to_string());
+            }
+            cursor = dir.parent();
         }
     }
     state.project_paths.first().cloned()
@@ -2280,16 +2287,20 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
         create_project_and_open_settings(client, state, &name).await?;
         return Ok(());
     }
-    // Synthetic "+ create" row in the Explorer picker: create a new file at the picker's
-    // current directory using the typed name. Routes through `buffer/open { create_if_missing }`
-    // so the server allocates a fresh buffer pre-bound to the not-yet-existing path; the user's
-    // first save writes it to disk (with mkdir-p of any missing intermediate dirs).
+    // Synthetic "+ create" row in the Explorer picker. A trailing `/` on the typed query
+    // switches the action from "create file" to "create directory". File creation routes
+    // through `buffer/open { create_if_missing }`; directory creation routes through
+    // `directory/create` and then navigates the picker into the new dir so the user can
+    // immediately start typing a filename inside it.
     if kind == PickerKind::Explorer && state.picker.highlighted_is_synthetic_create() {
-        let name = state.picker.query.text.trim().to_string();
-        if name.is_empty() {
+        let raw = state.picker.query.text.trim().to_string();
+        if raw.is_empty() {
             return Ok(());
         }
-        return create_file_in_explorer_dir(client, state, &name).await;
+        if let Some(name) = raw.strip_suffix('/') {
+            return create_directory_in_explorer_dir(client, state, name).await;
+        }
+        return create_file_in_explorer_dir(client, state, &raw).await;
     }
     let Some(item) = state.picker.highlighted().cloned() else {
         return Ok(());
@@ -4171,6 +4182,38 @@ async fn create_file_in_explorer_dir(
         })
         .await?;
     subscribe_to_buffer(client, state, open).await
+}
+
+/// Handle the Explorer's "+ create directory" synthetic row: create the directory via
+/// `directory/create`, then navigate the picker into the new (empty) dir so the user can
+/// immediately type a filename and create their first file inside it. The synthetic-row
+/// recompute already enforces single-segment names and refuses to overwrite an existing
+/// entry, so we don't need to defend here.
+async fn create_directory_in_explorer_dir(
+    client: &mut Client,
+    state: &mut AppState,
+    name: &str,
+) -> Result<()> {
+    use aether_protocol::directory::{DirectoryCreate, DirectoryCreateParams};
+    let Some(dir_abs) = state.picker.explorer_dir.clone() else {
+        return Ok(());
+    };
+    let target = std::path::Path::new(&dir_abs)
+        .join(name)
+        .display()
+        .to_string();
+    let result = match client
+        .rpc::<DirectoryCreate>(DirectoryCreateParams { path: target })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state.status = StatusMessage::error(format!("create directory failed: {e}"));
+            return Ok(());
+        }
+    };
+    state.status = StatusMessage::success(format!("created directory {}", result.path));
+    picker_navigate_to_dir(client, state, result.path, None).await
 }
 
 // ---- project settings -------------------------------------------------------------------------

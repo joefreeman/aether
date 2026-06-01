@@ -845,12 +845,21 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
             }
         }
         let highlighted = i == state.picker.selected;
-        lines.push(Line::from(picker_item_spans(
+        let mut spans = picker_item_spans(
             item,
             &state.root_labels,
             highlighted,
             text_width as usize,
-        )));
+        );
+        // Italicise the synthetic "+ Create …" row so it reads as an action affordance rather
+        // than a real entry. Applied uniformly across all spans of the row (including any
+        // fuzzy-match-highlight spans), since the synthetic never has match indices anyway.
+        if Some(i) == state.picker.synthetic_create_idx {
+            for span in spans.iter_mut() {
+                span.style = span.style.add_modifier(Modifier::ITALIC);
+            }
+        }
+        lines.push(Line::from(spans));
     }
     f.render_widget(
         Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),

@@ -395,9 +395,32 @@ impl PickerState {
                 // Shell-tab-completion style: the typed query is a literal prefix of the entry
                 // name. Natural candidate order preserved (dirs-then-files, alphabetical
                 // within each, as the listing builder produced it).
-                let (qc, case_insensitive) = smartcase_query(&self.query);
+                //
+                // Trailing-`/` convention (Explorer only): if the user's query ends with `/`,
+                // they're explicitly looking for a directory. Strip the slash for the prefix
+                // match *and* drop file entries from the result — `foo/` should match only
+                // `foo*` directories, never `foo.txt`. ExplorerRoots is unaffected: roots are
+                // conceptually directories and don't carry an `is_dir` flag.
+                let dir_only_filter = matches!(&self.candidates, PickerCandidates::Explorer(_))
+                    && self.query.ends_with('/');
+                let effective_query: &str = if dir_only_filter {
+                    self.query.trim_end_matches('/')
+                } else {
+                    &self.query
+                };
+                let (qc, case_insensitive) = smartcase_query(effective_query);
                 let mut buf = String::new();
                 for i in 0..self.candidates.len() {
+                    if dir_only_filter {
+                        // We've already confirmed `Explorer(_)` above; this match is just
+                        // pulling the `is_dir` flag out for the filter.
+                        let PickerCandidates::Explorer(e) = &self.candidates else {
+                            unreachable!("dir_only_filter implies Explorer candidates");
+                        };
+                        if !e.entries[i].is_dir {
+                            continue;
+                        }
+                    }
                     let name = self.candidates.display_at(i);
                     let starts = if case_insensitive {
                         buf.clear();
@@ -443,8 +466,19 @@ impl PickerState {
         let query_active = !self.query.is_empty();
         let pattern = (query_active && strategy == MatchStrategy::Fuzzy)
             .then(|| Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart));
+        // For prefix-match highlighting, count chars in the *effective* query — strip the
+        // trailing `/` for Explorer's dir-only case so we don't highlight one char past the
+        // end of the entry name. (E.g. `foo/` against entry `food` should highlight `foo`,
+        // not `food`.)
         let prefix_len: u32 = if query_active && strategy == MatchStrategy::PrefixSmartcase {
-            self.query.chars().count() as u32
+            let effective = if matches!(&self.candidates, PickerCandidates::Explorer(_))
+                && self.query.ends_with('/')
+            {
+                self.query.trim_end_matches('/')
+            } else {
+                &self.query
+            };
+            effective.chars().count() as u32
         } else {
             0
         };

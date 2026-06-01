@@ -163,11 +163,13 @@ impl PickerState {
         true
     }
 
-    /// Recompute the synthetic "+ create" row. Called after any change to `items` or `query`.
-    /// Appends a row labeled `+ create "<query>"` to `items` when the query is non-empty and
-    /// doesn't exactly match an existing entry — Projects use it to create new projects, and
-    /// Explorer uses it to create a new file at the current directory. Idempotent: strips any
-    /// prior synthetic row first.
+    /// Recompute the synthetic "Create …" row. Called after any change to `items` or `query`.
+    /// Appends a row labeled `Create <kind> "<query>"` to `items` when the query is non-empty
+    /// and doesn't exactly match an existing entry — Projects use it to create new projects,
+    /// and Explorer uses it to create a new file (or directory, when the query ends with `/`)
+    /// at the current directory. The italic styling at render time is what signals "this is
+    /// an action, not an entry"; we don't need a leading `+` decoration to convey the same.
+    /// Idempotent: strips any prior synthetic row first.
     pub fn recompute_synthetic_create_row(&mut self) {
         // Strip prior synthetic row if present.
         if let Some(idx) = self.synthetic_create_idx.take() {
@@ -189,29 +191,61 @@ impl PickerState {
                     return;
                 }
                 PickerItem::Project {
-                    name: format!("+ create \"{q}\""),
+                    name: format!("Create project \"{q}\""),
                     match_indices: Vec::new(),
                 }
             }
             Some(PickerKind::Explorer) => {
-                // Don't offer "+ create" while a real entry exactly matches the typed name —
-                // that's an existing file/dir the user can just Enter on. Slashes in `q` are
-                // also rejected: file creation here is single-segment within the current dir
-                // (mkdir-p flows live in save-as, not here).
-                if q.contains('/') {
+                // A trailing `/` switches the synthetic from "Create file …" to "Create
+                // directory …". We strip it once to get the base name. Multiple-segment
+                // paths (`foo/bar/`, `foo/bar.rs`) are allowed — the server's
+                // `directory/create` and `buffer/open { create_if_missing }` both mkdir-p the
+                // intermediate dirs, so the synthetic just hands them the full relative path.
+                let (base, dir_intent) = match q.strip_suffix('/') {
+                    Some(stripped) => (stripped, true),
+                    None => (q, false),
+                };
+                if base.is_empty() {
                     return;
                 }
-                let already_exists = self.items.iter().any(|item| match item {
-                    PickerItem::DirEntry { name, .. } => name == q,
-                    _ => false,
-                });
-                if already_exists {
+                // Validate each segment: no empty (rules out `foo//bar`), no `.` or `..`
+                // (rules out `./`, `..`, `foo/./bar`, `foo/../bar` — `.` and `..` aren't
+                // legal filenames and the server's boundary check would reject the traversal
+                // anyway). Catches `.` and `./` as the most common confusions.
+                let segments_valid = base
+                    .split('/')
+                    .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
+                if !segments_valid {
                     return;
                 }
+                // Single-segment names: the items vec covers the current dir, so we can check
+                // whether the typed name already exists and suppress the synthetic. Multi-
+                // segment names refer to paths outside the current dir's listing — we trust
+                // the server (mkdir-p is idempotent, and `buffer/open` opens an existing file
+                // when `create_if_missing` finds one).
+                if !base.contains('/') {
+                    let already_exists = self.items.iter().any(|item| match item {
+                        PickerItem::DirEntry { name, .. } => name == base,
+                        _ => false,
+                    });
+                    if already_exists {
+                        return;
+                    }
+                }
+                let label = if dir_intent {
+                    // The word "directory" already signals what's getting created; no need
+                    // for a trailing `/` to disambiguate. Keeping `is_dir: false` below so
+                    // the row picks up the same neutral white styling as the file variant —
+                    // it's an *action* affordance, not a real entry.
+                    format!("Create directory \"{base}\"")
+                } else {
+                    format!("Create file \"{base}\"")
+                };
                 PickerItem::DirEntry {
-                    name: format!("+ create \"{q}\""),
-                    // Synthetic is always a leaf-file affordance: routing through buffer/open
-                    // with create_if_missing creates the file, not a directory.
+                    name: label,
+                    // Always `false` — see comment above. The selector routes via
+                    // `synthetic_create_idx` + the trailing-slash check in the query, so this
+                    // flag never reaches the navigate-into-dir path in `select_picker_item`.
                     is_dir: false,
                     match_indices: Vec::new(),
                 }
@@ -321,8 +355,8 @@ mod tests {
         let last = s.items.last().unwrap();
         match last {
             PickerItem::DirEntry { name, is_dir, .. } => {
-                assert_eq!(name, "+ create \"newfile.rs\"");
-                assert!(!is_dir, "synthetic create row is always a file affordance");
+                assert_eq!(name, "Create file \"newfile.rs\"");
+                assert!(!is_dir, "synthetic row is always rendered as a neutral action");
             }
             other => panic!("expected DirEntry, got {other:?}"),
         }
@@ -339,12 +373,100 @@ mod tests {
     }
 
     #[test]
-    fn explorer_synthetic_suppressed_when_query_contains_slash() {
-        // Cross-directory creation lives in save-as, not here — the picker is single-segment.
+    fn explorer_synthetic_allows_multi_segment_paths() {
+        // Multi-segment names are allowed; the server's mkdir-p creates intermediate dirs at
+        // commit time. The items existence check is skipped (it only covers the current dir).
         let mut s = empty_state(PickerKind::Explorer, "subdir/newfile.rs");
         s.items = vec![dir_entry("src", true)];
         s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 2);
+        match s.items.last().unwrap() {
+            PickerItem::DirEntry { name, .. } => {
+                assert_eq!(name, "Create file \"subdir/newfile.rs\"");
+            }
+            other => panic!("expected DirEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explorer_synthetic_allows_multi_segment_dirs() {
+        let mut s = empty_state(PickerKind::Explorer, "subdir/inner/");
+        s.items = Vec::new();
+        s.recompute_synthetic_create_row();
         assert_eq!(s.items.len(), 1);
+        match s.items.last().unwrap() {
+            PickerItem::DirEntry { name, .. } => {
+                assert_eq!(name, "Create directory \"subdir/inner\"");
+            }
+            other => panic!("expected DirEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explorer_synthetic_suppressed_for_dot_segments() {
+        // `.`, `./`, `..`, `../`, `foo/./bar`, `foo/../bar`, `foo//bar` — none of these are
+        // legal filenames; the synthetic shouldn't tempt the user into trying.
+        for query in [".", "./", "..", "../", "foo/./bar", "foo/../bar", "foo//bar"] {
+            let mut s = empty_state(PickerKind::Explorer, query);
+            s.items = Vec::new();
+            s.recompute_synthetic_create_row();
+            assert!(
+                s.synthetic_create_idx.is_none(),
+                "synthetic should be suppressed for {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explorer_synthetic_switches_to_dir_intent_on_trailing_slash() {
+        let mut s = empty_state(PickerKind::Explorer, "newdir/");
+        s.items = vec![dir_entry("src", true)];
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 2);
+        match s.items.last().unwrap() {
+            PickerItem::DirEntry { name, is_dir, .. } => {
+                assert_eq!(name, "Create directory \"newdir\"");
+                assert!(
+                    !is_dir,
+                    "synthetic stays `is_dir: false` so it inherits the neutral file styling"
+                );
+            }
+            other => panic!("expected DirEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explorer_synthetic_dir_suppressed_when_name_already_exists() {
+        // An existing file blocks a dir-create with the same base name (filesystem would
+        // refuse anyway). Same in reverse: an existing dir blocks file creation.
+        let mut s = empty_state(PickerKind::Explorer, "src/");
+        s.items = vec![dir_entry("src", true)];
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 1);
+        assert!(s.synthetic_create_idx.is_none());
+    }
+
+    #[test]
+    fn explorer_synthetic_dir_suppressed_against_existing_dir_entry() {
+        // Regression: when the user types `newdir/`, the client strips the trailing slash
+        // before filtering server-side — so the existing `newdir` entry stays in items, and
+        // the recompute must spot it and suppress the synthetic. (Before the fix, the slash
+        // made it to the server's prefix filter, hid `newdir` from items, and the synthetic
+        // was offered for a directory that already existed.)
+        let mut s = empty_state(PickerKind::Explorer, "newdir/");
+        s.items = vec![dir_entry("newdir", true)];
+        s.recompute_synthetic_create_row();
+        assert_eq!(s.items.len(), 1, "no synthetic when the dir already exists");
+        assert!(s.synthetic_create_idx.is_none());
+    }
+
+    #[test]
+    fn explorer_synthetic_dir_suppressed_when_only_slash() {
+        // "/" alone strips to empty — nothing to create.
+        let mut s = empty_state(PickerKind::Explorer, "/");
+        s.items = Vec::new();
+        s.recompute_synthetic_create_row();
+        assert!(s.items.is_empty());
         assert!(s.synthetic_create_idx.is_none());
     }
 
@@ -370,7 +492,7 @@ mod tests {
         s.recompute_synthetic_create_row();
         assert_eq!(s.items.len(), 2);
         match s.items.last().unwrap() {
-            PickerItem::DirEntry { name, .. } => assert_eq!(name, "+ create \"other.rs\""),
+            PickerItem::DirEntry { name, .. } => assert_eq!(name, "Create file \"other.rs\""),
             other => panic!("expected DirEntry, got {other:?}"),
         }
     }
@@ -402,8 +524,8 @@ mod tests {
             false,
         );
         assert!(ok);
-        // Items should be [a.rs, b.rs, c.rs, "+ create"] — the synthetic re-added without
-        // having removed `b.rs` (which would happen if the stale idx=1 was used).
+        // Items should be [a.rs, b.rs, c.rs, "Create file …"] — the synthetic re-added
+        // without having removed `b.rs` (which would happen if the stale idx=1 was used).
         assert_eq!(s.items.len(), 4);
         let names: Vec<&str> = s
             .items
@@ -413,6 +535,6 @@ mod tests {
                 _ => panic!(),
             })
             .collect();
-        assert_eq!(names, vec!["a.rs", "b.rs", "c.rs", "+ create \"ne\""]);
+        assert_eq!(names, vec!["a.rs", "b.rs", "c.rs", "Create file \"ne\""]);
     }
 }

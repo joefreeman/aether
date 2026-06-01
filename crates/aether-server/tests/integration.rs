@@ -8054,6 +8054,81 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
     drop(server);
 }
 
+/// Regression: `buffer/open { create_if_missing: true }` used to canonicalize the parent dir,
+/// which fails when the parent itself doesn't exist. With a multi-segment path like
+/// `foo/bar.rs` and no pre-existing `foo/`, that crashed the client. The fix is to use
+/// `canonicalize_partial` so the boundary check works against a not-fully-existing path; the
+/// actual mkdir-p happens at save time.
+#[tokio::test]
+async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    // Open with a path whose parent (`foo/`) doesn't exist yet.
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("foo/bar.rs".into()),
+            language: None,
+            create_if_missing: true,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert!(
+        open.path.as_deref().is_some_and(|p| p.ends_with("foo/bar.rs")),
+        "buffer should be bound to the not-yet-existing multi-segment path; got {:?}",
+        open.path
+    );
+    // Nothing on disk yet — `create_if_missing` only allocates a buffer, the file (and its
+    // missing parents) materialise at save time.
+    assert!(!dir_path.join("foo").exists());
+
+    // Now save: this should mkdir-p `foo/` and write the file.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id: open.buffer_id,
+            text: "hello\n".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        4,
+        &BufferSaveParams {
+            buffer_id: open.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(dir_path.join("foo").is_dir(), "save should mkdir-p the parent");
+    let written = std::fs::read_to_string(dir_path.join("foo/bar.rs")).unwrap();
+    assert_eq!(written, "hello\n");
+    drop(server);
+}
+
 /// Save-as into a not-yet-existing subdirectory creates the directory tree on the fly — same
 /// `mkdir -p` semantics you'd get from a shell. Covers the common "I want to save into a new
 /// folder I haven't made yet" flow without making the user pre-create the dir.
@@ -10123,6 +10198,99 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
     drop(server);
 }
 
+/// A trailing `/` on the Explorer query restricts the match to directory entries — a user
+/// typing `foo/` is asking "show me dirs starting with foo", not "match files too". The
+/// stripped prefix (`foo`) is what's matched against entry names.
+#[tokio::test]
+async fn picker_explorer_trailing_slash_filters_to_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("src-extra")).unwrap();
+    std::fs::write(root.join("src.txt"), "file with src prefix\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![canonical_root.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    // Plain `src` matches both dirs and the file.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            kind: PickerKind::Explorer,
+            query: "src".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let plain = expect_notification::<PickerUpdate>(&mut ws).await;
+    let names: Vec<String> = plain
+        .items
+        .iter()
+        .map(|i| match i {
+            PickerItem::DirEntry { name, .. } => name.clone(),
+            other => panic!("expected DirEntry, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["src", "src-extra", "src.txt"]);
+
+    // `src/` matches only the dirs.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        4,
+        &PickerQueryParams {
+            kind: PickerKind::Explorer,
+            query: "src/".into(),
+            generation: 2,
+        },
+    )
+    .await;
+    let slashed = expect_notification::<PickerUpdate>(&mut ws).await;
+    let names: Vec<String> = slashed
+        .items
+        .iter()
+        .map(|i| match i {
+            PickerItem::DirEntry { name, is_dir, .. } => {
+                assert!(*is_dir, "trailing `/` filter must drop non-dir entries");
+                name.clone()
+            }
+            other => panic!("expected DirEntry, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["src", "src-extra"]);
+
+    drop(server);
+}
+
 /// Clearing the explorer query (Alt-Backspace on the client) sends a `picker/query` with an
 /// empty string and the bumped generation; the server reranks and the push restores the full
 /// directory listing.
@@ -10467,6 +10635,72 @@ async fn directory_list_rejects_missing_path() {
     assert!(
         err.contains("canonicalizing"),
         "missing path should fail canonicalization; got: {err}"
+    );
+    drop(server);
+}
+
+/// `directory/create` creates the requested directory inside the project and returns its
+/// canonical absolute path. mkdir-p semantics so multi-level paths in one call work too.
+#[tokio::test]
+async fn directory_create_makes_dir_and_returns_canonical_path() {
+    use aether_protocol::directory::{DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult};
+    let (server, mut ws, root) = setup_explorer_workspace().await;
+    let target = root.join("brand-new");
+    let result: DirectoryCreateResult = send_request::<DirectoryCreate>(
+        &mut ws,
+        30,
+        &DirectoryCreateParams {
+            path: target.display().to_string(),
+        },
+    )
+    .await;
+    assert_eq!(result.path, target.to_str().unwrap());
+    assert!(target.is_dir(), "directory should exist on disk after the call");
+    drop(server);
+}
+
+/// `directory/create` enforces the project boundary — `../escape/...` requests are refused
+/// and produce no filesystem side effects. Mirrors the equivalent save-as guard so we don't
+/// accidentally have an "anyone with the active project can mkdir anywhere" hole.
+#[tokio::test]
+async fn directory_create_refuses_outside_project_boundary() {
+    use aether_protocol::directory::{DirectoryCreate, DirectoryCreateParams};
+    let outer = tempfile::tempdir().unwrap();
+    let project = outer.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_canonical = std::fs::canonicalize(&project).unwrap();
+    std::mem::forget(outer);
+
+    let server = spawn_for_test("test-proj", vec![project_canonical.clone()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let escape = project_canonical.parent().unwrap().join("escape");
+    let err = send_request_expect_err::<DirectoryCreate>(
+        &mut ws,
+        2,
+        &DirectoryCreateParams {
+            path: escape.display().to_string(),
+        },
+    )
+    .await;
+    assert!(
+        err.contains("outside the project") || err.contains("canonicalizing"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !escape.exists(),
+        "boundary check must run before mkdir — `escape` dir should not exist"
     );
     drop(server);
 }

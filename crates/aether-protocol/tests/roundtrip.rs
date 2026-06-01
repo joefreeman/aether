@@ -5,7 +5,8 @@
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::{CursorMove, CursorMoveParams, Direction, Motion, WordBoundary};
 use aether_protocol::directory::{
-    DirectoryEntry, DirectoryList, DirectoryListParams, DirectoryListResult,
+    DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryList,
+    DirectoryListParams, DirectoryListResult,
 };
 use aether_protocol::envelope::{
     ClientInbound, ErrorObject, ErrorResponse, JsonRpc, Notification, NotificationMethod, Request,
@@ -239,6 +240,21 @@ fn directory_list_result_shape() {
     assert_eq!(v["parent"], "/home/foo/proj");
     assert_eq!(v["entries"][0], json!({"name": "lib", "is_dir": true}));
     assert_eq!(v["entries"][1], json!({"name": "main.rs", "is_dir": false}));
+}
+
+#[test]
+fn directory_create_method_name_and_shape() {
+    assert_eq!(DirectoryCreate::NAME, "directory/create");
+    let params = to_value(DirectoryCreateParams {
+        path: "/proj/newdir".into(),
+    })
+    .unwrap();
+    assert_eq!(params, json!({ "path": "/proj/newdir" }));
+    let result = to_value(DirectoryCreateResult {
+        path: "/proj/newdir".into(),
+    })
+    .unwrap();
+    assert_eq!(result, json!({ "path": "/proj/newdir" }));
 }
 
 #[test]

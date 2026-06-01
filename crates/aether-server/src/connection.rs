@@ -18,7 +18,7 @@ use aether_protocol::cursor::{
     CursorContract, CursorExpand, CursorMove, CursorRedo, CursorSelectLine, CursorSet,
     CursorSwapAnchor, CursorUndo,
 };
-use aether_protocol::directory::DirectoryList;
+use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
@@ -289,6 +289,7 @@ async fn dispatch(
         PickerHide::NAME => run!(PickerHide, handlers::picker_hide),
         PickerGrepNavigate::NAME => run!(PickerGrepNavigate, handlers::picker_grep_navigate),
         DirectoryList::NAME => run!(DirectoryList, handlers::directory_list),
+        DirectoryCreate::NAME => run!(DirectoryCreate, handlers::directory_create),
         other => Err(RpcError::method_not_found(other)),
     }
 }
