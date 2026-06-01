@@ -1850,7 +1850,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         };
         Line::from(vec![Span::raw(text)])
     } else {
-        let dirty_marker = buffer_status_markers(state);
+        let dirty_marker = state.buffer_status_marker();
         // Project / file / dirty / transient status sit on the left; counter (search and/or
         // grep, in that order) and cursor position sit on the right, with the counter to the
         // left of the position. When the row is narrow we truncate the right edge of the left
@@ -2076,23 +2076,6 @@ fn truncate_to_width(s: &str, max: usize) -> String {
     out
 }
 
-/// Status-bar indicator for buffer state. Single-character, highest-precedence wins — the
-/// operational safety net (can't silently lose work) is enforced by the save and reload
-/// error codes, so the status bar just flags the most-urgent condition.
-///   `[x]` = file removed on disk
-///   `[!]` = file modified on disk
-///   `[+]` = unsaved local edits
-fn buffer_status_markers(state: &AppState) -> &'static str {
-    if state.ed().externally_deleted {
-        "[x]"
-    } else if state.ed().externally_modified {
-        "[!]"
-    } else if state.dirty() {
-        "[+]"
-    } else {
-        ""
-    }
-}
 
 /// In insert mode: `A:B` (just the cursor). In normal mode: `A:B-C:D` (half-open) — A:B is the
 /// first byte of the selection, C:D is one byte past the last selected char. When the cursor /

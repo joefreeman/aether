@@ -185,6 +185,10 @@ pub struct AppState {
     /// can colour the message — "saved" reads as success, "save failed" reads as error, etc.
     /// Constructed via `StatusMessage::info` / `::success` / `::warning` / `::error`.
     pub status: StatusMessage,
+    /// Mirror of the most recently emitted terminal-title escape sequence. We only re-emit
+    /// when [`terminal_title`] derives something different, so frame-loop draws don't spam OSC
+    /// sequences down stdout. Empty string at startup; populated on the first render.
+    pub last_terminal_title: String,
     /// System clipboard handle. Held for the app's lifetime so the X11 selection isn't
     /// abandoned every operation. `None` if the clipboard couldn't be initialised (e.g. headless).
     pub clipboard: Option<arboard::Clipboard>,
@@ -342,8 +346,24 @@ impl AppState {
             .expect("BUG: AppState::ed_mut() called without an active editor")
     }
 
-    pub fn dirty(&self) -> bool {
-        self.ed().revision != self.ed().saved_revision
+    /// Single-character buffer-state marker, mirroring the status row:
+    ///   `[x]` — file removed on disk; `[!]` — file modified on disk; `[+]` — unsaved local
+    /// edits; `""` — clean. Highest-precedence wins so the user always sees the most urgent
+    /// flag. Empty when no editor is attached.
+    pub fn buffer_status_marker(&self) -> &'static str {
+        if !self.has_editor() {
+            return "";
+        }
+        let ed = self.ed();
+        if ed.externally_deleted {
+            "[x]"
+        } else if ed.externally_modified {
+            "[!]"
+        } else if ed.revision != ed.saved_revision {
+            "[+]"
+        } else {
+            ""
+        }
     }
 }
 
@@ -449,6 +469,7 @@ pub async fn bootstrap(
         viewport_rows,
         should_quit: false,
         status: StatusMessage::default(),
+        last_terminal_title: String::new(),
         clipboard: clipboard::new_handle(),
         pending_leader: None,
         picker: crate::picker::PickerState::default(),
@@ -482,6 +503,7 @@ fn empty_app_state(viewport_cols: u32, viewport_rows: u32) -> AppState {
         viewport_rows,
         should_quit: false,
         status: StatusMessage::default(),
+        last_terminal_title: String::new(),
         clipboard: clipboard::new_handle(),
         pending_leader: None,
         picker: crate::picker::PickerState::default(),
@@ -666,6 +688,7 @@ pub async fn run(
 
     apply_cursor_style(state);
     terminal.draw(|f| ui::draw(f, state))?;
+    refresh_terminal_title(state);
     while !state.should_quit {
         tokio::select! {
             ev = event_rx.recv() => {
@@ -692,8 +715,51 @@ pub async fn run(
         flush_pending_scroll(client, state).await?;
         flush_pending_picker_scroll(client, state).await?;
         terminal.draw(|f| ui::draw(f, state))?;
+        refresh_terminal_title(state);
     }
     Ok(())
+}
+
+/// Re-emit the terminal title via OSC if the derived title has changed since the last frame.
+/// Cheap when state is unchanged (just a string compare); a single OSC write when it does
+/// change. Failures are swallowed — the title is cosmetic and we'd rather have the editor
+/// keep running than crash on a quirky terminal that doesn't accept the sequence.
+fn refresh_terminal_title(state: &mut AppState) {
+    let title = terminal_title(state);
+    if title == state.last_terminal_title {
+        return;
+    }
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let _ = crossterm::queue!(stdout, crossterm::terminal::SetTitle(&title));
+    let _ = stdout.flush();
+    state.last_terminal_title = title;
+}
+
+/// Derive the terminal title from the current state. Mirrors the left segment of the editor
+/// status row — `[{project}] {file_label}` with an optional ` {marker}` — so the title
+/// answers "what am I editing?" at a glance. Before any project is active we fall back to a
+/// bare `Aether` placeholder; without a buffer (transient project-switch window) we just show
+/// the project name.
+fn terminal_title(state: &AppState) -> String {
+    if state.project_name.is_empty() {
+        return "Aether".to_string();
+    }
+    if !state.has_editor() {
+        return format!("[{}]", state.project_name);
+    }
+    let marker = state.buffer_status_marker();
+    let marker_suffix = if marker.is_empty() {
+        String::new()
+    } else {
+        format!(" {marker}")
+    };
+    format!(
+        "[{}] {}{}",
+        state.project_name,
+        state.ed().file_label,
+        marker_suffix
+    )
 }
 
 async fn dispatch_terminal_event(
@@ -4795,5 +4861,118 @@ mod tests {
             .expect("file must classify under one of the roots");
         assert_eq!(idx, 1, "should classify under root B (index 1), not root 0");
         assert_eq!(rel, "sub/file.rs");
+    }
+
+    // ---- terminal_title ----
+
+    #[test]
+    fn terminal_title_falls_back_to_aether_before_project_activation() {
+        let state = AppState {
+            project_name: String::new(),
+            project_paths: Vec::new(),
+            root_labels: Vec::new(),
+            viewport_cols: 80,
+            viewport_rows: 24,
+            should_quit: false,
+            status: StatusMessage::default(),
+            last_terminal_title: String::new(),
+            clipboard: None,
+            pending_leader: None,
+            picker: crate::picker::PickerState::default(),
+            save_prompt: None,
+            confirm_prompt: None,
+            editor: None,
+            project_settings: None,
+        };
+        assert_eq!(terminal_title(&state), "Aether");
+    }
+
+    #[test]
+    fn terminal_title_shows_project_only_when_no_editor() {
+        let mut state = AppState {
+            project_name: "demo".into(),
+            project_paths: vec!["/tmp/demo".into()],
+            root_labels: vec![String::new()],
+            viewport_cols: 80,
+            viewport_rows: 24,
+            should_quit: false,
+            status: StatusMessage::default(),
+            last_terminal_title: String::new(),
+            clipboard: None,
+            pending_leader: None,
+            picker: crate::picker::PickerState::default(),
+            save_prompt: None,
+            confirm_prompt: None,
+            editor: None,
+            project_settings: None,
+        };
+        assert_eq!(terminal_title(&state), "[demo]");
+        // Once a buffer exists, the title grows to include the file label.
+        state.editor = Some(stub_editor_state("[scratch 0]"));
+        assert_eq!(terminal_title(&state), "[demo] [scratch 0]");
+    }
+
+    #[test]
+    fn terminal_title_appends_dirty_marker() {
+        let mut state = AppState {
+            project_name: "demo".into(),
+            project_paths: vec!["/tmp/demo".into()],
+            root_labels: vec![String::new()],
+            viewport_cols: 80,
+            viewport_rows: 24,
+            should_quit: false,
+            status: StatusMessage::default(),
+            last_terminal_title: String::new(),
+            clipboard: None,
+            pending_leader: None,
+            picker: crate::picker::PickerState::default(),
+            save_prompt: None,
+            confirm_prompt: None,
+            editor: Some(stub_editor_state("src/main.rs")),
+            project_settings: None,
+        };
+        // Clean buffer → no marker.
+        assert_eq!(terminal_title(&state), "[demo] src/main.rs");
+        // Local edits → `[+]`.
+        if let Some(ed) = state.editor.as_mut() {
+            ed.revision = 5;
+        }
+        assert_eq!(terminal_title(&state), "[demo] src/main.rs [+]");
+        // External delete trumps `[+]`.
+        if let Some(ed) = state.editor.as_mut() {
+            ed.externally_deleted = true;
+        }
+        assert_eq!(terminal_title(&state), "[demo] src/main.rs [x]");
+    }
+
+    /// Minimal `EditorState` for title tests — only the fields the title code reads matter
+    /// (`file_label`, `revision`, `saved_revision`, `externally_modified`, `externally_deleted`).
+    /// The rest is filled with sensible defaults.
+    fn stub_editor_state(label: &str) -> EditorState {
+        EditorState {
+            mode: EditorMode::Normal,
+            buffer_id: 1,
+            viewport_id: 1,
+            cursor: Default::default(),
+            scroll_logical_line: 0,
+            window_first_logical_line: 0,
+            lines: Vec::new(),
+            line_count: 0,
+            max_scroll_logical_line: 0,
+            wrap: aether_protocol::viewport::WrapMode::None,
+            scroll_col: 0,
+            pending_scroll_lines: 0,
+            drag_anchor: None,
+            revision: 0,
+            saved_revision: 0,
+            externally_modified: false,
+            externally_deleted: false,
+            pending_count: 0,
+            pending_find: None,
+            last_motion: None,
+            search: Default::default(),
+            file_path: None,
+            file_label: label.into(),
+        }
     }
 }
