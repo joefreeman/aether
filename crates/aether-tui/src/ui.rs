@@ -11,6 +11,7 @@ use aether_protocol::search::SearchMatchRange;
 use aether_protocol::viewport::{Highlight, VisualRow, WrapMode};
 use aether_protocol::LogicalPosition;
 use crossterm::event::KeyCode;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -81,6 +82,13 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     } else {
         draw_no_project_view(f, state, chunks[0]);
     }
+    // A centered modal dims the content behind it so it stands out. Done once here, before any
+    // overlay paints: each overlay `Clear`s and repaints its own box opaquely, so only the area
+    // *behind* the dialog ends up dimmed.
+    let modal_open = state.picker.open || state.project_settings.is_some() || state.help.open;
+    if modal_open {
+        dim_backdrop(f.buffer_mut(), chunks[0]);
+    }
     // The unified picker overlay sits on top of either screen — same renderer for Files /
     // Buffers / Grep / Explorer / Projects.
     if state.picker.open {
@@ -105,6 +113,23 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         let buffer_area = chunks[0];
         let status_area = chunks.get(1).copied().unwrap_or(Rect::default());
         place_terminal_cursor(f, state, buffer_area, status_area);
+    }
+}
+
+/// Mute every cell in `area` to a faint grey on the base background — the modal backdrop. Keeps the
+/// glyphs (so the content stays faintly legible) but drops their colour and emphasis, so a dialog
+/// painted on top reads as the only live thing on screen.
+fn dim_backdrop(buf: &mut Buffer, area: Rect) {
+    let dim = Style::default()
+        .fg(NORD3)
+        .bg(NORD0)
+        .remove_modifier(Modifier::all());
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(dim);
+            }
+        }
     }
 }
 
@@ -240,16 +265,18 @@ fn draw_vertical_scrollbar(f: &mut Frame, area: Rect, offset: u16, total: u16, v
     }
 }
 
-/// The help overlay's tab bar: every [`HelpTab`] in display order, the active one bold + accent,
-/// the rest dimmed, joined by faint separators.
+/// The help overlay's tab bar: every [`HelpTab`] in display order, space-separated with no
+/// dividers — the active tab is accented and underlined, the rest dimmed, so the underline (not a
+/// separator glyph) carries the selection.
 fn tab_bar_line(active: HelpTab) -> Line<'static> {
-    let active_style = Style::default().fg(NORD8).add_modifier(Modifier::BOLD);
+    let active_style = Style::default()
+        .fg(NORD8)
+        .add_modifier(Modifier::UNDERLINED);
     let inactive = Style::default().fg(NORD3);
-    let sep = Style::default().fg(NORD3);
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, t) in HelpTab::ALL.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  │  ", sep));
+            spans.push(Span::raw("   "));
         }
         let style = if *t == active { active_style } else { inactive };
         spans.push(Span::styled(t.label(), style));
@@ -3249,6 +3276,53 @@ mod tests {
             Some(NORD9),
             "the literal comma key must stay key-coloured"
         );
+    }
+
+    /// The modal backdrop mutes a cell's colour and emphasis to the base palette but keeps its glyph
+    /// (so the content stays faintly visible behind a dialog).
+    #[test]
+    fn dim_backdrop_mutes_cells_keeping_glyphs() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(
+            0,
+            0,
+            "code",
+            Style::default().fg(NORD8).add_modifier(Modifier::BOLD),
+        );
+        dim_backdrop(&mut buf, area);
+        let cell = buf.cell((0, 0)).expect("cell present");
+        assert_eq!(cell.symbol(), "c", "glyph is preserved");
+        assert_eq!(cell.fg, NORD3, "foreground muted to grey");
+        assert_eq!(cell.bg, NORD0, "background flattened to base");
+        assert!(
+            !cell.modifier.contains(Modifier::BOLD),
+            "emphasis is dropped"
+        );
+    }
+
+    /// The tab bar marks the active tab with accent colour + underline (no divider glyphs); inactive
+    /// tabs are dim and unadorned.
+    #[test]
+    fn tab_bar_underlines_active() {
+        let line = tab_bar_line(HelpTab::Insert);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains('│'), "no divider glyphs");
+        let span = |label: &str| {
+            line.spans
+                .iter()
+                .find(|s| s.content.as_ref() == label)
+                .unwrap_or_else(|| panic!("tab {label:?} present"))
+        };
+        let active = span("Insert");
+        assert_eq!(active.style.fg, Some(NORD8), "active tab is accented");
+        assert!(
+            active.style.add_modifier.contains(Modifier::UNDERLINED),
+            "active tab is underlined"
+        );
+        let other = span("Normal");
+        assert_eq!(other.style.fg, Some(NORD3), "inactive tab is dim");
+        assert!(!other.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]
