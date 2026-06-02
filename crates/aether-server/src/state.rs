@@ -428,6 +428,9 @@ pub struct BufferSyntax {
 pub enum EditKindTag {
     Text,
     Delete,
+    /// Surround/unsurround edits. Tagged distinctly so they never coalesce with an adjacent typing
+    /// or delete burst into one undo group — each surround toggle is its own undo step.
+    Surround,
 }
 
 struct UndoEntry {

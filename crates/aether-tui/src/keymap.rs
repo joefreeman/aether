@@ -21,6 +21,7 @@
 //! rule, no loader exists: the tables are in-code `static` data.
 
 use aether_protocol::cursor::{Direction, VerticalDirection, WordBoundary};
+use aether_protocol::input::SurroundTarget;
 use aether_protocol::picker::PickerKind;
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -156,6 +157,11 @@ pub enum Action {
         dir: Direction,
         till: bool,
     },
+    /// `Ctrl-s` — arm the surround capture; the next keystroke names the delimiter to wrap the
+    /// target with. The target distinguishes Normal (selection) from Insert (line).
+    BeginSurround(SurroundTarget),
+    /// `Ctrl-Alt-s` — strip the delimiter pair hugging the target (inverse of surround).
+    Unsurround(SurroundTarget),
 
     // ---- viewport scroll ----
     Scroll {
@@ -250,6 +256,15 @@ impl Action {
                 | Action::NewScratch
         )
     }
+
+    /// Whether running this action arms a capture for one more keystroke — the next key is consumed
+    /// as data (a find target char or a surround delimiter), not a fresh binding. The help overlay
+    /// marks these with a trailing placeholder glyph so "another key follows" is visible without
+    /// spelling it out in the description. (`Space`/leader isn't included: its second key is already
+    /// shown as the `Space x` chord on each leader row.)
+    pub fn awaits_key(&self) -> bool {
+        matches!(self, Action::BeginFind { .. } | Action::BeginSurround(_))
+    }
 }
 
 /// One row of a keymap table: a chord (`code` + `mods` pattern) in a context, the action it runs,
@@ -283,7 +298,9 @@ impl Binding {
             && self.mods.display_mods() ^ other.mods.display_mods() == KeyModifiers::ALT
     }
 
-    /// Render the chord for the help overlay, e.g. `Alt-h`, `Ctrl-z`, `Space f`, `↑`.
+    /// Render the chord for the help overlay, e.g. `Alt-h`, `Ctrl-z`, `Space f`, `↑`. Chords that
+    /// arm a capture get a trailing `␣` placeholder (`f ␣`, `Ctrl-s ␣`) to signal that one more
+    /// keystroke is expected.
     pub fn key_label(&self) -> String {
         let mut s = String::new();
         if self.ctx == KeyContext::Leader {
@@ -297,6 +314,10 @@ impl Binding {
             s.push_str("Alt-");
         }
         s.push_str(&code_label(self.code));
+        if self.action.awaits_key() {
+            // U+2423 OPEN BOX — an empty "a key goes here" slot.
+            s.push_str(" ␣");
+        }
         s
     }
 }
@@ -476,6 +497,8 @@ static NORMAL: &[Binding] = &[
     bind!(NORMAL_CTX, ch('x'), Exact(CTRL), A::Cut, "Clipboard", "Cut selection"),
     bind!(NORMAL_CTX, ch('v'), Exact(CTRL), A::Paste, "Clipboard", "Paste before selection"),
     bind!(NORMAL_CTX, ch('r'), Exact(CTRL), A::ReplaceClipboard, "Clipboard", "Replace selection with clipboard"),
+    bind!(NORMAL_CTX, ch('s'), Exact(CTRL_ALT), A::Unsurround(SurroundTarget::Selection), "Edit", "Unsurround selection"),
+    bind!(NORMAL_CTX, ch('s'), Exact(CTRL), A::BeginSurround(SurroundTarget::Selection), "Edit", "Surround selection"),
 
     // ---- leader ----
     bind!(NORMAL_CTX, ch(' '), Exact(NONE), A::BeginLeader, "Leader", "Space leader chord"),
@@ -518,6 +541,8 @@ static INSERT: &[Binding] = &[
     bind!(INSERT_CTX, ch('x'), Exact(CTRL), A::CutLine, "Clipboard", "Cut line"),
     bind!(INSERT_CTX, ch('v'), Exact(CTRL), A::PasteAtCursor, "Clipboard", "Paste at cursor"),
     bind!(INSERT_CTX, ch('r'), Exact(CTRL), A::ReplaceLineClipboard, "Clipboard", "Replace line with clipboard"),
+    bind!(INSERT_CTX, ch('s'), Exact(CTRL_ALT), A::Unsurround(SurroundTarget::Line), "Edit", "Unsurround line"),
+    bind!(INSERT_CTX, ch('s'), Exact(CTRL), A::BeginSurround(SurroundTarget::Line), "Edit", "Surround line"),
 ];
 
 #[rustfmt::skip]
@@ -568,6 +593,32 @@ mod tests {
                 b.key_label()
             );
         }
+    }
+
+    /// Capture-arming chords (`f`/`t` find, `Ctrl-s` surround) render with a trailing `␣`
+    /// placeholder; immediate actions (incl. `Ctrl-Alt-s` unsurround) don't.
+    #[test]
+    fn awaiting_chords_render_placeholder() {
+        let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+
+        let f = lookup(KeyContext::Normal, KeyCode::Char('f'), KeyModifiers::NONE).unwrap();
+        assert!(f.action.awaits_key());
+        assert_eq!(f.key_label(), "f ␣");
+
+        let surround =
+            lookup(KeyContext::Normal, KeyCode::Char('s'), KeyModifiers::CONTROL).unwrap();
+        assert!(surround.action.awaits_key());
+        assert_eq!(surround.key_label(), "Ctrl-s ␣");
+
+        // Unsurround acts immediately — no placeholder.
+        let unsurround = lookup(KeyContext::Normal, KeyCode::Char('s'), ctrl_alt).unwrap();
+        assert!(!unsurround.action.awaits_key());
+        assert_eq!(unsurround.key_label(), "Ctrl-Alt-s");
+
+        // A plain motion never awaits.
+        let left = lookup(KeyContext::Normal, KeyCode::Char('h'), KeyModifiers::NONE).unwrap();
+        assert!(!left.action.awaits_key());
+        assert_eq!(left.key_label(), "h");
     }
 
     /// No two bindings in a context should match the *exact same* event, which would make the

@@ -158,6 +158,61 @@ pub struct InputMoveLinesParams {
     pub direction: VerticalDirection,
 }
 
+// ---- input/surround, input/unsurround -----------------------------------------------------------
+
+/// What a surround/unsurround operates on. Normal mode targets the selection; Insert mode — which
+/// has no selection to speak of — targets the cursor's whole line, mirroring the line-scoped
+/// `input/delete_line` / `input/change_line` family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurroundTarget {
+    /// Wrap/strip the current selection.
+    #[default]
+    Selection,
+    /// Wrap/strip the cursor line's content (excluding the trailing newline).
+    Line,
+}
+
+/// Wrap the surround target with a delimiter pair (`Ctrl-s <delim>`). `delimiter` is the key typed
+/// after `Ctrl-s` — either member of a bracket pair (`(`/`)`, `{`/`}`, `[`/`]`, `<`/`>`), a vim-style
+/// alias (`b`/`B`/`r`/`a`), or a symmetric quote (`"`, `'`, `` ` ``). The server resolves it to an
+/// open/close pair and replaces the target with `open + <target text> + close` in a single edit. For
+/// a selection target the post-edit cursor re-selects just the wrapped text; for a line target it
+/// collapses to a point past the close. An unrecognized delimiter is a no-op.
+pub struct InputSurround;
+impl RpcMethod for InputSurround {
+    const NAME: &'static str = "input/surround";
+    type Params = InputSurroundParams;
+    type Result = EditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InputSurroundParams {
+    pub buffer_id: BufferId,
+    pub delimiter: char,
+    #[serde(default)]
+    pub target: SurroundTarget,
+}
+
+/// Strip the delimiter pair immediately hugging the surround target (`Ctrl-Alt-s`) — the inverse of
+/// `input/surround`. For a selection target the server checks the single char just outside each end
+/// of the selection; for a line target it checks the line content's first and last chars. If they
+/// form a known pair it removes both — a selection target leaves the now-inner text selected so
+/// repeated presses peel nested layers. If they aren't a pair, it's a no-op.
+pub struct InputUnsurround;
+impl RpcMethod for InputUnsurround {
+    const NAME: &'static str = "input/unsurround";
+    type Params = InputUnsurroundParams;
+    type Result = EditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InputUnsurroundParams {
+    pub buffer_id: BufferId,
+    #[serde(default)]
+    pub target: SurroundTarget,
+}
+
 // ---- input/undo, input/redo ---------------------------------------------------------------------
 
 pub struct InputUndo;

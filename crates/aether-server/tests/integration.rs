@@ -16,7 +16,8 @@ use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectAc
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
-    InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
+    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
+    InputUnsurround, InputUnsurroundParams, SurroundTarget, UndoResult,
 };
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHide,
@@ -11253,6 +11254,483 @@ async fn project_activate_same_project_is_idempotent() {
     )
     .await;
     assert_eq!(reopen.buffer_id, open.buffer_id);
+
+    drop(server);
+}
+
+// ---- surround / unsurround ----------------------------------------------------------------------
+
+/// Subscribe a full-file viewport and return its id, so a following edit pushes a
+/// `ViewportLinesChanged` we can read the post-edit text from.
+async fn subscribe_full(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    buffer_id: u64,
+) -> ViewportSubscribeResult {
+    send_request::<ViewportSubscribe>(
+        ws,
+        id,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn surround_wraps_selection_and_selects_inner() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    // Select "bc" (cols 1..=2).
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+        },
+    )
+    .await;
+
+    let result: EditResult = send_request::<InputSurround>(
+        &mut ws,
+        12,
+        &InputSurroundParams {
+            buffer_id,
+            delimiter: '(',
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    assert_eq!(result.revision, 1);
+    // Cursor re-selects just the wrapped text "bc", not the parens: anchor on 'b', position on 'c'.
+    assert_eq!(result.cursor.anchor, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(result.cursor.position, LogicalPosition { line: 0, col: 3 });
+
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "a(bc)"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn surround_aliases_and_quotes() {
+    // `B` → braces, `"` → quotes.
+    let (server, mut ws, buffer_id) = setup_with_buffer("hi\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    // Select "hi".
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+    send_request::<InputSurround>(
+        &mut ws,
+        12,
+        &InputSurroundParams {
+            buffer_id,
+            delimiter: 'B',
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "{hi}"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn surround_unknown_delimiter_is_noop() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+        },
+    )
+    .await;
+    // 'z' isn't a known delimiter → no edit, revision stays at 0.
+    let result: EditResult = send_request::<InputSurround>(
+        &mut ws,
+        12,
+        &InputSurroundParams {
+            buffer_id,
+            delimiter: 'z',
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    assert_eq!(result.revision, 0);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn unsurround_strips_hugging_pair() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("a(bc)d\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    // Select the inner "bc" (cols 2..=3); the hugging chars are '(' at col 1 and ')' at col 4.
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+
+    let result: EditResult =
+        send_request::<InputUnsurround>(&mut ws, 12, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    assert_eq!(result.revision, 1);
+    // Inner text "bc" stays selected, now at cols 1..=2.
+    assert_eq!(result.cursor.anchor, LogicalPosition { line: 0, col: 1 });
+    assert_eq!(result.cursor.position, LogicalPosition { line: 0, col: 2 });
+
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "abcd"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn unsurround_noop_when_no_pair_hugs_selection() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abcd\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    // Select "bc"; hugging chars 'a' and 'd' aren't a pair.
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+        },
+    )
+    .await;
+
+    let result: EditResult =
+        send_request::<InputUnsurround>(&mut ws, 12, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    // No edit: revision unchanged, selection preserved.
+    assert_eq!(result.revision, 0);
+    assert_eq!(result.cursor.anchor, LogicalPosition { line: 0, col: 1 });
+    assert_eq!(result.cursor.position, LogicalPosition { line: 0, col: 2 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn surround_then_unsurround_roundtrips() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+        },
+    )
+    .await;
+    send_request::<InputSurround>(
+        &mut ws,
+        12,
+        &InputSurroundParams {
+            buffer_id,
+            delimiter: '[',
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "a[bc]"
+    );
+
+    // Surround left the inner "bc" selected, so unsurround strips the brackets we just added.
+    send_request::<InputUnsurround>(&mut ws, 13, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "abc"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn unsurround_peels_nested_layers_per_press() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("((x))\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    // Select the innermost "x" at col 2.
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+
+    // First press strips one layer: "((x))" → "(x)".
+    let r1: EditResult =
+        send_request::<InputUnsurround>(&mut ws, 12, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    assert_eq!(r1.revision, 1);
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "(x)"
+    );
+
+    // Selection now sits on "x" again — a second press peels the next layer: "(x)" → "x".
+    let r2: EditResult =
+        send_request::<InputUnsurround>(&mut ws, 13, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    assert_eq!(r2.revision, 2);
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "x"
+    );
+
+    // Nothing left to strip: third press is a no-op (revision unchanged).
+    let r3: EditResult =
+        send_request::<InputUnsurround>(&mut ws, 14, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    assert_eq!(r3.revision, 2);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn surround_line_wraps_whole_line_content() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    // No selection needed — line target uses the cursor's line. Cursor defaults to line 0.
+    let result: EditResult = send_request::<InputSurround>(
+        &mut ws,
+        11,
+        &InputSurroundParams {
+            buffer_id,
+            delimiter: '(',
+            target: SurroundTarget::Line,
+        },
+    )
+    .await;
+    assert_eq!(result.revision, 1);
+    // Line target keeps the caret on the same char (a point, not a selection). The caret started
+    // at col 0; the inserted '(' shifts it to col 1 so it still sits on 'a'.
+    assert_eq!(result.cursor.anchor, result.cursor.position);
+    assert_eq!(result.cursor.position, LogicalPosition { line: 0, col: 1 });
+
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "(abc)"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn surround_line_targets_cursor_line() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("x\nabc\ny\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    // Put the cursor on line 1 ("abc").
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 1 },
+            anchor: LogicalPosition { line: 1, col: 1 },
+        },
+    )
+    .await;
+
+    let result: EditResult = send_request::<InputSurround>(
+        &mut ws,
+        12,
+        &InputSurroundParams {
+            buffer_id,
+            delimiter: '"',
+            target: SurroundTarget::Line,
+        },
+    )
+    .await;
+    // Caret was on 'b' (line 1, col 1); the inserted leading quote shifts it to col 2, still on 'b'.
+    assert_eq!(result.cursor.anchor, result.cursor.position);
+    assert_eq!(result.cursor.position, LogicalPosition { line: 1, col: 2 });
+
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    // Only line 1 is wrapped; the neighbours are untouched.
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "x"
+    );
+    assert_eq!(
+        notif.replacement_lines[1].visual_rows[0].segments[0].text,
+        "\"abc\""
+    );
+    assert_eq!(
+        notif.replacement_lines[2].visual_rows[0].segments[0].text,
+        "y"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn unsurround_line_strips_wrapping_pair() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("(abc)\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    // Caret on 'b' (col 2 in "(abc)").
+    send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+
+    let result: EditResult = send_request::<InputUnsurround>(
+        &mut ws,
+        12,
+        &InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Line,
+        },
+    )
+    .await;
+    assert_eq!(result.revision, 1);
+    // Caret maintained: removing the leading '(' shifts it from col 2 to col 1, still on 'b'.
+    assert_eq!(result.cursor.anchor, result.cursor.position);
+    assert_eq!(result.cursor.position, LogicalPosition { line: 0, col: 1 });
+
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "abc"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn unsurround_line_noop_when_ends_arent_a_pair() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    // 'a' and 'c' aren't a pair → no edit.
+    let result: EditResult = send_request::<InputUnsurround>(
+        &mut ws,
+        11,
+        &InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Line,
+        },
+    )
+    .await;
+    assert_eq!(result.revision, 0);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn surround_line_then_unsurround_line_roundtrips() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
+    let _sub = subscribe_full(&mut ws, 10, buffer_id).await;
+
+    send_request::<InputSurround>(
+        &mut ws,
+        11,
+        &InputSurroundParams {
+            buffer_id,
+            delimiter: '{',
+            target: SurroundTarget::Line,
+        },
+    )
+    .await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "{hello}"
+    );
+
+    send_request::<InputUnsurround>(
+        &mut ws,
+        12,
+        &InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Line,
+        },
+    )
+    .await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    assert_eq!(
+        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        "hello"
+    );
 
     drop(server);
 }

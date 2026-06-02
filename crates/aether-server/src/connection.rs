@@ -24,8 +24,8 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::input::{
     InputBackspace, InputChangeLine, InputDedent, InputDelete, InputDeleteLine, InputIndent,
-    InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine, InputText,
-    InputToggleComment, InputUndo,
+    InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine,
+    InputSurround, InputText, InputToggleComment, InputUndo, InputUnsurround,
 };
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerHide, PickerQuery, PickerSelect, PickerView,
@@ -283,6 +283,8 @@ async fn dispatch(
             run!(InputNewlineAndIndent, handlers::input_newline_and_indent)
         }
         InputToggleComment::NAME => run!(InputToggleComment, handlers::input_toggle_comment),
+        InputSurround::NAME => run!(InputSurround, handlers::input_surround),
+        InputUnsurround::NAME => run!(InputUnsurround, handlers::input_unsurround),
         PickerView::NAME => run!(PickerView, handlers::picker_view),
         PickerQuery::NAME => run!(PickerQuery, handlers::picker_query),
         PickerSelect::NAME => run!(PickerSelect, handlers::picker_select),

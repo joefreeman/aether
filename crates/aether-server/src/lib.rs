@@ -11,6 +11,7 @@ mod indent;
 mod picker;
 mod server;
 mod state;
+mod surround;
 mod syntax;
 mod watcher;
 mod workspace_index;

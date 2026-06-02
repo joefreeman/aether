@@ -6,7 +6,9 @@ use crate::grep;
 use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{Buffer, EditKindTag, SearchEntry, ServerState, SharedState, Viewport};
+use crate::surround;
 use crate::wrap;
+use std::borrow::Cow;
 use aether_protocol::buffer::{
     BufferCloseParams, BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams,
     BufferOpenResult, BufferReloadParams, BufferReloadResult, BufferSaveParams, BufferSaveResult,
@@ -24,7 +26,8 @@ use aether_protocol::directory::{
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputMoveLinesParams, InputTextParams, UndoResult,
+    BufferOnlyParams, EditResult, InputMoveLinesParams, InputSurroundParams, InputTextParams,
+    InputUnsurroundParams, SurroundTarget, UndoResult,
 };
 use aether_protocol::picker::{
     PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHideParams, PickerItem, PickerKind,
@@ -2665,6 +2668,64 @@ fn current_selection_char_range(buf: &Buffer, cursor: &CursorState) -> (usize, u
     )
 }
 
+/// Whether the single chars immediately outside each end of the selection form a known delimiter
+/// pair — the precondition unsurround strips on. `current_selection_char_range` gives the
+/// selection as `[sc, ec)`, so the hugging chars are at `sc - 1` and `ec`; both must exist.
+fn has_enclosing_pair(buf: &Buffer, cursor: &CursorState) -> bool {
+    let (sc, ec) = current_selection_char_range(buf, cursor);
+    if sc < 1 || ec >= buf.text.len_chars() {
+        return false;
+    }
+    surround::matching_pair(buf.text.char(sc - 1), buf.text.char(ec))
+}
+
+/// Char range `[start, end)` of a line's content, excluding the trailing newline — the span a
+/// line-scoped surround/unsurround wraps or strips.
+fn line_content_char_range(buf: &Buffer, line: usize) -> (usize, usize) {
+    let start = buf.text.line_to_char(line);
+    let line_slice = buf.text.line(line);
+    let len_chars = line_slice.len_chars();
+    let has_trailing_nl = len_chars > 0 && line_slice.char(len_chars - 1) == '\n';
+    let content_chars = if has_trailing_nl {
+        len_chars - 1
+    } else {
+        len_chars
+    };
+    (start, start + content_chars)
+}
+
+/// Whether the cursor line's content begins and ends with a known delimiter pair — the precondition
+/// line-scoped unsurround strips on. Needs at least two content chars (the two delimiters).
+fn line_has_enclosing_pair(buf: &Buffer, line: usize) -> bool {
+    let (sc, ec) = line_content_char_range(buf, line);
+    if ec < sc + 2 {
+        return false;
+    }
+    surround::matching_pair(buf.text.char(sc), buf.text.char(ec - 1))
+}
+
+/// Echo the buffer's current revision and the client's cursor without editing — the `EditResult`
+/// an edit RPC returns when it resolves to a no-op (unknown surround delimiter, no enclosing pair).
+async fn current_edit_result(
+    state: &SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Result<EditResult, RpcError> {
+    let s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let revision = buf.revision;
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
+    let cursor = wrap_for_response(&s, client_id, buffer_id, cursor);
+    Ok(EditResult { revision, cursor })
+}
+
 // ---- input handlers ----------------------------------------------------------------------------
 
 pub async fn input_text(
@@ -2740,6 +2801,60 @@ pub async fn input_replace_line(
         EditKind::ReplaceLine { text: params.text },
     )
     .await
+}
+
+pub async fn input_surround(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: InputSurroundParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.client_id;
+    // An unrecognized delimiter key is a no-op — echo the current state unchanged.
+    let Some((open, close)) = surround::open_close(params.delimiter) else {
+        return current_edit_result(state, client_id, params.buffer_id).await;
+    };
+    let line = matches!(params.target, SurroundTarget::Line);
+    apply_edit(
+        state,
+        client_id,
+        params.buffer_id,
+        EditKind::Surround { open, close, line },
+    )
+    .await
+}
+
+pub async fn input_unsurround(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: InputUnsurroundParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.client_id;
+    let line = matches!(params.target, SurroundTarget::Line);
+    // No-op unless a known delimiter pair hugs the target. Checked up front so we never push a
+    // no-op undo entry through `apply_edit`.
+    {
+        let s = state.lock().await;
+        let buf = s
+            .buffers
+            .get(&params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let cursor = s
+            .cursors
+            .get(&(client_id, params.buffer_id))
+            .copied()
+            .unwrap_or_default();
+        let has_pair = if line {
+            line_has_enclosing_pair(buf, cursor.position.line as usize)
+        } else {
+            has_enclosing_pair(buf, &cursor)
+        };
+        if !has_pair {
+            let revision = buf.revision;
+            let cursor = wrap_for_response(&s, client_id, params.buffer_id, cursor);
+            return Ok(EditResult { revision, cursor });
+        }
+    }
+    apply_edit(state, client_id, params.buffer_id, EditKind::Unsurround { line }).await
 }
 
 pub async fn input_undo(
@@ -4417,6 +4532,29 @@ enum EditKind {
     ChangeLine,
     /// Replace the cursor's line (content + newline) with `text`. Insert-mode `Ctrl-r`.
     ReplaceLine { text: String },
+    /// Wrap the surround target with `open`…`close` (`Ctrl-s <delim>`). Modeled as a single replace
+    /// of the target range with `open + <target text> + close` so it's one undo step. `line` selects
+    /// the target: false → the selection (post-edit cursor re-selects the wrapped text), true → the
+    /// cursor line's content (post-edit cursor collapses to a point past the close).
+    Surround { open: char, close: char, line: bool },
+    /// Strip the pair of chars hugging the surround target (`Ctrl-Alt-s`), replacing the outer range
+    /// with the inner text. `line` matches `Surround`. `input_unsurround` guarantees a valid pair
+    /// exists before issuing this — the no-op case never reaches here.
+    Unsurround { line: bool },
+}
+
+/// Where the cursor lands after an edit.
+enum PostEdit {
+    /// Collapse to a point just past the inserted text. The default for typing, deletes, and
+    /// line-replace.
+    PointAfter,
+    /// Select the inserted text minus `lead` chars at the front and `trail` at the back. Paste uses
+    /// `(0, 0)` to select everything; selection-surround uses `(1, 1)` to skip the delimiters.
+    Select { lead: usize, trail: usize },
+    /// Collapse to a point at this absolute char offset (clamped to the edited line's content).
+    /// Line surround/unsurround use this to keep the caret on the same character it was on before
+    /// the delimiters were inserted/removed around it.
+    PointAt(usize),
 }
 
 async fn apply_edit(
@@ -4538,17 +4676,118 @@ async fn apply_edit(
                 last_line: line as u32,
             }
         }
+        EditKind::Surround { line, .. } => {
+            // The open/close chars are prepended/appended via insert_text below; the range here is
+            // just the text being wrapped. Line target → the line's content; selection target →
+            // the selection's char span [start, end).
+            if *line {
+                let l = cursor.position.line as usize;
+                let (sc, ec) = line_content_char_range(buf, l);
+                EditRange {
+                    start_char: sc,
+                    end_char: ec,
+                    first_line: l as u32,
+                    last_line: l as u32,
+                }
+            } else {
+                let (sc, ec) = current_selection_char_range(buf, &cursor);
+                let lo = motion::char_to_pos(buf, sc);
+                let hi = motion::char_to_pos(buf, ec.saturating_sub(1).max(sc));
+                EditRange {
+                    start_char: sc,
+                    end_char: ec,
+                    first_line: lo.line,
+                    last_line: hi.line,
+                }
+            }
+        }
+        EditKind::Unsurround { line } => {
+            // The range covers the delimiters plus the text between them; insert_text below drops
+            // the first and last chars. `input_unsurround` has verified a real pair sits at those
+            // ends, so the arithmetic can't underflow/overflow the buffer. Line target → the line's
+            // full content (delimiters are its first/last chars); selection target → the selection
+            // grown one char at each end to swallow the hugging delimiters.
+            if *line {
+                let l = cursor.position.line as usize;
+                let (sc, ec) = line_content_char_range(buf, l);
+                EditRange {
+                    start_char: sc,
+                    end_char: ec,
+                    first_line: l as u32,
+                    last_line: l as u32,
+                }
+            } else {
+                let (sc, ec) = current_selection_char_range(buf, &cursor);
+                let outer_start = sc - 1;
+                let outer_end = ec + 1;
+                let lo = motion::char_to_pos(buf, outer_start);
+                let hi = motion::char_to_pos(buf, outer_end.saturating_sub(1));
+                EditRange {
+                    start_char: outer_start,
+                    end_char: outer_end,
+                    first_line: lo.line,
+                    last_line: hi.line,
+                }
+            }
+        }
     };
-    let (insert_text, select_pasted): (&str, bool) = match &edit {
+    // `insert_text` is what gets written over `[start_char, end_char)`; `post_edit` decides where
+    // the cursor lands (see `PostEdit`).
+    let (insert_text, post_edit): (Cow<str>, PostEdit) = match &edit {
         EditKind::ReplaceWith {
             text,
             select_pasted,
-        } => (text.as_str(), *select_pasted),
-        EditKind::ReplaceLine { text } => (text.as_str(), false),
+        } => (
+            Cow::Borrowed(text.as_str()),
+            if *select_pasted {
+                PostEdit::Select { lead: 0, trail: 0 }
+            } else {
+                PostEdit::PointAfter
+            },
+        ),
+        EditKind::ReplaceLine { text } => (Cow::Borrowed(text.as_str()), PostEdit::PointAfter),
         EditKind::DeleteSelection
         | EditKind::Backspace
         | EditKind::DeleteLine
-        | EditKind::ChangeLine => ("", false),
+        | EditKind::ChangeLine => (Cow::Borrowed(""), PostEdit::PointAfter),
+        EditKind::Surround { open, close, line } => {
+            let inner: String = buf
+                .text
+                .slice(range.start_char..range.end_char)
+                .chars()
+                .collect();
+            let mut wrapped = String::with_capacity(inner.len() + open.len_utf8() + close.len_utf8());
+            wrapped.push(*open);
+            wrapped.push_str(&inner);
+            wrapped.push(*close);
+            // Selection target re-selects the inner text (skip the 1-char delimiters). Line target
+            // keeps the caret on the same char: the open delimiter is inserted before it, so shift
+            // the pre-edit caret right by one.
+            let post = if *line {
+                PostEdit::PointAt(motion::pos_to_char(buf, cursor.position) + 1)
+            } else {
+                PostEdit::Select { lead: 1, trail: 1 }
+            };
+            (Cow::Owned(wrapped), post)
+        }
+        EditKind::Unsurround { line } => {
+            // The inner text is everything between the stripped delimiters — the outer range minus
+            // one char at each end — for both targets.
+            let inner: String = buf
+                .text
+                .slice(range.start_char + 1..range.end_char - 1)
+                .chars()
+                .collect();
+            // Selection target re-selects the inner text. Line target keeps the caret on the same
+            // char: the open delimiter before it is removed, so shift the pre-edit caret left by one
+            // (clamped to the line content start below).
+            let post = if *line {
+                PostEdit::PointAt(motion::pos_to_char(buf, cursor.position).saturating_sub(1))
+            } else {
+                PostEdit::Select { lead: 0, trail: 0 }
+            };
+            (Cow::Owned(inner), post)
+        }
     };
 
     let start_char = range.start_char;
@@ -4561,6 +4800,7 @@ async fn apply_edit(
         | EditKind::Backspace
         | EditKind::DeleteLine
         | EditKind::ChangeLine => EditKindTag::Delete,
+        EditKind::Surround { .. } | EditKind::Unsurround { .. } => EditKindTag::Surround,
     };
 
     // Snapshot all per-client cursors on this buffer so the undo entry can restore them.
@@ -4579,14 +4819,21 @@ async fn apply_edit(
     // Mutate the buffer (rope edit + incremental reparse + undo-group bookkeeping).
     let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
     let was_dirty = buf_mut.dirty;
-    let revision = buf_mut.apply_edit(start_char, end_char, insert_text, kind_tag, cursors_before);
+    let revision = buf_mut.apply_edit(start_char, end_char, &insert_text, kind_tag, cursors_before);
 
     // Compute the cursor's new position.
     let inserted_char_count = insert_text.chars().count();
-    let new_cursor_state = if select_pasted && inserted_char_count > 0 {
-        // After pasting, select the inserted text. Block cursor on the last inserted char.
-        let last_char = start_char + inserted_char_count - 1;
-        let anchor_pos = motion::char_to_pos(buf_mut, start_char);
+    // A `Select` span only holds if it leaves a non-empty range (lead + trail < inserted count);
+    // otherwise it degrades to a point just past the insert.
+    let selection = match post_edit {
+        PostEdit::Select { lead, trail } if lead + trail < inserted_char_count => Some((lead, trail)),
+        _ => None,
+    };
+    let new_cursor_state = if let Some((lead, trail)) = selection {
+        // Select the inserted span. Block cursor on its last char.
+        let anchor_char = start_char + lead;
+        let last_char = start_char + inserted_char_count - 1 - trail;
+        let anchor_pos = motion::char_to_pos(buf_mut, anchor_char);
         let position_pos = motion::char_to_pos(buf_mut, last_char);
         CursorState {
             position: position_pos,
@@ -4595,7 +4842,13 @@ async fn apply_edit(
             grep_position: None,
         }
     } else {
-        let post_pos = motion::char_to_pos(buf_mut, start_char + inserted_char_count);
+        // Point cursor. `PointAt` keeps the caret on the same char (clamped to the edited line's
+        // content); everything else lands just past the inserted text.
+        let point_char = match post_edit {
+            PostEdit::PointAt(c) => c.clamp(start_char, buf_mut.text.len_chars()),
+            _ => start_char + inserted_char_count,
+        };
+        let post_pos = motion::char_to_pos(buf_mut, point_char);
         CursorState {
             position: post_pos,
             anchor: post_pos,

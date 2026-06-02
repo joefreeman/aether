@@ -12,7 +12,7 @@ use aether_protocol::envelope::{
     ClientInbound, ErrorObject, ErrorResponse, JsonRpc, Notification, NotificationMethod, Request,
     RpcMethod,
 };
-use aether_protocol::input::{InputText, InputTextParams};
+use aether_protocol::input::{InputSurround, InputSurroundParams, InputText, InputTextParams};
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
 };
@@ -132,6 +132,36 @@ fn input_text_params() {
         v,
         json!({"buffer_id": 1, "text": "hi", "select_pasted": false})
     );
+}
+
+#[test]
+fn input_surround_params() {
+    use aether_protocol::envelope::RpcMethod;
+    use aether_protocol::input::SurroundTarget;
+    assert_eq!(InputSurround::NAME, "input/surround");
+
+    // `delimiter` is a char — serialises as a one-char JSON string; `target` is snake_case.
+    let v = to_value(InputSurroundParams {
+        buffer_id: 7,
+        delimiter: '(',
+        target: SurroundTarget::Line,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 7, "delimiter": "(", "target": "line"})
+    );
+
+    // Round-trips back to the same values.
+    let back: InputSurroundParams = serde_json::from_value(v).unwrap();
+    assert_eq!(back.buffer_id, 7);
+    assert_eq!(back.delimiter, '(');
+    assert_eq!(back.target, SurroundTarget::Line);
+
+    // `target` defaults to Selection when omitted on the wire.
+    let defaulted: InputSurroundParams =
+        serde_json::from_value(json!({"buffer_id": 1, "delimiter": "{"})).unwrap();
+    assert_eq!(defaulted.target, SurroundTarget::Selection);
 }
 
 #[test]

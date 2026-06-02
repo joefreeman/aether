@@ -22,7 +22,8 @@ use aether_protocol::error::ErrorCode;
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
-    InputText, InputTextParams, InputToggleComment, InputUndo, UndoResult,
+    InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
+    InputUnsurroundParams, SurroundTarget, UndoResult,
 };
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem,
@@ -378,6 +379,10 @@ pub struct EditorState {
     /// Set after `f`/`t`/`F`/`T` (and Alt variants); the next keystroke is interpreted as the
     /// target character rather than a normal-mode binding.
     pub pending_find: Option<PendingFind>,
+    /// Set after `Ctrl-s`; the next keystroke names the delimiter to surround with rather than a
+    /// binding. The value records the target (selection in Normal, line in Insert). Mirrors
+    /// `pending_find`'s next-key-is-data capture.
+    pub pending_surround: Option<SurroundTarget>,
     /// The most recent repeatable motion, replayed by `r` (cursor move) or `Shift-r` (cursor
     /// move + extend selection).
     pub last_motion: Option<Motion>,
@@ -737,6 +742,7 @@ async fn build_editor_state_from_open(
         externally_deleted: false,
         pending_count: 0,
         pending_find: None,
+        pending_surround: None,
         last_motion: None,
         search: SearchState::default(),
         file_path: open.path,
@@ -792,6 +798,10 @@ pub async fn run(
         apply_pending_notifications(state, client);
         flush_pending_scroll(client, state).await?;
         flush_pending_picker_scroll(client, state).await?;
+        // Authoritative per-frame refresh: the mode-transition call sites don't fire when a key
+        // *arms* or *resolves* a capture (`f`/`t`/`Ctrl-s`/`Space`), so reassert the style here so
+        // the awaiting-key underline appears and clears reliably.
+        apply_cursor_style(state);
         terminal.draw(|f| ui::draw(f, state))?;
         refresh_terminal_title(state);
     }
@@ -856,15 +866,33 @@ async fn dispatch_terminal_event(
     }
 }
 
+/// Whether a keybinding is mid-entry and waiting for the next keystroke to complete it: `f`/`t`
+/// (find char), `Ctrl-s` (surround delimiter), `Space` (leader), or a partially-typed count prefix
+/// (`1`–`9`…). In each case the next key continues the in-flight command rather than starting a
+/// fresh one — so we flag it with a distinct cursor shape.
+fn awaiting_key(state: &AppState) -> bool {
+    if state.pending_leader.is_some() {
+        return true;
+    }
+    state.has_editor() && {
+        let ed = state.ed();
+        ed.pending_find.is_some() || ed.pending_surround.is_some() || ed.pending_count > 0
+    }
+}
+
 fn apply_cursor_style(state: &AppState) {
-    // Overlays always use the bar cursor (they're text-prompt UIs). With no editor and no
-    // overlay, fall back to the bar — there's nothing for the block cursor to sit on.
-    let style = if state.picker.open
+    // A pending capture (`f`/`t`/`Ctrl-s`/`Space`) takes precedence: the underline signals "I'm
+    // waiting for one more key." These captures only arm in the editor, never under an overlay.
+    let style = if awaiting_key(state) {
+        SetCursorStyle::SteadyUnderScore
+    } else if state.picker.open
         || state.save_prompt.is_some()
         || state.confirm_prompt.is_some()
         || state.project_settings.is_some()
         || !state.has_editor()
     {
+        // Overlays always use the bar cursor (they're text-prompt UIs). With no editor and no
+        // overlay, fall back to the bar — there's nothing for the block cursor to sit on.
         SetCursorStyle::SteadyBar
     } else {
         match state.ed().mode {
@@ -1291,6 +1319,8 @@ async fn run_action(
                 count,
             });
         }
+        Action::BeginSurround(target) => state.ed_mut().pending_surround = Some(target),
+        Action::Unsurround(target) => unsurround(client, state, target).await?,
 
         // ---- viewport scroll ----
         Action::Scroll { dir, unit } => match dir {
@@ -1434,6 +1464,15 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
                 pending.extend,
             )
             .await?;
+        }
+        return Ok(());
+    }
+
+    // Pending `Ctrl-s`: the next keystroke names the surround delimiter. Use the raw key so
+    // `Ctrl-s "` and friends pass through verbatim. Any non-`Char` key (Esc, arrow, etc.) cancels.
+    if let Some(target) = state.ed_mut().pending_surround.take() {
+        if let KeyCode::Char(delimiter) = k.code {
+            surround(client, state, delimiter, target).await?;
         }
         return Ok(());
     }
@@ -2398,6 +2437,15 @@ async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
 }
 
 async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
+    // Pending `Ctrl-s`: the next keystroke names the surround delimiter (line-scoped in Insert).
+    // Use the raw key so the delimiter isn't consumed as text. Non-`Char` keys cancel.
+    if let Some(target) = state.ed_mut().pending_surround.take() {
+        if let KeyCode::Char(delimiter) = k.code {
+            surround(client, state, delimiter, target).await?;
+        }
+        return Ok(());
+    }
+
     let (code, mods) = normalize_key(k);
     // Shared Ctrl editing shortcuts (`Global` table) first — mode-specific divergences live inside
     // the wrappers (handle_copy / handle_cut / etc.). Count is hardcoded to 1 in Insert (no
@@ -3251,6 +3299,40 @@ async fn backspace(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
         .rpc::<InputBackspace>(BufferOnlyParams {
             buffer_id: state.ed_mut().buffer_id,
+        })
+        .await?;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
+    Ok(())
+}
+
+async fn surround(
+    client: &mut Client,
+    state: &mut AppState,
+    delimiter: char,
+    target: SurroundTarget,
+) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<aether_protocol::input::InputSurround>(InputSurroundParams {
+            buffer_id: state.ed_mut().buffer_id,
+            delimiter,
+            target,
+        })
+        .await?;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
+    Ok(())
+}
+
+async fn unsurround(
+    client: &mut Client,
+    state: &mut AppState,
+    target: SurroundTarget,
+) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<aether_protocol::input::InputUnsurround>(InputUnsurroundParams {
+            buffer_id: state.ed_mut().buffer_id,
+            target,
         })
         .await?;
     state.ed_mut().revision = r.revision;
@@ -4643,11 +4725,57 @@ mod tests {
             externally_deleted: false,
             pending_count: 0,
             pending_find: None,
+            pending_surround: None,
             last_motion: None,
             search: Default::default(),
             file_path: None,
             file_label: label.into(),
         }
+    }
+
+    #[test]
+    fn awaiting_key_tracks_pending_captures() {
+        let mut state = empty_app_state(80, 24);
+        state.editor = Some(stub_editor_state("buf"));
+
+        // Nothing armed → not awaiting.
+        assert!(!awaiting_key(&state));
+
+        // Leader (`Space`) armed.
+        state.pending_leader = Some(PendingLeader::Space);
+        assert!(awaiting_key(&state));
+        state.pending_leader = None;
+
+        // Find (`f`/`t`) armed.
+        state.ed_mut().pending_find = Some(PendingFind {
+            direction: Direction::Forward,
+            till: false,
+            extend: false,
+            count: 1,
+        });
+        assert!(awaiting_key(&state));
+        state.ed_mut().pending_find = None;
+
+        // Surround (`Ctrl-s`) armed.
+        state.ed_mut().pending_surround = Some(SurroundTarget::Selection);
+        assert!(awaiting_key(&state));
+        state.ed_mut().pending_surround = None;
+
+        // Count prefix mid-entry (`2`… awaiting a motion).
+        state.ed_mut().pending_count = 2;
+        assert!(awaiting_key(&state));
+        state.ed_mut().pending_count = 0;
+
+        assert!(!awaiting_key(&state));
+    }
+
+    #[test]
+    fn awaiting_key_does_not_panic_without_editor() {
+        // No editor: the editor-scoped captures are simply unreachable, but leader still counts.
+        let mut state = empty_app_state(80, 24);
+        assert!(!awaiting_key(&state));
+        state.pending_leader = Some(PendingLeader::Space);
+        assert!(awaiting_key(&state));
     }
 
     #[test]
