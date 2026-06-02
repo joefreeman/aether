@@ -2,12 +2,15 @@
 
 use crate::app::{
     grep_counter_label, search_counter_label, search_match_count_label, AppState, EditorMode,
+    HelpTab,
 };
+use crate::keymap;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::picker::PickerItem;
 use aether_protocol::search::SearchMatchRange;
 use aether_protocol::viewport::{Highlight, VisualRow, WrapMode};
 use aether_protocol::LogicalPosition;
+use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -90,6 +93,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     if show_status {
         draw_status(f, state, chunks[1]);
     }
+    // Keyboard-shortcut help (Space ?) is the topmost overlay — drawn last so it covers anything
+    // underneath, and openable with or without an editor.
+    if state.help.open {
+        draw_help_overlay(f, state, chunks[0]);
+    }
     // The settings overlay needs a caret on its input row even when no editor exists (e.g. right
     // after `project/create`). Fall back to a zero Rect for the status area in that case — the
     // settings branch in `place_terminal_cursor` doesn't read it.
@@ -129,13 +137,687 @@ fn draw_project_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     }
 }
 
+/// Keyboard-shortcut help overlay (`Space ?`). A bordered, centered modal — same geometry as the
+/// pickers — listing every binding grouped by context. The content is generated straight from the
+/// `keymap` tables (see [`help_lines`]) so it can never drift from the actual dispatch. Read-only;
+/// `state.help.scroll` pans the (possibly taller-than-the-box) content vertically.
+fn draw_help_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+    let box_area = picker_box_rect(area);
+    if box_area.width < 4 || box_area.height < 4 {
+        return;
+    }
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(NORD4))
+        .style(Style::default().bg(NORD0).fg(NORD4));
+    f.render_widget(block, box_area);
+    let inner = Rect {
+        x: box_area.x + 1,
+        y: box_area.y + 1,
+        width: box_area.width - 2,
+        height: box_area.height - 2,
+    };
+    let content = pad_horizontal(inner);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+    // A fixed tab bar on the top row (it must stay put while the body scrolls), then the per-tab
+    // body below it. When the box is too short for both, the tab bar wins and the body is dropped.
+    let tab_bar = Rect {
+        height: 1,
+        ..content
+    };
+    f.render_widget(
+        Paragraph::new(tab_bar_line(state.help.tab)).style(Style::default().fg(NORD4).bg(NORD0)),
+        tab_bar,
+    );
+    if content.height < 3 {
+        return;
+    }
+    let body = Rect {
+        y: content.y + 2,
+        height: content.height - 2,
+        ..content
+    };
+    // Reserve the rightmost column for a scrollbar when the tab is taller than the body (same cue
+    // as the picker). Decided from a full-width layout; if the scrollbar is shown we re-wrap to the
+    // narrower text area, which can only add lines (so the bar stays warranted).
+    let full = help_lines(state.help.tab, body.width as usize);
+    let needs_scrollbar = full.len() as u16 > body.height;
+    let (lines, text_width) = if needs_scrollbar {
+        let tw = body.width.saturating_sub(1);
+        (help_lines(state.help.tab, tw as usize), tw)
+    } else {
+        (full, body.width)
+    };
+    // Feed the scroll state the current geometry so key/wheel handling can clamp to the real
+    // bottom; then render from its clamped offset.
+    let total = lines.len() as u16;
+    state.help.scroll.record(total, body.height);
+    let scroll = state.help.scroll.offset();
+    let text_area = Rect {
+        width: text_width,
+        ..body
+    };
+    let para = Paragraph::new(lines)
+        .style(Style::default().fg(NORD4).bg(NORD0))
+        .scroll((scroll, 0));
+    f.render_widget(para, text_area);
+    if needs_scrollbar {
+        let bar = Rect {
+            x: body.x + text_width,
+            width: 1,
+            ..body
+        };
+        draw_vertical_scrollbar(f, bar, scroll, total, body.height);
+    }
+}
+
+/// A 1-column vertical scrollbar over `total` lines with `visible` rows shown from `offset`. Thumb
+/// size and position mirror [`draw_picker_scrollbar`]: `visible/total` of the track, at `offset/total`.
+fn draw_vertical_scrollbar(f: &mut Frame, area: Rect, offset: u16, total: u16, visible: u16) {
+    let track_h = area.height;
+    if track_h == 0 {
+        return;
+    }
+    let total = u64::from(total.max(1));
+    let window = u64::from(visible.min(total as u16).max(1));
+    let th = u64::from(track_h);
+    let thumb_h = ((window * th + total - 1) / total).max(1).min(th) as u16;
+    let max_thumb_y = track_h.saturating_sub(thumb_h);
+    let thumb_y = ((u64::from(offset) * th) / total) as u16;
+    let thumb_y = thumb_y.min(max_thumb_y);
+
+    let buf = f.buffer_mut();
+    let thumb_style = Style::default().fg(NORD8).bg(NORD0);
+    let track_style = Style::default().fg(NORD3).bg(NORD0);
+    for i in 0..track_h {
+        let in_thumb = i >= thumb_y && i < thumb_y + thumb_h;
+        let glyph = if in_thumb { "█" } else { "│" };
+        let style = if in_thumb { thumb_style } else { track_style };
+        buf.set_string(area.x, area.y + i, glyph, style);
+    }
+}
+
+/// The help overlay's tab bar: every [`HelpTab`] in display order, the active one bold + accent,
+/// the rest dimmed, joined by faint separators.
+fn tab_bar_line(active: HelpTab) -> Line<'static> {
+    let active_style = Style::default().fg(NORD8).add_modifier(Modifier::BOLD);
+    let inactive = Style::default().fg(NORD3);
+    let sep = Style::default().fg(NORD3);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, t) in HelpTab::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  │  ", sep));
+        }
+        let style = if *t == active { active_style } else { inactive };
+        spans.push(Span::styled(t.label(), style));
+    }
+    Line::from(spans)
+}
+
+/// Bindings omitted from the help overlay. The leader *trigger* (`Space` → [`BeginLeader`]) is
+/// hidden: its chords have their own Application tab, so the raw trigger would just be noise (and a
+/// lone "Leader" group) on the Normal tab.
+///
+/// [`BeginLeader`]: keymap::Action::BeginLeader
+fn help_hidden(b: &keymap::Binding) -> bool {
+    matches!(b.action, keymap::Action::BeginLeader)
+}
+
+/// The keymap contexts shown on `tab`, in render order. The Normal and Insert tabs append the
+/// shared `Global` (Ctrl-editing) table so each tab mirrors that mode's full dispatch fallback.
+fn tab_contexts(tab: HelpTab) -> &'static [keymap::KeyContext] {
+    use keymap::KeyContext as C;
+    match tab {
+        HelpTab::Normal => &[C::Normal, C::Global],
+        HelpTab::Insert => &[C::Insert, C::Global],
+        HelpTab::Search => &[C::Search],
+        HelpTab::Application => &[C::Leader],
+    }
+}
+
+/// Build one help *tab*'s lines from the `keymap` tables: each of the tab's contexts (see
+/// [`tab_contexts`]) rendered as accent-coloured `group` headings followed by their rows. The tab
+/// bar already names the mode, so contexts carry no heading of their own — the shared `Global`
+/// block on the Normal/Insert tabs simply flows on as further groups. Within a sub-section, columns
+/// are aligned to that section's own widths, a key's Alt variant occupies an aligned second column,
+/// and descriptions word-wrap (with a hanging indent) to `width`. When a section is too narrow to
+/// fit the Alt column, the Alt variant stacks on its own indented line instead.
+fn help_lines(tab: HelpTab, width: usize) -> Vec<Line<'static>> {
+    let heading = Style::default().fg(NORD8).add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(NORD9);
+    let desc_style = Style::default().fg(NORD4);
+    // The `/` that joins a merged direction pair (e.g. `h / l`) renders dimmer, as a separator.
+    let sep_style = Style::default().fg(NORD3);
+    let w = width.max(24);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Render grouped by `group`, *merging same-named groups across the tab's contexts* — so the
+    // Normal-mode `Delete` and the shared `Ctrl-d` (both "Edit") land in one section. The shared
+    // (extra-context) groups render as a block after the primary context's own groups, keeping the
+    // Ctrl-editing keys together. The table itself is ordered by key proximity to drive lookup, so
+    // a group's rows aren't contiguous there; collecting them here keeps each heading single.
+    let bindings: Vec<&'static keymap::Binding> = keymap::all().collect();
+    let contexts = tab_contexts(tab);
+    let primary = contexts[0];
+    let extra = &contexts[1..];
+    let mut done = vec![false; bindings.len()];
+
+    // Group names from the shared (extra) contexts, in first-appearance order.
+    let mut shared_groups: Vec<&'static str> = Vec::new();
+    for &cx in extra {
+        for b in &bindings {
+            if b.ctx == cx && !help_hidden(b) && !shared_groups.contains(&b.group) {
+                shared_groups.push(b.group);
+            }
+        }
+    }
+    // Primary groups that aren't also shared keep their place; the shared block follows them (a
+    // primary group whose name *is* shared, like Normal's "Edit", merges into that shared section).
+    let mut group_order: Vec<&'static str> = Vec::new();
+    for b in &bindings {
+        if b.ctx == primary
+            && !help_hidden(b)
+            && !shared_groups.contains(&b.group)
+            && !group_order.contains(&b.group)
+        {
+            group_order.push(b.group);
+        }
+    }
+    group_order.extend(shared_groups.iter().copied());
+
+    for (gi, g) in group_order.iter().enumerate() {
+        if gi > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(g.to_string(), heading)));
+
+        // Gather the group's rows from every context in the tab (in context order), so a merged
+        // group collects both the mode key and the shared Ctrl key. Alt folding (a key's same-key
+        // Alt sibling, always later in the table) and direction-pair merging stay per-context —
+        // they only ever pair within one context. The Leader context never folds Alt: there
+        // `Space Alt-s` is a distinct chord, not a modifier variant of `Space s`.
+        let mut display: Vec<DisplayRow> = Vec::new();
+        for &cx in contexts {
+            let fold_alt = cx != keymap::KeyContext::Leader;
+            let mut rows: Vec<(&'static keymap::Binding, Option<&'static keymap::Binding>)> =
+                Vec::new();
+            for i in 0..bindings.len() {
+                let b = bindings[i];
+                if done[i] || b.ctx != cx || b.group != *g || help_hidden(b) {
+                    continue;
+                }
+                done[i] = true;
+                let sibling = fold_alt
+                    .then(|| {
+                        bindings.iter().enumerate().skip(i + 1).find(|(j, c)| {
+                            !done[*j]
+                                && c.ctx == cx
+                                && c.group == b.group
+                                && c.is_alt_pair(b)
+                                && !help_hidden(c)
+                        })
+                    })
+                    .flatten();
+                rows.push(match sibling {
+                    Some((j, c)) => {
+                        done[j] = true;
+                        if b.is_alt() {
+                            (*c, Some(b))
+                        } else {
+                            (b, Some(*c))
+                        }
+                    }
+                    None => (b, None),
+                });
+            }
+            // Fold forward/backward direction pairs (h/l, j/k, ↑/↓, …) onto one row, merging their
+            // keys and symmetric descriptions ("Char left"/"Char right" → "Char left/right").
+            display.extend(build_display_rows(cx, &rows));
+        }
+        // Collapse aliases: two plain keys for the *same* command (e.g. `Delete` and `Ctrl-d`, both
+        // "Delete selection") into one `Delete, Ctrl-d` row. Comma — not the direction-pair `/` —
+        // signals "either key", not two opposite directions.
+        merge_alias_rows(&mut display);
+
+        // Column widths, computed per section so each lays out independently.
+        let kw = display
+            .iter()
+            .map(|r| r.base.key.width())
+            .max()
+            .unwrap_or(0);
+        // The base column spans *every* row, whether or not it has an Alt variant, so the Alt
+        // column begins past the longest base description. Sizing it only to Alt-bearing rows
+        // (whose descriptions can be short, e.g. `Search`/`Next match`) lets a long description
+        // on an Alt-less row (`Esc  Clear the active search`) overrun the Alt column. The Alt
+        // cell widths still only consider rows that actually carry an Alt variant.
+        let bdw = display
+            .iter()
+            .map(|r| r.base.desc.width())
+            .max()
+            .unwrap_or(0);
+        let (mut adw, mut akw, mut any_alt) = (0usize, 0usize, false);
+        for r in &display {
+            if let Some(a) = &r.alt {
+                any_alt = true;
+                adw = adw.max(a.desc.width());
+                akw = akw.max(a.key.width());
+            }
+        }
+        // The base and Alt cells share one column width so they read as two even columns. Size
+        // it to content (the wider of the two natural cell widths) rather than stretching to
+        // the box — that keeps the columns close together on wide terminals — but cap it at
+        // half the width so two columns plus a gap always fit. Go side-by-side only when the
+        // base cell fits unwrapped and the Alt cell keeps a usable description width; otherwise
+        // the Alt variant stacks on its own line.
+        const GAP: usize = 3;
+        const MIN_ALT_DESC: usize = 10;
+        let base_cell = kw + 2 + bdw;
+        let alt_cell = akw + 1 + adw;
+        let cap = w.saturating_sub(GAP) / 2;
+        let col_w = base_cell.max(alt_cell).min(cap);
+        let side_by_side = any_alt && cap >= base_cell && col_w >= akw + 1 + MIN_ALT_DESC;
+
+        for r in &display {
+            let bkey = &r.base.key;
+            if let (Some(a), true) = (&r.alt, side_by_side) {
+                // [ base key  base desc ]<gap>[ alt key  alt desc ] — two equal `col_w` columns.
+                let base_field = col_w - kw - 2; // base desc fits unwrapped (col_w ≥ base_cell)
+                let alt_desc_w = col_w - akw - 1;
+                let chunks = wrap_words(&a.desc, alt_desc_w);
+                // Only the key column dims its `/` separator; descriptions keep theirs in the
+                // normal text colour (pass `desc_style` as the separator style).
+                let mut spans = padded_spans(bkey, kw, key_style, sep_style);
+                spans.push(Span::raw("  "));
+                spans.extend(padded_spans(
+                    &r.base.desc,
+                    base_field,
+                    desc_style,
+                    desc_style,
+                ));
+                spans.push(Span::raw(" ".repeat(GAP)));
+                spans.extend(padded_spans(&a.key, akw, key_style, sep_style));
+                spans.push(Span::raw(" "));
+                spans.extend(sep_spans(&chunks[0], desc_style, desc_style));
+                lines.push(Line::from(spans));
+                let alt_desc_col = col_w + GAP + akw + 1;
+                for c in &chunks[1..] {
+                    let mut l = vec![Span::raw(" ".repeat(alt_desc_col))];
+                    l.extend(sep_spans(c, desc_style, desc_style));
+                    lines.push(Line::from(l));
+                }
+            } else {
+                // Base on its own wrapped line(s); a stacked Alt (too narrow to align) indents
+                // under the base description.
+                push_wrapped(
+                    &mut lines,
+                    bkey,
+                    kw,
+                    &r.base.desc,
+                    w,
+                    key_style,
+                    desc_style,
+                    sep_style,
+                );
+                if let Some(a) = &r.alt {
+                    let mut indented = vec![Span::raw(" ".repeat(kw + 2))];
+                    let inner = wrapped_spans(
+                        &a.key,
+                        a.key.width(),
+                        &a.desc,
+                        w - (kw + 2),
+                        key_style,
+                        desc_style,
+                        sep_style,
+                    );
+                    // Splice the first inner line after the indent; push the rest with indent.
+                    let mut iter = inner.into_iter();
+                    if let Some(first) = iter.next() {
+                        indented.extend(first);
+                        lines.push(Line::from(indented));
+                    }
+                    for rest in iter {
+                        let mut l = vec![Span::raw(" ".repeat(kw + 2))];
+                        l.extend(rest);
+                        lines.push(Line::from(l));
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// Push a `<key>  <description>` block to `lines`, word-wrapping the description to `width` with a
+/// hanging indent aligned under the description column.
+fn push_wrapped(
+    lines: &mut Vec<Line<'static>>,
+    key: &str,
+    key_w: usize,
+    desc: &str,
+    width: usize,
+    key_style: Style,
+    desc_style: Style,
+    sep_style: Style,
+) {
+    let desc_col = key_w + 2;
+    let chunks = wrap_words(desc, width.saturating_sub(desc_col));
+    // Key column dims its `/`; the description keeps its `/` in the normal text colour.
+    let mut first = padded_spans(key, key_w, key_style, sep_style);
+    first.push(Span::raw("  "));
+    first.extend(sep_spans(&chunks[0], desc_style, desc_style));
+    lines.push(Line::from(first));
+    for c in &chunks[1..] {
+        let mut l = vec![Span::raw(" ".repeat(desc_col))];
+        l.extend(sep_spans(c, desc_style, desc_style));
+        lines.push(Line::from(l));
+    }
+}
+
+/// Like [`push_wrapped`] but returns the span rows instead of pushing them (so a caller can add a
+/// leading indent). Each returned `Vec<Span>` is one rendered line.
+fn wrapped_spans(
+    key: &str,
+    key_w: usize,
+    desc: &str,
+    width: usize,
+    key_style: Style,
+    desc_style: Style,
+    sep_style: Style,
+) -> Vec<Vec<Span<'static>>> {
+    let desc_col = key_w + 1;
+    let chunks = wrap_words(desc, width.saturating_sub(desc_col));
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    // Key column dims its `/`; the description keeps its `/` in the normal text colour.
+    let mut first = padded_spans(key, key_w, key_style, sep_style);
+    first.push(Span::raw(" "));
+    first.extend(sep_spans(&chunks[0], desc_style, desc_style));
+    out.push(first);
+    for c in &chunks[1..] {
+        let mut l = vec![Span::raw(" ".repeat(desc_col))];
+        l.extend(sep_spans(c, desc_style, desc_style));
+        out.push(l);
+    }
+    out
+}
+
+/// Render `text` as spans, dimming the row's separators with `sep` and everything else with `main`:
+/// a standalone `/` token (the direction-pair separator) and a *trailing* comma on a token (the
+/// alias separator, `Delete, Ctrl-d`). A lone `,` token is the literal comma *key* (`Space ,`), not
+/// a separator, so it stays `main`. Descriptions pass `sep == main`, so their `/` and prose commas
+/// (e.g. "Go to line (count, default 1)") are never dimmed.
+fn sep_spans(text: &str, main: Style, sep: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, tok) in text.split(' ').enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        if tok == "/" {
+            spans.push(Span::styled("/", sep));
+        } else if let Some(word) = tok.strip_suffix(',').filter(|w| !w.is_empty()) {
+            spans.push(Span::styled(word.to_string(), main));
+            spans.push(Span::styled(",", sep));
+        } else if !tok.is_empty() {
+            spans.push(Span::styled(tok.to_string(), main));
+        }
+    }
+    spans
+}
+
+/// [`sep_spans`] then right-pad with spaces to a display width of `w`.
+fn padded_spans(text: &str, w: usize, main: Style, sep: Style) -> Vec<Span<'static>> {
+    let mut spans = sep_spans(text, main, sep);
+    let pad = w.saturating_sub(text.width());
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans
+}
+
+/// Greedy word-wrap to `width` columns. Always returns at least one (possibly empty) line. Words
+/// longer than `width` overflow rather than being hard-split — fine for the short help strings.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split_whitespace() {
+        let ww = word.width();
+        if cur.is_empty() {
+            cur.push_str(word);
+            cur_w = ww;
+        } else if cur_w + 1 + ww <= width {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_w += 1 + ww;
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+            cur_w = ww;
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// One key+description cell in the help overlay. Owned because direction-pair rows merge the text
+/// of two bindings.
+struct Cell {
+    key: String,
+    desc: String,
+}
+
+/// A help row ready to render: a base cell and its optional aligned Alt cell.
+struct DisplayRow {
+    base: Cell,
+    alt: Option<Cell>,
+}
+
+/// Forward/backward key pairs (in display order) whose rows are folded onto one line, merging both
+/// the keys (`h`,`l` → `h/l`) and their symmetric descriptions. Keyed by context.
+const DIRECTION_PAIRS: &[(keymap::KeyContext, KeyCode, KeyCode)] = &[
+    (
+        keymap::KeyContext::Normal,
+        KeyCode::Char('h'),
+        KeyCode::Char('l'),
+    ),
+    (
+        keymap::KeyContext::Normal,
+        KeyCode::Char('j'),
+        KeyCode::Char('k'),
+    ),
+    (
+        keymap::KeyContext::Normal,
+        KeyCode::Char('['),
+        KeyCode::Char(']'),
+    ),
+    (
+        keymap::KeyContext::Normal,
+        KeyCode::Char('{'),
+        KeyCode::Char('}'),
+    ),
+    (
+        keymap::KeyContext::Normal,
+        KeyCode::Char('<'),
+        KeyCode::Char('>'),
+    ),
+    (keymap::KeyContext::Normal, KeyCode::Up, KeyCode::Down),
+    (keymap::KeyContext::Normal, KeyCode::Left, KeyCode::Right),
+    (
+        keymap::KeyContext::Normal,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+    ),
+    (keymap::KeyContext::Insert, KeyCode::Up, KeyCode::Down),
+    (keymap::KeyContext::Insert, KeyCode::Left, KeyCode::Right),
+    (keymap::KeyContext::Search, KeyCode::Up, KeyCode::Down),
+    (keymap::KeyContext::Search, KeyCode::Left, KeyCode::Right),
+];
+
+/// The display-ordered pair `code` belongs to in `cx`, if any.
+fn direction_pair(cx: keymap::KeyContext, code: KeyCode) -> Option<(KeyCode, KeyCode)> {
+    DIRECTION_PAIRS
+        .iter()
+        .find(|(c, a, b)| *c == cx && (*a == code || *b == code))
+        .map(|(_, a, b)| (*a, *b))
+}
+
+/// Turn a sub-section's paired `(base, Alt)` bindings into display rows, folding direction pairs
+/// (h/l, j/k, …) onto a single merged row.
+fn build_display_rows(
+    cx: keymap::KeyContext,
+    rows: &[(&'static keymap::Binding, Option<&'static keymap::Binding>)],
+) -> Vec<DisplayRow> {
+    let mut out: Vec<DisplayRow> = Vec::new();
+    let mut used = vec![false; rows.len()];
+    for i in 0..rows.len() {
+        if used[i] {
+            continue;
+        }
+        let (base, alt) = rows[i];
+        // Fold a direction pair only when its partner is in this section and both sides agree on
+        // having an Alt variant (so the merged columns stay symmetric).
+        if let Some((first, second)) = direction_pair(cx, base.code) {
+            let partner = if base.code == first { second } else { first };
+            if let Some(j) = rows.iter().position(|(b, _)| b.code == partner) {
+                let (pbase, palt) = rows[j];
+                if j != i && !used[j] && alt.is_some() == palt.is_some() {
+                    used[i] = true;
+                    used[j] = true;
+                    // Put the two sides in the pair's display order.
+                    let (fb, fa, sb, sa) = if base.code == first {
+                        (base, alt, pbase, palt)
+                    } else {
+                        (pbase, palt, base, alt)
+                    };
+                    out.push(DisplayRow {
+                        base: Cell {
+                            key: merge_keys(&fb.key_label(), &sb.key_label()),
+                            desc: merge_descs(fb.desc, sb.desc),
+                        },
+                        alt: match (fa, sa) {
+                            (Some(fa), Some(sa)) => Some(Cell {
+                                key: merge_keys(&fa.key_label(), &sa.key_label()),
+                                desc: merge_descs(fa.desc, sa.desc),
+                            }),
+                            _ => None,
+                        },
+                    });
+                    continue;
+                }
+            }
+        }
+        used[i] = true;
+        out.push(DisplayRow {
+            base: Cell {
+                key: base.key_label(),
+                desc: base.desc.to_string(),
+            },
+            alt: alt.map(|a| Cell {
+                key: a.key_label(),
+                desc: a.desc.to_string(),
+            }),
+        });
+    }
+    out
+}
+
+/// Collapse rows that are *aliases* — different keys bound to the same command, identified by an
+/// identical description — into a single row whose keys are joined with `, ` (e.g. `Delete` and
+/// `Ctrl-d`, both "Delete selection", → `Delete, Ctrl-d`). Only plain rows merge: a row carrying an
+/// Alt variant keeps its two-column shape. Keys join in first-appearance order, and three-plus
+/// aliases chain (`A, B, C`). Comma rather than the direction-pair `/` keeps "either key" distinct
+/// from "two opposite directions".
+fn merge_alias_rows(display: &mut Vec<DisplayRow>) {
+    let mut i = 0;
+    while i < display.len() {
+        if display[i].alt.is_none() {
+            let mut j = i + 1;
+            while j < display.len() {
+                if display[j].alt.is_none() && display[j].base.desc == display[i].base.desc {
+                    let other = display.remove(j).base.key;
+                    display[i].base.key = format!("{}, {}", display[i].base.key, other);
+                } else {
+                    j += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Merge two key labels into `a / b` form. When factoring the common prefix/suffix leaves a single
+/// differing char on each side (`Alt-h`/`Alt-l` → `Alt-h / l`, `↑`/`↓` → `↑ / ↓`) we use the
+/// compact factored form; otherwise we show both keys in full (`PageUp` / `PageDown`) since a
+/// factored `PageUp / Down` reads worse. Chars (not bytes) so multi-byte glyphs aren't split.
+fn merge_keys(a: &str, b: &str) -> String {
+    if a == b {
+        return a.to_string();
+    }
+    let av: Vec<char> = a.chars().collect();
+    let bv: Vec<char> = b.chars().collect();
+    let (pre, mid_a, mid_b, suf) = factor_common(&av, &bv);
+    if mid_a.len() <= 1 && mid_b.len() <= 1 {
+        format!(
+            "{}{} / {}{}",
+            pre.iter().collect::<String>(),
+            mid_a.iter().collect::<String>(),
+            mid_b.iter().collect::<String>(),
+            suf.iter().collect::<String>(),
+        )
+    } else {
+        format!("{a} / {b}")
+    }
+}
+
+/// Merge two descriptions word-wise: factor out common leading/trailing *words* and join the
+/// differing middles with ` / ` — e.g. `"Char left"`+`"Char right"` → `"Char left / right"`.
+/// Word-level (not char-level) so a letter shared by two words — the `t` in `left`/`right` — isn't
+/// split off.
+fn merge_descs(a: &str, b: &str) -> String {
+    if a == b {
+        return a.to_string();
+    }
+    let aw: Vec<&str> = a.split(' ').collect();
+    let bw: Vec<&str> = b.split(' ').collect();
+    let (pre, mid_a, mid_b, suf) = factor_common(&aw, &bw);
+    let mut parts: Vec<String> = Vec::new();
+    if !pre.is_empty() {
+        parts.push(pre.join(" "));
+    }
+    parts.push(format!("{} / {}", mid_a.join(" "), mid_b.join(" ")));
+    if !suf.is_empty() {
+        parts.push(suf.join(" "));
+    }
+    parts.join(" ")
+}
+
+/// Split two slices into their common prefix, the two differing middles, and their common suffix.
+/// Shared by the char-wise [`merge_keys`] and word-wise [`merge_descs`].
+fn factor_common<'a, T: PartialEq>(a: &'a [T], b: &'a [T]) -> (&'a [T], &'a [T], &'a [T], &'a [T]) {
+    let max = a.len().min(b.len());
+    let mut p = 0;
+    while p < max && a[p] == b[p] {
+        p += 1;
+    }
+    let mut s = 0;
+    while s < max - p && a[a.len() - 1 - s] == b[b.len() - 1 - s] {
+        s += 1;
+    }
+    (
+        &a[..p],
+        &a[p..a.len() - s],
+        &b[p..b.len() - s],
+        &b[b.len() - s..],
+    )
+}
+
 /// Header block: `Project Settings (<name>)` heading, a blank row, `Project roots:` label.
 /// Degrades gracefully when the header area is shorter than 3 rows.
-fn draw_settings_header(
-    f: &mut Frame,
-    settings: &crate::app::ProjectSettingsState,
-    area: Rect,
-) {
+fn draw_settings_header(f: &mut Frame, settings: &crate::app::ProjectSettingsState, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -274,7 +956,10 @@ fn draw_settings_rows(
             let truncated = truncate_middle(&body, text_budget);
             let bg = if highlighted { NORD2 } else { NORD0 };
             let path_style = Style::default().fg(NORD4).bg(bg);
-            lines.push(Line::from(vec![leading, Span::styled(truncated, path_style)]));
+            lines.push(Line::from(vec![
+                leading,
+                Span::styled(truncated, path_style),
+            ]));
         } else {
             // Input row: no highlight regardless of selection. Placeholder when empty, plain
             // text otherwise; ratatui clips past the right edge for very long inputs.
@@ -845,12 +1530,8 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
             }
         }
         let highlighted = i == state.picker.selected;
-        let mut spans = picker_item_spans(
-            item,
-            &state.root_labels,
-            highlighted,
-            text_width as usize,
-        );
+        let mut spans =
+            picker_item_spans(item, &state.root_labels, highlighted, text_width as usize);
         // Italicise the synthetic "+ Create …" row so it reads as an action affordance rather
         // than a real entry. Applied uniformly across all spans of the row (including any
         // fuzzy-match-highlight spans), since the synthetic never has match indices anyway.
@@ -956,7 +1637,13 @@ fn picker_item_spans(
         match_indices,
     } = item
     {
-        return root_item_spans(*path_index, match_indices, root_labels, highlighted, max_width);
+        return root_item_spans(
+            *path_index,
+            match_indices,
+            root_labels,
+            highlighted,
+            max_width,
+        );
     }
 
     let bg = if highlighted { NORD2 } else { NORD0 };
@@ -1849,7 +2536,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // No editor: status row only shows transient feedback (project activation, errors).
         Line::from(vec![
             Span::raw(" "),
-            Span::styled(state.status.text.clone(), status_message_style(&state.status)),
+            Span::styled(
+                state.status.text.clone(),
+                status_message_style(&state.status),
+            ),
         ])
     } else if matches!(state.ed().mode, EditorMode::Search) {
         let prompt = format!("/{}", state.ed().search.query.text);
@@ -1865,11 +2555,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // left of the position. When the row is narrow we truncate the right edge of the left
         // segment with `…` so the right segment stays whole and the position never gets
         // painted over.
-        let counter_parts: Vec<String> =
-            [search_counter_label(state), grep_counter_label(state)]
-                .into_iter()
-                .flatten()
-                .collect();
+        let counter_parts: Vec<String> = [search_counter_label(state), grep_counter_label(state)]
+            .into_iter()
+            .flatten()
+            .collect();
         let pos = format_position(state);
         let right = if counter_parts.is_empty() {
             pos
@@ -1972,7 +2661,9 @@ fn draw_save_prompt_spans(
     spans.push(Span::styled(prompt.input.text.clone(), base_style));
 
     // Ghost suggestion: gray suffix after the cursor when one's available.
-    let ghost = prompt.ghost_suffix(&state.project_paths).unwrap_or_default();
+    let ghost = prompt
+        .ghost_suffix(&state.project_paths)
+        .unwrap_or_default();
     let ghost_w = ghost.width();
     if !ghost.is_empty() {
         spans.push(Span::styled(ghost, dim_style));
@@ -2029,7 +2720,10 @@ fn build_editor_status_spans(
 
     if left_pre_w >= left_max {
         // Even the pre-status segment overflows — truncate it and drop the status.
-        spans.push(Span::styled(truncate_to_width(left_pre, left_max), base_style));
+        spans.push(Span::styled(
+            truncate_to_width(left_pre, left_max),
+            base_style,
+        ));
     } else if status.is_empty() {
         spans.push(Span::styled(left_pre.to_string(), base_style));
     } else {
@@ -2084,7 +2778,6 @@ fn truncate_to_width(s: &str, max: usize) -> String {
     out.push_str(ellipsis);
     out
 }
-
 
 /// In insert mode: `A:B` (just the cursor). In normal mode: `A:B-C:D` (half-open) — A:B is the
 /// first byte of the selection, C:D is one byte past the last selected char. When the cursor /
@@ -2185,10 +2878,7 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         return;
     }
     let ed = state.ed();
-    if matches!(ed.mode, EditorMode::Search)
-        && state.save_prompt.is_none()
-        && !state.picker.open
-    {
+    if matches!(ed.mode, EditorMode::Search) && state.save_prompt.is_none() && !state.picker.open {
         // Park the terminal cursor on the status row, just past `/` + the typed query up
         // to the input cursor (so Left/Right navigate within the query, not always at the
         // end).
@@ -2421,6 +3111,203 @@ fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spot-check the rendered overlay: unpaired descriptions appear verbatim, Alt variants are
+    /// folded inline, and forward/backward pairs are merged into one row with merged keys and
+    /// descriptions.
+    #[test]
+    fn help_lines_render_expected_rows() {
+        // Concatenate every tab (wide enough that nothing wraps); the expected rows are spread
+        // across them — `Toggle soft wrap` on Normal/Insert, the grep pair on Normal, etc.
+        let rendered: String = HelpTab::ALL
+            .iter()
+            .flat_map(|t| help_lines(*t, 100))
+            .flat_map(|l| l.spans.into_iter())
+            .map(|s| s.content.into_owned())
+            .collect();
+        // Unpaired bindings appear verbatim (key + description).
+        for needle in [
+            "Toggle soft wrap",
+            "Clear the active search",
+            "Show keyboard shortcuts",
+            "Center cursor in window",
+        ] {
+            assert!(rendered.contains(needle), "missing: {needle:?}");
+        }
+        // Direction pairs are merged (keys and descriptions), with a spaced `/` separator.
+        for needle in [
+            "h / l",
+            "Character left / right",
+            "j / k",
+            "Logical line down / up",
+            "[ / ]",
+            "Previous / Next navigation unit",
+            "{ / }",
+            "Select to start / end of unit",
+            "< / >",
+            "Previous / Next grep hit",
+            "↑ / ↓",
+            "Scroll up / down one line",
+            "← / →",
+            "PageUp / PageDown",
+            "Scroll page up / down",
+        ] {
+            assert!(rendered.contains(needle), "expected merged row: {needle:?}");
+        }
+        // Alt variants fold onto the base line, and merge alongside a direction pair.
+        assert!(
+            rendered.contains("Alt-h / l"),
+            "Alt variant of a pair should merge too"
+        );
+        assert!(rendered.contains("First non-blank / End of line"));
+        // The un-merged "lef / right" bug (char-level merge splitting a shared letter) must not recur.
+        assert!(
+            !rendered.contains("lef / right"),
+            "descriptions must merge word-wise"
+        );
+    }
+
+    /// The mode-divergent Ctrl keys read with the right scope on each tab — selection-scoped on
+    /// Normal, line-scoped on Insert — and the Selection group's bare `c`/`r` no longer mis-fold
+    /// the unrelated `Ctrl-c`/`Ctrl-r` onto their rows.
+    #[test]
+    fn help_lines_describe_ctrl_keys_per_mode() {
+        let render = |tab| -> Vec<String> {
+            help_lines(tab, 120)
+                .into_iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        let normal = render(HelpTab::Normal);
+        let insert = render(HelpTab::Insert);
+        // A line holding both the key and its description (spacing-agnostic — the gutter width
+        // shifts as keys merge).
+        let row = |ls: &[String], key: &str, desc: &str| {
+            ls.iter().any(|l| l.contains(key) && l.contains(desc))
+        };
+
+        // Normal: selection-scoped wording; Insert: line-scoped wording.
+        assert!(row(&normal, "Ctrl-c", "Change selection"));
+        assert!(row(&insert, "Ctrl-d", "Delete line"));
+        assert!(row(&insert, "Ctrl-c", "Change line"));
+        assert!(row(&insert, "Ctrl-y", "Copy line"));
+
+        // Normal collapses the two keys for "delete selection" (the Delete key and Ctrl-d) into one
+        // aliased row, comma-separated; Insert keeps them apart (different commands there).
+        assert!(row(&normal, "Delete, Ctrl-d", "Delete selection"));
+        assert!(!insert.iter().any(|l| l.contains("Delete, Ctrl-d")));
+
+        // The fold bug: `Ctrl-c` must not be glued onto the bare-`c` Collapse row.
+        let collapse = normal
+            .iter()
+            .find(|l| l.contains("Collapse selection"))
+            .expect("Collapse row present");
+        assert!(
+            !collapse.contains("Ctrl-c"),
+            "Ctrl-c must not fold onto the bare `c` row: {collapse:?}"
+        );
+    }
+
+    /// The comma joining aliased keys (`Delete, Ctrl-d`) renders in the dim separator colour, like
+    /// the direction-pair `/`. The literal comma *key* (`Space ,`) stays key-coloured, and prose
+    /// commas in descriptions are untouched (covered by `sep == main` for descriptions).
+    #[test]
+    fn alias_separator_comma_is_dimmed() {
+        let comma_fg = |lines: &[Line<'static>], row: &str| -> Option<Color> {
+            lines
+                .iter()
+                .find(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        .contains(row)
+                })
+                .and_then(|l| {
+                    l.spans
+                        .iter()
+                        .find(|s| s.content.as_ref() == ",")
+                        .map(|s| s.style.fg)
+                })
+                .flatten()
+        };
+        let normal = help_lines(HelpTab::Normal, 120);
+        let app = help_lines(HelpTab::Application, 120);
+        // NORD3 = the dim separator colour; NORD9 = the key colour.
+        assert_eq!(
+            comma_fg(&normal, "Delete, Ctrl-d"),
+            Some(NORD3),
+            "alias separator comma should be dimmed"
+        );
+        assert_eq!(
+            comma_fg(&app, "Space ,"),
+            Some(NORD9),
+            "the literal comma key must stay key-coloured"
+        );
+    }
+
+    #[test]
+    fn merge_keys_factors_single_chars_else_shows_both() {
+        assert_eq!(merge_keys("Alt-h", "Alt-l"), "Alt-h / l");
+        assert_eq!(merge_keys("↑", "↓"), "↑ / ↓");
+        assert_eq!(merge_keys("[", "]"), "[ / ]");
+        assert_eq!(merge_keys("x", "x"), "x");
+        // Multi-char differing middles aren't factored (avoids "PageUp / Down").
+        assert_eq!(merge_keys("PageUp", "PageDown"), "PageUp / PageDown");
+    }
+
+    #[test]
+    fn merge_descs_is_word_wise() {
+        // The shared trailing letter of "left"/"right" stays attached (word-level merge).
+        assert_eq!(merge_descs("Char left", "Char right"), "Char left / right");
+        assert_eq!(
+            merge_descs("Scroll up one line", "Scroll down one line"),
+            "Scroll up / down one line"
+        );
+        assert_eq!(
+            merge_descs("First non-blank of line", "End of line"),
+            "First non-blank / End of line"
+        );
+    }
+
+    #[test]
+    fn wrap_words_breaks_on_spaces() {
+        assert_eq!(wrap_words("a b c", 3), vec!["a b", "c"]);
+        assert_eq!(wrap_words("hello world", 100), vec!["hello world"]);
+        assert_eq!(wrap_words("", 10), vec![String::new()]);
+        // A single over-long word overflows rather than being hard-split.
+        assert_eq!(
+            wrap_words("supercalifragilistic", 5),
+            vec!["supercalifragilistic"]
+        );
+    }
+
+    #[test]
+    fn padded_spans_pads_to_display_width() {
+        let st = Style::default();
+        let total: usize = padded_spans("ab", 5, st, st)
+            .iter()
+            .map(|s| s.content.width())
+            .sum();
+        assert_eq!(total, 5, "short text is padded to the column width");
+        let total: usize = padded_spans("abcde", 3, st, st)
+            .iter()
+            .map(|s| s.content.width())
+            .sum();
+        assert_eq!(total, 5, "already-wider text is not truncated");
+    }
+
+    #[test]
+    fn narrow_help_wraps_to_more_lines() {
+        // Squeezing the width forces descriptions to wrap / Alt variants to stack, so the overlay
+        // grows taller. (The scroll machinery then makes the extra lines reachable.)
+        assert!(help_lines(HelpTab::Normal, 100).len() > help_lines(HelpTab::Normal, 200).len());
+    }
 
     // ---- truncate_to_width ----
 

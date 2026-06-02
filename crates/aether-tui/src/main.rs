@@ -2,9 +2,11 @@ mod app;
 mod client;
 mod clipboard;
 mod discovery;
+mod keymap;
 mod labels;
 mod picker;
 mod save_prompt;
+mod scroll;
 mod stderr_capture;
 mod text_input;
 mod ui;
@@ -57,7 +59,8 @@ async fn main() -> anyhow::Result<()> {
 
     let info = discovery::read()?;
     let base_url = format!("ws://127.0.0.1:{}", info.port);
-    let mut client = client::Client::connect(&base_url, &info.token, env!("CARGO_PKG_VERSION")).await?;
+    let mut client =
+        client::Client::connect(&base_url, &info.token, env!("CARGO_PKG_VERSION")).await?;
 
     let mut terminal = setup_terminal()?;
     install_panic_hook();

@@ -44,7 +44,11 @@ impl Client {
     /// Connect to the server with credentials in the query string. The server checks the token
     /// during the WebSocket upgrade and rejects the connection if it's wrong — no JSON-RPC
     /// handshake.
-    pub async fn connect(base_url: &str, token: &str, client_version: &str) -> anyhow::Result<Self> {
+    pub async fn connect(
+        base_url: &str,
+        token: &str,
+        client_version: &str,
+    ) -> anyhow::Result<Self> {
         let url = format!("{base_url}/?token={token}&client_version={client_version}");
         let (ws, _) = tokio_tungstenite::connect_async(&url)
             .await

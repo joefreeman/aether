@@ -147,11 +147,9 @@ impl SavePromptState {
     /// SelectingRoot.
     pub fn listing_path(&self, project_paths: &[String]) -> Option<String> {
         match &self.mode {
-            PromptMode::Editing(e) => Some(dir_of_path(
-                project_paths,
-                e.path_index,
-                &self.input.text,
-            )),
+            PromptMode::Editing(e) => {
+                Some(dir_of_path(project_paths, e.path_index, &self.input.text))
+            }
             PromptMode::SelectingRoot(_) => None,
         }
     }
@@ -442,8 +440,8 @@ impl SavePromptState {
         if matches.is_empty() {
             return;
         }
-        let new = (sr.suggestion_idx as i64 + delta as i64)
-            .clamp(0, matches.len() as i64 - 1) as usize;
+        let new =
+            (sr.suggestion_idx as i64 + delta as i64).clamp(0, matches.len() as i64 - 1) as usize;
         sr.suggestion_idx = new;
     }
 
@@ -699,7 +697,11 @@ mod tests {
     #[test]
     fn alt_j_advances_through_matches_without_wrap() {
         let mut s = editing_at_root(&paths());
-        s.set_listing(vec![entry("foo", false), entry("foobar", false), entry("foobaz", false)]);
+        s.set_listing(vec![
+            entry("foo", false),
+            entry("foobar", false),
+            entry("foobaz", false),
+        ]);
         // All match the empty partial — Alt-j moves through them.
         assert_eq!(s.ghost_suffix(&paths()).as_deref(), Some("foo"));
         s.alt_j(&paths());
@@ -714,7 +716,11 @@ mod tests {
     #[test]
     fn alt_k_steps_back() {
         let mut s = editing_at_root(&paths());
-        s.set_listing(vec![entry("a", false), entry("b", false), entry("c", false)]);
+        s.set_listing(vec![
+            entry("a", false),
+            entry("b", false),
+            entry("c", false),
+        ]);
         s.alt_j(&paths());
         s.alt_j(&paths());
         assert_eq!(s.ghost_suffix(&paths()).as_deref(), Some("c"));

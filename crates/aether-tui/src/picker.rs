@@ -291,7 +291,9 @@ pub enum ItemKey<'a> {
     },
     DirEntry(&'a str),
     Project(&'a str),
-    Root { path_index: u32 },
+    Root {
+        path_index: u32,
+    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -356,7 +358,10 @@ mod tests {
         match last {
             PickerItem::DirEntry { name, is_dir, .. } => {
                 assert_eq!(name, "Create file \"newfile.rs\"");
-                assert!(!is_dir, "synthetic row is always rendered as a neutral action");
+                assert!(
+                    !is_dir,
+                    "synthetic row is always rendered as a neutral action"
+                );
             }
             other => panic!("expected DirEntry, got {other:?}"),
         }
@@ -406,7 +411,15 @@ mod tests {
     fn explorer_synthetic_suppressed_for_dot_segments() {
         // `.`, `./`, `..`, `../`, `foo/./bar`, `foo/../bar`, `foo//bar` — none of these are
         // legal filenames; the synthetic shouldn't tempt the user into trying.
-        for query in [".", "./", "..", "../", "foo/./bar", "foo/../bar", "foo//bar"] {
+        for query in [
+            ".",
+            "./",
+            "..",
+            "../",
+            "foo/./bar",
+            "foo/../bar",
+            "foo//bar",
+        ] {
             let mut s = empty_state(PickerKind::Explorer, query);
             s.items = Vec::new();
             s.recompute_synthetic_create_row();

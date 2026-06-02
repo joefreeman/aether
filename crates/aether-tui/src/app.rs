@@ -3,6 +3,7 @@
 
 use crate::client::Client;
 use crate::clipboard;
+use crate::keymap::{self, Action, InsertWhere, ScrollDir, ScrollUnit};
 use crate::text_input::PromptKeyOutcome;
 use crate::ui;
 use aether_protocol::buffer::{
@@ -14,11 +15,10 @@ use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams, CursorRedo,
     CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
     CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
-    Direction, Motion, VerticalDirection, WordBoundary,
+    Direction, Motion, VerticalDirection,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
-use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
@@ -29,6 +29,7 @@ use aether_protocol::picker::{
     PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
     PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
 };
+use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNext, SearchPrev, SearchSet,
     SearchSetParams, SearchStateChanged, SearchSummary,
@@ -139,16 +140,28 @@ pub struct StatusMessage {
 
 impl StatusMessage {
     pub fn info(text: impl Into<String>) -> Self {
-        Self { text: text.into(), kind: StatusKind::Info }
+        Self {
+            text: text.into(),
+            kind: StatusKind::Info,
+        }
     }
     pub fn success(text: impl Into<String>) -> Self {
-        Self { text: text.into(), kind: StatusKind::Success }
+        Self {
+            text: text.into(),
+            kind: StatusKind::Success,
+        }
     }
     pub fn warning(text: impl Into<String>) -> Self {
-        Self { text: text.into(), kind: StatusKind::Warning }
+        Self {
+            text: text.into(),
+            kind: StatusKind::Warning,
+        }
     }
     pub fn error(text: impl Into<String>) -> Self {
-        Self { text: text.into(), kind: StatusKind::Error }
+        Self {
+            text: text.into(),
+            kind: StatusKind::Error,
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
@@ -209,6 +222,68 @@ pub struct AppState {
     /// Active project-settings overlay (`Space ,`). When `Some`, draws a centered modal listing
     /// the project's roots, with a permanent add-root input row at the bottom. Closed by Esc.
     pub project_settings: Option<ProjectSettingsState>,
+    /// Keyboard-shortcut help overlay (`Space ?`). A read-only, client-local cheatsheet generated
+    /// from the `keymap` tables — no server round-trip. Closed by Esc.
+    pub help: HelpState,
+}
+
+/// State for the keyboard-shortcut help overlay. Open/closed, the selected tab, and a scroll
+/// position; the content is generated on the fly from the `keymap` binding tables, so there's
+/// nothing to cache here.
+#[derive(Debug, Default)]
+pub struct HelpState {
+    pub open: bool,
+    pub tab: HelpTab,
+    pub scroll: crate::scroll::ScrollState,
+}
+
+/// Which tab the help overlay is showing. The tabs mirror the key-dispatch layers: one per editor
+/// mode (`Normal`/`Insert`/`Search`), plus `Application` for the `Space`-leader chords. The shared
+/// `Ctrl-` editing keys (the `Global` table) are surfaced on both the Normal and Insert tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HelpTab {
+    #[default]
+    Normal,
+    Insert,
+    Search,
+    Application,
+}
+
+impl HelpTab {
+    /// Tabs in left-to-right display order — the order `h`/`l` cycles through.
+    pub const ALL: [HelpTab; 4] = [
+        HelpTab::Normal,
+        HelpTab::Insert,
+        HelpTab::Search,
+        HelpTab::Application,
+    ];
+
+    /// Label shown in the overlay's tab bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            HelpTab::Normal => "Normal",
+            HelpTab::Insert => "Insert",
+            HelpTab::Search => "Search",
+            HelpTab::Application => "Application",
+        }
+    }
+
+    /// Step `delta` tabs along [`HelpTab::ALL`], wrapping at both ends.
+    fn step(self, delta: isize) -> HelpTab {
+        let n = HelpTab::ALL.len() as isize;
+        let i = HelpTab::ALL.iter().position(|t| *t == self).unwrap_or(0) as isize;
+        HelpTab::ALL[(((i + delta) % n + n) % n) as usize]
+    }
+
+    /// The next tab to the right (wraps around to the first).
+    pub fn next(self) -> HelpTab {
+        self.step(1)
+    }
+
+    /// The previous tab to the left (wraps around to the last).
+    pub fn prev(self) -> HelpTab {
+        self.step(-1)
+    }
 }
 
 /// Project-settings overlay. Shows the active project's roots plus an always-present "add root"
@@ -406,10 +481,7 @@ pub async fn bootstrap(
                 let (path_index, relative_path) = strip_longest_root(&abs_str, &project_paths)
                     .map(|(i, r)| (i as u32, r))
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "{} is outside the project's roots",
-                            abs.display()
-                        )
+                        anyhow::anyhow!("{} is outside the project's roots", abs.display())
                     })?;
                 (Some((path_index, relative_path)), None)
             }
@@ -477,6 +549,7 @@ pub async fn bootstrap(
         confirm_prompt: None,
         editor: Some(editor),
         project_settings: None,
+        help: HelpState::default(),
     };
 
     // Seed the Explorer picker's remembered directory before the auto-open so it lists the
@@ -511,6 +584,7 @@ fn empty_app_state(viewport_cols: u32, viewport_rows: u32) -> AppState {
         confirm_prompt: None,
         editor: None,
         project_settings: None,
+        help: HelpState::default(),
     }
 }
 
@@ -907,6 +981,21 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
     // Project-settings overlay (and its add-root sub-prompt) take priority over everything
     // else — they're modal and can be reached from both the editor view and the no-editor
     // view, so route them up here before any has_editor branching.
+    // The help overlay sits above everything (it's openable with or without an editor) and is
+    // scrollable by keys or the mouse wheel, so route both to it before any other overlay or
+    // dispatch. Non-key/mouse events (e.g. resize) fall through to normal handling.
+    if state.help.open {
+        match &ev {
+            Event::Key(k) if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat => {
+                return handle_help_key(state, *k);
+            }
+            Event::Mouse(m) => {
+                handle_help_mouse(state, *m);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if let Event::Key(k) = &ev {
         if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat {
             if state.project_settings.is_some() {
@@ -1047,9 +1136,286 @@ fn normalize_key(k: KeyEvent) -> (KeyCode, KeyModifiers) {
     (code, mods)
 }
 
-const SHIFT_ONLY: KeyModifiers = KeyModifiers::SHIFT;
-const ALT_ONLY: KeyModifiers = KeyModifiers::ALT;
-const CTRL_ONLY: KeyModifiers = KeyModifiers::CONTROL;
+/// Execute a resolved [`Action`]. This is the *execution* half of the data-driven keymap (the
+/// *lookup* half lives in `keymap.rs`): the match arms hold the bodies that used to sit inline in
+/// the per-mode `match (code, mods)` handlers. Runtime context the table can't carry — `count`,
+/// whether Shift was held (`extend`), the viewport id, `last_motion` — is resolved here against
+/// live `AppState`. Stateful captures that aren't chord lookups (digit accumulation, the `f`/`t`
+/// continuation) stay in the handlers' preludes, not here.
+async fn run_action(
+    client: &mut Client,
+    state: &mut AppState,
+    action: Action,
+    count: u32,
+    extend: bool,
+) -> Result<()> {
+    match action {
+        // ---- motions ----
+        Action::MoveChar(direction) => {
+            move_motion(client, state, Motion::Char { direction, count }, extend).await?
+        }
+        Action::MoveWord { dir, boundary } => {
+            // Forward `w` is exclusive when extending — a selection built from it stops before the
+            // next word's first char. Backward is always inclusive.
+            move_motion(
+                client,
+                state,
+                Motion::Word {
+                    direction: dir,
+                    count,
+                    boundary,
+                    exclusive: dir == Direction::Forward && extend,
+                },
+                extend,
+            )
+            .await?
+        }
+        Action::MoveWordEnd { dir, boundary } => {
+            move_motion(
+                client,
+                state,
+                Motion::WordEnd {
+                    direction: dir,
+                    count,
+                    boundary,
+                },
+                extend,
+            )
+            .await?
+        }
+        Action::MoveVisualLine(direction) => {
+            let viewport_id = state.ed_mut().viewport_id;
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction,
+                    count,
+                },
+                extend,
+            )
+            .await?
+        }
+        Action::MoveLogicalLine(direction) => {
+            move_motion(
+                client,
+                state,
+                Motion::LogicalLine {
+                    direction,
+                    count,
+                    preserve_col: true,
+                },
+                extend,
+            )
+            .await?
+        }
+        Action::MoveLineStart => move_motion(client, state, Motion::LineStart, extend).await?,
+        Action::MoveLineEnd => move_motion(client, state, Motion::LineEnd, extend).await?,
+        Action::MoveLineFirstNonblank => {
+            move_motion(client, state, Motion::LineFirstNonblank, extend).await?
+        }
+        Action::GotoLine { last } => {
+            let line = if last {
+                state.ed_mut().line_count.saturating_sub(1)
+            } else {
+                count.saturating_sub(1)
+            };
+            let position = LogicalPosition { line, col: 0 };
+            move_motion(client, state, Motion::Goto { position }, extend).await?
+        }
+        Action::MatchBracket { inner } => {
+            move_motion(client, state, Motion::MatchBracket { inner }, extend).await?
+        }
+        Action::PageMotion { dir, half } => {
+            let viewport_id = state.ed_mut().viewport_id;
+            let span = if half {
+                (state.viewport_rows / 2).max(1)
+            } else {
+                state.viewport_rows.max(1)
+            };
+            let lines = count.saturating_mul(span);
+            move_motion(
+                client,
+                state,
+                Motion::VisualLine {
+                    viewport_id,
+                    direction: dir,
+                    count: lines,
+                },
+                extend,
+            )
+            .await?
+        }
+        // `]`/`[` navigate units (never extend); `}`/`{` jump to a unit edge (always extend).
+        Action::NavUnit(Direction::Forward) => {
+            move_motion(client, state, Motion::NextNavigationUnit, false).await?
+        }
+        Action::NavUnit(Direction::Backward) => {
+            move_motion(client, state, Motion::PrevNavigationUnit, false).await?
+        }
+        Action::NavUnitEdge { start: false } => {
+            move_motion(client, state, Motion::EndOfNavigationUnit, true).await?
+        }
+        Action::NavUnitEdge { start: true } => {
+            move_motion(client, state, Motion::StartOfNavigationUnit, true).await?
+        }
+
+        // ---- selection / cursor history ----
+        Action::SelectLine(direction) => {
+            select_line(client, state, direction, extend, count).await?
+        }
+        Action::SwapAnchor => swap_anchor(client, state).await?,
+        Action::CollapseSelection => {
+            if !state.ed_mut().cursor.is_point() {
+                clear_selection(client, state).await?;
+            }
+        }
+        Action::TreeExpand => tree_expand(client, state, count).await?,
+        Action::TreeContract => tree_contract(client, state, count).await?,
+        Action::MotionUndo => motion_undo(client, state, count).await?,
+        Action::MotionRedo => motion_redo(client, state, count).await?,
+        Action::RepeatMotion => {
+            if let Some(motion) = state.ed_mut().last_motion.clone() {
+                for _ in 0..count.max(1) {
+                    move_motion(client, state, motion.clone(), extend).await?;
+                }
+            }
+        }
+        Action::CenterCursor => center_cursor(client, state).await?,
+        Action::BeginFind { dir, till } => {
+            state.ed_mut().pending_find = Some(PendingFind {
+                direction: dir,
+                till,
+                extend,
+                count,
+            });
+        }
+
+        // ---- viewport scroll ----
+        Action::Scroll { dir, unit } => match dir {
+            ScrollDir::Up | ScrollDir::Down => {
+                let rows = state.viewport_rows as i64;
+                let mag = match unit {
+                    ScrollUnit::Line => 1,
+                    ScrollUnit::Half => (rows / 2).max(1),
+                    ScrollUnit::Page => rows.max(1),
+                };
+                let delta = if matches!(dir, ScrollDir::Up) {
+                    -mag
+                } else {
+                    mag
+                };
+                scroll_lines(state, delta);
+            }
+            ScrollDir::Left | ScrollDir::Right => {
+                let cols = state.viewport_cols as i64;
+                let mag = match unit {
+                    ScrollUnit::Half => (cols / 2).max(1),
+                    _ => 1,
+                };
+                let delta = if matches!(dir, ScrollDir::Left) {
+                    -mag
+                } else {
+                    mag
+                };
+                scroll_cols(state, delta);
+            }
+        },
+
+        // ---- mode transitions ----
+        Action::EnterInsert(where_) => enter_insert_at(client, state, where_).await?,
+        Action::LeaveInsert => leave_insert(state),
+        Action::BeginLeader => state.pending_leader = Some(PendingLeader::Space),
+
+        // ---- edits (Global Ctrl table + Insert keys) ----
+        Action::Backspace => backspace(client, state).await?,
+        Action::NewlineIndent => newline_and_indent(client, state).await?,
+        Action::InsertTab => insert_text(client, state, "\t").await?,
+        Action::DeletePoint => delete_selection(client, state).await?,
+        Action::DeleteSelection => {
+            for _ in 0..count.max(1) {
+                delete_selection(client, state).await?;
+            }
+        }
+        Action::DeleteLine => delete_line(client, state).await?,
+        Action::Undo => undo(client, state, count).await?,
+        Action::Redo => redo(client, state, count).await?,
+        Action::ToggleWrap => toggle_wrap(client, state).await?,
+        Action::MoveLines(dir) => move_lines(client, state, dir, count).await?,
+        Action::JoinLines => join_lines(client, state, count).await?,
+        Action::Indent => indent(client, state, count).await?,
+        Action::Dedent => dedent(client, state, count).await?,
+        Action::ToggleComment => toggle_comment(client, state).await?,
+        Action::OpenLineBelow => open_line_below(client, state).await?,
+        Action::OpenLineAbove => open_line_above(client, state).await?,
+        Action::Copy => copy_to_clipboard(client, state, CopyScope::Selection).await?,
+        Action::CopyLine => copy_to_clipboard(client, state, CopyScope::Line).await?,
+        Action::Cut => cut_to_clipboard(client, state, CopyScope::Selection).await?,
+        Action::CutLine => cut_to_clipboard(client, state, CopyScope::Line).await?,
+        Action::Paste => paste_before(client, state, count).await?,
+        Action::PasteAtCursor => paste_at_cursor(client, state).await?,
+        Action::Change => change_selection(client, state).await?,
+        Action::ChangeLine => change_line(client, state).await?,
+        Action::ReplaceClipboard => paste_replace(client, state, count).await?,
+        Action::ReplaceLineClipboard => replace_line_with_clipboard(client, state).await?,
+
+        // ---- search ----
+        Action::EnterSearch => enter_search_mode(client, state).await?,
+        Action::SearchFromSelection => search_from_selection(client, state).await?,
+        Action::SearchCycle(dir) => search_cycle(client, state, dir, count).await?,
+        Action::SearchAbort => abort_search(client, state).await?,
+        Action::SearchCommit => commit_search(state),
+        Action::SearchHistoryPrev => {
+            history_up(state);
+            run_incremental_search(client, state).await?;
+        }
+        Action::SearchHistoryNext => {
+            history_down(state);
+            run_incremental_search(client, state).await?;
+        }
+        Action::SearchCursorLeft => state.ed_mut().search.query.move_left(),
+        Action::SearchCursorRight => state.ed_mut().search.query.move_right(),
+        Action::SearchBackspace => {
+            state.ed_mut().search.query.backspace();
+            state.ed_mut().search.history_cursor = None;
+            run_incremental_search(client, state).await?;
+        }
+        Action::GrepNavigate(dir) => grep_navigate(client, state, dir).await?,
+        Action::DropSearch => {
+            // Drop the active search (clears highlights, disables n/Alt-n). Use `d` to drop the
+            // current selection instead.
+            if state.ed_mut().search.active || state.ed_mut().search.summary.is_some() {
+                let _ = client
+                    .rpc::<SearchClear>(SearchClearParams {
+                        buffer_id: state.ed_mut().buffer_id,
+                    })
+                    .await;
+            }
+            state.ed_mut().search.active = false;
+            state.ed_mut().search.summary = None;
+        }
+
+        // ---- pickers / app-level ----
+        Action::OpenPicker(kind) => open_picker(client, state, kind).await?,
+        Action::OpenProjectSettings => {
+            if !state.project_name.is_empty() {
+                open_project_settings(state);
+            }
+        }
+        Action::OpenHelp => {
+            state.help.open = true;
+            state.help.scroll.scroll_to_top();
+        }
+        Action::Quit => state.should_quit = true,
+        Action::CloseBuffer => close_buffer(client, state).await?,
+        Action::Save => save_buffer(client, state).await?,
+        Action::SaveAs => begin_save_prompt(client, state).await?,
+        Action::Reload => reload_buffer(client, state).await?,
+        Action::NewScratch => new_scratch(client, state).await?,
+    }
+    Ok(())
+}
 
 async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
     // Pending `f`/`t`: the next keystroke names the target character. Use the raw key (skipping
@@ -1102,498 +1468,14 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
     let extend = mods.contains(KeyModifiers::SHIFT);
 
-    // Ctrl-modified shortcuts that Normal and Insert share live in `handle_ctrl_binding`.
-    // Mode-specific divergences (e.g. clipboard scope) are handled inside that dispatcher's
-    // per-binding wrappers.
-    if handle_ctrl_binding(client, state, code, mods, count).await? {
-        return Ok(());
+    // Ctrl-modified editing shortcuts shared with Insert live in the `Global` table; the rest of
+    // Normal mode is its own table. Both are data — see `keymap.rs`. The stateful prelude above
+    // (find-char capture, digit counts) stays here because it isn't a chord lookup.
+    if let Some(b) = keymap::lookup(keymap::KeyContext::Global, code, mods) {
+        return run_action(client, state, b.action, count, extend).await;
     }
-
-    match (code, mods) {
-        // ---- meta ----
-        (KeyCode::Esc, _) => {
-            // Drop the active search (clears highlights, disables n/Alt-n). Use `d` to drop the
-            // current selection instead.
-            if state.ed_mut().search.active || state.ed_mut().search.summary.is_some() {
-                let _ = client
-                    .rpc::<SearchClear>(SearchClearParams {
-                        buffer_id: state.ed_mut().buffer_id,
-                    })
-                    .await;
-            }
-            state.ed_mut().search.active = false;
-            state.ed_mut().search.summary = None;
-        }
-        // `c` collapses any multi-char selection to a 1-char point at the cursor. No-op if
-        // already a point. Visually unchanged: the block cursor stays where it was.
-        (KeyCode::Char('c'), m) if m == KeyModifiers::NONE => {
-            if !state.ed_mut().cursor.is_point() {
-                clear_selection(client, state).await?;
-            }
-        }
-
-        // ---- non-letter motions and scroll ----
-        // Home/End map to logical-line start/end; arrows scroll the viewport without moving the
-        // cursor (so the cursor can drift off-screen until a motion snaps it back). Alt-arrow
-        // scrolls by a half-viewport. PageUp/Down are full-viewport scrolls.
-        (KeyCode::Home, _) => move_motion(client, state, Motion::LineStart, extend).await?,
-        (KeyCode::End, _) => move_motion(client, state, Motion::LineEnd, extend).await?,
-        (KeyCode::PageDown, _) => scroll_lines(state, state.viewport_rows as i64),
-        (KeyCode::PageUp, _) => scroll_lines(state, -(state.viewport_rows as i64)),
-        (KeyCode::Up, m) if m.contains(KeyModifiers::ALT) => {
-            scroll_lines(state, -((state.viewport_rows / 2) as i64))
-        }
-        (KeyCode::Down, m) if m.contains(KeyModifiers::ALT) => {
-            scroll_lines(state, (state.viewport_rows / 2) as i64)
-        }
-        (KeyCode::Up, _) => scroll_lines(state, -1),
-        (KeyCode::Down, _) => scroll_lines(state, 1),
-        (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => {
-            scroll_cols(state, -((state.viewport_cols / 2) as i64))
-        }
-        (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => {
-            scroll_cols(state, (state.viewport_cols / 2) as i64)
-        }
-        (KeyCode::Left, _) => scroll_cols(state, -1),
-        (KeyCode::Right, _) => scroll_cols(state, 1),
-
-        // ---- motions: hjkl (logical) and Alt-hjkl (line jumps + visual rows) ----
-        // `h/l` move by char; `Alt-h/l` jump to the first non-whitespace / end of the logical
-        // line. `j/k` move by logical line; `Alt-j/k` move by one visual row (the only "visual"
-        // motion now — used to step inside wrapped content). `0` (below) goes to literal col 0
-        // for cases where you want column zero, not first non-blank.
-        (KeyCode::Char('h'), m) if m.contains(KeyModifiers::ALT) => {
-            move_motion(client, state, Motion::LineFirstNonblank, extend).await?
-        }
-        (KeyCode::Char('h'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            move_motion(
-                client,
-                state,
-                Motion::Char {
-                    direction: Direction::Backward,
-                    count,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('l'), m) if m.contains(KeyModifiers::ALT) => {
-            move_motion(client, state, Motion::LineEnd, extend).await?
-        }
-        (KeyCode::Char('l'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            move_motion(
-                client,
-                state,
-                Motion::Char {
-                    direction: Direction::Forward,
-                    count,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('k'), m) if m.contains(KeyModifiers::ALT) => {
-            let viewport_id = state.ed_mut().viewport_id;
-            move_motion(
-                client,
-                state,
-                Motion::VisualLine {
-                    viewport_id,
-                    direction: VerticalDirection::Up,
-                    count,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('k'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            move_motion(
-                client,
-                state,
-                Motion::LogicalLine {
-                    direction: Direction::Backward,
-                    count,
-                    preserve_col: true,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('j'), m) if m.contains(KeyModifiers::ALT) => {
-            let viewport_id = state.ed_mut().viewport_id;
-            move_motion(
-                client,
-                state,
-                Motion::VisualLine {
-                    viewport_id,
-                    direction: VerticalDirection::Down,
-                    count,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('j'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            move_motion(
-                client,
-                state,
-                Motion::LogicalLine {
-                    direction: Direction::Forward,
-                    count,
-                    preserve_col: true,
-                },
-                extend,
-            )
-            .await?
-        }
-
-        // ---- motions: page / half-page ----
-        // `u`/`d` move the cursor by a full viewport's worth of visual rows; `Alt-u`/`Alt-d` move
-        // by half. Measured in visual rows so wrapped content steps consistently. Count prefix
-        // multiplies (e.g. `3d` = three pages). The viewport follows the cursor on re-render.
-        (KeyCode::Char('d'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            let viewport_id = state.ed_mut().viewport_id;
-            let lines = count.saturating_mul(state.viewport_rows.max(1));
-            move_motion(
-                client,
-                state,
-                Motion::VisualLine {
-                    viewport_id,
-                    direction: VerticalDirection::Down,
-                    count: lines,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('u'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            let viewport_id = state.ed_mut().viewport_id;
-            let lines = count.saturating_mul(state.viewport_rows.max(1));
-            move_motion(
-                client,
-                state,
-                Motion::VisualLine {
-                    viewport_id,
-                    direction: VerticalDirection::Up,
-                    count: lines,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::ALT) => {
-            let viewport_id = state.ed_mut().viewport_id;
-            let lines = count.saturating_mul((state.viewport_rows / 2).max(1));
-            move_motion(
-                client,
-                state,
-                Motion::VisualLine {
-                    viewport_id,
-                    direction: VerticalDirection::Down,
-                    count: lines,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('u'), m) if m.contains(KeyModifiers::ALT) => {
-            let viewport_id = state.ed_mut().viewport_id;
-            let lines = count.saturating_mul((state.viewport_rows / 2).max(1));
-            move_motion(
-                client,
-                state,
-                Motion::VisualLine {
-                    viewport_id,
-                    direction: VerticalDirection::Up,
-                    count: lines,
-                },
-                extend,
-            )
-            .await?
-        }
-
-        // ---- motions: WORD (w/b/e) and Alt for word ----
-        // Plain `w/b/e` use big WORDs (whitespace-delimited); `Alt-w/b/e` use small words
-        // (alphanumeric/symbol category transitions). Forward `w` is exclusive when extending —
-        // Shift-w selects up to (but not including) the start of the next WORD, matching the
-        // vim/helix convention that operator-style selections don't bleed into the next word.
-        (KeyCode::Char('w'), m) if m.contains(KeyModifiers::ALT) => {
-            move_motion(
-                client,
-                state,
-                Motion::Word {
-                    direction: Direction::Forward,
-                    count,
-                    boundary: WordBoundary::Word,
-                    exclusive: extend,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('w'), m) if !m.contains(KeyModifiers::CONTROL) => {
-            move_motion(
-                client,
-                state,
-                Motion::Word {
-                    direction: Direction::Forward,
-                    count,
-                    boundary: WordBoundary::BigWord,
-                    exclusive: extend,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('b'), m) if m.contains(KeyModifiers::ALT) => {
-            move_motion(
-                client,
-                state,
-                Motion::Word {
-                    direction: Direction::Backward,
-                    count,
-                    boundary: WordBoundary::Word,
-                    exclusive: false,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('b'), m) if !m.contains(KeyModifiers::CONTROL) => {
-            move_motion(
-                client,
-                state,
-                Motion::Word {
-                    direction: Direction::Backward,
-                    count,
-                    boundary: WordBoundary::BigWord,
-                    exclusive: false,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('e'), m) if m.contains(KeyModifiers::ALT) => {
-            move_motion(
-                client,
-                state,
-                Motion::WordEnd {
-                    direction: Direction::Forward,
-                    count,
-                    boundary: WordBoundary::Word,
-                },
-                extend,
-            )
-            .await?
-        }
-        (KeyCode::Char('e'), _) => {
-            move_motion(
-                client,
-                state,
-                Motion::WordEnd {
-                    direction: Direction::Forward,
-                    count,
-                    boundary: WordBoundary::BigWord,
-                },
-                extend,
-            )
-            .await?
-        }
-
-        // ---- motions: line start ----
-        (KeyCode::Char('0'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            move_motion(client, state, Motion::LineStart, extend).await?
-        }
-
-        // ---- motions: find char (`f`/`t` + Alt for backward, Shift to extend) ----
-        // After pressing one of these, the *next* keystroke is interpreted as the target
-        // character (see the `pending_find` block at the top of this handler).
-        (KeyCode::Char('f'), m) if m.contains(KeyModifiers::ALT) => {
-            state.ed_mut().pending_find = Some(PendingFind {
-                direction: Direction::Backward,
-                till: false,
-                extend,
-                count,
-            })
-        }
-        (KeyCode::Char('f'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            state.ed_mut().pending_find = Some(PendingFind {
-                direction: Direction::Forward,
-                till: false,
-                extend,
-                count,
-            })
-        }
-        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::ALT) => {
-            state.ed_mut().pending_find = Some(PendingFind {
-                direction: Direction::Backward,
-                till: true,
-                extend,
-                count,
-            })
-        }
-        (KeyCode::Char('t'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            state.ed_mut().pending_find = Some(PendingFind {
-                direction: Direction::Forward,
-                till: true,
-                extend,
-                count,
-            })
-        }
-
-        // ---- motion: matching bracket ----
-        // `m` jumps to the bracket that matches the one under (or enclosing) the cursor.
-        // `Shift-m` does the same with `extend=true`, producing a selection from the original
-        // position to the match — a natural "select around brackets" gesture (Vim's `v%`).
-        // `Alt-m` is the "inner" counterpart: it jumps one char inside the matching bracket
-        // and toggles sides on repeat, so `Alt-m Shift-Alt-m` selects everything *inside*
-        // the bracket pair (excluding the brackets themselves).
-        (KeyCode::Char('m'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            move_motion(client, state, Motion::MatchBracket { inner: false }, extend).await?
-        }
-        (KeyCode::Char('m'), m) if m == ALT_ONLY || m == (ALT_ONLY | SHIFT_ONLY) => {
-            move_motion(client, state, Motion::MatchBracket { inner: true }, extend).await?
-        }
-
-        // ---- motions: navigation units ----
-        // `]` / `[` *navigate between* per-language navigation units (function, struct, HTML
-        // element, CSS rule set, etc. — see `LanguageConfig::navigation_kinds`). The cursor's
-        // position implicitly determines the level: inside a method the next hit is the next
-        // method in the same class; on the class header the next hit is the next top-level
-        // item. Scope boundaries are *not* crossed.
-        // `}` / `{` *jump to the end / start* of the enclosing navigation unit, extending the
-        // selection. Use `}` on a function header to select the whole function; use `{` to
-        // select from the cursor back to the function's start. Unlike `]`/`[` they don't have
-        // a "next" hop, so they work on the last unit in a container too.
-        (KeyCode::Char(']'), m) if m == KeyModifiers::NONE => {
-            move_motion(client, state, Motion::NextNavigationUnit, false).await?
-        }
-        (KeyCode::Char('['), m) if m == KeyModifiers::NONE => {
-            move_motion(client, state, Motion::PrevNavigationUnit, false).await?
-        }
-        (KeyCode::Char('}'), _) => {
-            move_motion(client, state, Motion::EndOfNavigationUnit, true).await?
-        }
-        (KeyCode::Char('{'), _) => {
-            move_motion(client, state, Motion::StartOfNavigationUnit, true).await?
-        }
-
-        // ---- motions: goto line ----
-        // `g` jumps to line N (1-indexed; no prefix = line 1). `Alt-g` jumps to the last line.
-        // Shift extends the selection. The server clamps line numbers past EOF.
-        (KeyCode::Char('g'), m) if m.contains(KeyModifiers::ALT) => {
-            let target = LogicalPosition {
-                line: state.ed_mut().line_count.saturating_sub(1),
-                col: 0,
-            };
-            move_motion(client, state, Motion::Goto { position: target }, extend).await?
-        }
-        (KeyCode::Char('g'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            let target = LogicalPosition {
-                line: count.saturating_sub(1),
-                col: 0,
-            };
-            move_motion(client, state, Motion::Goto { position: target }, extend).await?
-        }
-
-        // ---- line selection ----
-        // `x` always grows the selection's bottom edge downward; `Alt-x` always grows the top
-        // edge upward. With no selection: `x` picks the current line (or the next at end-of-line)
-        // and `Alt-x` picks the previous (or the current at end-of-line). The `Shift` variants
-        // keep the other edge in place (extending); the non-shift variants collapse onto a single
-        // line at the moved edge. The cursor stays on whichever end (top/bottom) it was on, so
-        // the bindings behave the same after `o` flips the selection direction.
-        (KeyCode::Char('x'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            select_line(client, state, Direction::Forward, extend, count).await?
-        }
-        (KeyCode::Char('x'), m) if m.contains(KeyModifiers::ALT) => {
-            select_line(client, state, Direction::Backward, extend, count).await?
-        }
-
-        // ---- selection manipulation ----
-        // `o` swaps the cursor and anchor — flips which end of the selection is the "leading"
-        // edge, so a subsequent `Shift-*` motion extends from the other side.
-        (KeyCode::Char('o'), m) if m == KeyModifiers::NONE => swap_anchor(client, state).await?,
-
-        // Tree-sitter selection expansion / contraction. `y` grows the selection to the smallest
-        // enclosing syntax node; `Alt-y` reverses one step. With `N` prefix, applied N times.
-        (KeyCode::Char('y'), m) if m == KeyModifiers::NONE => {
-            tree_expand(client, state, count).await?
-        }
-        (KeyCode::Char('y'), m) if m == ALT_ONLY => {
-            tree_contract(client, state, count).await?
-        }
-
-        // Motion undo / redo — per-client history of cursor/selection changes, capped at the
-        // last buffer mutation. Distinct from `Ctrl-z`/`Ctrl-Alt-z` which rewind buffer edits.
-        (KeyCode::Char('z'), m) if m == ALT_ONLY => motion_redo(client, state, count).await?,
-        (KeyCode::Char('z'), m) if m == KeyModifiers::NONE => {
-            motion_undo(client, state, count).await?
-        }
-
-        // Repeat the last *repeatable* motion (see `is_repeatable_motion`). `r` runs it as a
-        // plain cursor move; `Shift-r` runs it extending the current selection. `Nr` loops the
-        // motion N times — so e.g. after `f x`, `5r` jumps to the 5th next `x`.
-        (KeyCode::Char('r'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            if let Some(motion) = state.ed_mut().last_motion.clone() {
-                for _ in 0..count.max(1) {
-                    move_motion(client, state, motion.clone(), extend).await?;
-                }
-            }
-        }
-
-        // ---- mode transitions ----
-        (KeyCode::Char('i'), m) if m == KeyModifiers::NONE => {
-            enter_insert_at(client, state, InsertWhere::SelectionStart).await?
-        }
-        (KeyCode::Char('a'), m) if m == KeyModifiers::NONE => {
-            enter_insert_at(client, state, InsertWhere::SelectionEnd).await?
-        }
-        (KeyCode::Char('i'), m) if m == ALT_ONLY => {
-            enter_insert_at(client, state, InsertWhere::FirstLineStart).await?
-        }
-        (KeyCode::Char('a'), m) if m == ALT_ONLY => {
-            enter_insert_at(client, state, InsertWhere::LastLineEnd).await?
-        }
-
-        // ---- viewport ----
-        // `Ctrl-p` (toggle wrap) goes through the shared Ctrl handler below; only the
-        // non-Ctrl viewport bindings (centre-cursor) live here.
-        (KeyCode::Char('-'), m) if m == KeyModifiers::NONE => center_cursor(client, state).await?,
-
-        // ---- delete (also bound to Delete key) ----
-        // The plain `Delete` key shares semantics with `Ctrl-d` in Normal mode (delete-
-        // selection, repeated `count` times). `Ctrl-d` itself is in `handle_ctrl_binding`.
-        (KeyCode::Delete, _) => handle_delete(client, state, count).await?,
-
-        // ---- leader (Space) ----
-        // `Space` starts a multi-key chord; the next keystroke selects the action. See
-        // `handle_leader_key`.
-        (KeyCode::Char(' '), m) if m == KeyModifiers::NONE => {
-            state.pending_leader = Some(PendingLeader::Space)
-        }
-
-        // ---- search ----
-        (KeyCode::Char('/'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            enter_search_mode(client, state).await?
-        }
-        (KeyCode::Char('/'), m) if m == ALT_ONLY => search_from_selection(client, state).await?,
-        (KeyCode::Char('n'), m) if m.contains(KeyModifiers::ALT) => {
-            search_cycle(client, state, Direction::Backward, count).await?
-        }
-        (KeyCode::Char('n'), m) if m == KeyModifiers::NONE || m == SHIFT_ONLY => {
-            search_cycle(client, state, Direction::Forward, count).await?
-        }
-
-        // ---- grep navigation ----
-        // `>` / `<` step through the last grep query's hits without re-opening the picker. The
-        // server resolves the next/previous hit against the cursor's position (within-file
-        // first, falling through to the next/previous file in path order). Silently no-op when
-        // there are no cached hits or we're past the list ends.
-        (KeyCode::Char('>'), _) => grep_navigate(client, state, Direction::Forward).await?,
-        (KeyCode::Char('<'), _) => grep_navigate(client, state, Direction::Backward).await?,
-
-        _ => {}
+    if let Some(b) = keymap::lookup(keymap::KeyContext::Normal, code, mods) {
+        run_action(client, state, b.action, count, extend).await?;
     }
     Ok(())
 }
@@ -1645,112 +1527,17 @@ async fn handle_leader_key(
     leader: PendingLeader,
     k: KeyEvent,
 ) -> Result<()> {
+    // `Space` is the only leader for now; the chord's second key resolves against the `Leader`
+    // table. Actions that act on the current buffer are dropped without an editor (matching the
+    // old "Esc cancels a half-typed chord" behaviour) so the pre-activation screen only surfaces
+    // the editor-free actions (`Space p/q/,/?`).
+    let _ = leader;
     let (code, mods) = normalize_key(k);
-    let alt_only: KeyModifiers = KeyModifiers::ALT;
-    // Bindings that act on the current buffer (or the project's file index) need both an active
-    // editor and an active project. Without those, fall through to the chord-cancel branch — the
-    // pre-activation event loop only surfaces Space p / Space q to the user. We could also error,
-    // but silently dropping matches the existing "Esc cancels" cancellation behaviour for chords
-    // the user composed and changed their mind on.
-    let needs_editor = matches!(
-        (leader, code, mods),
-        (PendingLeader::Space, KeyCode::Char('f'), m) if m == KeyModifiers::NONE
-    ) || matches!(
-        (leader, code, mods),
-        (PendingLeader::Space, KeyCode::Char('b'), m) if m == KeyModifiers::NONE
-    ) || matches!(
-        (leader, code, mods),
-        (PendingLeader::Space, KeyCode::Char('g'), m) if m == KeyModifiers::NONE
-    ) || matches!(
-        (leader, code, mods),
-        (PendingLeader::Space, KeyCode::Char('e'), m) if m == KeyModifiers::NONE
-    ) || matches!(
-        (leader, code, mods),
-        (PendingLeader::Space, KeyCode::Char('w'), m) if m == KeyModifiers::NONE
-    ) || matches!(
-        (leader, code, mods),
-        (PendingLeader::Space, KeyCode::Char('s'), _)
-    ) || matches!(
-        (leader, code, mods),
-        (PendingLeader::Space, KeyCode::Char('r'), m) if m == KeyModifiers::NONE
-    ) || matches!(
-        (leader, code, mods),
-        (PendingLeader::Space, KeyCode::Char('n'), _)
-    );
-    if needs_editor && !state.has_editor() {
-        return Ok(());
-    }
-    match (leader, code, mods) {
-        // `Space f` — open the file picker. Resumes the prior query + highlight + scroll
-        // position; first-ever open is empty.
-        (PendingLeader::Space, KeyCode::Char('f'), m) if m == KeyModifiers::NONE => {
-            open_picker(client, state, PickerKind::Files).await?;
+    if let Some(b) = keymap::lookup(keymap::KeyContext::Leader, code, mods) {
+        if b.action.needs_editor() && !state.has_editor() {
+            return Ok(());
         }
-        // `Space b` — open the buffer picker. MRU-ordered with the current buffer at the top;
-        // selecting it is a no-op switch. Useful for quickly cycling back to a recent buffer
-        // without going through the file browser.
-        (PendingLeader::Space, KeyCode::Char('b'), m) if m == KeyModifiers::NONE => {
-            open_picker(client, state, PickerKind::Buffers).await?;
-        }
-        // `Space g` — open the grep picker. Pre-fills the input from the active buffer's search
-        // query (so workspace-search continues the in-buffer search), falling back to the last
-        // grep query, then empty. Same-query reopens hit the server-side cache and appear
-        // instantly; a different query reruns the search.
-        (PendingLeader::Space, KeyCode::Char('g'), m) if m == KeyModifiers::NONE => {
-            open_picker(client, state, PickerKind::Grep).await?;
-        }
-        // `Space e` — open the filesystem explorer. Resumes the prior directory + highlight on
-        // reopen; first-ever open lands in the parent of the current file (or the first project
-        // root). Filter via the query input; `Alt-Backspace` clears the filter and (when the
-        // filter is already empty) steps up to the parent directory; `Enter` opens the
-        // highlighted file or descends into the highlighted directory.
-        (PendingLeader::Space, KeyCode::Char('e'), m) if m == KeyModifiers::NONE => {
-            open_picker(client, state, PickerKind::Explorer).await?;
-        }
-        // `Space p` — open the project picker overlay. Lists every project under
-        // `$XDG_CONFIG_HOME/aether/projects/`; selecting one calls `project/activate` and
-        // rebuilds the editor on that project.
-        (PendingLeader::Space, KeyCode::Char('p'), m) if m == KeyModifiers::NONE => {
-            open_picker(client, state, PickerKind::Projects).await?;
-        }
-        // `Space ,` — open the project settings overlay. Lists the active project's roots;
-        // `a` adds, `d` removes. Only meaningful when a project is active.
-        (PendingLeader::Space, KeyCode::Char(','), m) if m == KeyModifiers::NONE => {
-            if !state.project_name.is_empty() {
-                open_project_settings(state);
-            }
-        }
-        // ---- app-level meta actions ----
-        // These used to live under Ctrl-, but `Ctrl` is reserved for buffer-content edits.
-        // Quit / close buffer / save / save-as / new file / new scratch all sit under `Space`.
-        (PendingLeader::Space, KeyCode::Char('q'), m) if m == KeyModifiers::NONE => {
-            state.should_quit = true;
-        }
-        (PendingLeader::Space, KeyCode::Char('w'), m) if m == KeyModifiers::NONE => {
-            close_buffer(client, state).await?;
-        }
-        (PendingLeader::Space, KeyCode::Char('s'), m) if m == KeyModifiers::NONE => {
-            save_buffer(client, state).await?;
-        }
-        (PendingLeader::Space, KeyCode::Char('s'), m) if m == alt_only => {
-            begin_save_prompt(client, state).await?;
-        }
-        // `Space r` — reload the current buffer from disk. Discards local changes; used to
-        // pick up an external modification (paired with the `[!]` indicator and the save
-        // conflict prompt).
-        (PendingLeader::Space, KeyCode::Char('r'), m) if m == KeyModifiers::NONE => {
-            reload_buffer(client, state).await?;
-        }
-        // `Space n` — spawn a fresh scratch buffer. The path is chosen at save time via the
-        // save-as prompt (which handles roots / parent dirs / mkdir -p), so we don't ask up
-        // front. Replaces the older two-chord setup (`Space n` opening a new-file prompt and
-        // `Space Alt-n` for scratch) — the prompt's pre-fill never really earned its keep over
-        // "just save-as when you're ready".
-        (PendingLeader::Space, KeyCode::Char('n'), m) if m == KeyModifiers::NONE => {
-            new_scratch(client, state).await?;
-        }
-        // Esc or any other key cancels the chord without further action.
-        _ => {}
+        run_action(client, state, b.action, 1, false).await?;
     }
     Ok(())
 }
@@ -2280,9 +2067,7 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
         if name.is_empty() {
             return Ok(());
         }
-        let _ = client
-            .rpc::<PickerHide>(PickerHideParams { kind })
-            .await;
+        let _ = client.rpc::<PickerHide>(PickerHideParams { kind }).await;
         state.picker.open = false;
         create_project_and_open_settings(client, state, &name).await?;
         return Ok(());
@@ -2568,8 +2353,7 @@ fn resolve_cli_path(arg: &str) -> Result<std::path::PathBuf> {
             .context("could not read current directory to resolve a relative CLI path")?;
         cwd.join(raw)
     };
-    std::fs::canonicalize(&joined)
-        .with_context(|| format!("could not resolve {arg}"))
+    std::fs::canonicalize(&joined).with_context(|| format!("could not resolve {arg}"))
 }
 
 /// Strip the longest matching project root off `abs`. Returns `(root_index, relative_path)`,
@@ -2615,88 +2399,27 @@ async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
 
 async fn handle_insert_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
     let (code, mods) = normalize_key(k);
-    // Try shared Ctrl shortcuts first; mode-specific divergences live inside the wrappers
-    // (handle_copy / handle_cut / etc.). Count is hardcoded to 1 in Insert — no pending_count
-    // accumulator here.
-    if handle_ctrl_binding(client, state, code, mods, 1).await? {
-        return Ok(());
+    // Shared Ctrl editing shortcuts (`Global` table) first — mode-specific divergences live inside
+    // the wrappers (handle_copy / handle_cut / etc.). Count is hardcoded to 1 in Insert (no
+    // pending_count accumulator). Then the Insert-specific table (Esc, arrows, Enter, …).
+    if let Some(b) = keymap::lookup(keymap::KeyContext::Global, code, mods) {
+        return run_action(client, state, b.action, 1, false).await;
     }
-    match (code, mods) {
-        (KeyCode::Esc, _) => leave_insert(state),
-        // Insert-mode Backspace deletes the char before the cursor; Delete deletes the 1-char
-        // point at the cursor (the always-have-selection invariant means the point IS the
-        // char to delete).
-        (KeyCode::Backspace, _) => backspace(client, state).await?,
-        (KeyCode::Delete, _) => delete_selection(client, state).await?,
-        (KeyCode::Enter, _) => newline_and_indent(client, state).await?,
-        (KeyCode::Tab, _) => insert_text(client, state, "\t").await?,
-        (KeyCode::Left, _) => {
-            move_motion(
-                client,
-                state,
-                Motion::Char {
-                    direction: Direction::Backward,
-                    count: 1,
-                },
-                false,
-            )
-            .await?
-        }
-        (KeyCode::Right, _) => {
-            move_motion(
-                client,
-                state,
-                Motion::Char {
-                    direction: Direction::Forward,
-                    count: 1,
-                },
-                false,
-            )
-            .await?
-        }
-        (KeyCode::Up, _) => {
-            let viewport_id = state.ed_mut().viewport_id;
-            move_motion(
-                client,
-                state,
-                Motion::VisualLine {
-                    viewport_id,
-                    direction: VerticalDirection::Up,
-                    count: 1,
-                },
-                false,
-            )
-            .await?
-        }
-        (KeyCode::Down, _) => {
-            let viewport_id = state.ed_mut().viewport_id;
-            move_motion(
-                client,
-                state,
-                Motion::VisualLine {
-                    viewport_id,
-                    direction: VerticalDirection::Down,
-                    count: 1,
-                },
-                false,
-            )
-            .await?
-        }
-
-        (KeyCode::Char(c), m)
-            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
-        {
+    if let Some(b) = keymap::lookup(keymap::KeyContext::Insert, code, mods) {
+        return run_action(client, state, b.action, 1, false).await;
+    }
+    // Anything else that's a bare printable char is literal text.
+    if let KeyCode::Char(c) = code {
+        if !mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::ALT) {
             // `normalize_key` lowercased the char and synthesised SHIFT so the Ctrl-* bindings
             // above can match consistently. Reverse that for actual text insertion.
-            let c = if m.contains(KeyModifiers::SHIFT) {
+            let c = if mods.contains(KeyModifiers::SHIFT) {
                 c.to_ascii_uppercase()
             } else {
                 c
             };
             insert_text(client, state, &c.to_string()).await?;
         }
-
-        _ => {}
     }
     Ok(())
 }
@@ -2743,33 +2466,19 @@ async fn open_file_at_path(
 
 async fn handle_search_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
     // Don't `normalize_key` here — that lowercases uppercase chars and synthesises SHIFT, which
-    // is what Normal-mode keymaps want but would strip case from the literal search query.
-    match (k.code, k.modifiers) {
-        (KeyCode::Esc, _) => abort_search(client, state).await?,
-        (KeyCode::Enter, _) => commit_search(state),
-        (KeyCode::Up, _) => {
-            history_up(state);
-            run_incremental_search(client, state).await?;
-        }
-        (KeyCode::Down, _) => {
-            history_down(state);
-            run_incremental_search(client, state).await?;
-        }
-        (KeyCode::Left, _) => state.ed_mut().search.query.move_left(),
-        (KeyCode::Right, _) => state.ed_mut().search.query.move_right(),
-        (KeyCode::Backspace, _) => {
-            state.ed_mut().search.query.backspace();
-            state.ed_mut().search.history_cursor = None;
-            run_incremental_search(client, state).await?;
-        }
-        (KeyCode::Char(c), m)
-            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+    // is what Normal-mode keymaps want but would strip case from the literal search query. The
+    // `Search` table only holds the editing/control keys; printable chars fall through to the
+    // query-insert tail below.
+    if let Some(b) = keymap::lookup(keymap::KeyContext::Search, k.code, k.modifiers) {
+        return run_action(client, state, b.action, 1, false).await;
+    }
+    if let KeyCode::Char(c) = k.code {
+        if !k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT)
         {
             state.ed_mut().search.query.insert_char(c);
             state.ed_mut().search.history_cursor = None;
             run_incremental_search(client, state).await?;
         }
-        _ => {}
     }
     Ok(())
 }
@@ -3394,17 +3103,6 @@ async fn clear_selection(client: &mut Client, state: &mut AppState) -> Result<()
     Ok(())
 }
 
-enum InsertWhere {
-    /// `i` — at the cursor (or at the lower end of the selection).
-    SelectionStart,
-    /// `a` — after the cursor (or at the upper end of the selection).
-    SelectionEnd,
-    /// `Alt-i` — column 0 of the first line of the selection (or the cursor's line).
-    FirstLineStart,
-    /// `Alt-a` — end of the last line of the selection (or the cursor's line).
-    LastLineEnd,
-}
-
 async fn enter_insert_at(
     client: &mut Client,
     state: &mut AppState,
@@ -3603,125 +3301,9 @@ async fn replace_line_with_clipboard(client: &mut Client, state: &mut AppState) 
     Ok(())
 }
 
-// ---- shared Ctrl-binding dispatch -------------------------------------------------------------
-//
-// `handle_ctrl_binding` covers every Ctrl-modified shortcut that Normal and Insert mode share.
-// Mode-dependent commands (copy/cut/paste/change/delete/replace) get thin wrappers below that
-// branch on `state.ed_mut().mode` to pick the right scope/behavior. This lets both mode
-// handlers delegate to one dispatcher instead of carrying ~22 duplicated arms each.
-
-/// Ctrl-y in Normal: copy selection. In Insert: copy current line.
-async fn handle_copy(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let scope = scope_for_mode(state);
-    copy_to_clipboard(client, state, scope).await
-}
-
-/// Ctrl-x in Normal: cut selection. In Insert: cut current line.
-async fn handle_cut(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let scope = scope_for_mode(state);
-    cut_to_clipboard(client, state, scope).await
-}
-
-/// Ctrl-v in Normal: paste-before (collapses to selection start + inserts with select_pasted).
-/// In Insert: paste at cursor (no selection of the inserted text — the bar cursor sits past it
-/// ready to keep typing).
-async fn handle_paste(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    match state.ed_mut().mode {
-        EditorMode::Insert => paste_at_cursor(client, state).await,
-        _ => paste_before(client, state, count).await,
-    }
-}
-
-/// Ctrl-c. In Normal: delete the selection and enter Insert. In Insert: blank the current line
-/// (we're already in Insert).
-async fn handle_change(client: &mut Client, state: &mut AppState) -> Result<()> {
-    match state.ed_mut().mode {
-        EditorMode::Insert => change_line(client, state).await,
-        _ => change_selection(client, state).await,
-    }
-}
-
-/// Ctrl-d. In Normal: delete the selection (looped `count` times). In Insert: delete the
-/// current line (count ignored — Insert has no count accumulator).
-async fn handle_delete(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    match state.ed_mut().mode {
-        EditorMode::Insert => delete_line(client, state).await,
-        _ => {
-            for _ in 0..count.max(1) {
-                delete_selection(client, state).await?;
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Ctrl-r. In Normal: paste-replace selection (paste + select-pasted, looped). In Insert:
-/// replace the current line with the clipboard.
-async fn handle_replace_with_clipboard(
-    client: &mut Client,
-    state: &mut AppState,
-    count: u32,
-) -> Result<()> {
-    match state.ed_mut().mode {
-        EditorMode::Insert => replace_line_with_clipboard(client, state).await,
-        _ => paste_replace(client, state, count).await,
-    }
-}
-
-fn scope_for_mode(state: &AppState) -> CopyScope {
-    match state.ed().mode {
-        EditorMode::Insert => CopyScope::Line,
-        _ => CopyScope::Selection,
-    }
-}
-
-/// Dispatch every Ctrl-modified binding shared between Normal and Insert. Returns `Ok(true)`
-/// when a binding matched (the caller short-circuits); `Ok(false)` when nothing matched and
-/// the caller should try mode-specific bindings. `count` is `pending_count` (Normal) or `1`
-/// (Insert).
-async fn handle_ctrl_binding(
-    client: &mut Client,
-    state: &mut AppState,
-    code: KeyCode,
-    mods: KeyModifiers,
-    count: u32,
-) -> Result<bool> {
-    let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
-    // The Ctrl shortcuts here are limited to things that *change the buffer's contents*
-    // (edits, clipboard, undo/redo, indent, etc.). App-level meta actions — quit, save,
-    // close/open buffers — live under the `Space` leader instead (`handle_leader_key`).
-    match (code, mods) {
-        // ---- viewport ----
-        (KeyCode::Char('p'), CTRL_ONLY) => toggle_wrap(client, state).await?,
-        // ---- undo / redo ----
-        (KeyCode::Char('z'), CTRL_ONLY) => undo(client, state, count).await?,
-        (KeyCode::Char('z'), m) if m == ctrl_alt => redo(client, state, count).await?,
-        // ---- line manipulation (count-taking in Normal; count=1 in Insert) ----
-        (KeyCode::Char('j'), CTRL_ONLY) => {
-            move_lines(client, state, VerticalDirection::Down, count).await?
-        }
-        (KeyCode::Char('k'), CTRL_ONLY) => {
-            move_lines(client, state, VerticalDirection::Up, count).await?
-        }
-        (KeyCode::Char('g'), CTRL_ONLY) => join_lines(client, state, count).await?,
-        (KeyCode::Char('l'), CTRL_ONLY) => indent(client, state, count).await?,
-        (KeyCode::Char('h'), CTRL_ONLY) => dedent(client, state, count).await?,
-        (KeyCode::Char('t'), CTRL_ONLY) => toggle_comment(client, state).await?,
-        (KeyCode::Char('o'), CTRL_ONLY) => open_line_below(client, state).await?,
-        (KeyCode::Char('o'), m) if m == ctrl_alt => open_line_above(client, state).await?,
-        // ---- mode-dependent: clipboard, change, delete, replace ----
-        (KeyCode::Char('y'), CTRL_ONLY) => handle_copy(client, state).await?,
-        (KeyCode::Char('x'), CTRL_ONLY) => handle_cut(client, state).await?,
-        (KeyCode::Char('v'), CTRL_ONLY) => handle_paste(client, state, count).await?,
-        (KeyCode::Char('c'), CTRL_ONLY) => handle_change(client, state).await?,
-        (KeyCode::Char('d'), CTRL_ONLY) => handle_delete(client, state, count).await?,
-        (KeyCode::Char('r'), CTRL_ONLY) => {
-            handle_replace_with_clipboard(client, state, count).await?
-        }
-        _ => return Ok(false),
-    }
-    Ok(true)
-}
+// The selection/clipboard Ctrl shortcuts no longer branch on mode here: each mode binds its own
+// action (`Copy`/`DeleteSelection`/… in Normal, `CopyLine`/`DeleteLine`/… in Insert), so
+// `run_action` dispatches straight to `copy_to_clipboard(Selection)` / `delete_line` / etc.
 
 async fn join_lines(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
     for _ in 0..count.max(1) {
@@ -4040,11 +3622,7 @@ async fn reload_buffer(client: &mut Client, state: &mut AppState) -> Result<()> 
 
 /// Send `buffer/reload` with explicit `force`. `force: false` is the default `Space r` path;
 /// `force: true` is the retry after a user-confirmed `WOULD_DISCARD_CHANGES`.
-async fn reload_buffer_with(
-    client: &mut Client,
-    state: &mut AppState,
-    force: bool,
-) -> Result<()> {
+async fn reload_buffer_with(client: &mut Client, state: &mut AppState, force: bool) -> Result<()> {
     if state.ed_mut().file_path.is_none() {
         state.status = StatusMessage::warning("scratch buffer has no path to reload");
         return Ok(());
@@ -4158,8 +3736,9 @@ async fn create_file_in_explorer_dir(
         return Ok(());
     };
     let Some((path_index, rel_dir)) = strip_longest_root(&dir_abs, &state.project_paths) else {
-        state.status =
-            StatusMessage::error(format!("can't create file in {dir_abs}: outside the project"));
+        state.status = StatusMessage::error(format!(
+            "can't create file in {dir_abs}: outside the project"
+        ));
         return Ok(());
     };
     let relative_path = if rel_dir.is_empty() {
@@ -4236,6 +3815,44 @@ fn open_project_settings(state: &mut AppState) {
     apply_cursor_style(state);
 }
 
+/// Key handling for the keyboard-shortcut help overlay (`Space ?`). Read-only: Esc / `?` / `q`
+/// close it; the arrows and PageUp/Down scroll. The render clamps `scroll` to the content height,
+/// so over-scrolling here is harmless.
+fn handle_help_key(state: &mut AppState, k: KeyEvent) -> Result<()> {
+    // Scroll math (and clamping to the real bottom) lives in `ScrollState`, which the renderer
+    // feeds the box geometry. Here we just translate keys to intents. `h`/`l` (and the arrows /
+    // Tab) move *between* tabs; `j`/`k` (and ↑/↓) scroll *within* one. Switching tabs resets the
+    // scroll to the top, since each tab is its own (usually short) page.
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => state.help.open = false,
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+            state.help.tab = state.help.tab.prev();
+            state.help.scroll.scroll_to_top();
+        }
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+            state.help.tab = state.help.tab.next();
+            state.help.scroll.scroll_to_top();
+        }
+        KeyCode::Up | KeyCode::Char('k') => state.help.scroll.scroll_by(-1),
+        KeyCode::Down | KeyCode::Char('j') => state.help.scroll.scroll_by(1),
+        KeyCode::PageUp => state.help.scroll.page(false),
+        KeyCode::PageDown | KeyCode::Char(' ') => state.help.scroll.page(true),
+        KeyCode::Home | KeyCode::Char('g') => state.help.scroll.scroll_to_top(),
+        KeyCode::End | KeyCode::Char('G') => state.help.scroll.scroll_to_bottom(),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Mouse handling for the help overlay — the wheel scrolls, everything else is ignored.
+fn handle_help_mouse(state: &mut AppState, m: MouseEvent) {
+    match m.kind {
+        MouseEventKind::ScrollUp => state.help.scroll.scroll_by(-3),
+        MouseEventKind::ScrollDown => state.help.scroll.scroll_by(3),
+        _ => {}
+    }
+}
+
 /// Selection model: `selected ∈ 0..=roots.len()`, where `roots.len()` is the input row. Alt-j/k
 /// move between fields (mirroring the picker's chord, so Alt-j/k means "navigate" everywhere in
 /// the app). Left/Right stay free to move the caret inside the input. Delete or Ctrl-d on a root
@@ -4250,8 +3867,8 @@ async fn handle_project_settings_key(
     let mods = k.modifiers;
     // Ctrl-d is accepted alongside the Delete key for both staging and confirming a removal —
     // easier to reach on keyboards where Delete is awkward (or absent on small layouts).
-    let is_delete_chord = code == KeyCode::Delete
-        || (code == KeyCode::Char('d') && mods == KeyModifiers::CONTROL);
+    let is_delete_chord =
+        code == KeyCode::Delete || (code == KeyCode::Char('d') && mods == KeyModifiers::CONTROL);
 
     // Pending-delete confirmation takes precedence over every other key. While set, only
     // y/Y/Enter/Delete/Ctrl-d commit and n/N/Esc cancel; everything else is swallowed so the
@@ -4366,11 +3983,13 @@ async fn commit_add_root(client: &mut Client, state: &mut AppState) -> Result<()
         }
         Err(e) => {
             if let Some(s) = state.project_settings.as_mut() {
-                s.error = Some(if let Some(rpc_err) = e.downcast_ref::<crate::client::RpcError>() {
-                    rpc_err.message.clone()
-                } else {
-                    e.to_string()
-                });
+                s.error = Some(
+                    if let Some(rpc_err) = e.downcast_ref::<crate::client::RpcError>() {
+                        rpc_err.message.clone()
+                    } else {
+                        e.to_string()
+                    },
+                );
             }
         }
     }
@@ -4697,7 +4316,12 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
         let col = state.ed_mut().cursor.position.col;
         if col < state.ed_mut().scroll_col {
             state.ed_mut().scroll_col = col;
-        } else if col >= state.ed_mut().scroll_col.saturating_add(state.viewport_cols) {
+        } else if col
+            >= state
+                .ed_mut()
+                .scroll_col
+                .saturating_add(state.viewport_cols)
+        {
             state.ed_mut().scroll_col = col.saturating_sub(state.viewport_cols.saturating_sub(1));
         }
     }
@@ -4930,6 +4554,7 @@ mod tests {
             confirm_prompt: None,
             editor: None,
             project_settings: None,
+            help: HelpState::default(),
         };
         assert_eq!(terminal_title(&state), "Aether");
     }
@@ -4952,6 +4577,7 @@ mod tests {
             confirm_prompt: None,
             editor: None,
             project_settings: None,
+            help: HelpState::default(),
         };
         assert_eq!(terminal_title(&state), "[demo]");
         // Once a buffer exists, the title grows to include the file label.
@@ -4977,6 +4603,7 @@ mod tests {
             confirm_prompt: None,
             editor: Some(stub_editor_state("src/main.rs")),
             project_settings: None,
+            help: HelpState::default(),
         };
         // Clean buffer → no marker.
         assert_eq!(terminal_title(&state), "[demo] src/main.rs");
@@ -5021,5 +4648,55 @@ mod tests {
             file_path: None,
             file_label: label.into(),
         }
+    }
+
+    #[test]
+    fn help_overlay_key_handling() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut state = empty_app_state(80, 24);
+        state.help.open = true;
+        // Simulate a render recording the geometry (100 lines, 10 visible → max offset 90), which
+        // is what lets the key handler clamp correctly.
+        state.help.scroll.record(100, 10);
+        // Down scrolls, Up scrolls back and saturates at the top.
+        handle_help_key(&mut state, press(KeyCode::Down)).unwrap();
+        assert_eq!(state.help.scroll.offset(), 1);
+        handle_help_key(&mut state, press(KeyCode::Up)).unwrap();
+        assert_eq!(state.help.scroll.offset(), 0);
+        handle_help_key(&mut state, press(KeyCode::Up)).unwrap();
+        assert_eq!(state.help.scroll.offset(), 0, "scroll saturates at the top");
+        // End jumps to the bottom (clamped to max offset), Home returns to the top.
+        handle_help_key(&mut state, press(KeyCode::End)).unwrap();
+        assert_eq!(state.help.scroll.offset(), 90);
+        handle_help_key(&mut state, press(KeyCode::Home)).unwrap();
+        assert_eq!(state.help.scroll.offset(), 0);
+        // h/l (and ←/→) switch tabs, wrapping at both ends, and reset the scroll to the top.
+        state.help.scroll.record(100, 10);
+        handle_help_key(&mut state, press(KeyCode::End)).unwrap();
+        assert_eq!(state.help.scroll.offset(), 90);
+        assert_eq!(state.help.tab, HelpTab::Normal);
+        handle_help_key(&mut state, press(KeyCode::Char('l'))).unwrap();
+        assert_eq!(state.help.tab, HelpTab::Insert, "l moves to the next tab");
+        assert_eq!(
+            state.help.scroll.offset(),
+            0,
+            "switching tabs resets the scroll"
+        );
+        handle_help_key(&mut state, press(KeyCode::Char('h'))).unwrap();
+        assert_eq!(state.help.tab, HelpTab::Normal, "h moves back");
+        handle_help_key(&mut state, press(KeyCode::Char('h'))).unwrap();
+        assert_eq!(
+            state.help.tab,
+            HelpTab::Application,
+            "h wraps to the last tab"
+        );
+        handle_help_key(&mut state, press(KeyCode::Right)).unwrap();
+        assert_eq!(state.help.tab, HelpTab::Normal, "→ wraps to the first tab");
+
+        // Esc closes the overlay; other keys are swallowed while it's open.
+        assert!(state.help.open);
+        handle_help_key(&mut state, press(KeyCode::Esc)).unwrap();
+        assert!(!state.help.open);
     }
 }
