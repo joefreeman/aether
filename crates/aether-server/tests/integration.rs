@@ -3376,9 +3376,9 @@ async fn select_line_forward_at_end_of_line_no_anchor_picks_current_line() {
     drop(server);
 }
 
-/// On an empty line, "selecting" the line is a degenerate no-op (the only position is the
-/// newline at col 0). Without special-casing, repeated `x` presses would stay on the empty
-/// line forever. The forward variant should advance to the next line on first press.
+/// An empty line is already wholly selected (the point cursor *is* its newline at col 0). So a
+/// non-extend forward press steps to the next line — there's nothing more to select in place, and
+/// staying would get stuck.
 #[tokio::test]
 async fn select_line_forward_on_empty_line_advances() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n\ngamma\n").await;
@@ -3406,6 +3406,41 @@ async fn select_line_forward_on_empty_line_advances() {
     .await;
     // Advanced to line 2, with a whole-line selection over "gamma".
     assert_eq!(st.anchor, LogicalPosition { line: 2, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
+
+    drop(server);
+}
+
+/// `Shift-x` (extend) on an empty line grows the selection *over* it to the next line, keeping the
+/// empty line in the range — rather than jumping past it. Since the empty line is already whole,
+/// extending engages even though it's a point selection.
+#[tokio::test]
+async fn select_line_forward_extend_on_empty_line_includes_it() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n\ngamma\n").await;
+
+    // Park on the empty line (line 1), no anchor.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: LogicalPosition { line: 1, col: 0 },
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: true,
+        },
+    )
+    .await;
+    // Anchor stays on the empty line; selection extends down through "gamma".
+    assert_eq!(st.anchor, LogicalPosition { line: 1, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 });
 
     drop(server);

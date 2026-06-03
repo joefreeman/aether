@@ -2539,12 +2539,14 @@ pub async fn cursor_select_line(
     let has_range = !current.is_point();
     let cursor_was_at_top = has_range && cur == top_edge;
 
-    // Advance the relevant edge only when the selection is already snapped to whole lines;
-    // otherwise snap it without advancing. A point cursor (anchor == position) on an empty
-    // line is trivially whole — there's nothing within the line to extend over, so we
-    // advance on the first press rather than getting stuck. Backward on any point cursor
-    // (extend or not) also advances upward, so Alt-x and Alt-Shift-x both jump to the line
-    // above on the first press (see the doc comment).
+    // Advance the relevant edge only when the selection already spans whole lines; otherwise snap
+    // it without advancing. A point cursor (anchor == position) on an empty line is trivially
+    // whole — its only char is the newline at col 0, so the point already selects the line. So the
+    // edge advances past it (plain `x`/`Alt-x` step to the next/previous line rather than getting
+    // stuck), and — when extending — it counts as a real range so `Shift-x`/`Alt-Shift-x` grow
+    // *over* the empty line instead of jumping past it (the `|| already_whole` in the match).
+    // Backward on any point cursor (extend or not) also advances upward, so Alt-x / Alt-Shift-x
+    // jump to the line above on the first press (see the doc comment).
     let bottom_len = motion::line_byte_len_excl_newline(buf, bottom_edge.line);
     let already_whole = if has_range {
         top_edge.col == 0 && bottom_edge.col >= bottom_len
@@ -2562,7 +2564,13 @@ pub async fn cursor_select_line(
     } else {
         bottom_edge.line
     };
-    let (top_line, bottom_line) = match (params.extend && has_range, params.direction) {
+    // Extend (grow the span) only when Shift is held *and* there's already a whole-line span to
+    // grow from — a real range, or an empty line whose whole-line form is a point. Otherwise
+    // collapse to a single line: snap the current line, or step to the next/previous one.
+    let (top_line, bottom_line) = match (
+        params.extend && (has_range || already_whole),
+        params.direction,
+    ) {
         (true, _) => (new_top, new_bottom),
         (false, Direction::Forward) => (new_bottom, new_bottom),
         (false, Direction::Backward) => (new_top, new_top),
