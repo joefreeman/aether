@@ -4,7 +4,7 @@
 //! - Runtime info:   `$XDG_RUNTIME_DIR/aether/server.json` (one file per running server, not per
 //!   project — a single server now hosts many projects, picked per-client via `project/activate`).
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,10 @@ pub const SERVER_PORT: u16 = 2384;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
+    /// Project name. Derived from the config *filename* (`<name>.toml`), which is authoritative —
+    /// it is not stored in the file. `#[serde(skip)]` keeps it off both the parse and write paths;
+    /// `load_project` injects it after parsing.
+    #[serde(skip)]
     pub name: String,
     pub paths: Vec<PathBuf>,
 }
@@ -29,16 +33,10 @@ pub fn load_project(name: &str) -> anyhow::Result<ProjectConfig> {
     let path = project_config_path(name)?;
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("reading project config at {}", path.display()))?;
-    let config: ProjectConfig = toml::from_str(&content)
+    let mut config: ProjectConfig = toml::from_str(&content)
         .with_context(|| format!("parsing project config at {}", path.display()))?;
-    if config.name != name {
-        bail!(
-            "project name mismatch in {}: file says {:?}, expected {:?}",
-            path.display(),
-            config.name,
-            name
-        );
-    }
+    // The filename is the source of truth for the project name; the file body doesn't carry it.
+    config.name = name.to_string();
     Ok(config)
 }
 
@@ -60,8 +58,8 @@ pub fn projects_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Enumerate the configured project names by scanning `*.toml` files in `projects_dir`. The
-/// file *name* (without extension) is authoritative; the body's `name` field is validated on
-/// load. Returns an empty list (not an error) when the directory doesn't exist yet — a fresh
+/// file *name* (without extension) is the project name; the body carries only `paths`.
+/// Returns an empty list (not an error) when the directory doesn't exist yet — a fresh
 /// install with no projects configured shouldn't be a server-side fatal.
 pub fn list_project_names() -> anyhow::Result<Vec<String>> {
     let dir = projects_dir()?;

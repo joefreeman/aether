@@ -32,9 +32,10 @@ struct Cli {
     /// must have a config at `$XDG_CONFIG_HOME/aether/projects/<name>.toml`; the daemon loads
     /// it on first activation.
     project: Option<String>,
-    /// File or directory to open, relative to the first project path. A directory opens the
-    /// file browser at that location with a scratch buffer underneath. Omit to start in a
-    /// scratch buffer with no file browser. Ignored when no project is selected.
+    /// File or directory to open. Resolved against the current working directory and must fall
+    /// within one of the project's roots. A directory opens the file browser at that location
+    /// with a scratch buffer underneath. Omit to start in a scratch buffer with no file browser.
+    /// Ignored when no project is selected.
     file: Option<String>,
 }
 
