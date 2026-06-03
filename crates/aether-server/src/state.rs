@@ -189,6 +189,72 @@ impl ServerState {
         self.buffer_projects.get(&buffer_id).map(|s| s.as_str())
     }
 
+    /// Rename a loaded project in place: move its entry to the new key (updating `entry.name`),
+    /// then re-point every buffer association and client active-project that referenced the old
+    /// name. Open buffers are otherwise untouched — only the name key changes, nothing is closed —
+    /// so this is safe even with dirty buffers in the project. Returns the project's root paths
+    /// (display form) on success, or `None` if no project was loaded under `old`. The caller is
+    /// responsible for renaming the on-disk config and for rejecting name collisions first.
+    pub fn rename_project(&mut self, old: &str, new: &str) -> Option<Vec<String>> {
+        let mut entry = self.projects.remove(old)?;
+        entry.name = new.to_string();
+        let paths: Vec<String> = entry.paths.iter().map(|p| p.display().to_string()).collect();
+        self.projects.insert(new.to_string(), entry);
+        for project in self.buffer_projects.values_mut() {
+            if project == old {
+                *project = new.to_string();
+            }
+        }
+        for session in self.clients.values_mut() {
+            if session.active_project.as_deref() == Some(old) {
+                session.active_project = Some(new.to_string());
+            }
+        }
+        Some(paths)
+    }
+
+    /// True if any connected client currently has `name` as its active project. `project/delete`
+    /// refuses in that case so deletion can't pull the rug out from under an open session.
+    pub fn project_active_anywhere(&self, name: &str) -> bool {
+        self.clients
+            .values()
+            .any(|c| c.active_project.as_deref() == Some(name))
+    }
+
+    /// Buffer ids belonging to `name`. Used by `project/delete` to find what it would close (and
+    /// to screen them for unsaved changes first).
+    pub fn buffers_in_project(&self, name: &str) -> Vec<BufferId> {
+        self.buffer_projects
+            .iter()
+            .filter(|(_, p)| p.as_str() == name)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Delete a loaded project's in-memory state: drop the project entry and close every buffer
+    /// that belonged to it, tearing down all per-buffer state (same teardown as `buffer/close` /
+    /// `project/remove_root`). Returns the closed buffer ids. The caller is responsible for the
+    /// refusal checks ([`Self::project_active_anywhere`], dirty buffers) and for removing the
+    /// on-disk config. A no-op for the project entry when it was never loaded; still closes any
+    /// of its buffers that exist.
+    pub fn delete_project(&mut self, name: &str) -> Vec<BufferId> {
+        let closed = self.buffers_in_project(name);
+        for &id in &closed {
+            self.buffers.remove(&id);
+            self.buffer_projects.remove(&id);
+            self.viewports.retain(|_, v| v.buffer_id != id);
+            self.cursors.retain(|(_, b), _| *b != id);
+            self.motion_history.retain(|(_, b), _| *b != id);
+            self.virtual_col.retain(|(_, b), _| *b != id);
+            self.tree_selection_history.retain(|(_, b), _| *b != id);
+            self.searches.retain(|(_, b), _| *b != id);
+            self.last_scroll.retain(|(_, b), _| *b != id);
+            self.drop_buffer_from_mru(id);
+        }
+        self.projects.remove(name);
+        closed
+    }
+
     pub fn allocate_buffer_id(&mut self) -> BufferId {
         let id = self.next_buffer_id;
         self.next_buffer_id += 1;
@@ -939,4 +1005,138 @@ pub struct Viewport {
     pub first_logical_line: u32,
     /// Last logical line currently pushed to the client (exclusive).
     pub last_logical_line_exclusive: u32,
+}
+
+#[cfg(test)]
+mod project_state_tests {
+    use super::*;
+
+    fn project_entry(name: &str, paths: Vec<PathBuf>) -> ProjectEntry {
+        ProjectEntry {
+            name: name.to_string(),
+            paths: paths.clone(),
+            workspace_index: Arc::new(WorkspaceIndex::new(paths)),
+            mru_buffers: VecDeque::new(),
+        }
+    }
+
+    fn session(active: &str) -> (ClientId, ClientSession) {
+        let id = uuid::Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<Notification>(1);
+        // Leak the receiver so the channel stays open for the test's lifetime.
+        std::mem::forget(_rx);
+        (
+            id,
+            ClientSession {
+                client_id: id,
+                outbound: tx,
+                active_project: Some(active.to_string()),
+            },
+        )
+    }
+
+    /// The "rename while the project and its buffers are open" path: re-keys the project map (and
+    /// updates `entry.name`), every buffer association, and every client's active-project pointer
+    /// — while leaving buffers and unrelated projects untouched.
+    #[test]
+    fn rename_project_rekeys_buffers_and_clients() {
+        let mut s = ServerState::new("tok".to_string());
+        s.projects
+            .insert("old".to_string(), project_entry("old", vec![PathBuf::from("/tmp/x")]));
+        s.projects
+            .insert("other".to_string(), project_entry("other", vec![]));
+
+        // A buffer in the renamed project, plus one in an unrelated project.
+        let buf = s.allocate_buffer_id();
+        s.buffer_projects.insert(buf, "old".to_string());
+        let other_buf = s.allocate_buffer_id();
+        s.buffer_projects.insert(other_buf, "other".to_string());
+
+        let (c1, sess1) = session("old");
+        s.clients.insert(c1, sess1);
+        let (c2, sess2) = session("other");
+        s.clients.insert(c2, sess2);
+
+        let paths = s.rename_project("old", "new").expect("project was loaded");
+        assert_eq!(paths, vec!["/tmp/x".to_string()]);
+
+        // Project map re-keyed; the entry's own name field follows.
+        assert!(!s.projects.contains_key("old"));
+        assert_eq!(s.projects.get("new").map(|p| p.name.as_str()), Some("new"));
+        assert!(s.projects.contains_key("other"));
+
+        // The buffer is re-pointed but still present (nothing closed); the unrelated one is left.
+        assert_eq!(s.buffer_projects.get(&buf).map(String::as_str), Some("new"));
+        assert_eq!(
+            s.buffer_projects.get(&other_buf).map(String::as_str),
+            Some("other")
+        );
+
+        // Only the matching client's active-project pointer follows the rename.
+        assert_eq!(
+            s.clients.get(&c1).unwrap().active_project.as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            s.clients.get(&c2).unwrap().active_project.as_deref(),
+            Some("other")
+        );
+    }
+
+    /// Renaming a project that isn't loaded returns `None` (the handler maps this to an internal
+    /// error; it can't happen in practice since projects are never unloaded at runtime).
+    #[test]
+    fn rename_project_unknown_returns_none() {
+        let mut s = ServerState::new("tok".to_string());
+        assert!(s.rename_project("nope", "new").is_none());
+    }
+
+    /// `project_active_anywhere` is the delete guard: true iff *some* client has the project
+    /// active, so deleting it would pull the rug.
+    #[test]
+    fn project_active_anywhere_tracks_any_client() {
+        let mut s = ServerState::new("tok".to_string());
+        let (c1, sess1) = session("alpha");
+        s.clients.insert(c1, sess1);
+        assert!(s.project_active_anywhere("alpha"));
+        assert!(!s.project_active_anywhere("beta"));
+    }
+
+    /// Deleting a project drops its entry and closes exactly its buffers (tearing down their
+    /// per-buffer state), leaving unrelated projects and their buffers intact.
+    #[test]
+    fn delete_project_closes_only_its_buffers() {
+        let mut s = ServerState::new("tok".to_string());
+        s.projects
+            .insert("doomed".to_string(), project_entry("doomed", vec![PathBuf::from("/tmp/d")]));
+        s.projects
+            .insert("keep".to_string(), project_entry("keep", vec![]));
+
+        let buf_a = s.allocate_buffer_id();
+        s.buffer_projects.insert(buf_a, "doomed".to_string());
+        let buf_b = s.allocate_buffer_id();
+        s.buffer_projects.insert(buf_b, "doomed".to_string());
+        let survivor = s.allocate_buffer_id();
+        s.buffer_projects.insert(survivor, "keep".to_string());
+        // Per-buffer state that teardown must also clear (cursors keyed by (client, buffer)).
+        let (client, sess) = session("keep");
+        s.cursors.insert((client, buf_a), CursorState::default());
+        s.cursors.insert((client, survivor), CursorState::default());
+        s.clients.insert(client, sess);
+
+        let mut closed = s.delete_project("doomed");
+        closed.sort();
+        let mut expected = vec![buf_a, buf_b];
+        expected.sort();
+        assert_eq!(closed, expected);
+
+        // Entry gone; its buffers and their per-buffer state are gone; the unrelated ones remain.
+        assert!(!s.projects.contains_key("doomed"));
+        assert!(s.projects.contains_key("keep"));
+        assert!(!s.buffer_projects.contains_key(&buf_a));
+        assert!(!s.buffer_projects.contains_key(&buf_b));
+        assert!(!s.cursors.contains_key(&(client, buf_a)));
+        assert_eq!(s.buffer_projects.get(&survivor).map(String::as_str), Some("keep"));
+        assert!(s.cursors.contains_key(&(client, survivor)));
+    }
 }

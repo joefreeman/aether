@@ -28,6 +28,15 @@ impl ErrorCode {
     /// the client can name them in a prompt. The user has to save or revert those buffers
     /// before retrying.
     pub const DIRTY_BUFFERS_PREVENT_REMOVE: Self = Self(-32004);
+    /// `project/delete` rejected because the named project is the active project of at least one
+    /// connected client. The client must switch away (activate a different project) before the
+    /// project can be deleted — this is what prevents pulling the rug out from under an open
+    /// session.
+    pub const ACTIVE_PROJECT_PREVENTS_DELETE: Self = Self(-32005);
+    /// `project/delete` rejected because at least one buffer in the project has unsaved changes.
+    /// Like [`Self::DIRTY_BUFFERS_PREVENT_REMOVE`], the `data` field carries
+    /// `{ "dirty_buffer_ids": [u64] }`. The user has to save or revert those buffers first.
+    pub const DIRTY_BUFFERS_PREVENT_DELETE: Self = Self(-32006);
     pub const INVALID_PATH: Self = Self(-32010);
     pub const BUFFER_NOT_FOUND: Self = Self(-32011);
     pub const VIEWPORT_NOT_FOUND: Self = Self(-32012);

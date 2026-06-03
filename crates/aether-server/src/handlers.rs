@@ -36,8 +36,8 @@ use aether_protocol::picker::{
 };
 use aether_protocol::project::{
     ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
-    ProjectInfo, ProjectListParams, ProjectListResult, ProjectRemoveRootParams,
-    ProjectRemoveRootResult, ProjectSummary,
+    ProjectDeleteParams, ProjectInfo, ProjectListParams, ProjectListResult, ProjectRemoveRootParams,
+    ProjectRemoveRootResult, ProjectRenameParams, ProjectSummary,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
@@ -189,6 +189,23 @@ pub async fn project_activate(
     })
 }
 
+/// Validate and normalize a user-supplied project name. Trims surrounding whitespace, then
+/// rejects empty names and names containing path separators — the name becomes a `<name>.toml`
+/// filename, so a `/`, `\`, `.`, or `..` could escape the projects dir. Shared by
+/// `project/create` and `project/rename`.
+fn validate_project_name(raw: &str) -> Result<String, RpcError> {
+    let name = raw.trim().to_string();
+    if name.is_empty() {
+        return Err(RpcError::invalid_params("project name must not be empty"));
+    }
+    if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        return Err(RpcError::invalid_params(
+            "project name must not contain path separators",
+        ));
+    }
+    Ok(name)
+}
+
 /// Create a fresh project with no roots. Writes an empty-`paths` TOML to disk, registers the
 /// project in memory, and activates it for the calling client. Refuses if a project of that
 /// name already exists, or if the name is empty / contains path separators.
@@ -198,15 +215,7 @@ pub async fn project_create(
     params: ProjectCreateParams,
 ) -> Result<ProjectActivateResult, RpcError> {
     let client_id = ctx.client_id;
-    let name = params.name.trim().to_string();
-    if name.is_empty() {
-        return Err(RpcError::invalid_params("project name must not be empty"));
-    }
-    if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
-        return Err(RpcError::invalid_params(
-            "project name must not contain path separators",
-        ));
-    }
+    let name = validate_project_name(&params.name)?;
     let exists = crate::config::project_config_exists(&name)
         .map_err(|e| RpcError::internal(format!("checking project config: {e}")))?;
     if exists {
@@ -447,6 +456,115 @@ pub async fn project_remove_root(
         closed_buffer_ids: affected,
         next_buffer_id,
     })
+}
+
+/// Rename a project: move its on-disk config, then re-key every in-memory reference to the old
+/// name (the project map, buffer→project associations, and clients' active-project pointers).
+/// Open buffers keep their ids and paths and nothing is closed, so this is safe regardless of
+/// dirty state. Refuses an empty / separator-bearing name or a collision with an existing
+/// project; a no-op when the name is unchanged.
+pub async fn project_rename(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: ProjectRenameParams,
+) -> Result<ProjectInfo, RpcError> {
+    let new_name = validate_project_name(&params.new_name)?;
+    let old_name = params.project;
+
+    // Confirm the project is loaded *before* touching disk, so a failure here leaves nothing
+    // half-applied. Projects are never removed from the map at runtime, so this stays true for
+    // the re-key below.
+    {
+        let s = state.lock().await;
+        let entry = s
+            .projects
+            .get(&old_name)
+            .ok_or_else(|| RpcError::unknown_project(&old_name))?;
+        if new_name == old_name {
+            // No-op rename — return current info without touching disk or state.
+            return Ok(ProjectInfo {
+                name: old_name,
+                paths: entry.paths.iter().map(|p| p.display().to_string()).collect(),
+            });
+        }
+    }
+
+    // Refuse clobbering another project's config; `fs::rename` would otherwise overwrite it.
+    let exists = crate::config::project_config_exists(&new_name)
+        .map_err(|e| RpcError::internal(format!("checking project config: {e}")))?;
+    if exists {
+        return Err(RpcError::invalid_params(format!(
+            "project {new_name} already exists"
+        )));
+    }
+
+    // Disk first, outside the lock (file I/O). If this fails, in-memory state is untouched.
+    crate::config::rename_project_config(&old_name, &new_name)
+        .map_err(|e| RpcError::internal(format!("renaming project config: {e}")))?;
+
+    // Re-key every in-memory reference from the old name to the new one. Projects are never
+    // removed from the map at runtime, so the entry we confirmed above is still present.
+    let mut s = state.lock().await;
+    let entry_paths = s
+        .rename_project(&old_name, &new_name)
+        .ok_or_else(|| RpcError::internal("project vanished during rename"))?;
+
+    tracing::info!(old = %old_name, new = %new_name, "project renamed");
+    Ok(ProjectInfo {
+        name: new_name,
+        paths: entry_paths,
+    })
+}
+
+/// Delete a project: drop its in-memory state (closing its buffers) and remove its on-disk config.
+/// Forgets the project *definition* — source files under its roots are untouched. Refuses if the
+/// project is active for any client (the caller must switch away first), or if any of its buffers
+/// is dirty.
+pub async fn project_delete(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: ProjectDeleteParams,
+) -> Result<(), RpcError> {
+    let name = params.name;
+
+    let mut s = state.lock().await;
+
+    // Refuse to delete a project anyone is currently in — that's the rug-pull we promised to
+    // prevent. The switcher already greys out the caller's own active project; this also covers
+    // other connected clients.
+    if s.project_active_anywhere(&name) {
+        return Err(RpcError::new(
+            ErrorCode::ACTIVE_PROJECT_PREVENTS_DELETE,
+            format!("project {name} is active — switch to another project before deleting it"),
+        ));
+    }
+
+    // Refuse if any buffer in the project has unsaved changes (mirrors `project/remove_root`).
+    let dirty: Vec<BufferId> = s
+        .buffers_in_project(&name)
+        .into_iter()
+        .filter(|id| s.buffers.get(id).map(|b| b.dirty).unwrap_or(false))
+        .collect();
+    if !dirty.is_empty() {
+        let mut err = RpcError::new(
+            ErrorCode::DIRTY_BUFFERS_PREVENT_DELETE,
+            format!("{} buffer(s) in project {name} have unsaved changes", dirty.len()),
+        );
+        err.data = Some(serde_json::json!({ "dirty_buffer_ids": dirty }));
+        return Err(err);
+    }
+
+    let closed = s.delete_project(&name);
+    // Intentionally leave the (now-orphaned) project roots in the watcher: dropping a watch is
+    // best-effort and a sibling project may share the same root. Stale watches are harmless — the
+    // watcher drops events that don't map to a loaded project.
+    drop(s);
+
+    crate::config::delete_project_config(&name)
+        .map_err(|e| RpcError::internal(format!("deleting project config: {e}")))?;
+
+    tracing::info!(project = %name, closed = closed.len(), "project deleted");
+    Ok(())
 }
 
 // ---- buffer/open --------------------------------------------------------------------------------
@@ -5803,4 +5921,25 @@ fn find_nearest_grep_hit<'a>(
             Ordering::Less => false,
         })
         .or_else(|| hits.first())
+}
+
+#[cfg(test)]
+mod project_name_tests {
+    use super::validate_project_name;
+
+    #[test]
+    fn trims_surrounding_whitespace_and_accepts() {
+        assert_eq!(validate_project_name("  my-proj  ").unwrap(), "my-proj");
+        assert_eq!(validate_project_name("aether").unwrap(), "aether");
+    }
+
+    #[test]
+    fn rejects_empty_blank_and_path_separators() {
+        for bad in ["", "   ", "a/b", "a\\b", ".", ".."] {
+            assert!(
+                validate_project_name(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
 }

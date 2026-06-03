@@ -381,6 +381,35 @@ fn project_add_root_params_round_trip() {
 }
 
 #[test]
+fn project_rename_params_round_trip() {
+    use aether_protocol::project::{ProjectRename, ProjectRenameParams};
+    assert_eq!(ProjectRename::NAME, "project/rename");
+    let p = ProjectRenameParams {
+        project: "aether".into(),
+        new_name: "aether-next".into(),
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v, json!({"project": "aether", "new_name": "aether-next"}));
+    // Result is a plain ProjectInfo (new name + paths).
+    let info = ProjectInfo {
+        name: "aether-next".into(),
+        paths: vec!["/p".into()],
+    };
+    assert_eq!(to_value(&info).unwrap()["name"], "aether-next");
+}
+
+#[test]
+fn project_delete_params_round_trip() {
+    use aether_protocol::project::{ProjectDelete, ProjectDeleteParams};
+    assert_eq!(ProjectDelete::NAME, "project/delete");
+    let p = ProjectDeleteParams {
+        name: "aether".into(),
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v, json!({"name": "aether"}));
+}
+
+#[test]
 fn project_remove_root_result_shape() {
     use aether_protocol::project::{ProjectRemoveRoot, ProjectRemoveRootResult};
     assert_eq!(ProjectRemoveRoot::NAME, "project/remove_root");

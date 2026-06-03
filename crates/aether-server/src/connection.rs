@@ -31,7 +31,8 @@ use aether_protocol::picker::{
     PickerGrepNavigate, PickerHide, PickerQuery, PickerSelect, PickerView,
 };
 use aether_protocol::project::{
-    ProjectActivate, ProjectAddRoot, ProjectCreate, ProjectList, ProjectRemoveRoot,
+    ProjectActivate, ProjectAddRoot, ProjectCreate, ProjectDelete, ProjectList, ProjectRemoveRoot,
+    ProjectRename,
 };
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::viewport::{
@@ -244,6 +245,8 @@ async fn dispatch(
         ProjectCreate::NAME => run!(ProjectCreate, handlers::project_create),
         ProjectAddRoot::NAME => run!(ProjectAddRoot, handlers::project_add_root),
         ProjectRemoveRoot::NAME => run!(ProjectRemoveRoot, handlers::project_remove_root),
+        ProjectRename::NAME => run!(ProjectRename, handlers::project_rename),
+        ProjectDelete::NAME => run!(ProjectDelete, handlers::project_delete),
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),

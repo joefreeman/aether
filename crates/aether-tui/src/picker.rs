@@ -78,6 +78,11 @@ pub struct PickerState {
     /// `picker/select`. `None` when no synthetic row is present (kind isn't Projects, query is
     /// empty, or an existing project matches the query exactly).
     pub synthetic_create_idx: Option<usize>,
+    /// Projects-picker only. When `Some(name)`, a delete of project `<name>` is awaiting `[y/N]`
+    /// confirmation: the input row renders the prompt and key handling is restricted to
+    /// confirm/cancel (mirroring the settings overlay's `pending_delete`). Cleared on open/hide
+    /// and on resolve. Stores the name (not an index) so a background re-rank can't retarget it.
+    pub pending_delete: Option<String>,
 }
 
 impl PickerState {

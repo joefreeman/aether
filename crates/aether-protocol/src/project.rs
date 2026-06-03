@@ -140,3 +140,47 @@ pub struct ProjectRemoveRootResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_buffer_id: Option<crate::BufferId>,
 }
+
+/// Rename a project. Moves the on-disk config (`<old>.toml` → `<new>.toml`) and re-keys the
+/// project's in-memory state: the server's project map, every open buffer's project association,
+/// and every client's active-project pointer. Open buffers are untouched — they keep their ids
+/// and paths — so a rename is safe even with dirty buffers in the project, and nothing is closed
+/// or reloaded.
+///
+/// Refuses if a project named `new_name` already exists, or if `new_name` is empty / contains
+/// path separators (same constraints as `project/create`). Renaming a project to its current
+/// name is a no-op that returns the current info.
+pub struct ProjectRename;
+impl RpcMethod for ProjectRename {
+    const NAME: &'static str = "project/rename";
+    type Params = ProjectRenameParams;
+    type Result = ProjectInfo;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectRenameParams {
+    /// The project to rename (its current name).
+    pub project: String,
+    /// The desired new name.
+    pub new_name: String,
+}
+
+/// Delete a project: remove its on-disk config (`<name>.toml`) and drop its in-memory state,
+/// closing any buffers that belonged to it. This forgets the project *definition* — it does NOT
+/// touch the source files under the project's roots.
+///
+/// Refuses if the project is any connected client's active project (`ACTIVE_PROJECT_PREVENTS_-
+/// DELETE`) — the caller must switch away first — or if any buffer in the project has unsaved
+/// changes (`DIRTY_BUFFERS_PREVENT_DELETE`). Invoked from the project switcher; you can't delete
+/// a project you're not looking at the list of, and you can't delete the one you're in.
+pub struct ProjectDelete;
+impl RpcMethod for ProjectDelete {
+    const NAME: &'static str = "project/delete";
+    type Params = ProjectDeleteParams;
+    type Result = ();
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectDeleteParams {
+    pub name: String,
+}

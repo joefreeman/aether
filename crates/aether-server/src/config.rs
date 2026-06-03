@@ -170,3 +170,31 @@ pub fn write_project_config(config: &ProjectConfig) -> anyhow::Result<()> {
 pub fn project_config_exists(name: &str) -> anyhow::Result<bool> {
     Ok(project_config_path(name)?.exists())
 }
+
+/// Rename a project's TOML config on disk (`<old>.toml` → `<new>.toml`). Used by
+/// `project/rename`. The caller is responsible for refusing when the destination already exists
+/// (see `project_config_exists`) — `fs::rename` would otherwise silently clobber it.
+pub fn rename_project_config(old: &str, new: &str) -> anyhow::Result<()> {
+    let from = project_config_path(old)?;
+    let to = project_config_path(new)?;
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating projects dir {}", parent.display()))?;
+    }
+    std::fs::rename(&from, &to).with_context(|| {
+        format!("renaming project config {} -> {}", from.display(), to.display())
+    })?;
+    Ok(())
+}
+
+/// Delete a project's TOML config from disk. Used by `project/delete`. Does not remove the source
+/// files under the project's roots — only the project definition. A missing file is treated as
+/// success (the end state — no config — is what was asked for).
+pub fn delete_project_config(name: &str) -> anyhow::Result<()> {
+    let path = project_config_path(name)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("deleting project config at {}", path.display())),
+    }
+}

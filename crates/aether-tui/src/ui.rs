@@ -842,8 +842,14 @@ fn factor_common<'a, T: PartialEq>(a: &'a [T], b: &'a [T]) -> (&'a [T], &'a [T],
     )
 }
 
-/// Header block: `Project Settings (<name>)` heading, a blank row, `Project roots:` label.
-/// Degrades gracefully when the header area is shorter than 3 rows.
+/// Label above the editable project-name field.
+const NAME_LABEL: &str = "Name:";
+
+/// Header block: `Project Settings` heading, a blank spacer, the editable name field (a `Name:`
+/// label with the value on the indented line below it), another blank, and the `Project roots:`
+/// label. Degrades gracefully when the header area is shorter than its 6 rows. The value renders
+/// in plain (white) text like the add-root input row; its terminal caret — placed separately — is
+/// the focus cue.
 fn draw_settings_header(f: &mut Frame, settings: &crate::app::ProjectSettingsState, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -856,16 +862,32 @@ fn draw_settings_header(f: &mut Frame, settings: &crate::app::ProjectSettingsSta
         .fg(NORD4)
         .bg(NORD0)
         .add_modifier(Modifier::BOLD);
-    let mut lines: Vec<Line> = Vec::with_capacity(3);
+    let value_style = Style::default().fg(NORD4).bg(NORD0);
+    let area_w = area.width as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(6);
     if area.height >= 1 {
-        let heading = format!("Project Settings ({})", settings.project_name);
-        let heading = truncate_right(&heading, area.width as usize);
+        let heading = truncate_right("Project Settings", area_w);
         lines.push(Line::from(Span::styled(heading, heading_style)));
     }
     if area.height >= 2 {
         lines.push(Line::from(""));
     }
     if area.height >= 3 {
+        lines.push(Line::from(Span::styled(NAME_LABEL, label_style)));
+    }
+    if area.height >= 4 {
+        // Value on the line below the label, indented one column to match how roots sit under the
+        // `Project roots:` label.
+        let value = truncate_right(&settings.name_input.text, area_w.saturating_sub(1));
+        lines.push(Line::from(vec![
+            Span::styled(" ", value_style),
+            Span::styled(value, value_style),
+        ]));
+    }
+    if area.height >= 5 {
+        lines.push(Line::from(""));
+    }
+    if area.height >= 6 {
         lines.push(Line::from(Span::styled("Project roots:", label_style)));
     }
     f.render_widget(
@@ -896,7 +918,7 @@ fn settings_layout(box_area: Rect, has_error: bool) -> Option<SettingsLayout> {
     if content.height == 0 || content.width == 0 {
         return None;
     }
-    let header_h = 3u16.min(content.height);
+    let header_h = 6u16.min(content.height);
     let remaining = content.height - header_h;
     let error_h = if has_error { 1u16.min(remaining) } else { 0u16 };
     let rows_h = remaining - error_h;
@@ -931,7 +953,7 @@ fn settings_layout(box_area: Rect, has_error: bool) -> Option<SettingsLayout> {
 
 /// Render the roots + input row list. On a root row the path text is bolded in the accent color
 /// when selected (no row-spanning bg bar — keeps the highlight subtle and consistent with the
-/// project picker); the pending-delete row swaps the path for a red `remove "<path>"? [y/N]`
+/// project picker); the pending-delete row swaps the path for a red `Remove "<path>"? [y/N]`
 /// prompt. The input row carries no selection styling — its visible terminal caret is the focus
 /// cue. Each list item is indented one column past the section label.
 fn draw_settings_rows(
@@ -946,22 +968,24 @@ fn draw_settings_rows(
     let base_style = Style::default().fg(NORD4).bg(NORD0);
     let total_items = settings.roots.len() + 1;
     let max = (area.height as usize).max(1);
-    let start = settings
-        .selected
+    // `selected` is dialog-global (0 = name field, in the header); within this rows area item `i`
+    // maps to global index `i + 1`. Drop one level to scroll relative to the rows.
+    let rows_selected = settings.selected.saturating_sub(1);
+    let start = rows_selected
         .saturating_sub(max.saturating_sub(1))
         .min(total_items.saturating_sub(max));
     let area_w = area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
     for i in start..(start + max).min(total_items) {
-        let highlighted = i == settings.selected;
+        let highlighted = settings.selected == i + 1;
         // 1-col indent so list items sit visually under the section label.
         let leading = Span::styled(" ", base_style);
         let text_budget = area_w.saturating_sub(1);
         if i < settings.roots.len() {
             let root = &settings.roots[i];
-            let pending = settings.pending_delete && i == settings.selected;
+            let pending = settings.pending_delete && settings.selected == i + 1;
             if pending {
-                const PREFIX: &str = "remove \"";
+                const PREFIX: &str = "Remove \"";
                 const SUFFIX: &str = "\"? [y/N]";
                 let fixed_w = PREFIX.width() + SUFFIX.width();
                 let path_budget = text_budget.saturating_sub(fixed_w);
@@ -1010,6 +1034,32 @@ fn draw_settings_rows(
     f.render_widget(Paragraph::new(lines).style(base_style), area);
 }
 
+/// Place the terminal caret on the settings overlay's name value (header line 3 — below the
+/// heading, blank spacer, and `Name:` label, indented one column). Mirrors `draw_settings_header`.
+/// Only places the caret when the header is tall enough to show the value; otherwise leaves it
+/// unset (ratatui hides it).
+fn place_settings_name_cursor(
+    f: &mut Frame,
+    settings: &crate::app::ProjectSettingsState,
+    buffer_area: Rect,
+) {
+    let box_area = picker_box_rect(buffer_area);
+    let Some(layout) = settings_layout(box_area, settings.error.is_some()) else {
+        return;
+    };
+    let header = layout.header;
+    if header.height < 4 || header.width == 0 {
+        return;
+    }
+    let row_y = header.y + 3;
+    let typed_w = settings.name_input.width_to_cursor() as u16;
+    // +1 for the one-column indent the value row carries.
+    let base = header.x.saturating_add(1);
+    let max_x = header.x + header.width.saturating_sub(1);
+    let col = base.saturating_add(typed_w).min(max_x);
+    f.set_cursor_position((col, row_y));
+}
+
 /// Place the terminal caret on the settings overlay's input row. Mirrors the layout math in
 /// `draw_project_settings_overlay`: same inner padding, same error-footer split, same scroll
 /// slide. Only places the caret when the input row is currently visible (with a small list and
@@ -1030,8 +1080,10 @@ fn place_settings_input_cursor(
     }
     let total_items = settings.roots.len() + 1;
     let max = (rows.height as usize).max(1);
-    let start = settings
-        .selected
+    // See `draw_settings_rows`: `selected` is dialog-global (0 = name field); shift to a rows-area
+    // index for the scroll math.
+    let rows_selected = settings.selected.saturating_sub(1);
+    let start = rows_selected
         .saturating_sub(max.saturating_sub(1))
         .min(total_items.saturating_sub(max));
     let input_idx = settings.roots.len();
@@ -1554,6 +1606,29 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
                     text_width as usize,
                 )));
                 prev_grep_key = Some(key);
+            }
+        }
+        // A staged delete renders its [y/N] confirmation *over* the project's own row — in the
+        // same warning red the settings overlay uses for root removal — replacing the normal
+        // name/label spans. Matched by name (what `pending_delete` stores) rather than by the
+        // selected index, so a background re-rank can't smear the prompt onto the wrong row.
+        if let (PickerItem::Project { name, .. }, Some(pending)) =
+            (item, state.picker.pending_delete.as_deref())
+        {
+            if name.as_str() == pending {
+                const PREFIX: &str = "Delete project \"";
+                const SUFFIX: &str = "\"? [y/N]";
+                let warn_style = Style::default()
+                    .fg(NORD11)
+                    .bg(NORD0)
+                    .add_modifier(Modifier::BOLD);
+                let name_budget =
+                    (text_width as usize).saturating_sub(PREFIX.width() + SUFFIX.width());
+                let shown = truncate_middle(name, name_budget);
+                let prompt =
+                    truncate_right(&format!("{PREFIX}{shown}{SUFFIX}"), text_width as usize);
+                lines.push(Line::from(Span::styled(prompt, warn_style)));
+                continue;
             }
         }
         let highlighted = i == state.picker.selected;
@@ -2896,10 +2971,13 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
     // Settings overlay takes precedence over every other cursor target. We only place the caret
-    // when the input row is focused; on a root row the cursor is hidden (no `set_cursor_position`
-    // call → ratatui hides it for this frame).
+    // when a text field is focused — the name field (index 0) or the add-root input row (last
+    // index); on a root row the cursor is hidden (no `set_cursor_position` call → ratatui hides
+    // it for this frame).
     if let Some(settings) = state.project_settings.as_ref() {
-        if settings.selected == settings.roots.len() {
+        if settings.selected == 0 {
+            place_settings_name_cursor(f, settings, buffer_area);
+        } else if settings.selected == settings.roots.len() + 1 {
             place_settings_input_cursor(f, settings, buffer_area);
         }
         return;
@@ -2917,6 +2995,10 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         return;
     }
     if state.picker.open {
+        // No caret while a delete confirmation owns the input row — there's nothing to type into.
+        if state.picker.pending_delete.is_some() {
+            return;
+        }
         // Place the cursor inside the picker overlay's input row, at the current insertion
         // point within the query (or at the start, on the placeholder, when empty). For the
         // Explorer picker we offset by the dir-context prefix width — the prefix sits before
