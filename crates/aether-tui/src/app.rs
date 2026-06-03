@@ -2600,7 +2600,9 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
 /// Switch to an already-open buffer by id (no path lookup; works for scratch buffers too).
 /// Subscribes a fresh viewport and restores per-buffer cursor + scroll from the server. No-op
 /// in the sense that the buffer's contents and per-client state already exist server-side —
-/// we're just rebinding the client to it.
+/// we're just rebinding the client to it. Never discards the scratch we're leaving: this is
+/// navigation among the already-open buffers (the scratch is one of them), so dropping it as a
+/// side effect would be surprising — unlike opening a *file*, which replaces the placeholder.
 async fn attach_buffer(
     client: &mut Client,
     state: &mut AppState,
@@ -2638,6 +2640,7 @@ async fn new_scratch(client: &mut Client, state: &mut AppState) -> Result<()> {
             jump_to: None,
         })
         .await?;
+    // New Scratch is an explicit request for a fresh placeholder — don't discard the one we're on.
     subscribe_to_buffer(client, state, open).await
 }
 
@@ -2685,9 +2688,20 @@ async fn finalize_close_buffer(
     Ok(())
 }
 
+/// The current buffer's id when it's an empty, unmodified scratch — the placeholder the editor
+/// spawns so you always land *somewhere*. `None` otherwise. A scratch has no path to save in
+/// place, so it only becomes dirty once typed into; "no path and not dirty" therefore already
+/// implies empty, and the line-count check is a cheap guard.
+fn empty_scratch_id(state: &AppState) -> Option<BufferId> {
+    let ed = state.editor.as_ref()?;
+    (ed.file_path.is_none() && ed.revision == ed.saved_revision && ed.line_count <= 1)
+        .then_some(ed.buffer_id)
+}
+
 /// Shared post-`buffer/open` plumbing for runtime buffer switches: build the new `EditorState`
 /// (via the shared core, inheriting the previous editor's wrap), replace `state.editor`, and
-/// ensure the cursor is in view. `attach_buffer` and `new_scratch` route through this.
+/// ensure the cursor is in view. `attach_buffer`, `new_scratch`, and `subscribe_replacing_scratch`
+/// route through this.
 async fn subscribe_to_buffer(
     client: &mut Client,
     state: &mut AppState,
@@ -2715,7 +2729,30 @@ async fn subscribe_to_buffer(
     // Cover the case where the restored scroll disagrees with the cursor (e.g. a `jump_to`
     // override on a buffer we've already opened before, so the stored scroll wasn't computed
     // around the new cursor). Cheap when the cursor is already visible — no RPC.
-    ensure_cursor_in_window(client, state).await?;
+    ensure_cursor_in_window(client, state).await
+}
+
+/// Switch to a freshly opened *file* buffer, then discard the empty placeholder scratch we were on
+/// (if any). Opening a file replaces the placeholder; the buffer-switch path (`attach_buffer`)
+/// deliberately leaves the scratch alone — it's navigation among the already-open buffers.
+async fn subscribe_replacing_scratch(
+    client: &mut Client,
+    state: &mut AppState,
+    open: BufferOpenResult,
+) -> Result<()> {
+    // Capture the scratch we're leaving before `subscribe_to_buffer` replaces the editor. Skip it
+    // if the buffer we're opening somehow *is* it (defensive — a file buffer has a path).
+    let leaving_scratch = empty_scratch_id(state).filter(|&id| id != open.buffer_id);
+    subscribe_to_buffer(client, state, open).await?;
+    // Drop the leftover scratch now that the editor has moved to the file; the server prunes it
+    // from the project MRU. Best-effort — a failure (e.g. it raced closed) is harmless.
+    if let Some(scratch_id) = leaving_scratch {
+        let _ = client
+            .rpc::<BufferClose>(BufferCloseParams {
+                buffer_id: scratch_id,
+            })
+            .await;
+    }
     Ok(())
 }
 
@@ -2873,7 +2910,7 @@ async fn open_file_at_path(
             jump_to,
         })
         .await?;
-    subscribe_to_buffer(client, state, open).await
+    subscribe_replacing_scratch(client, state, open).await
 }
 
 async fn handle_search_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
@@ -4206,7 +4243,7 @@ async fn create_file_in_explorer_dir(
             jump_to: None,
         })
         .await?;
-    subscribe_to_buffer(client, state, open).await
+    subscribe_replacing_scratch(client, state, open).await
 }
 
 /// Handle the Explorer's "+ create directory" synthetic row: create the directory via
@@ -5009,6 +5046,28 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `empty_scratch_id` flags only an empty, unmodified scratch (the discardable placeholder):
+    /// not when there's no editor, not once it's been typed into (dirty), and not a file-backed
+    /// buffer.
+    #[test]
+    fn empty_scratch_id_detects_only_unmodified_scratch() {
+        let mut state = empty_app_state(80, 24);
+        assert_eq!(empty_scratch_id(&state), None, "no editor → nothing to discard");
+
+        // Fresh scratch: no path, not dirty, empty.
+        state.editor = Some(stub_editor_state("(scratch 1)"));
+        assert_eq!(empty_scratch_id(&state), Some(state.ed().buffer_id));
+
+        // Typed into → dirty → keep it.
+        state.ed_mut().revision = 5; // saved_revision stays 0
+        assert_eq!(empty_scratch_id(&state), None);
+
+        // File-backed buffer is never a scratch.
+        state.editor = Some(stub_editor_state("src/main.rs"));
+        state.ed_mut().file_path = Some("/proj/src/main.rs".to_string());
+        assert_eq!(empty_scratch_id(&state), None);
+    }
 
     /// The ephemeral status line is dismissed only by events the user actually drives. Passive
     /// events the handler ignores must not dismiss it, or one arriving just after a slow save would
