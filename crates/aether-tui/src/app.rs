@@ -1679,7 +1679,10 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
     state.picker.total_matches = 0;
     state.picker.total_candidates = view.total_candidates;
     state.picker.ticking = true;
-    state.picker.selected = 0;
+    // The Buffers picker is MRU-ordered, so item 0 is the buffer you're already in. Default the
+    // highlight to item 1 — the previously-viewed buffer — so `Enter` is a quick flip back.
+    // `apply_update` clamps this to 0 when there's only one buffer.
+    state.picker.selected = if kind == PickerKind::Buffers { 1 } else { 0 };
     // Prefer the server-resolved centre item (set when `center_on_cursor_grep_hit` resolved)
     // so `apply_update` snaps the highlight to the same row the server framed.
     state.picker.resume_target = view.effective_center_on.clone().or(center_on);
