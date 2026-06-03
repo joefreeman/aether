@@ -861,14 +861,34 @@ async fn dispatch_terminal_event(
     state: &mut AppState,
     ev: Event,
 ) -> Result<()> {
-    // Each user-driven event clears the ephemeral status line before being processed. Anything
-    // the event itself sets (save/copy feedback, search truncation, etc.) stays visible until
-    // the *next* event.
-    state.status = StatusMessage::default();
+    // Clear the ephemeral status line before processing an event the user actually drives — a key
+    // press/repeat, mouse action, resize, or paste. Anything the event itself sets (save/copy
+    // feedback, search truncation, etc.) stays visible until the *next* such event. We must NOT
+    // clear on events `handle_event` ignores — key *releases* (which the kitty keyboard protocol
+    // reports) and focus changes — otherwise a release landing just after a slow save (its disk
+    // `fsync` outlasts the keypress) would wipe the "saved" message before it could be read.
+    if event_dismisses_status(&ev) {
+        state.status = StatusMessage::default();
+    }
     if let Event::Resize(cols, rows) = &ev {
         handle_resize(client, state, *cols, *rows).await
     } else {
         handle_event(client, state, ev).await
+    }
+}
+
+/// Whether a terminal event should dismiss the ephemeral status line. True only for events the
+/// user deliberately drives (key press/repeat, mouse click/scroll/drag, resize, paste). False for
+/// the passive events `handle_event` ignores, so they can't silently clear a freshly-set message
+/// (e.g. the "saved" feedback): key *releases* (reported under the kitty keyboard protocol), focus
+/// changes, and — crucially — mouse *motion*, which the terminal streams continuously while the
+/// cursor is over the window with mouse capture enabled.
+fn event_dismisses_status(ev: &Event) -> bool {
+    match ev {
+        Event::Key(k) => matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat),
+        Event::Mouse(m) => !matches!(m.kind, MouseEventKind::Moved),
+        Event::FocusGained | Event::FocusLost => false,
+        _ => true,
     }
 }
 
@@ -4989,6 +5009,44 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ephemeral status line is dismissed only by events the user actually drives. Passive
+    /// events the handler ignores must not dismiss it, or one arriving just after a slow save would
+    /// wipe the "saved" message: key *releases* (kitty keyboard protocol), focus changes, and mouse
+    /// *motion* (streamed continuously under mouse capture). Real actions still dismiss it.
+    #[test]
+    fn event_dismisses_status_only_for_actionable_events() {
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyEventState, MouseButton, MouseEvent, MouseEventKind,
+        };
+        let key = |kind| {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::CONTROL,
+                kind,
+                state: KeyEventState::NONE,
+            })
+        };
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert!(event_dismisses_status(&key(KeyEventKind::Press)));
+        assert!(event_dismisses_status(&key(KeyEventKind::Repeat)));
+        assert!(!event_dismisses_status(&key(KeyEventKind::Release)));
+        assert!(!event_dismisses_status(&Event::FocusGained));
+        assert!(!event_dismisses_status(&Event::FocusLost));
+        // Mouse motion (hover) is passive and must not dismiss; clicks/scroll are deliberate.
+        assert!(!event_dismisses_status(&mouse(MouseEventKind::Moved)));
+        assert!(event_dismisses_status(&mouse(MouseEventKind::Down(MouseButton::Left))));
+        assert!(event_dismisses_status(&mouse(MouseEventKind::ScrollDown)));
+        // Deliberate non-key events still dismiss it (matches the prior clear-on-any behaviour).
+        assert!(event_dismisses_status(&Event::Resize(80, 24)));
+    }
 
     /// `resolve_cli_path` resolves a relative arg against CWD, not against an arbitrary base.
     /// Tested here because the old (buggy) behaviour joined relative args with `project_paths[0]`
