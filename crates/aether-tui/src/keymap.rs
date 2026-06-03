@@ -73,7 +73,7 @@ impl ModPattern {
 }
 
 /// Vertical/horizontal scroll direction for [`Action::Scroll`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum ScrollDir {
     Up,
     Down,
@@ -82,7 +82,7 @@ pub enum ScrollDir {
 }
 
 /// How far a [`Action::Scroll`] moves: one line/column, half a viewport, or a full viewport.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum ScrollUnit {
     Line,
     Half,
@@ -106,7 +106,7 @@ pub enum InsertWhere {
 /// and `extend` and the viewport id are resolved by `run_action` against live `AppState`, so an
 /// `Action` is plain `Copy` data and the tables can be `static`. The big match that turns an
 /// `Action` into RPCs lives in `app.rs::run_action`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Action {
     // ---- motions (extend = Shift) ----
     MoveChar(Direction),
@@ -264,6 +264,47 @@ impl Action {
     /// shown as the `Space x` chord on each leader row.)
     pub fn awaits_key(&self) -> bool {
         matches!(self, Action::BeginFind { .. } | Action::BeginSurround(_))
+    }
+
+    /// Whether `r` (and `Shift-r`, which adds `extend`) should remember this action and replay it.
+    /// The repeat unit is the *binding intent*, not a low-level motion: `run_action` records the
+    /// `Action` (+ its `count`) after running a flagged one, and `RepeatMotion` re-runs it. Recording
+    /// the intent — rather than the resolved `Motion` — is what lets `r` reach non-`move_motion`
+    /// motions like line-select and tree expand/contract, and what lets a viewport-relative motion
+    /// (`PageMotion`) recompute its span against the *current* viewport on replay.
+    ///
+    /// The set is **cursor/selection motions only**:
+    /// - every cursor motion, including absolute ones (`LineEnd`, `GotoLine`, `NavUnitEdge`): a
+    ///   no-op replay is harmless, and excluding them would just be a surprise,
+    /// - the selection motions `SelectLine` and `TreeExpand`/`TreeContract`,
+    /// - `SearchCycle` (`n`) — stepping match-to-match is a motion in spirit.
+    ///
+    /// Deliberately **excluded**: edits (a separate "repeat last change" binding is planned), `Scroll`
+    /// (moves the viewport, not the cursor), `GrepNavigate` (`</>` can jump across buffers), and the
+    /// non-motion selection ops (`SwapAnchor`, `CollapseSelection`, motion undo/redo, `CenterCursor`).
+    /// `BeginFind` is excluded here because replaying it would just re-arm the capture; the resolved
+    /// find motion is recorded separately when the target char is typed.
+    pub fn is_repeatable(&self) -> bool {
+        matches!(
+            self,
+            Action::MoveChar(_)
+                | Action::MoveWord { .. }
+                | Action::MoveWordEnd { .. }
+                | Action::MoveVisualLine(_)
+                | Action::MoveLogicalLine(_)
+                | Action::MoveLineStart
+                | Action::MoveLineEnd
+                | Action::MoveLineFirstNonblank
+                | Action::GotoLine { .. }
+                | Action::MatchBracket { .. }
+                | Action::PageMotion { .. }
+                | Action::NavUnit(_)
+                | Action::NavUnitEdge { .. }
+                | Action::SelectLine(_)
+                | Action::TreeExpand
+                | Action::TreeContract
+                | Action::SearchCycle(_)
+        )
     }
 }
 
@@ -766,6 +807,40 @@ mod tests {
         assert!(ctrl_z.is_alt_pair(ctrl_alt_z));
         // Same letter, *different* modifier (None vs Ctrl) is not a pair.
         assert!(!c.is_alt_pair(ctrl_c));
+    }
+
+    /// `is_repeatable` flags exactly the cursor/selection motions `r` replays — every motion
+    /// (including absolute ones), plus line-select / tree expand-contract / search-cycle — and
+    /// nothing else (edits, scroll, grep-nav, the non-motion selection ops, the find *arming*).
+    #[test]
+    fn repeatable_covers_motions_and_selection_only() {
+        let repeats = |ctx, code, mods| lookup(ctx, code, mods).unwrap().action.is_repeatable();
+        let n = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+
+        // Incremental motions.
+        assert!(repeats(KeyContext::Normal, ch('h'), n));
+        assert!(repeats(KeyContext::Normal, ch('w'), n));
+        assert!(repeats(KeyContext::Normal, ch('j'), n));
+        assert!(repeats(KeyContext::Normal, ch(']'), n));
+        // Absolute motions repeat too (a no-op replay is harmless, not a surprise).
+        assert!(repeats(KeyContext::Normal, ch('0'), n));
+        assert!(repeats(KeyContext::Normal, ch('g'), n));
+        assert!(repeats(KeyContext::Normal, ch('}'), n));
+        // Selection motions.
+        assert!(repeats(KeyContext::Normal, ch('x'), n)); // line-select
+        assert!(repeats(KeyContext::Normal, ch('y'), n)); // tree expand
+        assert!(repeats(KeyContext::Normal, ch('n'), n)); // search cycle
+
+        // Not motions: edits, scroll, grep-nav, non-motion selection ops, find arming.
+        assert!(!repeats(KeyContext::Normal, ch('d'), ctrl)); // delete selection
+        assert!(!repeats(KeyContext::Normal, KeyCode::Up, n)); // scroll
+        assert!(!repeats(KeyContext::Normal, ch('>'), n)); // grep navigate
+        assert!(!repeats(KeyContext::Normal, ch('o'), n)); // swap anchor
+        assert!(!repeats(KeyContext::Normal, ch('c'), n)); // collapse selection
+        assert!(!repeats(KeyContext::Normal, ch('z'), n)); // motion undo
+        assert!(!repeats(KeyContext::Normal, ch('f'), n)); // find *arming* (resolved find recorded elsewhere)
+        assert!(!repeats(KeyContext::Normal, ch('r'), n)); // repeat itself never self-records
     }
 
     /// Alt variants whose original guard was `m.contains(ALT)` must still match when Shift is also

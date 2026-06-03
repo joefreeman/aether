@@ -83,6 +83,20 @@ pub struct PendingFind {
     pub count: u32,
 }
 
+/// What `r`/`Shift-r` replays. The repeat unit is the binding *intent*, not a resolved `Motion`:
+/// most actions are remembered as the `Action` (plus the `count` they were issued with) and replayed
+/// straight back through `run_action`, which reconstructs the motion against live state each time.
+/// The one exception is find-char: `BeginFind` only arms a capture, so the actual target char isn't
+/// known until the next keystroke — that resolved `Motion::FindChar` is stored directly.
+#[derive(Debug, Clone)]
+pub enum RepeatTarget {
+    /// Re-run this binding via `run_action(action, count, extend)`. Covers every repeatable action
+    /// except find — see [`Action::is_repeatable`].
+    Action { action: Action, count: u32 },
+    /// Replay a resolved `f`/`t` find (the target char is baked in). Recorded when the char is typed.
+    Find(Motion),
+}
+
 /// Client-side mirror of the server's search state. The server owns the match list (and pushes
 /// per-line highlights via viewport line renders); the client just tracks the query, the latest
 /// summary, the history list, and the snapshot used to revert from EditorMode::Search via Esc.
@@ -389,9 +403,9 @@ pub struct EditorState {
     /// binding. The value records the target (selection in Normal, line in Insert). Mirrors
     /// `pending_find`'s next-key-is-data capture.
     pub pending_surround: Option<SurroundTarget>,
-    /// The most recent repeatable motion, replayed by `r` (cursor move) or `Shift-r` (cursor
-    /// move + extend selection).
-    pub last_motion: Option<Motion>,
+    /// The most recent repeatable action, replayed by `r` (no extend) or `Shift-r` (extend the
+    /// selection with the replayed motion). See [`RepeatTarget`].
+    pub last_repeat: Option<RepeatTarget>,
     pub search: SearchState,
     /// Canonical absolute path of this buffer's file on disk, if any.
     pub file_path: Option<String>,
@@ -749,7 +763,7 @@ async fn build_editor_state_from_open(
         pending_count: 0,
         pending_find: None,
         pending_surround: None,
-        last_motion: None,
+        last_repeat: None,
         search: SearchState::default(),
         file_path: open.path,
         file_label,
@@ -1330,9 +1344,22 @@ async fn run_action(
         Action::MotionUndo => motion_undo(client, state, count).await?,
         Action::MotionRedo => motion_redo(client, state, count).await?,
         Action::RepeatMotion => {
-            if let Some(motion) = state.ed_mut().last_motion.clone() {
+            // `r`'s own `count` is how many times to replay; the stored target keeps the original
+            // motion's `count` baked in (so `2w` then `3r` steps 2 words three times). `extend` is
+            // the live Shift on the `r` press, never how the original was issued — that's the
+            // `r` (move) vs `Shift-r` (move + extend) distinction. Replaying an `Action` target
+            // re-runs `run_action`, which re-records the same target (idempotent); `RepeatMotion`
+            // itself isn't repeatable, so it never overwrites the target with itself.
+            if let Some(target) = state.ed_mut().last_repeat.clone() {
                 for _ in 0..count.max(1) {
-                    move_motion(client, state, motion.clone(), extend).await?;
+                    match &target {
+                        RepeatTarget::Action { action, count } => {
+                            Box::pin(run_action(client, state, *action, *count, extend)).await?;
+                        }
+                        RepeatTarget::Find(motion) => {
+                            move_motion(client, state, motion.clone(), extend).await?;
+                        }
+                    }
                 }
             }
         }
@@ -1470,6 +1497,12 @@ async fn run_action(
         Action::Reload => reload_buffer(client, state).await?,
         Action::NewScratch => new_scratch(client, state).await?,
     }
+    // Remember the action for `r`/`Shift-r` to replay. Recorded *after* a successful run (an RPC
+    // error above short-circuits via `?` and leaves the previous target intact). Find is handled
+    // separately at its capture site, since the target char isn't part of the `Action`.
+    if action.is_repeatable() {
+        state.ed_mut().last_repeat = Some(RepeatTarget::Action { action, count });
+    }
     Ok(())
 }
 
@@ -1478,18 +1511,16 @@ async fn handle_normal_key(client: &mut Client, state: &mut AppState, k: KeyEven
     // `normalize_key`) so `f X` is case-sensitive. Any non-`Char` key (Esc, arrow, etc.) cancels.
     if let Some(pending) = state.ed_mut().pending_find.take() {
         if let KeyCode::Char(ch) = k.code {
-            move_motion(
-                client,
-                state,
-                Motion::FindChar {
-                    ch,
-                    direction: pending.direction,
-                    count: pending.count,
-                    till: pending.till,
-                },
-                pending.extend,
-            )
-            .await?;
+            let motion = Motion::FindChar {
+                ch,
+                direction: pending.direction,
+                count: pending.count,
+                till: pending.till,
+            };
+            move_motion(client, state, motion.clone(), pending.extend).await?;
+            // `BeginFind` only armed the capture; the repeatable thing is this resolved find, so
+            // record it here (with its target char) rather than via `Action::is_repeatable`.
+            state.ed_mut().last_repeat = Some(RepeatTarget::Find(motion));
         }
         return Ok(());
     }
@@ -3399,42 +3430,14 @@ async fn move_motion(
     let new: CursorState = client
         .rpc::<CursorMove>(CursorMoveParams {
             buffer_id: state.ed_mut().buffer_id,
-            motion: motion.clone(),
+            motion,
             extend_selection: extend,
         })
         .await?;
     state.ed_mut().cursor = new;
-    if is_repeatable_motion(&motion) {
-        state.ed_mut().last_motion = Some(motion);
-    }
+    // Repeat (`r`) is recorded by the caller at the `Action` layer (see `run_action`) and at the
+    // find-char capture site — not here — so this funnel stays a pure cursor move.
     Ok(())
-}
-
-/// Motions worth remembering for `r`/`Shift-r` repeat: those where each press makes incremental
-/// progress. Absolute positions (line endpoints, buffer endpoints, goto) are excluded because
-/// repeating them is a no-op.
-fn is_repeatable_motion(motion: &Motion) -> bool {
-    match motion {
-        Motion::Char { .. }
-        | Motion::Word { .. }
-        | Motion::WordEnd { .. }
-        | Motion::LogicalLine { .. }
-        | Motion::VisualLine { .. }
-        | Motion::FindChar { .. }
-        | Motion::NextNavigationUnit
-        | Motion::PrevNavigationUnit => true,
-        Motion::LineStart
-        | Motion::LineEnd
-        | Motion::LineFirstNonblank
-        | Motion::BufferStart
-        | Motion::BufferEnd
-        | Motion::Goto { .. }
-        | Motion::VisualLineStart { .. }
-        | Motion::VisualLineEnd { .. }
-        | Motion::MatchBracket { .. }
-        | Motion::EndOfNavigationUnit
-        | Motion::StartOfNavigationUnit => false,
-    }
 }
 
 async fn select_line(
@@ -5292,7 +5295,7 @@ mod tests {
             pending_count: 0,
             pending_find: None,
             pending_surround: None,
-            last_motion: None,
+            last_repeat: None,
             search: Default::default(),
             file_path: None,
             file_label: label.into(),
