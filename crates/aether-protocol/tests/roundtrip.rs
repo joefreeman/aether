@@ -174,6 +174,7 @@ fn buffer_open_result_shape() {
         revision: 0,
         saved_revision: 0,
         path: None,
+        scratch_number: Some(3),
         cursor: Default::default(),
         scroll: None,
     })
@@ -181,6 +182,7 @@ fn buffer_open_result_shape() {
     assert_eq!(v["buffer_id"], 42);
     assert_eq!(v["language"], "rust");
     assert_eq!(v["saved_revision"], 0);
+    assert_eq!(v["scratch_number"], 3);
     // Cursor always serialises (CursorState::default() is `{position: {line:0,col:0}, anchor: {line:0,col:0}}`).
     assert_eq!(v["cursor"]["position"]["line"], 0);
     assert_eq!(v["cursor"]["position"]["col"], 0);
@@ -199,6 +201,7 @@ fn buffer_open_result_restored_scroll() {
         revision: 0,
         saved_revision: 0,
         path: None,
+        scratch_number: None,
         cursor: Default::default(),
         scroll: Some(ScrollPosition {
             logical_line: 7,
@@ -208,6 +211,8 @@ fn buffer_open_result_restored_scroll() {
     .unwrap();
     assert_eq!(v["scroll"]["logical_line"], 7);
     assert_eq!(v["scroll"]["sub_row"], 0.5);
+    // `scratch_number: None` skips serialisation, like a file buffer.
+    assert!(v.get("scratch_number").is_none());
 }
 
 #[test]

@@ -231,6 +231,20 @@ impl ServerState {
             .collect()
     }
 
+    /// The display number to assign a *new* scratch buffer in `project`: the lowest positive
+    /// integer not already in use by another scratch there. Keeps `(scratch N)` numbers small and
+    /// stable, reusing one once its buffer closes. Call before inserting the new buffer.
+    pub fn next_scratch_number(&self, project: &str) -> u32 {
+        let used: std::collections::HashSet<u32> = self
+            .buffer_projects
+            .iter()
+            .filter(|(_, p)| p.as_str() == project)
+            .filter_map(|(id, _)| self.buffers.get(id))
+            .filter_map(|b| b.scratch_number)
+            .collect();
+        (1..).find(|n| !used.contains(n)).expect("u32 range is non-empty")
+    }
+
     /// Buffer ids in `project` whose backing file is at or under `canonical` — an exact match for
     /// a file, or a path-prefix match for a directory. Used by `path/delete` to find the buffers a
     /// deletion would close (and to screen them for unsaved changes first).
@@ -474,6 +488,11 @@ impl ServerState {
 pub struct Buffer {
     pub id: BufferId,
     pub canonical_path: Option<PathBuf>,
+    /// Small per-project display number for a scratch buffer (`(scratch N)`), assigned at creation
+    /// as the lowest positive integer not in use by another scratch in the project — so the numbers
+    /// stay small, stay stable for the buffer's life, and a freed number gets reused. `None` for
+    /// file-backed buffers (which display their path instead).
+    pub scratch_number: Option<u32>,
     pub text: ropey::Rope,
     pub revision: Revision,
     pub language: Option<String>,
@@ -577,6 +596,7 @@ impl Buffer {
         Ok(Buffer {
             id,
             canonical_path: Some(canonical),
+            scratch_number: None,
             text,
             revision: 0,
             language,
@@ -608,6 +628,7 @@ impl Buffer {
         Buffer {
             id,
             canonical_path: Some(canonical),
+            scratch_number: None,
             text,
             revision: 0,
             language,
@@ -626,7 +647,7 @@ impl Buffer {
         }
     }
 
-    pub fn scratch(id: BufferId, language: Option<String>) -> Self {
+    pub fn scratch(id: BufferId, language: Option<String>, scratch_number: u32) -> Self {
         let text = ropey::Rope::new();
         let syntax = language
             .as_deref()
@@ -635,6 +656,7 @@ impl Buffer {
         Buffer {
             id,
             canonical_path: None,
+            scratch_number: Some(scratch_number),
             text,
             revision: 0,
             language,
@@ -1199,5 +1221,36 @@ mod project_state_tests {
             s.buffers_under_path("other-proj", Path::new("/ws/src")).is_empty(),
             "scoped to the named project"
         );
+    }
+
+    /// `next_scratch_number` returns the lowest positive integer not used by another scratch in the
+    /// project: small, reuses freed numbers, ignores file buffers, and numbers projects apart.
+    #[test]
+    fn next_scratch_number_picks_lowest_unused_per_project() {
+        let mut s = ServerState::new("tok".to_string());
+        assert_eq!(s.next_scratch_number("proj"), 1, "empty project → 1");
+
+        let add_scratch = |s: &mut ServerState, n: u32| {
+            let id = s.allocate_buffer_id();
+            s.buffers.insert(id, Buffer::scratch(id, None, n));
+            s.buffer_projects.insert(id, "proj".to_string());
+            id
+        };
+        let s1 = add_scratch(&mut s, 1);
+        add_scratch(&mut s, 2);
+        // A file buffer (no scratch number) doesn't occupy a slot.
+        let file = s.allocate_buffer_id();
+        s.buffers
+            .insert(file, Buffer::new_at_path(file, PathBuf::from("/p/a.rs"), None));
+        s.buffer_projects.insert(file, "proj".to_string());
+        assert_eq!(s.next_scratch_number("proj"), 3, "1 and 2 used → 3");
+
+        // Free #1 → it's reused rather than handing out 3.
+        s.buffers.remove(&s1);
+        s.buffer_projects.remove(&s1);
+        assert_eq!(s.next_scratch_number("proj"), 1);
+
+        // A different project numbers independently.
+        assert_eq!(s.next_scratch_number("other"), 1);
     }
 }

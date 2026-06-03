@@ -726,7 +726,7 @@ async fn build_editor_state_from_open(
         .await?;
     let file_label = match open.path.as_deref() {
         Some(p) => project_relative_label(p, project_paths, root_labels),
-        None => format!("(scratch {})", open.buffer_id),
+        None => format!("(scratch {})", open.scratch_number.map(u64::from).unwrap_or(open.buffer_id)),
     };
     Ok(EditorState {
         mode: EditorMode::Normal,

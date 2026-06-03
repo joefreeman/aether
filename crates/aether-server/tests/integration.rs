@@ -7438,7 +7438,11 @@ async fn buffers_picker_renders_scratch_placeholder() {
     )
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let expected = format!("(scratch {})", scratch.buffer_id);
+    // The label is rendered from the scratch's display *number*, not its buffer id.
+    let expected = format!(
+        "(scratch {})",
+        scratch.scratch_number.expect("a scratch carries a number")
+    );
     assert!(
         update
             .items
@@ -7447,6 +7451,44 @@ async fn buffers_picker_renders_scratch_placeholder() {
         "expected display {expected:?} in items: {:?}",
         update.items,
     );
+
+    drop(server);
+}
+
+/// The displayed scratch number tracks the project's scratch count (lowest-unused), not the global
+/// buffer-id counter — so it stays small even after file buffers have bumped the id, and a freed
+/// number is reused.
+#[tokio::test]
+async fn scratch_number_is_per_project_lowest_unused() {
+    // `setup_with_buffer` opens a *file* buffer first, so a later scratch won't have buffer_id 1.
+    let (server, mut ws, file_id) = setup_with_buffer("hello\n").await;
+    let scratch_params = || BufferOpenParams {
+        buffer_id: None,
+        path_index: None,
+        relative_path: None,
+        language: None,
+        create_if_missing: false,
+        jump_to: None,
+    };
+
+    let s1: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 100, &scratch_params()).await;
+    assert_ne!(s1.buffer_id, file_id);
+    assert_eq!(
+        s1.scratch_number,
+        Some(1),
+        "first scratch is #1 (its buffer_id was {})",
+        s1.buffer_id
+    );
+
+    let s2: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 101, &scratch_params()).await;
+    assert_eq!(s2.scratch_number, Some(2));
+
+    // Close #1; the next scratch reuses its freed number rather than taking #3.
+    let _: BufferCloseResult =
+        send_request::<BufferClose>(&mut ws, 102, &BufferCloseParams { buffer_id: s1.buffer_id })
+            .await;
+    let s3: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 103, &scratch_params()).await;
+    assert_eq!(s3.scratch_number, Some(1), "freed #1 is reused, not #3");
 
     drop(server);
 }

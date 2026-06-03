@@ -710,6 +710,7 @@ pub async fn buffer_open(
         let revision = buf.revision;
         let saved_revision = buf.saved_revision();
         let path = buf.canonical_path.as_ref().map(|p| p.display().to_string());
+        let scratch_number = buf.scratch_number;
         let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
         let cursor = resolve_open_cursor(&mut s, client_id, buffer_id, clamped_jump);
         let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, buffer_id)).copied());
@@ -721,6 +722,7 @@ pub async fn buffer_open(
             revision,
             saved_revision,
             path,
+            scratch_number,
             cursor,
             scroll,
         };
@@ -737,7 +739,8 @@ pub async fn buffer_open(
         (None, None) => {
             let mut s = state.lock().await;
             let id = s.allocate_buffer_id();
-            let buf = Buffer::scratch(id, params.language.clone());
+            let scratch_number = s.next_scratch_number(&active_project_name);
+            let buf = Buffer::scratch(id, params.language.clone(), scratch_number);
             let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
             let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump);
             let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, id)).copied());
@@ -749,6 +752,7 @@ pub async fn buffer_open(
                 revision: 0,
                 saved_revision: buf.saved_revision(),
                 path: None,
+                scratch_number: Some(scratch_number),
                 cursor,
                 scroll,
             };
@@ -846,6 +850,7 @@ pub async fn buffer_open(
                 revision,
                 saved_revision,
                 path: Some(canonical.display().to_string()),
+                scratch_number: None,
                 cursor,
                 scroll,
             };
@@ -888,6 +893,7 @@ pub async fn buffer_open(
         revision: buf.revision,
         saved_revision: buf.saved_revision(),
         path: Some(canonical.display().to_string()),
+        scratch_number: None,
         cursor,
         scroll,
     };
@@ -5226,7 +5232,7 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
     let display = match buf.canonical_path.as_deref() {
         Some(p) => crate::workspace_index::project_relative_display(p, roots)
             .unwrap_or_else(|| p.display().to_string()),
-        None => format!("(scratch {})", buf.id),
+        None => format!("(scratch {})", buf.scratch_number.map(u64::from).unwrap_or(buf.id)),
     };
     picker_state::BufferCandidate {
         buffer_id: buf.id,

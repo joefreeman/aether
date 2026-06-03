@@ -52,6 +52,11 @@ pub struct BufferOpenResult {
     /// Canonical absolute path of the file on disk, when the buffer is backed by one. `None` for
     /// scratch buffers. Lets the client (e.g. file-browser navigation) work in absolute paths.
     pub path: Option<String>,
+    /// Small per-project display number for a scratch buffer (`(scratch N)`); `None` for
+    /// file-backed buffers. The client renders the buffer label from this rather than `buffer_id`,
+    /// so the numbers stay small and reset as scratches close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_number: Option<u32>,
     /// Server-side cursor state for this `(client, buffer)`. `CursorState::default()` for a buffer
     /// the client hasn't touched yet; the prior position for a buffer the client is reopening.
     #[serde(default)]
