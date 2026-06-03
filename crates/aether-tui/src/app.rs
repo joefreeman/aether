@@ -1888,33 +1888,15 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
             let step = state.picker.pane_rows as i64;
             picker_move_selection(client, state, step).await?;
         }
-        // `Alt-Backspace` — multi-step "back" inside the Explorer picker:
-        //   1. Non-empty filter → clear the filter (preserving the highlight as a resume anchor).
-        //   2. Filter empty + inside a subdirectory → step up to the parent directory.
-        //   3. Filter empty + at the top of a root → switch to Roots mode (list all project roots).
-        //   4. Filter empty + already in Roots mode → no-op (no further "back" to take).
-        // We deliberately leave `resume_row_offset` as `None` on the clear path — a filtered
-        // listing usually has the highlight near the top of the visible window, and pinning
-        // that offset onto the larger unfiltered listing scrolls items off the top, making it
-        // look like the filter is still active.
-        (KeyCode::Backspace, m) if m == KeyModifiers::ALT => {
-            if !state.picker.query.is_empty() {
-                let anchor = state.picker.highlighted().cloned();
-                state.picker.query.clear();
-                send_picker_query(client, state).await?;
-                state.picker.resume_target = anchor;
-            } else if matches!(state.picker.kind, Some(PickerKind::Explorer)) {
-                if let Some(parent) = state.picker.explorer_parent.clone() {
-                    let leaving = explorer_leaving_name(state);
-                    picker_navigate_to_dir(client, state, parent, leaving.as_deref()).await?;
-                } else if state.picker.explorer_dir.is_some() && state.project_paths.len() > 1 {
-                    // At the top of a root (no parent inside the project) — escape into the
-                    // Roots view. Single-root projects skip this: there's only one root, so
-                    // there's nothing to pick between. Already-in-Roots case falls through
-                    // (the `explorer_dir.is_none()` arm).
-                    picker_enter_roots_mode(client, state).await?;
-                }
-            }
+        // `Alt-Backspace` / `Alt-h` — multi-step "back": with a filter active, clear it; otherwise
+        // (Explorer only) step up to the parent directory, or from a root's top into Roots mode.
+        // `Alt-h` mirrors the vim-style leftward motion. See `picker_back`.
+        (KeyCode::Backspace, m) if m == KeyModifiers::ALT => picker_back(client, state).await?,
+        (KeyCode::Char('h'), m) if m == KeyModifiers::ALT => picker_back(client, state).await?,
+        // `Alt-l` enters the highlighted directory (a subdir, or a root in Roots mode) in the
+        // Explorer — like Enter, but it never opens a file. No-op on file rows / other pickers.
+        (KeyCode::Char('l'), m) if m == KeyModifiers::ALT => {
+            enter_highlighted_dir(client, state).await?;
         }
         (KeyCode::Left, _) => state.picker.query.move_left(),
         (KeyCode::Right, _) => state.picker.query.move_right(),
@@ -1940,6 +1922,73 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
         _ => {}
     }
     Ok(())
+}
+
+/// The picker "back" gesture, shared by `Alt-Backspace` and `Alt-h`:
+///   1. Non-empty filter → clear the filter (preserving the highlight as a resume anchor).
+///   2. Filter empty + Explorer inside a subdirectory → step up to the parent directory.
+///   3. Filter empty + Explorer at the top of a root → switch to Roots mode (multi-root only).
+///   4. Otherwise → no-op (no further "back" to take).
+///
+/// We deliberately leave `resume_row_offset` as `None` on the clear path — a filtered listing
+/// usually has the highlight near the top of the visible window, and pinning that offset onto the
+/// larger unfiltered listing scrolls items off the top, making it look like the filter is still
+/// active.
+async fn picker_back(client: &mut Client, state: &mut AppState) -> Result<()> {
+    if !state.picker.query.is_empty() {
+        let anchor = state.picker.highlighted().cloned();
+        state.picker.query.clear();
+        send_picker_query(client, state).await?;
+        state.picker.resume_target = anchor;
+    } else if matches!(state.picker.kind, Some(PickerKind::Explorer)) {
+        if let Some(parent) = state.picker.explorer_parent.clone() {
+            let leaving = explorer_leaving_name(state);
+            picker_navigate_to_dir(client, state, parent, leaving.as_deref()).await?;
+        } else if state.picker.explorer_dir.is_some() && state.project_paths.len() > 1 {
+            // At the top of a root (no parent inside the project) — escape into the Roots view.
+            // Single-root projects skip this: there's only one root, so there's nothing to pick
+            // between. Already-in-Roots case falls through (the `explorer_dir.is_none()` arm).
+            picker_enter_roots_mode(client, state).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Enter the highlighted directory in the Explorer picker — a subdirectory `DirEntry`, or a root
+/// in Roots mode. Returns `true` if it navigated, `false` if the highlight isn't a directory (a
+/// file row, or a non-Explorer picker). Shared by `Enter` (which falls back to opening files) and
+/// `Alt-l` (which only enters directories). The synthetic "+ create" row is a non-dir `DirEntry`,
+/// so it falls through to `false` here — `Alt-l` won't trigger creation.
+async fn enter_highlighted_dir(client: &mut Client, state: &mut AppState) -> Result<bool> {
+    if state.picker.kind != Some(PickerKind::Explorer) {
+        return Ok(false);
+    }
+    let Some(item) = state.picker.highlighted().cloned() else {
+        return Ok(false);
+    };
+    match item {
+        PickerItem::DirEntry {
+            name,
+            is_dir: true,
+            ..
+        } => {
+            let target = std::path::Path::new(state.picker.explorer_dir.as_deref().unwrap_or(""))
+                .join(&name)
+                .display()
+                .to_string();
+            picker_navigate_to_dir(client, state, target, None).await?;
+            Ok(true)
+        }
+        // Roots mode: a Root row navigates to that root's top. The client looks up the absolute
+        // path from project_paths — the server stays out of presentation.
+        PickerItem::Root { path_index, .. } => {
+            if let Some(target) = state.project_paths.get(path_index as usize).cloned() {
+                picker_navigate_to_dir(client, state, target, None).await?;
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Stage a `[y/N]` delete confirmation for the highlighted row, if it's deletable. Dispatches by
@@ -2339,29 +2388,11 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
     let Some(item) = state.picker.highlighted().cloned() else {
         return Ok(());
     };
-    // Explorer + directory entry: Enter is "enter this directory" rather than "select" — same
-    // semantics as Alt-l, kept here for muscle memory. File entries fall through to the normal
+    // Explorer + a directory (subdir or root): Enter "enters" it rather than selecting — the same
+    // navigation `Alt-l` performs. File entries return `false` and fall through to the normal
     // selection path (server returns `File { path }`, we open it).
-    if kind == PickerKind::Explorer {
-        if let aether_protocol::picker::PickerItem::DirEntry {
-            name, is_dir: true, ..
-        } = &item
-        {
-            let target = std::path::Path::new(state.picker.explorer_dir.as_deref().unwrap_or(""))
-                .join(name)
-                .display()
-                .to_string();
-            picker_navigate_to_dir(client, state, target, None).await?;
-            return Ok(());
-        }
-        // Roots mode: Enter on a Root row navigates to that root's top. The client looks up the
-        // absolute path from project_paths — the server stays out of presentation.
-        if let aether_protocol::picker::PickerItem::Root { path_index, .. } = &item {
-            if let Some(target) = state.project_paths.get(*path_index as usize).cloned() {
-                picker_navigate_to_dir(client, state, target, None).await?;
-            }
-            return Ok(());
-        }
+    if enter_highlighted_dir(client, state).await? {
+        return Ok(());
     }
     if kind.preserves_state() {
         let row_offset = state
