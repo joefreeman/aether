@@ -7370,7 +7370,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
     drop(server);
 }
 
-/// Scratch buffers show up in the picker with a `[scratch N]` placeholder display.
+/// Scratch buffers show up in the picker with a `(scratch N)` placeholder display.
 #[tokio::test]
 async fn buffers_picker_renders_scratch_placeholder() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
@@ -7403,7 +7403,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
     )
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let expected = format!("[scratch {}]", scratch.buffer_id);
+    let expected = format!("(scratch {})", scratch.buffer_id);
     assert!(
         update
             .items

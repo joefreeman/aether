@@ -77,7 +77,7 @@ pub enum PickerItem {
     /// between pushes (an active picker re-pushes on dirty transitions).
     Buffer {
         buffer_id: BufferId,
-        /// What the row renders: project-relative path for file-backed buffers, `[scratch N]`
+        /// What the row renders: project-relative path for file-backed buffers, `(scratch N)`
         /// for scratch buffers. Also the haystack the matcher scores against.
         display: String,
         dirty: bool,

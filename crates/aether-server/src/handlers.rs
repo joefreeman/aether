@@ -5172,7 +5172,7 @@ fn build_lines_changed_notif(
 
 /// Build the buffer-picker candidate list for `client_id`: every buffer belonging to the
 /// client's active project, MRU first, then any project buffers the client hasn't touched yet
-/// (e.g. opened by another client of the same project) in buffer-id order. `[scratch N]`
+/// (e.g. opened by another client of the same project) in buffer-id order. `(scratch N)`
 /// placeholder display for buffers without a path. Returns an empty list if the client has no
 /// active project (the picker shouldn't be reachable without one, but the lookup stays defensive).
 fn build_buffer_candidates(
@@ -5218,7 +5218,7 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
     let display = match buf.canonical_path.as_deref() {
         Some(p) => crate::workspace_index::project_relative_display(p, roots)
             .unwrap_or_else(|| p.display().to_string()),
-        None => format!("[scratch {}]", buf.id),
+        None => format!("(scratch {})", buf.id),
     };
     picker_state::BufferCandidate {
         buffer_id: buf.id,

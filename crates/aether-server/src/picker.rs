@@ -21,7 +21,7 @@ use std::sync::Arc;
 pub struct BufferCandidate {
     pub buffer_id: BufferId,
     /// Display string used for both rendering and fuzzy matching. Project-relative for
-    /// file-backed buffers; `[scratch N]` for scratch buffers.
+    /// file-backed buffers; `(scratch N)` for scratch buffers.
     pub display: String,
     pub dirty: bool,
 }

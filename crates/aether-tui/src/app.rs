@@ -726,7 +726,7 @@ async fn build_editor_state_from_open(
         .await?;
     let file_label = match open.path.as_deref() {
         Some(p) => project_relative_label(p, project_paths, root_labels),
-        None => format!("[scratch {}]", open.buffer_id),
+        None => format!("(scratch {})", open.buffer_id),
     };
     Ok(EditorState {
         mode: EditorMode::Normal,
@@ -4979,8 +4979,8 @@ mod tests {
         };
         assert_eq!(terminal_title(&state), "[demo]");
         // Once a buffer exists, the title grows to include the file label.
-        state.editor = Some(stub_editor_state("[scratch 0]"));
-        assert_eq!(terminal_title(&state), "[demo] [scratch 0]");
+        state.editor = Some(stub_editor_state("(scratch 0)"));
+        assert_eq!(terminal_title(&state), "[demo] (scratch 0)");
     }
 
     #[test]
