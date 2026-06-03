@@ -2125,7 +2125,7 @@ fn truncate_path_with_indices(
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let top = state.ed().scroll_logical_line;
-    let selection = ordered_selection(&state.ed().cursor);
+    let selection = ordered_selection(&state.ed().cursor, state.ed().mode);
     let viewport_rows = area.height as usize;
     let viewport_cols = area.width;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
@@ -2157,11 +2157,13 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             let segment = match vrow.segments.first() {
                 Some(s) => s,
                 None => {
-                    // Empty line — paint a trailing cell when the selection continues past
-                    // this line (the line's newline char is conceptually in the range).
+                    // Empty line — paint a trailing cell when the line's newline (at col 0) falls
+                    // in the selection: the range starts at/before this line and ends at/after it.
+                    // `>=` (not `>`) so a selection ending *on* the empty line — including a point
+                    // cursor parked there — still highlights its newline.
                     let empty_newline_selected = is_last_vrow_of_line
                         && selection
-                            .is_some_and(|(s, e)| s.line <= logical_line && e.line > logical_line);
+                            .is_some_and(|(s, e)| s.line <= logical_line && e.line >= logical_line);
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     if empty_newline_selected {
                         spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
@@ -2357,14 +2359,20 @@ fn bracket_positions_on_visual_row(
         .collect()
 }
 
-/// `Some((lo, hi))` when the selection covers more than one char (range). `None` for a point
-/// cursor — the block cursor alone visualises the 1-char "selection", so we don't draw the
-/// extra range highlight.
-fn ordered_selection(cursor: &CursorState) -> Option<(LogicalPosition, LogicalPosition)> {
-    if cursor.is_point() {
-        return None;
-    }
+/// The cursor's selection as an inclusive `(lo, hi)` range. A range cursor (anchor != position)
+/// always yields one. A *point* cursor is the 1-char selection of the char under it — yielded only
+/// in Normal mode, where the block cursor represents exactly that span, so the char's selection
+/// highlight + whitespace/newline indicator (`→`/`·`/`↵`) render the same as inside a multi-char
+/// selection. In Insert/Search the cursor is a bar (a gap between chars), not a selection, so a
+/// point yields `None`.
+fn ordered_selection(
+    cursor: &CursorState,
+    mode: EditorMode,
+) -> Option<(LogicalPosition, LogicalPosition)> {
     let p = cursor.position;
+    if cursor.is_point() {
+        return matches!(mode, EditorMode::Normal).then_some((p, p));
+    }
     let anchor = cursor.anchor;
     if (p.line, p.col) <= (anchor.line, anchor.col) {
         Some((p, anchor))
