@@ -29,7 +29,7 @@ use aether_protocol::input::{
 };
 use aether_protocol::path::PathDelete;
 use aether_protocol::picker::{
-    PickerGrepNavigate, PickerHide, PickerQuery, PickerSelect, PickerView,
+    PickerGrepFileJump, PickerGrepNavigate, PickerHide, PickerQuery, PickerSelect, PickerView,
 };
 use aether_protocol::project::{
     ProjectActivate, ProjectAddRoot, ProjectCreate, ProjectDelete, ProjectList, ProjectRemoveRoot,
@@ -295,6 +295,7 @@ async fn dispatch(
         PickerSelect::NAME => run!(PickerSelect, handlers::picker_select),
         PickerHide::NAME => run!(PickerHide, handlers::picker_hide),
         PickerGrepNavigate::NAME => run!(PickerGrepNavigate, handlers::picker_grep_navigate),
+        PickerGrepFileJump::NAME => run!(PickerGrepFileJump, handlers::picker_grep_file_jump),
         DirectoryList::NAME => run!(DirectoryList, handlers::directory_list),
         DirectoryCreate::NAME => run!(DirectoryCreate, handlers::directory_create),
         other => Err(RpcError::method_not_found(other)),

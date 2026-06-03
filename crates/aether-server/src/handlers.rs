@@ -30,9 +30,9 @@ use aether_protocol::input::{
     InputUnsurroundParams, SurroundTarget, UndoResult,
 };
 use aether_protocol::picker::{
-    PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHideParams, PickerItem, PickerKind,
-    PickerQueryParams, PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams,
-    PickerViewParams, PickerViewResult,
+    PickerGrepFileJumpParams, PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHideParams,
+    PickerItem, PickerKind, PickerQueryParams, PickerSelectParams, PickerSelectResult, PickerUpdate,
+    PickerUpdateParams, PickerViewParams, PickerViewResult,
 };
 use aether_protocol::project::{
     ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
@@ -5941,6 +5941,82 @@ pub async fn picker_grep_navigate(
     }))
 }
 
+/// Index of the file-boundary hit to jump to within `hits` (grep candidates, grouped into
+/// contiguous per-file runs). `from` is the selection's current index.
+///
+/// - Forward → the first hit whose `(path_index, relative_path)` differs from `from`'s, scanning
+///   forward (i.e. the first hit of the next file).
+/// - Backward → the start of `from`'s own file run; or, if `from` is already that start, the start
+///   of the previous file's run (vim-`{`).
+///
+/// Returns `None` at the ends (no next file going forward; already on the very first hit going
+/// backward). Pure + index-only so it's straightforward to unit-test.
+fn grep_file_boundary(
+    hits: &[picker_state::GrepHitCandidate],
+    from: usize,
+    direction: Direction,
+) -> Option<usize> {
+    let key = |i: usize| (hits[i].path_index, hits[i].relative_path.as_str());
+    let cur = key(from);
+    match direction {
+        Direction::Forward => (from + 1..hits.len()).find(|&j| key(j) != cur),
+        Direction::Backward => {
+            // Walk back to the first hit of the current file.
+            let mut run_start = from;
+            while run_start > 0 && key(run_start - 1) == cur {
+                run_start -= 1;
+            }
+            if from != run_start {
+                return Some(run_start); // not at the top of this file → go there
+            }
+            if run_start == 0 {
+                return None; // already on the very first hit
+            }
+            // At the top of this file → walk to the top of the previous file.
+            let prev = key(run_start - 1);
+            let mut p = run_start - 1;
+            while p > 0 && key(p - 1) == prev {
+                p -= 1;
+            }
+            Some(p)
+        }
+    }
+}
+
+/// Move the grep picker's selection to the first hit of the next / previous file. Computed against
+/// the full cached hit list so it works past the client's over-fetch window; the client frames the
+/// returned hit via `picker/view { center_on }`. `None` when there's no further file that way.
+pub async fn picker_grep_file_jump(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: PickerGrepFileJumpParams,
+) -> Result<Option<PickerItem>, RpcError> {
+    let client_id = ctx.client_id;
+    let s = state.lock().await;
+    let Some(picker) = s.pickers.get(&(client_id, PickerKind::Grep)) else {
+        return Ok(None);
+    };
+    let picker_state::PickerCandidates::Grep(ref hits) = picker.candidates else {
+        return Ok(None);
+    };
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    let from = (params.from_index as usize).min(hits.len() - 1);
+    let Some(target) = grep_file_boundary(hits, from, params.direction) else {
+        return Ok(None);
+    };
+    let h = &hits[target];
+    Ok(Some(PickerItem::GrepHit {
+        path_index: h.path_index,
+        relative_path: h.relative_path.clone(),
+        line: h.line,
+        col: h.col,
+        preview: h.preview.clone(),
+        match_indices: h.match_indices.clone(),
+    }))
+}
+
 /// First grep hit "after" the cursor. Within the same file: the first hit whose `(line, col)` is
 /// past the cursor's. Across files: the first hit whose `(path_index, relative_path)` sorts after
 /// `current`. If the current buffer has no path (scratch or outside every root), every hit counts
@@ -6026,5 +6102,62 @@ mod project_name_tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod grep_boundary_tests {
+    use super::*;
+
+    fn hit(rel: &str, line: u32) -> picker_state::GrepHitCandidate {
+        picker_state::GrepHitCandidate {
+            path_index: 0,
+            relative_path: rel.to_string(),
+            abs_path: format!("/ws/{rel}"),
+            line,
+            col: 0,
+            match_byte_len: 1,
+            preview: String::new(),
+            match_indices: Vec::new(),
+        }
+    }
+
+    // Three files in walker order: a.rs (3 hits), b.rs (1 hit), c.rs (2 hits).
+    fn sample() -> Vec<picker_state::GrepHitCandidate> {
+        vec![
+            hit("a.rs", 1),
+            hit("a.rs", 5),
+            hit("a.rs", 9), // indices 0,1,2
+            hit("b.rs", 2), // index 3
+            hit("c.rs", 1),
+            hit("c.rs", 4), // indices 4,5
+        ]
+    }
+
+    #[test]
+    fn forward_jumps_to_next_files_first_hit() {
+        let h = sample();
+        // From anywhere within a.rs → the first hit of b.rs (index 3).
+        assert_eq!(grep_file_boundary(&h, 0, Direction::Forward), Some(3));
+        assert_eq!(grep_file_boundary(&h, 2, Direction::Forward), Some(3));
+        // From b.rs → the first hit of c.rs (index 4).
+        assert_eq!(grep_file_boundary(&h, 3, Direction::Forward), Some(4));
+        // Within the last file → nothing further forward.
+        assert_eq!(grep_file_boundary(&h, 4, Direction::Forward), None);
+        assert_eq!(grep_file_boundary(&h, 5, Direction::Forward), None);
+    }
+
+    #[test]
+    fn backward_goes_to_current_file_top_then_previous_file() {
+        let h = sample();
+        // Mid-file (a.rs, index 2) → top of a.rs (index 0).
+        assert_eq!(grep_file_boundary(&h, 2, Direction::Backward), Some(0));
+        assert_eq!(grep_file_boundary(&h, 1, Direction::Backward), Some(0));
+        // Already on the top of c.rs (index 4) → top of the previous file b.rs (index 3).
+        assert_eq!(grep_file_boundary(&h, 4, Direction::Backward), Some(3));
+        // Top of b.rs (index 3) → top of a.rs (index 0).
+        assert_eq!(grep_file_boundary(&h, 3, Direction::Backward), Some(0));
+        // The very first hit → nothing further back.
+        assert_eq!(grep_file_boundary(&h, 0, Direction::Backward), None);
     }
 }

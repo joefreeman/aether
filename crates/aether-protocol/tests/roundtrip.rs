@@ -410,6 +410,22 @@ fn project_delete_params_round_trip() {
 }
 
 #[test]
+fn picker_grep_file_jump_round_trips() {
+    use aether_protocol::cursor::Direction;
+    use aether_protocol::picker::{PickerGrepFileJump, PickerGrepFileJumpParams};
+    assert_eq!(PickerGrepFileJump::NAME, "picker/grep_file_jump");
+    let p = PickerGrepFileJumpParams {
+        from_index: 7,
+        direction: Direction::Backward,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["from_index"], 7);
+    let back: PickerGrepFileJumpParams = serde_json::from_value(v).unwrap();
+    assert_eq!(back.from_index, 7);
+    assert!(matches!(back.direction, Direction::Backward));
+}
+
+#[test]
 fn path_delete_round_trips() {
     use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
     assert_eq!(PathDelete::NAME, "path/delete");

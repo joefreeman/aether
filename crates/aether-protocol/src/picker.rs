@@ -353,6 +353,28 @@ pub struct PickerGrepNavigateTarget {
     pub query: String,
 }
 
+/// Move the open grep picker's selection to the first hit of the next or previous *file* (grep
+/// hits are grouped into contiguous per-file runs). Computed server-side against the full result
+/// list, so it works even when the target file is past the client's over-fetched window — the
+/// client then frames the returned hit via `picker/view { center_on }`.
+///
+/// `Forward` → first hit of the next file. `Backward` → first hit of the *current* file, or, if
+/// the selection is already on it, the first hit of the previous file (vim-`{` feel). Returns
+/// `None` when there's no further file in that direction (already at the first / last file).
+pub struct PickerGrepFileJump;
+impl RpcMethod for PickerGrepFileJump {
+    const NAME: &'static str = "picker/grep_file_jump";
+    type Params = PickerGrepFileJumpParams;
+    type Result = Option<PickerItem>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PickerGrepFileJumpParams {
+    /// The selection's current absolute index in the result list (`offset + selected`).
+    pub from_index: u32,
+    pub direction: Direction,
+}
+
 // ---- picker/update (notification) ---------------------------------------------------------------
 
 /// Server-pushed window contents. Sent whenever the subscribed window's items change (matcher

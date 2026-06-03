@@ -1888,15 +1888,26 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
             let step = state.picker.pane_rows as i64;
             picker_move_selection(client, state, step).await?;
         }
-        // `Alt-Backspace` / `Alt-h` — multi-step "back": with a filter active, clear it; otherwise
-        // (Explorer only) step up to the parent directory, or from a root's top into Roots mode.
-        // `Alt-h` mirrors the vim-style leftward motion. See `picker_back`.
+        // `Alt-Backspace` — multi-step "back": with a filter active, clear it; otherwise (Explorer
+        // only) step up to the parent directory, or from a root's top into Roots mode.
         (KeyCode::Backspace, m) if m == KeyModifiers::ALT => picker_back(client, state).await?,
-        (KeyCode::Char('h'), m) if m == KeyModifiers::ALT => picker_back(client, state).await?,
-        // `Alt-l` enters the highlighted directory (a subdir, or a root in Roots mode) in the
-        // Explorer — like Enter, but it never opens a file. No-op on file rows / other pickers.
+        // `Alt-h` / `Alt-l` are vim-style left/right. Their meaning is per-kind: in Grep they jump
+        // the selection to the previous / next file's first hit; in the Explorer they step up a
+        // level (`picker_back`) / enter the highlighted directory; elsewhere `Alt-h` clears the
+        // filter (via `picker_back`) and `Alt-l` is a no-op.
+        (KeyCode::Char('h'), m) if m == KeyModifiers::ALT => {
+            if state.picker.kind == Some(PickerKind::Grep) {
+                grep_jump_file(client, state, Direction::Backward).await?;
+            } else {
+                picker_back(client, state).await?;
+            }
+        }
         (KeyCode::Char('l'), m) if m == KeyModifiers::ALT => {
-            enter_highlighted_dir(client, state).await?;
+            if state.picker.kind == Some(PickerKind::Grep) {
+                grep_jump_file(client, state, Direction::Forward).await?;
+            } else {
+                enter_highlighted_dir(client, state).await?;
+            }
         }
         (KeyCode::Left, _) => state.picker.query.move_left(),
         (KeyCode::Right, _) => state.picker.query.move_right(),
@@ -1988,6 +1999,94 @@ async fn enter_highlighted_dir(client: &mut Client, state: &mut AppState) -> Res
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+/// Jump the grep picker's selection to the first hit of the next / previous file. The server finds
+/// the boundary across the *whole* result list (so it works past the over-fetch window); the client
+/// then moves there with natural scrolling:
+///
+/// - When the target is in the loaded window, reposition locally — no refetch, no flicker. The
+///   target lands at the top of the pane, unless it's already on screen, in which case only the
+///   highlight moves (`reveal_picker_selection_at_top`).
+/// - When the target is past the window, refetch without a blank: keep the current items rendered,
+///   adopt the server-framed offset, and let the arriving push swap the window in — snapping the
+///   target to the top via `resume_row_offset = 0`.
+///
+/// No-op when there's no further file that way.
+async fn grep_jump_file(
+    client: &mut Client,
+    state: &mut AppState,
+    direction: Direction,
+) -> Result<()> {
+    use aether_protocol::picker::{PickerGrepFileJump, PickerGrepFileJumpParams};
+    if state.picker.kind != Some(PickerKind::Grep) || state.picker.items.is_empty() {
+        return Ok(());
+    }
+    let from_index = state.picker.offset + state.picker.selected as u32;
+    let Some(target) = client
+        .rpc::<PickerGrepFileJump>(PickerGrepFileJumpParams {
+            from_index,
+            direction,
+        })
+        .await?
+    else {
+        return Ok(()); // already at the first / last file
+    };
+
+    // In the loaded window → purely local move, no refetch.
+    if let Some(idx) = state
+        .picker
+        .items
+        .iter()
+        .position(|i| crate::picker::item_key(i) == crate::picker::item_key(&target))
+    {
+        state.picker.selected = idx;
+        reveal_picker_selection_at_top(state);
+        return Ok(());
+    }
+
+    // Past the window → frame the target with a refetch. We leave `items` / `selected` /
+    // `visible_start` untouched so the current window stays on screen until the push lands (no
+    // blank frame); adopting the server-framed `offset` now means that push reconciles via the
+    // cache-swap path, and `resume_target` + `resume_row_offset: 0` snap the target to the top.
+    let limit = state.picker.limit.max(1);
+    let view = client
+        .rpc::<PickerView>(PickerViewParams {
+            kind: PickerKind::Grep,
+            reset: false,
+            offset: 0,
+            limit,
+            center_on: Some(target.clone()),
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            explorer_roots: false,
+        })
+        .await?;
+    state.picker.generation = view.generation;
+    state.picker.offset = view.effective_offset;
+    state.picker.total_candidates = view.total_candidates;
+    state.picker.resume_target = view.effective_center_on.or(Some(target));
+    state.picker.resume_row_offset = Some(0);
+    Ok(())
+}
+
+/// Scroll the picker so `selected` sits at the *top* of the pane — unless it's already visible, in
+/// which case leave the scroll alone (only the highlight moved). Used by grep file-jumps so landing
+/// on a new file reveals it from its first hit, while an in-view jump doesn't yank the scroll.
+fn reveal_picker_selection_at_top(state: &mut AppState) {
+    let pane_rows = state.picker.pane_rows.max(1) as usize;
+    let visible_count = crate::ui::picker_visible_item_count_from(
+        &state.picker.items,
+        state.picker.visible_start,
+        pane_rows,
+        state.picker.kind,
+    );
+    let visible_end = state.picker.visible_start + visible_count;
+    let already_visible = state.picker.selected >= state.picker.visible_start
+        && state.picker.selected < visible_end;
+    if !already_visible {
+        state.picker.visible_start = state.picker.selected;
     }
 }
 
