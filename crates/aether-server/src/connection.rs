@@ -27,6 +27,7 @@ use aether_protocol::input::{
     InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine,
     InputSurround, InputText, InputToggleComment, InputUndo, InputUnsurround,
 };
+use aether_protocol::path::PathDelete;
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerHide, PickerQuery, PickerSelect, PickerView,
 };
@@ -247,6 +248,7 @@ async fn dispatch(
         ProjectRemoveRoot::NAME => run!(ProjectRemoveRoot, handlers::project_remove_root),
         ProjectRename::NAME => run!(ProjectRename, handlers::project_rename),
         ProjectDelete::NAME => run!(ProjectDelete, handlers::project_delete),
+        PathDelete::NAME => run!(PathDelete, handlers::path_delete),
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),

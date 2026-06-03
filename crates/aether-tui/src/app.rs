@@ -1850,14 +1850,14 @@ async fn picker_navigate_to_dir(
 }
 
 async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
-    // A staged project delete locks the picker into a [y/N] confirmation: `y` deletes; anything
-    // that reads as "no" (n/N/Esc/Enter, matching the app's other confirms) cancels; every other
-    // key is swallowed so a stray press can't silently drop the pending state.
-    if let Some(name) = state.picker.pending_delete.clone() {
+    // A staged delete locks the picker into a [y/N] confirmation: `y` deletes; anything that reads
+    // as "no" (n/N/Esc/Enter, matching the app's other confirms) cancels; every other key is
+    // swallowed so a stray press can't silently drop the pending state.
+    if let Some(pending) = state.picker.pending_delete.clone() {
         match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 state.picker.pending_delete = None;
-                confirm_delete_project(client, state, &name).await?;
+                confirm_picker_delete(client, state, pending).await?;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
                 state.picker.pending_delete = None;
@@ -1924,12 +1924,13 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
                 send_picker_query(client, state).await?;
             }
         }
-        // `Delete` / `Ctrl-d` stages a project deletion (Projects picker only). The synthetic
-        // "Create project …" row and the caller's active project aren't deletable — `stage_-
-        // delete_project` screens both. Ctrl-d carries CONTROL so it never reaches the query-
-        // insert arm below; Delete isn't a `Char` at all.
-        (KeyCode::Delete, _) => stage_delete_project(state),
-        (KeyCode::Char('d'), m) if m == KeyModifiers::CONTROL => stage_delete_project(state),
+        // `Delete` / `Ctrl-d` stages a delete on the highlighted row: a project (Projects picker),
+        // or a file/directory (Files / Explorer pickers). `stage_delete` screens out the things
+        // that aren't deletable (the synthetic "Create …" row, the active project, root rows).
+        // Ctrl-d carries CONTROL so it never reaches the query-insert arm below; Delete isn't a
+        // `Char` at all.
+        (KeyCode::Delete, _) => stage_delete(state),
+        (KeyCode::Char('d'), m) if m == KeyModifiers::CONTROL => stage_delete(state),
         (KeyCode::Char(c), m)
             if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
         {
@@ -1941,28 +1942,89 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
     Ok(())
 }
 
-/// Stage a `[y/N]` delete confirmation for the highlighted project, if it's deletable. No-op
-/// unless the Projects picker is open and the highlight is a real project row (not the synthetic
-/// "Create project …" affordance). The active project can't be deleted — surface that inline
-/// rather than staging — matching the server, which refuses it anyway.
-fn stage_delete_project(state: &mut AppState) {
-    if state.picker.kind != Some(PickerKind::Projects) {
+/// Stage a `[y/N]` delete confirmation for the highlighted row, if it's deletable. Dispatches by
+/// picker kind: a project (Projects picker) or a file/directory (Files / Explorer pickers). The
+/// synthetic "Create …" row, Root rows, Buffer/Grep rows, and the active project aren't deletable
+/// and no-op — the active project surfaces an inline note (matching the server, which refuses it
+/// anyway).
+fn stage_delete(state: &mut AppState) {
+    use crate::picker::{PendingDelete, PendingDeleteAction};
+    let Some(kind) = state.picker.kind else {
         return;
-    }
+    };
     if state.picker.highlighted_is_synthetic_create() {
         return;
     }
-    let Some(PickerItem::Project { name, .. }) = state.picker.items.get(state.picker.selected)
-    else {
+    let Some(item) = state.picker.highlighted().cloned() else {
         return;
     };
-    let name = name.clone();
-    if name == state.project_name {
-        state.status =
-            StatusMessage::info(format!("can't delete \"{name}\" — it's the active project"));
-        return;
+    let pending = match (kind, &item) {
+        (PickerKind::Projects, PickerItem::Project { name, .. }) => {
+            if *name == state.project_name {
+                state.status = StatusMessage::info(format!(
+                    "can't delete \"{name}\" — it's the active project"
+                ));
+                return;
+            }
+            PendingDelete {
+                action: PendingDeleteAction::Project(name.clone()),
+                item: item.clone(),
+                noun: "project",
+                name: name.clone(),
+            }
+        }
+        (
+            PickerKind::Files,
+            PickerItem::File {
+                path_index,
+                relative_path,
+                ..
+            },
+        ) => {
+            let Some(root) = state.project_paths.get(*path_index as usize) else {
+                return;
+            };
+            let abs = std::path::Path::new(root)
+                .join(relative_path)
+                .display()
+                .to_string();
+            PendingDelete {
+                action: PendingDeleteAction::Path(abs),
+                item: item.clone(),
+                noun: "file",
+                name: relative_path.clone(),
+            }
+        }
+        (PickerKind::Explorer, PickerItem::DirEntry { name, is_dir, .. }) => {
+            let Some(dir) = state.picker.explorer_dir.as_deref() else {
+                return;
+            };
+            let abs = std::path::Path::new(dir).join(name).display().to_string();
+            PendingDelete {
+                action: PendingDeleteAction::Path(abs),
+                item: item.clone(),
+                noun: if *is_dir { "directory" } else { "file" },
+                name: name.clone(),
+            }
+        }
+        _ => return,
+    };
+    state.picker.pending_delete = Some(pending);
+}
+
+/// Execute a confirmed picker delete, dispatching to the project- or path-delete flow.
+async fn confirm_picker_delete(
+    client: &mut Client,
+    state: &mut AppState,
+    pending: crate::picker::PendingDelete,
+) -> Result<()> {
+    use crate::picker::PendingDeleteAction;
+    match pending.action {
+        PendingDeleteAction::Project(name) => confirm_delete_project(client, state, &name).await,
+        PendingDeleteAction::Path(abs) => {
+            confirm_delete_path(client, state, &abs, pending.noun, &pending.name).await
+        }
     }
-    state.picker.pending_delete = Some(name);
 }
 
 /// Send `project/delete` for a confirmed project, then rebuild the picker list from disk (the
@@ -1994,6 +2056,67 @@ async fn confirm_delete_project(
             };
             state.status = StatusMessage::error(msg);
         }
+    }
+    Ok(())
+}
+
+/// Send `path/delete` (move to OS trash) for a confirmed file/directory, then refresh the list. If
+/// the delete closed the buffer we're currently editing, re-attach to the server-suggested next
+/// buffer (or a fresh scratch), mirroring `remove_root`. On refusal — a buffer under the path is
+/// dirty, or it's outside the project — surface the server's message.
+async fn confirm_delete_path(
+    client: &mut Client,
+    state: &mut AppState,
+    abs: &str,
+    noun: &str,
+    name: &str,
+) -> Result<()> {
+    use aether_protocol::path::{PathDelete, PathDeleteParams};
+    match client
+        .rpc::<PathDelete>(PathDeleteParams {
+            path: abs.to_string(),
+        })
+        .await
+    {
+        Ok(res) => {
+            if let Some(cur) = state.editor.as_ref().map(|e| e.buffer_id) {
+                if res.closed_buffer_ids.contains(&cur) {
+                    match res.next_buffer_id {
+                        Some(next) => attach_buffer(client, state, next).await?,
+                        None => new_scratch(client, state).await?,
+                    }
+                }
+            }
+            state.status = StatusMessage::success(format!("trashed {noun} \"{name}\""));
+            refresh_picker_after_path_delete(client, state).await?;
+        }
+        Err(e) => {
+            let msg = if let Some(rpc_err) = e.downcast_ref::<crate::client::RpcError>() {
+                rpc_err.message.clone()
+            } else {
+                e.to_string()
+            };
+            state.status = StatusMessage::error(msg);
+        }
+    }
+    Ok(())
+}
+
+/// Refresh the active picker after a file/directory delete so the trashed entry drops out: the
+/// Explorer re-lists its current directory; the Files picker re-views (re-walking the now-
+/// invalidated workspace index). The query resets — fine for a one-off management action.
+async fn refresh_picker_after_path_delete(
+    client: &mut Client,
+    state: &mut AppState,
+) -> Result<()> {
+    match state.picker.kind {
+        Some(PickerKind::Explorer) => {
+            if let Some(dir) = state.picker.explorer_dir.clone() {
+                picker_navigate_to_dir(client, state, dir, None).await?;
+            }
+        }
+        Some(PickerKind::Files) => open_picker(client, state, PickerKind::Files).await?,
+        _ => {}
     }
     Ok(())
 }

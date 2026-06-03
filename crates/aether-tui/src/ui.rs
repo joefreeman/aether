@@ -1608,25 +1608,23 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
                 prev_grep_key = Some(key);
             }
         }
-        // A staged delete renders its [y/N] confirmation *over* the project's own row — in the
-        // same warning red the settings overlay uses for root removal — replacing the normal
-        // name/label spans. Matched by name (what `pending_delete` stores) rather than by the
+        // A staged delete renders its [y/N] confirmation *over* the target row — in the same
+        // warning red the settings overlay uses for root removal — replacing the normal spans.
+        // Matched by `item_key` (which ignores fuzzy-match highlight offsets) rather than the
         // selected index, so a background re-rank can't smear the prompt onto the wrong row.
-        if let (PickerItem::Project { name, .. }, Some(pending)) =
-            (item, state.picker.pending_delete.as_deref())
-        {
-            if name.as_str() == pending {
-                const PREFIX: &str = "Delete project \"";
+        if let Some(pending) = state.picker.pending_delete.as_ref() {
+            if crate::picker::item_key(item) == crate::picker::item_key(&pending.item) {
+                let prefix = format!("Delete {} \"", pending.noun);
                 const SUFFIX: &str = "\"? [y/N]";
                 let warn_style = Style::default()
                     .fg(NORD11)
                     .bg(NORD0)
                     .add_modifier(Modifier::BOLD);
                 let name_budget =
-                    (text_width as usize).saturating_sub(PREFIX.width() + SUFFIX.width());
-                let shown = truncate_middle(name, name_budget);
+                    (text_width as usize).saturating_sub(prefix.width() + SUFFIX.width());
+                let shown = truncate_middle(&pending.name, name_budget);
                 let prompt =
-                    truncate_right(&format!("{PREFIX}{shown}{SUFFIX}"), text_width as usize);
+                    truncate_right(&format!("{prefix}{shown}{SUFFIX}"), text_width as usize);
                 lines.push(Line::from(Span::styled(prompt, warn_style)));
                 continue;
             }

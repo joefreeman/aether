@@ -231,6 +231,38 @@ impl ServerState {
             .collect()
     }
 
+    /// Buffer ids in `project` whose backing file is at or under `canonical` — an exact match for
+    /// a file, or a path-prefix match for a directory. Used by `path/delete` to find the buffers a
+    /// deletion would close (and to screen them for unsaved changes first).
+    pub fn buffers_under_path(&self, project: &str, canonical: &Path) -> Vec<BufferId> {
+        self.buffers
+            .iter()
+            .filter(|(id, b)| {
+                self.buffer_projects.get(id).map(|s| s.as_str()) == Some(project)
+                    && b.canonical_path
+                        .as_deref()
+                        .is_some_and(|p| p == canonical || p.starts_with(canonical))
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Close one buffer: drop it and every per-`(client, buffer)` slice keyed to it. This is the
+    /// canonical `buffer/close` teardown, shared by root removal, project deletion, and path
+    /// deletion so they can't drift out of sync.
+    pub fn close_buffer(&mut self, id: BufferId) {
+        self.buffers.remove(&id);
+        self.buffer_projects.remove(&id);
+        self.viewports.retain(|_, v| v.buffer_id != id);
+        self.cursors.retain(|(_, b), _| *b != id);
+        self.motion_history.retain(|(_, b), _| *b != id);
+        self.virtual_col.retain(|(_, b), _| *b != id);
+        self.tree_selection_history.retain(|(_, b), _| *b != id);
+        self.searches.retain(|(_, b), _| *b != id);
+        self.last_scroll.retain(|(_, b), _| *b != id);
+        self.drop_buffer_from_mru(id);
+    }
+
     /// Delete a loaded project's in-memory state: drop the project entry and close every buffer
     /// that belonged to it, tearing down all per-buffer state (same teardown as `buffer/close` /
     /// `project/remove_root`). Returns the closed buffer ids. The caller is responsible for the
@@ -240,16 +272,7 @@ impl ServerState {
     pub fn delete_project(&mut self, name: &str) -> Vec<BufferId> {
         let closed = self.buffers_in_project(name);
         for &id in &closed {
-            self.buffers.remove(&id);
-            self.buffer_projects.remove(&id);
-            self.viewports.retain(|_, v| v.buffer_id != id);
-            self.cursors.retain(|(_, b), _| *b != id);
-            self.motion_history.retain(|(_, b), _| *b != id);
-            self.virtual_col.retain(|(_, b), _| *b != id);
-            self.tree_selection_history.retain(|(_, b), _| *b != id);
-            self.searches.retain(|(_, b), _| *b != id);
-            self.last_scroll.retain(|(_, b), _| *b != id);
-            self.drop_buffer_from_mru(id);
+            self.close_buffer(id);
         }
         self.projects.remove(name);
         closed
@@ -1138,5 +1161,43 @@ mod project_state_tests {
         assert!(!s.cursors.contains_key(&(client, buf_a)));
         assert_eq!(s.buffer_projects.get(&survivor).map(String::as_str), Some("keep"));
         assert!(s.cursors.contains_key(&(client, survivor)));
+    }
+
+    /// `buffers_under_path` (the `path/delete` screen) matches a file exactly and matches a
+    /// directory by path-prefix — component-wise, so `/ws/src` doesn't catch `/ws/srcfoo` — and is
+    /// scoped to the named project.
+    #[test]
+    fn buffers_under_path_matches_file_and_dir_prefix() {
+        let mut s = ServerState::new("tok".to_string());
+        s.projects
+            .insert("proj".to_string(), project_entry("proj", vec![PathBuf::from("/ws")]));
+
+        let add = |s: &mut ServerState, path: &str| -> BufferId {
+            let id = s.allocate_buffer_id();
+            s.buffers
+                .insert(id, Buffer::new_at_path(id, PathBuf::from(path), None));
+            s.buffer_projects.insert(id, "proj".to_string());
+            id
+        };
+        let a = add(&mut s, "/ws/src/a.rs");
+        let b = add(&mut s, "/ws/src/sub/b.rs");
+        let _sibling = add(&mut s, "/ws/srcfoo/c.rs"); // not under /ws/src
+        let _lib = add(&mut s, "/ws/lib/d.rs");
+
+        let mut under = s.buffers_under_path("proj", Path::new("/ws/src"));
+        under.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(under, expected, "directory prefix should match a.rs and sub/b.rs only");
+
+        assert_eq!(
+            s.buffers_under_path("proj", Path::new("/ws/src/a.rs")),
+            vec![a],
+            "exact file path matches just that buffer"
+        );
+        assert!(
+            s.buffers_under_path("other-proj", Path::new("/ws/src")).is_empty(),
+            "scoped to the named project"
+        );
     }
 }

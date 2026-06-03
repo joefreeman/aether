@@ -410,6 +410,31 @@ fn project_delete_params_round_trip() {
 }
 
 #[test]
+fn path_delete_round_trips() {
+    use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
+    assert_eq!(PathDelete::NAME, "path/delete");
+    let p = PathDeleteParams {
+        path: "/ws/src/foo.rs".into(),
+    };
+    assert_eq!(to_value(&p).unwrap(), json!({"path": "/ws/src/foo.rs"}));
+
+    let full = PathDeleteResult {
+        closed_buffer_ids: vec![3, 7],
+        next_buffer_id: Some(9),
+    };
+    let v = to_value(&full).unwrap();
+    assert_eq!(v["closed_buffer_ids"], json!([3, 7]));
+    assert_eq!(v["next_buffer_id"], 9);
+
+    // `next_buffer_id` is omitted when there's nothing to attach to.
+    let none = PathDeleteResult {
+        closed_buffer_ids: vec![],
+        next_buffer_id: None,
+    };
+    assert_eq!(to_value(&none).unwrap().get("next_buffer_id"), None);
+}
+
+#[test]
 fn project_remove_root_result_shape() {
     use aether_protocol::project::{ProjectRemoveRoot, ProjectRemoveRootResult};
     assert_eq!(ProjectRemoveRoot::NAME, "project/remove_root");

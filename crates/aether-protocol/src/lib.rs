@@ -10,6 +10,7 @@ pub mod directory;
 pub mod envelope;
 pub mod error;
 pub mod input;
+pub mod path;
 pub mod picker;
 pub mod project;
 pub mod search;

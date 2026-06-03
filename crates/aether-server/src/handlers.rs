@@ -39,6 +39,7 @@ use aether_protocol::project::{
     ProjectDeleteParams, ProjectInfo, ProjectListParams, ProjectListResult, ProjectRemoveRootParams,
     ProjectRemoveRootResult, ProjectRenameParams, ProjectSummary,
 };
+use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
     SearchSetResult, SearchStateChanged, SearchSummary,
@@ -394,16 +395,7 @@ pub async fn project_remove_root(
 
     // Close the affected buffers (clean ones). Same teardown as buffer/close.
     for &id in &affected {
-        s.buffers.remove(&id);
-        s.buffer_projects.remove(&id);
-        s.viewports.retain(|_, v| v.buffer_id != id);
-        s.cursors.retain(|(_, b), _| *b != id);
-        s.motion_history.retain(|(_, b), _| *b != id);
-        s.virtual_col.retain(|(_, b), _| *b != id);
-        s.tree_selection_history.retain(|(_, b), _| *b != id);
-        s.searches.retain(|(_, b), _| *b != id);
-        s.last_scroll.retain(|(_, b), _| *b != id);
-        s.drop_buffer_from_mru(id);
+        s.close_buffer(id);
     }
 
     // Persist the updated path list. Re-grab the project mutably for the write.
@@ -565,6 +557,99 @@ pub async fn project_delete(
 
     tracing::info!(project = %name, closed = closed.len(), "project deleted");
     Ok(())
+}
+
+/// Delete a file or directory by moving it to the OS trash. Validates the path is inside the
+/// active project (and isn't a root itself), refuses if it — or, for a directory, anything under
+/// it — has unsaved changes, then trashes it and closes the now-orphaned buffers.
+pub async fn path_delete(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: PathDeleteParams,
+) -> Result<PathDeleteResult, RpcError> {
+    let client_id = ctx.client_id;
+    let raw = std::path::PathBuf::from(&params.path);
+    // Full canonicalization — the target must exist to be deleted.
+    let canonical = std::fs::canonicalize(&raw)
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
+
+    // Validate the boundary and screen for unsaved changes under the lock, before touching disk.
+    {
+        let s = state.lock().await;
+        let project = s.active_project_or_err(client_id)?;
+        if !project.contains(&canonical) {
+            return Err(RpcError::invalid_path(format!(
+                "{} is outside the project's access boundary",
+                canonical.display()
+            )));
+        }
+        if project.paths.iter().any(|p| p == &canonical) {
+            return Err(RpcError::invalid_params(format!(
+                "{} is a project root — remove it from project settings instead",
+                canonical.display()
+            )));
+        }
+        let project_name = project.name.clone();
+        let dirty: Vec<BufferId> = s
+            .buffers_under_path(&project_name, &canonical)
+            .into_iter()
+            .filter(|id| s.buffers.get(id).map(|b| b.dirty).unwrap_or(false))
+            .collect();
+        if !dirty.is_empty() {
+            let mut err = RpcError::new(
+                ErrorCode::DIRTY_BUFFERS_PREVENT_DELETE,
+                format!(
+                    "{} buffer(s) under {} have unsaved changes",
+                    dirty.len(),
+                    canonical.display()
+                ),
+            );
+            err.data = Some(serde_json::json!({ "dirty_buffer_ids": dirty }));
+            return Err(err);
+        }
+    }
+
+    // Move to the OS trash (recoverable) — directories go whole. Outside the lock: filesystem I/O.
+    trash::delete(&canonical)
+        .map_err(|e| RpcError::file_io(format!("trashing {}: {e}", canonical.display())))?;
+
+    // Close the buffers whose backing file just went to the trash, and refresh.
+    let mut s = state.lock().await;
+    let Some(project_name) = s.clients.get(&client_id).and_then(|c| c.active_project.clone()) else {
+        // Client deactivated mid-call — the trash already happened; nothing left to tear down.
+        return Ok(PathDeleteResult {
+            closed_buffer_ids: Vec::new(),
+            next_buffer_id: None,
+        });
+    };
+    let closed = s.buffers_under_path(&project_name, &canonical);
+    for &id in &closed {
+        s.close_buffer(id);
+    }
+    // Drop the Files-picker cache so a re-view re-walks without the deleted path. The watcher will
+    // also notice the removal, but this keeps the client's immediate refresh consistent.
+    if let Some(p) = s.projects.get(&project_name) {
+        p.workspace_index.invalidate();
+    }
+    let next_buffer_id = s
+        .active_project(client_id)
+        .and_then(|p| p.mru_buffers.front().copied())
+        .or_else(|| {
+            s.buffer_projects
+                .iter()
+                .find(|(_, name)| name.as_str() == project_name)
+                .map(|(id, _)| *id)
+        });
+    let pushes = refresh_buffer_pickers(&mut s);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    tracing::info!(path = %canonical.display(), closed = closed.len(), "path trashed");
+    Ok(PathDeleteResult {
+        closed_buffer_ids: closed,
+        next_buffer_id,
+    })
 }
 
 // ---- buffer/open --------------------------------------------------------------------------------

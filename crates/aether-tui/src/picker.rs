@@ -78,11 +78,34 @@ pub struct PickerState {
     /// `picker/select`. `None` when no synthetic row is present (kind isn't Projects, query is
     /// empty, or an existing project matches the query exactly).
     pub synthetic_create_idx: Option<usize>,
-    /// Projects-picker only. When `Some(name)`, a delete of project `<name>` is awaiting `[y/N]`
-    /// confirmation: the input row renders the prompt and key handling is restricted to
-    /// confirm/cancel (mirroring the settings overlay's `pending_delete`). Cleared on open/hide
-    /// and on resolve. Stores the name (not an index) so a background re-rank can't retarget it.
-    pub pending_delete: Option<String>,
+    /// When set, a delete is awaiting `[y/N]` confirmation: the target row renders the prompt and
+    /// key handling is restricted to confirm/cancel (mirroring the settings overlay's
+    /// `pending_delete`). Cleared on open/hide and on resolve. Covers project deletion (Projects
+    /// picker) and file/directory deletion (Files / Explorer pickers).
+    pub pending_delete: Option<PendingDelete>,
+}
+
+/// A staged delete awaiting `[y/N]` confirmation in the picker. The `item` it targets is matched
+/// by [`item_key`] (not index) when rendering, so a background re-rank can't smear the prompt onto
+/// the wrong row.
+#[derive(Debug, Clone)]
+pub struct PendingDelete {
+    pub action: PendingDeleteAction,
+    /// The picker row the prompt renders over.
+    pub item: PickerItem,
+    /// Noun for the prompt — `"project"`, `"file"`, or `"directory"`.
+    pub noun: &'static str,
+    /// Display name shown inside the quotes in the prompt.
+    pub name: String,
+}
+
+/// What a confirmed picker delete actually does.
+#[derive(Debug, Clone)]
+pub enum PendingDeleteAction {
+    /// `project/delete { name }`.
+    Project(String),
+    /// `path/delete { path }` — the absolute path of a file or directory.
+    Path(String),
 }
 
 impl PickerState {
