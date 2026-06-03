@@ -1,4 +1,5 @@
-<img src="logo.svg" alt="Aether" width="128" />
+<img src="logo.svg" alt="Aether" width="100" />
+<br />
 
 # Aether
 
@@ -28,19 +29,19 @@ Type `Space ?` for the in-app overlay. Holding the Shift key extends the selecti
 | Key | Action |
 | --- | --- |
 | `h`/`l` | Character left/right |
-| `j`/`k` | Logical line down/up |
-| `Alt-j`/`Alt-k` | Visual row down/up |
-| `w`/`b` | Big word forward/backward |
-| `Alt-w`/`Alt-b` | Small word forward/backward |
+| `j`/`Alt-j` | Logical/visual line down |
+| `k`/`Alt-k` | Logical/visual line up |
+| `w`/`Alt-w` | Big/small word forward |
+| `b`/`Alt-b` | Big/small word backward |
 | `e`/`Alt-e` | Big/small word end |
 | `0`/`Home` | Logical line start |
 | `Alt-l`/`End` | Logical line end |
 | `Alt-h` | First non-blank of line |
 | `g`/`Alt-g` | Go to line (count, default 1)/last line |
-| `d`/`u` | Cursor down/up a page |
-| `Alt-d`/`Alt-u` | Cursor down/up half a page |
-| `f`/`t` | Find/till character forward (next key is the target) |
-| `Alt-f`/`Alt-t` | Find/till character backward |
+| `d`/`Alt-d` | Cursor down a page/half page |
+| `u`/`Alt-u` | Cursor up a page/half page |
+| `f`/`Alt-f` | Find character forward/backward (next key is the target) |
+| `t`/`Alt-t` | Till character forward/backward |
 | `m`/`Alt-m` | Matching bracket/inner matching bracket |
 | `]`/`[` | Next/previous navigation unit |
 | `}`/`{` | Select to end/start of unit |
