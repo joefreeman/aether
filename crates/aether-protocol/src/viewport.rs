@@ -27,6 +27,46 @@ pub struct LogicalLineRender {
     /// to each line they touch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub search_matches: Vec<SearchMatchRange>,
+    /// Virtual (non-buffer) rows rendered *above* this logical line, only populated when the
+    /// viewport has the inline diff view enabled. Currently these are the baseline lines a hunk
+    /// removed or replaced, shown as phantom "deleted" rows that have no cursor position. The
+    /// client renders them before the line's `visual_rows` and counts them as occupied screen
+    /// rows, but never lets the cursor land on them. Deletions at end-of-buffer anchor to the
+    /// trailing empty line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_rows_above: Vec<VirtualRow>,
+    /// Per-line Git change marker, computed whenever the buffer's hunks are known (independent of
+    /// the diff-view toggle) so the client can always draw a gutter change-bar. `Added` /
+    /// `Modified` are the new-side lines of those hunks; `Deleted` marks the line a pure deletion
+    /// sits above. `None` for unchanged lines. The client also reuses `Added`/`Modified` to tint
+    /// the line background while the diff view is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_marker: Option<DiffMarker>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffMarker {
+    Added,
+    Modified,
+    /// Lines were removed immediately above this one (a pure deletion). The line itself is
+    /// unchanged — only the gutter flags it; it carries no background tint.
+    Deleted,
+}
+
+/// A rendered row that doesn't correspond to any buffer line — see
+/// [`LogicalLineRender::virtual_rows_above`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualRow {
+    pub text: String,
+    pub kind: VirtualRowKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtualRowKind {
+    /// A baseline line removed or replaced in the working buffer (inline diff).
+    Deleted,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

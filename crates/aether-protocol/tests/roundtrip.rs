@@ -12,6 +12,11 @@ use aether_protocol::envelope::{
     ClientInbound, ErrorObject, ErrorResponse, JsonRpc, Notification, NotificationMethod, Request,
     RpcMethod,
 };
+use aether_protocol::git::{
+    BlameInfo, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitNavigateHunk,
+    GitNavigateHunkParams, HunkDirection, GitSetDiffView, GitSetDiffViewParams,
+};
+use aether_protocol::viewport::{DiffMarker, LogicalLineRender, VirtualRow, VirtualRowKind};
 use aether_protocol::input::{InputSurround, InputSurroundParams, InputText, InputTextParams};
 use aether_protocol::search::{SearchSet, SearchSetParams};
 use aether_protocol::project::{
@@ -60,6 +65,97 @@ fn client_inbound_discriminates() {
         from_value::<ClientInbound>(notif).unwrap(),
         ClientInbound::Notification(_)
     ));
+}
+
+#[test]
+fn git_blame_line_params_shape() {
+    let p = GitBlameLineParams {
+        buffer_id: 3,
+        line: 41,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v, json!({"buffer_id": 3, "line": 41}));
+    assert_eq!(GitBlameLine::NAME, "git/blame_line");
+}
+
+#[test]
+fn git_blame_line_result_roundtrip() {
+    // A committed line and an uncommitted line both round-trip; `None` is the no-blame case.
+    let committed = GitBlameLineResult {
+        blame: Some(BlameInfo {
+            commit: "a1b2c3d".into(),
+            author: "Ada".into(),
+            timestamp: 1_700_000_000,
+            summary: "Wire up blame".into(),
+            is_uncommitted: false,
+        }),
+    };
+    let v = to_value(&committed).unwrap();
+    assert_eq!(v["blame"]["commit"], "a1b2c3d");
+    assert_eq!(v["blame"]["author"], "Ada");
+    assert_eq!(v["blame"]["timestamp"], 1_700_000_000_i64);
+    assert_eq!(v["blame"]["is_uncommitted"], false);
+    let back: GitBlameLineResult = from_value(v).unwrap();
+    assert_eq!(back.blame.unwrap().summary, "Wire up blame");
+
+    let none = GitBlameLineResult { blame: None };
+    assert_eq!(to_value(&none).unwrap(), json!({"blame": null}));
+}
+
+#[test]
+fn git_set_diff_view_params_shape() {
+    let p = GitSetDiffViewParams {
+        viewport_id: 9,
+        enabled: true,
+    };
+    assert_eq!(to_value(&p).unwrap(), json!({"viewport_id": 9, "enabled": true}));
+    assert_eq!(GitSetDiffView::NAME, "git/set_diff_view");
+}
+
+#[test]
+fn logical_line_render_virtual_rows_shape() {
+    // `virtual_rows_above` is omitted when empty (back-compat) and uses snake_case kinds.
+    let bare = LogicalLineRender {
+        logical_line: 0,
+        visual_rows: vec![],
+        search_matches: vec![],
+        virtual_rows_above: vec![],
+        diff_marker: None,
+    };
+    let v = to_value(&bare).unwrap();
+    assert!(v.get("virtual_rows_above").is_none(), "empty omitted from wire");
+    assert!(v.get("diff_marker").is_none(), "None marker omitted from wire");
+
+    let with_del = LogicalLineRender {
+        logical_line: 4,
+        visual_rows: vec![],
+        search_matches: vec![],
+        virtual_rows_above: vec![VirtualRow {
+            text: "old line".into(),
+            kind: VirtualRowKind::Deleted,
+        }],
+        diff_marker: Some(DiffMarker::Modified),
+    };
+    let v = to_value(&with_del).unwrap();
+    assert_eq!(v["virtual_rows_above"][0]["text"], "old line");
+    assert_eq!(v["virtual_rows_above"][0]["kind"], "deleted");
+    assert_eq!(v["diff_marker"], "modified");
+    let back: LogicalLineRender = from_value(v).unwrap();
+    assert_eq!(back.virtual_rows_above.len(), 1);
+    assert_eq!(back.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
+    assert_eq!(back.diff_marker, Some(DiffMarker::Modified));
+}
+
+#[test]
+fn git_navigate_hunk_shapes() {
+    let p = GitNavigateHunkParams {
+        buffer_id: 2,
+        from_line: 10,
+        direction: HunkDirection::Next,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v, json!({"buffer_id": 2, "from_line": 10, "direction": "next"}));
+    assert_eq!(GitNavigateHunk::NAME, "git/navigate_hunk");
 }
 
 #[test]

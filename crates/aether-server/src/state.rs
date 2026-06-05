@@ -66,12 +66,32 @@ pub struct ServerState {
     /// Per-`(client, kind)` picker state. Survives `picker/hide` (so resume restores query +
     /// ranking); cleared on disconnect.
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
+    /// Per-buffer Git diff hunks: the live buffer's text against its committed (HEAD) content.
+    /// Populated on `buffer/open` for file-backed buffers; recomputed as the buffer changes.
+    /// Empty / absent for scratch buffers, untracked files, and files outside a repo. Shared by
+    /// all clients viewing the buffer (the baseline is a property of the file, not the viewer).
+    pub git_hunks: HashMap<BufferId, Vec<crate::git::DiffHunk>>,
+    /// Per-buffer cached Git baseline: resolved repo location + the committed (HEAD) content,
+    /// LF-normalized. Populated on open, refreshed when HEAD changes (the watcher), and read by
+    /// the per-edit `diff_hunks` so editing never re-runs repo discovery or re-reads the blob.
+    pub git_baseline: HashMap<BufferId, crate::git::GitBaseline>,
+    /// Per-buffer cached whole-file blame, tagged with the revision it was computed at. Lazily
+    /// (re)computed on `git/blame_line` when stale, so moving the cursor around a buffer at one
+    /// revision never recomputes. Cleared on close.
+    pub git_blame: HashMap<BufferId, BlameCache>,
     /// Single shared fuzzy matcher. `nucleo_matcher::Matcher` reuses scratch buffers across
     /// calls, so it's cheaper to share one than construct per RPC. Not `Sync`, so the global
     /// lock around `ServerState` is what serializes access.
     pub matcher: nucleo_matcher::Matcher,
     next_buffer_id: u64,
     next_viewport_id: u64,
+}
+
+/// Cached whole-file blame for a buffer, valid only while `revision` matches the buffer's. One
+/// entry per 0-based buffer line; `None` for lines with no blame (e.g. the trailing empty line).
+pub struct BlameCache {
+    pub revision: Revision,
+    pub lines: Vec<Option<aether_protocol::git::BlameInfo>>,
 }
 
 /// Server-side state for one client's active search on a specific buffer.
@@ -153,6 +173,9 @@ impl ServerState {
             searches: HashMap::new(),
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
+            git_hunks: HashMap::new(),
+            git_baseline: HashMap::new(),
+            git_blame: HashMap::new(),
             matcher: picker_state::make_matcher(),
             next_buffer_id: 1,
             next_viewport_id: 1,
@@ -274,6 +297,9 @@ impl ServerState {
         self.tree_selection_history.retain(|(_, b), _| *b != id);
         self.searches.retain(|(_, b), _| *b != id);
         self.last_scroll.retain(|(_, b), _| *b != id);
+        self.git_hunks.remove(&id);
+        self.git_baseline.remove(&id);
+        self.git_blame.remove(&id);
         self.drop_buffer_from_mru(id);
     }
 
@@ -1050,6 +1076,10 @@ pub struct Viewport {
     pub first_logical_line: u32,
     /// Last logical line currently pushed to the client (exclusive).
     pub last_logical_line_exclusive: u32,
+    /// Inline diff view: when on, rendered windows interleave phantom "deleted" rows from the
+    /// buffer's Git hunks and the buffer's hunks are recomputed on every edit. Per-viewport so
+    /// two views of the same buffer can differ. Toggled by `git/set_diff_view`.
+    pub diff_view: bool,
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ pub mod cursor;
 pub mod directory;
 pub mod envelope;
 pub mod error;
+pub mod git;
 pub mod input;
 pub mod path;
 pub mod picker;

@@ -5,6 +5,7 @@ mod config;
 mod connection;
 mod cursor;
 mod error;
+mod git;
 mod grep;
 mod handlers;
 mod indent;

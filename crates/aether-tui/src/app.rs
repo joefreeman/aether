@@ -19,6 +19,10 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
+use aether_protocol::git::{
+    BlameInfo, GitBlameLine, GitBlameLineParams, GitNavigateHunk, GitNavigateHunkParams,
+    GitSetDiffView, GitSetDiffViewParams, HunkDirection,
+};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
@@ -369,6 +373,12 @@ pub struct EditorState {
     pub viewport_id: ViewportId,
     pub cursor: CursorState,
     pub scroll_logical_line: u32,
+    /// Visual rows of the top logical line (`scroll_logical_line`) hidden above the viewport — the
+    /// fractional part of the scroll position. Lets scrolling advance by *visual* rows (so it
+    /// doesn't jump over a wrapped line's rows or a diff hunk's phantom deleted rows) while the
+    /// server stays logical-line based. Always `< ` the top line's visual height; reset to 0 by
+    /// any logical-line-aligned scroll (cursor jumps, window refetches).
+    pub scroll_skip_rows: u32,
     pub window_first_logical_line: u32,
     pub lines: Vec<LogicalLineRender>,
     /// Total logical lines in the buffer, kept fresh from every viewport response /
@@ -378,6 +388,10 @@ pub struct EditorState {
     /// the buffer's last visual row at the bottom of the viewport.
     pub max_scroll_logical_line: u32,
     pub wrap: WrapMode,
+    /// Inline diff view toggle. Server-authoritative (per-viewport); mirrored here so the
+    /// keybinding can flip it. When on, the server interleaves phantom "deleted" rows into the
+    /// pushed window.
+    pub diff_view: bool,
     /// Horizontal scroll, in bytes. Only meaningful when `wrap == WrapMode::None`; reset to 0
     /// when soft wrap is on (wrapped content never overflows). Client-only.
     pub scroll_col: u32,
@@ -411,9 +425,22 @@ pub struct EditorState {
     /// selection with the replayed motion). See [`RepeatTarget`].
     pub last_repeat: Option<RepeatTarget>,
     pub search: SearchState,
+    /// Git blame for the cursor's line, shown as end-of-line virtual text in Normal mode. Lazily
+    /// fetched (see [`refresh_blame`]) when the cursor changes line or the buffer revision
+    /// changes; never fetched in Insert mode so typing doesn't thrash the server's blame cache.
+    pub blame: BlameState,
     /// Canonical absolute path of this buffer's file on disk, if any.
     pub file_path: Option<String>,
     pub file_label: String,
+}
+
+/// Client-side cache of the cursor line's blame. `key` records the `(line, revision)` the `info`
+/// was fetched for, so a stale entry is never shown for the wrong line and we skip refetching
+/// when nothing relevant changed.
+#[derive(Default)]
+pub struct BlameState {
+    pub key: Option<(u32, u64)>,
+    pub info: Option<BlameInfo>,
 }
 
 pub use crate::save_prompt::SavePromptState;
@@ -479,7 +506,9 @@ pub async fn bootstrap(
     rows: u16,
 ) -> Result<AppState> {
     let viewport_rows = rows.saturating_sub(1) as u32;
-    let viewport_cols = cols as u32;
+    // Reserve the gutter column up front so the content width (and everything derived from it,
+    // including the cols we report to the server) accounts for it.
+    let viewport_cols = (cols as u32).saturating_sub(crate::ui::GUTTER_WIDTH as u32);
 
     // No project named on the CLI: return an empty AppState with the Projects picker open. The
     // event loop will draw the picker and accept input until the user activates a project.
@@ -752,11 +781,13 @@ async fn build_editor_state_from_open(
         viewport_id: sub.viewport_id,
         cursor: open.cursor,
         scroll_logical_line: initial_scroll.logical_line,
+        scroll_skip_rows: 0,
         window_first_logical_line: sub.window.first_logical_line,
         lines: sub.window.lines,
         line_count: sub.window.line_count,
         max_scroll_logical_line: sub.window.max_scroll_logical_line,
         wrap,
+        diff_view: false,
         scroll_col: 0,
         pending_scroll_lines: 0,
         drag_anchor: None,
@@ -769,6 +800,7 @@ async fn build_editor_state_from_open(
         pending_surround: None,
         last_repeat: None,
         search: SearchState::default(),
+        blame: BlameState::default(),
         file_path: open.path,
         file_label,
     })
@@ -822,6 +854,7 @@ pub async fn run(
         apply_pending_notifications(state, client);
         flush_pending_scroll(client, state).await?;
         flush_pending_picker_scroll(client, state).await?;
+        refresh_blame(client, state).await?;
         // Authoritative per-frame refresh: the mode-transition call sites don't fire when a key
         // *arms* or *resolves* a capture (`f`/`t`/`Ctrl-s`/`Space`), so reassert the style here so
         // the awaiting-key underline appears and clears reliably.
@@ -829,6 +862,37 @@ pub async fn run(
         terminal.draw(|f| ui::draw(f, state))?;
         refresh_terminal_title(state);
     }
+    Ok(())
+}
+
+/// Fetch and cache the blame for the cursor's current line so the renderer can show it as
+/// end-of-line virtual text. Only runs in Normal mode: in Insert mode every keystroke bumps the
+/// revision, and refetching (which makes the server recompute whole-file blame) per keystroke
+/// would be wasteful and visually noisy. Skips the round-trip when the cached `(line, revision)`
+/// is unchanged, so it's a cheap no-op on most frames. Best-effort — an RPC failure clears the
+/// blame rather than propagating and disturbing editing.
+async fn refresh_blame(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(ed) = state.editor.as_ref() else {
+        return Ok(());
+    };
+    if ed.mode != EditorMode::Normal {
+        return Ok(());
+    }
+    let key = (ed.cursor.position.line, ed.revision);
+    if ed.blame.key == Some(key) {
+        return Ok(());
+    }
+    let (buffer_id, line) = (ed.buffer_id, key.0);
+    let info = match client
+        .rpc::<GitBlameLine>(GitBlameLineParams { buffer_id, line })
+        .await
+    {
+        Ok(r) => r.blame,
+        Err(_) => None,
+    };
+    let ed = state.ed_mut();
+    ed.blame.key = Some(key);
+    ed.blame.info = info;
     Ok(())
 }
 
@@ -1429,6 +1493,9 @@ async fn run_action(
         Action::Undo => undo(client, state, count).await?,
         Action::Redo => redo(client, state, count).await?,
         Action::ToggleWrap => toggle_wrap(client, state).await?,
+        Action::ToggleDiffView => toggle_diff_view(client, state).await?,
+        Action::NextHunk => navigate_hunk(client, state, HunkDirection::Next).await?,
+        Action::PrevHunk => navigate_hunk(client, state, HunkDirection::Prev).await?,
         Action::MoveLines(dir) => move_lines(client, state, dir, count).await?,
         Action::JoinLines => join_lines(client, state, count).await?,
         Action::Indent => indent(client, state, count).await?,
@@ -3402,13 +3469,13 @@ async fn handle_resize(
     rows: u16,
 ) -> Result<()> {
     let viewport_rows = rows.saturating_sub(1) as u32;
-    state.viewport_cols = cols as u32;
+    state.viewport_cols = (cols as u32).saturating_sub(crate::ui::GUTTER_WIDTH as u32);
     state.viewport_rows = viewport_rows;
     let viewport_id = state.ed_mut().viewport_id;
     let r = client
         .rpc::<ViewportResize>(ViewportResizeParams {
             viewport_id,
-            cols: cols as u32,
+            cols: state.viewport_cols,
             rows: viewport_rows,
         })
         .await?;
@@ -3417,6 +3484,7 @@ async fn handle_resize(
     ed.line_count = r.window.line_count;
     ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
     ed.lines = r.window.lines;
+    ed.scroll_skip_rows = 0; // visual heights changed; re-align the top line
 
     // If the picker is open, the resize changed how many result rows fit. Re-subscribe with the
     // new `limit`, keeping the current `offset`. The server's next push uses the new window.
@@ -4988,6 +5056,7 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
     state.ed_mut().wrap = new_wrap;
     state.ed_mut().window_first_logical_line = r.window.first_logical_line;
     state.ed_mut().lines = r.window.lines;
+    state.ed_mut().scroll_skip_rows = 0; // wrap changed visual heights; re-align the top line
     // Horizontal scroll is meaningless under soft wrap — content never overflows right.
     if matches!(new_wrap, WrapMode::Soft) {
         state.ed_mut().scroll_col = 0;
@@ -5002,6 +5071,51 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
     Ok(())
 }
 
+/// Toggle the server-side inline diff view for the active viewport and adopt the re-rendered
+/// window. Like `toggle_wrap`, the whole window is resent because the phantom rows change the
+/// visual layout and `max_scroll`.
+async fn toggle_diff_view(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let enabled = !state.ed_mut().diff_view;
+    let r = client
+        .rpc::<GitSetDiffView>(GitSetDiffViewParams {
+            viewport_id: state.ed_mut().viewport_id,
+            enabled,
+        })
+        .await?;
+    let ed = state.ed_mut();
+    ed.diff_view = enabled;
+    ed.window_first_logical_line = r.window.first_logical_line;
+    ed.line_count = r.window.line_count;
+    ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
+    ed.lines = r.window.lines;
+    ed.scroll_skip_rows = 0; // phantom rows appeared/vanished; re-align the top line
+    state.status =
+        StatusMessage::info(format!("diff: {}", if enabled { "on" } else { "off" }));
+    Ok(())
+}
+
+/// Jump the cursor to the next/previous changed region. The server recomputes hunks and moves the
+/// cursor authoritatively; the dispatch funnel scrolls it into view afterward (cursor changed).
+/// A status note when there's nothing further in that direction.
+async fn navigate_hunk(
+    client: &mut Client,
+    state: &mut AppState,
+    direction: HunkDirection,
+) -> Result<()> {
+    let r = client
+        .rpc::<GitNavigateHunk>(GitNavigateHunkParams {
+            buffer_id: state.ed_mut().buffer_id,
+            from_line: state.ed_mut().cursor.position.line,
+            direction,
+        })
+        .await?;
+    state.ed_mut().cursor = r.cursor;
+    if !r.moved {
+        state.status = StatusMessage::info("no more changes".to_string());
+    }
+    Ok(())
+}
+
 /// Accumulate a vertical-scroll delta. Doesn't touch the cursor and doesn't issue an RPC — the
 /// actual `viewport/scroll` is sent when `flush_pending_scroll` runs (before the next draw, or
 /// at the start of `ensure_cursor_in_window`). This lets a trackpad burst of N scroll events
@@ -5010,32 +5124,89 @@ fn scroll_lines(state: &mut AppState, delta: i64) {
     state.ed_mut().pending_scroll_lines = state.ed_mut().pending_scroll_lines.saturating_add(delta);
 }
 
-/// Apply any accumulated `pending_scroll_lines` to the server via one `viewport/scroll` call.
-/// No-op if zero. Called before every draw and from inside `ensure_cursor_in_window` so the
-/// cursor-visibility check sees the user's intended scroll position.
+/// The number of visual rows a logical line occupies in the current window: its phantom deleted
+/// rows plus its (possibly wrapped) content rows. Out-of-window lines fall back to 1 — accurate
+/// enough for the rare scroll that walks past the overscanned window before the next refetch.
+fn line_visual_height(state: &AppState, logical_line: u32) -> u32 {
+    let local = (logical_line as i64) - (state.ed().window_first_logical_line as i64);
+    if local < 0 || local >= state.ed().lines.len() as i64 {
+        return 1;
+    }
+    let r = &state.ed().lines[local as usize];
+    (r.virtual_rows_above.len() + r.visual_rows.len().max(1)) as u32
+}
+
+/// Advance a `(logical_line, skip)` scroll position by `delta` *visual* rows (negative = up),
+/// stepping across logical-line boundaries using each line's visual height. This is what makes
+/// scrolling move one visual row at a time instead of jumping a whole (wrapped / phantom-row-
+/// padded) logical line.
+fn scroll_advance(state: &AppState, line: &mut u32, skip: &mut u32, delta: i64) {
+    if delta >= 0 {
+        let mut remaining = delta as u32;
+        while remaining > 0 {
+            let rows_below = line_visual_height(state, *line)
+                .saturating_sub(1)
+                .saturating_sub(*skip);
+            if remaining <= rows_below {
+                *skip += remaining;
+                return;
+            }
+            remaining -= rows_below + 1; // +1 to cross into the next line's first row
+            *line += 1;
+            *skip = 0;
+        }
+    } else {
+        let mut remaining = (-delta) as u32;
+        while remaining > 0 {
+            if remaining <= *skip {
+                *skip -= remaining;
+                return;
+            }
+            remaining -= *skip + 1; // +1 to cross into the previous line's last row
+            if *line == 0 {
+                *skip = 0;
+                return;
+            }
+            *line -= 1;
+            *skip = line_visual_height(state, *line).saturating_sub(1);
+        }
+    }
+}
+
+/// Apply any accumulated `pending_scroll_lines` (now in *visual rows*) to the scroll position.
+/// A pure within-line move just updates `scroll_skip_rows` (no RPC — same window); crossing into a
+/// new logical line issues one `viewport/scroll`. Called before every draw and from inside
+/// `ensure_cursor_in_window`.
 async fn flush_pending_scroll(client: &mut Client, state: &mut AppState) -> Result<()> {
     if !state.has_editor() {
         return Ok(());
     }
-    let ed = state.ed_mut();
-    if ed.pending_scroll_lines == 0 {
+    let delta = state.ed().pending_scroll_lines;
+    if delta == 0 {
         return Ok(());
     }
-    let delta = ed.pending_scroll_lines;
-    ed.pending_scroll_lines = 0;
-    let raw = if delta >= 0 {
-        ed.scroll_logical_line.saturating_add(delta as u32)
-    } else {
-        ed.scroll_logical_line.saturating_sub((-delta) as u32)
-    };
-    // Server-computed: highest scroll position that still puts the buffer's last visual row at
-    // the bottom of the viewport. Accounts for wrap (where one logical line can be multiple
-    // visual rows).
-    let target = raw.min(ed.max_scroll_logical_line);
-    if target == ed.scroll_logical_line {
-        return Ok(()); // no movement after clamping; skip the RPC
+    state.ed_mut().pending_scroll_lines = 0;
+
+    let mut line = state.ed().scroll_logical_line;
+    let mut skip = state.ed().scroll_skip_rows;
+    scroll_advance(state, &mut line, &mut skip, delta);
+
+    // Clamp to the server-computed last scroll line (it accounts for wrap). At the very bottom we
+    // align to the logical line — fine-positioning into the final screenful isn't worth the math.
+    let max = state.ed().max_scroll_logical_line;
+    if line >= max {
+        line = max;
+        skip = 0;
     }
-    scroll_to(client, state, target).await
+
+    if line == state.ed().scroll_logical_line && skip == state.ed().scroll_skip_rows {
+        return Ok(()); // no movement
+    }
+    if line != state.ed().scroll_logical_line {
+        scroll_to(client, state, line).await?; // resets skip to 0 + refetches the window
+    }
+    state.ed_mut().scroll_skip_rows = skip;
+    Ok(())
 }
 
 /// Scroll the viewport horizontally by `delta` columns. Only meaningful under `WrapMode::None`;
@@ -5062,6 +5233,8 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
         })
         .await?;
     state.ed_mut().scroll_logical_line = target_line;
+    // A logical-line-aligned scroll: the target line sits flush at the top, no hidden rows.
+    state.ed_mut().scroll_skip_rows = 0;
     state.ed_mut().window_first_logical_line = r.window.first_logical_line;
     state.ed_mut().line_count = r.window.line_count;
     state.ed_mut().max_scroll_logical_line = r.window.max_scroll_logical_line;
@@ -5303,11 +5476,13 @@ mod tests {
             viewport_id: 1,
             cursor: Default::default(),
             scroll_logical_line: 0,
+            scroll_skip_rows: 0,
             window_first_logical_line: 0,
             lines: Vec::new(),
             line_count: 0,
             max_scroll_logical_line: 0,
             wrap: aether_protocol::viewport::WrapMode::None,
+            diff_view: false,
             scroll_col: 0,
             pending_scroll_lines: 0,
             drag_anchor: None,
@@ -5320,9 +5495,62 @@ mod tests {
             pending_surround: None,
             last_repeat: None,
             search: Default::default(),
+            blame: Default::default(),
             file_path: None,
             file_label: label.into(),
         }
+    }
+
+    #[test]
+    fn scroll_advance_steps_one_visual_row_across_tall_lines() {
+        use aether_protocol::viewport::{Segment, VirtualRow, VirtualRowKind, VisualRow};
+
+        // Heights: line0=1, line1=3 (2 phantom deleted rows + 1 content), line2=1, line3=1.
+        // Global visual rows from the top: 0=(0,0) 1=(1,0) 2=(1,1) 3=(1,2) 4=(2,0) 5=(3,0).
+        let line = |phantom: usize, content: usize| LogicalLineRender {
+            logical_line: 0,
+            visual_rows: (0..content.max(1))
+                .map(|_| VisualRow {
+                    byte_offset: 0,
+                    continuation_indent: 0,
+                    segments: vec![Segment {
+                        text: String::new(),
+                        highlights: vec![],
+                    }],
+                })
+                .collect(),
+            search_matches: vec![],
+            virtual_rows_above: (0..phantom)
+                .map(|_| VirtualRow {
+                    text: String::new(),
+                    kind: VirtualRowKind::Deleted,
+                })
+                .collect(),
+            diff_marker: None,
+        };
+
+        let mut state = empty_app_state(80, 24);
+        state.editor = Some(stub_editor_state("buf"));
+        state.ed_mut().window_first_logical_line = 0;
+        state.ed_mut().lines = vec![line(0, 1), line(2, 1), line(0, 1), line(0, 1)];
+
+        let walk = |delta: i64, from: (u32, u32)| {
+            let (mut l, mut s) = from;
+            scroll_advance(&state, &mut l, &mut s, delta);
+            (l, s)
+        };
+
+        // Down: one visual row at a time, stopping *on* the phantom rows of line 1.
+        assert_eq!(walk(1, (0, 0)), (1, 0), "into line 1's first phantom row");
+        assert_eq!(walk(2, (0, 0)), (1, 1), "second phantom row");
+        assert_eq!(walk(3, (0, 0)), (1, 2), "line 1's content row");
+        assert_eq!(walk(4, (0, 0)), (2, 0), "across the tall line to line 2");
+
+        // Up: mirror image.
+        assert_eq!(walk(-1, (2, 0)), (1, 2));
+        assert_eq!(walk(-3, (2, 0)), (1, 0));
+        assert_eq!(walk(-4, (2, 0)), (0, 0));
+        assert_eq!(walk(-10, (1, 1)), (0, 0), "clamps at the top");
     }
 
     #[test]

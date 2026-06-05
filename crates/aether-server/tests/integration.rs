@@ -12,6 +12,10 @@ use aether_protocol::cursor::{
     CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
+use aether_protocol::git::{
+    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitNavigateHunk, GitNavigateHunkParams,
+    GitNavigateHunkResult, GitSetDiffView, GitSetDiffViewParams, HunkDirection,
+};
 use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
@@ -33,8 +37,9 @@ use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
     ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSetWrap,
     ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
-    ViewportWindowResult, WrapMode,
+    ViewportWindowResult, VirtualRowKind, WrapMode,
 };
+use aether_protocol::viewport::DiffMarker;
 use aether_protocol::LogicalPosition;
 use aether_server::spawn_for_test;
 use futures_util::{SinkExt, StreamExt};
@@ -12189,6 +12194,416 @@ async fn surround_line_then_unsurround_line_roundtrips() {
         notif.replacement_lines[0].visual_rows[0].segments[0].text,
         "hello"
     );
+
+    drop(server);
+}
+
+/// Init a git repo at `dir` and commit `name` with `content` under a known author.
+fn git_commit_file(dir: &std::path::Path, name: &str, content: &str) {
+    let repo = git2::Repository::init(dir).unwrap();
+    std::fs::write(dir.join(name), content).unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new(name)).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init commit", &tree, &[])
+        .unwrap();
+}
+
+#[tokio::test]
+async fn git_blame_line_reports_committed_author() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "tracked.rs", "fn main() {}\n");
+
+    let server = spawn_for_test("blame-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "blame-proj".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("tracked.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+
+    let res: GitBlameLineResult = send_request::<GitBlameLine>(
+        &mut ws,
+        3,
+        &GitBlameLineParams {
+            buffer_id: open.buffer_id,
+            line: 0,
+        },
+    )
+    .await;
+    let blame = res.blame.expect("committed line should have blame");
+    assert_eq!(blame.author, "Test");
+    assert!(!blame.is_uncommitted);
+    assert_eq!(blame.summary, "init commit");
+    assert_eq!(blame.commit.len(), 7);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_blame_line_is_none_without_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("loose.rs"), "x\n").unwrap();
+
+    let server = spawn_for_test("norepo-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "norepo-proj".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("loose.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+
+    let res: GitBlameLineResult = send_request::<GitBlameLine>(
+        &mut ws,
+        3,
+        &GitBlameLineParams {
+            buffer_id: open.buffer_id,
+            line: 0,
+        },
+    )
+    .await;
+    assert!(res.blame.is_none());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_set_diff_view_interleaves_deleted_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+
+    let server = spawn_for_test("diff-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "diff-proj".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("edit.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+
+    // Modify line 0 in the *live buffer only* (never written to disk): insert "X" at its start.
+    let _edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: open.buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+
+    // Turn the diff view on: the response carries the re-rendered window with the baseline line
+    // shown as a phantom "deleted" row above the edited line.
+    let on: ViewportWindowResult = send_request::<GitSetDiffView>(
+        &mut ws,
+        5,
+        &GitSetDiffViewParams {
+            viewport_id: sub.viewport_id,
+            enabled: true,
+        },
+    )
+    .await;
+    let line0 = on
+        .window
+        .lines
+        .iter()
+        .find(|l| l.logical_line == 0)
+        .expect("line 0 in window");
+    assert_eq!(line0.virtual_rows_above.len(), 1, "one deleted baseline row");
+    assert_eq!(line0.virtual_rows_above[0].text, "alpha");
+    assert_eq!(line0.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
+    assert_eq!(line0.visual_rows[0].segments[0].text, "Xalpha");
+    // The edited real line is tinted as Modified.
+    assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+
+    // Turning it back off clears the phantom rows.
+    let off: ViewportWindowResult = send_request::<GitSetDiffView>(
+        &mut ws,
+        6,
+        &GitSetDiffViewParams {
+            viewport_id: sub.viewport_id,
+            enabled: false,
+        },
+    )
+    .await;
+    let line0 = off
+        .window
+        .lines
+        .iter()
+        .find(|l| l.logical_line == 0)
+        .unwrap();
+    // Phantom rows are gone, but the gutter marker persists — it's always-on, independent of the
+    // inline diff toggle.
+    assert!(line0.virtual_rows_above.is_empty());
+    assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_gutter_marker_present_without_diff_view() {
+    // The change-bar gutter is always on: editing a line tags it with a `diff_marker` in the
+    // pushed window even though the inline diff view was never enabled.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "g.rs", "alpha\nbeta\n");
+
+    let server = spawn_for_test("gutter-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "gutter-proj".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("g.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+
+    // Edit line 0; the resulting lines_changed push should carry the gutter marker.
+    let _edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: open.buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+
+    let notif = expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    let line0 = notif
+        .replacement_lines
+        .iter()
+        .find(|l| l.logical_line == 0)
+        .expect("line 0 in push");
+    assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+    // No diff view → no phantom rows.
+    assert!(line0.virtual_rows_above.is_empty());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_navigate_hunk_jumps_between_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "nav.rs", "l0\nl1\nl2\nl3\nl4\n");
+
+    let server = spawn_for_test("nav-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "nav-proj".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("nav.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+
+    // Two separate changed regions: edit line 0, then line 3.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        4,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 3, col: 0 },
+            anchor: LogicalPosition { line: 3, col: 0 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        5,
+        &InputTextParams {
+            buffer_id,
+            text: "Y".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+
+    // From line 0, Next lands on the line-3 hunk.
+    let next: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        &mut ws,
+        6,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line: 0,
+            direction: HunkDirection::Next,
+        },
+    )
+    .await;
+    assert!(next.moved);
+    assert_eq!(next.cursor.position.line, 3);
+
+    // From line 3, there's nothing further forward.
+    let none: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        &mut ws,
+        7,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line: 3,
+            direction: HunkDirection::Next,
+        },
+    )
+    .await;
+    assert!(!none.moved);
+
+    // From line 3, Prev lands back on the line-0 hunk.
+    let prev: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        &mut ws,
+        8,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line: 3,
+            direction: HunkDirection::Prev,
+        },
+    )
+    .await;
+    assert!(prev.moved);
+    assert_eq!(prev.cursor.position.line, 0);
 
     drop(server);
 }

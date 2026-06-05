@@ -19,6 +19,7 @@ use aether_protocol::cursor::{
     CursorSwapAnchor, CursorUndo,
 };
 use aether_protocol::directory::{DirectoryCreate, DirectoryList};
+use aether_protocol::git::{GitBlameLine, GitNavigateHunk, GitSetDiffView};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
@@ -298,6 +299,9 @@ async fn dispatch(
         PickerGrepFileJump::NAME => run!(PickerGrepFileJump, handlers::picker_grep_file_jump),
         DirectoryList::NAME => run!(DirectoryList, handlers::directory_list),
         DirectoryCreate::NAME => run!(DirectoryCreate, handlers::directory_create),
+        GitBlameLine::NAME => run!(GitBlameLine, handlers::git_blame_line),
+        GitSetDiffView::NAME => run!(GitSetDiffView, handlers::git_set_diff_view),
+        GitNavigateHunk::NAME => run!(GitNavigateHunk, handlers::git_navigate_hunk),
         other => Err(RpcError::method_not_found(other)),
     }
 }

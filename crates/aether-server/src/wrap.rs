@@ -47,6 +47,8 @@ pub fn render_line(
         logical_line,
         visual_rows,
         search_matches: Vec::new(),
+        virtual_rows_above: Vec::new(),
+        diff_marker: None,
     }
 }
 

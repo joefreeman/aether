@@ -16,7 +16,8 @@
 //! project's roots, so cold projects don't waste an inotify slot.
 
 use crate::handlers::{
-    collect_buffer_state_pushes, refresh_explorers_for_dirs, reload_buffer_locked,
+    collect_buffer_state_pushes, refresh_explorers_for_dirs, refresh_git_for_buffer,
+    reload_buffer_locked,
 };
 use crate::state::{ServerState, SharedState};
 use aether_protocol::envelope::Notification;
@@ -153,6 +154,28 @@ async fn handle_event(state: &SharedState, event: Event) {
                 }
             }
         }
+
+        // External Git operations (commit / checkout / stage) touch files under `.git`. Refresh
+        // the baseline + hunks of any open buffer in an affected repo so the gutter and inline
+        // diff reflect the new HEAD without needing a buffer edit. (Only sees `.git` changes when
+        // it's within a watched project root — the common repo-root-is-project-root case.)
+        let git_workdirs: HashSet<PathBuf> =
+            paths.iter().filter_map(|p| git_change_workdir(p)).collect();
+        if !git_workdirs.is_empty() {
+            let affected: Vec<BufferId> = s
+                .git_baseline
+                .iter()
+                .filter(|(_, b)| {
+                    b.repo
+                        .as_ref()
+                        .is_some_and(|r| git_workdirs.contains(&r.workdir))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in affected {
+                pushes.extend(refresh_git_for_buffer(&mut s, id));
+            }
+        }
         let picker_pushes = refresh_explorers_for_dirs(&mut s, &affected_dirs);
         pushes.extend(picker_pushes);
     }
@@ -171,6 +194,28 @@ enum Category {
 
 fn buffer_for_path(s: &ServerState, path: &Path) -> Option<BufferId> {
     s.buffer_for_path_any_project(path)
+}
+
+/// If `path` is a meaningful file inside a `.git` directory — `HEAD`, `index`, `packed-refs`, or
+/// anything under `refs/` (the things commit/checkout/stage touch) — return the repo's working
+/// directory (the parent of `.git`). Ignores `*.lock` temp files and noise like `logs/` and
+/// `objects/`. The returned workdir is what each buffer's cached `GitRepo.workdir` is keyed on.
+fn git_change_workdir(path: &Path) -> Option<PathBuf> {
+    let comps: Vec<_> = path.components().collect();
+    let git_idx = comps.iter().position(|c| c.as_os_str() == ".git")?;
+    let inner: PathBuf = comps[git_idx + 1..].iter().map(|c| c.as_os_str()).collect();
+    let inner_str = inner.to_string_lossy();
+    if inner_str.ends_with(".lock") {
+        return None;
+    }
+    let meaningful = inner_str == "HEAD"
+        || inner_str == "index"
+        || inner_str == "packed-refs"
+        || inner.starts_with("refs");
+    if !meaningful {
+        return None;
+    }
+    Some(comps[..git_idx].iter().map(|c| c.as_os_str()).collect())
 }
 
 fn handle_buffer_event(
@@ -228,6 +273,37 @@ fn handle_buffer_event(
                     pushes.extend(collect_buffer_state_pushes(s, buf_id));
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::git_change_workdir;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn detects_meaningful_git_files() {
+        for inner in ["HEAD", "index", "packed-refs", "refs/heads/main", "refs/tags/v1"] {
+            let p = PathBuf::from(format!("/home/u/proj/.git/{inner}"));
+            assert_eq!(
+                git_change_workdir(&p),
+                Some(PathBuf::from("/home/u/proj")),
+                "{inner} should map to the workdir",
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_noise_and_non_git_paths() {
+        for p in [
+            "/home/u/proj/.git/index.lock",   // lock temp file
+            "/home/u/proj/.git/logs/HEAD",    // reflog
+            "/home/u/proj/.git/objects/ab/cd", // object write
+            "/home/u/proj/.git/COMMIT_EDITMSG",
+            "/home/u/proj/src/main.rs",       // ordinary source file
+        ] {
+            assert_eq!(git_change_workdir(Path::new(p)), None, "{p} should be ignored");
         }
     }
 }

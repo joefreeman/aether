@@ -185,6 +185,9 @@ pub enum Action {
     Undo,
     Redo,
     ToggleWrap,
+    ToggleDiffView,
+    NextHunk,
+    PrevHunk,
     MoveLines(VerticalDirection),
     JoinLines,
     Indent,
@@ -257,6 +260,9 @@ impl Action {
                 | Action::SaveAs
                 | Action::Reload
                 | Action::NewScratch
+                | Action::ToggleDiffView
+                | Action::NextHunk
+                | Action::PrevHunk
         )
     }
 
@@ -614,6 +620,9 @@ static LEADER: &[Binding] = &[
     bind!(LEADER_CTX, ch('s'), Exact(NONE), A::Save, "App", "Save"),
     bind!(LEADER_CTX, ch('s'), Exact(ALT), A::SaveAs, "App", "Save as"),
     bind!(LEADER_CTX, ch('r'), Exact(NONE), A::Reload, "App", "Reload from disk"),
+    bind!(LEADER_CTX, ch('d'), Exact(NONE), A::ToggleDiffView, "View", "Toggle inline diff"),
+    bind!(LEADER_CTX, ch(']'), Exact(NONE), A::NextHunk, "View", "Next change (hunk)"),
+    bind!(LEADER_CTX, ch('['), Exact(NONE), A::PrevHunk, "View", "Previous change (hunk)"),
     bind!(LEADER_CTX, ch('n'), Exact(NONE), A::NewScratch, "App", "New scratch buffer"),
     bind!(LEADER_CTX, ch('?'), Any, A::OpenHelp, "App", "Show keyboard shortcuts"),
 ];

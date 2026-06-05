@@ -6,9 +6,10 @@ use crate::app::{
 };
 use crate::keymap;
 use aether_protocol::cursor::CursorState;
+use aether_protocol::git::BlameInfo;
 use aether_protocol::picker::PickerItem;
 use aether_protocol::search::SearchMatchRange;
-use aether_protocol::viewport::{Highlight, VisualRow, WrapMode};
+use aether_protocol::viewport::{DiffMarker, Highlight, VisualRow, WrapMode};
 use aether_protocol::LogicalPosition;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
@@ -24,6 +25,12 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// client tells the server to reserve in wrap math.
 pub const CONTINUATION_MARKER: &str = "↪ ";
 pub const CONTINUATION_MARKER_WIDTH: u32 = 2;
+
+/// Width of the always-on left gutter (the Git change-bar column). Reserved from the content
+/// width: the client subtracts it from the cols it reports to the server, so soft-wrap and all
+/// the server's column math operate on the narrower content area, and the client paints the
+/// gutter in the reclaimed column.
+pub const GUTTER_WIDTH: u16 = 1;
 
 /// Display width of a tab character. Tabs render as spaces aligned to the next multiple of
 /// this — i.e. proper tab stops, not a fixed-width substitution. Hardcoded for v1; making it
@@ -60,6 +67,13 @@ const NORD12: Color = Color::Rgb(208, 135, 112); // Aurora orange — attributes
 const NORD13: Color = Color::Rgb(235, 203, 139); // Aurora yellow — string escapes
 const NORD14: Color = Color::Rgb(163, 190, 140); // Aurora green — strings
 const NORD15: Color = Color::Rgb(180, 142, 173); // Aurora purple — numbers, constants
+
+// Inline diff backgrounds. Phantom "deleted" rows render red-on-dark-red so they read as removed
+// without being mistaken for real buffer content; added/modified real lines get a subtle dark
+// tint behind their normal syntax-highlighted text.
+const GIT_DELETED_BG: Color = Color::Rgb(59, 34, 38); // dark muted red
+const GIT_ADDED_BG: Color = Color::Rgb(45, 58, 45); // dark muted green
+const GIT_MODIFIED_BG: Color = Color::Rgb(58, 54, 40); // dark muted olive
 
 pub fn draw(f: &mut Frame, state: &AppState) {
     // The status row carries activation feedback, save-as / new-file prompts, and the dirty +
@@ -2127,7 +2141,10 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let top = state.ed().scroll_logical_line;
     let selection = ordered_selection(&state.ed().cursor, state.ed().mode);
     let viewport_rows = area.height as usize;
-    let viewport_cols = area.width;
+    // The leftmost `GUTTER_WIDTH` cols are the change-bar gutter; content fills the rest. The
+    // server already wrapped to this reduced width (the client reports it as `cols`).
+    let viewport_cols = area.width.saturating_sub(GUTTER_WIDTH);
+    let diff_view = state.ed().diff_view;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
     let scroll_col = if matches!(state.ed().wrap, WrapMode::None) {
         state.ed().scroll_col
@@ -2135,8 +2152,34 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         0
     };
 
+    // Blame for the cursor line, rendered as dim end-of-line virtual text. Only in Normal mode,
+    // and only when the cached blame was fetched for the line the cursor is actually on (guards
+    // against a one-frame mismatch right after the cursor moves).
+    let cursor_line = state.ed().cursor.position.line;
+    let blame_text: Option<String> = if matches!(state.ed().mode, EditorMode::Normal)
+        && state.ed().blame.key.map(|(l, _)| l) == Some(cursor_line)
+    {
+        state.ed().blame.info.as_ref().map(format_blame)
+    } else {
+        None
+    };
+
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
     let mut logical_line = top;
+
+    // Visual rows of the top logical line hidden above the viewport (sub-line scroll offset).
+    // Clamp to the top line's height so it can only ever skip into that line, never bleed onto
+    // the next — keeps scrolling robust if heights shift between a scroll and the next frame.
+    let mut skip_rows = {
+        let local = (top as i64) - (state.ed().window_first_logical_line as i64);
+        if local >= 0 && (local as usize) < state.ed().lines.len() {
+            let r = &state.ed().lines[local as usize];
+            let h = (r.virtual_rows_above.len() + r.visual_rows.len().max(1)) as u32;
+            state.ed().scroll_skip_rows.min(h.saturating_sub(1))
+        } else {
+            0
+        }
+    };
 
     'outer: loop {
         if lines.len() >= viewport_rows {
@@ -2148,8 +2191,41 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         }
         let render = &state.ed().lines[local_idx as usize];
 
+        // Inline diff: phantom "deleted" rows render above the line's real content. They occupy
+        // screen rows (and so are counted here) but carry no cursor position. Each band is a
+        // visible change, so it gets a red change-*bar* in the gutter (matching add/modify),
+        // rather than the compact `▔` top-marker used when there's no band.
+        for vrow in &render.virtual_rows_above {
+            if skip_rows > 0 {
+                skip_rows -= 1;
+                continue;
+            }
+            if lines.len() >= viewport_rows {
+                break 'outer;
+            }
+            let mut spans = deleted_virtual_row_spans(&vrow.text, viewport_cols);
+            spans.insert(0, gutter_bar(NORD11));
+            lines.push(Line::from(spans));
+        }
+        // The gutter change-bar reflects this line's marker (always on). With the diff view on, a
+        // pure-deletion anchor's `▔` is redundant (the band above already shows it), so suppress
+        // it. The diff-view background tint is separate and only applies while the view is on.
+        let gutter_mark = match render.diff_marker {
+            Some(DiffMarker::Deleted) if diff_view => None,
+            other => other,
+        };
+        let line_tint = if diff_view {
+            render.diff_marker.and_then(diff_marker_bg)
+        } else {
+            None
+        };
+
         let last_vrow_idx = render.visual_rows.len().saturating_sub(1);
         for (vrow_idx, vrow) in render.visual_rows.iter().enumerate() {
+            if skip_rows > 0 {
+                skip_rows -= 1;
+                continue; // hidden above the viewport by the sub-line scroll offset
+            }
             if lines.len() >= viewport_rows {
                 break 'outer;
             }
@@ -2168,7 +2244,10 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     if empty_newline_selected {
                         spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
                     }
-                    lines.push(Line::from(spans));
+                    let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
+                    append_eol_blame(&mut spans, show_blame.then(|| blame_text.as_deref()).flatten());
+                    apply_line_tint(&mut spans, line_tint, viewport_cols);
+                    lines.push(prepend_gutter(gutter_mark, spans));
                     continue;
                 }
             };
@@ -2247,7 +2326,10 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if highlight_trailing_newline {
                 spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
             }
-            lines.push(Line::from(spans));
+            let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
+            append_eol_blame(&mut spans, show_blame.then(|| blame_text.as_deref()).flatten());
+            apply_line_tint(&mut spans, line_tint, viewport_cols);
+            lines.push(prepend_gutter(gutter_mark, spans));
         }
         logical_line = match logical_line.checked_add(1) {
             Some(n) => n,
@@ -2261,6 +2343,135 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
         area,
     );
+}
+
+/// The content spans of one inline-diff phantom row: the removed baseline line, red on a dark-red
+/// fill that spans the content width so the deletion reads as a distinct band. Tabs expand to
+/// spaces for stable width; content wider than the viewport is clipped. The gutter cell is added
+/// separately by [`prepend_gutter`].
+fn deleted_virtual_row_spans(text: &str, width: u16) -> Vec<Span<'static>> {
+    let expanded = text.replace('\t', &" ".repeat(TAB_WIDTH as usize));
+    let mut shown: String = expanded.chars().take(width as usize).collect();
+    let used = shown.chars().count();
+    shown.push_str(&" ".repeat((width as usize).saturating_sub(used)));
+    vec![Span::styled(
+        shown,
+        Style::default().fg(NORD11).bg(GIT_DELETED_BG),
+    )]
+}
+
+/// A solid change-bar cell in the given color (`GUTTER_WIDTH` cols).
+fn gutter_bar(color: Color) -> Span<'static> {
+    Span::styled("▎".to_string(), Style::default().fg(color))
+}
+
+/// The change-bar cell for the gutter: a colored bar for added/modified lines, a top marker for a
+/// line that has deletions just above it (only used when no deletion band is shown), or blank.
+/// Exactly `GUTTER_WIDTH` cols wide.
+fn gutter_span(mark: Option<DiffMarker>) -> Span<'static> {
+    match mark {
+        Some(DiffMarker::Added) => gutter_bar(NORD14),    // green bar
+        Some(DiffMarker::Modified) => gutter_bar(NORD13), // yellow bar (matches modified tint)
+        Some(DiffMarker::Deleted) => {
+            Span::styled("▔".to_string(), Style::default().fg(NORD11)) // red "removed above"
+        }
+        None => Span::styled(" ".to_string(), Style::default().fg(NORD0)), // unchanged → blank
+    }
+}
+
+/// Prepend the gutter cell to a row's content spans, producing the final `Line`.
+fn prepend_gutter(mark: Option<DiffMarker>, mut spans: Vec<Span<'static>>) -> Line<'static> {
+    spans.insert(0, gutter_span(mark));
+    Line::from(spans)
+}
+
+/// The background tint for an inline-diff line: added/modified get a tint, deleted-anchor lines
+/// (unchanged content) get none.
+fn diff_marker_bg(marker: DiffMarker) -> Option<Color> {
+    match marker {
+        DiffMarker::Added => Some(GIT_ADDED_BG),
+        DiffMarker::Modified => Some(GIT_MODIFIED_BG),
+        DiffMarker::Deleted => None,
+    }
+}
+
+/// Tint a real line's row with its diff-marker background: set the tint behind every span that
+/// doesn't already carry its own background (so syntax fg shows through, but selection/search
+/// highlights keep their backgrounds), then fill to the right edge so the tint spans the row.
+/// No-op when `tint` is `None`.
+fn apply_line_tint(spans: &mut Vec<Span<'static>>, tint: Option<Color>, width: u16) {
+    let Some(bg) = tint else { return };
+    for span in spans.iter_mut() {
+        if span.style.bg.is_none() {
+            span.style = span.style.bg(bg);
+        }
+    }
+    // Over-long fill is clipped by the Paragraph; this just guarantees we reach the right edge.
+    spans.push(Span::styled(
+        " ".repeat(width as usize),
+        Style::default().bg(bg),
+    ));
+}
+
+/// Append `blame` as dim, italic end-of-line virtual text with a few cols of lead-in. The
+/// Paragraph clips to the viewport width, so on a line that already fills the screen the blame
+/// simply shows less (or nothing) — no wrapping, no overwriting code.
+fn append_eol_blame(spans: &mut Vec<Span<'static>>, blame: Option<&str>) {
+    if let Some(text) = blame {
+        spans.push(Span::styled(
+            format!("    {text}"),
+            Style::default().fg(NORD3).add_modifier(Modifier::ITALIC),
+        ));
+    }
+}
+
+/// One-line blame label: `author · 3 days ago · summary`, or a plain marker for a line the user
+/// has edited but not committed.
+fn format_blame(info: &BlameInfo) -> String {
+    if info.is_uncommitted {
+        return "You · Uncommitted".to_string();
+    }
+    format!(
+        "{} · {} · {}",
+        info.author,
+        relative_time(info.timestamp),
+        info.summary
+    )
+}
+
+/// Coarse "N units ago" rendering of a Unix timestamp against the wall clock. Future timestamps
+/// (clock skew) and the last minute both read as "just now".
+fn relative_time(timestamp: i64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = (now - timestamp).max(0);
+
+    const MIN: i64 = 60;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+
+    let (n, unit) = if secs < MIN {
+        return "just now".to_string();
+    } else if secs < HOUR {
+        (secs / MIN, "minute")
+    } else if secs < DAY {
+        (secs / HOUR, "hour")
+    } else if secs < WEEK {
+        (secs / DAY, "day")
+    } else if secs < MONTH {
+        (secs / WEEK, "week")
+    } else if secs < YEAR {
+        (secs / MONTH, "month")
+    } else {
+        (secs / YEAR, "year")
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
 /// Drop the first `scroll_col` bytes of the row's text, then shift highlight + selection + match
@@ -3062,8 +3273,10 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         return; // cursor off-screen
     };
     let row = buffer_area.y + visual_row as u16;
+    // `visual_col` is content-relative; shift past the gutter to the real screen column.
     let col = buffer_area
         .x
+        .saturating_add(GUTTER_WIDTH)
         .saturating_add(visual_col.min(buffer_area.width.saturating_sub(1)));
     f.set_cursor_position((col, row));
 }
@@ -3083,6 +3296,21 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
         0
     };
 
+    // Visual rows of the top line hidden above the viewport. `visual_offset` is measured from the
+    // top line's first row; the on-screen row is `visual_offset - skip`. Clamp identically to
+    // `draw_buffer` so the two never disagree.
+    let skip = {
+        let local = (top as i64) - (state.ed().window_first_logical_line as i64);
+        if local >= 0 && (local as usize) < state.ed().lines.len() {
+            let r = &state.ed().lines[local as usize];
+            let h = (r.virtual_rows_above.len() + r.visual_rows.len().max(1)) as u32;
+            state.ed().scroll_skip_rows.min(h.saturating_sub(1))
+        } else {
+            0
+        }
+    };
+    let bottom = viewport_rows + skip; // bail once we're past the last visible row
+
     let mut visual_offset: u32 = 0;
     for line_idx in top..=cursor.line {
         let local_idx = (line_idx as i64) - (state.ed().window_first_logical_line as i64);
@@ -3090,12 +3318,16 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
             return None;
         }
         let render = &state.ed().lines[local_idx as usize];
+        // Phantom diff rows render above this line's content, so they push the cursor down whether
+        // or not this is the cursor's line.
+        visual_offset += render.virtual_rows_above.len() as u32;
         if line_idx == cursor.line {
             let row_idx = find_row_idx_for_col(&render.visual_rows, cursor.col);
             visual_offset += row_idx as u32;
-            if visual_offset >= viewport_rows {
-                return None;
+            if visual_offset < skip || visual_offset >= bottom {
+                return None; // hidden above the top, or below the bottom
             }
+            let visual_offset = visual_offset - skip;
             let row = &render.visual_rows[row_idx];
             // Walk chars in the row's text up to the cursor's byte offset, summing display
             // widths. The cursor lives in byte coordinates on the wire, but we render at display
@@ -3128,7 +3360,7 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
             return Some((visual_offset as u16, visual_col as u16));
         }
         visual_offset += render.visual_rows.len() as u32;
-        if visual_offset >= viewport_rows {
+        if visual_offset >= bottom {
             return None;
         }
     }
@@ -3164,7 +3396,11 @@ pub fn screen_to_logical(
     if (screen_row as u32) >= state.viewport_rows {
         return None;
     }
-    let mut rows_remaining = screen_row as u32;
+    // Strip the gutter: a click in the gutter column maps to the start of the line's content.
+    let screen_col = screen_col.saturating_sub(GUTTER_WIDTH);
+    // Screen row 0 is the top line's `scroll_skip_rows`-th visual row, so the click's global
+    // visual-row offset (from the top line's first row) is `screen_row + skip`.
+    let mut rows_remaining = screen_row as u32 + state.ed().scroll_skip_rows;
     let mut logical_line = state.ed().scroll_logical_line;
     loop {
         let local_idx = (logical_line as i64) - (state.ed().window_first_logical_line as i64);
@@ -3177,6 +3413,16 @@ pub fn screen_to_logical(
             });
         }
         let render = &state.ed().lines[local_idx as usize];
+        // Phantom diff rows render above the line's content. A click on one maps to the start of
+        // the real line it sits above (they have no addressable position of their own).
+        let virtual_rows = render.virtual_rows_above.len() as u32;
+        if rows_remaining < virtual_rows {
+            return Some(LogicalPosition {
+                line: logical_line,
+                col: 0,
+            });
+        }
+        rows_remaining -= virtual_rows;
         let visual_rows_in_line = render.visual_rows.len() as u32;
         if rows_remaining < visual_rows_in_line {
             let vrow = &render.visual_rows[rows_remaining as usize];

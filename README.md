@@ -18,6 +18,7 @@ buffer, see each other's cursors, and share a single undo stack.
 - Undo and redo stacks for edits and cursor/selection motions
 - Fuzzy pickers for files/buffers/projects, file explorer, project-wide grep
 - Mouse support, soft wrap, system-clipboard integration
+- Git integration (gutter, diff, blame)
 
 ## Keybindings
 
@@ -105,6 +106,7 @@ normal and line-scoped in insert (since insert has no selection).
 | --- | --- |
 | `Space f` | Find files |
 | `Space b` | Switch buffer |
+| `Space d` | Toggle Git diff |
 | `Space g` | Grep workspace |
 | `Space e` | File explorer |
 | `Space p` | Switch project |

@@ -54,6 +54,9 @@ tree-sitter-bash = "0.25"
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
 streaming-iterator = "0.1"
+# Git integration (diff/blame). Local-only: default features (ssh/https/network) disabled so
+# the build doesn't pull in openssl/libssh2 — we never talk to a remote.
+git2 = { version = "0.19", default-features = false }
 notify = "7"
 toml = "0.8"
 directories = "5"
