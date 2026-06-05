@@ -13,6 +13,7 @@ use aether_protocol::envelope::{
     RpcMethod,
 };
 use aether_protocol::input::{InputSurround, InputSurroundParams, InputText, InputTextParams};
+use aether_protocol::search::{SearchSet, SearchSetParams};
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
 };
@@ -118,6 +119,36 @@ fn cursor_move_params_use_motion() {
             "extend_selection": true,
         })
     );
+}
+
+#[test]
+fn search_set_params() {
+    use aether_protocol::envelope::RpcMethod;
+    assert_eq!(SearchSet::NAME, "search/set");
+
+    // Full shape: anchor present, extend set.
+    let v = to_value(SearchSetParams {
+        buffer_id: 3,
+        query: "foo".into(),
+        anchor: Some(LogicalPosition { line: 2, col: 5 }),
+        extend: true,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "buffer_id": 3,
+            "query": "foo",
+            "anchor": {"line": 2, "col": 5},
+            "extend": true,
+        })
+    );
+
+    // `extend` defaults to false when omitted on the wire (back-compat with older clients).
+    let p: SearchSetParams =
+        from_value(json!({"buffer_id": 3, "query": "foo", "anchor": null})).unwrap();
+    assert!(!p.extend);
+    assert!(p.anchor.is_none());
 }
 
 #[test]

@@ -6667,6 +6667,7 @@ async fn search_set_returns_summary_and_jumps_to_first_match() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            extend: false,
         },
     )
     .await;
@@ -6675,6 +6676,54 @@ async fn search_set_returns_summary_and_jumps_to_first_match() {
     assert_eq!(r.summary.current_index, 1);
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_set_extend_grows_selection_from_anchor_through_match() {
+    // Matches of "foo": (0,0)..(0,2), (0,8)..(0,10), (1,0)..(1,2). `?` from a caret at (0,4) selects
+    // from there *through* the next match (0,8) — anchor stays at (0,4), head lands on the match's
+    // last char (0,10). The counter tracks the head, so it reads "2".
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+            extend: true,
+        },
+    )
+    .await;
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 4 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 10 });
+    assert_eq!(r.summary.current_index, 2);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_set_extend_resets_to_match_on_wrap() {
+    // `?` from a caret past the last match (1,4) finds a match only by wrapping to the top. A wrap
+    // resets to selecting just the match — anchor at its start (0,0), head at its last char (0,2) —
+    // rather than ballooning the selection backward across the whole buffer.
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 1, col: 4 }),
+            extend: true,
+        },
+    )
+    .await;
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(r.summary.current_index, 1);
 
     drop(server);
 }
@@ -6689,6 +6738,7 @@ async fn search_smartcase_lowercase_is_case_insensitive() {
             buffer_id,
             query: "foo".into(),
             anchor: None,
+            extend: false,
         },
     )
     .await;
@@ -6707,6 +6757,7 @@ async fn search_smartcase_uppercase_is_case_sensitive() {
             buffer_id,
             query: "Foo".into(),
             anchor: None,
+            extend: false,
         },
     )
     .await;
@@ -6725,6 +6776,7 @@ async fn search_regex_metacharacters() {
             buffer_id,
             query: r"\d+".into(),
             anchor: None,
+            extend: false,
         },
     )
     .await;
@@ -6743,6 +6795,7 @@ async fn search_no_matches_returns_zero_summary() {
             buffer_id,
             query: "zzz".into(),
             anchor: None,
+            extend: false,
         },
     )
     .await;
@@ -6763,6 +6816,7 @@ async fn search_empty_query_clears_active_search() {
             buffer_id,
             query: "alpha".into(),
             anchor: None,
+            extend: false,
         },
     )
     .await;
@@ -6773,6 +6827,7 @@ async fn search_empty_query_clears_active_search() {
             buffer_id,
             query: String::new(),
             anchor: None,
+            extend: false,
         },
     )
     .await;
@@ -6791,6 +6846,7 @@ async fn search_next_cycles_forward_and_wraps() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            extend: false,
         },
     )
     .await;
@@ -6819,6 +6875,7 @@ async fn search_prev_cycles_backward_with_wrap() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            extend: false,
         },
     )
     .await;
@@ -6841,6 +6898,7 @@ async fn search_prev_orients_backward() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 8 }),
+            extend: false,
         },
     )
     .await;
@@ -6866,6 +6924,7 @@ async fn search_next_wrap_stays_forward_oriented() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 1, col: 0 }),
+            extend: false,
         },
     )
     .await;
@@ -6892,6 +6951,7 @@ async fn search_prev_wrap_stays_backward_oriented() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            extend: false,
         },
     )
     .await;
@@ -6921,6 +6981,7 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 8 }),
+            extend: false,
         },
     )
     .await;
@@ -6952,6 +7013,7 @@ async fn search_extend_resets_to_single_match_on_wrap() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 4 }),
+            extend: false,
         },
     )
     .await;
@@ -6986,6 +7048,7 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            extend: false,
         },
     )
     .await;
@@ -7014,6 +7077,7 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            extend: false,
         },
     )
     .await;
@@ -7041,6 +7105,7 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            extend: false,
         },
     )
     .await;
@@ -7054,8 +7119,9 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
     .await;
     assert_eq!(r1.cursor.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(r1.cursor.position, LogicalPosition { line: 0, col: 10 });
-    // Spanning two matches → not "on" a single match, so the index counter blanks.
-    assert_eq!(r1.summary.current_index, 0);
+    // Selection spans two matches, but the counter tracks the match the *head* rests on — here the
+    // second match, whose last char (0,10) the head sits on.
+    assert_eq!(r1.summary.current_index, 2);
     // A second extend-next keeps the same anchor and steps the head to the third match — i.e. it
     // makes progress rather than re-finding the second match.
     let r2: SearchNavResult = send_request::<SearchNext>(
@@ -7081,6 +7147,7 @@ async fn search_prev_extend_keeps_anchor_and_grows_backward() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 1, col: 0 }),
+            extend: false,
         },
     )
     .await;
@@ -7113,6 +7180,7 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
             buffer_id,
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 8 }),
+            extend: false,
         },
     )
     .await;
@@ -7151,6 +7219,7 @@ async fn search_clear_removes_active_search() {
             buffer_id,
             query: "foo".into(),
             anchor: None,
+            extend: false,
         },
     )
     .await;
@@ -10268,6 +10337,7 @@ async fn search_set_response_carries_grep_position() {
             buffer_id,
             query: "needle".into(),
             anchor: Some(LogicalPosition { line: 1, col: 4 }),
+            extend: false,
         },
     )
     .await;

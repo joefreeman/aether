@@ -26,6 +26,13 @@ pub struct SearchSetParams {
     pub buffer_id: BufferId,
     pub query: String,
     pub anchor: Option<LogicalPosition>,
+    /// When `true` and `anchor` is set, grow the selection from `anchor` *through* the matched term
+    /// (anchor stays at `anchor`, head lands on the match's last char) instead of re-selecting just
+    /// the match — this is the `?` "select to match" entry. Ignored when the match is only found by
+    /// wrapping past the buffer end (the selection then resets to just the match, mirroring how
+    /// `search/next` handles a wrap) or when `anchor` is `None`.
+    #[serde(default)]
+    pub extend: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,8 +98,9 @@ pub struct SearchSummary {
     pub total: u32,
     /// True when the server hit its match cap and the actual match count exceeds `total`.
     pub truncated: bool,
-    /// 1-based index of the match the cursor's selection currently sits on (i.e. the selection's
-    /// start equals a match's start). `0` means the cursor isn't on a match.
+    /// 1-based index of the match the cursor head currently sits on (the head falls within the
+    /// match's bounds). `0` means the head isn't on any match. Stays live even when the selection
+    /// spans several matches (`?` / `Shift-n`), since only the head position matters.
     pub current_index: u32,
 }
 

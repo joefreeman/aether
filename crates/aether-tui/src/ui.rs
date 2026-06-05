@@ -2371,7 +2371,11 @@ fn ordered_selection(
 ) -> Option<(LogicalPosition, LogicalPosition)> {
     let p = cursor.position;
     if cursor.is_point() {
-        return matches!(mode, EditorMode::Normal).then_some((p, p));
+        // A point is a single-char selection (Helix-style). Render it in Normal mode, and also in
+        // Search mode so a one-char selection stays visible while the search input has focus —
+        // multi-char ranges already show there (the range path below ignores mode), and a point
+        // shouldn't be the exception. Insert mode stays caret-only (no selection block).
+        return matches!(mode, EditorMode::Normal | EditorMode::Search).then_some((p, p));
     }
     let anchor = cursor.anchor;
     if (p.line, p.col) <= (anchor.line, anchor.col) {
@@ -3226,6 +3230,38 @@ fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_selection_keeps_point_visible_in_search() {
+        let at = |line, col| LogicalPosition { line, col };
+        let point = CursorState {
+            position: at(1, 3),
+            anchor: at(1, 3),
+            ..Default::default()
+        };
+        // A single-char selection (point) shows in Normal and stays visible while the search input
+        // has focus, but Insert mode is caret-only.
+        assert_eq!(
+            ordered_selection(&point, EditorMode::Normal),
+            Some((at(1, 3), at(1, 3)))
+        );
+        assert_eq!(
+            ordered_selection(&point, EditorMode::Search),
+            Some((at(1, 3), at(1, 3)))
+        );
+        assert_eq!(ordered_selection(&point, EditorMode::Insert), None);
+
+        // A multi-char range shows regardless of mode (incl. Search), and is returned start-first.
+        let range = CursorState {
+            position: at(1, 5),
+            anchor: at(1, 1),
+            ..Default::default()
+        };
+        assert_eq!(
+            ordered_selection(&range, EditorMode::Search),
+            Some((at(1, 1), at(1, 5)))
+        );
+    }
 
     /// Spot-check the rendered overlay: unpaired descriptions appear verbatim, Alt variants are
     /// folded inline, and forward/backward pairs are merged into one row with merged keys and

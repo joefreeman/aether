@@ -211,6 +211,9 @@ pub enum Action {
 
     // ---- search ----
     EnterSearch,
+    /// `?` — enter search, but grow the selection from the cursor to each incremental match
+    /// (instead of re-selecting just the matched word).
+    EnterSearchToCursor,
     SearchFromSelection,
     SearchCycle(Direction),
     /// `Esc` — abort search and revert.
@@ -526,6 +529,7 @@ static NORMAL: &[Binding] = &[
     bind!(NORMAL_CTX, KeyCode::Delete, Any, A::DeleteSelection, "Edit", "Delete selection"),
     bind!(NORMAL_CTX, ch('/'), IgnoreShift(NONE), A::EnterSearch, "Search", "Search"),
     bind!(NORMAL_CTX, ch('/'), Exact(ALT), A::SearchFromSelection, "Search", "Search for selection"),
+    bind!(NORMAL_CTX, ch('?'), IgnoreShift(NONE), A::EnterSearchToCursor, "Search", "Select from cursor to match"),
     bind!(NORMAL_CTX, ch('n'), IgnoreShift(ALT), A::SearchCycle(Direction::Backward), "Search", "Previous match"),
     bind!(NORMAL_CTX, ch('n'), IgnoreShift(NONE), A::SearchCycle(Direction::Forward), "Search", "Next match"),
     bind!(NORMAL_CTX, ch('>'), Any, A::GrepNavigate(Direction::Forward), "Search", "Next grep hit"),
@@ -660,6 +664,25 @@ mod tests {
         let left = lookup(KeyContext::Normal, KeyCode::Char('h'), KeyModifiers::NONE).unwrap();
         assert!(!left.action.awaits_key());
         assert_eq!(left.key_label(), "h");
+    }
+
+    #[test]
+    fn search_entry_bindings() {
+        // Plain `/` enters a normal search; `?` enters the extend-to-cursor variant. They're
+        // distinct key codes, so `?` doesn't collide with `/`'s IgnoreShift matcher.
+        assert!(matches!(
+            lookup(KeyContext::Normal, KeyCode::Char('/'), KeyModifiers::NONE).map(|b| b.action),
+            Some(Action::EnterSearch)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Normal, KeyCode::Char('?'), KeyModifiers::NONE).map(|b| b.action),
+            Some(Action::EnterSearchToCursor)
+        ));
+        // Enhanced terminals report `?` with SHIFT held — IgnoreShift still routes it.
+        assert!(matches!(
+            lookup(KeyContext::Normal, KeyCode::Char('?'), KeyModifiers::SHIFT).map(|b| b.action),
+            Some(Action::EnterSearchToCursor)
+        ));
     }
 
     /// No two bindings in a context should match the *exact same* event, which would make the

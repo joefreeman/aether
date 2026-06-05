@@ -996,12 +996,21 @@ pub async fn search_set(
         // (wrapping to the first match if none). This is how incremental search keeps the cursor
         // anchored at `/`-press time across keystrokes.
         if let Some(anchor_pos) = params.anchor {
-            if let Some((start, end_excl)) = first_match_at_or_after_with_wrap(&entry, anchor_pos) {
+            let (target, wrapped) = first_match_at_or_after_with_wrap(&entry, anchor_pos);
+            if let Some((start, end_excl)) = target {
                 let start_char = motion::pos_to_char(buf, start);
                 let end_char_excl = motion::pos_to_char(buf, end_excl);
                 let last_char = end_char_excl.saturating_sub(1).max(start_char);
                 let position = motion::char_to_pos(buf, last_char);
-                let anchor_p = motion::char_to_pos(buf, start_char);
+                // `?`-search grows the selection from where `?` was pressed (`anchor_pos`) through
+                // the match. A wrap is the exception — extending across the buffer boundary would
+                // engulf the whole span, so on wrap we reset to selecting just the match, exactly
+                // like `search/next`. Plain `/` always selects just the match.
+                let anchor_p = if params.extend && !wrapped {
+                    anchor_pos
+                } else {
+                    motion::char_to_pos(buf, start_char)
+                };
                 let new_cursor = CursorState {
                     position,
                     anchor: anchor_p,
@@ -1033,16 +1042,21 @@ pub async fn search_set(
     Ok(SearchSetResult { cursor, summary })
 }
 
+/// First match at-or-after `pos`, falling back to the first match in the buffer (a wrap). Returns
+/// the match plus whether it was reached by wrapping, so `?`-search can reset its selection on a
+/// wrap rather than extending across the buffer boundary.
 fn first_match_at_or_after_with_wrap(
     entry: &SearchEntry,
     pos: LogicalPosition,
-) -> Option<(LogicalPosition, LogicalPosition)> {
-    entry
+) -> (Option<(LogicalPosition, LogicalPosition)>, bool) {
+    let found = entry
         .matches
         .iter()
         .copied()
-        .find(|(start, _)| pos_tuple(*start) >= pos_tuple(pos))
-        .or_else(|| entry.matches.first().copied())
+        .find(|(start, _)| pos_tuple(*start) >= pos_tuple(pos));
+    let wrapped = found.is_none();
+    let target = found.or_else(|| entry.matches.first().copied());
+    (target, wrapped)
 }
 
 pub async fn search_clear(
@@ -1279,14 +1293,12 @@ fn summary_for(
 /// against the match's single char. Comparing both endpoints means the counter only shows
 /// when the user is genuinely "on" a match — extending or shrinking the selection drops it.
 fn match_index_for_cursor(buf: &Buffer, entry: &SearchEntry, cursor: &CursorState) -> u32 {
-    // Normalize the selection's two endpoints to [lo, hi] so the check is orientation-agnostic: a
-    // match counts as "current" whether the selection is forward-oriented (anchor at start, head at
-    // last char) or backward-oriented (head at start, anchor at last char), since both cover exactly
-    // the match. Extending or shrinking past the match's bounds still drops the index.
+    // The counter reflects the match the cursor *head* sits on: a match is "current" when the head
+    // falls anywhere within it. This keeps the index live across all the ways a head lands on a
+    // match — `/` and `?` entry, `n`/`Alt-n` re-selection, and `Shift-n`/`Shift-Alt-n` extension
+    // (where the selection spans several matches but the head rests on one). It's orientation-
+    // agnostic by construction, since only the head matters, not which end is the anchor.
     let pos_char = motion::pos_to_char(buf, cursor.position);
-    let anchor_char = motion::pos_to_char(buf, cursor.anchor);
-    let sel_lo = pos_char.min(anchor_char);
-    let sel_hi = pos_char.max(anchor_char);
     entry
         .matches
         .iter()
@@ -1294,7 +1306,7 @@ fn match_index_for_cursor(buf: &Buffer, entry: &SearchEntry, cursor: &CursorStat
             let m_start_char = motion::pos_to_char(buf, *start);
             let m_end_char = motion::pos_to_char(buf, *end_excl);
             let m_last_char = m_end_char.saturating_sub(1);
-            sel_lo == m_start_char && sel_hi == m_last_char
+            pos_char >= m_start_char && pos_char <= m_last_char
         })
         .map(|i| (i as u32).saturating_add(1))
         .unwrap_or(0)
@@ -1363,9 +1375,9 @@ fn collect_viewport_refresh(
 
 /// After a cursor change for `(client_id, buffer_id)`, build a `search/state_changed`
 /// notification with the recomputed `current_index` — but only when a search is active *and*
-/// the index actually changed since the last push. The cursor counts as "on" a match only when
-/// the selection's full range coincides with the match (both endpoints), so extending or
-/// shrinking the selection drops the counter rather than leaving it stale.
+/// the index actually changed since the last push. The cursor counts as "on" a match whenever its
+/// head sits within one (see `match_index_for_cursor`), so the counter stays live as the cursor
+/// moves on and off matches, including while a `?`/`Shift-n` selection spans several of them.
 fn collect_cursor_search_update(
     s: &mut ServerState,
     client_id: ClientId,

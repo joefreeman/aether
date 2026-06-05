@@ -120,6 +120,10 @@ pub struct SearchState {
     /// The live-typed query, stashed when the user steps into history with Up so that Down can
     /// restore it on the way back out.
     pub history_draft: String,
+    /// True while in a `?`-initiated search: instead of re-selecting just the matched word, each
+    /// incremental match grows the selection from where `?` was pressed (the snapshot anchor) to the
+    /// match. Reset on every entry into search mode and on commit/abort.
+    pub extend_to_cursor: bool,
 }
 
 #[derive(Debug)]
@@ -1445,6 +1449,10 @@ async fn run_action(
 
         // ---- search ----
         Action::EnterSearch => enter_search_mode(client, state).await?,
+        Action::EnterSearchToCursor => {
+            enter_search_mode(client, state).await?;
+            state.ed_mut().search.extend_to_cursor = true;
+        }
         Action::SearchFromSelection => search_from_selection(client, state).await?,
         Action::SearchCycle(dir) => search_cycle(client, state, dir, count, extend).await?,
         Action::SearchAbort => abort_search(client, state).await?,
@@ -1602,6 +1610,7 @@ async fn grep_navigate(
                 buffer_id,
                 query: target.query.clone(),
                 anchor: Some(target.position),
+                extend: false,
             })
             .await?;
         let ed = state.ed_mut();
@@ -2600,6 +2609,7 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
                         buffer_id,
                         query: query.clone(),
                         anchor: Some(position),
+                        extend: false,
                     })
                     .await?;
                 let ed = state.ed_mut();
@@ -2976,6 +2986,7 @@ async fn enter_search_mode(client: &mut Client, state: &mut AppState) -> Result<
         let ed = state.ed_mut();
         ed.search.history_cursor = None;
         ed.search.history_draft.clear();
+        ed.search.extend_to_cursor = false;
         ed.mode = EditorMode::Search;
     }
     apply_cursor_style(state);
@@ -3006,6 +3017,7 @@ fn commit_search(state: &mut AppState) {
     let ed = state.ed_mut();
     ed.search.history_cursor = None;
     ed.search.history_draft.clear();
+    ed.search.extend_to_cursor = false;
     ed.mode = EditorMode::Normal;
     apply_cursor_style(state);
 }
@@ -3076,6 +3088,7 @@ async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
                 buffer_id: state.ed_mut().buffer_id,
                 query: snap.query.clone(),
                 anchor: None,
+                extend: false,
             })
             .await?;
         state.ed_mut().search.summary = Some(r.summary);
@@ -3102,6 +3115,7 @@ async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
     if snap.scroll_logical_line != state.ed_mut().scroll_logical_line {
         scroll_to(client, state, snap.scroll_logical_line).await?;
     }
+    state.ed_mut().search.extend_to_cursor = false;
     state.ed_mut().mode = EditorMode::Normal;
     apply_cursor_style(state);
     Ok(())
@@ -3142,15 +3156,20 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
         .snapshot
         .as_ref()
         .map(|s| selection_start(&s.cursor));
-    let (buffer_id, query) = {
+    let (buffer_id, query, extend) = {
         let ed = state.ed_mut();
-        (ed.buffer_id, ed.search.query.text.clone())
+        (
+            ed.buffer_id,
+            ed.search.query.text.clone(),
+            ed.search.extend_to_cursor,
+        )
     };
     let result = client
         .rpc::<SearchSet>(SearchSetParams {
             buffer_id,
             query,
             anchor,
+            extend,
         })
         .await;
     let revert_needed = match result {
@@ -3285,6 +3304,7 @@ async fn search_from_selection(client: &mut Client, state: &mut AppState) -> Res
             buffer_id,
             query: query.clone(),
             anchor: None,
+            extend: false,
         })
         .await?;
     state.ed_mut().search.summary = Some(result.summary);
@@ -3343,6 +3363,7 @@ async fn search_cycle(
                 buffer_id: state.ed_mut().buffer_id,
                 query: last,
                 anchor: None,
+                extend: false,
             })
             .await?;
         state.ed_mut().cursor = r.cursor;
