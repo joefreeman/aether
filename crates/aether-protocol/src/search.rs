@@ -51,7 +51,8 @@ pub struct SearchClearParams {
 // ---- search/next & search/prev ------------------------------------------------------------------
 
 /// Move the cursor to the next match after its current position (wraps to the first match at the
-/// buffer end). No-op if there's no active search or no matches.
+/// buffer end). No-op if there's no active search or no matches. When `extend` is set the anchor
+/// stays put and only the cursor head moves to the match, growing the selection.
 pub struct SearchNext;
 impl RpcMethod for SearchNext {
     const NAME: &'static str = "search/next";
@@ -69,6 +70,10 @@ impl RpcMethod for SearchPrev {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchNavParams {
     pub buffer_id: BufferId,
+    /// Keep the current anchor and move only the cursor head onto the match (`Shift-n` /
+    /// `Shift-Alt-n`), so the selection grows from the anchor to the match. When false the
+    /// navigation re-selects just the match (anchor at its start, head at its end).
+    pub extend: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

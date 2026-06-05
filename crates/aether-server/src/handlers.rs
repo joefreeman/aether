@@ -1069,7 +1069,7 @@ pub async fn search_next(
     ctx: &mut ConnectionCtx,
     params: SearchNavParams,
 ) -> Result<SearchNavResult, RpcError> {
-    search_navigate(state, ctx, params.buffer_id, Direction::Forward).await
+    search_navigate(state, ctx, params.buffer_id, Direction::Forward, params.extend).await
 }
 
 pub async fn search_prev(
@@ -1077,7 +1077,7 @@ pub async fn search_prev(
     ctx: &mut ConnectionCtx,
     params: SearchNavParams,
 ) -> Result<SearchNavResult, RpcError> {
-    search_navigate(state, ctx, params.buffer_id, Direction::Backward).await
+    search_navigate(state, ctx, params.buffer_id, Direction::Backward, params.extend).await
 }
 
 async fn search_navigate(
@@ -1085,6 +1085,7 @@ async fn search_navigate(
     ctx: &mut ConnectionCtx,
     buffer_id: BufferId,
     direction: Direction,
+    extend: bool,
 ) -> Result<SearchNavResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -1114,26 +1115,40 @@ async fn search_navigate(
         });
     }
 
-    // Use the leftmost end of the current selection as the reference, so a `prev` from a match
-    // doesn't re-select the current match. If the cursor isn't on a match, pick the natural
-    // direction from the cursor's position.
+    // Find the next/prev match relative to the selection's *far edge in the travel direction* — the
+    // right end going forward, the left end going backward. This is the cursor/head in the normal
+    // case (a selection oriented the way you're travelling), so navigation proceeds from where the
+    // cursor is. But using the far edge rather than the head directly means a direction reversal off
+    // a match (e.g. `n` then `Alt-n`) steps to the adjacent match instead of re-selecting the one
+    // you're on, and a plain `n`/`prev` after a multi-match `Shift`-extend steps off the *whole*
+    // selection instead of landing back inside it. Extend uses the same reference, so both paths
+    // keep making progress for free.
     let current = s.cursors.get(&key).copied().unwrap_or_default();
-    let reference = selection_start(&current);
-    let target = match direction {
+    let reference = match direction {
+        Direction::Forward => selection_end(&current),
+        Direction::Backward => selection_start(&current),
+    };
+    // Find the match strictly past the reference in the travel direction. If there isn't one we
+    // wrap to the far end — and remember that we wrapped, so an extend can reset instead of growing
+    // across the boundary (see the orientation block below).
+    let found = match direction {
         Direction::Forward => entry
             .matches
             .iter()
             .copied()
-            .find(|(start, _)| pos_tuple(*start) > pos_tuple(reference))
-            .or_else(|| entry.matches.first().copied()),
+            .find(|(start, _)| pos_tuple(*start) > pos_tuple(reference)),
         Direction::Backward => entry
             .matches
             .iter()
             .rev()
             .copied()
-            .find(|(start, _)| pos_tuple(*start) < pos_tuple(reference))
-            .or_else(|| entry.matches.last().copied()),
+            .find(|(start, _)| pos_tuple(*start) < pos_tuple(reference)),
     };
+    let wrapped = found.is_none();
+    let target = found.or_else(|| match direction {
+        Direction::Forward => entry.matches.first().copied(),
+        Direction::Backward => entry.matches.last().copied(),
+    });
     let Some((start, end_excl)) = target else {
         return Ok(SearchNavResult {
             cursor: current,
@@ -1141,14 +1156,40 @@ async fn search_navigate(
         });
     };
 
-    // Place anchor at start, cursor at the last char of the match. We compute the inclusive end
-    // here (one char before the exclusive end) using char-index arithmetic, mirroring how
-    // `Char` motion does it — that way multi-byte matches stay on char boundaries.
+    // Resolve the match's char bounds. We compute the inclusive end here (one char before the
+    // exclusive end) using char-index arithmetic, mirroring how `Char` motion does it — that way
+    // multi-byte matches stay on char boundaries.
     let start_char = motion::pos_to_char(buf, start);
     let end_char_excl = motion::pos_to_char(buf, end_excl);
     let last_char = end_char_excl.saturating_sub(1).max(start_char);
-    let position = motion::char_to_pos(buf, last_char);
-    let anchor_pos = motion::char_to_pos(buf, start_char);
+    // Non-extend re-selects just the match, oriented by travel direction: going forward the anchor
+    // sits at the start and the head leads on the last char; going backward they swap so the head
+    // leads on the start char (cursor before anchor). The orientation comes purely from `direction`,
+    // so a wrap doesn't flip it — a forward `n` that wraps end→start stays forward-oriented, a
+    // backward `prev` that wraps start→end stays backward-oriented. Either way the leftmost end is
+    // still the match start, so the `selection_start` reference above keeps making progress.
+    //
+    // Extend pins the anchor and lands the head on the match's near edge in the travel direction —
+    // the last char going forward (so the selection covers through the match), the first char going
+    // back — re-anchoring via `extend_anchor` so reversing direction grows the selection instead of
+    // discarding the span already covered on the far side. A wrap is the exception: growing the
+    // anchor across the document boundary would engulf the whole span from the wrapped match through
+    // the old position, so on wrap we fall through to the non-extend reset and select just the
+    // target match, letting the user start a fresh selection from the far end.
+    let start_pos = motion::char_to_pos(buf, start_char);
+    let last_pos = motion::char_to_pos(buf, last_char);
+    let (anchor_pos, position) = if extend && !wrapped {
+        let head = match direction {
+            Direction::Forward => last_pos,
+            Direction::Backward => start_pos,
+        };
+        (extend_anchor(&current, head), head)
+    } else {
+        match direction {
+            Direction::Forward => (start_pos, last_pos),
+            Direction::Backward => (last_pos, start_pos),
+        }
+    };
     let new_cursor = CursorState {
         position,
         anchor: anchor_pos,
@@ -1185,6 +1226,33 @@ fn selection_start(c: &CursorState) -> LogicalPosition {
     }
 }
 
+fn selection_end(c: &CursorState) -> LogicalPosition {
+    if pos_tuple(c.anchor) > pos_tuple(c.position) {
+        c.anchor
+    } else {
+        c.position
+    }
+}
+
+/// New anchor for an *extending* move whose cursor lands on `head`. Normally the anchor is kept, so
+/// the selection is the usual `[anchor, head]`. But when `head` falls on the opposite side of the
+/// anchor from the *current* cursor — a direction reversal across the pivot — keeping the anchor
+/// would throw away the span the selection already covered on the old side. In that case we
+/// re-anchor to the previous cursor position so the move grows the selection rather than collapsing
+/// it across the pivot. The decision is based purely on where `head` lands relative to the current
+/// selection, so it's independent of which binding (next/prev, etc.) drove the move.
+fn extend_anchor(current: &CursorState, head: LogicalPosition) -> LogicalPosition {
+    let a = pos_tuple(current.anchor);
+    let c = pos_tuple(current.position);
+    let h = pos_tuple(head);
+    let crosses_pivot = (c < a && h > a) || (c > a && h < a);
+    if crosses_pivot {
+        current.position
+    } else {
+        current.anchor
+    }
+}
+
 fn pos_tuple(p: LogicalPosition) -> (u32, u32) {
     (p.line, p.col)
 }
@@ -1211,8 +1279,14 @@ fn summary_for(
 /// against the match's single char. Comparing both endpoints means the counter only shows
 /// when the user is genuinely "on" a match — extending or shrinking the selection drops it.
 fn match_index_for_cursor(buf: &Buffer, entry: &SearchEntry, cursor: &CursorState) -> u32 {
+    // Normalize the selection's two endpoints to [lo, hi] so the check is orientation-agnostic: a
+    // match counts as "current" whether the selection is forward-oriented (anchor at start, head at
+    // last char) or backward-oriented (head at start, anchor at last char), since both cover exactly
+    // the match. Extending or shrinking past the match's bounds still drops the index.
     let pos_char = motion::pos_to_char(buf, cursor.position);
     let anchor_char = motion::pos_to_char(buf, cursor.anchor);
+    let sel_lo = pos_char.min(anchor_char);
+    let sel_hi = pos_char.max(anchor_char);
     entry
         .matches
         .iter()
@@ -1220,7 +1294,7 @@ fn match_index_for_cursor(buf: &Buffer, entry: &SearchEntry, cursor: &CursorStat
             let m_start_char = motion::pos_to_char(buf, *start);
             let m_end_char = motion::pos_to_char(buf, *end_excl);
             let m_last_char = m_end_char.saturating_sub(1);
-            anchor_char == m_start_char && pos_char == m_last_char
+            sel_lo == m_start_char && sel_hi == m_last_char
         })
         .map(|i| (i as u32).saturating_add(1))
         .unwrap_or(0)

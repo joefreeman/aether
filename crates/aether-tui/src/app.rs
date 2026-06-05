@@ -1446,7 +1446,7 @@ async fn run_action(
         // ---- search ----
         Action::EnterSearch => enter_search_mode(client, state).await?,
         Action::SearchFromSelection => search_from_selection(client, state).await?,
-        Action::SearchCycle(dir) => search_cycle(client, state, dir, count).await?,
+        Action::SearchCycle(dir) => search_cycle(client, state, dir, count, extend).await?,
         Action::SearchAbort => abort_search(client, state).await?,
         Action::SearchCommit => commit_search(state),
         Action::SearchHistoryPrev => {
@@ -3330,6 +3330,7 @@ async fn search_cycle(
     state: &mut AppState,
     direction: Direction,
     count: u32,
+    extend: bool,
 ) -> Result<()> {
     if !state.ed_mut().search.active {
         // No active search: revive the most recent history entry server-side, then cycle.
@@ -3361,6 +3362,7 @@ async fn search_cycle(
     for _ in 0..count.max(1) {
         let params = SearchNavParams {
             buffer_id: state.ed_mut().buffer_id,
+            extend,
         };
         let result = match direction {
             Direction::Forward => client.rpc::<SearchNext>(params).await?,

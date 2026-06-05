@@ -34,8 +34,8 @@ Type `Space ?` for the in-app overlay. Holding the Shift key extends the selecti
 | `w`/`Alt-w` | Big/small word forward |
 | `b`/`Alt-b` | Big/small word backward |
 | `e`/`Alt-e` | Big/small word end |
-| `0`/`Home` | Logical line start |
-| `Alt-l`/`End` | Logical line end |
+| `0`, `Home` | Logical line start |
+| `Alt-l`, `End` | Logical line end |
 | `Alt-h` | First non-blank of line |
 | `g`/`Alt-g` | Go to line (count, default 1)/last line |
 | `d`/`Alt-d` | Cursor down a page/half page |

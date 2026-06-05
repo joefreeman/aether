@@ -6795,15 +6795,15 @@ async fn search_next_cycles_forward_and_wraps() {
     )
     .await;
     let r1: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id }).await;
+        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
     assert_eq!(r1.summary.current_index, 2);
     assert_eq!(r1.cursor.anchor, LogicalPosition { line: 0, col: 8 });
     let r2: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
+        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: false }).await;
     assert_eq!(r2.summary.current_index, 3);
     // Wrap.
     let r3: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 13, &SearchNavParams { buffer_id }).await;
+        send_request::<SearchNext>(&mut ws, 13, &SearchNavParams { buffer_id, extend: false }).await;
     assert_eq!(r3.summary.current_index, 1);
 
     drop(server);
@@ -6824,8 +6824,319 @@ async fn search_prev_cycles_backward_with_wrap() {
     .await;
     // From the first match, prev wraps to the last.
     let r: SearchNavResult =
-        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id }).await;
+        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
     assert_eq!(r.summary.current_index, 3);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_prev_orients_backward() {
+    // Matches of "foo": (0,0)..(0,2), (0,8)..(0,10), (1,0)..(1,2).
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 8 }),
+        },
+    )
+    .await;
+    // Backward (non-extend) re-selects the previous match oriented by travel direction: the head
+    // leads on the start char (cursor before anchor), the anchor trails on the last char.
+    let r: SearchNavResult =
+        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    assert_eq!(r.summary.current_index, 1);
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_next_wrap_stays_forward_oriented() {
+    // Matches of "foo": (0,0)..(0,2), (0,8)..(0,10), (1,0)..(1,2).
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 1, col: 0 }),
+        },
+    )
+    .await;
+    // From the last match, forward `next` wraps physically backward to the first match — but the
+    // orientation follows logical travel (forward), so it stays forward-oriented: anchor on the
+    // start, head on the last char. The wrap doesn't flip orientation.
+    let r: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    assert_eq!(r.summary.current_index, 1);
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_prev_wrap_stays_backward_oriented() {
+    // Matches of "foo": (0,0)..(0,2), (0,8)..(0,10), (1,0)..(1,2).
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
+    // From the first match, backward `prev` wraps physically forward to the last match — orientation
+    // still follows logical travel (backward), so it stays backward-oriented: head on the start,
+    // anchor on the last char.
+    let r: SearchNavResult =
+        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    assert_eq!(r.summary.current_index, 3);
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 2 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_backward_oriented_then_extend_forward_grows_over_both() {
+    // Matches of "foo": (0,0)..(0,2), (0,8)..(0,10), (1,0)..(1,2). Land on the second match, step
+    // back (non-extend) to the first — leaving a backward-oriented selection — then extend forward.
+    // The forward extend must reach back across the pivot and grow to cover both matches rather than
+    // collapsing onto just the second.
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 8 }),
+        },
+    )
+    .await;
+    // Alt-n: backward-oriented selection of the first match — anchor (0,2), head (0,0).
+    let back: SearchNavResult =
+        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    assert_eq!(back.cursor.anchor, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(back.cursor.position, LogicalPosition { line: 0, col: 0 });
+    // Shift-n: extend forward to the second match. Crosses the pivot, re-anchors to the previous
+    // head (0,0), so the selection grows to (0,0)..(0,10) — both matches covered, not just the second.
+    let fwd: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: true }).await;
+    assert_eq!(fwd.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(fwd.cursor.position, LogicalPosition { line: 0, col: 10 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_extend_resets_to_single_match_on_wrap() {
+    // Four matches of "foo". Extend forward across the first three, then one more extend past the end
+    // wraps to the first match — and instead of ballooning the selection across the wrap boundary it
+    // resets to just the first match (forward-oriented), letting the user start a fresh selection.
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo foo bar foo baz foo\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+        },
+    )
+    .await;
+    // Start on the second match (0,4). Extend forward twice: spans matches 2..4 (0,4)..(0,22).
+    let _: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: true }).await;
+    let pre: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: true }).await;
+    assert_eq!(pre.cursor.anchor, LogicalPosition { line: 0, col: 4 });
+    assert_eq!(pre.cursor.position, LogicalPosition { line: 0, col: 22 });
+    // One more extend wraps past the end. Rather than re-anchoring across the wrap (which would
+    // engulf (0,0)..(0,22)), it resets to just the first match, forward-oriented.
+    let wrap: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 13, &SearchNavParams { buffer_id, extend: true }).await;
+    assert_eq!(wrap.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(wrap.cursor.position, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(wrap.summary.current_index, 1);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
+    // Matches of "foo": (0,0)..(0,2), (0,8)..(0,10), (1,0)..(1,2). `next` to the second match leaves
+    // a forward-oriented selection (head on the right). Immediately reversing with `prev` must step
+    // to the *first* match, not re-select the second — i.e. one keypress moves you, not two.
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
+    // On the first match; `next` → second match (forward-oriented, head at (0,10)).
+    let fwd: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    assert_eq!(fwd.summary.current_index, 2);
+    // Reverse: `prev` steps to the first match, not back onto the second.
+    let back: SearchNavResult =
+        send_request::<SearchPrev>(&mut ws, 12, &SearchNavParams { buffer_id, extend: false }).await;
+    assert_eq!(back.summary.current_index, 1);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_plain_next_steps_off_multi_match_extend_selection() {
+    // Four matches of "foo". Extend across the first two, then a plain (non-extend) `next` must step
+    // off the *whole* selection to the third match — not land back inside it on the second.
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("foo foo bar foo baz foo\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
+    // Extend forward: selection now spans the first two matches (anchor (0,0), head (0,6)).
+    let _: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: true }).await;
+    // Plain next: steps off the whole selection to the third match at (0,12), not the second (0,4).
+    let r: SearchNavResult =
+        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: false }).await;
+    assert_eq!(r.summary.current_index, 3);
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 12 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 14 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_next_extend_keeps_anchor_and_grows_selection() {
+    // Matches of "foo": (0,0), (0,8), (1,0).
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+        },
+    )
+    .await;
+    // Cursor sits on the first match: anchor (0,0), head (0,2).
+    // Extend-next pins the anchor and moves only the head onto the second match's end.
+    let r1: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        11,
+        &SearchNavParams { buffer_id, extend: true },
+    )
+    .await;
+    assert_eq!(r1.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(r1.cursor.position, LogicalPosition { line: 0, col: 10 });
+    // Spanning two matches → not "on" a single match, so the index counter blanks.
+    assert_eq!(r1.summary.current_index, 0);
+    // A second extend-next keeps the same anchor and steps the head to the third match — i.e. it
+    // makes progress rather than re-finding the second match.
+    let r2: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        12,
+        &SearchNavParams { buffer_id, extend: true },
+    )
+    .await;
+    assert_eq!(r2.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(r2.cursor.position, LogicalPosition { line: 1, col: 2 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_prev_extend_keeps_anchor_and_grows_backward() {
+    // Matches of "foo": (0,0), (0,8), (1,0).
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 1, col: 0 }),
+        },
+    )
+    .await;
+    // Cursor sits on the third match: anchor (1,0), head (1,2). Extend-prev moves the head back to
+    // the second match's start. Because that crosses the pivot (the head jumps from the right of the
+    // anchor to its left), the anchor re-pins to the previous cursor position (1,2) so the third
+    // match stays fully covered — the selection becomes (0,8)..(1,2), not (0,8)..(1,0).
+    let r: SearchNavResult = send_request::<SearchPrev>(
+        &mut ws,
+        11,
+        &SearchNavParams { buffer_id, extend: true },
+    )
+    .await;
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 2 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 8 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
+    // Matches of "foo": (0,0), (0,8), (1,0). Start on the middle match, extend backward, then
+    // forward. Each reversal crosses the pivot, so the anchor re-pins to the previous cursor and the
+    // selection keeps growing outward rather than collapsing back across the anchor.
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo bar foo baz\nfoo qux\n").await;
+    let _ = send_request::<SearchSet>(
+        &mut ws,
+        10,
+        &SearchSetParams {
+            buffer_id,
+            query: "foo".into(),
+            anchor: Some(LogicalPosition { line: 0, col: 8 }),
+        },
+    )
+    .await;
+    // On the second match: anchor (0,8), head (0,10). Extend-prev to the first match crosses the
+    // pivot → anchor re-pins to (0,10), selection (0,0)..(0,10) (both matches covered).
+    let back: SearchNavResult = send_request::<SearchPrev>(
+        &mut ws,
+        11,
+        &SearchNavParams { buffer_id, extend: true },
+    )
+    .await;
+    assert_eq!(back.cursor.anchor, LogicalPosition { line: 0, col: 10 });
+    assert_eq!(back.cursor.position, LogicalPosition { line: 0, col: 0 });
+    // Now extend forward to the third match. This reverses again and crosses the pivot, so the
+    // anchor re-pins to the previous cursor (0,0): the selection grows to (0,0)..(1,2), covering all
+    // three matches, rather than shrinking back to just the third.
+    let fwd: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        12,
+        &SearchNavParams { buffer_id, extend: true },
+    )
+    .await;
+    assert_eq!(fwd.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(fwd.cursor.position, LogicalPosition { line: 1, col: 2 });
 
     drop(server);
 }
@@ -6846,7 +7157,7 @@ async fn search_clear_removes_active_search() {
     let _: () = send_request::<SearchClear>(&mut ws, 11, &SearchClearParams { buffer_id }).await;
     // After clear, n/prev should report no matches.
     let r: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id }).await;
+        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: false }).await;
     assert_eq!(r.summary.total, 0);
 
     drop(server);
