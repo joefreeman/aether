@@ -9,6 +9,7 @@ mod git;
 mod grep;
 mod handlers;
 mod indent;
+mod lsp;
 mod picker;
 mod server;
 mod state;

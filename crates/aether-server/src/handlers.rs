@@ -45,13 +45,19 @@ use aether_protocol::git::{
     GitBlameLineParams, GitBlameLineResult, GitNavigateHunkParams, GitNavigateHunkResult,
     GitSetDiffViewParams, HunkDirection,
 };
+use aether_protocol::lsp::{
+    DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
+    LspDiagnosticsChangedParams, LspFormatResult, LspGotoDefinitionResult, LspHoverResult,
+    LspLocation, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServerParams,
+    LspServerStatusParams, LspServerStatusResult, LspStatus,
+};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
     SearchSetResult, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::viewport::{
-    DiffMarker, LogicalLineRange, LogicalLineRender, ViewportLinesChanged,
+    DiagnosticSpan, DiffMarker, LogicalLineRange, LogicalLineRender, ViewportLinesChanged,
     ViewportLinesChangedParams, ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams,
     ViewportSubscribeParams, ViewportSubscribeResult, ViewportUnsubscribeParams,
     ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
@@ -732,6 +738,7 @@ pub async fn buffer_open(
             scratch_number,
             cursor,
             scroll,
+            lsp_server: buffer_lsp_server_ref(&s, buffer_id),
         };
         s.touch_mru(buffer_id);
         let pushes = refresh_buffer_pickers(&mut s);
@@ -762,6 +769,7 @@ pub async fn buffer_open(
                 scratch_number: Some(scratch_number),
                 cursor,
                 scroll,
+                lsp_server: None, // scratch buffers are never language-server-backed
             };
             s.buffers.insert(id, buf);
             s.buffer_projects.insert(id, active_project_name.clone());
@@ -860,6 +868,7 @@ pub async fn buffer_open(
                 scratch_number: None,
                 cursor,
                 scroll,
+                lsp_server: buffer_lsp_server_ref(&s, existing),
             };
             s.touch_mru(existing);
             let pushes = refresh_buffer_pickers(&mut s);
@@ -893,6 +902,44 @@ pub async fn buffer_open(
     s.buffer_projects.insert(id, active_project_name.clone());
     s.git_baseline.insert(id, git_baseline);
     s.git_hunks.insert(id, git_hunks);
+
+    // LSP: ensure a language server for this file's language and open the document against it.
+    // `ensure` returns a launch request when it created a fresh (Starting) handle; we spawn the
+    // handshake task after releasing the lock. `notify_open` is a no-op until the server is ready —
+    // the launch task opens every registered buffer once the handshake lands.
+    let mut lsp_launch: Option<(
+        crate::lsp::manager::LspServerKey,
+        crate::lsp::config::LspServerSpec,
+        u64,
+    )> = None;
+    if let Some(language) = s.buffers[&id].language.clone() {
+        if let Some(spec) = crate::lsp::config::server_spec(&language) {
+            let roots = s
+                .projects
+                .get(&active_project_name)
+                .map(|p| p.paths.clone())
+                .unwrap_or_default();
+            let root = crate::lsp::manager::discover_root(
+                &canonical,
+                spec.root_markers,
+                crate::lsp::config::workspace_marker(&language),
+                &roots,
+            );
+            let key = crate::lsp::manager::LspServerKey {
+                root,
+                language: language.clone(),
+            };
+            if let Some(generation) = s.lsp.ensure(&key, spec.command) {
+                lsp_launch = Some((key.clone(), spec, generation));
+            }
+            s.lsp.register_doc(id, &key);
+            let uri = crate::lsp::uri::path_to_uri(&canonical);
+            let text = s.buffers[&id].text.to_string();
+            let version = s.buffers[&id].revision as i64;
+            s.lsp.notify_open(id, &key, &uri, &language, version, &text);
+        }
+    }
+
     let cursor = match client_id {
         Some(c) => wrap_for_response(&s, c, id, cursor),
         None => cursor,
@@ -910,10 +957,14 @@ pub async fn buffer_open(
         scratch_number: None,
         cursor,
         scroll,
+        lsp_server: buffer_lsp_server_ref(&s, id),
     };
     s.touch_mru(id);
     let pushes = refresh_buffer_pickers(&mut s);
     drop(s);
+    if let Some((key, spec, generation)) = lsp_launch {
+        tokio::spawn(crate::lsp::manager::launch(state.clone(), key, spec, generation));
+    }
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
@@ -1003,6 +1054,7 @@ pub async fn git_set_diff_view(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let hunks = buffer_hunks(&s, buffer_id);
+    let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
         buf,
@@ -1016,6 +1068,7 @@ pub async fn git_set_diff_view(
         search,
         params.enabled,
         hunks,
+        diagnostics,
     );
 
     let vp = s
@@ -1095,6 +1148,558 @@ pub async fn git_navigate_hunk(
     })
 }
 
+// ---- lsp/* --------------------------------------------------------------------------------------
+
+/// Status of every language server in the client's active project. Drives the LSP status dialog.
+pub async fn lsp_server_status(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    _params: LspServerStatusParams,
+) -> Result<LspServerStatusResult, RpcError> {
+    let s = state.lock().await;
+    let roots = s.active_project_or_err(ctx.client_id)?.paths.clone();
+    Ok(LspServerStatusResult {
+        servers: s.lsp.status_for_roots(&roots),
+    })
+}
+
+/// Restart the language server(s) for a language in the client's active project.
+pub async fn lsp_restart_server(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: LspRestartServerParams,
+) -> Result<(), RpcError> {
+    let roots = {
+        let s = state.lock().await;
+        s.active_project_or_err(ctx.client_id)?.paths.clone()
+    };
+    crate::lsp::manager::restart(state, &params.language, &roots).await;
+    Ok(())
+}
+
+/// Everything needed to issue a cursor-positioned LSP request: a cloned client for the buffer's
+/// (ready) server, the document URI, and the cursor mapped into the server's position encoding.
+struct LspCursorRequest {
+    client: crate::lsp::client::LspClient,
+    uri: String,
+    line: u32,
+    character: u32,
+    encoding: crate::lsp::position::PositionEncoding,
+}
+
+/// Resolve [`LspCursorRequest`] for `client_id`'s cursor in `buffer_id`, or `None` if the buffer
+/// isn't file-backed or has no ready language server. Runs under the state lock; the caller must
+/// drop the lock before awaiting the request (the LSP round-trip must not hold it).
+fn lsp_cursor_request(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Option<LspCursorRequest> {
+    let buf = s.buffers.get(&buffer_id)?;
+    let path = buf.canonical_path.as_deref()?;
+    let key = s.lsp.doc_server.get(&buffer_id)?;
+    let handle = s.lsp.servers.get(key)?;
+    if !matches!(handle.status, LspStatus::Ready) {
+        return None;
+    }
+    let client = handle.client.clone()?;
+    let encoding = handle.position_encoding;
+    let pos = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default()
+        .position;
+    let line_text = line_text_no_newline(buf, pos.line);
+    let character = crate::lsp::position::byte_to_lsp(&line_text, pos.col as usize, encoding);
+    Some(LspCursorRequest {
+        client,
+        uri: crate::lsp::uri::path_to_uri(path),
+        line: pos.line,
+        character,
+        encoding,
+    })
+}
+
+/// The `(language, workspace_root)` of the language server backing `buffer_id`, if one is attached.
+/// Read from the LSP doc routing, so it's correct on first open and reopen alike. The client uses
+/// it to show this buffer's server health (servers are keyed by `(language, workspace_root)`).
+fn buffer_lsp_server_ref(
+    s: &ServerState,
+    buffer_id: BufferId,
+) -> Option<aether_protocol::lsp::LspServerRef> {
+    s.lsp.doc_server.get(&buffer_id).map(|key| aether_protocol::lsp::LspServerRef {
+        language: key.language.clone(),
+        workspace_root: key.root.display().to_string(),
+    })
+}
+
+/// A buffer line's text without its trailing newline; empty if `line` is past the end.
+fn line_text_no_newline(buf: &Buffer, line: u32) -> String {
+    if line as usize >= buf.text.len_lines() {
+        return String::new();
+    }
+    let mut s: String = buf.text.line(line as usize).chunks().collect();
+    while s.ends_with('\n') || s.ends_with('\r') {
+        s.pop();
+    }
+    s
+}
+
+/// Hover info at the cursor. Returns empty when there's no ready server or the server has nothing.
+pub async fn lsp_hover(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: LspBufferParams,
+) -> Result<LspHoverResult, RpcError> {
+    let req = {
+        let s = state.lock().await;
+        lsp_cursor_request(&s, ctx.client_id, params.buffer_id)
+    };
+    let Some(req) = req else {
+        return Ok(LspHoverResult { contents: None });
+    };
+    let params_json = serde_json::json!({
+        "textDocument": { "uri": req.uri },
+        "position": { "line": req.line, "character": req.character },
+    });
+    let contents = match req.client.request("textDocument/hover", params_json).await {
+        Ok(v) => parse_hover_contents(&v),
+        Err(e) => {
+            tracing::debug!(error = %e, "lsp hover request failed");
+            None
+        }
+    };
+    Ok(LspHoverResult { contents })
+}
+
+/// Definition location for the symbol at the cursor. Returns `None` when there's no ready server
+/// or the server resolves nothing.
+pub async fn lsp_goto_definition(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: LspBufferParams,
+) -> Result<LspGotoDefinitionResult, RpcError> {
+    let req = {
+        let s = state.lock().await;
+        lsp_cursor_request(&s, ctx.client_id, params.buffer_id)
+    };
+    let Some(req) = req else {
+        return Ok(LspGotoDefinitionResult { location: None });
+    };
+    let params_json = serde_json::json!({
+        "textDocument": { "uri": req.uri },
+        "position": { "line": req.line, "character": req.character },
+    });
+    let location = match req.client.request("textDocument/definition", params_json).await {
+        Ok(v) => parse_definition(&v, req.encoding),
+        Err(e) => {
+            tracing::debug!(error = %e, "lsp definition request failed");
+            None
+        }
+    };
+    Ok(LspGotoDefinitionResult { location })
+}
+
+/// Jump the cursor to the next/previous diagnostic in the buffer. The server holds the diagnostics,
+/// so it resolves the target and moves the cursor authoritatively (mirrors [`git_navigate_hunk`]).
+pub async fn lsp_navigate_diagnostic(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: LspNavigateDiagnosticParams,
+) -> Result<LspNavigateDiagnosticResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    if !s.buffers.contains_key(&params.buffer_id) {
+        return Err(RpcError::buffer_not_found(params.buffer_id));
+    }
+    let key = (client_id, params.buffer_id);
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
+
+    let target = navigate_diagnostic_target(
+        buffer_diagnostics(&s, params.buffer_id),
+        params.from_line,
+        params.direction,
+    );
+    let Some(target) = target else {
+        let response = wrap_for_response(&s, client_id, params.buffer_id, current);
+        return Ok(LspNavigateDiagnosticResult {
+            cursor: response,
+            moved: false,
+        });
+    };
+
+    let buf = &s.buffers[&params.buffer_id];
+    let position = motion::clamp_position(buf, target);
+    let result = CursorState {
+        position,
+        anchor: position,
+        match_bracket: None,
+        grep_position: None,
+    };
+    s.cursors.insert(key, result);
+    s.record_motion(key, current, result);
+    s.virtual_col.remove(&key);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let response = wrap_for_response(&s, client_id, params.buffer_id, result);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
+    Ok(LspNavigateDiagnosticResult {
+        cursor: response,
+        moved: true,
+    })
+}
+
+/// The position of the nearest diagnostic strictly beyond `from_line` in `direction`, or `None` if
+/// there's none that way. Diagnostics are compared by their start position (line then byte column),
+/// so the jump lands on the diagnostic's column; like hunk navigation it's line-granular — a second
+/// diagnostic on the cursor's own line isn't a separate stop.
+fn navigate_diagnostic_target(
+    diags: &[crate::lsp::diagnostics::BufferDiagnostic],
+    from_line: u32,
+    direction: DiagnosticDirection,
+) -> Option<LogicalPosition> {
+    let mut anchors: Vec<LogicalPosition> = diags.iter().map(|d| d.start).collect();
+    anchors.sort_by_key(|p| (p.line, p.col));
+    anchors.dedup();
+    match direction {
+        DiagnosticDirection::Next => anchors.iter().find(|p| p.line > from_line).copied(),
+        DiagnosticDirection::Prev => anchors.iter().rev().find(|p| p.line < from_line).copied(),
+    }
+}
+
+/// Everything needed to issue a whole-document formatting request: the ready server's client, the
+/// document URI + negotiated encoding, the buffer revision at request time (to detect a concurrent
+/// edit), and the LSP formatting options derived from the buffer's indent style.
+struct LspFormatReq {
+    client: crate::lsp::client::LspClient,
+    uri: String,
+    encoding: crate::lsp::position::PositionEncoding,
+    revision: Revision,
+    tab_size: u32,
+    insert_spaces: bool,
+}
+
+/// Outcome of resolving a format request before the round-trip — lets `lsp_format` report a
+/// specific reason rather than a catch-all.
+enum FormatResolve {
+    Ready(LspFormatReq),
+    /// A server for this language exists but isn't `Ready` yet.
+    NotReady,
+    /// The attached server crashed or was stopped.
+    Unavailable,
+    /// No formatter: no server attached / not file-backed, or the ready server doesn't advertise
+    /// `documentFormattingProvider`.
+    Unsupported,
+}
+
+fn lsp_format_resolve(s: &ServerState, buffer_id: BufferId) -> FormatResolve {
+    let Some(buf) = s.buffers.get(&buffer_id) else { return FormatResolve::Unsupported };
+    let Some(path) = buf.canonical_path.as_deref() else { return FormatResolve::Unsupported };
+    let Some(key) = s.lsp.doc_server.get(&buffer_id) else { return FormatResolve::Unsupported };
+    let Some(handle) = s.lsp.servers.get(key) else { return FormatResolve::Unsupported };
+    match handle.status {
+        LspStatus::Ready => {}
+        LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => {
+            return FormatResolve::NotReady
+        }
+        LspStatus::Crashed { .. } | LspStatus::Stopped => return FormatResolve::Unavailable,
+    }
+    if !handle.document_formatting {
+        return FormatResolve::Unsupported;
+    }
+    let Some(client) = handle.client.clone() else { return FormatResolve::Unsupported };
+    let (tab_size, insert_spaces) = match buf.indent_style {
+        crate::indent::IndentStyle::Tab => (4, false),
+        crate::indent::IndentStyle::Spaces(n) => (n as u32, true),
+    };
+    FormatResolve::Ready(LspFormatReq {
+        client,
+        uri: crate::lsp::uri::path_to_uri(path),
+        encoding: handle.position_encoding,
+        revision: buf.revision,
+        tab_size,
+        insert_spaces,
+    })
+}
+
+/// Format the whole buffer via `textDocument/formatting`. Resolves the server and captures the
+/// document version under the lock, drops the lock for the round-trip, then re-locks and applies
+/// the returned edits as a single whole-document replacement (one undo step), re-pushing the
+/// affected viewports — mirrors the undo/redo whole-rope-swap path.
+pub async fn lsp_format(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: LspBufferParams,
+) -> Result<LspFormatResult, RpcError> {
+    let client_id = ctx.client_id;
+    let buffer_id = params.buffer_id;
+
+    // Echo the current (possibly soft-wrap-adjusted) cursor with a non-`Applied` status.
+    let outcome = |s: &ServerState, status: FormatStatus| -> LspFormatResult {
+        let cursor = s
+            .cursors
+            .get(&(client_id, buffer_id))
+            .copied()
+            .unwrap_or_default();
+        LspFormatResult {
+            cursor: wrap_for_response(s, client_id, buffer_id, cursor),
+            status,
+        }
+    };
+
+    let resolved = {
+        let s = state.lock().await;
+        lsp_format_resolve(&s, buffer_id)
+    };
+    let req = match resolved {
+        FormatResolve::Ready(req) => req,
+        FormatResolve::NotReady => {
+            let s = state.lock().await;
+            return Ok(outcome(&s, FormatStatus::NotReady));
+        }
+        FormatResolve::Unavailable => {
+            let s = state.lock().await;
+            return Ok(outcome(&s, FormatStatus::Unavailable));
+        }
+        FormatResolve::Unsupported => {
+            let s = state.lock().await;
+            return Ok(outcome(&s, FormatStatus::Unsupported));
+        }
+    };
+
+    let params_json = serde_json::json!({
+        "textDocument": { "uri": req.uri },
+        "options": { "tabSize": req.tab_size, "insertSpaces": req.insert_spaces },
+    });
+    let edits = match req.client.request("textDocument/formatting", params_json).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "lsp format request failed");
+            let s = state.lock().await;
+            return Ok(outcome(&s, FormatStatus::NoChange));
+        }
+    };
+
+    let mut s = state.lock().await;
+    let Some(buf) = s.buffers.get(&buffer_id) else {
+        return Err(RpcError::buffer_not_found(buffer_id));
+    };
+    // Edits were computed against `req.revision`; if the buffer moved under us, they're stale.
+    if buf.revision != req.revision {
+        return Ok(outcome(&s, FormatStatus::NoChange));
+    }
+    let Some(new_text) = apply_lsp_text_edits(&buf.text, &edits, req.encoding) else {
+        return Ok(outcome(&s, FormatStatus::NoChange));
+    };
+    if buf.text == new_text.as_str() {
+        return Ok(outcome(&s, FormatStatus::NoChange)); // formatter produced identical text
+    }
+
+    // Apply as one whole-document replacement (single undo step), then refresh like undo/redo.
+    let was_dirty = buf.dirty;
+    let old_len = buf.text.len_chars();
+    let cursors_before: HashMap<ClientId, CursorState> = s
+        .cursors
+        .iter()
+        .filter_map(|((c, b), cs)| (*b == buffer_id).then_some((*c, *cs)))
+        .collect();
+    let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+    let revision = buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Format, cursors_before);
+
+    // Clamp every cursor on the buffer into the reformatted rope.
+    let cursor_ids: Vec<ClientId> = s
+        .cursors
+        .keys()
+        .filter_map(|(c, b)| (*b == buffer_id).then_some(*c))
+        .collect();
+    for cid in cursor_ids {
+        if let Some(cur) = s.cursors.get(&(cid, buffer_id)).copied() {
+            let clamped = clamp_cursor(&s.buffers[&buffer_id], cur);
+            s.cursors.insert((cid, buffer_id), clamped);
+        }
+    }
+    s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_tree_selection_history_for_buffer(buffer_id);
+    s.clear_virtual_col_for_buffer(buffer_id);
+
+    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let new_line_count = s.buffers[&buffer_id].line_count();
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    notify_lsp_change(&mut s, buffer_id);
+
+    let buf_ref = &s.buffers[&buffer_id];
+    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    for vp in s.viewports.values() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        let search = s.searches.get(&(vp.client_id, buffer_id));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
+        ));
+    }
+    let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+
+    let result_cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
+    let result_cursor = wrap_for_response(&s, client_id, buffer_id, result_cursor);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in search_summary_pushes {
+        let _ = sender.send(notif).await;
+    }
+    for (sender, notif) in picker_pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(LspFormatResult {
+        cursor: result_cursor,
+        status: FormatStatus::Applied,
+    })
+}
+
+/// Apply an LSP `TextEdit[]` to `text`, returning the resulting full document, or `None` when the
+/// array is empty/absent or an edit is malformed. Edits are non-overlapping per the spec; applied
+/// in descending start order so earlier byte offsets stay valid.
+fn apply_lsp_text_edits(
+    text: &ropey::Rope,
+    edits: &serde_json::Value,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> Option<String> {
+    let arr = edits.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut byte_edits: Vec<(usize, usize, &str)> = Vec::with_capacity(arr.len());
+    for e in arr {
+        let range = e.get("range")?;
+        let new_text = e
+            .get("newText")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let sb = lsp_pos_to_byte(text, range.get("start")?, encoding)?;
+        let eb = lsp_pos_to_byte(text, range.get("end")?, encoding)?;
+        if sb > eb {
+            return None;
+        }
+        byte_edits.push((sb, eb, new_text));
+    }
+    byte_edits.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out: String = text.to_string();
+    for (sb, eb, new) in byte_edits {
+        if eb > out.len() || !out.is_char_boundary(sb) || !out.is_char_boundary(eb) {
+            return None;
+        }
+        out.replace_range(sb..eb, new);
+    }
+    Some(out)
+}
+
+/// Convert an LSP position (line + `character` in `encoding`) to an absolute byte offset in `text`.
+/// A line at/past the buffer end clamps to the byte length.
+fn lsp_pos_to_byte(
+    text: &ropey::Rope,
+    pos: &serde_json::Value,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> Option<usize> {
+    let line = pos.get("line")?.as_u64()? as usize;
+    let character = pos.get("character")?.as_u64()? as u32;
+    if line >= text.len_lines() {
+        return Some(text.len_bytes());
+    }
+    let mut line_str: String = text.line(line).chunks().collect();
+    while line_str.ends_with('\n') || line_str.ends_with('\r') {
+        line_str.pop();
+    }
+    let byte_in_line = crate::lsp::position::lsp_to_byte(&line_str, character, encoding);
+    Some(text.line_to_byte(line) + byte_in_line)
+}
+
+/// Flatten an LSP hover `contents` (MarkupContent, MarkedString, or an array of them) to a string.
+fn parse_hover_contents(v: &serde_json::Value) -> Option<String> {
+    let s = markup_to_string(v.get("contents")?)?;
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+fn markup_to_string(c: &serde_json::Value) -> Option<String> {
+    match c {
+        serde_json::Value::String(s) => Some(s.clone()),
+        // MarkupContent { kind, value } or the legacy MarkedString { language, value }.
+        serde_json::Value::Object(o) => o.get("value").and_then(|v| v.as_str()).map(String::from),
+        serde_json::Value::Array(a) => {
+            let parts: Vec<String> = a.iter().filter_map(markup_to_string).collect();
+            (!parts.is_empty()).then(|| parts.join("\n\n"))
+        }
+        _ => None,
+    }
+}
+
+/// Parse an LSP definition response (`Location`, `Location[]`, `LocationLink[]`, or null) into the
+/// first target location, converting its position into the buffer's byte columns.
+fn parse_definition(
+    v: &serde_json::Value,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> Option<LspLocation> {
+    let first = match v {
+        serde_json::Value::Array(a) => a.first()?,
+        serde_json::Value::Object(_) => v,
+        _ => return None,
+    };
+    let (uri, range) = if let Some(u) = first.get("uri") {
+        (u.as_str()?, first.get("range")?)
+    } else {
+        // LocationLink: prefer the precise selection range, fall back to the full target range.
+        let u = first.get("targetUri")?.as_str()?;
+        let range = first
+            .get("targetSelectionRange")
+            .or_else(|| first.get("targetRange"))?;
+        (u, range)
+    };
+    let start = range.get("start")?;
+    let line = start.get("line")?.as_u64()? as u32;
+    let character = start.get("character")?.as_u64()? as u32;
+    let path = crate::lsp::uri::uri_to_path(uri)?;
+    let col = target_byte_col(&path, line, character, encoding);
+    Some(LspLocation {
+        path: path.display().to_string(),
+        position: LogicalPosition { line, col },
+    })
+}
+
+/// Convert a target position's `character` (in the server's encoding) to a byte column. For UTF-8
+/// the character *is* the byte offset; otherwise read the target line from disk to convert
+/// (best-effort — falls back to the raw character if the file can't be read).
+fn target_byte_col(
+    path: &std::path::Path,
+    line: u32,
+    character: u32,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> u32 {
+    if matches!(encoding, crate::lsp::position::PositionEncoding::Utf8) {
+        return character;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return character;
+    };
+    match content.lines().nth(line as usize) {
+        Some(line_str) => crate::lsp::position::lsp_to_byte(line_str, character, encoding) as u32,
+        None => character,
+    }
+}
+
 /// Re-resolve a buffer's Git baseline from disk (HEAD changed externally — commit / checkout /
 /// stage), recompute its hunks, invalidate cached blame, and build `viewport/lines_changed`
 /// pushes for every viewport on the buffer so the gutter / inline diff refresh live. Called by
@@ -1121,6 +1726,7 @@ pub(crate) fn refresh_git_for_buffer(
 
     let buf = &s.buffers[&buffer_id];
     let hunks = buffer_hunks(s, buffer_id);
+    let diagnostics = buffer_diagnostics(s, buffer_id);
     let mut pushes = Vec::new();
     for vp in s.viewports.values() {
         if vp.buffer_id != buffer_id {
@@ -1132,7 +1738,7 @@ pub(crate) fn refresh_git_for_buffer(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf, vp, revision, search, hunks),
+            build_lines_changed_notif(buf, vp, revision, search, hunks, diagnostics),
         ));
     }
     pushes
@@ -1558,6 +2164,7 @@ fn collect_viewport_refresh(
     let revision = buf.revision;
     let search_entry = s.searches.get(&(client_id, buffer_id));
     let hunks = buffer_hunks(s, buffer_id);
+    let diagnostics = buffer_diagnostics(s, buffer_id);
     for vp in s.viewports.values() {
         if vp.client_id != client_id || vp.buffer_id != buffer_id {
             continue;
@@ -1583,6 +2190,7 @@ fn collect_viewport_refresh(
             search_entry,
             vp.diff_view,
             hunks,
+            diagnostics,
         );
         let params = ViewportLinesChangedParams {
             viewport_id: vp.id,
@@ -1767,19 +2375,9 @@ pub async fn buffer_close(
     if !s.buffers.contains_key(&params.buffer_id) {
         return Err(RpcError::buffer_not_found(params.buffer_id));
     }
-    s.buffers.remove(&params.buffer_id);
-    s.buffer_projects.remove(&params.buffer_id);
-    s.viewports.retain(|_, v| v.buffer_id != params.buffer_id);
-    s.cursors.retain(|(_, b), _| *b != params.buffer_id);
-    s.motion_history.retain(|(_, b), _| *b != params.buffer_id);
-    s.virtual_col.retain(|(_, b), _| *b != params.buffer_id);
-    s.tree_selection_history
-        .retain(|(_, b), _| *b != params.buffer_id);
-    s.searches.retain(|(_, b), _| *b != params.buffer_id);
-    s.last_scroll.retain(|(_, b), _| *b != params.buffer_id);
-    s.git_hunks.remove(&params.buffer_id);
-    s.git_blame.remove(&params.buffer_id);
-    s.drop_buffer_from_mru(params.buffer_id);
+    // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
+    // clears diagnostics, and tears down the language server if this was its last buffer).
+    let stopped_server = s.close_buffer(params.buffer_id);
     // Pick the next buffer for the requesting client: top of the active project's MRU after
     // cleanup, or — if that's empty — any remaining buffer in the project. The client uses this
     // to attach without an extra RPC round-trip.
@@ -1797,7 +2395,12 @@ pub async fn buffer_close(
                     .map(|(id, _)| *id)
             })
         });
-    let pushes = refresh_buffer_pickers(&mut s);
+    let mut pushes = refresh_buffer_pickers(&mut s);
+    // If closing this buffer shut its language server down, refresh any open "LSP servers"
+    // picker so the now-gone server drops out of the list.
+    if stopped_server.is_some() {
+        pushes.extend(refresh_lsp_server_pickers(&mut s));
+    }
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -1914,7 +2517,7 @@ pub async fn buffer_cut(
         let search = s.searches.get(&(vp.client_id, params.buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, params.buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, params.buffer_id), buffer_diagnostics(&s, params.buffer_id)),
         ));
     }
 
@@ -2236,6 +2839,8 @@ pub(crate) fn reload_buffer_locked(
     let search_summary_pushes = refresh_searches_for_buffer(s, buffer_id);
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(s, buffer_id, new_line_count);
+    // LSP: reload swapped the rope (manual or watcher-driven) — keep the server's analysis fresh.
+    notify_lsp_change(s, buffer_id);
 
     let revision = s.buffers[&buffer_id].revision;
     let buf_ref = &s.buffers[&buffer_id];
@@ -2250,7 +2855,7 @@ pub(crate) fn reload_buffer_locked(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
         ));
     }
 
@@ -2295,6 +2900,7 @@ pub async fn viewport_subscribe(
     );
     let search = s.searches.get(&(client_id, params.buffer_id));
     let hunks = buffer_hunks(&s, params.buffer_id);
+    let diagnostics = buffer_diagnostics(&s, params.buffer_id);
     let buf = &s.buffers[&params.buffer_id];
     // A freshly subscribed viewport starts with the diff view off, but still carries gutter
     // markers (computed from `hunks` regardless of the toggle).
@@ -2310,6 +2916,7 @@ pub async fn viewport_subscribe(
         search,
         false,
         hunks,
+        diagnostics,
     );
 
     let viewport_id = s.allocate_viewport_id();
@@ -2369,6 +2976,7 @@ pub async fn viewport_resize(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let hunks = buffer_hunks(&s, buffer_id);
+    let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
         buf,
@@ -2382,6 +2990,7 @@ pub async fn viewport_resize(
         search,
         diff_view,
         hunks,
+        diagnostics,
     );
 
     let vp = s
@@ -2422,6 +3031,7 @@ pub async fn viewport_set_wrap(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let hunks = buffer_hunks(&s, buffer_id);
+    let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
         buf,
@@ -2435,6 +3045,7 @@ pub async fn viewport_set_wrap(
         search,
         diff_view,
         hunks,
+        diagnostics,
     );
 
     let vp = s
@@ -2476,6 +3087,7 @@ pub async fn viewport_scroll(
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
     let hunks = buffer_hunks(&s, buffer_id);
+    let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
         buf,
@@ -2489,6 +3101,7 @@ pub async fn viewport_scroll(
         search,
         diff_view,
         hunks,
+        diagnostics,
     );
 
     let vp = s
@@ -2663,6 +3276,192 @@ fn buffer_hunks(s: &ServerState, buffer_id: BufferId) -> &[crate::git::DiffHunk]
         .unwrap_or(&[])
 }
 
+/// The buffer's language-server diagnostics, or an empty slice when none are known.
+fn buffer_diagnostics(
+    s: &ServerState,
+    buffer_id: BufferId,
+) -> &[crate::lsp::diagnostics::BufferDiagnostic] {
+    s.diagnostics
+        .get(&buffer_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// Notify the language server of a buffer's new full text (LSP `didChange`). Must be called by
+/// *every* path that changes buffer text — edits, undo/redo, reload — or the server's analysis
+/// (and its diagnostics) goes stale. A no-op unless the buffer is file-backed and open against a
+/// ready server; `notify` is a channel send, so it's fire-and-forget under the lock.
+fn notify_lsp_change(s: &mut ServerState, buffer_id: BufferId) {
+    let Some(buf) = s.buffers.get(&buffer_id) else {
+        return;
+    };
+    let Some(uri) = buf.canonical_path.as_deref().map(crate::lsp::uri::path_to_uri) else {
+        return;
+    };
+    let revision = buf.revision as i64;
+    let text = buf.text.to_string();
+    s.lsp.notify_change(buffer_id, &uri, revision, &text);
+}
+
+/// Build the diagnostics-picker candidates for `buffer_id`: one per diagnostic, sorted top-to-bottom
+/// by position, carrying the buffer's path for the `FileAt` jump. Empty if the buffer is gone or has
+/// no path.
+fn build_diagnostic_candidates(
+    s: &ServerState,
+    buffer_id: BufferId,
+) -> Vec<picker_state::DiagnosticCandidate> {
+    let Some(abs_path) = s
+        .buffers
+        .get(&buffer_id)
+        .and_then(|b| b.canonical_path.as_deref())
+        .map(|p| p.display().to_string())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<picker_state::DiagnosticCandidate> = buffer_diagnostics(s, buffer_id)
+        .iter()
+        .map(|d| picker_state::DiagnosticCandidate {
+            line: d.start.line,
+            col: d.start.col,
+            severity: d.severity,
+            message: d.message.clone(),
+            abs_path: abs_path.clone(),
+        })
+        .collect();
+    out.sort_by_key(|c| (c.line, c.col));
+    out
+}
+
+/// Build the LSP-servers-picker candidates: one per language server whose workspace root falls
+/// under `project_roots`, sorted by name then language for a stable order.
+fn build_lsp_server_candidates(
+    s: &ServerState,
+    project_roots: &[std::path::PathBuf],
+) -> Vec<picker_state::LspServerCandidate> {
+    let mut out: Vec<picker_state::LspServerCandidate> = s
+        .lsp
+        .status_for_roots(project_roots)
+        .into_iter()
+        .map(|st| picker_state::LspServerCandidate {
+            root_label: lsp_root_label(&st.workspace_root, project_roots),
+            name: st.name,
+            language: st.language,
+            workspace_root: st.workspace_root,
+            status: st.status,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.language.cmp(&b.language)));
+    out
+}
+
+/// The picker's display label for a server's workspace root: its path relative to the containing
+/// project root, or empty when the server is rooted *at* a project root (so single-root projects
+/// show no redundant path — only monorepo sub-roots get a disambiguating label).
+fn lsp_root_label(workspace_root: &str, project_roots: &[std::path::PathBuf]) -> String {
+    let root = std::path::Path::new(workspace_root);
+    let base = project_roots
+        .iter()
+        .filter(|r| root.starts_with(r))
+        .max_by_key(|r| r.components().count());
+    match base.and_then(|b| root.strip_prefix(b).ok()) {
+        Some(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Replace a buffer's diagnostics and re-render the viewports showing it, so the new markers appear
+/// without an edit. Returns the notifications to send once the state lock is released (the
+/// `watcher.rs:183` pattern). A no-op (empty) when the buffer isn't open.
+pub fn set_diagnostics_and_refresh(
+    s: &mut ServerState,
+    buffer_id: BufferId,
+    diagnostics: Vec<crate::lsp::diagnostics::BufferDiagnostic>,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    s.diagnostics.insert(buffer_id, diagnostics);
+    if !s.buffers.contains_key(&buffer_id) {
+        return Vec::new();
+    }
+    let buf = &s.buffers[&buffer_id];
+    let revision = buf.revision;
+    let hunks = buffer_hunks(s, buffer_id);
+    let diags = buffer_diagnostics(s, buffer_id);
+    let counts = diagnostic_counts(diags);
+    let mut pushes = Vec::new();
+    // One `lsp/diagnostics_changed` (buffer-wide counts) per distinct client viewing the buffer,
+    // plus the per-viewport `viewport/lines_changed` re-render (squiggles + gutter).
+    let mut counted_clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
+    for vp in s.viewports.values() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        if counted_clients.insert(vp.client_id) {
+            pushes.push((sender.clone(), diagnostics_changed_notif(buffer_id, counts)));
+        }
+        let search = s.searches.get(&(vp.client_id, buffer_id));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(buf, vp, revision, search, hunks, diags),
+        ));
+    }
+    pushes
+}
+
+/// Per-severity counts over a buffer's diagnostics, for the status-bar summary.
+fn diagnostic_counts(diags: &[crate::lsp::diagnostics::BufferDiagnostic]) -> DiagnosticCounts {
+    use aether_protocol::viewport::DiagnosticSeverity::*;
+    let mut c = DiagnosticCounts::default();
+    for d in diags {
+        match d.severity {
+            Error => c.errors += 1,
+            Warning => c.warnings += 1,
+            Information => c.infos += 1,
+            Hint => c.hints += 1,
+        }
+    }
+    c
+}
+
+fn diagnostics_changed_notif(buffer_id: BufferId, counts: DiagnosticCounts) -> Notification {
+    Notification {
+        jsonrpc: JsonRpc,
+        method: LspDiagnosticsChanged::NAME.into(),
+        params: serde_json::to_value(LspDiagnosticsChangedParams { buffer_id, counts })
+            .expect("infallible"),
+    }
+}
+
+/// The per-line footprint of `diags` on `line_idx`: byte ranges clipped to `[0, line_len]`. A
+/// diagnostic spanning multiple lines contributes to each line it covers (start line from its
+/// column to EOL, middle lines whole, end line up to its column), carrying the full message so the
+/// client can show it wherever the cursor sits. Zero-width diagnostics are kept (the client widens
+/// them to one cell).
+fn diagnostic_spans_on_line(
+    diags: &[crate::lsp::diagnostics::BufferDiagnostic],
+    line_idx: u32,
+    line_len: u32,
+) -> Vec<DiagnosticSpan> {
+    let mut out = Vec::new();
+    for d in diags {
+        if line_idx < d.start.line || line_idx > d.end.line {
+            continue;
+        }
+        let s = if line_idx == d.start.line { d.start.col } else { 0 };
+        let e = if line_idx == d.end.line { d.end.col } else { line_len };
+        let s = s.min(line_len);
+        let e = e.min(line_len).max(s);
+        out.push(DiagnosticSpan {
+            start: s,
+            end: e,
+            severity: d.severity,
+            message: d.message.clone(),
+        });
+    }
+    out
+}
+
 /// Find the largest `scroll_logical_line` such that the buffer's last visual row sits at the
 /// bottom of the viewport. Walks logical lines from the end backward, accumulating their visual
 /// row counts under the current wrap settings until we have `viewport_rows` rows. Diff-view
@@ -2719,6 +3518,7 @@ fn render_window(
     search: Option<&SearchEntry>,
     diff_view: bool,
     hunks: &[crate::git::DiffHunk],
+    diagnostics: &[crate::lsp::diagnostics::BufferDiagnostic],
 ) -> Window {
     let mut lines: Vec<LogicalLineRender> = Vec::with_capacity((last_excl - first) as usize);
 
@@ -2772,6 +3572,7 @@ fn render_window(
             render.virtual_rows_above = rows.clone();
         }
         render.diff_marker = markers.get(&i).copied();
+        render.diagnostics = diagnostic_spans_on_line(diagnostics, i, text.len() as u32);
         lines.push(render);
     }
     Window {
@@ -4095,7 +4896,7 @@ async fn apply_toggle_comment(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
         ));
     }
 
@@ -4552,7 +5353,7 @@ async fn apply_indent_or_dedent(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
         ));
     }
 
@@ -4732,7 +5533,7 @@ pub async fn input_move_lines(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
         ));
     }
 
@@ -4923,7 +5724,7 @@ pub async fn input_join_lines(
                 continue;
             };
             let search = s.searches.get(&(vp.client_id, buffer_id));
-            pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search, buffer_hunks(&s, buffer_id))));
+            pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id))));
         }
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
         let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
@@ -5038,6 +5839,8 @@ async fn apply_undo_or_redo(
     let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    // LSP: the rope was swapped wholesale — tell the server so its diagnostics aren't stale.
+    notify_lsp_change(&mut s, buffer_id);
     let buf_ref = &s.buffers[&buffer_id];
     let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
     for vp in s.viewports.values() {
@@ -5050,7 +5853,7 @@ async fn apply_undo_or_redo(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
         ));
     }
 
@@ -5569,7 +6372,7 @@ async fn apply_edit(
             continue;
         };
         let search = s.searches.get(&(vp.client_id, buffer_id));
-        let notif = build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id));
+        let notif = build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id));
         pushes.push((sender, notif));
     }
 
@@ -5577,6 +6380,9 @@ async fn apply_edit(
     // edit after a save). The picker row renders dirty + display only, so per-keystroke edits
     // mid-burst don't need pushes.
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+
+    // LSP: full-document sync.
+    notify_lsp_change(&mut s, buffer_id);
 
     let new_cursor_state = wrap_for_response(&s, client_id, buffer_id, new_cursor_state);
     drop(s);
@@ -5608,6 +6414,7 @@ fn build_lines_changed_notif(
     revision: Revision,
     search: Option<&SearchEntry>,
     hunks: &[crate::git::DiffHunk],
+    diagnostics: &[crate::lsp::diagnostics::BufferDiagnostic],
 ) -> Notification {
     let line_count = buffer.line_count();
     let new_first = vp.first_logical_line.min(line_count);
@@ -5627,6 +6434,7 @@ fn build_lines_changed_notif(
         search,
         vp.diff_view,
         hunks,
+        diagnostics,
     );
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
@@ -5731,6 +6539,53 @@ fn refresh_buffer_pickers(s: &mut ServerState) -> Vec<(mpsc::Sender<Notification
             continue;
         };
         picker.candidates = picker_state::PickerCandidates::Buffers(new_candidates);
+        picker.rerank(matcher);
+        if let Some(window) = picker.subscribed.as_mut() {
+            let total = picker.ranked.len() as u32;
+            if window.offset >= total {
+                window.offset = total.saturating_sub(window.limit);
+            }
+        }
+        let Some(update) = picker_state::build_update(picker, matcher) else {
+            continue;
+        };
+        let Some(sender) = clients.get(&client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        pushes.push((sender, picker_update_notif(update)));
+    }
+    pushes
+}
+
+/// Rebuild and re-push every subscribed `LspServers` picker. Called whenever a server's status
+/// changes (from `crate::lsp::manager`) so the open dialog's health glyphs update live — e.g.
+/// `◐ → ●` as a restart completes. Mirrors [`refresh_buffer_pickers`].
+pub fn refresh_lsp_server_pickers(
+    s: &mut ServerState,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    let client_ids: Vec<ClientId> = s
+        .pickers
+        .iter()
+        .filter_map(|((c, k), p)| {
+            (*k == PickerKind::LspServers && p.subscribed.is_some()).then_some(*c)
+        })
+        .collect();
+    let mut pushes = Vec::new();
+    for client_id in client_ids {
+        let Some(roots) = s.active_project(client_id).map(|p| p.paths.clone()) else {
+            continue;
+        };
+        let new_candidates = build_lsp_server_candidates(s, &roots);
+        let ServerState {
+            pickers,
+            matcher,
+            clients,
+            ..
+        } = &mut *s;
+        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::LspServers)) else {
+            continue;
+        };
+        picker.candidates = picker_state::PickerCandidates::LspServers(new_candidates);
         picker.rerank(matcher);
         if let Some(window) = picker.subscribed.as_mut() {
             let total = picker.ranked.len() as u32;
@@ -6083,6 +6938,22 @@ pub async fn picker_view(
                     .collect(),
             )
         }
+        PickerKind::Diagnostics => match params.buffer_id {
+            // Fresh open: build from the buffer's current diagnostics.
+            Some(buffer_id) => {
+                let s = state.lock().await;
+                picker_state::PickerCandidates::Diagnostics(build_diagnostic_candidates(&s, buffer_id))
+            }
+            // Resume / scroll re-view: an empty placeholder; `preserve_existing` keeps the snapshot.
+            None => picker_state::PickerCandidates::Diagnostics(Vec::new()),
+        },
+        PickerKind::LspServers => {
+            // Rebuilt every view from the active project's servers — the set is tiny and statuses
+            // change, so there's no snapshot to preserve.
+            let s = state.lock().await;
+            let roots = s.active_project_or_err(client_id)?.paths.clone();
+            picker_state::PickerCandidates::LspServers(build_lsp_server_candidates(&s, &roots))
+        }
     };
 
     let mut s = state.lock().await;
@@ -6146,6 +7017,12 @@ pub async fn picker_view(
             (picker_state::PickerCandidates::Grep(_), picker_state::PickerCandidates::Grep(_)) => {
                 true
             }
+            // Diagnostics: keep the snapshot taken on open across scroll/resume re-views (the
+            // re-view sends an empty placeholder), like Grep.
+            (
+                picker_state::PickerCandidates::Diagnostics(_),
+                picker_state::PickerCandidates::Diagnostics(_),
+            ) => true,
             _ => false,
         };
         if !preserve_existing {
@@ -6705,5 +7582,194 @@ mod grep_boundary_tests {
         assert_eq!(grep_file_boundary(&h, 3, Direction::Backward), Some(0));
         // The very first hit → nothing further back.
         assert_eq!(grep_file_boundary(&h, 0, Direction::Backward), None);
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_span_tests {
+    use super::{diagnostic_counts, diagnostic_spans_on_line, navigate_diagnostic_target};
+    use aether_protocol::lsp::DiagnosticDirection;
+    use crate::lsp::diagnostics::BufferDiagnostic;
+    use aether_protocol::viewport::DiagnosticSeverity;
+    use aether_protocol::LogicalPosition;
+
+    #[test]
+    fn diagnostic_counts_tally_by_severity() {
+        let mk = |severity| BufferDiagnostic {
+            start: LogicalPosition { line: 0, col: 0 },
+            end: LogicalPosition { line: 0, col: 1 },
+            severity,
+            message: "m".into(),
+        };
+        let diags = vec![
+            mk(DiagnosticSeverity::Error),
+            mk(DiagnosticSeverity::Error),
+            mk(DiagnosticSeverity::Warning),
+            mk(DiagnosticSeverity::Hint),
+        ];
+        let c = diagnostic_counts(&diags);
+        assert_eq!((c.errors, c.warnings, c.infos, c.hints), (2, 1, 0, 1));
+        assert!(diagnostic_counts(&[]).is_empty());
+    }
+
+    fn diag(l0: u32, c0: u32, l1: u32, c1: u32) -> BufferDiagnostic {
+        BufferDiagnostic {
+            start: LogicalPosition { line: l0, col: c0 },
+            end: LogicalPosition { line: l1, col: c1 },
+            severity: DiagnosticSeverity::Error,
+            message: "m".into(),
+        }
+    }
+
+    #[test]
+    fn single_line_span_is_clipped_to_its_range() {
+        let diags = [diag(2, 3, 2, 7)];
+        assert!(diagnostic_spans_on_line(&diags, 1, 80).is_empty());
+        let on = diagnostic_spans_on_line(&diags, 2, 80);
+        assert_eq!(on.len(), 1);
+        assert_eq!((on[0].start, on[0].end), (3, 7));
+        assert!(diagnostic_spans_on_line(&diags, 3, 80).is_empty());
+    }
+
+    #[test]
+    fn multi_line_span_covers_each_line() {
+        // Lines 1..=3; line lengths 10/20/30.
+        let diags = [diag(1, 4, 3, 6)];
+        let start = diagnostic_spans_on_line(&diags, 1, 10);
+        assert_eq!((start[0].start, start[0].end), (4, 10)); // from col to EOL
+        let mid = diagnostic_spans_on_line(&diags, 2, 20);
+        assert_eq!((mid[0].start, mid[0].end), (0, 20)); // whole line
+        let end = diagnostic_spans_on_line(&diags, 3, 30);
+        assert_eq!((end[0].start, end[0].end), (0, 6)); // up to col
+    }
+
+    #[test]
+    fn columns_clamp_to_line_length() {
+        let diags = [diag(0, 50, 0, 99)];
+        let on = diagnostic_spans_on_line(&diags, 0, 5);
+        assert_eq!((on[0].start, on[0].end), (5, 5)); // both clamped to EOL
+    }
+
+    #[test]
+    fn zero_width_diagnostic_is_kept() {
+        let diags = [diag(0, 2, 0, 2)];
+        let on = diagnostic_spans_on_line(&diags, 0, 10);
+        assert_eq!(on.len(), 1);
+        assert_eq!((on[0].start, on[0].end), (2, 2));
+    }
+
+    #[test]
+    fn navigate_diagnostic_finds_next_and_prev() {
+        use DiagnosticDirection::{Next, Prev};
+        // Diagnostics on lines 2 (col 4), 5, 9 — deliberately out of order to exercise the sort.
+        let diags = [diag(5, 0, 5, 1), diag(2, 4, 2, 6), diag(9, 0, 9, 3)];
+        // From line 3: next is line 5, prev is line 2 (at its column).
+        assert_eq!(navigate_diagnostic_target(&diags, 3, Next), Some(LogicalPosition { line: 5, col: 0 }));
+        assert_eq!(navigate_diagnostic_target(&diags, 3, Prev), Some(LogicalPosition { line: 2, col: 4 }));
+        // Strictly beyond the cursor line: standing on a diagnostic line skips it.
+        assert_eq!(navigate_diagnostic_target(&diags, 5, Next), Some(LogicalPosition { line: 9, col: 0 }));
+        assert_eq!(navigate_diagnostic_target(&diags, 5, Prev), Some(LogicalPosition { line: 2, col: 4 }));
+    }
+
+    #[test]
+    fn navigate_diagnostic_returns_none_at_the_ends() {
+        use DiagnosticDirection::{Next, Prev};
+        let diags = [diag(2, 0, 2, 1), diag(7, 0, 7, 1)];
+        assert_eq!(navigate_diagnostic_target(&diags, 7, Next), None); // nothing past the last
+        assert_eq!(navigate_diagnostic_target(&diags, 2, Prev), None); // nothing before the first
+        assert_eq!(navigate_diagnostic_target(&[], 0, Next), None); // no diagnostics at all
+    }
+}
+
+#[cfg(test)]
+mod lsp_parse_tests {
+    use super::*;
+    use crate::lsp::position::PositionEncoding;
+    use serde_json::json;
+
+    #[test]
+    fn hover_markup_content_string_and_array() {
+        assert_eq!(
+            parse_hover_contents(&json!({"contents": {"kind": "markdown", "value": "fn foo()"}})).as_deref(),
+            Some("fn foo()")
+        );
+        assert_eq!(
+            parse_hover_contents(&json!({"contents": "plain"})).as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            parse_hover_contents(&json!({"contents": [{"language": "rust", "value": "a"}, "b"]})).as_deref(),
+            Some("a\n\nb")
+        );
+    }
+
+    #[test]
+    fn hover_empty_or_absent_is_none() {
+        assert!(parse_hover_contents(&json!({"contents": null})).is_none());
+        assert!(parse_hover_contents(&json!({"contents": "   "})).is_none());
+        assert!(parse_hover_contents(&json!({})).is_none());
+    }
+
+    #[test]
+    fn definition_location_array_and_link() {
+        // Bare Location.
+        let v = json!({"uri": "file:///p/a.rs", "range": {"start": {"line": 3, "character": 5}, "end": {"line": 3, "character": 8}}});
+        let loc = parse_definition(&v, PositionEncoding::Utf8).unwrap();
+        assert_eq!(loc.path, "/p/a.rs");
+        assert_eq!(loc.position, LogicalPosition { line: 3, col: 5 });
+        // Array → first.
+        let v = json!([{"uri": "file:///p/a.rs", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}}]);
+        assert_eq!(parse_definition(&v, PositionEncoding::Utf8).unwrap().position.line, 1);
+        // LocationLink → targetSelectionRange preferred over targetRange.
+        let v = json!([{
+            "targetUri": "file:///p/b.rs",
+            "targetSelectionRange": {"start": {"line": 7, "character": 2}, "end": {"line": 7, "character": 9}},
+            "targetRange": {"start": {"line": 6, "character": 0}, "end": {"line": 8, "character": 0}}
+        }]);
+        let loc = parse_definition(&v, PositionEncoding::Utf8).unwrap();
+        assert_eq!(loc.path, "/p/b.rs");
+        assert_eq!(loc.position, LogicalPosition { line: 7, col: 2 });
+    }
+
+    #[test]
+    fn definition_null_and_empty_is_none() {
+        assert!(parse_definition(&json!(null), PositionEncoding::Utf8).is_none());
+        assert!(parse_definition(&json!([]), PositionEncoding::Utf8).is_none());
+    }
+
+    #[test]
+    fn apply_text_edits_single_and_multi() {
+        use ropey::Rope;
+        let text = Rope::from_str("foo\nbar\n");
+        // Replace "bar" (line 1, cols 0..3) with "BAZ".
+        let edits = json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 3}}, "newText": "BAZ"}]);
+        assert_eq!(
+            apply_lsp_text_edits(&text, &edits, PositionEncoding::Utf8).unwrap(),
+            "foo\nBAZ\n"
+        );
+        // Two edits given out of order — descending-start application keeps offsets valid.
+        let edits = json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "X"},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 3}}, "newText": "Q"},
+        ]);
+        assert_eq!(
+            apply_lsp_text_edits(&text, &edits, PositionEncoding::Utf8).unwrap(),
+            "Xfoo\nQ\n"
+        );
+    }
+
+    #[test]
+    fn apply_text_edits_whole_document_and_empty() {
+        use ropey::Rope;
+        let text = Rope::from_str("a\nb\n");
+        // Whole-document replace: end one past the last line clamps to the buffer end.
+        let edits = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": "z\n"}]);
+        assert_eq!(
+            apply_lsp_text_edits(&text, &edits, PositionEncoding::Utf8).unwrap(),
+            "z\n"
+        );
+        // Empty / absent edit lists are a no-op (None), not an empty document.
+        assert!(apply_lsp_text_edits(&text, &json!([]), PositionEncoding::Utf8).is_none());
+        assert!(apply_lsp_text_edits(&text, &json!(null), PositionEncoding::Utf8).is_none());
     }
 }

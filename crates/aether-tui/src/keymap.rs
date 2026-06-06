@@ -242,6 +242,19 @@ pub enum Action {
     SaveAs,
     Reload,
     NewScratch,
+
+    // ---- LSP ----
+    /// Show hover info (type signature + docs) for the symbol at the cursor.
+    Hover,
+    /// Jump to the definition of the symbol at the cursor.
+    GotoDefinition,
+    /// Show the diagnostic(s) at the cursor in the hover box.
+    ShowDiagnostic,
+    /// Jump the cursor to the next/previous diagnostic in the buffer.
+    NextDiagnostic,
+    PrevDiagnostic,
+    /// Format the whole buffer via the language server.
+    Format,
 }
 
 impl Action {
@@ -255,11 +268,20 @@ impl Action {
                 | Action::OpenPicker(PickerKind::Buffers)
                 | Action::OpenPicker(PickerKind::Grep)
                 | Action::OpenPicker(PickerKind::Explorer)
+                | Action::OpenPicker(PickerKind::Diagnostics)
+                | Action::OpenPicker(PickerKind::LspServers)
                 | Action::CloseBuffer
                 | Action::Save
                 | Action::SaveAs
                 | Action::Reload
                 | Action::NewScratch
+                | Action::Hover
+                | Action::GotoDefinition
+                | Action::ShowDiagnostic
+                | Action::NextDiagnostic
+                | Action::PrevDiagnostic
+                | Action::Format
+                | Action::ToggleWrap
                 | Action::ToggleDiffView
                 | Action::NextHunk
                 | Action::PrevHunk
@@ -557,7 +579,6 @@ static NORMAL: &[Binding] = &[
 
 #[rustfmt::skip]
 static GLOBAL: &[Binding] = &[
-    bind!(GLOBAL_CTX, ch('p'), Exact(CTRL), A::ToggleWrap, "View", "Toggle soft wrap"),
     bind!(GLOBAL_CTX, ch('z'), Exact(CTRL), A::Undo, "Edit", "Undo"),
     bind!(GLOBAL_CTX, ch('z'), Exact(CTRL_ALT), A::Redo, "Edit", "Redo"),
     bind!(GLOBAL_CTX, ch('j'), Exact(CTRL), A::MoveLines(VerticalDirection::Down), "Edit", "Move line(s) down"),
@@ -616,14 +637,23 @@ static LEADER: &[Binding] = &[
     bind!(LEADER_CTX, ch('p'), Exact(NONE), A::OpenPicker(PickerKind::Projects), "Project", "Switch project"),
     bind!(LEADER_CTX, ch(','), Exact(NONE), A::OpenProjectSettings, "Project", "Project settings"),
     bind!(LEADER_CTX, ch('q'), Exact(NONE), A::Quit, "App", "Quit"),
-    bind!(LEADER_CTX, ch('w'), Exact(NONE), A::CloseBuffer, "App", "Close buffer"),
+    bind!(LEADER_CTX, ch('c'), Exact(NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(LEADER_CTX, ch('s'), Exact(NONE), A::Save, "App", "Save"),
     bind!(LEADER_CTX, ch('s'), Exact(ALT), A::SaveAs, "App", "Save as"),
     bind!(LEADER_CTX, ch('r'), Exact(NONE), A::Reload, "App", "Reload from disk"),
-    bind!(LEADER_CTX, ch('d'), Exact(NONE), A::ToggleDiffView, "View", "Toggle inline diff"),
-    bind!(LEADER_CTX, ch(']'), Exact(NONE), A::NextHunk, "View", "Next change (hunk)"),
-    bind!(LEADER_CTX, ch('['), Exact(NONE), A::PrevHunk, "View", "Previous change (hunk)"),
     bind!(LEADER_CTX, ch('n'), Exact(NONE), A::NewScratch, "App", "New scratch buffer"),
+    bind!(LEADER_CTX, ch('w'), Exact(NONE), A::ToggleWrap, "View", "Toggle soft wrap"),
+    bind!(LEADER_CTX, ch('i'), Exact(NONE), A::ToggleDiffView, "View", "Toggle inline diff"),
+    bind!(LEADER_CTX, ch('h'), Exact(NONE), A::NextHunk, "View", "Next change (hunk)"),
+    bind!(LEADER_CTX, ch('h'), Exact(ALT), A::PrevHunk, "View", "Previous change (hunk)"),
+    bind!(LEADER_CTX, ch('m'), Exact(NONE), A::Format, "Code", "Format document"),
+    bind!(LEADER_CTX, ch('k'), Exact(NONE), A::Hover, "Code", "Hover (type & docs)"),
+    bind!(LEADER_CTX, ch('d'), Exact(NONE), A::GotoDefinition, "Code", "Go to definition"),
+    bind!(LEADER_CTX, ch('j'), Exact(NONE), A::ShowDiagnostic, "Code", "Show diagnostic at cursor"),
+    bind!(LEADER_CTX, ch('t'), Exact(NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics list"),
+    bind!(LEADER_CTX, ch('l'), Exact(NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
+    bind!(LEADER_CTX, ch('x'), Exact(NONE), A::NextDiagnostic, "Code", "Next diagnostic"),
+    bind!(LEADER_CTX, ch('x'), Exact(ALT), A::PrevDiagnostic, "Code", "Previous diagnostic"),
     bind!(LEADER_CTX, ch('?'), Any, A::OpenHelp, "App", "Show keyboard shortcuts"),
 ];
 
@@ -659,8 +689,12 @@ mod tests {
         assert!(f.action.awaits_key());
         assert_eq!(f.key_label(), "f ␣");
 
-        let surround =
-            lookup(KeyContext::Normal, KeyCode::Char('s'), KeyModifiers::CONTROL).unwrap();
+        let surround = lookup(
+            KeyContext::Normal,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        )
+        .unwrap();
         assert!(surround.action.awaits_key());
         assert_eq!(surround.key_label(), "Ctrl-s ␣");
 

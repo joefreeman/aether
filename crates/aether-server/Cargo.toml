@@ -16,7 +16,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
 
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 

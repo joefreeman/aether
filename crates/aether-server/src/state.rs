@@ -83,6 +83,12 @@ pub struct ServerState {
     /// calls, so it's cheaper to share one than construct per RPC. Not `Sync`, so the global
     /// lock around `ServerState` is what serializes access.
     pub matcher: nucleo_matcher::Matcher,
+    /// Language-server sessions (one per workspace-root × language) and the buffers synced against
+    /// them. See [`crate::lsp::manager`].
+    pub lsp: crate::lsp::manager::LspManager,
+    /// Latest diagnostics per buffer, in buffer coordinates (byte columns). Replaced wholesale on
+    /// each `publishDiagnostics`; cleared on close. Empty/absent when a buffer has none.
+    pub diagnostics: HashMap<BufferId, Vec<crate::lsp::diagnostics::BufferDiagnostic>>,
     next_buffer_id: u64,
     next_viewport_id: u64,
 }
@@ -177,6 +183,8 @@ impl ServerState {
             git_baseline: HashMap::new(),
             git_blame: HashMap::new(),
             matcher: picker_state::make_matcher(),
+            lsp: crate::lsp::manager::LspManager::default(),
+            diagnostics: HashMap::new(),
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
@@ -287,7 +295,16 @@ impl ServerState {
     /// Close one buffer: drop it and every per-`(client, buffer)` slice keyed to it. This is the
     /// canonical `buffer/close` teardown, shared by root removal, project deletion, and path
     /// deletion so they can't drift out of sync.
-    pub fn close_buffer(&mut self, id: BufferId) {
+    /// Returns the key of a language server that was torn down because this was its last buffer
+    /// (so the caller can refresh open status views), or `None`.
+    pub fn close_buffer(&mut self, id: BufferId) -> Option<crate::lsp::manager::LspServerKey> {
+        // Notify any language server before we drop the buffer (needs its path).
+        let lsp_uri = self
+            .buffers
+            .get(&id)
+            .and_then(|b| b.canonical_path.as_deref())
+            .map(crate::lsp::uri::path_to_uri);
+        let stopped_server = lsp_uri.and_then(|uri| self.lsp.notify_close(id, &uri));
         self.buffers.remove(&id);
         self.buffer_projects.remove(&id);
         self.viewports.retain(|_, v| v.buffer_id != id);
@@ -300,7 +317,9 @@ impl ServerState {
         self.git_hunks.remove(&id);
         self.git_baseline.remove(&id);
         self.git_blame.remove(&id);
+        self.diagnostics.remove(&id);
         self.drop_buffer_from_mru(id);
+        stopped_server
     }
 
     /// Delete a loaded project's in-memory state: drop the project entry and close every buffer
@@ -565,6 +584,9 @@ pub enum EditKindTag {
     /// Surround/unsurround edits. Tagged distinctly so they never coalesce with an adjacent typing
     /// or delete burst into one undo group — each surround toggle is its own undo step.
     Surround,
+    /// Whole-buffer formatting (`lsp/format`). Its own tag so a format is always a single undo
+    /// step and never coalesces into an adjacent typing/delete burst.
+    Format,
 }
 
 struct UndoEntry {

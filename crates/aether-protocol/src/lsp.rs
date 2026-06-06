@@ -1,0 +1,257 @@
+//! LSP-related messages.
+//!
+//! Aether-server is itself an LSP *client*: it hosts language-server subprocesses and translates
+//! between them and connected editor clients (see `docs/lsp.md`). The TUI never speaks LSP. These
+//! messages surface language-server *health* to the client — the status of each server in the
+//! active project plus live transitions — and let the client request a restart.
+//!
+//! Defined in Phase 0 ahead of the transport so the wire shape is pinned and the status UI can be
+//! built against it; the server side that emits these lands in Phase 1.
+
+use crate::cursor::CursorState;
+use crate::envelope::{NotificationMethod, RpcMethod};
+use crate::{BufferId, LogicalPosition};
+use serde::{Deserialize, Serialize};
+
+// ---- lsp/hover ----------------------------------------------------------------------------------
+
+/// Hover info (type signature + docs) for the client's cursor in `buffer_id`. Cursor-relative —
+/// like the input commands, it carries no position; the server uses the cursor it already tracks.
+pub struct LspHover;
+impl RpcMethod for LspHover {
+    const NAME: &'static str = "lsp/hover";
+    type Params = LspBufferParams;
+    type Result = LspHoverResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspHoverResult {
+    /// Hover text (markdown or plain), or `None` when the server has nothing for the cursor / no
+    /// server is attached.
+    pub contents: Option<String>,
+}
+
+// ---- lsp/goto_definition ------------------------------------------------------------------------
+
+/// Resolve the definition of the symbol at the client's cursor. Cursor-relative (no position on
+/// the wire). The client navigates to the returned location itself (`buffer/open` + jump).
+pub struct LspGotoDefinition;
+impl RpcMethod for LspGotoDefinition {
+    const NAME: &'static str = "lsp/goto_definition";
+    type Params = LspBufferParams;
+    type Result = LspGotoDefinitionResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspGotoDefinitionResult {
+    /// `None` when there's no definition (or no server). The first location is returned when the
+    /// server offers several.
+    pub location: Option<LspLocation>,
+}
+
+/// A resolved source location, in the editor's own coordinates (absolute path + byte-column
+/// position) — already converted from the server's LSP position encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspLocation {
+    /// Absolute filesystem path to the target file.
+    pub path: String,
+    pub position: LogicalPosition,
+}
+
+/// Params for the cursor-relative LSP requests: just the buffer; the server uses its own cursor.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspBufferParams {
+    pub buffer_id: BufferId,
+}
+
+/// Identifies the language server backing a buffer — its `(language, workspace_root)` key. Returned
+/// in `buffer/open` so the client can show *this buffer's* server health: servers are keyed by
+/// `(language, workspace_root)`, so language alone is ambiguous when a monorepo runs several
+/// same-language servers at different roots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspServerRef {
+    pub language: String,
+    pub workspace_root: String,
+}
+
+// ---- lsp/format ---------------------------------------------------------------------------------
+
+/// Format the whole buffer via the language server (`textDocument/formatting`). The server
+/// requests the edits, applies them to the buffer itself (one undo step), and pushes the
+/// re-rendered viewports — so this is just a trigger, like the other cursor-relative commands.
+pub struct LspFormat;
+impl RpcMethod for LspFormat {
+    const NAME: &'static str = "lsp/format";
+    type Params = LspBufferParams;
+    type Result = LspFormatResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspFormatResult {
+    /// Cursor after formatting (clamped into the reformatted buffer). Unchanged unless
+    /// `status == Applied`.
+    pub cursor: CursorState,
+    /// Why formatting did or didn't change the buffer — lets the client show a specific message
+    /// instead of a catch-all.
+    pub status: FormatStatus,
+}
+
+/// Outcome of an [`LspFormat`] request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatStatus {
+    /// Edits were applied; the buffer changed.
+    Applied,
+    /// A formatter ran but produced no changes (already canonical), or the edits were dropped as
+    /// stale (the buffer changed under the request).
+    NoChange,
+    /// A server exists for this language but isn't `Ready` yet — try again shortly.
+    NotReady,
+    /// The language server crashed or was stopped — it can't format until it's running again.
+    Unavailable,
+    /// A ready server is attached but doesn't advertise a document formatter for this language.
+    Unsupported,
+}
+
+// ---- lsp/navigate_diagnostic --------------------------------------------------------------------
+
+/// Jump the cursor to the next/previous diagnostic in the buffer. Mirrors `git/navigate_hunk`: the
+/// server holds the diagnostics, so it resolves the target and moves the cursor authoritatively.
+pub struct LspNavigateDiagnostic;
+impl RpcMethod for LspNavigateDiagnostic {
+    const NAME: &'static str = "lsp/navigate_diagnostic";
+    type Params = LspNavigateDiagnosticParams;
+    type Result = LspNavigateDiagnosticResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspNavigateDiagnosticParams {
+    pub buffer_id: BufferId,
+    /// The cursor's current 0-based line; the search for the next/previous diagnostic starts here.
+    pub from_line: u32,
+    pub direction: DiagnosticDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticDirection {
+    Next,
+    Prev,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspNavigateDiagnosticResult {
+    /// Cursor after the jump. Equal to the incoming cursor when `moved` is false.
+    pub cursor: CursorState,
+    /// False when there's no diagnostic in the requested direction (cursor unchanged).
+    pub moved: bool,
+}
+
+// ---- lsp/server_status --------------------------------------------------------------------------
+
+/// Snapshot of every language server for the client's active project. Drives the "LSP servers"
+/// status dialog.
+pub struct LspServerStatusList;
+impl RpcMethod for LspServerStatusList {
+    const NAME: &'static str = "lsp/server_status";
+    type Params = LspServerStatusParams;
+    type Result = LspServerStatusResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct LspServerStatusParams {}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspServerStatusResult {
+    pub servers: Vec<LspServerStatus>,
+}
+
+// ---- lsp/restart_server -------------------------------------------------------------------------
+
+/// Restart the language server for a given language: shut it down and respawn, then re-open every
+/// currently-open buffer of that language against the fresh process.
+pub struct LspRestartServer;
+impl RpcMethod for LspRestartServer {
+    const NAME: &'static str = "lsp/restart_server";
+    type Params = LspRestartServerParams;
+    type Result = ();
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspRestartServerParams {
+    /// The language whose server should be restarted, e.g. `"rust"`.
+    pub language: String,
+}
+
+// ---- lsp/status_changed (notification) ----------------------------------------------------------
+
+/// Pushed whenever a server's [`LspStatus`] transitions, so the status bar / dialog updates live
+/// without polling.
+pub struct LspStatusChanged;
+impl NotificationMethod for LspStatusChanged {
+    const NAME: &'static str = "lsp/status_changed";
+    type Params = LspServerStatus;
+}
+
+// ---- lsp/diagnostics_changed (notification) -----------------------------------------------------
+
+/// Pushed when a buffer's diagnostics change, carrying per-severity counts for the status bar.
+/// (The per-line spans for squiggles/gutter ride `viewport/lines_changed`; this is the buffer-wide
+/// summary the client can't derive from just the visible window.)
+pub struct LspDiagnosticsChanged;
+impl NotificationMethod for LspDiagnosticsChanged {
+    const NAME: &'static str = "lsp/diagnostics_changed";
+    type Params = LspDiagnosticsChangedParams;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspDiagnosticsChangedParams {
+    pub buffer_id: BufferId,
+    pub counts: DiagnosticCounts,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticCounts {
+    pub errors: u32,
+    pub warnings: u32,
+    pub infos: u32,
+    pub hints: u32,
+}
+
+impl DiagnosticCounts {
+    pub fn is_empty(&self) -> bool {
+        self.errors == 0 && self.warnings == 0 && self.infos == 0 && self.hints == 0
+    }
+}
+
+// ---- shared payloads ----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspServerStatus {
+    /// Display name reported by the server, e.g. `"rust-analyzer"`.
+    pub name: String,
+    /// The language this server backs, e.g. `"rust"`.
+    pub language: String,
+    /// Absolute workspace root the server was launched against.
+    pub workspace_root: String,
+    pub status: LspStatus,
+}
+
+/// Lifecycle of a single language server. Internally tagged on `state` for a flat wire shape:
+/// `{"state":"ready"}`, `{"state":"crashed","code":1,"message":"..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LspStatus {
+    /// Subprocess spawned; handshake not yet sent.
+    Starting,
+    /// `initialize` sent, awaiting the capabilities response.
+    Initializing,
+    /// Handshake complete; serving requests.
+    Ready,
+    /// Shutting down and respawning (see [`LspRestartServer`]).
+    Restarting,
+    /// The subprocess exited unexpectedly.
+    Crashed { code: Option<i32>, message: String },
+    /// Cleanly shut down; not running.
+    Stopped,
+}

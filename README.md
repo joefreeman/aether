@@ -19,6 +19,7 @@ buffer, see each other's cursors, and share a single undo stack.
 - Fuzzy pickers for files/buffers/projects, file explorer, project-wide grep
 - Mouse support, soft wrap, system-clipboard integration
 - Git integration (gutter, diff, blame)
+- LSP (diagnostics, hover, go-to-definition, format)
 
 ## Keybindings
 
@@ -90,7 +91,6 @@ normal and line-scoped in insert (since insert has no selection).
 | `Ctrl-g` | Join lines | Join lines |
 | `Ctrl-t` | Toggle comment | Toggle comment |
 | `Ctrl-o`/`Ctrl-Alt-o` | Open line below/above | Open line below/above |
-| `Ctrl-p` | Toggle soft wrap | Toggle soft wrap |
 
 ### Mode transitions
 
@@ -100,13 +100,12 @@ normal and line-scoped in insert (since insert has no selection).
 | `Alt-i`/`Alt-a` | Insert at first line start/last line end |
 | `Esc` | Leave insert mode |
 
-### Application commands
+### Application
 
 | Chord | Action |
 | --- | --- |
 | `Space f` | Find files |
 | `Space b` | Switch buffer |
-| `Space d` | Toggle Git diff |
 | `Space g` | Grep workspace |
 | `Space e` | File explorer |
 | `Space p` | Switch project |
@@ -114,9 +113,29 @@ normal and line-scoped in insert (since insert has no selection).
 | `Space s`/`Space Alt-s` | Save/save as |
 | `Space r` | Reload from disk |
 | `Space n` | New scratch buffer |
-| `Space w` | Close buffer |
+| `Space c` | Close buffer |
 | `Space q` | Quit |
 | `Space ?` | Show keyboard shortcuts |
+
+### View
+
+| Chord | Action |
+| --- | --- |
+| `Space w` | Toggle soft wrap |
+| `Space i` | Toggle inline Git diff |
+| `Space h`/`Space Alt-h` | Next/previous Git hunk |
+
+### Code / LSP
+
+| Chord | Action |
+| --- | --- |
+| `Space d` | Go to definition |
+| `Space k` | Hover (type & docs) |
+| `Space j` | Show diagnostic at cursor |
+| `Space x`/`Space Alt-x` | Next/previous diagnostic |
+| `Space t` | Diagnostics list |
+| `Space m` | Format document |
+| `Space l` | LSP servers (status, restart) |
 
 ## Building
 

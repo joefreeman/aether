@@ -7,9 +7,12 @@ use crate::app::{
 use crate::keymap;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::BlameInfo;
+use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerItem;
 use aether_protocol::search::SearchMatchRange;
-use aether_protocol::viewport::{DiffMarker, Highlight, VisualRow, WrapMode};
+use aether_protocol::viewport::{
+    DiagnosticSeverity, DiagnosticSpan, DiffMarker, Highlight, VisualRow, WrapMode,
+};
 use aether_protocol::LogicalPosition;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
@@ -96,6 +99,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     } else {
         draw_no_project_view(f, state, chunks[0]);
     }
+    // Hover popup (Space k): floats over the buffer, below any modal (a keypress that opens a modal
+    // first dismisses hover, so they never coexist).
+    if state.has_editor() && state.hover.is_some() {
+        draw_hover_overlay(f, state, chunks[0]);
+    }
     // A centered modal dims the content behind it so it stands out. Done once here, before any
     // overlay paints: each overlay `Clear`s and repaints its own box opaquely, so only the area
     // *behind* the dialog ends up dimmed.
@@ -180,6 +188,165 @@ fn draw_project_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
 /// pickers — listing every binding grouped by context. The content is generated straight from the
 /// `keymap` tables (see [`help_lines`]) so it can never drift from the actual dispatch. Read-only;
 /// `state.help.scroll` pans the (possibly taller-than-the-box) content vertically.
+/// Max body height (rows of text) for the hover box — beyond this it scrolls.
+const HOVER_MAX_BODY: u16 = 16;
+
+/// Computed placement of the hover popup within `area`: where the box sits and how its body is laid
+/// out. Shared by the renderer and the caret placement (which hides the terminal cursor when the box
+/// covers it). `None` when no hover is showing or it can't fit.
+struct HoverLayout {
+    area: Rect,
+    body_h: u16,
+    text_w: u16,
+    needs_scrollbar: bool,
+    /// Display lines paired with the severity color to render them in (`None` = plain).
+    lines: Vec<(String, Option<DiagnosticSeverity>)>,
+}
+
+/// Lay out the hover popup: bottom-anchored, capped at [`HOVER_MAX_BODY`] rows (taller content
+/// scrolls), with the last inner column reserved for a scrollbar when it overflows.
+fn hover_layout(state: &AppState, area: Rect) -> Option<HoverLayout> {
+    let hover = state.hover.as_ref()?;
+    let content_w = area.width.saturating_sub(2).min(80);
+    let max_body = area.height.saturating_sub(2).min(HOVER_MAX_BODY);
+    if content_w < 8 || max_body == 0 {
+        return None;
+    }
+    let full = hover_display_lines(&hover.blocks, content_w as usize);
+    if full.is_empty() {
+        return None;
+    }
+    let needs_scrollbar = full.len() as u16 > max_body;
+    let (lines, text_w) = if needs_scrollbar {
+        (
+            hover_display_lines(&hover.blocks, content_w.saturating_sub(1) as usize),
+            content_w - 1,
+        )
+    } else {
+        (full, content_w)
+    };
+    let body_h = (lines.len() as u16).min(max_body);
+    let box_h = body_h + 2;
+    Some(HoverLayout {
+        area: Rect {
+            x: area.x,
+            y: area.bottom().saturating_sub(box_h),
+            width: content_w + 2,
+            height: box_h,
+        },
+        body_h,
+        text_w,
+        needs_scrollbar,
+        lines,
+    })
+}
+
+/// Hover popup showing the language server's hover text (or a diagnostic), anchored to the bottom of
+/// the editor. Height is capped at [`HOVER_MAX_BODY`]; taller content scrolls (panned by the
+/// keys/wheel handled in `app`) with a scrollbar in the last column.
+fn draw_hover_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+    let (Some(layout), Some(hover)) = (hover_layout(state, area), state.hover.as_ref()) else {
+        return;
+    };
+    let total = layout.lines.len() as u16;
+    f.render_widget(Clear, layout.area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(hover_border_color(&hover.blocks)))
+        .style(Style::default().bg(NORD0).fg(NORD4));
+    f.render_widget(block, layout.area);
+    let inner = Rect {
+        x: layout.area.x + 1,
+        y: layout.area.y + 1,
+        width: layout.area.width - 2,
+        height: layout.body_h,
+    };
+
+    hover.scroll.record(total, layout.body_h);
+    let offset = hover.scroll.offset();
+    let text_area = Rect {
+        width: layout.text_w,
+        ..inner
+    };
+    let shown: Vec<Line> = layout
+        .lines
+        .into_iter()
+        .map(|(text, severity)| {
+            let fg = severity.map_or(NORD4, diag_color);
+            Line::from(Span::styled(text, Style::default().fg(fg)))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(shown)
+            .style(Style::default().bg(NORD0).fg(NORD4))
+            .scroll((offset, 0)),
+        text_area,
+    );
+    if layout.needs_scrollbar {
+        let bar = Rect {
+            x: inner.x + inner.width - 1,
+            y: inner.y,
+            width: 1,
+            height: inner.height,
+        };
+        draw_vertical_scrollbar(f, bar, offset, total, layout.body_h);
+    }
+}
+
+/// Flatten hover markdown to display lines: drop code-fence markers (```), word-wrap long lines to
+/// `width`, and trim leading/trailing blank lines.
+fn hover_lines(text: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if line.trim_start().starts_with("```") {
+            continue;
+        }
+        if line.is_empty() {
+            out.push(String::new());
+        } else {
+            out.extend(wrap_words(line, width));
+        }
+    }
+    while out.first().is_some_and(String::is_empty) {
+        out.remove(0);
+    }
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out
+}
+
+/// Border color for the hover popup: the worst severity among its blocks (matching the gutter dot /
+/// text), or frost blue (`NORD8`) for a plain LSP-hover popup with no severities.
+fn hover_border_color(blocks: &[crate::app::HoverBlock]) -> Color {
+    blocks
+        .iter()
+        .filter_map(|b| b.severity)
+        .max_by_key(|s| severity_rank(*s))
+        .map_or(NORD8, diag_color)
+}
+
+/// Wrap each hover block to `width` and tag every produced line with the block's severity (for
+/// coloring). Blocks are separated by a blank line; empty blocks are skipped.
+fn hover_display_lines(
+    blocks: &[crate::app::HoverBlock],
+    width: usize,
+) -> Vec<(String, Option<DiagnosticSeverity>)> {
+    let mut out: Vec<(String, Option<DiagnosticSeverity>)> = Vec::new();
+    for block in blocks {
+        let block_lines = hover_lines(&block.text, width);
+        if block_lines.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push((String::new(), None));
+        }
+        out.extend(block_lines.into_iter().map(|line| (line, block.severity)));
+    }
+    out
+}
+
 fn draw_help_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     let box_area = picker_box_rect(area);
     if box_area.width < 4 || box_area.height < 4 {
@@ -1383,9 +1550,82 @@ fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
             Constraint::Min(0),
         ])
         .split(inner);
+    // LSP-servers drill-down: one plain box (no input/separator split — that reads as a filter
+    // field) with the title and the status/error as a single scrollable region. `Esc` returns to
+    // the list.
+    if let (Some(aether_protocol::picker::PickerKind::LspServers), Some(detail)) =
+        (state.picker.kind, state.picker.lsp_detail.as_ref())
+    {
+        draw_lsp_detail(f, detail, pad_horizontal(inner));
+        return;
+    }
     draw_picker_input_row(f, state, pad_horizontal(rows[0]));
     draw_picker_separator(f, box_area, rows[1]);
     draw_picker_results(f, state, pad_horizontal(rows[2]));
+}
+
+/// The LSP-server detail drill-down: a single scrollable region holding the title (health glyph +
+/// name + language), then the workspace root, state, and — for a crashed server — the captured
+/// error (e.g. typescript-language-server's "Could not find a valid TypeScript installation").
+/// No input/separator split, so it doesn't masquerade as a filter box. Pre-wrapped so the
+/// scrollbar geometry is exact.
+fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area: Rect) {
+    let text_w = area.width.saturating_sub(1).max(1); // reserve a column for the scrollbar
+    let (glyph, glyph_color) = lsp_status_glyph(&detail.status);
+    let (label, label_color) = lsp_status_label(&detail.status);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+            Span::styled(detail.name.clone(), Style::default().fg(NORD4).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {}", detail.language), Style::default().fg(NORD3)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("root    {}", detail.workspace_root),
+            Style::default().fg(NORD3),
+        )),
+        Line::from(vec![
+            Span::styled("status  ", Style::default().fg(NORD3)),
+            Span::styled(label, Style::default().fg(label_color)),
+        ]),
+    ];
+    if let LspStatus::Crashed { code, message } = &detail.status {
+        lines.push(Line::from(""));
+        for w in wrap_words(message, text_w as usize) {
+            lines.push(Line::from(Span::styled(w, Style::default().fg(NORD11))));
+        }
+        if let Some(c) = code {
+            lines.push(Line::from(Span::styled(
+                format!("exit code {c}"),
+                Style::default().fg(NORD3),
+            )));
+        }
+    }
+    let total = lines.len() as u16;
+    let body_h = area.height;
+    detail.scroll.record(total, body_h);
+    let offset = detail.scroll.offset();
+    let text_area = Rect { width: text_w, ..area };
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)).scroll((offset, 0)),
+        text_area,
+    );
+    if total > body_h {
+        let bar = Rect { x: area.x + area.width - 1, y: area.y, width: 1, height: area.height };
+        draw_vertical_scrollbar(f, bar, offset, total, body_h);
+    }
+}
+
+/// Word label + color for an LSP server's lifecycle state (matches the glyph colors).
+fn lsp_status_label(status: &LspStatus) -> (&'static str, Color) {
+    match status {
+        LspStatus::Ready => ("ready", NORD14),
+        LspStatus::Starting => ("starting", NORD13),
+        LspStatus::Initializing => ("initializing", NORD13),
+        LspStatus::Restarting => ("restarting", NORD13),
+        LspStatus::Crashed { .. } => ("crashed", NORD11),
+        LspStatus::Stopped => ("stopped", NORD3),
+    }
 }
 
 /// Inset `area` by one column on each side. If the area is too narrow for any padding (≤2 cols),
@@ -1544,6 +1784,8 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Grep) => "Grep workspace…",
         Some(aether_protocol::picker::PickerKind::Explorer) => "Filter entries…",
         Some(aether_protocol::picker::PickerKind::Projects) => "Switch project…",
+        Some(aether_protocol::picker::PickerKind::Diagnostics) => "Filter diagnostics…",
+        Some(aether_protocol::picker::PickerKind::LspServers) => "Filter servers…",
         None => "Search…",
     }
 }
@@ -1759,6 +2001,42 @@ fn picker_item_spans(
             max_width,
         );
     }
+    if let PickerItem::Diagnostic {
+        line,
+        severity,
+        message,
+        match_indices,
+        ..
+    } = item
+    {
+        return diagnostic_item_spans(
+            *line,
+            *severity,
+            message,
+            match_indices,
+            highlighted,
+            max_width,
+        );
+    }
+    if let PickerItem::LspServer {
+        name,
+        language,
+        root_label,
+        status,
+        match_indices,
+        ..
+    } = item
+    {
+        return lsp_server_item_spans(
+            name,
+            language,
+            root_label,
+            status,
+            match_indices,
+            highlighted,
+            max_width,
+        );
+    }
 
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
@@ -1784,7 +2062,9 @@ fn picker_item_spans(
         PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
         | PickerItem::DirEntry { .. }
-        | PickerItem::Root { .. } => unreachable!("handled above"),
+        | PickerItem::Root { .. }
+        | PickerItem::Diagnostic { .. }
+        | PickerItem::LspServer { .. } => unreachable!("handled above"),
     };
 
     let text_budget = max_width.saturating_sub(dirty_suffix.len());
@@ -2043,6 +2323,154 @@ fn grep_hit_spans(
     spans
 }
 
+/// Diagnostics-picker row: `• {line} {message}`, the dot colored by severity (matching the gutter)
+/// and the line number dim; fuzzy matches in the message are highlighted.
+fn diagnostic_item_spans(
+    line: u32,
+    severity: DiagnosticSeverity,
+    message: &str,
+    match_indices: &[u32],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    // The message itself is colored by severity (matching the squiggle/popup); fuzzy matches stay
+    // the bright accent so they remain visible. The line number trails in gray parentheses.
+    let base = Style::default().fg(diag_color(severity)).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let line_suffix = format!(" ({})", line + 1);
+    let msg_budget = max_width.saturating_sub(line_suffix.width());
+
+    let truncated: String = message
+        .chars()
+        .scan(0usize, |w, c| {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if *w + cw > msg_budget {
+                None
+            } else {
+                *w += cw;
+                Some(c)
+            }
+        })
+        .collect();
+    let kept = truncated.chars().count() as u32;
+    let kept_indices: Vec<u32> = match_indices.iter().copied().filter(|&i| i < kept).collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if kept_indices.is_empty() {
+        spans.push(Span::styled(truncated, base));
+    } else {
+        let mut current = String::new();
+        let mut current_is_match = false;
+        let mut idx_iter = kept_indices.iter().copied().peekable();
+        for (ci, ch) in truncated.chars().enumerate() {
+            let is_match = idx_iter.peek().copied() == Some(ci as u32);
+            if is_match {
+                idx_iter.next();
+            }
+            if is_match != current_is_match && !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    if current_is_match { match_style } else { base },
+                ));
+            }
+            current_is_match = is_match;
+            current.push(ch);
+        }
+        if !current.is_empty() {
+            spans.push(Span::styled(
+                current,
+                if current_is_match { match_style } else { base },
+            ));
+        }
+    }
+    spans.push(Span::styled(
+        line_suffix,
+        Style::default().fg(NORD3).bg(bg),
+    ));
+    spans
+}
+
+/// One LSP-servers picker row: a health glyph (the same `●`/`◐`/`✗`/`○` + color as the status-bar
+/// indicator), the server name with fuzzy-match highlights, and the language dimmed at the tail.
+/// The glyph re-renders live as `lsp/status_changed` re-pushes the picker.
+fn lsp_server_item_spans(
+    name: &str,
+    language: &str,
+    root_label: &str,
+    status: &LspStatus,
+    match_indices: &[u32],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let (glyph, glyph_color) = lsp_status_glyph(status);
+    let base = Style::default().fg(NORD4).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    // Dim tail: the language, plus the project-relative root when the server isn't at the project
+    // root (empty `root_label` → omitted, so single-root projects show just the language).
+    let tail = if root_label.is_empty() {
+        format!("  {language}")
+    } else {
+        format!("  {language}  {root_label}")
+    };
+    // Glyph + a trailing space, then the name fills the budget left after the glyph and the tail.
+    let glyph_cols = glyph.width() + 1;
+    let name_budget = max_width
+        .saturating_sub(glyph_cols)
+        .saturating_sub(tail.width());
+
+    let truncated: String = name
+        .chars()
+        .scan(0usize, |w, c| {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if *w + cw > name_budget {
+                None
+            } else {
+                *w += cw;
+                Some(c)
+            }
+        })
+        .collect();
+    let kept = truncated.chars().count() as u32;
+    let kept_indices: Vec<u32> = match_indices.iter().copied().filter(|&i| i < kept).collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        format!("{glyph} "),
+        Style::default().fg(glyph_color).bg(bg),
+    ));
+    if kept_indices.is_empty() {
+        spans.push(Span::styled(truncated, base));
+    } else {
+        let mut current = String::new();
+        let mut current_is_match = false;
+        let mut idx_iter = kept_indices.iter().copied().peekable();
+        for (ci, ch) in truncated.chars().enumerate() {
+            let is_match = idx_iter.peek().copied() == Some(ci as u32);
+            if is_match {
+                idx_iter.next();
+            }
+            if is_match != current_is_match && !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    if current_is_match { match_style } else { base },
+                ));
+            }
+            current_is_match = is_match;
+            current.push(ch);
+        }
+        if !current.is_empty() {
+            spans.push(Span::styled(
+                current,
+                if current_is_match { match_style } else { base },
+            ));
+        }
+    }
+    spans.push(Span::styled(tail, Style::default().fg(NORD3).bg(bg)));
+    spans
+}
+
 /// One Explorer entry row: leaf name with a trailing `/` for directories, NORD8 (frost blue)
 /// for directories, fuzzy-match highlights overlaid the same way the Files picker does. The
 /// `/` suffix is appended *after* the name proper so `match_indices` (which index into the
@@ -2204,6 +2632,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 break 'outer;
             }
             let mut spans = deleted_virtual_row_spans(&vrow.text, viewport_cols);
+            // Two-col gutter: red deletion bar (git column) + blank diagnostic column.
             spans.insert(0, gutter_bar(NORD11));
             lines.push(Line::from(spans));
         }
@@ -2269,6 +2698,8 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             });
             let matches_on_row =
                 matches_on_visual_row(vrow.byte_offset, row_text_len, &render.search_matches);
+            let diags_on_row =
+                diagnostics_on_visual_row(vrow.byte_offset, row_text_len, &render.diagnostics);
             let brackets_on_row = bracket_positions_on_visual_row(
                 logical_line,
                 vrow.byte_offset,
@@ -2278,13 +2709,15 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 
             // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
             // bytes when scroll_col == 0 (the common case), so this is a no-op under soft wrap.
-            let (clipped_text, clipped_highlights, clipped_sel, clipped_matches) = clip_horizontal(
-                &segment.text,
-                &segment.highlights,
-                sel_on_row,
-                &matches_on_row,
-                scroll_col,
-            );
+            let (clipped_text, clipped_highlights, clipped_sel, clipped_matches, clipped_diags) =
+                clip_horizontal(
+                    &segment.text,
+                    &segment.highlights,
+                    sel_on_row,
+                    &matches_on_row,
+                    &diags_on_row,
+                    scroll_col,
+                );
             let clipped_brackets: Vec<u32> = brackets_on_row
                 .iter()
                 .filter(|b| **b >= scroll_col)
@@ -2321,6 +2754,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 clipped_sel,
                 &clipped_matches,
                 &clipped_brackets,
+                &clipped_diags,
                 body_width,
             ));
             if highlight_trailing_newline {
@@ -2365,12 +2799,11 @@ fn gutter_bar(color: Color) -> Span<'static> {
     Span::styled("▎".to_string(), Style::default().fg(color))
 }
 
-/// The change-bar cell for the gutter: a colored bar for added/modified lines, a top marker for a
-/// line that has deletions just above it (only used when no deletion band is shown), or blank.
-/// Exactly `GUTTER_WIDTH` cols wide.
-fn gutter_span(mark: Option<DiffMarker>) -> Span<'static> {
+/// The git column of the gutter: a colored bar for added/modified lines, a top marker for a line
+/// with deletions just above it, or blank. One col wide.
+fn git_gutter_cell(mark: Option<DiffMarker>) -> Span<'static> {
     match mark {
-        Some(DiffMarker::Added) => gutter_bar(NORD14),    // green bar
+        Some(DiffMarker::Added) => gutter_bar(NORD14), // green bar
         Some(DiffMarker::Modified) => gutter_bar(NORD13), // yellow bar (matches modified tint)
         Some(DiffMarker::Deleted) => {
             Span::styled("▔".to_string(), Style::default().fg(NORD11)) // red "removed above"
@@ -2379,9 +2812,9 @@ fn gutter_span(mark: Option<DiffMarker>) -> Span<'static> {
     }
 }
 
-/// Prepend the gutter cell to a row's content spans, producing the final `Line`.
+/// Prepend the gutter cell (git change column) to a row's content spans, producing the final `Line`.
 fn prepend_gutter(mark: Option<DiffMarker>, mut spans: Vec<Span<'static>>) -> Line<'static> {
-    spans.insert(0, gutter_span(mark));
+    spans.insert(0, git_gutter_cell(mark));
     Line::from(spans)
 }
 
@@ -2476,15 +2909,29 @@ fn relative_time(timestamp: i64) -> String {
 
 /// Drop the first `scroll_col` bytes of the row's text, then shift highlight + selection + match
 /// ranges to match the new origin. Anything fully scrolled off the left is filtered out.
+#[allow(clippy::type_complexity)]
 fn clip_horizontal(
     text: &str,
     highlights: &[Highlight],
     sel: Option<(u32, u32)>,
     matches: &[(u32, u32)],
+    diags: &[(u32, u32, DiagnosticSeverity)],
     scroll_col: u32,
-) -> (String, Vec<Highlight>, Option<(u32, u32)>, Vec<(u32, u32)>) {
+) -> (
+    String,
+    Vec<Highlight>,
+    Option<(u32, u32)>,
+    Vec<(u32, u32)>,
+    Vec<(u32, u32, DiagnosticSeverity)>,
+) {
     if scroll_col == 0 {
-        return (text.to_string(), highlights.to_vec(), sel, matches.to_vec());
+        return (
+            text.to_string(),
+            highlights.to_vec(),
+            sel,
+            matches.to_vec(),
+            diags.to_vec(),
+        );
     }
     let skip = scroll_col as usize;
     let clipped_text = if skip >= text.len() {
@@ -2517,7 +2964,17 @@ fn clip_horizontal(
     };
     let new_sel = sel.and_then(shift_range);
     let new_matches = matches.iter().copied().filter_map(shift_range).collect();
-    (clipped_text, new_highlights, new_sel, new_matches)
+    let new_diags = diags
+        .iter()
+        .filter_map(|(s, e, sev)| shift_range((*s, *e)).map(|(s, e)| (s, e, *sev)))
+        .collect();
+    (
+        clipped_text,
+        new_highlights,
+        new_sel,
+        new_matches,
+        new_diags,
+    )
 }
 
 /// Clip per-logical-line search match ranges (delivered by the server in `LogicalLineRender`) to
@@ -2543,6 +3000,57 @@ fn matches_on_visual_row(
             }
         })
         .collect()
+}
+
+/// Clip per-logical-line diagnostic spans to this visual row's byte range, returning row-relative
+/// `(start, end, severity)`. A zero-width diagnostic within the row is widened to one cell so it's
+/// visible; a diagnostic ending exactly at the row's end (its `\n`) is dropped (nothing to draw).
+fn diagnostics_on_visual_row(
+    row_byte_offset: u32,
+    row_text_len: u32,
+    diags: &[DiagnosticSpan],
+) -> Vec<(u32, u32, DiagnosticSeverity)> {
+    if row_text_len == 0 {
+        return Vec::new();
+    }
+    let row_end = row_byte_offset + row_text_len;
+    diags
+        .iter()
+        .filter_map(|d| {
+            let s = d.start.max(row_byte_offset);
+            let e = d.end.min(row_end);
+            if e > s {
+                Some((s - row_byte_offset, e - row_byte_offset, d.severity))
+            } else if d.start == d.end && d.start >= row_byte_offset && d.start < row_end {
+                // Zero-width (point) diagnostic: underline the single cell at its position.
+                let p = d.start - row_byte_offset;
+                Some((p, p + 1, d.severity))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The underline / message color for a diagnostic severity.
+fn diag_color(severity: DiagnosticSeverity) -> Color {
+    match severity {
+        DiagnosticSeverity::Error => NORD11,      // red
+        DiagnosticSeverity::Warning => NORD13,    // yellow
+        DiagnosticSeverity::Information => NORD8, // frost blue
+        DiagnosticSeverity::Hint => NORD3,        // dim gray
+    }
+}
+
+/// Ordering for "most important" severity (Error highest), so a line with several diagnostics shows
+/// its worst one's message and a cell underneath several picks the worst color.
+fn severity_rank(severity: DiagnosticSeverity) -> u8 {
+    match severity {
+        DiagnosticSeverity::Error => 3,
+        DiagnosticSeverity::Warning => 2,
+        DiagnosticSeverity::Information => 1,
+        DiagnosticSeverity::Hint => 0,
+    }
 }
 
 /// For the visual row at `(logical_line, row_byte_offset..row_byte_offset+row_text_len)`,
@@ -2639,6 +3147,7 @@ fn build_spans(
     sel: Option<(u32, u32)>,
     matches: &[(u32, u32)],
     match_brackets: &[u32],
+    diagnostics: &[(u32, u32, DiagnosticSeverity)],
     max_chars: u16,
 ) -> Vec<Span<'static>> {
     let truncated: String = text.chars().take(max_chars as usize).collect();
@@ -2674,6 +3183,19 @@ fn build_spans(
         }
     }
 
+    // Per-byte diagnostic severity (worst wins where they overlap), so we can underline each cell in
+    // its severity color.
+    let mut byte_diag: Vec<Option<DiagnosticSeverity>> = vec![None; trunc_len];
+    for (s, e, sev) in diagnostics {
+        let s = (*s as usize).min(trunc_len);
+        let e = (*e as usize).min(trunc_len);
+        for slot in byte_diag.iter_mut().take(e).skip(s) {
+            if slot.map_or(true, |cur| severity_rank(*sev) > severity_rank(cur)) {
+                *slot = Some(*sev);
+            }
+        }
+    }
+
     let style_at = |byte_idx: usize| -> Style {
         let mut style = byte_kind[byte_idx].map(theme_for).unwrap_or_default();
         // Match-bracket overlay: bold + NORD12 (Aurora orange). The only warm tone in our
@@ -2692,6 +3214,14 @@ fn build_spans(
             if byte_idx >= s as usize && byte_idx < e as usize {
                 style = style.bg(NORD10);
             }
+        }
+        // Diagnostic underline, colored by severity. Drawn last so it layers over selection/match
+        // backgrounds without disturbing the foreground syntax color. Terminals without colored
+        // underlines fall back to a plain underline.
+        if let Some(sev) = byte_diag[byte_idx] {
+            style = style
+                .add_modifier(Modifier::UNDERLINED)
+                .underline_color(diag_color(sev));
         }
         style
     };
@@ -2897,8 +3427,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 
         Line::from(build_editor_status_spans(
             &left_pre,
+            diagnostic_count_spans(state),
             &state.status,
             &right,
+            lsp_indicator_span(state),
             area.width as usize,
         ))
     };
@@ -3029,46 +3561,124 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
 /// The right segment is never truncated — the cursor position is more useful than the message.
 fn build_editor_status_spans(
     left_pre: &str,
+    diag_spans: Vec<Span<'static>>,
     status: &crate::app::StatusMessage,
     right: &str,
+    lsp: Option<Span<'static>>,
     total_width: usize,
 ) -> Vec<Span<'static>> {
     let base_style = Style::default().bg(NORD1).fg(NORD4);
-    let right_w = right.width();
+    // Right segment: the counters/position, then the LSP glyph pinned to the far edge. Reserve the
+    // glyph's width plus a leading gap and a trailing space (the latter gives the fat `●` room).
+    let lsp_w = lsp.as_ref().map(|s| s.content.width() + 2).unwrap_or(0);
+    let right_w = right.width() + lsp_w;
     // Always keep at least one cell of gap between the left content and the right segment.
     let left_max = total_width.saturating_sub(right_w + 1);
 
-    let left_pre_w = left_pre.width();
     let mut spans: Vec<Span<'static>> = Vec::new();
-
-    if left_pre_w >= left_max {
-        // Even the pre-status segment overflows — truncate it and drop the status.
-        spans.push(Span::styled(
-            truncate_to_width(left_pre, left_max),
-            base_style,
-        ));
-    } else if status.is_empty() {
-        spans.push(Span::styled(left_pre.to_string(), base_style));
+    let mut used = 0usize;
+    if left_pre.width() >= left_max {
+        // Even the project/file segment overflows — truncate it and drop the rest.
+        let t = truncate_to_width(left_pre, left_max);
+        used += t.width();
+        spans.push(Span::styled(t, base_style));
     } else {
-        // Pre-status fits; budget the rest for the status text + its leading separator.
-        let separator = "    ";
-        let separator_w = separator.width();
-        let remaining = left_max.saturating_sub(left_pre_w + separator_w);
-        let status_text = if status.text.width() <= remaining {
-            status.text.clone()
-        } else {
-            truncate_to_width(&status.text, remaining)
-        };
         spans.push(Span::styled(left_pre.to_string(), base_style));
-        spans.push(Span::styled(separator.to_string(), base_style));
-        spans.push(Span::styled(status_text, status_message_style(status)));
+        used += left_pre.width();
+        // Diagnostic counts sit right after the dirty marker (a space, then the colored counts).
+        let diag_w: usize = diag_spans.iter().map(|s| s.content.width()).sum();
+        if diag_w > 0 && used + 1 + diag_w <= left_max {
+            spans.push(Span::styled(" ".to_string(), base_style));
+            used += 1;
+            for s in diag_spans {
+                used += s.content.width();
+                spans.push(s);
+            }
+        }
+        // Status message after a separator, truncated to whatever's left.
+        if !status.is_empty() {
+            let separator = "    ";
+            let remaining = left_max.saturating_sub(used + separator.width());
+            if remaining > 0 {
+                let text = if status.text.width() <= remaining {
+                    status.text.clone()
+                } else {
+                    truncate_to_width(&status.text, remaining)
+                };
+                used += separator.width() + text.width();
+                spans.push(Span::styled(separator.to_string(), base_style));
+                spans.push(Span::styled(text, status_message_style(status)));
+            }
+        }
     }
 
-    let used_w: usize = spans.iter().map(|s| s.content.width()).sum();
-    let pad_w = total_width.saturating_sub(used_w + right_w);
+    let pad_w = total_width.saturating_sub(used + right_w);
     spans.push(Span::styled(" ".repeat(pad_w), base_style));
     spans.push(Span::styled(right.to_string(), base_style));
+    if let Some(glyph) = lsp {
+        spans.push(Span::styled(" ".to_string(), base_style));
+        spans.push(glyph);
+        spans.push(Span::styled(" ".to_string(), base_style));
+    }
     spans
+}
+
+/// Diagnostic severity counts for the current buffer, worst-first, as colored spans (e.g. a red
+/// `✗ 2`). Empty when the buffer has none. A space sits between each glyph and its count (the
+/// `✗`/`⚠` glyphs read wide), and the severity segments are separated by a space.
+fn diagnostic_count_spans(state: &AppState) -> Vec<Span<'static>> {
+    let bg = Style::default().bg(NORD1);
+    let mut parts: Vec<Span<'static>> = Vec::new();
+    let Some(counts) = state
+        .editor
+        .as_ref()
+        .and_then(|ed| state.diagnostic_counts.get(&ed.buffer_id))
+    else {
+        return parts;
+    };
+    for (n, glyph, severity) in [
+        (counts.errors, "✗", DiagnosticSeverity::Error),
+        (counts.warnings, "⚠", DiagnosticSeverity::Warning),
+        (counts.infos, "ℹ", DiagnosticSeverity::Information),
+        (counts.hints, "·", DiagnosticSeverity::Hint),
+    ] {
+        if n > 0 {
+            if !parts.is_empty() {
+                parts.push(Span::styled(" ".to_string(), bg));
+            }
+            parts.push(Span::styled(
+                format!("{glyph} {n}"),
+                bg.fg(diag_color(severity)),
+            ));
+        }
+    }
+    parts
+}
+
+/// The far-right LSP health glyph for the buffer's own server (just the state-colored
+/// `●`/`◐`/`✗`/`○`). `None` when the buffer has no attached server or no status yet. Keyed by the
+/// buffer's `(language, workspace_root)` so it's correct even when several same-language servers run.
+fn lsp_indicator_span(state: &AppState) -> Option<Span<'static>> {
+    let server = state.editor.as_ref()?.lsp_server.as_ref()?;
+    let status = state
+        .lsp_status
+        .get(&(server.language.clone(), server.workspace_root.clone()))?;
+    let (glyph, color) = lsp_status_glyph(&status.status);
+    Some(Span::styled(
+        glyph.to_string(),
+        Style::default().bg(NORD1).fg(color),
+    ))
+}
+
+/// Glyph + color for a language-server state. `◐` reads as "busy" for the transitional states (the
+/// loop is event-driven, so it changes when a `lsp/status_changed` arrives rather than animating).
+fn lsp_status_glyph(status: &LspStatus) -> (&'static str, Color) {
+    match status {
+        LspStatus::Ready => ("●", NORD14),
+        LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => ("◐", NORD13),
+        LspStatus::Crashed { .. } => ("✗", NORD11),
+        LspStatus::Stopped => ("○", NORD3),
+    }
 }
 
 /// Truncate `s` so its display width is at most `max`, appending `…` when the input was longer.
@@ -3216,8 +3826,9 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         return;
     }
     if state.picker.open {
-        // No caret while a delete confirmation owns the input row — there's nothing to type into.
-        if state.picker.pending_delete.is_some() {
+        // No caret while a delete confirmation owns the input row, or while the LSP detail
+        // drill-down replaces it — there's nothing to type into.
+        if state.picker.pending_delete.is_some() || state.picker.lsp_detail.is_some() {
             return;
         }
         // Place the cursor inside the picker overlay's input row, at the current insertion
@@ -3278,6 +3889,14 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         .x
         .saturating_add(GUTTER_WIDTH)
         .saturating_add(visual_col.min(buffer_area.width.saturating_sub(1)));
+    // Hide the caret when the (bottom-anchored) hover popup is painted over it — no
+    // `set_cursor_position` call leaves the terminal cursor hidden for this frame.
+    if let Some(layout) = hover_layout(state, buffer_area) {
+        let b = layout.area;
+        if row >= b.y && row < b.y + b.height && col >= b.x && col < b.x + b.width {
+            return;
+        }
+    }
     f.set_cursor_position((col, row));
 }
 
@@ -3732,6 +4351,73 @@ mod tests {
     }
 
     #[test]
+    fn hover_lines_strips_fences_wraps_and_trims() {
+        let text = "```rust\nfn foo()\n```\n\nDocs paragraph here";
+        assert_eq!(
+            hover_lines(text, 80),
+            vec![
+                "fn foo()".to_string(),
+                String::new(),
+                "Docs paragraph here".to_string()
+            ]
+        );
+        // Leading/trailing blank lines are trimmed; long lines wrap.
+        assert_eq!(hover_lines("\n\nhi\n\n", 80), vec!["hi".to_string()]);
+        assert!(hover_lines("aaaa bbbb cccc", 9).len() >= 2);
+    }
+
+    #[test]
+    fn hover_display_lines_tags_blocks_with_severity() {
+        use crate::app::HoverBlock;
+        let blocks = vec![
+            HoverBlock {
+                text: "Error: bad thing".into(),
+                severity: Some(DiagnosticSeverity::Error),
+            },
+            HoverBlock {
+                text: "Hint: maybe".into(),
+                severity: Some(DiagnosticSeverity::Hint),
+            },
+        ];
+        let lines = hover_display_lines(&blocks, 80);
+        assert_eq!(
+            lines[0],
+            ("Error: bad thing".to_string(), Some(DiagnosticSeverity::Error))
+        );
+        assert_eq!(lines[1], (String::new(), None), "blank separator between blocks");
+        assert_eq!(
+            lines[2],
+            ("Hint: maybe".to_string(), Some(DiagnosticSeverity::Hint))
+        );
+        // A plain (hover) block carries no severity → default color.
+        let plain = vec![HoverBlock {
+            text: "fn x()".into(),
+            severity: None,
+        }];
+        assert_eq!(hover_display_lines(&plain, 80)[0], ("fn x()".to_string(), None));
+    }
+
+    #[test]
+    fn hover_border_color_matches_worst_severity() {
+        use crate::app::HoverBlock;
+        let blk = |severity| HoverBlock {
+            text: "m".into(),
+            severity,
+        };
+        // Plain hover → frost blue.
+        assert_eq!(hover_border_color(&[blk(None)]), NORD8);
+        // Worst severity wins.
+        assert_eq!(
+            hover_border_color(&[blk(Some(DiagnosticSeverity::Hint)), blk(Some(DiagnosticSeverity::Error))]),
+            diag_color(DiagnosticSeverity::Error)
+        );
+        assert_eq!(
+            hover_border_color(&[blk(Some(DiagnosticSeverity::Warning))]),
+            diag_color(DiagnosticSeverity::Warning)
+        );
+    }
+
+    #[test]
     fn padded_spans_pads_to_display_width() {
         let st = Style::default();
         let total: usize = padded_spans("ab", 5, st, st)
@@ -3801,7 +4487,7 @@ mod tests {
     #[test]
     fn editor_status_spans_no_status_pads_to_right_edge() {
         let status = crate::app::StatusMessage::default();
-        let spans = build_editor_status_spans("[proj] file.rs", &status, "12:5", 30);
+        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, "12:5", None, 30);
         let text = spans_text(&spans);
         assert!(text.starts_with("[proj] file.rs"));
         assert!(text.ends_with("12:5"));
@@ -3811,7 +4497,7 @@ mod tests {
     #[test]
     fn editor_status_spans_renders_status_with_color() {
         let status = crate::app::StatusMessage::success("saved (rev 1)");
-        let spans = build_editor_status_spans("[proj] file.rs", &status, "12:5", 60);
+        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, "12:5", None, 60);
         // Status text should appear, sandwiched between the left bit and the padding/right.
         let text = spans_text(&spans);
         assert!(text.contains("[proj] file.rs"));
@@ -3830,7 +4516,7 @@ mod tests {
         // total=30, right="12:5" (4) + gap(1) = 5 reserved; left_max=25. left_pre="[proj] file.rs" (14)
         // + separator(4) = 18 used. Status budget = 25 - 18 = 7. So a long status truncates.
         let status = crate::app::StatusMessage::info("a much longer status message");
-        let spans = build_editor_status_spans("[proj] file.rs", &status, "12:5", 30);
+        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, "12:5", None, 30);
         let status_span = spans
             .iter()
             .find(|s| s.style.fg == Some(NORD4) && s.content.contains('…'))
@@ -3846,7 +4532,7 @@ mod tests {
         // total=12, right=4, gap=1 → left_max=7. left_pre="[proj] file.rs" (14) > 7, so it
         // gets truncated and the status is dropped entirely.
         let status = crate::app::StatusMessage::error("save failed: disk full");
-        let spans = build_editor_status_spans("[proj] file.rs", &status, "12:5", 12);
+        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, "12:5", None, 12);
         let text = spans_text(&spans);
         // No part of the status text should make it into the rendered line.
         assert!(
@@ -3856,5 +4542,100 @@ mod tests {
         assert!(text.contains('…'));
         assert!(text.ends_with("12:5"));
         assert_eq!(spans_total_width(&spans), 12);
+    }
+
+    fn dspan(start: u32, end: u32, severity: DiagnosticSeverity) -> DiagnosticSpan {
+        DiagnosticSpan {
+            start,
+            end,
+            severity,
+            message: "m".into(),
+        }
+    }
+
+    #[test]
+    fn diagnostics_on_visual_row_clips_to_row_and_widens_zero_width() {
+        let diags = vec![
+            dspan(4, 9, DiagnosticSeverity::Error),
+            dspan(20, 20, DiagnosticSeverity::Warning), // zero-width point
+        ];
+        // Row [0,12): the error clips to (4,9); the point at 20 is off-row.
+        assert_eq!(
+            diagnostics_on_visual_row(0, 12, &diags),
+            vec![(4, 9, DiagnosticSeverity::Error)]
+        );
+        // Row [16,30): the point widens to one cell at row-relative 4.
+        assert_eq!(
+            diagnostics_on_visual_row(16, 14, &diags),
+            vec![(4, 5, DiagnosticSeverity::Warning)]
+        );
+        // Empty rows carry nothing.
+        assert!(diagnostics_on_visual_row(0, 0, &diags).is_empty());
+    }
+
+    /// Per-char underline state from `build_spans`, indexed by column (ASCII input → col == byte).
+    fn underline_cols(spans: &[Span<'static>]) -> Vec<(bool, Option<Color>)> {
+        let mut out = Vec::new();
+        for s in spans {
+            for _ in s.content.chars() {
+                out.push((
+                    s.style.add_modifier.contains(Modifier::UNDERLINED),
+                    s.style.underline_color,
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn build_spans_underlines_diagnostic_in_severity_color() {
+        let diags = [(2u32, 4u32, DiagnosticSeverity::Warning)];
+        let cells = underline_cols(&build_spans("abcdef", &[], None, &[], &[], &diags, 80));
+        for (col, (underlined, color)) in cells.into_iter().enumerate() {
+            if col == 2 || col == 3 {
+                assert!(underlined, "cell {col} underlined");
+                assert_eq!(color, Some(NORD13), "cell {col} warning-yellow");
+            } else {
+                assert!(!underlined, "cell {col} not underlined");
+            }
+        }
+    }
+
+    #[test]
+    fn build_spans_underline_uses_worst_severity_on_overlap() {
+        // Hint over [0,3) with an error over [1,2): the error color wins on the overlapping cell.
+        let diags = [
+            (0u32, 3u32, DiagnosticSeverity::Hint),
+            (1u32, 2u32, DiagnosticSeverity::Error),
+        ];
+        let cells = underline_cols(&build_spans("xyz", &[], None, &[], &[], &diags, 80));
+        assert_eq!(cells[1].1, Some(NORD11), "overlap shows error red");
+        assert_eq!(cells[0].1, Some(NORD3), "non-overlap keeps hint gray");
+    }
+
+    #[test]
+    fn lsp_status_glyph_maps_states() {
+        assert_eq!(lsp_status_glyph(&LspStatus::Ready), ("●", NORD14));
+        assert_eq!(lsp_status_glyph(&LspStatus::Initializing), ("◐", NORD13));
+        assert_eq!(lsp_status_glyph(&LspStatus::Restarting), ("◐", NORD13));
+        assert_eq!(
+            lsp_status_glyph(&LspStatus::Crashed {
+                code: None,
+                message: String::new()
+            }),
+            ("✗", NORD11)
+        );
+        assert_eq!(lsp_status_glyph(&LspStatus::Stopped), ("○", NORD3));
+    }
+
+    #[test]
+    fn lsp_status_label_maps_states() {
+        assert_eq!(lsp_status_label(&LspStatus::Ready), ("ready", NORD14));
+        assert_eq!(lsp_status_label(&LspStatus::Starting), ("starting", NORD13));
+        assert_eq!(lsp_status_label(&LspStatus::Stopped), ("stopped", NORD3));
+        assert_eq!(
+            lsp_status_label(&LspStatus::Crashed { code: Some(1), message: "boom".into() }),
+            ("crashed", NORD11)
+        );
     }
 }

@@ -42,6 +42,35 @@ pub struct LogicalLineRender {
     /// the line background while the diff view is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_marker: Option<DiffMarker>,
+    /// Language-server diagnostics intersecting this logical line, as byte ranges within the line
+    /// (already converted from the server's LSP position encoding). A diagnostic spanning multiple
+    /// lines contributes one entry — carrying the full message — to each line it touches, so the
+    /// client can underline the span and show the message wherever the cursor lands. Empty when no
+    /// diagnostics apply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DiagnosticSpan>,
+}
+
+/// One diagnostic's footprint on a single logical line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticSpan {
+    /// Byte offset within the logical line where the underline starts.
+    pub start: u32,
+    /// Byte offset within the logical line where the underline ends (exclusive). For a zero-width
+    /// diagnostic (`start == end`) the client underlines one cell so it's visible.
+    pub end: u32,
+    pub severity: DiagnosticSeverity,
+    /// The full diagnostic message (repeated on each line the diagnostic covers).
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -11,6 +11,8 @@
 
 use crate::cursor::Direction;
 use crate::envelope::{NotificationMethod, RpcMethod};
+use crate::lsp::LspStatus;
+use crate::viewport::DiagnosticSeverity;
 use crate::{BufferId, LogicalPosition};
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +42,13 @@ pub enum PickerKind {
     /// kinds in that this picker is usable *before* a project is active (it's how the user
     /// gets one active in the first place) — every other picker requires `active_project`.
     Projects,
+    /// The current buffer's LSP diagnostics, fuzzy-matched on the message. Scoped to one buffer
+    /// (`PickerViewParams::buffer_id`). Selecting one jumps to its position (via `FileAt`).
+    Diagnostics,
+    /// The language servers for the active project, fuzzy-matched on server name. Unlike the
+    /// other kinds this isn't a jump target: the client restarts the highlighted server in place
+    /// (`Ctrl-r` → `lsp/restart_server`) and the list live-updates as statuses change.
+    LspServers,
 }
 
 impl PickerKind {
@@ -105,6 +114,17 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
+    /// One diagnostic in the current buffer. Identity is `(line, col, message)`. The matcher
+    /// haystack is `message`; `match_indices` are char offsets into it. Selecting jumps to
+    /// `(line, col)`.
+    Diagnostic {
+        line: u32,
+        col: u32,
+        severity: DiagnosticSeverity,
+        message: String,
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
     /// One configured project. Identity is `name` (the file stem of the project's TOML config).
     /// Selecting a `Project` returns a `PickerSelectResult::Project` and the client follows up
     /// with `project/activate`.
@@ -132,6 +152,24 @@ pub enum PickerItem {
     /// disambiguator is client-derived and not part of the haystack.
     Root {
         path_index: u32,
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One language server for the active project. Identity is `(language, workspace_root)` — the
+    /// server key. Carries `status` so the client renders the health glyph; the matcher haystack
+    /// is `name`. Not a jump target: the client acts on it via `lsp/restart_server`, so there's
+    /// no corresponding `PickerSelectResult` variant.
+    LspServer {
+        name: String,
+        language: String,
+        /// Absolute workspace root — the stable identity half (with `language`).
+        workspace_root: String,
+        /// Display-only: `workspace_root` relative to its project root, or empty when the server
+        /// is rooted *at* a project root (so single-root projects show no redundant path; only
+        /// monorepo sub-roots get a disambiguating label). Server-computed.
+        #[serde(default)]
+        root_label: String,
+        status: LspStatus,
         #[serde(default)]
         match_indices: Vec<u32>,
     },
@@ -187,6 +225,10 @@ pub struct PickerViewParams {
     /// mode" by pressing `Alt-Backspace` at the top of a root.
     #[serde(default, skip_serializing_if = "is_false")]
     pub explorer_roots: bool,
+    /// Diagnostics only: the buffer to list diagnostics for. Required when opening the Diagnostics
+    /// picker (`reset: true`); `None` on resume/scroll re-views (the candidate snapshot is kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
 }
 
 fn is_false(b: &bool) -> bool {

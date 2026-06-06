@@ -39,7 +39,11 @@ use aether_protocol::viewport::{
     ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
     ViewportWindowResult, VirtualRowKind, WrapMode,
 };
-use aether_protocol::viewport::DiffMarker;
+use aether_protocol::lsp::{
+    FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
+    LspGotoDefinitionResult, LspHover, LspHoverResult, LspServerStatus, LspStatus, LspStatusChanged,
+};
+use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker};
 use aether_protocol::LogicalPosition;
 use aether_server::spawn_for_test;
 use futures_util::{SinkExt, StreamExt};
@@ -7285,6 +7289,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7335,6 +7340,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7389,6 +7395,7 @@ async fn picker_select_returns_absolute_path() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7453,6 +7460,7 @@ async fn picker_resume_centers_on_remembered_item() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7495,6 +7503,7 @@ async fn picker_resume_centers_on_remembered_item() {
             }),
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7526,6 +7535,7 @@ async fn picker_reset_wipes_persisted_query() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7563,6 +7573,7 @@ async fn picker_reset_wipes_persisted_query() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7661,6 +7672,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7710,6 +7722,7 @@ async fn buffers_picker_select_returns_buffer_id() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7818,6 +7831,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -7928,6 +7942,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -8015,6 +8030,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -8120,6 +8136,7 @@ async fn buffers_picker_pushes_on_save() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -8195,6 +8212,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -8282,6 +8300,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -9710,6 +9729,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -9784,6 +9804,7 @@ async fn picker_grep_short_query_yields_empty_result() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -9827,6 +9848,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -9868,6 +9890,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -9898,6 +9921,7 @@ async fn picker_grep_treats_query_as_regex() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -9941,6 +9965,7 @@ async fn picker_grep_caches_completed_query() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10027,6 +10052,7 @@ async fn setup_grep_with_needle_query() -> (
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10278,6 +10304,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
             center_on: None,
             center_on_cursor_grep_hit: Some(buffer_id),
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10305,6 +10332,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
             center_on: None,
             center_on_cursor_grep_hit: Some(buffer_id),
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10488,6 +10516,7 @@ async fn picker_explorer_default_lists_project_root() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10536,6 +10565,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some(target.display().to_string()),
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10578,6 +10608,7 @@ async fn picker_explorer_query_filters_by_prefix() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10637,6 +10668,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10699,6 +10731,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10772,6 +10805,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10832,6 +10866,7 @@ async fn picker_explorer_query_is_smartcase() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10893,6 +10928,7 @@ async fn picker_explorer_select_file_returns_absolute_path() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some(target.display().to_string()),
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10940,6 +10976,7 @@ async fn picker_explorer_select_directory_errors() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -10982,6 +11019,7 @@ async fn picker_explorer_rejects_path_outside_project() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some("/etc".into()),
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -11187,6 +11225,7 @@ async fn picker_explorer_resumes_last_directory() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some(target.display().to_string()),
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -11213,6 +11252,7 @@ async fn picker_explorer_resumes_last_directory() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -11242,6 +11282,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         },
     )
@@ -12606,4 +12647,726 @@ async fn git_navigate_hunk_jumps_between_changes() {
     assert_eq!(prev.cursor.position.line, 0);
 
     drop(server);
+}
+
+// ---- real-LSP verification ----------------------------------------------------------------------
+//
+// These open a file against an actual language server and assert our client integrates with it:
+// `lsp_diag_*` assert a diagnostic rides back on `viewport/lines_changed` (the full inbound path);
+// `lsp_ready_*` assert the server reaches `Ready` via `lsp/status_changed` (handshake only, for
+// servers whose diagnostics need a full project or don't fire on a lone file). All are `#[ignore]`d
+// (need the server installed) and FAIL — not skip — if a prerequisite is missing, since running
+// them is an explicit opt-in. Provision the whole toolchain with `mise install`; run with:
+//   AETHER_TEST_TYPESCRIPT_DIR="$(mise where npm:typescript)/lib/node_modules/typescript" \
+//     mise exec -- cargo test -p aether-server --test integration -- --ignored --test-threads=1 lsp_
+// Each test names the server it needs; install it however you like as long as it's on PATH.
+
+type Ws = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// Fail fast (rather than time out) if a server binary isn't on PATH.
+fn require_server_on_path(cmd: &str) {
+    let found = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
+        .unwrap_or(false);
+    assert!(
+        found,
+        "language server `{cmd}` is not on PATH — install the toolchain (`mise install`) and run via \
+         `mise exec -- cargo test ...`"
+    );
+}
+
+/// Spawn a server over `root`, connect, activate, open `rel_path`, subscribe a viewport. Returns the
+/// handle (keep it alive) and the socket.
+async fn open_and_subscribe(
+    project: &str,
+    root: &std::path::Path,
+    rel_path: &str,
+) -> (aether_server::ServerHandle, Ws) {
+    let server = spawn_for_test(project, vec![root.to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams { name: project.into() },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some(rel_path.into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 100,
+            rows: 40,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    (server, ws)
+}
+
+/// Open `rel_path` (in a workspace pre-populated under `root`) and return the first non-empty
+/// diagnostics batch on `viewport/lines_changed`. Panics on timeout.
+async fn run_lsp_diagnostics(
+    project: &str,
+    root: &std::path::Path,
+    rel_path: &str,
+    timeout_secs: u64,
+) -> Vec<(DiagnosticSeverity, String)> {
+    use std::time::Duration;
+    let (server, mut ws) = open_and_subscribe(project, root, rel_path).await;
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            let text = next_text(&mut ws).await;
+            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text) {
+                if n.method == ViewportLinesChanged::NAME {
+                    let p: ViewportLinesChangedParams =
+                        serde_json::from_value(n.params).expect("typed params");
+                    let diags: Vec<(DiagnosticSeverity, String)> = p
+                        .replacement_lines
+                        .iter()
+                        .flat_map(|l| l.diagnostics.iter())
+                        .map(|d| (d.severity, d.message.clone()))
+                        .collect();
+                    if !diags.is_empty() {
+                        return diags;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    drop(server);
+    result.unwrap_or_else(|_| panic!("no diagnostics within {timeout_secs}s for {project}"))
+}
+
+/// Open `rel_path` and wait for `language`'s server to reach `Ready` via `lsp/status_changed`.
+/// Panics on timeout. For servers whose diagnostics need a full project / don't fire on a lone file,
+/// this still verifies spawn + handshake + status push.
+async fn run_lsp_until_ready(
+    project: &str,
+    root: &std::path::Path,
+    rel_path: &str,
+    language: &str,
+    timeout_secs: u64,
+) {
+    use std::time::Duration;
+    let (server, mut ws) = open_and_subscribe(project, root, rel_path).await;
+    let ready = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            let text = next_text(&mut ws).await;
+            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text) {
+                if n.method == LspStatusChanged::NAME {
+                    let s: LspServerStatus = serde_json::from_value(n.params).expect("typed");
+                    if s.language == language && matches!(s.status, LspStatus::Ready) {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    drop(server);
+    ready.unwrap_or_else(|_| panic!("{language} server did not reach Ready within {timeout_secs}s"));
+}
+
+/// Write `files` into a fresh temp dir, then [`run_lsp_diagnostics`].
+async fn first_lsp_diagnostics(
+    project: &str,
+    files: &[(&str, &str)],
+    rel_path: &str,
+    timeout_secs: u64,
+) -> Vec<(DiagnosticSeverity, String)> {
+    let dir = lay_out(files);
+    run_lsp_diagnostics(project, dir.path(), rel_path, timeout_secs).await
+}
+
+/// Write `files` into a fresh temp dir, then [`run_lsp_until_ready`].
+async fn first_lsp_ready(
+    project: &str,
+    files: &[(&str, &str)],
+    rel_path: &str,
+    language: &str,
+    timeout_secs: u64,
+) {
+    let dir = lay_out(files);
+    run_lsp_until_ready(project, dir.path(), rel_path, language, timeout_secs).await;
+}
+
+fn lay_out(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, contents) in files {
+        let path = dir.path().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+    dir
+}
+
+fn dump_diags(label: &str, diags: &[(DiagnosticSeverity, String)]) {
+    eprintln!("--- {label}: {} diagnostic(s) ---", diags.len());
+    for (sev, msg) in diags {
+        eprintln!("  [{sev:?}] {}", msg.lines().next().unwrap_or(""));
+    }
+}
+
+// ---- diagnostic-path tests (assert a diagnostic arrives) ----
+
+#[tokio::test]
+#[ignore = "needs rust-analyzer"]
+async fn lsp_diag_rust_analyzer() {
+    require_server_on_path("rust-analyzer");
+    let diags = first_lsp_diagnostics(
+        "diag-rust",
+        &[
+            ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
+            ("main.rs", "fn main() {\n    let _x: i32 = \"not an int\";\n}\n"),
+        ],
+        "main.rs",
+        90,
+    )
+    .await;
+    dump_diags("rust-analyzer", &diags);
+    assert!(diags.iter().any(|(s, _)| matches!(s, DiagnosticSeverity::Error)));
+}
+
+#[tokio::test]
+#[ignore = "needs pyright-langserver"]
+async fn lsp_diag_pyright() {
+    require_server_on_path("pyright-langserver");
+    let diags = first_lsp_diagnostics(
+        "diag-py",
+        &[("main.py", "print(undefined_variable_xyz)\n")],
+        "main.py",
+        60,
+    )
+    .await;
+    dump_diags("pyright", &diags);
+    assert!(!diags.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs gopls + go"]
+async fn lsp_diag_gopls() {
+    require_server_on_path("gopls");
+    let diags = first_lsp_diagnostics(
+        "diag-go",
+        &[
+            ("go.mod", "module example\n\ngo 1.21\n"),
+            ("main.go", "package main\n\nfunc main() {\n\tvar _ int = \"not an int\"\n}\n"),
+        ],
+        "main.go",
+        120,
+    )
+    .await;
+    dump_diags("gopls", &diags);
+    assert!(diags.iter().any(|(s, _)| matches!(s, DiagnosticSeverity::Error)));
+}
+
+#[tokio::test]
+#[ignore = "needs taplo"]
+async fn lsp_diag_taplo() {
+    require_server_on_path("taplo");
+    let diags = first_lsp_diagnostics("diag-toml", &[("bad.toml", "key = \n")], "bad.toml", 30).await;
+    dump_diags("taplo", &diags);
+    assert!(!diags.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs vscode-json-language-server"]
+async fn lsp_diag_json() {
+    require_server_on_path("vscode-json-language-server");
+    let diags = first_lsp_diagnostics("diag-json", &[("bad.json", "{ \"a\": }\n")], "bad.json", 30).await;
+    dump_diags("json", &diags);
+    assert!(!diags.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs yaml-language-server"]
+async fn lsp_diag_yaml() {
+    require_server_on_path("yaml-language-server");
+    let diags = first_lsp_diagnostics("diag-yaml", &[("bad.yaml", "foo: [1, 2\n")], "bad.yaml", 30).await;
+    dump_diags("yaml", &diags);
+    assert!(!diags.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs vscode-css-language-server"]
+async fn lsp_diag_css() {
+    require_server_on_path("vscode-css-language-server");
+    let diags = first_lsp_diagnostics("diag-css", &[("bad.css", "a { color: }\n")], "bad.css", 30).await;
+    dump_diags("css", &diags);
+    assert!(!diags.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs bash-language-server + shellcheck"]
+async fn lsp_diag_bash() {
+    require_server_on_path("bash-language-server");
+    require_server_on_path("shellcheck");
+    let diags = first_lsp_diagnostics(
+        "diag-bash",
+        &[("bad.sh", "#!/bin/bash\nif true; then\n  echo hi\n")],
+        "bad.sh",
+        45,
+    )
+    .await;
+    dump_diags("bash", &diags);
+    assert!(!diags.is_empty());
+}
+
+/// typescript-language-server bundles no tsserver — it resolves `typescript` from the workspace's
+/// `node_modules` (as a real project would), so the test symlinks one in. Locates it via
+/// `AETHER_TEST_TYPESCRIPT_DIR` or node's own resolution; fails (doesn't skip) if neither works.
+#[tokio::test]
+#[ignore = "needs typescript-language-server + a resolvable typescript"]
+async fn lsp_diag_typescript() {
+    require_server_on_path("typescript-language-server");
+    let ts_lib = find_typescript_lib().expect(
+        "could not locate the `typescript` package — set AETHER_TEST_TYPESCRIPT_DIR to its dir \
+         (e.g. \"$(mise where npm:typescript)/lib/node_modules/typescript\") or install it on node's path",
+    );
+    let dir = lay_out(&[
+        ("tsconfig.json", "{\"compilerOptions\":{\"strict\":true}}\n"),
+        ("main.ts", "const x: number = \"hello\";\nexport {};\n"),
+    ]);
+    std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+    std::os::unix::fs::symlink(&ts_lib, dir.path().join("node_modules/typescript")).unwrap();
+    let diags = run_lsp_diagnostics("diag-ts", dir.path(), "main.ts", 90).await;
+    dump_diags("typescript-language-server", &diags);
+    assert!(!diags.is_empty());
+}
+
+/// Locate an installed `typescript` package dir (holding `lib/tsserver.js`), installer-agnostically:
+/// the `AETHER_TEST_TYPESCRIPT_DIR` override first, then node's own module resolution.
+fn find_typescript_lib() -> Option<std::path::PathBuf> {
+    let has_tsserver = |dir: std::path::PathBuf| dir.join("lib/tsserver.js").exists().then_some(dir);
+    if let Some(dir) = std::env::var_os("AETHER_TEST_TYPESCRIPT_DIR") {
+        if let Some(found) = has_tsserver(std::path::PathBuf::from(dir)) {
+            return Some(found);
+        }
+    }
+    let out = std::process::Command::new("node")
+        .args([
+            "-e",
+            "try{process.stdout.write(require.resolve('typescript/package.json'))}catch(e){process.exit(1)}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let pkg_json = std::path::PathBuf::from(String::from_utf8(out.stdout).ok()?);
+    has_tsserver(pkg_json.parent()?.to_path_buf())
+}
+
+// ---- handshake-only tests (server reaches Ready) ----
+// For servers whose diagnostics need a full project (elixir/erlang) or don't fire on a lone file
+// (html/markdown). These verify spawn + handshake + status push.
+
+#[tokio::test]
+#[ignore = "needs vscode-html-language-server"]
+async fn lsp_ready_html() {
+    require_server_on_path("vscode-html-language-server");
+    first_lsp_ready("ready-html", &[("index.html", "<html><body></body></html>\n")], "index.html", "html", 30).await;
+}
+
+#[tokio::test]
+#[ignore = "needs marksman"]
+async fn lsp_ready_markdown() {
+    require_server_on_path("marksman");
+    first_lsp_ready("ready-md", &[("README.md", "# Title\n\nsome text\n")], "README.md", "markdown", 30).await;
+}
+
+#[tokio::test]
+#[ignore = "needs elixir-ls (+ elixir/erlang)"]
+async fn lsp_ready_elixir() {
+    require_server_on_path("elixir-ls");
+    first_lsp_ready(
+        "ready-ex",
+        &[
+            ("mix.exs", "defmodule P.MixProject do\n  use Mix.Project\n  def project, do: [app: :p, version: \"0.1.0\"]\nend\n"),
+            ("lib/p.ex", "defmodule P do\n  def hello, do: :world\nend\n"),
+        ],
+        "lib/p.ex",
+        "elixir",
+        90,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs elp (+ erlang)"]
+async fn lsp_ready_erlang() {
+    require_server_on_path("elp");
+    first_lsp_ready(
+        "ready-erl",
+        &[
+            ("rebar.config", "{erl_opts, [debug_info]}.\n"),
+            ("src/p.erl", "-module(p).\n-export([hello/0]).\nhello() -> world.\n"),
+        ],
+        "src/p.erl",
+        "erlang",
+        90,
+    )
+    .await;
+}
+
+/// Wait until a `viewport/lines_changed` carries diagnostics (`want`=true) or none (`want`=false).
+/// Returns false on timeout.
+async fn wait_for_diag_state(ws: &mut Ws, want: bool, timeout_secs: u64) -> bool {
+    use std::time::Duration;
+    tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            let text = next_text(ws).await;
+            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text) {
+                if n.method == ViewportLinesChanged::NAME {
+                    let p: ViewportLinesChangedParams =
+                        serde_json::from_value(n.params).expect("typed");
+                    let has = p.replacement_lines.iter().any(|l| !l.diagnostics.is_empty());
+                    if has == want {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Regression test: undo must send `didChange` so the server re-analyzes and clears a diagnostic for
+/// an error that was undone. Without the fix, undo bypassed `notify_change` and the squiggle stuck.
+#[tokio::test]
+#[ignore = "needs rust-analyzer"]
+async fn lsp_diagnostics_clear_on_undo() {
+    require_server_on_path("rust-analyzer");
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
+        ("main.rs", "fn main() {}\n"),
+    ]);
+    let (server, mut ws) = open_and_subscribe("undo-rust", dir.path(), "main.rs").await;
+    // Re-open by path to learn the buffer id (dedups to the same buffer).
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+
+    // Type a stray token at the start → a syntax error rust-analyzer will flag.
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        12,
+        &InputTextParams {
+            buffer_id,
+            text: "@".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    assert!(
+        wait_for_diag_state(&mut ws, true, 90).await,
+        "expected a diagnostic after introducing an error"
+    );
+
+    // Undo — the fix must send didChange so the server re-analyzes the reverted text and clears it.
+    let undo: UndoResult = send_request::<InputUndo>(&mut ws, 13, &BufferOnlyParams { buffer_id }).await;
+    assert!(undo.applied);
+    let cleared = wait_for_diag_state(&mut ws, false, 90).await;
+    drop(server);
+    assert!(cleared, "diagnostics did not clear after undo (didChange not sent on undo?)");
+}
+
+/// Place the cursor at `(line, col)` in `buffer_id`.
+async fn set_cursor(ws: &mut Ws, id: u64, buffer_id: u64, line: u32, col: u32) {
+    let _: CursorState = send_request::<CursorSet>(
+        ws,
+        id,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line, col },
+            anchor: LogicalPosition { line, col },
+        },
+    )
+    .await;
+}
+
+/// Phase 3: hover at the cursor returns the symbol's info from rust-analyzer. Polls until the
+/// server has analyzed the file (hover is empty until then).
+#[tokio::test]
+#[ignore = "needs rust-analyzer"]
+async fn lsp_hover_returns_contents() {
+    use std::time::Duration;
+    require_server_on_path("rust-analyzer");
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
+        ("main.rs", "fn main() {\n    let _x: i32 = 1;\n}\n"),
+    ]);
+    let (server, mut ws) = open_and_subscribe("hover-rust", dir.path(), "main.rs").await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
+        language: None, create_if_missing: false, jump_to: None,
+    }).await;
+    let buffer_id = open.buffer_id;
+    set_cursor(&mut ws, 11, buffer_id, 0, 3).await; // on `main`
+
+    let mut id = 100;
+    let contents = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let r: LspHoverResult =
+                send_request::<LspHover>(&mut ws, id, &LspBufferParams { buffer_id }).await;
+            id += 1;
+            if let Some(c) = r.contents {
+                if !c.is_empty() {
+                    return c;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    })
+    .await;
+    drop(server);
+    let contents = contents.expect("hover did not return contents within 90s");
+    eprintln!("hover contents:\n{contents}");
+    assert!(contents.contains("fn main"), "expected the fn signature, got: {contents}");
+}
+
+/// Phase 3: goto-definition at a call site resolves to the definition's location.
+#[tokio::test]
+#[ignore = "needs rust-analyzer"]
+async fn lsp_goto_definition_resolves() {
+    use std::time::Duration;
+    require_server_on_path("rust-analyzer");
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
+        ("main.rs", "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n"),
+    ]);
+    let (server, mut ws) = open_and_subscribe("def-rust", dir.path(), "main.rs").await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
+        language: None, create_if_missing: false, jump_to: None,
+    }).await;
+    let buffer_id = open.buffer_id;
+    set_cursor(&mut ws, 11, buffer_id, 4, 14).await; // inside the `helper()` call
+
+    let mut id = 100;
+    let loc = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let r: LspGotoDefinitionResult =
+                send_request::<LspGotoDefinition>(&mut ws, id, &LspBufferParams { buffer_id }).await;
+            id += 1;
+            if let Some(loc) = r.location {
+                return loc;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    })
+    .await;
+    drop(server);
+    let loc = loc.expect("goto-definition did not resolve within 90s");
+    eprintln!("definition at {}:{}", loc.path, loc.position.line);
+    assert!(loc.path.ends_with("main.rs"), "unexpected path: {}", loc.path);
+    assert_eq!(loc.position.line, 0, "helper is defined on line 0");
+}
+
+/// Phase 5: `lsp/format` reformats the buffer via rust-analyzer (rustfmt). Polls until the server
+/// is ready enough to return edits, then saves and checks the on-disk text is canonically
+/// formatted. A second format must leave that canonical text untouched (no corruption from
+/// re-applying edits).
+#[tokio::test]
+#[ignore = "needs rust-analyzer + rustfmt"]
+async fn lsp_format_reformats() {
+    use std::time::Duration;
+    require_server_on_path("rust-analyzer");
+    const FORMATTED: &str = "fn main() {\n    let _x = 1;\n}\n";
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
+        // Deliberately mis-spaced/under-indented — rustfmt has work to do.
+        ("main.rs", "fn main() {\nlet _x=1;\n}\n"),
+    ]);
+    let main_path = dir.path().join("main.rs");
+    let (server, mut ws) = open_and_subscribe("fmt-rust", dir.path(), "main.rs").await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
+        language: None, create_if_missing: false, jump_to: None,
+    }).await;
+    let buffer_id = open.buffer_id;
+
+    // Poll until rust-analyzer is ready enough to return formatting edits.
+    let mut id = 100;
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let r: LspFormatResult =
+                send_request::<LspFormat>(&mut ws, id, &LspBufferParams { buffer_id }).await;
+            id += 1;
+            if r.status == FormatStatus::Applied {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    })
+    .await
+    .expect("format did not apply within 90s");
+
+    // Save and verify the on-disk content is canonically formatted.
+    let save_params = BufferSaveParams { buffer_id, path_index: None, relative_path: None, overwrite: true };
+    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, id, &save_params).await;
+    id += 1;
+    let once = std::fs::read_to_string(&main_path).unwrap();
+    assert_eq!(once, FORMATTED, "format did not canonicalize the buffer");
+
+    // Formatting again must leave the canonical text intact (re-applied edits don't corrupt it).
+    let _: LspFormatResult =
+        send_request::<LspFormat>(&mut ws, id, &LspBufferParams { buffer_id }).await;
+    id += 1;
+    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, id, &save_params).await;
+    let twice = std::fs::read_to_string(&main_path).unwrap();
+    drop(server);
+    assert_eq!(twice, FORMATTED, "second format changed already-canonical text");
+}
+
+/// Regression: the vscode JSON server gates its formatter behind `initializationOptions:
+/// {provideFormatter:true}` (it reports `documentFormattingProvider:false` without it). With that
+/// option wired in `config.rs`, `lsp/format` reformats a compact JSON file rather than reporting
+/// `Unsupported`.
+#[tokio::test]
+#[ignore = "needs vscode-json-language-server"]
+async fn lsp_format_json_reformats() {
+    use std::time::Duration;
+    require_server_on_path("vscode-json-language-server");
+    let dir = lay_out(&[("data.json", "{\"a\":1,\"b\":[1,2,3]}\n")]);
+    let json_path = dir.path().join("data.json");
+    let (server, mut ws) = open_and_subscribe("fmt-json", dir.path(), "data.json").await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("data.json".into()),
+        language: None, create_if_missing: false, jump_to: None,
+    }).await;
+    let buffer_id = open.buffer_id;
+
+    let mut id = 100;
+    let status = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let r: LspFormatResult =
+                send_request::<LspFormat>(&mut ws, id, &LspBufferParams { buffer_id }).await;
+            id += 1;
+            // Stop as soon as we get a definitive answer — `Applied` (good) or `Unsupported`
+            // (the regression we're guarding against). `NotReady` keeps polling.
+            if matches!(r.status, FormatStatus::Applied | FormatStatus::Unsupported) {
+                return r.status;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("format did not resolve within 60s");
+    assert_eq!(status, FormatStatus::Applied, "json server should advertise a formatter");
+
+    let save_params = BufferSaveParams { buffer_id, path_index: None, relative_path: None, overwrite: true };
+    let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, id, &save_params).await;
+    let formatted = std::fs::read_to_string(&json_path).unwrap();
+    drop(server);
+    // The compact input gets expanded across lines with indentation.
+    assert!(formatted.contains('\n'), "expected multi-line JSON, got: {formatted:?}");
+    assert_ne!(formatted, "{\"a\":1,\"b\":[1,2,3]}\n", "json was not reformatted");
+}
+
+/// Phase: the buffer-scoped diagnostics picker lists the buffer's diagnostics and selecting one
+/// resolves to its location (FileAt). Real rust-analyzer.
+#[tokio::test]
+#[ignore = "needs rust-analyzer"]
+async fn lsp_diagnostics_picker_lists_and_selects() {
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
+        PickerUpdateParams, PickerView, PickerViewParams,
+    };
+    require_server_on_path("rust-analyzer");
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
+        ("main.rs", "fn main() {\n    let _x: i32 = \"not an int\";\n}\n"),
+    ]);
+    let (server, mut ws) = open_and_subscribe("diagpick", dir.path(), "main.rs").await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
+        language: None, create_if_missing: false, jump_to: None,
+    }).await;
+    let buffer_id = open.buffer_id;
+    assert!(wait_for_diag_state(&mut ws, true, 90).await, "diagnostics should arrive");
+
+    // Open the diagnostics picker for this buffer.
+    let _view = send_request::<PickerView>(&mut ws, 20, &PickerViewParams {
+        kind: PickerKind::Diagnostics,
+        reset: true,
+        offset: 0,
+        limit: 50,
+        center_on: None,
+        center_on_cursor_grep_hit: None,
+        directory_path: None,
+        buffer_id: Some(buffer_id),
+        explorer_roots: false,
+    }).await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.kind, PickerKind::Diagnostics);
+
+    let diag_item = update.items.iter().find_map(|i| match i {
+        PickerItem::Diagnostic { message, .. } if !message.is_empty() => Some(i.clone()),
+        _ => None,
+    });
+    let diag_item = diag_item.expect("picker lists at least one diagnostic");
+    if let PickerItem::Diagnostic { severity, message, .. } = &diag_item {
+        eprintln!("diagnostic picker item: [{severity:?}] {message}");
+    }
+
+    // Selecting it resolves to the buffer's file at the diagnostic position.
+    let result: PickerSelectResult = send_request::<PickerSelect>(&mut ws, 21, &PickerSelectParams {
+        kind: PickerKind::Diagnostics,
+        item: diag_item,
+    }).await;
+    drop(server);
+    match result {
+        PickerSelectResult::FileAt { path, .. } => assert!(path.ends_with("main.rs"), "got {path}"),
+        other => panic!("expected FileAt, got {other:?}"),
+    }
 }

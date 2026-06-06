@@ -2,6 +2,8 @@
 //! client owns the highlighted row plus a small persisted slot (`last_selected`) used to restore
 //! the highlight on reopen via `view { center_on }`.
 
+use crate::scroll::ScrollState;
+use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::{PickerItem, PickerKind};
 use std::collections::HashMap;
 
@@ -83,6 +85,24 @@ pub struct PickerState {
     /// `pending_delete`). Cleared on open/hide and on resolve. Covers project deletion (Projects
     /// picker) and file/directory deletion (Files / Explorer pickers).
     pub pending_delete: Option<PendingDelete>,
+    /// LSP-servers picker only. When set, the picker body shows this server's status/error detail
+    /// (a drill-down entered with `Enter`) instead of the list; `Esc` clears it back to the list.
+    /// A snapshot taken at `Enter` time — it doesn't live-update.
+    pub lsp_detail: Option<LspServerDetail>,
+}
+
+/// Drill-down detail for one LSP server, shown in place of the LSP-servers list. Built client-side
+/// from the highlighted picker row (which already carries the server's `status`, incl. a crash
+/// message), so no extra server round-trip is needed.
+#[derive(Debug)]
+pub struct LspServerDetail {
+    pub name: String,
+    pub language: String,
+    pub workspace_root: String,
+    pub status: LspStatus,
+    /// Scroll position of the (possibly long) detail body. Interior-mutable: the renderer records
+    /// the geometry, the key handler reads it back to clamp (see [`ScrollState`]).
+    pub scroll: ScrollState,
 }
 
 /// A staged delete awaiting `[y/N]` confirmation in the picker. The `item` it targets is matched
@@ -322,6 +342,16 @@ pub enum ItemKey<'a> {
     Root {
         path_index: u32,
     },
+    Diagnostic {
+        line: u32,
+        col: u32,
+    },
+    /// An LSP server, identified by its `(language, workspace_root)` key — stable across the
+    /// status changes that drive the picker's live re-pushes.
+    LspServer {
+        language: &'a str,
+        workspace_root: &'a str,
+    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -351,6 +381,18 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::Project { name, .. } => ItemKey::Project(name.as_str()),
         PickerItem::Root { path_index, .. } => ItemKey::Root {
             path_index: *path_index,
+        },
+        PickerItem::Diagnostic { line, col, .. } => ItemKey::Diagnostic {
+            line: *line,
+            col: *col,
+        },
+        PickerItem::LspServer {
+            language,
+            workspace_root,
+            ..
+        } => ItemKey::LspServer {
+            language: language.as_str(),
+            workspace_root: workspace_root.as_str(),
         },
     }
 }

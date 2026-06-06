@@ -29,6 +29,11 @@ use aether_protocol::input::{
     InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
     InputUnsurroundParams, SurroundTarget, UndoResult,
 };
+use aether_protocol::lsp::{
+    DiagnosticCounts, DiagnosticDirection, FormatStatus, LspDiagnosticsChanged,
+    LspDiagnosticsChangedParams, LspFormat, LspNavigateDiagnostic, LspNavigateDiagnosticParams,
+    LspRestartServer, LspRestartServerParams, LspServerRef, LspServerStatus, LspStatusChanged,
+};
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem,
     PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
@@ -40,7 +45,8 @@ use aether_protocol::search::{
     SearchSetParams, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::viewport::{
-    LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
+    DiagnosticSeverity, LogicalLineRender, ScrollPosition, ViewportLinesChanged,
+    ViewportLinesChangedParams,
     ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSetWrap,
     ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
     WrapMode,
@@ -248,6 +254,47 @@ pub struct AppState {
     /// Keyboard-shortcut help overlay (`Space ?`). A read-only, client-local cheatsheet generated
     /// from the `keymap` tables — no server round-trip. Closed by Esc.
     pub help: HelpState,
+    /// Latest language-server status per server, keyed by `(language, workspace_root)`, from
+    /// `lsp/status_changed`. Drives the status-bar health indicator for the current buffer's
+    /// server (keyed this way so several same-language servers don't collide). Persists for the
+    /// session.
+    pub lsp_status: std::collections::HashMap<(String, String), LspServerStatus>,
+    /// Active hover popup (`Space k` hover / `Space j` diagnostic). `Some` shows a floating box; scroll keys / the
+    /// wheel pan it, Esc or any other key dismisses it.
+    pub hover: Option<HoverPopup>,
+    /// Per-buffer diagnostic counts from `lsp/diagnostics_changed`, for the status-bar summary.
+    pub diagnostic_counts: std::collections::HashMap<BufferId, DiagnosticCounts>,
+}
+
+/// One block of hover-popup content. `severity` colors the block to match the gutter dot (for
+/// diagnostics); `None` renders plain (for LSP hover text).
+pub struct HoverBlock {
+    pub text: String,
+    pub severity: Option<DiagnosticSeverity>,
+}
+
+/// A showing hover/diagnostic popup: its content blocks plus the scroll offset within it (the box
+/// caps its height and scrolls when the content is taller).
+pub struct HoverPopup {
+    pub blocks: Vec<HoverBlock>,
+    pub scroll: crate::scroll::ScrollState,
+}
+
+impl HoverPopup {
+    /// A plain, uncolored popup — for LSP hover (type signature + docs).
+    pub fn plain(text: String) -> Self {
+        Self::from_blocks(vec![HoverBlock {
+            text,
+            severity: None,
+        }])
+    }
+
+    pub fn from_blocks(blocks: Vec<HoverBlock>) -> Self {
+        Self {
+            blocks,
+            scroll: crate::scroll::ScrollState::default(),
+        }
+    }
 }
 
 /// State for the keyboard-shortcut help overlay. Open/closed, the selected tab, and a scroll
@@ -432,6 +479,14 @@ pub struct EditorState {
     /// Canonical absolute path of this buffer's file on disk, if any.
     pub file_path: Option<String>,
     pub file_label: String,
+    /// The buffer's language id (e.g. `"rust"`), from `buffer/open`. `None` for unknown/plain-text
+    /// buffers. Used for language-scoped UI (e.g. the "no formatter for {lang}" note).
+    pub language: Option<String>,
+    /// The language server backing this buffer, from `buffer/open` — its `(language,
+    /// workspace_root)` key. `None` when no server is attached. Selects *which* server's health the
+    /// status bar shows (language alone is ambiguous when a project runs several same-language
+    /// servers at different roots).
+    pub lsp_server: Option<LspServerRef>,
 }
 
 /// Client-side cache of the cursor line's blame. `key` records the `(line, revision)` the `info`
@@ -608,6 +663,9 @@ pub async fn bootstrap(
         editor: Some(editor),
         project_settings: None,
         help: HelpState::default(),
+        lsp_status: std::collections::HashMap::new(),
+        hover: None,
+        diagnostic_counts: std::collections::HashMap::new(),
     };
 
     // Seed the Explorer picker's remembered directory before the auto-open so it lists the
@@ -643,6 +701,9 @@ fn empty_app_state(viewport_cols: u32, viewport_rows: u32) -> AppState {
         editor: None,
         project_settings: None,
         help: HelpState::default(),
+        lsp_status: std::collections::HashMap::new(),
+        hover: None,
+        diagnostic_counts: std::collections::HashMap::new(),
     }
 }
 
@@ -773,7 +834,10 @@ async fn build_editor_state_from_open(
         .await?;
     let file_label = match open.path.as_deref() {
         Some(p) => project_relative_label(p, project_paths, root_labels),
-        None => format!("(scratch {})", open.scratch_number.map(u64::from).unwrap_or(open.buffer_id)),
+        None => format!(
+            "(scratch {})",
+            open.scratch_number.map(u64::from).unwrap_or(open.buffer_id)
+        ),
     };
     Ok(EditorState {
         mode: EditorMode::Normal,
@@ -803,6 +867,8 @@ async fn build_editor_state_from_open(
         blame: BlameState::default(),
         file_path: open.path,
         file_label,
+        language: open.language,
+        lsp_server: open.lsp_server,
     })
 }
 
@@ -1018,6 +1084,26 @@ fn apply_pending_notifications(state: &mut AppState, client: &mut Client) {
 }
 
 fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notification) {
+    // LSP status is project-scoped, not editor-bound — record it regardless of editor presence so
+    // the status-bar indicator is fresh the moment a buffer appears.
+    if n.method == LspStatusChanged::NAME {
+        match serde_json::from_value::<LspServerStatus>(n.params) {
+            Ok(s) => {
+                state.lsp_status.insert((s.language.clone(), s.workspace_root.clone()), s);
+            }
+            Err(e) => state.status = StatusMessage::error(format!("bad lsp/status_changed: {e}")),
+        }
+        return;
+    }
+    if n.method == LspDiagnosticsChanged::NAME {
+        match serde_json::from_value::<LspDiagnosticsChangedParams>(n.params) {
+            Ok(p) => {
+                state.diagnostic_counts.insert(p.buffer_id, p.counts);
+            }
+            Err(e) => state.status = StatusMessage::error(format!("bad lsp/diagnostics_changed: {e}")),
+        }
+        return;
+    }
     // Editor-bound notifications: drop them entirely when there's no active editor (e.g. mid-
     // project-switch, or before the first activation). The picker/* notification is the only
     // one that still applies — pickers can outlive an editor (project picker, in particular).
@@ -1132,8 +1218,68 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
             _ => {}
         }
     }
+    // Hover popup: the mouse wheel pans it while it's showing.
+    if state.hover.is_some() {
+        if let (Event::Mouse(m), Some(h)) = (&ev, state.hover.as_mut()) {
+            match m.kind {
+                MouseEventKind::ScrollUp => {
+                    h.scroll.scroll_by(-3);
+                    return Ok(());
+                }
+                MouseEventKind::ScrollDown => {
+                    h.scroll.scroll_by(3);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
     if let Event::Key(k) = &ev {
         if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat {
+            // A showing hover popup intercepts scroll keys (pan it, consume), Esc (dismiss,
+            // consume), and any other key (dismiss, then fall through so the key does its normal
+            // thing). The hover action re-sets it later in this same dispatch.
+            if state.hover.is_some() {
+                let scrolled = if let Some(h) = state.hover.as_mut() {
+                    match k.code {
+                        KeyCode::Up => {
+                            h.scroll.scroll_by(-1);
+                            true
+                        }
+                        KeyCode::Down => {
+                            h.scroll.scroll_by(1);
+                            true
+                        }
+                        KeyCode::PageUp => {
+                            h.scroll.page(false);
+                            true
+                        }
+                        KeyCode::PageDown => {
+                            h.scroll.page(true);
+                            true
+                        }
+                        KeyCode::Home => {
+                            h.scroll.scroll_to_top();
+                            true
+                        }
+                        KeyCode::End => {
+                            h.scroll.scroll_to_bottom();
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if scrolled {
+                    return Ok(());
+                }
+                let was_esc = k.code == KeyCode::Esc;
+                state.hover = None;
+                if was_esc {
+                    return Ok(());
+                }
+            }
             if state.project_settings.is_some() {
                 return handle_project_settings_key(client, state, *k).await;
             }
@@ -1175,14 +1321,16 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
             if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
                 return Ok(());
             }
-            // Pending leader chord (e.g. `Space f`): the next key resolves the binding.
+            // Pending leader chord (e.g. `Space f`): the next key resolves the binding. Handled
+            // inline (not an early return) so a leader action that moves the cursor — next/prev
+            // diagnostic, hunk nav, goto-definition — still hits the `ensure_cursor_in_window`
+            // check below, like every other binding.
             if let Some(leader) = state.pending_leader.take() {
-                return handle_leader_key(client, state, leader, k).await;
-            }
-            // Overlays first — they sit on top of whichever screen is underneath. The
+                handle_leader_key(client, state, leader, k).await?;
+            // Overlays next — they sit on top of whichever screen is underneath. The
             // confirm prompt takes priority over everything else (it can layer on top of the
             // save prompt for the overwrite case).
-            if state.confirm_prompt.is_some() {
+            } else if state.confirm_prompt.is_some() {
                 handle_confirm_prompt_key(client, state, k).await?;
             } else if state.save_prompt.is_some() {
                 handle_save_prompt_key(client, state, k).await?;
@@ -1205,7 +1353,10 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
         }
         _ => return Ok(()),
     }
-    if state.ed_mut().cursor.position != cursor_before {
+    // Snap the view to the cursor if a binding moved it. Guard `has_editor`: a leader action can
+    // close the last buffer (`Space c`) or quit (`Space q`), leaving no editor — and `ed_mut()`
+    // would panic. (Before leader chords fell through to here, this couldn't happen.)
+    if state.has_editor() && state.ed_mut().cursor.position != cursor_before {
         ensure_cursor_in_window(client, state).await?;
     }
     Ok(())
@@ -1571,6 +1722,12 @@ async fn run_action(
         Action::SaveAs => begin_save_prompt(client, state).await?,
         Action::Reload => reload_buffer(client, state).await?,
         Action::NewScratch => new_scratch(client, state).await?,
+        Action::Hover => lsp_hover(client, state).await?,
+        Action::GotoDefinition => lsp_goto_definition(client, state).await?,
+        Action::ShowDiagnostic => show_diagnostic(state),
+        Action::NextDiagnostic => navigate_diagnostic(client, state, DiagnosticDirection::Next).await?,
+        Action::PrevDiagnostic => navigate_diagnostic(client, state, DiagnosticDirection::Prev).await?,
+        Action::Format => lsp_format(client, state).await?,
     }
     // Remember the action for `r`/`Shift-r` to replay. Recorded *after* a successful run (an RPC
     // error above short-circuits via `?` and leaves the previous target intact). Find is handled
@@ -1770,6 +1927,9 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
     // evaluate `state.ed_mut().buffer_id` for non-Grep kinds — Projects opens before any editor
     // exists.
     let center_on_cursor_grep_hit = (kind == PickerKind::Grep).then(|| state.ed_mut().buffer_id);
+    // The diagnostics picker is scoped to the current buffer; the server builds its candidates from
+    // that buffer's diagnostics on open.
+    let diagnostics_buffer = (kind == PickerKind::Diagnostics).then(|| state.ed_mut().buffer_id);
     let view = client
         .rpc::<PickerView>(PickerViewParams {
             kind,
@@ -1779,6 +1939,7 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
             center_on: center_on.clone(),
             center_on_cursor_grep_hit,
             directory_path: explorer_path_for_view,
+            buffer_id: diagnostics_buffer,
             explorer_roots: false,
         })
         .await?;
@@ -1816,6 +1977,7 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
     state.picker.resume_row_offset = resume_row_offset;
     state.picker.pending_offset = None;
     state.picker.pending_delete = None;
+    state.picker.lsp_detail = None;
     // Explorer: the server returns the canonical path + parent. Stash them so navigation
     // (Alt-h) and the header row know where they are. For other kinds, clear so a stale
     // explorer dir from a prior session doesn't leak into Files/Buffers/Grep state.
@@ -1910,6 +2072,7 @@ async fn picker_enter_roots_mode(client: &mut Client, state: &mut AppState) -> R
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: true,
         })
         .await?;
@@ -1951,6 +2114,7 @@ async fn picker_navigate_to_dir(
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: Some(directory_path),
+            buffer_id: None,
             explorer_roots: false,
         })
         .await?;
@@ -1997,10 +2161,47 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
         return Ok(());
     }
 
+    // LSP-servers detail drill-down: the body shows one server's status/error. Keys scroll it;
+    // Esc returns to the list (the picker stays open). Read-only — all other keys are swallowed.
+    if state.picker.lsp_detail.is_some() {
+        match k.code {
+            KeyCode::Esc => state.picker.lsp_detail = None,
+            KeyCode::Up => detail_scroll(state, -1),
+            KeyCode::Down => detail_scroll(state, 1),
+            KeyCode::PageUp => detail_page(state, false),
+            KeyCode::PageDown => detail_page(state, true),
+            KeyCode::Home => {
+                if let Some(d) = state.picker.lsp_detail.as_mut() {
+                    d.scroll.scroll_to_top();
+                }
+            }
+            KeyCode::End => {
+                if let Some(d) = state.picker.lsp_detail.as_mut() {
+                    d.scroll.scroll_to_bottom();
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // Keep query input case-sensitive (so smartcase works), so skip `normalize_key`.
     match (k.code, k.modifiers) {
         (KeyCode::Esc, _) => hide_picker(client, state).await?,
-        (KeyCode::Enter, _) => select_picker_item(client, state).await?,
+        // The LSP-servers picker: Enter drills into the highlighted server's status/error detail
+        // (Esc there returns to the list); restart is `Ctrl-r`. Every other kind confirms the row.
+        (KeyCode::Enter, _) => {
+            if state.picker.kind == Some(PickerKind::LspServers) {
+                open_lsp_detail(state);
+            } else {
+                select_picker_item(client, state).await?;
+            }
+        }
+        // `Ctrl-r` restarts the highlighted server (LSP-servers picker only). Carries CONTROL so it
+        // never reaches the query-insert arm; a no-op for the other kinds.
+        (KeyCode::Char('r'), m) if m == KeyModifiers::CONTROL => {
+            lsp_picker_restart(client, state).await?;
+        }
         // `Alt-k` / `Alt-j` move the highlight up / down. Arrow keys are intentionally not bound
         // — modal navigation keeps the hand on the home row, matching the editor's vim-style
         // motions. The `Alt` modifier separates them from raw `j`/`k` typed into the query.
@@ -2109,9 +2310,7 @@ async fn enter_highlighted_dir(client: &mut Client, state: &mut AppState) -> Res
     };
     match item {
         PickerItem::DirEntry {
-            name,
-            is_dir: true,
-            ..
+            name, is_dir: true, ..
         } => {
             let target = std::path::Path::new(state.picker.explorer_dir.as_deref().unwrap_or(""))
                 .join(&name)
@@ -2190,6 +2389,7 @@ async fn grep_jump_file(
             center_on: Some(target.clone()),
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         })
         .await?;
@@ -2213,8 +2413,8 @@ fn reveal_picker_selection_at_top(state: &mut AppState) {
         state.picker.kind,
     );
     let visible_end = state.picker.visible_start + visible_count;
-    let already_visible = state.picker.selected >= state.picker.visible_start
-        && state.picker.selected < visible_end;
+    let already_visible =
+        state.picker.selected >= state.picker.visible_start && state.picker.selected < visible_end;
     if !already_visible {
         state.picker.visible_start = state.picker.selected;
     }
@@ -2383,10 +2583,7 @@ async fn confirm_delete_path(
 /// Refresh the active picker after a file/directory delete so the trashed entry drops out: the
 /// Explorer re-lists its current directory; the Files picker re-views (re-walking the now-
 /// invalidated workspace index). The query resets — fine for a one-off management action.
-async fn refresh_picker_after_path_delete(
-    client: &mut Client,
-    state: &mut AppState,
-) -> Result<()> {
+async fn refresh_picker_after_path_delete(client: &mut Client, state: &mut AppState) -> Result<()> {
     match state.picker.kind {
         Some(PickerKind::Explorer) => {
             if let Some(dir) = state.picker.explorer_dir.clone() {
@@ -2547,6 +2744,7 @@ async fn flush_pending_picker_scroll(client: &mut Client, state: &mut AppState) 
             center_on: None,
             center_on_cursor_grep_hit: None,
             directory_path: None,
+            buffer_id: None,
             explorer_roots: false,
         })
         .await?;
@@ -2921,6 +3119,51 @@ pub(crate) fn strip_longest_root(abs: &str, project_paths: &[String]) -> Option<
         .map(|(i, _, rel)| (i, rel))
 }
 
+/// Drill into the highlighted LSP server's status/error detail (`Enter` in the LSP-servers picker).
+/// A snapshot from the row, which already carries the server's `status` (incl. any crash message).
+fn open_lsp_detail(state: &mut AppState) {
+    if let Some(PickerItem::LspServer { name, language, workspace_root, status, .. }) =
+        state.picker.highlighted()
+    {
+        state.picker.lsp_detail = Some(crate::picker::LspServerDetail {
+            name: name.clone(),
+            language: language.clone(),
+            workspace_root: workspace_root.clone(),
+            status: status.clone(),
+            scroll: crate::scroll::ScrollState::default(),
+        });
+    }
+}
+
+fn detail_scroll(state: &mut AppState, delta: i32) {
+    if let Some(d) = state.picker.lsp_detail.as_mut() {
+        d.scroll.scroll_by(delta);
+    }
+}
+
+fn detail_page(state: &mut AppState, down: bool) {
+    if let Some(d) = state.picker.lsp_detail.as_mut() {
+        d.scroll.page(down);
+    }
+}
+
+/// Restart the language server highlighted in the LSP-servers picker (`Ctrl-r`). Fire-and-forget
+/// against `lsp/restart_server`; the dialog stays open and the server's `lsp/status_changed`
+/// pushes drive the live re-render of its health glyph. A no-op when the highlighted row isn't a
+/// server (wrong picker kind / empty list).
+async fn lsp_picker_restart(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(PickerItem::LspServer { language, name, .. }) = state.picker.highlighted() else {
+        return Ok(());
+    };
+    let language = language.clone();
+    let name = name.clone();
+    client
+        .rpc::<LspRestartServer>(LspRestartServerParams { language })
+        .await?;
+    state.status = StatusMessage::info(format!("restarting {name}"));
+    Ok(())
+}
+
 async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
     let Some(kind) = state.picker.kind else {
         return Ok(());
@@ -2941,6 +3184,7 @@ async fn hide_picker(client: &mut Client, state: &mut AppState) -> Result<()> {
     state.picker.open = false;
     state.picker.pending_offset = None;
     state.picker.pending_delete = None;
+    state.picker.lsp_detail = None;
     apply_cursor_style(state);
     Ok(())
 }
@@ -3019,6 +3263,108 @@ async fn open_file_at_path(
         })
         .await?;
     subscribe_replacing_scratch(client, state, open).await
+}
+
+/// `Space k` — request hover info for the symbol at the cursor and show it in a popup. Empty
+/// result → a transient status note rather than an empty box.
+async fn lsp_hover(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(buffer_id) = state.editor.as_ref().map(|e| e.buffer_id) else {
+        return Ok(());
+    };
+    match client
+        .rpc::<aether_protocol::lsp::LspHover>(aether_protocol::lsp::LspBufferParams { buffer_id })
+        .await
+    {
+        Ok(r) => match r.contents {
+            Some(text) => state.hover = Some(HoverPopup::plain(text)),
+            None => {
+                state.hover = None;
+                state.status = StatusMessage::info("No hover info");
+            }
+        },
+        Err(e) => state.status = StatusMessage::error(format!("hover failed: {e}")),
+    }
+    Ok(())
+}
+
+/// `Space d` — resolve the definition of the symbol at the cursor and jump to it (opening the file
+/// if needed). Out-of-project targets (e.g. dependencies) can't be opened yet — surfaced as a note.
+async fn lsp_goto_definition(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(buffer_id) = state.editor.as_ref().map(|e| e.buffer_id) else {
+        return Ok(());
+    };
+    match client
+        .rpc::<aether_protocol::lsp::LspGotoDefinition>(aether_protocol::lsp::LspBufferParams {
+            buffer_id,
+        })
+        .await
+    {
+        Ok(r) => match r.location {
+            Some(loc) => {
+                if let Err(e) =
+                    open_file_at_path(client, state, loc.path.clone(), false, Some(loc.position)).await
+                {
+                    state.status =
+                        StatusMessage::warning(format!("definition at {}: {e}", loc.path));
+                }
+            }
+            None => state.status = StatusMessage::info("No definition found"),
+        },
+        Err(e) => state.status = StatusMessage::error(format!("goto definition failed: {e}")),
+    }
+    Ok(())
+}
+
+/// `Space j` — show the diagnostic(s) at the cursor in the hover box (reusing the hover rendering).
+/// Prefers diagnostics under the cursor column, falling back to all on the cursor's line. Reads the
+/// cached window render, so it needs no server round-trip.
+fn show_diagnostic(state: &mut AppState) {
+    let Some(ed) = state.editor.as_ref() else {
+        return;
+    };
+    let cursor = ed.cursor.position;
+    let local = (cursor.line as i64) - (ed.window_first_logical_line as i64);
+    let diags: Vec<(DiagnosticSeverity, String)> = if local >= 0 && (local as usize) < ed.lines.len()
+    {
+        let line = &ed.lines[local as usize];
+        let under: Vec<(DiagnosticSeverity, String)> = line
+            .diagnostics
+            .iter()
+            .filter(|d| cursor.col >= d.start && cursor.col <= d.end)
+            .map(|d| (d.severity, d.message.clone()))
+            .collect();
+        if under.is_empty() {
+            line.diagnostics
+                .iter()
+                .map(|d| (d.severity, d.message.clone()))
+                .collect()
+        } else {
+            under
+        }
+    } else {
+        Vec::new()
+    };
+    if diags.is_empty() {
+        state.status = StatusMessage::info("No diagnostics on this line");
+        return;
+    }
+    let blocks = diags
+        .into_iter()
+        .map(|(severity, msg)| HoverBlock {
+            text: format!("{}: {msg}", severity_label(severity)),
+            severity: Some(severity),
+        })
+        .collect();
+    state.hover = Some(HoverPopup::from_blocks(blocks));
+}
+
+fn severity_label(severity: DiagnosticSeverity) -> &'static str {
+    match severity {
+        DiagnosticSeverity::Error => "Error",
+        DiagnosticSeverity::Warning => "Warning",
+        DiagnosticSeverity::Information => "Info",
+        DiagnosticSeverity::Hint => "Hint",
+    }
 }
 
 async fn handle_search_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
@@ -3501,6 +3847,7 @@ async fn handle_resize(
                     center_on: None,
                     center_on_cursor_grep_hit: None,
                     directory_path: None,
+                    buffer_id: None,
                     explorer_roots: false,
                 })
                 .await?;
@@ -5057,7 +5404,7 @@ async fn toggle_wrap(client: &mut Client, state: &mut AppState) -> Result<()> {
     state.ed_mut().window_first_logical_line = r.window.first_logical_line;
     state.ed_mut().lines = r.window.lines;
     state.ed_mut().scroll_skip_rows = 0; // wrap changed visual heights; re-align the top line
-    // Horizontal scroll is meaningless under soft wrap — content never overflows right.
+                                         // Horizontal scroll is meaningless under soft wrap — content never overflows right.
     if matches!(new_wrap, WrapMode::Soft) {
         state.ed_mut().scroll_col = 0;
     }
@@ -5089,8 +5436,7 @@ async fn toggle_diff_view(client: &mut Client, state: &mut AppState) -> Result<(
     ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
     ed.lines = r.window.lines;
     ed.scroll_skip_rows = 0; // phantom rows appeared/vanished; re-align the top line
-    state.status =
-        StatusMessage::info(format!("diff: {}", if enabled { "on" } else { "off" }));
+    state.status = StatusMessage::info(format!("diff: {}", if enabled { "on" } else { "off" }));
     Ok(())
 }
 
@@ -5112,6 +5458,55 @@ async fn navigate_hunk(
     state.ed_mut().cursor = r.cursor;
     if !r.moved {
         state.status = StatusMessage::info("no more changes".to_string());
+    }
+    Ok(())
+}
+
+/// Format the whole buffer via the language server. The server applies the edits authoritatively
+/// (one undo step) and pushes the re-rendered viewports; we just adopt the returned cursor and note
+/// when nothing changed (no server, no edits, or already-formatted).
+async fn lsp_format(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let r = client
+        .rpc::<LspFormat>(aether_protocol::lsp::LspBufferParams {
+            buffer_id: state.ed_mut().buffer_id,
+        })
+        .await?;
+    state.ed_mut().cursor = r.cursor;
+    // Specific feedback per outcome — "nothing happened" has several distinct causes.
+    let note = match r.status {
+        FormatStatus::Applied => None,
+        FormatStatus::NoChange => Some("already formatted".to_string()),
+        FormatStatus::NotReady => Some("language server still starting".to_string()),
+        FormatStatus::Unavailable => Some("language server unavailable".to_string()),
+        FormatStatus::Unsupported => Some(match state.ed().language.as_deref() {
+            Some(lang) => format!("no formatter for {lang}"),
+            None => "no formatter for this file".to_string(),
+        }),
+    };
+    if let Some(note) = note {
+        state.status = StatusMessage::info(note);
+    }
+    Ok(())
+}
+
+/// Jump the cursor to the next/previous diagnostic. The server holds the diagnostics and moves the
+/// cursor authoritatively; the dispatch funnel scrolls it into view afterward. A status note when
+/// there's nothing further in that direction. (Sibling of [`navigate_hunk`].)
+async fn navigate_diagnostic(
+    client: &mut Client,
+    state: &mut AppState,
+    direction: DiagnosticDirection,
+) -> Result<()> {
+    let r = client
+        .rpc::<LspNavigateDiagnostic>(LspNavigateDiagnosticParams {
+            buffer_id: state.ed_mut().buffer_id,
+            from_line: state.ed_mut().cursor.position.line,
+            direction,
+        })
+        .await?;
+    state.ed_mut().cursor = r.cursor;
+    if !r.moved {
+        state.status = StatusMessage::info("no more diagnostics".to_string());
     }
     Ok(())
 }
@@ -5246,13 +5641,43 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn lsp_status_changed_updates_status_map() {
+        let mut state = empty_app_state(80, 24);
+        let params = serde_json::to_value(LspServerStatus {
+            name: "rust-analyzer".into(),
+            language: "rust".into(),
+            workspace_root: "/p".into(),
+            status: aether_protocol::lsp::LspStatus::Ready,
+        })
+        .unwrap();
+        apply_notification(
+            &mut state,
+            aether_protocol::envelope::Notification {
+                jsonrpc: aether_protocol::envelope::JsonRpc,
+                method: LspStatusChanged::NAME.into(),
+                params,
+            },
+        );
+        let s = state
+            .lsp_status
+            .get(&("rust".to_string(), "/p".to_string()))
+            .expect("status recorded by (language, root)");
+        assert_eq!(s.name, "rust-analyzer");
+        assert!(matches!(s.status, aether_protocol::lsp::LspStatus::Ready));
+    }
+
     /// `empty_scratch_id` flags only an empty, unmodified scratch (the discardable placeholder):
     /// not when there's no editor, not once it's been typed into (dirty), and not a file-backed
     /// buffer.
     #[test]
     fn empty_scratch_id_detects_only_unmodified_scratch() {
         let mut state = empty_app_state(80, 24);
-        assert_eq!(empty_scratch_id(&state), None, "no editor → nothing to discard");
+        assert_eq!(
+            empty_scratch_id(&state),
+            None,
+            "no editor → nothing to discard"
+        );
 
         // Fresh scratch: no path, not dirty, empty.
         state.editor = Some(stub_editor_state("(scratch 1)"));
@@ -5300,7 +5725,9 @@ mod tests {
         assert!(!event_dismisses_status(&Event::FocusLost));
         // Mouse motion (hover) is passive and must not dismiss; clicks/scroll are deliberate.
         assert!(!event_dismisses_status(&mouse(MouseEventKind::Moved)));
-        assert!(event_dismisses_status(&mouse(MouseEventKind::Down(MouseButton::Left))));
+        assert!(event_dismisses_status(&mouse(MouseEventKind::Down(
+            MouseButton::Left
+        ))));
         assert!(event_dismisses_status(&mouse(MouseEventKind::ScrollDown)));
         // Deliberate non-key events still dismiss it (matches the prior clear-on-any behaviour).
         assert!(event_dismisses_status(&Event::Resize(80, 24)));
@@ -5402,6 +5829,9 @@ mod tests {
             editor: None,
             project_settings: None,
             help: HelpState::default(),
+            lsp_status: std::collections::HashMap::new(),
+            hover: None,
+            diagnostic_counts: std::collections::HashMap::new(),
         };
         assert_eq!(terminal_title(&state), "Aether");
     }
@@ -5425,6 +5855,9 @@ mod tests {
             editor: None,
             project_settings: None,
             help: HelpState::default(),
+            lsp_status: std::collections::HashMap::new(),
+            hover: None,
+            diagnostic_counts: std::collections::HashMap::new(),
         };
         assert_eq!(terminal_title(&state), "[demo]");
         // Once a buffer exists, the title grows to include the file label.
@@ -5451,6 +5884,9 @@ mod tests {
             editor: Some(stub_editor_state("src/main.rs")),
             project_settings: None,
             help: HelpState::default(),
+            lsp_status: std::collections::HashMap::new(),
+            hover: None,
+            diagnostic_counts: std::collections::HashMap::new(),
         };
         // Clean buffer → no marker.
         assert_eq!(terminal_title(&state), "[demo] src/main.rs");
@@ -5498,6 +5934,8 @@ mod tests {
             blame: Default::default(),
             file_path: None,
             file_label: label.into(),
+            language: None,
+            lsp_server: None,
         }
     }
 
@@ -5527,6 +5965,7 @@ mod tests {
                 })
                 .collect(),
             diff_marker: None,
+            diagnostics: vec![],
         };
 
         let mut state = empty_app_state(80, 24);

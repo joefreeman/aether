@@ -8,7 +8,9 @@
 //! walk, switch to `nucleo::Nucleo` and a per-picker tick task.
 
 use crate::workspace_index::CachedFile;
+use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::{PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams};
+use aether_protocol::viewport::DiagnosticSeverity;
 use aether_protocol::{BufferId, LogicalPosition};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -79,6 +81,32 @@ pub struct GrepHitCandidate {
     pub match_indices: Vec<u32>,
 }
 
+/// One diagnostics-picker candidate — a single diagnostic in the scoped buffer. `message` is the
+/// fuzzy haystack; `abs_path` + `(line, col)` drive the `FileAt` jump on select.
+#[derive(Debug, Clone)]
+pub struct DiagnosticCandidate {
+    pub line: u32,
+    pub col: u32,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub abs_path: String,
+}
+
+/// One LSP-servers-picker candidate — a language server for the active project. `name` is the
+/// fuzzy haystack; `language` is the key the client restarts by. Rebuilt on every `picker/view`
+/// and on each `lsp/status_changed` (the list is tiny and the status changes), so the row's
+/// `status` glyph stays live.
+#[derive(Debug, Clone)]
+pub struct LspServerCandidate {
+    pub name: String,
+    pub language: String,
+    pub workspace_root: String,
+    /// `workspace_root` relative to its project root, or empty when rooted at a project root.
+    /// Display-only (see [`PickerItem::LspServer`]).
+    pub root_label: String,
+    pub status: LspStatus,
+}
+
 /// How a candidate set turns a non-empty query into a ranked subset. Each `PickerCandidates`
 /// variant picks one; `rerank` and `build_window_items` dispatch on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +145,12 @@ pub enum PickerCandidates {
     /// Configured project names. Re-listed on each `picker/view` — small N, no caching needed,
     /// and the user may have edited `~/.config/aether/projects/` between opens.
     Projects(Vec<ProjectCandidate>),
+    /// The scoped buffer's diagnostics. Built on open; preserved across non-reset re-views (like
+    /// Grep) so scrolling doesn't rebuild against a possibly-changed set.
+    Diagnostics(Vec<DiagnosticCandidate>),
+    /// The active project's language servers. Rebuilt on every view and on each status change
+    /// (small N), so it's never preserved — the row glyphs reflect live status.
+    LspServers(Vec<LspServerCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -138,6 +172,8 @@ impl PickerCandidates {
             PickerCandidates::Explorer(e) => e.entries.len(),
             PickerCandidates::ExplorerRoots(v) => v.len(),
             PickerCandidates::Projects(v) => v.len(),
+            PickerCandidates::Diagnostics(v) => v.len(),
+            PickerCandidates::LspServers(v) => v.len(),
         }
     }
 
@@ -149,6 +185,8 @@ impl PickerCandidates {
             PickerCandidates::Explorer(_) => PickerKind::Explorer,
             PickerCandidates::ExplorerRoots(_) => PickerKind::Explorer,
             PickerCandidates::Projects(_) => PickerKind::Projects,
+            PickerCandidates::Diagnostics(_) => PickerKind::Diagnostics,
+            PickerCandidates::LspServers(_) => PickerKind::LspServers,
         }
     }
 
@@ -164,6 +202,8 @@ impl PickerCandidates {
             PickerCandidates::Explorer(e) => &e.entries[idx].name,
             PickerCandidates::ExplorerRoots(v) => &v[idx].basename,
             PickerCandidates::Projects(v) => &v[idx].name,
+            PickerCandidates::Diagnostics(v) => &v[idx].message,
+            PickerCandidates::LspServers(v) => &v[idx].name,
         }
     }
 
@@ -213,6 +253,27 @@ impl PickerCandidates {
                 name: v[idx].name.clone(),
                 match_indices,
             },
+            PickerCandidates::Diagnostics(v) => {
+                let c = &v[idx];
+                PickerItem::Diagnostic {
+                    line: c.line,
+                    col: c.col,
+                    severity: c.severity,
+                    message: c.message.clone(),
+                    match_indices,
+                }
+            }
+            PickerCandidates::LspServers(v) => {
+                let c = &v[idx];
+                PickerItem::LspServer {
+                    name: c.name.clone(),
+                    language: c.language.clone(),
+                    workspace_root: c.workspace_root.clone(),
+                    root_label: c.root_label.clone(),
+                    status: c.status.clone(),
+                    match_indices,
+                }
+            }
         }
     }
 
@@ -257,6 +318,24 @@ impl PickerCandidates {
             (PickerCandidates::Projects(v), PickerItem::Project { name, .. }) => {
                 v.iter().position(|c| c.name == *name)
             }
+            (
+                PickerCandidates::Diagnostics(v),
+                PickerItem::Diagnostic {
+                    line, col, message, ..
+                },
+            ) => v
+                .iter()
+                .position(|c| c.line == *line && c.col == *col && c.message == *message),
+            (
+                PickerCandidates::LspServers(v),
+                PickerItem::LspServer {
+                    language,
+                    workspace_root,
+                    ..
+                },
+            ) => v
+                .iter()
+                .position(|c| c.language == *language && c.workspace_root == *workspace_root),
             _ => None,
         }
     }
@@ -268,7 +347,9 @@ impl PickerCandidates {
         match self {
             PickerCandidates::Files(_)
             | PickerCandidates::Buffers(_)
-            | PickerCandidates::Projects(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::Projects(_)
+            | PickerCandidates::Diagnostics(_)
+            | PickerCandidates::LspServers(_) => MatchStrategy::Fuzzy,
             PickerCandidates::Explorer(_) | PickerCandidates::ExplorerRoots(_) => {
                 MatchStrategy::PrefixSmartcase
             }
@@ -317,6 +398,19 @@ impl PickerCandidates {
             PickerCandidates::Projects(v) => Some(PickerSelectResult::Project {
                 name: v[idx].name.clone(),
             }),
+            PickerCandidates::Diagnostics(v) => {
+                let c = &v[idx];
+                Some(PickerSelectResult::FileAt {
+                    path: c.abs_path.clone(),
+                    position: LogicalPosition {
+                        line: c.line,
+                        col: c.col,
+                    },
+                })
+            }
+            // LSP servers aren't a jump target — the client restarts the highlighted server via
+            // `lsp/restart_server` (Ctrl-r). `select` never fires for this kind.
+            PickerCandidates::LspServers(_) => None,
         }
     }
 }
@@ -551,4 +645,85 @@ fn smartcase_query(query: &str) -> (String, bool) {
 pub fn resolve_select(state: &PickerState, item: &PickerItem) -> Option<PickerSelectResult> {
     let idx = state.candidates.position_of(item)?;
     state.candidates.select_result(idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lsp_candidates() -> PickerCandidates {
+        PickerCandidates::LspServers(vec![
+            LspServerCandidate {
+                name: "rust-analyzer".into(),
+                language: "rust".into(),
+                workspace_root: "/proj".into(),
+                root_label: String::new(),
+                status: LspStatus::Ready,
+            },
+            LspServerCandidate {
+                name: "gopls".into(),
+                language: "go".into(),
+                workspace_root: "/proj/svc".into(),
+                root_label: "svc".into(),
+                status: LspStatus::Starting,
+            },
+        ])
+    }
+
+    #[test]
+    fn lsp_server_candidates_round_trip_to_items() {
+        let c = lsp_candidates();
+        assert_eq!(c.kind(), PickerKind::LspServers);
+        assert_eq!(c.len(), 2);
+        // The name is the fuzzy haystack, and servers fuzzy-match like the other small lists.
+        assert_eq!(c.display_at(0), "rust-analyzer");
+        assert_eq!(c.match_strategy(), MatchStrategy::Fuzzy);
+        match c.make_item(0, vec![0, 1]) {
+            PickerItem::LspServer {
+                name,
+                language,
+                workspace_root,
+                root_label,
+                status,
+                match_indices,
+            } => {
+                assert_eq!(name, "rust-analyzer");
+                assert_eq!(language, "rust");
+                assert_eq!(workspace_root, "/proj");
+                assert_eq!(root_label, ""); // rooted at the project root → no label
+                assert_eq!(status, LspStatus::Ready);
+                assert_eq!(match_indices, vec![0, 1]);
+            }
+            other => panic!("expected LspServer, got {other:?}"),
+        }
+        // The sub-rooted server carries its relative label.
+        match c.make_item(1, vec![]) {
+            PickerItem::LspServer { root_label, .. } => assert_eq!(root_label, "svc"),
+            other => panic!("expected LspServer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lsp_server_identity_is_language_and_root() {
+        let c = lsp_candidates();
+        // Round-trips by (language, workspace_root).
+        assert_eq!(c.position_of(&c.make_item(1, vec![])), Some(1));
+        // Same language, different root → no match (monorepo dual-root case).
+        let elsewhere = PickerItem::LspServer {
+            name: "ignored".into(),
+            language: "go".into(),
+            workspace_root: "/elsewhere".into(),
+            root_label: "elsewhere".into(),
+            status: LspStatus::Ready,
+            match_indices: vec![],
+        };
+        assert_eq!(c.position_of(&elsewhere), None);
+    }
+
+    #[test]
+    fn lsp_server_is_not_a_select_target() {
+        // Restart is driven client-side (Ctrl-r → lsp/restart_server); `select` is a no-op, so
+        // `select_result` yields None and `picker/select` never acts on this kind.
+        assert!(lsp_candidates().select_result(0).is_none());
+    }
 }

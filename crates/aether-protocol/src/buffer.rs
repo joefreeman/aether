@@ -66,6 +66,11 @@ pub struct BufferOpenResult {
     /// should default to `{logical_line: 0, sub_row: 0.0}`. Lets reopen restore the prior view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<ScrollPosition>,
+    /// The language server backing this buffer, when one is configured for its language and a
+    /// workspace root was found. `None` otherwise. Lets the client show *this buffer's* server
+    /// health (servers are keyed by `(language, workspace_root)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_server: Option<crate::lsp::LspServerRef>,
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------

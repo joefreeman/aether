@@ -3,7 +3,9 @@
 //! doc.
 
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
-use aether_protocol::cursor::{CursorMove, CursorMoveParams, Direction, Motion, WordBoundary};
+use aether_protocol::cursor::{
+    CursorMove, CursorMoveParams, CursorState, Direction, Motion, WordBoundary,
+};
 use aether_protocol::directory::{
     DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryList,
     DirectoryListParams, DirectoryListResult,
@@ -16,11 +18,20 @@ use aether_protocol::git::{
     BlameInfo, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitNavigateHunk,
     GitNavigateHunkParams, HunkDirection, GitSetDiffView, GitSetDiffViewParams,
 };
-use aether_protocol::viewport::{DiffMarker, LogicalLineRender, VirtualRow, VirtualRowKind};
+use aether_protocol::viewport::{
+    DiagnosticSeverity, DiagnosticSpan, DiffMarker, LogicalLineRender, VirtualRow, VirtualRowKind,
+};
 use aether_protocol::input::{InputSurround, InputSurroundParams, InputText, InputTextParams};
 use aether_protocol::search::{SearchSet, SearchSetParams};
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
+};
+use aether_protocol::lsp::{
+    DiagnosticCounts, DiagnosticDirection, LspBufferParams, LspDiagnosticsChanged,
+    LspDiagnosticsChangedParams, LspGotoDefinition, LspGotoDefinitionResult, LspHover,
+    FormatStatus, LspFormat, LspFormatResult, LspHoverResult, LspLocation, LspNavigateDiagnostic,
+    LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServer, LspServerStatus,
+    LspServerStatusList, LspStatus, LspStatusChanged,
 };
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::LogicalPosition;
@@ -121,10 +132,12 @@ fn logical_line_render_virtual_rows_shape() {
         search_matches: vec![],
         virtual_rows_above: vec![],
         diff_marker: None,
+        diagnostics: vec![],
     };
     let v = to_value(&bare).unwrap();
     assert!(v.get("virtual_rows_above").is_none(), "empty omitted from wire");
     assert!(v.get("diff_marker").is_none(), "None marker omitted from wire");
+    assert!(v.get("diagnostics").is_none(), "empty diagnostics omitted from wire");
 
     let with_del = LogicalLineRender {
         logical_line: 4,
@@ -135,15 +148,26 @@ fn logical_line_render_virtual_rows_shape() {
             kind: VirtualRowKind::Deleted,
         }],
         diff_marker: Some(DiffMarker::Modified),
+        diagnostics: vec![DiagnosticSpan {
+            start: 4,
+            end: 9,
+            severity: DiagnosticSeverity::Error,
+            message: "unused variable".into(),
+        }],
     };
     let v = to_value(&with_del).unwrap();
     assert_eq!(v["virtual_rows_above"][0]["text"], "old line");
     assert_eq!(v["virtual_rows_above"][0]["kind"], "deleted");
     assert_eq!(v["diff_marker"], "modified");
+    assert_eq!(v["diagnostics"][0]["start"], 4);
+    assert_eq!(v["diagnostics"][0]["end"], 9);
+    assert_eq!(v["diagnostics"][0]["severity"], "error");
+    assert_eq!(v["diagnostics"][0]["message"], "unused variable");
     let back: LogicalLineRender = from_value(v).unwrap();
     assert_eq!(back.virtual_rows_above.len(), 1);
     assert_eq!(back.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
     assert_eq!(back.diff_marker, Some(DiffMarker::Modified));
+    assert_eq!(back.diagnostics[0].severity, DiagnosticSeverity::Error);
 }
 
 #[test]
@@ -304,10 +328,15 @@ fn buffer_open_result_shape() {
         scratch_number: Some(3),
         cursor: Default::default(),
         scroll: None,
+        lsp_server: Some(aether_protocol::lsp::LspServerRef {
+            language: "rust".into(),
+            workspace_root: "/proj".into(),
+        }),
     })
     .unwrap();
     assert_eq!(v["buffer_id"], 42);
     assert_eq!(v["language"], "rust");
+    assert_eq!(v["lsp_server"]["workspace_root"], "/proj");
     assert_eq!(v["saved_revision"], 0);
     assert_eq!(v["scratch_number"], 3);
     // Cursor always serialises (CursorState::default() is `{position: {line:0,col:0}, anchor: {line:0,col:0}}`).
@@ -334,12 +363,15 @@ fn buffer_open_result_restored_scroll() {
             logical_line: 7,
             sub_row: 0.5,
         }),
+        lsp_server: None,
     })
     .unwrap();
     assert_eq!(v["scroll"]["logical_line"], 7);
     assert_eq!(v["scroll"]["sub_row"], 0.5);
     // `scratch_number: None` skips serialisation, like a file buffer.
     assert!(v.get("scratch_number").is_none());
+    // `lsp_server: None` is skipped too.
+    assert!(v.get("lsp_server").is_none(), "lsp_server: None should be skipped");
 }
 
 #[test]
@@ -444,6 +476,145 @@ fn notification_roundtrip() {
     let s = serde_json::to_string(&n).unwrap();
     let v: serde_json::Value = from_str(&s).unwrap();
     assert_eq!(v["method"], "viewport/lines_changed");
+    assert!(v.get("id").is_none(), "notifications carry no id");
+}
+
+#[test]
+fn lsp_method_names() {
+    assert_eq!(LspServerStatusList::NAME, "lsp/server_status");
+    assert_eq!(LspRestartServer::NAME, "lsp/restart_server");
+    assert_eq!(LspStatusChanged::NAME, "lsp/status_changed");
+}
+
+#[test]
+fn lsp_diagnostics_changed_shape() {
+    assert_eq!(LspDiagnosticsChanged::NAME, "lsp/diagnostics_changed");
+    let p = LspDiagnosticsChangedParams {
+        buffer_id: 5,
+        counts: DiagnosticCounts { errors: 2, warnings: 1, infos: 0, hints: 3 },
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["buffer_id"], 5);
+    assert_eq!(v["counts"]["errors"], 2);
+    assert_eq!(v["counts"]["hints"], 3);
+    assert!(!DiagnosticCounts { errors: 1, ..Default::default() }.is_empty());
+    assert!(DiagnosticCounts::default().is_empty());
+}
+
+#[test]
+fn lsp_hover_and_goto_shapes() {
+    assert_eq!(LspHover::NAME, "lsp/hover");
+    assert_eq!(LspGotoDefinition::NAME, "lsp/goto_definition");
+    // Cursor-relative params carry only the buffer.
+    let v = to_value(LspBufferParams { buffer_id: 3 }).unwrap();
+    assert_eq!(v, json!({"buffer_id": 3}));
+    // Hover: optional contents.
+    let v = to_value(LspHoverResult { contents: Some("fn x()".into()) }).unwrap();
+    assert_eq!(v["contents"], "fn x()");
+    // Goto: optional location with absolute path + byte-col position.
+    let r = LspGotoDefinitionResult {
+        location: Some(LspLocation {
+            path: "/p/src/lib.rs".into(),
+            position: LogicalPosition { line: 12, col: 4 },
+        }),
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["location"]["path"], "/p/src/lib.rs");
+    assert_eq!(v["location"]["position"]["line"], 12);
+    let back: LspGotoDefinitionResult = from_value(v).unwrap();
+    assert_eq!(back.location.unwrap().position.col, 4);
+}
+
+#[test]
+fn lsp_format_shape() {
+    assert_eq!(LspFormat::NAME, "lsp/format");
+    // Params are the shared cursor-relative buffer params.
+    assert_eq!(to_value(LspBufferParams { buffer_id: 4 }).unwrap(), json!({"buffer_id": 4}));
+    let r = LspFormatResult {
+        cursor: CursorState::default(),
+        status: FormatStatus::Applied,
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["status"], "applied");
+    assert_eq!(to_value(FormatStatus::Unsupported).unwrap(), json!("unsupported"));
+    let back: LspFormatResult = from_value(v).unwrap();
+    assert_eq!(back.status, FormatStatus::Applied);
+}
+
+#[test]
+fn lsp_navigate_diagnostic_shape() {
+    assert_eq!(LspNavigateDiagnostic::NAME, "lsp/navigate_diagnostic");
+    let p = LspNavigateDiagnosticParams {
+        buffer_id: 7,
+        from_line: 3,
+        direction: DiagnosticDirection::Next,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v, json!({"buffer_id": 7, "from_line": 3, "direction": "next"}));
+    assert_eq!(
+        to_value(DiagnosticDirection::Prev).unwrap(),
+        json!("prev")
+    );
+    let r = LspNavigateDiagnosticResult {
+        cursor: CursorState::default(),
+        moved: true,
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["moved"], true);
+    let back: LspNavigateDiagnosticResult = from_value(v).unwrap();
+    assert!(back.moved);
+}
+
+#[test]
+fn lsp_status_is_internally_tagged() {
+    // Unit variant: just the tag.
+    assert_eq!(to_value(LspStatus::Ready).unwrap(), json!({"state": "ready"}));
+    // Struct variant: tag alongside its fields, flat.
+    assert_eq!(
+        to_value(LspStatus::Crashed {
+            code: Some(1),
+            message: "boom".into(),
+        })
+        .unwrap(),
+        json!({"state": "crashed", "code": 1, "message": "boom"})
+    );
+    // Round-trips back.
+    let s = LspStatus::Stopped;
+    assert_eq!(from_value::<LspStatus>(to_value(&s).unwrap()).unwrap(), s);
+}
+
+#[test]
+fn lsp_server_status_shape() {
+    let st = LspServerStatus {
+        name: "rust-analyzer".into(),
+        language: "rust".into(),
+        workspace_root: "/home/joe/proj".into(),
+        status: LspStatus::Initializing,
+    };
+    let v = to_value(&st).unwrap();
+    assert_eq!(v["name"], "rust-analyzer");
+    assert_eq!(v["language"], "rust");
+    assert_eq!(v["workspace_root"], "/home/joe/proj");
+    assert_eq!(v["status"], json!({"state": "initializing"}));
+}
+
+#[test]
+fn lsp_status_changed_notification_roundtrip() {
+    let n = Notification {
+        jsonrpc: JsonRpc,
+        method: LspStatusChanged::NAME.into(),
+        params: to_value(LspServerStatus {
+            name: "gopls".into(),
+            language: "go".into(),
+            workspace_root: "/x".into(),
+            status: LspStatus::Ready,
+        })
+        .unwrap(),
+    };
+    let s = serde_json::to_string(&n).unwrap();
+    let v: serde_json::Value = from_str(&s).unwrap();
+    assert_eq!(v["method"], "lsp/status_changed");
+    assert_eq!(v["params"]["status"]["state"], "ready");
     assert!(v.get("id").is_none(), "notifications carry no id");
 }
 
@@ -687,6 +858,51 @@ fn picker_item_file_is_tagged() {
 }
 
 #[test]
+fn picker_item_diagnostic_is_tagged() {
+    use aether_protocol::picker::{PickerKind, PickerItem};
+    assert_eq!(
+        to_value(PickerKind::Diagnostics).unwrap(),
+        json!("diagnostics")
+    );
+    let item = PickerItem::Diagnostic {
+        line: 12,
+        col: 4,
+        severity: DiagnosticSeverity::Error,
+        message: "mismatched types".into(),
+        match_indices: vec![0, 1],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(v["kind"], "diagnostic");
+    assert_eq!(v["line"], 12);
+    assert_eq!(v["severity"], "error");
+    assert_eq!(v["message"], "mismatched types");
+    let back: PickerItem = from_value(v).unwrap();
+    assert_eq!(back, item);
+}
+
+#[test]
+fn picker_item_lsp_server_is_tagged() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    assert_eq!(to_value(PickerKind::LspServers).unwrap(), json!("lsp_servers"));
+    let item = PickerItem::LspServer {
+        name: "rust-analyzer".into(),
+        language: "rust".into(),
+        workspace_root: "/proj".into(),
+        root_label: String::new(),
+        status: LspStatus::Ready,
+        match_indices: vec![0, 1],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(v["kind"], "lsp_server");
+    assert_eq!(v["name"], "rust-analyzer");
+    assert_eq!(v["language"], "rust");
+    // Status nests its own internally-tagged shape.
+    assert_eq!(v["status"], json!({"state": "ready"}));
+    let back: PickerItem = from_value(v).unwrap();
+    assert_eq!(back, item);
+}
+
+#[test]
 fn picker_view_params_omit_center_on_when_none() {
     use aether_protocol::picker::{PickerKind, PickerViewParams};
     let p = PickerViewParams {
@@ -697,6 +913,7 @@ fn picker_view_params_omit_center_on_when_none() {
         center_on: None,
         center_on_cursor_grep_hit: None,
         directory_path: None,
+        buffer_id: None,
         explorer_roots: false,
     };
     let v = to_value(&p).unwrap();
@@ -723,6 +940,7 @@ fn picker_view_params_center_on_serialized() {
         }),
         center_on_cursor_grep_hit: None,
         directory_path: None,
+        buffer_id: None,
         explorer_roots: false,
     };
     let v = to_value(&p).unwrap();
@@ -940,6 +1158,7 @@ fn picker_view_params_directory_path_skipped_when_none() {
         center_on: None,
         center_on_cursor_grep_hit: None,
         directory_path: None,
+        buffer_id: None,
         explorer_roots: false,
     };
     let v = to_value(&p).unwrap();
@@ -960,6 +1179,7 @@ fn picker_view_params_directory_path_serialized() {
         center_on: None,
         center_on_cursor_grep_hit: None,
         directory_path: Some("/home/x/proj/src".into()),
+        buffer_id: None,
         explorer_roots: false,
     };
     let v = to_value(&p).unwrap();

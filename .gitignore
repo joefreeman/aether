@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 Cargo.lock.bak
+# Erlang/elixir LSP crash dumps (left by elp/elixir-ls during testing)
+erl_crash.dump
+**/erl_crash.dump
