@@ -20,6 +20,7 @@ buffer, see each other's cursors, and share a single undo stack.
 - Mouse support, soft wrap, system-clipboard integration
 - Git integration (gutter, diff, blame)
 - LSP (diagnostics, hover, go-to-definition, format)
+- Terminal and web clients
 
 ## Keybindings
 
@@ -172,6 +173,21 @@ This produces two binaries:
 
    Projects are created and managed from the project picker (`Space p`); running `ae` with no
    arguments opens it.
+
+## Web client
+
+The web client (`web/`, TypeScript) is served by the same server process. Build the bundle once,
+then open it in a browser:
+
+```sh
+cd web
+npm install     # first time only
+npm run build   # tsc (typecheck + compile), then Vite bundles to web/dist
+```
+
+`npm run build` runs `tsc && vite build`. The server serves `web/dist` directly — the path is baked
+from the crate and read at runtime, so a rebuilt bundle is picked up without rebuilding the server —
+and injects the auth token into the page. With the server running, open <http://127.0.0.1:2384>.
 
 ## License
 

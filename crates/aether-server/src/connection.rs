@@ -42,7 +42,8 @@ use aether_protocol::project::{
 };
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::viewport::{
-    ViewportResize, ViewportScroll, ViewportSetWrap, ViewportSubscribe, ViewportUnsubscribe,
+    ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
+    ViewportUnsubscribe,
 };
 use aether_protocol::ClientId;
 use anyhow::Context;
@@ -267,6 +268,7 @@ async fn dispatch(
         ViewportSubscribe::NAME => run!(ViewportSubscribe, handlers::viewport_subscribe),
         ViewportResize::NAME => run!(ViewportResize, handlers::viewport_resize),
         ViewportScroll::NAME => run!(ViewportScroll, handlers::viewport_scroll),
+        ViewportScrollToRow::NAME => run!(ViewportScrollToRow, handlers::viewport_scroll_to_row),
         ViewportSetWrap::NAME => run!(ViewportSetWrap, handlers::viewport_set_wrap),
         ViewportUnsubscribe::NAME => run!(ViewportUnsubscribe, handlers::viewport_unsubscribe),
         CursorMove::NAME => run!(CursorMove, handlers::cursor_move),

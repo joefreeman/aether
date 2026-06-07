@@ -2199,6 +2199,9 @@ fn collect_viewport_refresh(
                 start_logical_line: vp.first_logical_line,
                 end_logical_line_exclusive: vp.last_logical_line_exclusive,
             },
+            total_visual_rows: window.total_visual_rows,
+            first_visual_row: window.first_visual_row,
+            max_line_width: window.max_line_width,
             replacement_lines: window.lines,
             line_count,
             max_scroll_logical_line: window.max_scroll_logical_line,
@@ -3002,6 +3005,64 @@ pub async fn viewport_resize(
     Ok(ViewportWindowResult { window })
 }
 
+pub async fn viewport_scroll_to_row(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::viewport::ViewportScrollToRowParams,
+) -> Result<ViewportWindowResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, diff_view) = (
+        vp.cols,
+        vp.rows,
+        vp.overscan_rows,
+        vp.wrap,
+        vp.continuation_marker_width,
+        vp.tab_width,
+        vp.buffer_id,
+        vp.diff_view,
+    );
+    let hunks = buffer_hunks(&s, buffer_id);
+    let buf = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let line_count = buf.line_count();
+    let deleted_rows = if diff_view {
+        deleted_rows_by_anchor(hunks, line_count)
+    } else {
+        HashMap::new()
+    };
+    let top_line = logical_line_at_visual_row(
+        buf,
+        cols,
+        wrap,
+        marker_width,
+        tab_width,
+        &deleted_rows,
+        params.top_visual_row,
+    );
+    let (first, last_excl) = pushed_range(top_line, rows, overscan, line_count);
+    let search = s.searches.get(&(client_id, buffer_id));
+    let hunks = buffer_hunks(&s, buffer_id);
+    let diagnostics = buffer_diagnostics(&s, buffer_id);
+    let buf = &s.buffers[&buffer_id];
+    let window = render_window(
+        buf, first, last_excl, cols, wrap, marker_width, tab_width, rows, search, diff_view, hunks,
+        diagnostics,
+    );
+    let vp = s
+        .viewports
+        .get_mut(&params.viewport_id)
+        .expect("just checked");
+    vp.scroll_logical_line = top_line;
+    vp.scroll_sub_row = 0.0;
+    vp.first_logical_line = first;
+    vp.last_logical_line_exclusive = last_excl;
+    Ok(ViewportWindowResult { window })
+}
+
 pub async fn viewport_set_wrap(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -3505,6 +3566,105 @@ fn compute_max_scroll(
     0
 }
 
+/// Number of real visual rows for one logical line (1 under no-wrap, else the wrapped count).
+fn line_visual_rows(
+    buf: &Buffer,
+    line_idx: u32,
+    no_wrap: bool,
+    cols: u32,
+    marker_width: u32,
+    tab_width: u32,
+) -> u32 {
+    if no_wrap {
+        return 1;
+    }
+    let mut text: String = buf.text.line(line_idx as usize).chunks().collect();
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    wrap::compute_rows(&text, cols, marker_width, tab_width).len() as u32
+}
+
+/// `(first_visual_row, total_visual_rows)` for the buffer at this config — the visual row where
+/// `first` begins and the buffer's total visual-row height (real + diff phantom rows). O(lines);
+/// the no-wrap/no-diff case is O(1).
+fn compute_visual_extent(
+    buf: &Buffer,
+    cols: u32,
+    wrap: aether_protocol::viewport::WrapMode,
+    marker_width: u32,
+    tab_width: u32,
+    deleted_rows: &HashMap<u32, Vec<VirtualRow>>,
+    first: u32,
+) -> (u32, u32) {
+    let line_count = buf.line_count();
+    let no_wrap = matches!(wrap, aether_protocol::viewport::WrapMode::None);
+    if no_wrap && deleted_rows.is_empty() {
+        return (first.min(line_count), line_count);
+    }
+    let mut total = 0u32;
+    let mut first_vr = 0u32;
+    for i in 0..line_count {
+        if i == first {
+            first_vr = total;
+        }
+        let virtual_n = deleted_rows.get(&i).map_or(0, |v| v.len() as u32);
+        total = total.saturating_add(line_visual_rows(buf, i, no_wrap, cols, marker_width, tab_width) + virtual_n);
+    }
+    if first >= line_count {
+        first_vr = total;
+    }
+    (first_vr, total)
+}
+
+/// Display width (cols) of the widest line in the buffer — sizes a client's native horizontal
+/// scroller under no-wrap. O(buffer chars); only called when wrap is off.
+fn compute_max_line_width(buf: &Buffer, tab_width: u32) -> u32 {
+    let mut max = 0u32;
+    for i in 0..buf.line_count() {
+        let mut text: String = buf.text.line(i as usize).chunks().collect();
+        if text.ends_with('\n') {
+            text.pop();
+        }
+        let mut col = 0u32;
+        for c in text.chars() {
+            col += wrap::char_display_width(c, col, tab_width);
+        }
+        max = max.max(col);
+    }
+    max
+}
+
+/// The logical line whose visual-row span contains `target_row` (clamped to the last line).
+fn logical_line_at_visual_row(
+    buf: &Buffer,
+    cols: u32,
+    wrap: aether_protocol::viewport::WrapMode,
+    marker_width: u32,
+    tab_width: u32,
+    deleted_rows: &HashMap<u32, Vec<VirtualRow>>,
+    target_row: u32,
+) -> u32 {
+    let line_count = buf.line_count();
+    if line_count == 0 {
+        return 0;
+    }
+    let no_wrap = matches!(wrap, aether_protocol::viewport::WrapMode::None);
+    if no_wrap && deleted_rows.is_empty() {
+        return target_row.min(line_count - 1);
+    }
+    let mut acc = 0u32;
+    for i in 0..line_count {
+        let virtual_n = deleted_rows.get(&i).map_or(0, |v| v.len() as u32);
+        let n = line_visual_rows(buf, i, no_wrap, cols, marker_width, tab_width) + virtual_n;
+        if acc + n > target_row {
+            return i;
+        }
+        acc += n;
+    }
+    line_count - 1
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_window(
     buf: &Buffer,
@@ -3575,6 +3735,13 @@ fn render_window(
         render.diagnostics = diagnostic_spans_on_line(diagnostics, i, text.len() as u32);
         lines.push(render);
     }
+    let (first_visual_row, total_visual_rows) =
+        compute_visual_extent(buf, cols, wrap, marker_width, tab_width, &deleted_rows, first);
+    let max_line_width = if matches!(wrap, aether_protocol::viewport::WrapMode::None) {
+        compute_max_line_width(buf, tab_width)
+    } else {
+        0
+    };
     Window {
         first_logical_line: first,
         last_logical_line_exclusive: last_excl,
@@ -3588,6 +3755,9 @@ fn render_window(
             tab_width,
             &deleted_rows,
         ),
+        total_visual_rows,
+        first_visual_row,
+        max_line_width,
         lines,
     }
 }
@@ -6443,6 +6613,9 @@ fn build_lines_changed_notif(
             start_logical_line: vp.first_logical_line,
             end_logical_line_exclusive: vp.last_logical_line_exclusive,
         },
+        total_visual_rows: window.total_visual_rows,
+        first_visual_row: window.first_visual_row,
+        max_line_width: window.max_line_width,
         replacement_lines: window.lines,
         line_count,
         max_scroll_logical_line: window.max_scroll_logical_line,

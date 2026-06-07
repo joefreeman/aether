@@ -5,7 +5,6 @@
 //! is read from disk at startup.
 
 use crate::config::{self, RuntimeInfo, SERVER_PORT};
-use crate::connection;
 use crate::state::{ServerState, SharedState};
 use crate::watcher;
 use anyhow::{bail, Context};
@@ -17,7 +16,7 @@ use tokio::sync::Mutex;
 
 /// Public entry point: bind the fixed port, manage the runtime file, run the server.
 pub async fn run() -> anyhow::Result<()> {
-    let token = uuid::Uuid::new_v4().to_string();
+    let token = config::resolve_token()?;
     let bind_addr = format!("127.0.0.1:{SERVER_PORT}");
     let listener = TcpListener::bind(&bind_addr)
         .await
@@ -68,7 +67,7 @@ pub async fn run_with_listener(listener: TcpListener, state: SharedState) -> any
                 tracing::debug!(%addr, "TCP connection accepted");
                 let state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = connection::handle(stream, state).await {
+                    if let Err(e) = crate::http::route(stream, state).await {
                         tracing::warn!(error = %e, %addr, "connection handler ended with error");
                     }
                 });

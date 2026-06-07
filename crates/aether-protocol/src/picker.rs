@@ -442,4 +442,14 @@ pub struct PickerUpdateParams {
     /// True while the matcher is still consuming candidates (walk in progress, or matcher hasn't
     /// quiesced after a query change). The client may use this to show a spinner.
     pub ticking: bool,
+    /// Grep only: the display-row index (hits interleaved with one section header per file group) of
+    /// this window's first item, accounting for the headers above it. Lets a client virtual-scroll a
+    /// list that renders per-file headers without its spacer under-counting those header rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grep_display_offset: Option<u32>,
+    /// Grep only: total display rows in the whole result set (`total_matches` + number of file
+    /// groups). Sizes the client's virtual-scroll spacer so every hit (incl. the last file's) is
+    /// reachable. `None` for non-grep kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grep_total_display_rows: Option<u32>,
 }

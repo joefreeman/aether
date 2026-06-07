@@ -8,6 +8,7 @@ mod error;
 mod git;
 mod grep;
 mod handlers;
+mod http;
 mod indent;
 mod lsp;
 mod picker;

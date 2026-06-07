@@ -1,0 +1,539 @@
+/* Nord palette — mirrors crates/aether-tui/src/ui.rs so the web client matches the terminal. */
+:root {
+  --nord0: #2e3440; /* main background */
+  --nord1: #3b4252; /* status line / panel */
+  --nord2: #434c5e; /* selection background */
+  --nord3: #4c566a; /* comments / dim */
+  --nord4: #d8dee9; /* main foreground */
+  --nord6: #eceff4; /* Snow Storm — brightest (picker text) */
+  --nord7: #8fbcbb; /* types */
+  --nord8: #88c0d0; /* functions, accents */
+  --nord9: #81a1c1; /* keywords, operators */
+  --nord10: #5e81ac; /* active selection bg */
+  --nord11: #bf616a; /* error */
+  --nord12: #d08770; /* attributes, macros */
+  --nord13: #ebcb8b; /* string escapes, warnings */
+  --nord14: #a3be8c; /* strings */
+  --nord15: #b48ead; /* numbers, constants */
+
+  --git-added-bg: #2d3a2d;
+  --git-modified-bg: #3a3628;
+  --git-deleted-bg: #3b2226;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  /* Stop horizontal overscroll (trackpad swipe) from triggering browser back/forward navigation. */
+  overscroll-behavior-x: none;
+}
+#app {
+  display: flex;
+  flex-direction: column;
+  background: var(--nord0);
+  color: var(--nord4);
+  font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+#buffer {
+  flex: 1 1 auto;
+  overflow-y: auto; /* native vertical scrolling over the full-height spacer (virtual scroll) */
+  overflow-x: hidden;
+  white-space: pre;
+  tab-size: 4;
+  position: relative;
+  user-select: none; /* the editor draws its own selection; suppress native text selection on drag */
+  cursor: text;
+}
+#buffer.hscroll { overflow-x: auto; } /* native horizontal scroll when word wrap is off */
+/* Keep horizontal overscroll inside the buffer — never chain to the browser's back/forward swipe. */
+#buffer { overscroll-behavior-x: contain; }
+.buffer-spacer { position: relative; width: 100%; }
+.buffer-content { position: absolute; left: 0; right: 0; will-change: top; }
+
+/* Offscreen, focusable (not display:none) so it can hold focus and receive native paste events. */
+.clipboard-capture {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+  resize: none;
+  overflow: hidden;
+}
+#status {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--nord1);
+  color: var(--nord4);
+  font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  padding: 2px 8px;
+  white-space: pre;
+  overflow: hidden;
+  /* Subtle lift above the buffer (status bar sits at the bottom, so the shadow casts upward). */
+  position: relative;
+  z-index: 5;
+  box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.15);
+}
+.status-left { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status-right { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; }
+.status-diag { margin-left: 5px; white-space: nowrap; } /* tight spacing between diagnostic counts */
+.status-diag:first-of-type { margin-left: 18px; } /* but a clear gap from the buffer name/marker */
+.status-icon {
+  width: 1.05em;
+  height: 1.05em;
+  vertical-align: -0.18em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+@keyframes status-spin { to { transform: rotate(360deg); } }
+.status-icon.spin { transform-origin: 50% 50%; animation: status-spin 0.9s linear infinite; }
+.sev-error { color: var(--nord11); }
+.sev-warning { color: var(--nord13); }
+.sev-information { color: var(--nord8); }
+.sev-hint { color: var(--nord3); }
+.lsp-ready { color: var(--nord14); }
+.lsp-busy { color: var(--nord13); }
+.lsp-crashed { color: var(--nord11); }
+.lsp-stopped { color: var(--nord3); }
+
+/* Toasts — transient messages, top-right, auto-dismissing. */
+#toasts {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: none;
+}
+.toast {
+  background: var(--nord1);
+  color: var(--nord4);
+  border: 1px solid var(--nord3);
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 6px 12px;
+  max-width: 420px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  transition: opacity 0.4s ease;
+}
+.toast.fade { opacity: 0; }
+.toast.error { border-left-color: var(--nord11); }
+.toast.warning { border-left-color: var(--nord13); }
+.toast.success { border-left-color: var(--nord14); }
+.toast.info { border-left-color: var(--nord8); }
+
+/* Connection banner — top-center, above everything; amber while reconnecting, red when given up. */
+#conn-banner {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--nord13);
+  color: var(--nord0);
+  font: 12px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 6px 14px;
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+#conn-banner.failed {
+  background: var(--nord11);
+  color: var(--nord6);
+}
+.conn-retry {
+  font: inherit;
+  background: rgba(0, 0, 0, 0.22);
+  color: inherit;
+  border: 1px solid rgba(0, 0, 0, 0.28);
+  border-radius: 4px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+
+#hover {
+  position: fixed;
+  z-index: 20;
+  max-width: 600px;
+  max-height: 40vh;
+  overflow: auto;
+  background: var(--nord1);
+  color: var(--nord4);
+  border: 1px solid var(--nord3);
+  border-radius: 4px;
+  padding: 6px 10px;
+  white-space: pre-wrap;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+}
+/* Markdown hover (LSP): code fences as blocks, inline code tinted, headings bold, rules dim. */
+#hover.markdown { white-space: normal; }
+#hover .md-line { margin: 2px 0; }
+#hover .md-heading { font-weight: bold; color: var(--nord8); }
+#hover .md-code {
+  margin: 6px 0;
+  padding: 6px 8px;
+  background: var(--nord0);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+#hover code { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--nord8); }
+#hover hr { border: none; border-top: 1px solid var(--nord3); margin: 6px 0; }
+
+/* Diagnostic hover: tint text + border by severity (id-specificity needed to beat #hover color). */
+#hover.sev-error { color: var(--nord11); border-color: var(--nord11); }
+#hover.sev-warning { color: var(--nord13); border-color: var(--nord13); }
+#hover.sev-information { color: var(--nord8); border-color: var(--nord8); }
+#hover.sev-hint { color: var(--nord3); border-color: var(--nord3); }
+
+/* Floating search input — sits above the status bar on the left, with a limited width (JS sets
+   `bottom` to clear the status bar; `display` toggles flex/none). */
+#searchbar {
+  position: fixed;
+  left: 12px;
+  bottom: 32px;
+  z-index: 15;
+  width: min(420px, 60vw);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--nord1);
+  border: 1px solid var(--nord3);
+  border-radius: 6px;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.22);
+  padding: 5px 10px;
+}
+.search-prompt { color: var(--nord8); flex: 0 0 auto; }
+.search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--nord6);
+  font: inherit;
+}
+.search-count { color: var(--nord3); flex: 0 0 auto; }
+
+.row { display: flex; min-height: 1.4em; } /* keep blank lines from collapsing to zero height */
+.row.added-bg { background: var(--git-added-bg); }
+.row.modified-bg { background: var(--git-modified-bg); }
+.row.deleted-phantom { background: var(--git-deleted-bg); color: var(--nord11); }
+
+/* Native change-bar: a colored left border in the gutter column (no text glyph). The transparent
+   border on every gutter keeps the text start aligned whether or not a line is changed. */
+.gutter {
+  flex: 0 0 auto;
+  width: 1ch;
+  box-sizing: border-box;
+  border-left: 3px solid transparent;
+  /* Stick to the left edge so the change-bar stays visible while scrolling horizontally. */
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--nord0);
+}
+.gutter.added { border-left-color: var(--nord14); }
+.gutter.modified { border-left-color: var(--nord13); }
+.gutter.phantom { border-left-color: var(--nord11); }
+/* Pure deletion with the diff view off: a small triangle straddling the line boundary (the removed
+   lines sit "between" this line and the one above), rather than a misleading bar on this line. */
+.gutter.deleted::before {
+  content: "";
+  position: absolute;
+  left: -3px; /* flush against the line's left edge (cancels the gutter's 3px border) */
+  top: 0;
+  transform: translateY(-50%);
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 6px solid var(--nord11);
+}
+
+.content { flex: 1 1 auto; }
+.cont-marker { color: var(--nord3); }
+
+/* Matches the terminal: search matches use NORD2 (gray-blue), the selection paints over them in the
+   more saturated NORD10 (deep blue) so it stands out. Precedence is source order (all single-class):
+   search-hit < selection < cursor — so a match inside a selection reads as selected, cursor wins. */
+.search-hit { background: var(--nord2); }
+.sel { background: var(--nord10); }
+.cursor { background: var(--nord4); color: var(--nord0); }
+.cursor.insert { background: transparent; color: inherit; box-shadow: inset 1.5px 0 0 var(--nord8); }
+
+/* Matching bracket (cursor on/inside a bracket pair) — bold orange, matching the terminal. */
+.match-bracket { color: var(--nord12); font-weight: bold; }
+/* End-of-line git blame for the cursor line. */
+.blame-eol { color: var(--nord3); font-style: italic; }
+
+/* Diagnostics — wavy underline in the severity colour. */
+.diag-error { text-decoration: underline wavy var(--nord11); }
+.diag-warning { text-decoration: underline wavy var(--nord13); }
+.diag-information { text-decoration: underline wavy var(--nord8); }
+.diag-hint { text-decoration: underline wavy var(--nord3); }
+
+/* ---- Modal dialogs (confirm / save-as) ---- */
+.modal {
+  min-width: 360px;
+  max-width: 70vw;
+  background: var(--nord1);
+  color: var(--nord6);
+  font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  border: 1px solid var(--nord3);
+  border-radius: 6px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  padding: 16px;
+  outline: none;
+}
+.modal-message { margin-bottom: 14px; }
+.modal-field { display: flex; gap: 8px; margin-bottom: 14px; }
+.modal-input,
+.modal-select {
+  font: inherit;
+  background: var(--nord0);
+  color: var(--nord6);
+  border: 1px solid var(--nord3);
+  border-radius: 4px;
+  padding: 6px 8px;
+  outline: none;
+}
+.modal-input { flex: 1 1 auto; min-width: 0; }
+.modal-input:focus, .modal-select:focus { border-color: var(--nord8); }
+.modal-buttons { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-btn {
+  font: inherit;
+  background: var(--nord2);
+  color: var(--nord6);
+  border: 1px solid var(--nord3);
+  border-radius: 4px;
+  padding: 5px 14px;
+  cursor: pointer;
+}
+.modal-btn:hover { background: var(--nord3); }
+.modal-btn.primary { background: var(--nord10); border-color: var(--nord10); }
+.modal-btn.primary:hover { background: var(--nord8); border-color: var(--nord8); }
+.modal-btn.danger { background: var(--nord11); border-color: var(--nord11); }
+.modal-btn.danger:hover { background: #cf6f77; border-color: #cf6f77; }
+
+/* Pickers + dialogs (save-as, project settings, help) share the picker offset (8vh from .overlay).
+   Only confirmations sit lower, so a confirm over a picker doesn't align with it. */
+.overlay.confirm-overlay { padding-top: 11vh; }
+
+/* LSP server info dialog. */
+.modal.lsp-info { width: min(560px, 88vw); }
+.lsp-info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; margin-bottom: 16px; }
+.lsp-info-key { color: var(--nord3); }
+.lsp-info-val { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-word; }
+
+/* Project settings. */
+.modal.project-settings { width: min(640px, 88vw); }
+.ps-label { color: var(--nord13); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+.ps-roots { margin-bottom: 12px; max-height: 40vh; overflow: auto; }
+.ps-root { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.ps-root-path { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.ps-root-del {
+  flex: 0 0 auto;
+  background: transparent;
+  color: var(--nord11);
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  padding: 0 6px;
+}
+.ps-root-del:hover { color: #cf6f77; }
+
+/* Help overlay. */
+.modal.help { width: min(760px, 92vw); max-height: 80vh; display: flex; flex-direction: column; }
+/* Tab bar across the top; the content below scrolls so switching tabs keeps the bar in place. */
+.help-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--nord3);
+  margin-bottom: 12px;
+  flex: 0 0 auto;
+}
+.help-tab {
+  font: inherit;
+  background: transparent;
+  color: var(--nord3);
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.help-tab:hover { color: var(--nord4); }
+.help-tab.active { color: var(--nord8); border-bottom-color: var(--nord8); }
+.help-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 28px;
+  align-content: start;
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1 1 auto;
+}
+.help-section { break-inside: avoid; margin-bottom: 14px; }
+.help-section-title {
+  color: var(--nord13);
+  margin-bottom: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.help-row { display: flex; gap: 10px; padding: 1px 0; }
+.help-key {
+  flex: 0 0 44%;
+  color: var(--nord8);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.help-desc { flex: 1 1 auto; color: var(--nord4); }
+
+/* ---- Picker overlay (command-palette style) ---- */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 24, 30, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 8vh;
+  z-index: 10;
+}
+.picker {
+  width: min(720px, 80vw);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--nord1);
+  color: var(--nord6);
+  font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  border: 1px solid var(--nord3);
+  border-radius: 6px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+.picker-input-row {
+  display: flex;
+  align-items: center;
+  background: var(--nord0);
+  border-bottom: 1px solid var(--nord3);
+  padding: 10px 12px;
+}
+.picker-path {
+  color: var(--nord8);
+  flex: 0 1 auto;
+  max-width: 55%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.picker-input {
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--nord6);
+  font: inherit;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+}
+.picker-list {
+  overflow-y: auto;
+  flex: 1 1 auto;
+  position: relative;
+}
+/* Virtual scroll: spacer spans all results; the loaded window is positioned within it. */
+.picker-spacer { position: relative; width: 100%; }
+.picker-window { position: absolute; left: 0; right: 0; top: 0; }
+.picker-row.create { position: absolute; left: 0; right: 0; }
+.picker-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 12px;
+  white-space: pre;
+  overflow: hidden;
+  cursor: pointer;
+}
+/* Subtle hover — underline the label (lighter cue than the keyboard-selection background); not on
+   headers or the selected row. */
+.picker-row:not(.grep-header):not(.selected):hover .picker-main {
+  text-decoration: underline;
+}
+.picker-row.selected {
+  background: var(--nord2);
+}
+.picker-prefix { color: var(--nord13); flex: 0 0 auto; }
+.sev-error { color: var(--nord11); }
+.sev-warning { color: var(--nord13); }
+.sev-information { color: var(--nord8); }
+.sev-hint { color: var(--nord3); }
+.picker-main { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.picker-dir { color: var(--nord8); } /* directories in frost blue, matching the terminal UI */
+.picker-row.create .picker-main { color: var(--nord14); } /* "+ create …" row in green */
+/* Grep file-group header — non-selectable, bold; the path in frost blue (matches the terminal). */
+/* Same box as a normal row (so it's exactly one display row tall, keeping virtual-scroll aligned).
+   Sticky within its .grep-section so the filename stays pinned while scrolling that file's hits. */
+.picker-row.grep-header {
+  color: var(--nord8);
+  font-weight: bold;
+  cursor: default;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--nord1);
+}
+/* Keep a hit from being hidden under the sticky header when scrolled into view. */
+.grep-section .picker-row:not(.grep-header) { scroll-margin-top: 1.6em; }
+.picker-meta { color: var(--nord3); flex: 1 1 auto; text-align: right; overflow: hidden; text-overflow: ellipsis; }
+.picker-row.selected .picker-meta { color: var(--nord4); }
+.picker .match { color: var(--nord13); font-weight: bold; }
+.picker-row.selected .match { color: var(--nord13); }
+.picker-count {
+  padding: 4px 12px;
+  border-top: 1px solid var(--nord3);
+  color: var(--nord3);
+  font-size: 12px;
+}
+
+/* Syntax highlight kinds — keys match render.ts's HL_CLASS, values mirror ui.rs::lookup_exact. */
+.hl-keyword { color: var(--nord9); }
+.hl-string { color: var(--nord14); }
+.hl-string-special { color: var(--nord13); }
+.hl-comment { color: var(--nord3); font-style: italic; }
+.hl-constant { color: var(--nord15); }
+.hl-function { color: var(--nord8); }
+.hl-macro { color: var(--nord12); }
+.hl-type { color: var(--nord7); }
+.hl-parameter { color: var(--nord4); }
+.hl-punct { color: var(--nord4); }
+.hl-property { color: var(--nord4); }
+.hl-title { color: var(--nord8); font-weight: bold; }
+.hl-uri { color: var(--nord8); text-decoration: underline; }
+.hl-reference { color: var(--nord8); }
+.hl-emphasis { font-style: italic; }
+.hl-strong { font-weight: bold; }

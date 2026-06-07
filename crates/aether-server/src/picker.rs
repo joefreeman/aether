@@ -602,6 +602,32 @@ impl PickerState {
     pub fn total_candidates(&self) -> u32 {
         self.candidates.len() as u32
     }
+
+    /// Grep display-row metrics for a window starting at ranked index `offset`: the display-row
+    /// index of that item (one section header per file group is interleaved above the hits) and the
+    /// total display rows (`ranked.len()` hits + the number of file groups). `None` for non-grep
+    /// pickers. Mirrors the client's header-per-file rendering so its virtual-scroll spacer +
+    /// positioning are exact.
+    fn grep_display_metrics(&self, offset: u32) -> Option<(u32, u32)> {
+        let PickerCandidates::Grep(hits) = &self.candidates else {
+            return None;
+        };
+        let mut total_files = 0u32;
+        let mut headers_at_or_before = 0u32;
+        let mut prev: Option<(u32, &str)> = None;
+        for (rank, &ci) in self.ranked.iter().enumerate() {
+            let h = &hits[ci as usize];
+            let key = (h.path_index, h.relative_path.as_str());
+            if prev != Some(key) {
+                total_files += 1;
+                prev = Some(key);
+                if (rank as u32) <= offset {
+                    headers_at_or_before += 1;
+                }
+            }
+        }
+        Some((offset + headers_at_or_before, self.ranked.len() as u32 + total_files))
+    }
 }
 
 /// Construct a `PickerUpdateParams` for the current window. Mirrors `build_window_items` plus
@@ -609,6 +635,10 @@ impl PickerState {
 pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<PickerUpdateParams> {
     let window = state.subscribed?;
     let (offset, items) = state.build_window_items(window.offset, window.limit, matcher);
+    let (grep_display_offset, grep_total_display_rows) = match state.grep_display_metrics(offset) {
+        Some((d, t)) => (Some(d), Some(t)),
+        None => (None, None),
+    };
     Some(PickerUpdateParams {
         kind: state.kind,
         generation: state.generation,
@@ -617,6 +647,8 @@ pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<Picker
         total_matches: state.ranked.len() as u32,
         total_candidates: state.total_candidates(),
         ticking: false,
+        grep_display_offset,
+        grep_total_display_rows,
     })
 }
 

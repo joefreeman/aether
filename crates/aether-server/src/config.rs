@@ -86,6 +86,45 @@ pub fn list_project_names() -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
+/// The WebSocket auth token, **stable across restarts** so a browser tab that's already loaded can
+/// reconnect after the server is restarted (the token is baked into the served page; a fresh random
+/// token per start would 401 every reconnect). Resolution order: `$AETHER_TOKEN`, else a persisted
+/// `config_dir/aether/token` file, else a freshly generated UUID written to that file (0600 on Unix).
+pub fn resolve_token() -> anyhow::Result<String> {
+    if let Ok(t) = std::env::var("AETHER_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Ok(t);
+        }
+    }
+    let path = token_path()?;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+    std::fs::write(&path, &token)
+        .with_context(|| format!("writing token file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(token)
+}
+
+fn token_path() -> anyhow::Result<PathBuf> {
+    let base = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
+    Ok(base.config_dir().join("aether").join("token"))
+}
+
 pub fn runtime_info_path() -> anyhow::Result<PathBuf> {
     let base = directories::BaseDirs::new()
         .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;

@@ -135,6 +135,16 @@ pub struct Window {
     /// at the bottom of the viewport. Server-computed because under soft wrap each line can
     /// occupy multiple visual rows.
     pub max_scroll_logical_line: u32,
+    /// Total visual rows in the whole buffer for this viewport's wrap+cols (real wrapped rows plus
+    /// any diff phantom rows). Lets a client size a native scroll container to the full document
+    /// (`total_visual_rows × line_height`). Equals `line_count` under `WrapMode::None` with no diff.
+    pub total_visual_rows: u32,
+    /// Visual-row index at which `first_logical_line` begins (cumulative rows of all lines above
+    /// it). Lets a client absolutely-position this window inside the full-height scroller.
+    pub first_visual_row: u32,
+    /// Display width (in cols) of the buffer's widest line, for sizing a native horizontal scroll
+    /// container under `WrapMode::None`. `0` under soft wrap (content always fits `cols`).
+    pub max_line_width: u32,
     pub lines: Vec<LogicalLineRender>,
 }
 
@@ -214,6 +224,25 @@ pub struct ViewportScrollParams {
     pub scroll: ScrollPosition,
 }
 
+// ---- viewport/scroll_to_row ---------------------------------------------------------------------
+
+/// Scroll so the given absolute visual row is at the top of the viewport. Visual-row-addressed
+/// (rather than logical-line) so a client doing native pixel scrolling can map `scrollTop /
+/// line_height` straight to a request — the server resolves the visual row to the logical line it
+/// falls in and returns the window (with `first_visual_row` for absolute positioning).
+pub struct ViewportScrollToRow;
+impl RpcMethod for ViewportScrollToRow {
+    const NAME: &'static str = "viewport/scroll_to_row";
+    type Params = ViewportScrollToRowParams;
+    type Result = ViewportWindowResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewportScrollToRowParams {
+    pub viewport_id: ViewportId,
+    pub top_visual_row: u32,
+}
+
 // ---- viewport/set_wrap --------------------------------------------------------------------------
 
 pub struct ViewportSetWrap;
@@ -262,4 +291,11 @@ pub struct ViewportLinesChangedParams {
     pub line_count: u32,
     /// Recomputed maximum legal `scroll_logical_line` after the edit.
     pub max_scroll_logical_line: u32,
+    /// Recomputed total visual rows after the edit — lets a native-scrolling client resize its
+    /// scroll container (the wrapped height can change when an edit lengthens/shortens a line).
+    pub total_visual_rows: u32,
+    /// Visual-row index of the changed range's first line, so the client can reposition the window.
+    pub first_visual_row: u32,
+    /// Recomputed widest-line width (cols) after the edit, for native horizontal scroll sizing.
+    pub max_line_width: u32,
 }

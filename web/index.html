@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aether</title>
+  <script>
+    // Replaced by aether-server when it serves the embedded bundle (same mechanism as the spike
+    // page). In Vite dev it stays the literal placeholder and the client falls back to
+    // import.meta.env.VITE_AETHER_TOKEN — see src/main.ts.
+    window.AETHER_TOKEN = "__AETHER_TOKEN__";
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

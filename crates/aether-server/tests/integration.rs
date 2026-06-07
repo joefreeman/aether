@@ -36,7 +36,8 @@ use aether_protocol::search::{
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
     ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSetWrap,
-    ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
+    ViewportScrollToRow, ViewportScrollToRowParams, ViewportSetWrapParams, ViewportSubscribe,
+    ViewportSubscribeParams, ViewportSubscribeResult,
     ViewportWindowResult, VirtualRowKind, WrapMode,
 };
 use aether_protocol::lsp::{
@@ -13369,4 +13370,150 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
         PickerSelectResult::FileAt { path, .. } => assert!(path.ends_with("main.rs"), "got {path}"),
         other => panic!("expected FileAt, got {other:?}"),
     }
+}
+
+/// The browser client is served by the same daemon on the same loopback port the WebSocket uses:
+/// a plain HTTP GET returns the web page, while WS upgrades still reach the JSON-RPC handler. This
+/// pins the HTTP-vs-WS routing seam and that the live token is injected into the served page so the
+/// browser can authenticate its socket without reading the runtime discovery file.
+#[tokio::test]
+async fn serves_web_client_over_http_with_injected_token() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+
+    // Plain HTTP GET on the same port the WebSocket tests use.
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut body = String::new();
+    stream.read_to_string(&mut body).await.unwrap();
+
+    assert!(
+        body.starts_with("HTTP/1.1 200 OK"),
+        "expected 200, got: {}",
+        &body[..body.len().min(80)]
+    );
+    assert!(body.contains("text/html"), "should be served as HTML");
+    // The live token is injected so the browser can open an authenticated WS.
+    assert!(body.contains(TEST_TOKEN), "token should be injected into the page");
+    // The placeholder must be fully substituted, not left literal.
+    assert!(!body.contains("__AETHER_TOKEN__"), "placeholder should be replaced");
+
+    // When the web client has been built (web/dist), the page links a hashed JS asset; fetch it to
+    // exercise the asset route + mime. Skipped when only the fallback spike page is served.
+    if let Some(asset) = body
+        .split_once("src=\"/")
+        .and_then(|(_, rest)| rest.split('"').next())
+        .filter(|p| p.ends_with(".js"))
+    {
+        let mut s2 = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+            .await
+            .unwrap();
+        s2.write_all(
+            format!("GET /{asset} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut js = String::new();
+        s2.read_to_string(&mut js).await.unwrap();
+        assert!(
+            js.starts_with("HTTP/1.1 200 OK"),
+            "asset /{asset} not served: {}",
+            &js[..js.len().min(60)]
+        );
+        assert!(js.contains("javascript"), "asset should be served as JS");
+    }
+
+    drop(server);
+}
+
+/// The viewport reports the buffer's total visual-row height and the window's first visual row, so
+/// a native-scrolling client can size a full-document scroller and position the loaded window. Under
+/// no-wrap the total equals the logical line count; first_visual_row tracks first_logical_line.
+#[tokio::test]
+async fn viewport_reports_visual_extent_and_scrolls_by_row() {
+    let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    let (server, mut ws, buffer_id) = setup_with_buffer(&content).await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 10,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    // No-wrap: one visual row per logical line; window starts at the top.
+    assert_eq!(sub.window.total_visual_rows, sub.window.line_count);
+    assert_eq!(sub.window.first_visual_row, 0);
+    // Widest line is "line 10".."line 99" — 7 cols.
+    assert_eq!(sub.window.max_line_width, 7);
+    let viewport_id = sub.viewport_id;
+
+    // Scroll so visual row 50 is at the top.
+    let res: ViewportWindowResult = send_request::<ViewportScrollToRow>(
+        &mut ws,
+        11,
+        &ViewportScrollToRowParams {
+            viewport_id,
+            top_visual_row: 50,
+        },
+    )
+    .await;
+    // Under no-wrap, first_visual_row == first_logical_line, and line 50 is in the loaded window.
+    assert_eq!(res.window.first_visual_row, res.window.first_logical_line);
+    assert!(res.window.first_logical_line <= 50);
+    assert!(res.window.lines.iter().any(|l| l.logical_line == 50));
+
+    drop(server);
+}
+
+/// Under soft wrap, total_visual_rows counts the wrapped rows, exceeding the logical line count.
+#[tokio::test]
+async fn viewport_total_visual_rows_counts_wrapped_rows() {
+    let content = format!("{}\nshort\n", "x".repeat(30));
+    let (server, mut ws, buffer_id) = setup_with_buffer(&content).await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 10,
+            rows: 5,
+            overscan_rows: 5,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    // The 30-char line wraps to several rows, so the total exceeds the 3 logical lines.
+    assert!(
+        sub.window.total_visual_rows > sub.window.line_count,
+        "total_visual_rows {} should exceed line_count {}",
+        sub.window.total_visual_rows,
+        sub.window.line_count
+    );
+    // Soft wrap never overflows horizontally, so no max-line-width is reported.
+    assert_eq!(sub.window.max_line_width, 0);
+
+    drop(server);
 }
