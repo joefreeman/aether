@@ -130,6 +130,84 @@ function joinPath(dir: string, name: string): string {
   if (!dir) return name;
   return dir.endsWith("/") ? dir + name : `${dir}/${name}`;
 }
+
+// ---- project-relative path labels (mirrors the TUI's labels.rs + project_relative_label) --------
+// The status bar shows a buffer's path relative to its project root, prefixed by a disambiguating
+// root label when the project has several roots that would otherwise read the same.
+
+/** One label per root, aligned by index. Single root → "" (no prefix needed). Roots that share a
+ *  basename grow a parenthesized parent (`api (work)`), deepening until unique. */
+function rootLabels(paths: string[]): string[] {
+  const n = paths.length;
+  if (n === 0) return [];
+  if (n === 1) return [""];
+  const MAX_DEPTH = 16;
+  const depths = new Array<number>(n).fill(0);
+  const labels = new Array<string>(n).fill("");
+  for (let pass = 0; pass <= MAX_DEPTH; pass++) {
+    for (let i = 0; i < n; i++) labels[i] = labelAtDepth(paths[i], depths[i]);
+    const byLabel = new Map<string, number[]>();
+    labels.forEach((l, i) => {
+      const arr = byLabel.get(l);
+      if (arr) arr.push(i);
+      else byLabel.set(l, [i]);
+    });
+    const collisions = [...byLabel.values()].filter((idxs) => idxs.length > 1);
+    if (collisions.length === 0) return labels;
+    let bumped = false;
+    for (const idxs of collisions)
+      for (const i of idxs)
+        if (depths[i] < MAX_DEPTH) {
+          depths[i]++;
+          bumped = true;
+        }
+    if (!bumped) return labels; // every colliding entry maxed out — accept the duplicates
+  }
+  return labels;
+}
+
+/** `{basename}` at depth 0, else `{basename} ({parent…/})` with `depth` parent components. */
+function labelAtDepth(path: string, depth: number): string {
+  const comps = path.split("/").filter((c) => c.length > 0);
+  const base = comps.length ? comps[comps.length - 1] : path;
+  if (depth === 0) return base;
+  const parents: string[] = [];
+  for (let i = comps.length - 2; i >= 0 && parents.length < depth; i--) parents.push(comps[i]);
+  if (parents.length === 0) return base;
+  parents.reverse();
+  return `${base} (${parents.join("/")})`;
+}
+
+/** Strip the longest matching project root off `abs` → `[rootIndex, relativePath]`, or null when
+ *  the path is under no root. Component-aware (a trailing-slash boundary), like the TUI. */
+function stripLongestRoot(abs: string, paths: string[]): [number, string] | null {
+  let best: [number, string] | null = null;
+  let bestLen = -1;
+  paths.forEach((root, i) => {
+    if (abs === root) {
+      if (root.length > bestLen) ((best = [i, ""]), (bestLen = root.length));
+      return;
+    }
+    const prefix = root.endsWith("/") ? root : root + "/";
+    if (abs.startsWith(prefix) && root.length > bestLen) {
+      best = [i, abs.slice(prefix.length)];
+      bestLen = root.length;
+    }
+  });
+  return best;
+}
+
+/** Display label for a buffer's absolute path: `{rootLabel}: {relative}` (label omitted when empty,
+ *  i.e. a single-root project), or the raw absolute path when it's under no project root. */
+function projectRelativeLabel(abs: string, paths: string[]): string {
+  const stripped = stripLongestRoot(abs, paths);
+  if (!stripped) return abs;
+  const [i, rel] = stripped;
+  const label = rootLabels(paths)[i] ?? "";
+  if (rel === "") return label;
+  if (label === "") return rel;
+  return `${label}: ${rel}`;
+}
 function lspKey(language: string, workspaceRoot: string): string {
   return `${language}\0${workspaceRoot}`;
 }
@@ -1077,7 +1155,9 @@ class Editor {
     this.cursor = open.cursor;
     this.currentPath = open.path ?? null;
     this.scratchNumber = open.path ? null : open.scratch_number ?? null;
-    this.label = open.path ? basename(open.path) : `(scratch ${open.scratch_number ?? open.buffer_id})`;
+    this.label = open.path
+      ? projectRelativeLabel(open.path, this.projectPaths)
+      : `(scratch ${open.scratch_number ?? open.buffer_id})`;
     this.revision = open.revision;
     this.savedRevision = open.saved_revision;
     this.externallyModified = false;
@@ -1874,7 +1954,7 @@ class Editor {
     const root = this.projectPaths[choice.pathIndex] ?? "";
     const abs = root.endsWith("/") ? root + choice.relativePath : `${root}/${choice.relativePath}`;
     this.currentPath = abs;
-    this.label = basename(abs);
+    this.label = projectRelativeLabel(abs, this.projectPaths);
   }
 
   private async reloadBuffer(): Promise<void> {
