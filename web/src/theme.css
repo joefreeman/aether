@@ -23,6 +23,10 @@
   /* Current-line tint, ~40% from NORD0 toward NORD1: subtler than NORD1 (which the status line
      uses) so the cursorline doesn't read as a panel. Off-palette — Nord has no shade in between. */
   --cursor-line-bg: #343a48;
+  /* Cursorline variants for changed lines under the diff view: a brighter green/olive so the
+     cursor's line still reads as added/modified rather than the plain blue cursorline hiding it. */
+  --cursor-line-added-bg: #3a4d3a;
+  --cursor-line-modified-bg: #4a4632;
 }
 
 html, body, #app {
@@ -240,8 +244,12 @@ html, body, #app {
 .row.deleted-phantom { background: var(--git-deleted-bg); color: var(--nord11); }
 /* Current-line highlight (Vim's `cursorline`). A subtle custom tint (see --cursor-line-bg), kept
    distinct from the status line's NORD1. Ordered after the diff tints so it wins on the cursor's
-   changed line. */
+   changed line. On a changed line under the diff view, a green/olive variant keeps the diff colour
+   visible (higher specificity — two extra classes — so it beats both the plain cursorline and the
+   diff tint regardless of order). */
 .row.cursor-line { background: var(--cursor-line-bg); }
+.row.cursor-line.added-bg { background: var(--cursor-line-added-bg); }
+.row.cursor-line.modified-bg { background: var(--cursor-line-modified-bg); }
 
 /* Native change-bar: a colored left border in the gutter column (no text glyph). The transparent
    border on every gutter keeps the text start aligned whether or not a line is changed. */

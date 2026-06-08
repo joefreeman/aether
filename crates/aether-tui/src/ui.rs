@@ -83,6 +83,10 @@ const GIT_MODIFIED_BG: Color = Color::Rgb(58, 54, 40); // dark muted olive
 // read as heavy as a panel) while still clearly marking the line. Off-palette by necessity — Nord
 // has no shade between NORD0 and NORD1.
 const CURSOR_LINE_BG: Color = Color::Rgb(52, 58, 72);
+// Cursorline variants for changed lines under the diff view: a brighter green/olive so the cursor's
+// line still reads as added/modified instead of the plain blue cursorline hiding the diff tint.
+const CURSOR_LINE_ADDED_BG: Color = Color::Rgb(58, 77, 58);
+const CURSOR_LINE_MODIFIED_BG: Color = Color::Rgb(74, 70, 50);
 
 pub fn draw(f: &mut Frame, state: &AppState) {
     // The status row carries activation feedback, save-as / new-file prompts, and the dirty +
@@ -2650,11 +2654,13 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             other => other,
         };
         // The cursor's line gets a subtle current-line tint that applies to every visual row of the
-        // logical line (so it stays whole under soft wrap). It takes precedence over the diff-view
-        // tint on that one line — the gutter change-bar still marks it as changed. Selection and
-        // search keep their own span backgrounds, so they paint over the tint via `apply_line_tint`.
+        // logical line (so it stays whole under soft wrap). On a changed line under the diff view it
+        // uses a green/olive cursorline variant so the diff colour isn't lost — the gutter change-bar
+        // still marks it too. Selection and search keep their own span backgrounds, so they paint
+        // over the tint via `apply_line_tint`.
         let line_tint = if logical_line == cursor_line {
-            Some(CURSOR_LINE_BG)
+            let marker = if diff_view { render.diff_marker } else { None };
+            Some(cursor_line_bg(marker))
         } else if diff_view {
             render.diff_marker.and_then(diff_marker_bg)
         } else {
@@ -2837,6 +2843,16 @@ fn diff_marker_bg(marker: DiffMarker) -> Option<Color> {
         DiffMarker::Added => Some(GIT_ADDED_BG),
         DiffMarker::Modified => Some(GIT_MODIFIED_BG),
         DiffMarker::Deleted => None,
+    }
+}
+
+/// Background tint for the cursor's current line. On an added/modified line (diff view on) it's a
+/// green/olive cursorline variant so the line still reads as changed; otherwise the plain cursorline.
+fn cursor_line_bg(diff_marker: Option<DiffMarker>) -> Color {
+    match diff_marker {
+        Some(DiffMarker::Added) => CURSOR_LINE_ADDED_BG,
+        Some(DiffMarker::Modified) => CURSOR_LINE_MODIFIED_BG,
+        _ => CURSOR_LINE_BG,
     }
 }
 
@@ -4650,5 +4666,17 @@ mod tests {
             lsp_status_label(&LspStatus::Crashed { code: Some(1), message: "boom".into() }),
             ("crashed", NORD11)
         );
+    }
+
+    #[test]
+    fn cursor_line_bg_uses_diff_variant_on_changed_lines() {
+        // An added/modified cursor line gets the green/olive variant, not the plain cursorline —
+        // and crucially not the diff tint itself, so it reads as "cursor here AND changed".
+        assert_eq!(cursor_line_bg(Some(DiffMarker::Added)), CURSOR_LINE_ADDED_BG);
+        assert_eq!(cursor_line_bg(Some(DiffMarker::Modified)), CURSOR_LINE_MODIFIED_BG);
+        assert_ne!(cursor_line_bg(Some(DiffMarker::Added)), GIT_ADDED_BG);
+        // Deleted (no real-line tint) and unchanged lines fall back to the plain cursorline.
+        assert_eq!(cursor_line_bg(Some(DiffMarker::Deleted)), CURSOR_LINE_BG);
+        assert_eq!(cursor_line_bg(None), CURSOR_LINE_BG);
     }
 }
