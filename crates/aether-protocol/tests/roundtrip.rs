@@ -840,6 +840,47 @@ fn buffer_closed_notification_shape() {
 }
 
 #[test]
+fn nav_goto_params_shape() {
+    use aether_protocol::cursor::CursorState;
+    use aether_protocol::nav::NavGotoParams;
+    // File entry: path fields present, buffer_id omitted; cursor carries the selection.
+    let p = NavGotoParams {
+        buffer_id: None,
+        path_index: Some(0),
+        relative_path: Some("src/main.rs".into()),
+        cursor: CursorState {
+            position: LogicalPosition { line: 9, col: 2 },
+            anchor: LogicalPosition { line: 5, col: 0 },
+            match_bracket: None,
+            grep_position: None,
+        },
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "path_index": 0,
+            "relative_path": "src/main.rs",
+            "cursor": { "position": {"line": 9, "col": 2}, "anchor": {"line": 5, "col": 0} },
+        })
+    );
+    // Round-trips with a bare cursor (no match_bracket/grep_position) and a buffer_id reference.
+    let parsed: NavGotoParams = from_value(json!({
+        "buffer_id": 3,
+        "cursor": { "position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0} },
+    }))
+    .unwrap();
+    assert_eq!(parsed.buffer_id, Some(3));
+    assert_eq!(parsed.relative_path, None);
+}
+
+#[test]
+fn nav_step_result_omits_absent_target() {
+    use aether_protocol::nav::NavStepResult;
+    assert_eq!(to_value(NavStepResult { target: None }).unwrap(), json!({}));
+}
+
+#[test]
 fn unit_result_round_trips() {
     // BufferClose and ViewportUnsubscribe have Result = (). The JSON unit value is `null`.
     let unit: () = ();

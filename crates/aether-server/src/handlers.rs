@@ -6,7 +6,7 @@ use crate::grep;
 use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
-    BlameCache, Buffer, EditKindTag, SearchEntry, ServerState, SharedState, Viewport,
+    BlameCache, Buffer, EditKindTag, NavEntry, SearchEntry, ServerState, SharedState, Viewport,
 };
 use crate::surround;
 use crate::wrap;
@@ -28,6 +28,9 @@ use aether_protocol::directory::{
 };
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
+use aether_protocol::nav::{
+    NavGotoParams, NavRecordParams, NavRecordResult, NavStepParams, NavStepResult,
+};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputMoveLinesParams, InputSurroundParams, InputTextParams,
     InputUnsurroundParams, SurroundTarget, UndoResult,
@@ -2457,6 +2460,180 @@ pub async fn buffer_close(
     }
     tracing::info!(buffer_id = params.buffer_id, "buffer closed");
     Ok(aether_protocol::buffer::BufferCloseResult { next_buffer_id })
+}
+
+// ---- nav (jump list) ----------------------------------------------------------------------------
+
+/// Map a buffer's canonical path to a `(path_index, relative_path)` within the client's active
+/// project, so a nav entry can reopen the file even after it's been closed. `(None, None)` for a
+/// scratch buffer (no path) or a buffer outside the active project's roots.
+fn buffer_path_ref(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> (Option<u32>, Option<String>) {
+    let Some(canonical) = s.buffers.get(&buffer_id).and_then(|b| b.canonical_path.clone()) else {
+        return (None, None);
+    };
+    let Some(project) = s.active_project(client_id) else {
+        return (None, None);
+    };
+    for (i, root) in project.paths.iter().enumerate() {
+        if canonical == *root {
+            return (Some(i as u32), Some(String::new())); // single-file root, or the root itself
+        }
+        if let Ok(rel) = canonical.strip_prefix(root) {
+            return (Some(i as u32), Some(rel.to_string_lossy().into_owned()));
+        }
+    }
+    (None, None)
+}
+
+/// The client's current location as a nav entry: the cursor it holds on `buffer_id` plus a
+/// reopenable path ref. The buffer is supplied by the client (not inferred from a viewport, since
+/// clients may hold several). `None` if that buffer no longer exists.
+fn nav_entry_for(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> Option<NavEntry> {
+    if !s.buffers.contains_key(&buffer_id) {
+        return None;
+    }
+    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+    let (path_index, relative_path) = buffer_path_ref(s, client_id, buffer_id);
+    Some(NavEntry { buffer_id, path_index, relative_path, cursor })
+}
+
+/// Open `entry`'s buffer (reopening a closed file by path, else attaching by id) and restore its
+/// full cursor/selection — clamped to the buffer's current bounds — *without* recording a motion
+/// in the per-buffer `z` history. Shared by `nav/back`/`nav/forward` and `nav/goto`.
+async fn navigate_to(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    entry: NavEntry,
+) -> Result<BufferOpenResult, RpcError> {
+    // Prefer reopening by path (survives a close); fall back to the id (the only handle a scratch
+    // buffer has). `jump_to` is left unset — we restore the full selection below, not a point.
+    let by_path = entry.path_index.is_some() || entry.relative_path.is_some();
+    let open_params = BufferOpenParams {
+        buffer_id: if by_path { None } else { Some(entry.buffer_id) },
+        path_index: entry.path_index,
+        relative_path: entry.relative_path.clone(),
+        language: None,
+        create_if_missing: false,
+        jump_to: None,
+    };
+    let mut result = buffer_open(state, ctx, open_params).await?;
+
+    let mut s = state.lock().await;
+    let restored = match s.buffers.get(&result.buffer_id) {
+        Some(buf) => CursorState {
+            position: motion::clamp_position(buf, entry.cursor.position),
+            anchor: motion::clamp_position(buf, entry.cursor.anchor),
+            match_bracket: None,
+            grep_position: None,
+        },
+        None => entry.cursor,
+    };
+    // Direct insert, *not* via record_motion — a jump-back must not feed `z` (see docs/nav design).
+    s.cursors.insert((ctx.client_id, result.buffer_id), restored);
+    result.cursor = restored;
+    Ok(result)
+}
+
+/// `nav/record` — snapshot the client's current location onto the back stack. The client only
+/// calls this for a navigation that actually moves, so recording is unconditional bar the
+/// duplicate-top collapse in [`NavHistory::record`].
+pub async fn nav_record(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: NavRecordParams,
+) -> Result<NavRecordResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let Some(entry) = nav_entry_for(&s, client_id, params.buffer_id) else {
+        return Ok(NavRecordResult { recorded: false });
+    };
+    let recorded = s.nav_history.entry(client_id).or_default().record(entry);
+    Ok(NavRecordResult { recorded })
+}
+
+/// Shared back/forward step: pop the chosen stack (skipping unrecoverable entries — a closed
+/// scratch), push the current location onto the other stack, and navigate to the popped entry.
+async fn nav_step(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    current_buffer: BufferId,
+    forward: bool,
+) -> Result<NavStepResult, RpcError> {
+    let client_id = ctx.client_id;
+    let chosen: Option<NavEntry> = {
+        let mut s = state.lock().await;
+        let current = nav_entry_for(&s, client_id, current_buffer);
+        let mut chosen = None;
+        loop {
+            let popped = s.nav_history.get_mut(&client_id).and_then(|h| {
+                if forward { h.forward.pop() } else { h.back.pop() }
+            });
+            let Some(entry) = popped else { break };
+            // A file entry can always be reopened; a scratch entry only if it's still open.
+            let resolvable = entry.path_index.is_some()
+                || entry.relative_path.is_some()
+                || s.buffers.contains_key(&entry.buffer_id);
+            if resolvable {
+                chosen = Some(entry);
+                break;
+            }
+        }
+        if chosen.is_some() {
+            if let Some(cur) = current {
+                let hist = s.nav_history.entry(client_id).or_default();
+                let other = if forward { &mut hist.back } else { &mut hist.forward };
+                other.push(cur);
+                if other.len() > crate::state::NAV_HISTORY_CAP {
+                    other.remove(0);
+                }
+            }
+        }
+        chosen
+    };
+    match chosen {
+        Some(entry) => Ok(NavStepResult {
+            target: Some(navigate_to(state, ctx, entry).await?),
+        }),
+        None => Ok(NavStepResult { target: None }),
+    }
+}
+
+pub async fn nav_back(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: NavStepParams,
+) -> Result<NavStepResult, RpcError> {
+    nav_step(state, ctx, params.buffer_id, false).await
+}
+
+pub async fn nav_forward(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: NavStepParams,
+) -> Result<NavStepResult, RpcError> {
+    nav_step(state, ctx, params.buffer_id, true).await
+}
+
+/// `nav/goto` — restore a stored entry without touching the server-side stacks. The web client
+/// owns its back/forward stacks (native browser history); this just performs the navigation.
+pub async fn nav_goto(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: NavGotoParams,
+) -> Result<NavStepResult, RpcError> {
+    let entry = NavEntry {
+        buffer_id: params.buffer_id.unwrap_or(0),
+        path_index: params.path_index,
+        relative_path: params.relative_path,
+        cursor: params.cursor,
+    };
+    Ok(NavStepResult {
+        target: Some(navigate_to(state, ctx, entry).await?),
+    })
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------

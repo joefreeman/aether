@@ -435,6 +435,19 @@ export interface BufferCloseResult {
   next_buffer_id?: BufferId | null;
 }
 
+/** `nav/goto` params — open a stored jump-list entry (reopening a closed file by path) and restore
+ *  its full cursor/selection without recording a motion. The web client uses this on `popstate`. */
+export interface NavGotoParams {
+  buffer_id?: BufferId | null;
+  path_index?: number | null;
+  relative_path?: string | null;
+  cursor: CursorState;
+}
+/** Result of `nav/goto` (and `nav/back`/`nav/forward`): the buffer to switch to, or absent. */
+export interface NavStepResult {
+  target?: BufferOpenResult | null;
+}
+
 /** `buffer/closed` push: another client (or a path/project deletion) closed a buffer we have open.
  *  Switch to `next_buffer_id`, or open a fresh scratch when absent. */
 export interface BufferClosedParams {

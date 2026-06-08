@@ -24,6 +24,9 @@ use aether_protocol::git::{
     BlameInfo, GitBlameLine, GitBlameLineParams, GitNavigateHunk, GitNavigateHunkParams,
     GitSetDiffView, GitSetDiffViewParams, HunkDirection,
 };
+use aether_protocol::nav::{
+    NavBack, NavForward, NavRecord, NavRecordParams, NavStepParams, NavStepResult,
+};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
@@ -1600,6 +1603,8 @@ async fn run_action(
         Action::TreeContract => tree_contract(client, state, count).await?,
         Action::MotionUndo => motion_undo(client, state, count).await?,
         Action::MotionRedo => motion_redo(client, state, count).await?,
+        Action::NavBack => nav_step(client, state, false).await?,
+        Action::NavForward => nav_step(client, state, true).await?,
         Action::RepeatMotion => {
             // `r`'s own `count` is how many times to replay; the stored target keeps the original
             // motion's `count` baked in (so `2w` then `3r` steps 2 words three times). `extend` is
@@ -1759,7 +1764,11 @@ async fn run_action(
         Action::Save => save_buffer(client, state).await?,
         Action::SaveAs => begin_save_prompt(client, state).await?,
         Action::Reload => reload_buffer(client, state).await?,
-        Action::NewScratch => new_scratch(client, state).await?,
+        Action::NewScratch => {
+            // Opening a fresh scratch is a buffer switch — record the origin so `Alt-Left` returns.
+            record_nav(client, state).await;
+            new_scratch(client, state).await?;
+        }
         Action::Hover => lsp_hover(client, state).await?,
         Action::GotoDefinition => lsp_goto_definition(client, state).await?,
         Action::ShowDiagnostic => show_diagnostic(state),
@@ -2898,6 +2907,11 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
             open_file_at_path(client, state, path, false, None).await?;
         }
         PickerSelectResult::Buffer { buffer_id } => {
+            // Switching to a different buffer is a jump; record the origin first (skip if it's the
+            // buffer we're already on — `attach_buffer` no-ops there).
+            if state.editor.as_ref().map(|e| e.buffer_id) != Some(buffer_id) {
+                record_nav(client, state).await;
+            }
             attach_buffer(client, state, buffer_id).await?;
         }
         PickerSelectResult::FileAt { path, position } => {
@@ -2938,6 +2952,43 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
         state.ed_mut().mode = EditorMode::Normal;
     }
     apply_cursor_style(state);
+    Ok(())
+}
+
+/// Snapshot the current location onto the server-side jump list before a user-initiated
+/// cross-file navigation. Best-effort — a failure shouldn't abort the navigation itself.
+async fn record_nav(client: &mut Client, state: &AppState) {
+    if let Some(ed) = state.editor.as_ref() {
+        let _ = client.rpc::<NavRecord>(NavRecordParams { buffer_id: ed.buffer_id }).await;
+    }
+}
+
+/// `Alt-Left` / `Alt-Right`: step the jump list (`forward=false` is back). The server restores the
+/// target buffer's cursor/selection without feeding the `z` motion history; we re-subscribe to
+/// whatever buffer it returns. A `None` target means we're already at the end of the stack.
+async fn nav_step(client: &mut Client, state: &mut AppState, forward: bool) -> Result<()> {
+    let Some(buffer_id) = state.editor.as_ref().map(|e| e.buffer_id) else {
+        return Ok(());
+    };
+    let res: NavStepResult = if forward {
+        client.rpc::<NavForward>(NavStepParams { buffer_id }).await?
+    } else {
+        client.rpc::<NavBack>(NavStepParams { buffer_id }).await?
+    };
+    match res.target {
+        Some(open) => {
+            state.ed_mut().mode = EditorMode::Normal;
+            subscribe_to_buffer(client, state, open).await?;
+            apply_cursor_style(state);
+        }
+        None => {
+            state.status = StatusMessage::info(if forward {
+                "no later location in history"
+            } else {
+                "no earlier location in history"
+            });
+        }
+    }
     Ok(())
 }
 
@@ -3274,6 +3325,9 @@ async fn open_file_at_path(
     create_if_missing: bool,
     jump_to: Option<aether_protocol::LogicalPosition>,
 ) -> Result<()> {
+    // Opening a file is a jump (every caller here is a user navigation: goto-def, grep nav, file/
+    // grep/explorer/diagnostics picker). Record where we're leaving onto the jump list first.
+    record_nav(client, state).await;
     // Find a `path_index` + `relative_path` pair the server will accept. Each project path is
     // either a file or a directory; we want the directory that contains the target.
     let target = std::path::PathBuf::from(&abs_path);

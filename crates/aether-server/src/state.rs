@@ -66,6 +66,12 @@ pub struct ServerState {
     /// Per-`(client, kind)` picker state. Survives `picker/hide` (so resume restores query +
     /// ranking); cleared on disconnect.
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
+    /// Per-client navigation history (the jump list): back/forward across files, browser-style.
+    /// Distinct from `motion_history` (per-buffer cursor undo via `z`): coarse, cross-buffer, and
+    /// untouched by edits or `z`. Recorded on qualifying jumps (see `nav/record`); driven by the
+    /// TUI's `nav/back`/`nav/forward`. The web client rides native browser history instead, so its
+    /// entries here go unused — but recording stays uniform across clients. Cleared on disconnect.
+    pub nav_history: HashMap<ClientId, NavHistory>,
     /// Per-buffer Git diff hunks: the live buffer's text against its committed (HEAD) content.
     /// Populated on `buffer/open` for file-backed buffers; recomputed as the buffer changes.
     /// Empty / absent for scratch buffers, untracked files, and files outside a repo. Shared by
@@ -134,6 +140,47 @@ impl MotionHistory {
     }
 }
 
+/// One location in the navigation history (jump list): a buffer plus the cursor/selection to
+/// restore. The path fields let a closed file be reopened; `buffer_id` is preferred while the
+/// buffer is still open (and is the only handle a scratch buffer has).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavEntry {
+    pub buffer_id: BufferId,
+    pub path_index: Option<u32>,
+    pub relative_path: Option<String>,
+    pub cursor: CursorState,
+}
+
+/// A client's back/forward jump list. Browser semantics: a jump pushes onto `back` and clears
+/// `forward`; stepping back/forward moves entries between the two and across the "current" cursor.
+#[derive(Default)]
+pub struct NavHistory {
+    pub back: Vec<NavEntry>,
+    pub forward: Vec<NavEntry>,
+}
+
+/// Cap on each direction of the jump list, mirroring `MOTION_HISTORY_CAP`'s "transient, not an
+/// audit log" framing — old jumps fall off the bottom.
+pub const NAV_HISTORY_CAP: usize = 100;
+
+impl NavHistory {
+    /// Push `entry` onto the back stack (dropping the oldest past the cap) and clear forward.
+    /// Collapses an exact duplicate of the current top so re-recording the same spot is a no-op.
+    /// Returns whether anything was pushed.
+    pub fn record(&mut self, entry: NavEntry) -> bool {
+        if self.back.last() == Some(&entry) {
+            self.forward.clear();
+            return false;
+        }
+        self.back.push(entry);
+        if self.back.len() > NAV_HISTORY_CAP {
+            self.back.remove(0);
+        }
+        self.forward.clear();
+        true
+    }
+}
+
 /// One configured project, loaded and ready to serve. Owns its canonical roots and workspace
 /// index (the picker file cache). One per active project; lives in `ServerState::projects`.
 pub struct ProjectEntry {
@@ -179,6 +226,7 @@ impl ServerState {
             searches: HashMap::new(),
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
+            nav_history: HashMap::new(),
             git_hunks: HashMap::new(),
             git_baseline: HashMap::new(),
             git_blame: HashMap::new(),
@@ -416,6 +464,12 @@ impl ServerState {
     /// Remove all picker state for the given client. Used on disconnect.
     pub fn drop_pickers_for_client(&mut self, client_id: ClientId) {
         self.pickers.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Remove the navigation history for the given client. Used on disconnect (a reconnect is a
+    /// fresh session, so the jump list — like cursor/selection state — is not recovered).
+    pub fn drop_nav_history_for_client(&mut self, client_id: ClientId) {
+        self.nav_history.remove(&client_id);
     }
 
     /// Bump `buffer_id` to the front of its project's MRU. Called from `buffer/open` every time

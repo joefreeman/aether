@@ -38,8 +38,12 @@ use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
     ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSetWrap,
     ViewportScrollToRow, ViewportScrollToRowParams, ViewportSetWrapParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult,
-    ViewportWindowResult, VirtualRowKind, WrapMode,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportUnsubscribe,
+    ViewportUnsubscribeParams, ViewportWindowResult, VirtualRowKind, WrapMode,
+};
+use aether_protocol::nav::{
+    NavBack, NavForward, NavGoto, NavGotoParams, NavRecord, NavRecordParams, NavRecordResult,
+    NavStepParams, NavStepResult,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -13602,5 +13606,164 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     assert_eq!(pushed.buffer_id, buf_a);
     assert_eq!(pushed.next_buffer_id, Some(buf_b));
 
+    drop(server);
+}
+
+// -------- nav (jump list) ------------------------------------------------------------------------
+
+/// Open + viewport-subscribe a file, returning (buffer_id, viewport_id). Mirrors a client switching
+/// buffers: the caller unsubscribes the previous viewport so the client only ever has one.
+async fn nav_open_file(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    file: &str,
+    prev_vp: Option<u64>,
+) -> (u64, u64) {
+    if let Some(vp) = prev_vp {
+        send_request::<ViewportUnsubscribe>(ws, id + 2, &ViewportUnsubscribeParams { viewport_id: vp })
+            .await;
+    }
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        ws,
+        id,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some(file.into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        ws,
+        id + 1,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    (open.buffer_id, sub.viewport_id)
+}
+
+/// nav/back then nav/forward step across files, restoring the recorded cursor/selection.
+#[tokio::test]
+async fn nav_back_and_forward_across_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\nsecond\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "bravo\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ProjectActivateResult =
+        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: "test-proj".into() }).await;
+
+    // In a.txt, make a selection on line 1 (anchor before cursor) so we can prove it's restored.
+    let (buf_a, vp_a) = nav_open_file(&mut ws, 10, "a.txt", None).await;
+    send_request::<CursorSet>(
+        &mut ws,
+        20,
+        &CursorSetParams {
+            buffer_id: buf_a,
+            position: LogicalPosition { line: 1, col: 4 },
+            anchor: LogicalPosition { line: 1, col: 1 },
+        },
+    )
+    .await;
+
+    // Record the jump origin, then jump to b.txt (dropping a's viewport, as a real client does).
+    let rec: NavRecordResult =
+        send_request::<NavRecord>(&mut ws, 30, &NavRecordParams { buffer_id: buf_a }).await;
+    assert!(rec.recorded);
+    let (buf_b, vp_b) = nav_open_file(&mut ws, 40, "b.txt", Some(vp_a)).await;
+
+    // Back (from b) → returns a.txt with the selection restored.
+    let back: NavStepResult =
+        send_request::<NavBack>(&mut ws, 50, &NavStepParams { buffer_id: buf_b }).await;
+    let target = back.target.expect("back should move to a.txt");
+    assert_eq!(target.buffer_id, buf_a);
+    assert_eq!(target.cursor.position, LogicalPosition { line: 1, col: 4 });
+    assert_eq!(target.cursor.anchor, LogicalPosition { line: 1, col: 1 });
+
+    // Re-point the viewport to a (the client follows the target), then forward (from a) → b.txt.
+    let (_a_again, vp_a2) = nav_open_file(&mut ws, 60, "a.txt", Some(vp_b)).await;
+    let fwd: NavStepResult =
+        send_request::<NavForward>(&mut ws, 70, &NavStepParams { buffer_id: buf_a }).await;
+    assert_eq!(fwd.target.expect("forward should move to b.txt").buffer_id, buf_b);
+
+    // Re-point to b, then back again (from b) lands on a once more (stack intact).
+    let (_b_again, _vp_b2) = nav_open_file(&mut ws, 90, "b.txt", Some(vp_a2)).await;
+    let back2: NavStepResult =
+        send_request::<NavBack>(&mut ws, 80, &NavStepParams { buffer_id: buf_b }).await;
+    assert_eq!(back2.target.expect("back again to a.txt").buffer_id, buf_a);
+
+    drop(server);
+}
+
+/// nav/back with nothing recorded is a no-op (`target: None`).
+#[tokio::test]
+async fn nav_back_empty_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ProjectActivateResult =
+        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: "test-proj".into() }).await;
+    let (buf_a, _) = nav_open_file(&mut ws, 10, "a.txt", None).await;
+
+    let back: NavStepResult =
+        send_request::<NavBack>(&mut ws, 20, &NavStepParams { buffer_id: buf_a }).await;
+    assert!(back.target.is_none());
+    drop(server);
+}
+
+/// nav/goto restores a closed file by path (its buffer_id is long gone) with the saved cursor,
+/// without touching the back/forward stacks. Models the web client's `popstate` restore.
+#[tokio::test]
+async fn nav_goto_reopens_by_path() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ProjectActivateResult =
+        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: "test-proj".into() }).await;
+    let (buf_a, _) = nav_open_file(&mut ws, 10, "a.txt", None).await;
+    // Close it so the stale buffer_id forces the path fallback.
+    send_request::<BufferClose>(&mut ws, 20, &BufferCloseParams { buffer_id: buf_a }).await;
+
+    let res: NavStepResult = send_request::<NavGoto>(
+        &mut ws,
+        30,
+        &NavGotoParams {
+            buffer_id: Some(buf_a), // stale on purpose
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            cursor: CursorState {
+                position: LogicalPosition { line: 2, col: 1 },
+                anchor: LogicalPosition { line: 2, col: 1 },
+                match_bracket: None,
+                grep_position: None,
+            },
+        },
+    )
+    .await;
+    let target = res.target.expect("goto should open the file");
+    assert_eq!(target.path.as_deref().map(|p| p.ends_with("a.txt")), Some(true));
+    assert_eq!(target.cursor.position, LogicalPosition { line: 2, col: 1 });
     drop(server);
 }

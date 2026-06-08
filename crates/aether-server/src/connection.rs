@@ -20,6 +20,7 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::git::{GitBlameLine, GitNavigateHunk, GitSetDiffView};
+use aether_protocol::nav::{NavBack, NavForward, NavGoto, NavRecord};
 use aether_protocol::lsp::{
     LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic, LspRestartServer,
     LspServerStatusList,
@@ -173,6 +174,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_tree_selection_history_for_client(client_id);
         s.drop_last_scroll_for_client(client_id);
         s.drop_pickers_for_client(client_id);
+        s.drop_nav_history_for_client(client_id);
         tracing::debug!(%client_id, "client session removed");
     }
     Ok(())
@@ -259,6 +261,10 @@ async fn dispatch(
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),
         BufferClose::NAME => run!(BufferClose, handlers::buffer_close),
+        NavRecord::NAME => run!(NavRecord, handlers::nav_record),
+        NavBack::NAME => run!(NavBack, handlers::nav_back),
+        NavForward::NAME => run!(NavForward, handlers::nav_forward),
+        NavGoto::NAME => run!(NavGoto, handlers::nav_goto),
         SearchSet::NAME => run!(SearchSet, handlers::search_set),
         SearchClear::NAME => run!(SearchClear, handlers::search_clear),
         SearchNext::NAME => run!(SearchNext, handlers::search_next),

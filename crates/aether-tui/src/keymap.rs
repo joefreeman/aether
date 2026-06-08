@@ -152,6 +152,9 @@ pub enum Action {
     MotionRedo,
     RepeatMotion,
     CenterCursor,
+    /// `Alt-Left` / `Alt-Right` — step back / forward through the cross-file jump list.
+    NavBack,
+    NavForward,
     /// `f`/`t` (+ Alt for backward) — arm the find-char capture; the next keystroke is the target.
     BeginFind {
         dir: Direction,
@@ -285,6 +288,8 @@ impl Action {
                 | Action::ToggleDiffView
                 | Action::NextHunk
                 | Action::PrevHunk
+                | Action::NavBack
+                | Action::NavForward
         )
     }
 
@@ -547,8 +552,10 @@ static NORMAL: &[Binding] = &[
     bind!(NORMAL_CTX, KeyCode::Down, IgnoreShift(ALT), A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Half }, "Scroll", "Scroll half page down"),
     bind!(NORMAL_CTX, KeyCode::Up, Any, A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Line }, "Scroll", "Scroll up one line"),
     bind!(NORMAL_CTX, KeyCode::Down, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Line }, "Scroll", "Scroll down one line"),
-    bind!(NORMAL_CTX, KeyCode::Left, IgnoreShift(ALT), A::Scroll { dir: ScrollDir::Left, unit: ScrollUnit::Half }, "Scroll", "Scroll half page left"),
-    bind!(NORMAL_CTX, KeyCode::Right, IgnoreShift(ALT), A::Scroll { dir: ScrollDir::Right, unit: ScrollUnit::Half }, "Scroll", "Scroll half page right"),
+    // Alt-Left/Right drive the cross-file jump list (back/forward); they must precede the plain
+    // Left/Right `Any` rows below, which still scroll horizontally one column.
+    bind!(NORMAL_CTX, KeyCode::Left, Exact(ALT), A::NavBack, "Navigation", "Jump back (history)"),
+    bind!(NORMAL_CTX, KeyCode::Right, Exact(ALT), A::NavForward, "Navigation", "Jump forward (history)"),
     bind!(NORMAL_CTX, KeyCode::Left, Any, A::Scroll { dir: ScrollDir::Left, unit: ScrollUnit::Line }, "Scroll", "Scroll left one column"),
     bind!(NORMAL_CTX, KeyCode::Right, Any, A::Scroll { dir: ScrollDir::Right, unit: ScrollUnit::Line }, "Scroll", "Scroll right one column"),
     bind!(NORMAL_CTX, ch('-'), Exact(NONE), A::CenterCursor, "Scroll", "Center cursor in window"),

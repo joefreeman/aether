@@ -12,6 +12,7 @@ pub mod error;
 pub mod git;
 pub mod input;
 pub mod lsp;
+pub mod nav;
 pub mod path;
 pub mod picker;
 pub mod project;

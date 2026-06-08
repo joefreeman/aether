@@ -52,6 +52,8 @@ import type {
   LspServerStatus,
   LogicalPosition,
   Motion,
+  NavGotoParams,
+  NavStepResult,
   PickerGrepNavigateTarget,
   PickerItem,
   PickerKind,
@@ -251,6 +253,8 @@ class Editor {
   private cols = 80;
   private rows = 24;
   private resizeTimer: number | undefined;
+  /** Debounce for keeping the URL fragment (cursor/selection) live during normal-mode movement. */
+  private historyTimer: number | undefined;
 
   // Dirty / external-change tracking (from buffer/open + edit results + buffer/state).
   private revision = 0;
@@ -381,6 +385,10 @@ class Editor {
     window.addEventListener("mouseup", () => (this.dragging = false));
     window.addEventListener("resize", () => this.onResize());
     window.addEventListener("keydown", (e) => this.onKeyDown(e));
+    // Native browser back/forward (Alt-←/→, toolbar buttons, mouse side-buttons, trackpad swipe)
+    // surface here — we freed Alt-←/→ in the keymap so the browser handles them. Each entry carries
+    // its location in `history.state`, so this also restores cursor/selection on reload-safe nav.
+    window.addEventListener("popstate", (e) => this.onPopState(e));
 
     void this.bootstrap(cfg);
   }
@@ -453,9 +461,24 @@ class Editor {
       });
       this.viewportId = sub.viewport_id;
       this.window = sub.window;
+      // Restore the cursor/selection from the URL fragment (a reloaded/shared link), clamped server-
+      // side. Best-effort — a stale fragment just leaves the cursor at the server's default.
+      const frag = this.parseFragment(location.hash);
+      if (frag) {
+        try {
+          this.cursor = await this.client.rpc<CursorState>("cursor/set", {
+            buffer_id: this.bufferId,
+            position: frag.position,
+            anchor: frag.anchor,
+          });
+        } catch {
+          /* out of range after an external change — keep the default */
+        }
+      }
       this.clipboardCapture.focus();
       this.render();
       this.revealCursor();
+      this.replaceHistory(); // seed the initial history entry with our location (for nav restore)
     } catch (err) {
       this.setStatus(`Connection error: ${(err as Error).message}`, true);
     }
@@ -532,6 +555,7 @@ class Editor {
       this.clipboardCapture.focus();
       this.render();
       this.revealCursor();
+      this.replaceHistory(); // refresh the current entry (fresh client_id; no new history entry)
       this.toast("Reconnected", "success");
     } catch (e) {
       this.toast(`Reconnect failed: ${(e as Error).message}`, "error");
@@ -562,6 +586,9 @@ class Editor {
     });
     this.renderStatusBar();
     this.maybeRefreshBlame();
+    // Keep the URL fragment tracking the cursor in Normal mode (debounced). Skipped in Insert —
+    // those positions aren't navigation targets and per-keystroke writes would hit browser limits.
+    if (this.mode === "normal") this.scheduleHistoryUpdate();
   }
 
   /** Visual rows the loaded window occupies (real + diff phantom). */
@@ -924,7 +951,7 @@ class Editor {
     this.closePicker();
     if (params) {
       params.create_if_missing = true;
-      this.enqueue(() => this.switchBuffer(params));
+      this.enqueue(() => this.switchBuffer(params, { recordJump: true }));
     } else {
       this.toast(`path outside project: ${absPath}`, "error");
     }
@@ -970,7 +997,7 @@ class Editor {
       this.setStatus("could not open selection", true);
       return;
     }
-    await this.switchBuffer(params);
+    await this.switchBuffer(params, { recordJump: true });
     // Opening a grep hit primes the buffer's search with the query so n / Alt-n continue from here.
     if (grepQuery && jumpTo) {
       const res = await this.client.rpc<SearchSetResult>("search/set", {
@@ -1021,13 +1048,18 @@ class Editor {
     this.blame = null;
     this.lspServerRef = open.lsp_server ?? null;
     this.diagCounts = null;
-    this.updateUrl();
   }
 
-  /** Reflect the current project + buffer in the address bar, so the tab is reloadable/shareable.
-   *  `?project=<name>&file=<relative path>` (with `&root=<n>` for a non-default root); scratch buffers
-   *  use `&scratch=<n>` instead of a file. replaceState — buffer switches don't spam history. */
-  private updateUrl(): void {
+  // ---- browser history (the jump list) --------------------------------------------------------
+  //
+  // The web client rides *native* browser history: a qualifying jump `pushState`s the destination,
+  // so Alt-←/→, the toolbar buttons, mouse side-buttons and trackpad swipe all step it; `popstate`
+  // restores an entry via `nav/goto`. Each entry stores its location in `history.state` (so it
+  // survives reconnect and reload), and the URL is kept human-shareable: `?project=…&file=…#L:C`
+  // (or `#aL:aC-cL:cC` for a selection, anchor first).
+
+  /** The `?project=&file=` (or `&scratch=`) query reflecting the current buffer. */
+  private buildQuery(): string {
     const params = new URLSearchParams();
     if (this.projectName) params.set("project", this.projectName);
     if (this.currentPath) {
@@ -1041,13 +1073,96 @@ class Editor {
     } else if (this.scratchNumber != null) {
       params.set("scratch", String(this.scratchNumber));
     }
-    const qs = params.toString();
-    history.replaceState(null, "", qs ? `${location.pathname}?${qs}` : location.pathname);
+    return params.toString();
   }
 
-  /** Open a different buffer and re-point the viewport at it. */
-  private async switchBuffer(openParams: BufferOpenParams): Promise<void> {
+  /** The cursor/selection fragment: `#line:col` for a point, `#aLine:aCol-cLine:cCol` (anchor
+   *  first, so orientation is encoded) for a selection. 1-based, matching the status bar. */
+  private cursorFragment(): string {
+    const enc = (q: LogicalPosition) => `${q.line + 1}:${q.col + 1}`;
+    const p = this.cursor.position;
+    const a = this.cursor.anchor;
+    return p.line === a.line && p.col === a.col ? `#${enc(p)}` : `#${enc(a)}-${enc(p)}`;
+  }
+
+  /** Parse a `#…` fragment back into a cursor/selection, or null if malformed. */
+  private parseFragment(frag: string): { position: LogicalPosition; anchor: LogicalPosition } | null {
+    const body = frag.replace(/^#/, "");
+    if (!body) return null;
+    const pt = (s: string): LogicalPosition | null => {
+      const [l, c] = s.split(":").map(Number);
+      return Number.isInteger(l) && Number.isInteger(c) && l >= 1 && c >= 1
+        ? { line: l - 1, col: c - 1 }
+        : null;
+    };
+    if (body.includes("-")) {
+      const [a, p] = body.split("-");
+      const anchor = pt(a);
+      const position = pt(p);
+      return anchor && position ? { position, anchor } : null;
+    }
+    const position = pt(body);
+    return position ? { position, anchor: position } : null;
+  }
+
+  private buildUrl(): string {
+    const qs = this.buildQuery();
+    return `${location.pathname}${qs ? `?${qs}` : ""}${this.cursorFragment()}`;
+  }
+
+  /** The location to stash in `history.state` so `popstate` can restore it via `nav/goto`. */
+  private navState(): { nav: NavGotoParams } {
+    const cursor = { position: this.cursor.position, anchor: this.cursor.anchor };
+    if (this.currentPath) {
+      const r = this.resolvePath(this.currentPath);
+      if (r) return { nav: { path_index: r.path_index, relative_path: r.relative_path, cursor } };
+    }
+    return { nav: { buffer_id: this.bufferId, cursor } }; // scratch, or outside any root
+  }
+
+  private replaceHistory(): void {
+    window.clearTimeout(this.historyTimer);
+    history.replaceState(this.navState(), "", this.buildUrl());
+  }
+
+  private pushHistory(): void {
+    window.clearTimeout(this.historyTimer);
+    history.pushState(this.navState(), "", this.buildUrl());
+  }
+
+  /** Keep the current entry's fragment current as the cursor moves (Normal mode), debounced to
+   *  respect browser pushState/replaceState throttling and avoid URL churn. */
+  private scheduleHistoryUpdate(): void {
+    window.clearTimeout(this.historyTimer);
+    this.historyTimer = window.setTimeout(() => history.replaceState(this.navState(), "", this.buildUrl()), 200);
+  }
+
+  /** Open a different buffer and re-point the viewport at it. With `recordJump`, a move pushes a
+   *  new browser-history entry (so Alt-←/→ return here); otherwise the current entry is replaced. */
+  private async switchBuffer(
+    openParams: BufferOpenParams,
+    opts: { recordJump?: boolean } = {},
+  ): Promise<void> {
+    // Flush the origin's live cursor into the current entry before we move, so a pushed back-entry
+    // captures exactly where we left (even if the movement debounce hadn't fired yet).
+    if (opts.recordJump) this.replaceHistory();
+    const originKey = this.locationKey();
     const open = await this.client.rpc<BufferOpenResult>("buffer/open", openParams);
+    await this.applyOpenedBuffer(open);
+    const moved = this.locationKey() !== originKey;
+    if (opts.recordJump && moved) this.pushHistory();
+    else this.replaceHistory();
+  }
+
+  /** A compact identity for the current location, for the "did this navigation actually move me?"
+   *  check (no entry is recorded for a jump that lands where you already are). */
+  private locationKey(): string {
+    return `${this.bufferId}:${this.cursor.position.line}:${this.cursor.position.col}`;
+  }
+
+  /** Post-`buffer/open` plumbing shared by switchBuffer and nav restore: adopt state, subscribe a
+   *  fresh viewport (dropping the old), paint. Does *not* touch browser history. */
+  private async applyOpenedBuffer(open: BufferOpenResult): Promise<void> {
     const oldViewport = this.viewportId;
     this.adoptOpenedBuffer(open);
     this.mode = "normal";
@@ -1073,6 +1188,20 @@ class Editor {
     this.bufferEl.scrollTop = 0; // reset before revealing the new buffer's cursor
     this.render();
     this.revealCursor();
+  }
+
+  /** Restore a jump-list entry on `popstate` (browser back/forward). The server opens the buffer
+   *  (reopening a closed file by path) and restores the full cursor/selection; we just re-point. */
+  private async gotoEntry(nav: NavGotoParams): Promise<void> {
+    const res = await this.client.rpc<NavStepResult>("nav/goto", nav);
+    if (res.target) await this.applyOpenedBuffer(res.target);
+  }
+
+  private onPopState(e: PopStateEvent): void {
+    const st = e.state as { nav?: NavGotoParams } | null;
+    if (!st?.nav) return; // not one of our entries (or the initial state) — leave it alone
+    const nav = st.nav;
+    this.enqueue(() => this.gotoEntry(nav));
   }
 
   // ---- action execution -----------------------------------------------------------------------
@@ -1336,7 +1465,7 @@ class Editor {
           const params = this.resolvePath(target.path);
           if (params) {
             params.jump_to = target.position;
-            await this.switchBuffer(params);
+            await this.switchBuffer(params, { recordJump: true });
             // Prime the buffer's search with the grep query so n / Alt-n continue from here.
             if (target.query) {
               const res = await this.client.rpc<SearchSetResult>("search/set", {
@@ -1371,7 +1500,7 @@ class Editor {
           const params = this.resolvePath(r.location.path);
           if (params) {
             params.jump_to = r.location.position;
-            await this.switchBuffer(params);
+            await this.switchBuffer(params, { recordJump: true });
           } else {
             this.setStatus(`definition outside project: ${r.location.path}`, true);
           }
@@ -1433,7 +1562,7 @@ class Editor {
         await this.reloadBuffer();
         break;
       case "newScratch":
-        await this.switchBuffer({ create_if_missing: false });
+        await this.switchBuffer({ create_if_missing: false }, { recordJump: true });
         break;
       case "closeBuffer":
         await this.closeBuffer();

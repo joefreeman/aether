@@ -151,10 +151,11 @@ const NORMAL: Binding[] = [
   b("ArrowDown", any, { t: "scroll", dir: "down", unit: "line" }),
   b("PageUp", any, { t: "scroll", dir: "up", unit: "page" }),
   b("PageDown", any, { t: "scroll", dir: "down", unit: "page" }),
-  b("ArrowLeft", exact(false, true), { t: "scroll", dir: "left", unit: "half" }),
-  b("ArrowRight", exact(false, true), { t: "scroll", dir: "right", unit: "half" }),
-  b("ArrowLeft", any, { t: "scroll", dir: "left", unit: "line" }),
-  b("ArrowRight", any, { t: "scroll", dir: "right", unit: "line" }),
+  // Horizontal scroll stays on plain Left/Right. They're `exact` (no modifiers) so Alt-Left/Right
+  // fall through *unhandled* to the browser, which drives back/forward through native history
+  // (popstate); binding them here (or matching them with `any`) would preventDefault that away.
+  b("ArrowLeft", exact(false, false), { t: "scroll", dir: "left", unit: "line" }),
+  b("ArrowRight", exact(false, false), { t: "scroll", dir: "right", unit: "line" }),
 
   b("Home", any, { t: "moveLineStart" }),
   b("End", any, { t: "moveLineEnd" }),
