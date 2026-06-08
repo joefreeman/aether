@@ -2447,10 +2447,13 @@ class Editor {
     if (cursorRow === null) return;
     const topRow = (this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h;
     const visible = this.visibleRows();
+    // Overscroll by half a row past the cursor so it lands just inside the edge (a sliver of the
+    // next line shows) rather than flush against it.
+    const margin = this.cell.h / 2;
     if (cursorRow < topRow) {
-      this.scrollTopTo(cursorRow * this.cell.h + BUFFER_PAD, true);
+      this.scrollTopTo(cursorRow * this.cell.h - margin + BUFFER_PAD, true);
     } else if (cursorRow >= topRow + visible) {
-      this.scrollTopTo((cursorRow - visible + 1) * this.cell.h + BUFFER_PAD, true);
+      this.scrollTopTo((cursorRow - visible + 1) * this.cell.h + margin + BUFFER_PAD, true);
     }
     // Horizontal (no-wrap): keep the cursor's column clear of the sticky gutter and the right edge.
     if (this.wrap === "none") {
