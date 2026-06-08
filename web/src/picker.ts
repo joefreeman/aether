@@ -482,7 +482,7 @@ export class Picker {
     this.items.forEach((item, i) => {
       // Grep: a non-selectable file header before the first hit of each file in the window.
       if (item.kind === "grep_hit") {
-        const key = `${item.path_index} ${item.relative_path}`;
+        const key = `${item.path_index}\0${item.relative_path}`;
         if (key !== prevGrepKey) {
           prevGrepKey = key;
           headersInWindow++;
