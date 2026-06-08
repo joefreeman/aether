@@ -208,6 +208,7 @@ function projectRelativeLabel(abs: string, paths: string[]): string {
   if (label === "") return rel;
   return `${label}: ${rel}`;
 }
+
 function lspKey(language: string, workspaceRoot: string): string {
   return `${language}\0${workspaceRoot}`;
 }
@@ -361,6 +362,9 @@ class Editor {
   private picker: Picker | null = null;
   private hoverEl: HTMLElement;
   private hoverOpen = false;
+  private faviconEl: HTMLLinkElement; // tab icon: "ae" mark when clean, a state-coloured dot when dirty
+  private faviconDark = window.matchMedia("(prefers-color-scheme: dark)"); // tab theme → glyph ink
+  private faviconKey = ""; // last-applied (state, theme) key, so we only rewrite the <link> on change
   private toastsEl: HTMLElement;
   private connBanner: HTMLElement; // shown while disconnected/reconnecting
   private disconnected = false; // suspend editing input while the socket is down
@@ -431,6 +435,11 @@ class Editor {
     this.hoverEl = document.createElement("div");
     this.hoverEl.id = "hover";
     this.hoverEl.style.display = "none";
+    this.faviconEl = document.createElement("link");
+    this.faviconEl.rel = "icon";
+    document.head.appendChild(this.faviconEl);
+    // The clean "ae" mark is monochrome on a transparent icon, so it must flip with the tab theme.
+    this.faviconDark.addEventListener("change", () => this.updateFavicon());
     this.toastsEl = document.createElement("div");
     this.toastsEl.id = "toasts";
     this.toastsEl.setAttribute("role", "status");
@@ -814,9 +823,11 @@ class Editor {
 
     this.statusEl.replaceChildren(left, right);
     document.title = this.windowTitle();
+    this.updateFavicon();
   }
 
-  /** Dirty / external-change marker, mirroring the TUI's buffer status marker. */
+  /** Dirty / external-change marker for the on-screen status bar. (In the browser tab this state is
+   *  carried by the favicon instead — see `updateFavicon` — so the title omits the marker.) */
   private statusMarker(): string {
     if (this.externallyDeleted) return " [deleted]";
     if (this.externallyModified) return " [changed]";
@@ -824,12 +835,44 @@ class Editor {
     return "";
   }
 
-  /** The window title, mirroring the TUI's terminal title: `[project] file [marker]`, falling back
-   *  to the project alone (no buffer) or `Aether` (no project). */
+  /** Buffer-state accent colour for the tab favicon (Nord palette), same precedence as the status
+   *  marker: deleted-on-disk → changed-on-disk → unsaved edits. `null` when clean — a clean buffer
+   *  shows the plain "ae" app mark instead of a status dot. */
+  private bufferStateColor(): string | null {
+    if (this.externallyDeleted) return "#bf616a"; // aurora red — gone on disk
+    if (this.externallyModified) return "#d08770"; // aurora orange — changed on disk
+    if (this.revision !== this.savedRevision) return "#81a1c1"; // frost blue — unsaved edits
+    return null; // clean — nothing to flag
+  }
+
+  /** Point the tab favicon (transparent background) at either the "ae" app mark when the buffer is
+   *  clean or a bold state-coloured dot when it's dirty — distinct shapes, not just a colour swap.
+   *  The clean mark is monochrome, so its ink follows the tab's light/dark theme. Skipped when the
+   *  (state, theme) pair is unchanged, since this runs on every status-bar render. */
+  private updateFavicon(): void {
+    const color = this.bufferStateColor();
+    const dark = this.faviconDark.matches;
+    const key = `${color ?? "ae"}:${dark ? "d" : "l"}`;
+    if (key === this.faviconKey) return;
+    this.faviconKey = key;
+    const mark = color
+      ? `<circle cx="16" cy="16" r="8" fill="${color}"/>`
+      : // The "æ" app mark as vector text (crisp at favicon size, unlike a hairline glyph path),
+        // inked light on a dark tab / dark on a light tab so it reads against the browser chrome.
+        // `&#230;` is the ASCII entity for æ, so the data URI stays pure-ASCII through encoding.
+        `<text x="16" y="15" text-anchor="middle" dominant-baseline="central" ` +
+        `font-family="system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif" ` +
+        `font-weight="400" font-size="32" fill="${dark ? "#d8dee9" : "#2e3440"}">&#230;</text>`;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">${mark}</svg>`;
+    this.faviconEl.href = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+  }
+
+  /** The window title, mirroring the TUI's terminal title minus the dirty marker (the favicon shows
+   *  that in the tab): `[project] file`, falling back to the project alone or `Aether`. */
   private windowTitle(): string {
     if (!this.projectName) return "Aether";
     if (!this.label) return `[${this.projectName}]`;
-    return `[${this.projectName}] ${this.label}${this.statusMarker()}`;
+    return `[${this.projectName}] ${this.label}`;
   }
 
   /** Cursor `line:col`, or the selection span in Normal mode (1-based). */
