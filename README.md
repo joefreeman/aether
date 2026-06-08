@@ -186,8 +186,9 @@ npm run build   # tsc (typecheck + compile), then Vite bundles to web/dist
 ```
 
 `npm run build` runs `tsc && vite build`. The server serves `web/dist` directly — the path is baked
-from the crate and read at runtime, so a rebuilt bundle is picked up without rebuilding the server —
-and injects the auth token into the page. With the server running, open <http://127.0.0.1:2384>.
+from the crate and read at runtime, so a rebuilt bundle is picked up without rebuilding the server.
+With the server running, open <http://127.0.0.1:2384>. There's no token to copy: the daemon is
+loopback-only and authorizes by `Host`/`Origin`, so a browser on the same machine just connects.
 
 ## License
 

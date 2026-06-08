@@ -12,7 +12,6 @@ use std::path::PathBuf;
 pub struct RuntimeInfo {
     pub pid: u32,
     pub port: u16,
-    pub token: String,
     pub started_at_unix_ms: u64,
 }
 

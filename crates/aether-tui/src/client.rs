@@ -41,15 +41,11 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to the server with credentials in the query string. The server checks the token
-    /// during the WebSocket upgrade and rejects the connection if it's wrong — no JSON-RPC
-    /// handshake.
-    pub async fn connect(
-        base_url: &str,
-        token: &str,
-        client_version: &str,
-    ) -> anyhow::Result<Self> {
-        let url = format!("{base_url}/?token={token}&client_version={client_version}");
+    /// Connect to the server over WebSocket. There's no token: the server authorizes by loopback
+    /// identity (it binds `127.0.0.1` and checks the `Host`/`Origin` headers), and a native client
+    /// connecting to `127.0.0.1` sends no `Origin` and a loopback `Host`, so it's accepted.
+    pub async fn connect(base_url: &str, client_version: &str) -> anyhow::Result<Self> {
+        let url = format!("{base_url}/?client_version={client_version}");
         let (ws, _) = tokio_tungstenite::connect_async(&url)
             .await
             .with_context(|| format!("connecting to {base_url}"))?;

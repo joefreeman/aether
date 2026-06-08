@@ -84,21 +84,16 @@ const BUFFER_PAD = 8; // px of breathing room above the first line / below the l
 type Mode = "normal" | "insert";
 
 interface Config {
-  token: string;
   wsBase: string;
   project: string | undefined;
 }
 
 function resolveConfig(): Config {
-  const injected = window.AETHER_TOKEN;
-  const token = injected && injected !== "__AETHER_TOKEN__" ? injected : import.meta.env.VITE_AETHER_TOKEN;
+  // No token: the daemon authorizes by loopback Host/Origin. Served from the daemon, `location.host`
+  // is the loopback origin; in Vite dev, VITE_AETHER_WS points at the daemon and the dev server's
+  // own localhost origin is accepted too.
   const wsBase = import.meta.env.VITE_AETHER_WS ?? `ws://${location.host}`;
-  if (!token) {
-    throw new Error(
-      "No token. Serve this via aether-server, or set VITE_AETHER_TOKEN (and VITE_AETHER_WS) for Vite dev — see README.",
-    );
-  }
-  return { token, wsBase, project: import.meta.env.VITE_AETHER_PROJECT };
+  return { wsBase, project: import.meta.env.VITE_AETHER_PROJECT };
 }
 
 interface Cell {
@@ -377,7 +372,7 @@ class Editor {
 
     this.cell = measureCell(this.bufferEl);
 
-    const url = `${cfg.wsBase}/?token=${encodeURIComponent(cfg.token)}&client_version=web-0.2`;
+    const url = `${cfg.wsBase}/?client_version=web-0.2`;
     this.client = new RpcClient(url, (method, params) => this.onNotification(method, params), {
       onConnState: (s) => this.setConnState(s),
       onReconnect: () => void this.reestablish(),

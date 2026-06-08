@@ -32,7 +32,6 @@ pub struct ServerState {
     /// once a project gets loaded. Per-server (not a global) so tests can spin up multiple servers
     /// in the same process without sharing watcher state.
     pub watcher: Option<Arc<std::sync::Mutex<notify::RecommendedWatcher>>>,
-    pub token: String,
     pub buffers: HashMap<BufferId, Buffer>,
     /// Which project each open buffer belongs to. Populated when a buffer is created
     /// (`buffer/open`) and looked up when scoping per-buffer state to a project (e.g. on
@@ -210,11 +209,10 @@ impl ProjectEntry {
 }
 
 impl ServerState {
-    pub fn new(token: String) -> Self {
+    pub fn new() -> Self {
         Self {
             projects: HashMap::new(),
             watcher: None,
-            token,
             buffers: HashMap::new(),
             buffer_projects: HashMap::new(),
             clients: HashMap::new(),
@@ -1191,7 +1189,7 @@ mod project_state_tests {
     /// — while leaving buffers and unrelated projects untouched.
     #[test]
     fn rename_project_rekeys_buffers_and_clients() {
-        let mut s = ServerState::new("tok".to_string());
+        let mut s = ServerState::new();
         s.projects
             .insert("old".to_string(), project_entry("old", vec![PathBuf::from("/tmp/x")]));
         s.projects
@@ -1238,7 +1236,7 @@ mod project_state_tests {
     /// error; it can't happen in practice since projects are never unloaded at runtime).
     #[test]
     fn rename_project_unknown_returns_none() {
-        let mut s = ServerState::new("tok".to_string());
+        let mut s = ServerState::new();
         assert!(s.rename_project("nope", "new").is_none());
     }
 
@@ -1246,7 +1244,7 @@ mod project_state_tests {
     /// active, so deleting it would pull the rug.
     #[test]
     fn project_active_anywhere_tracks_any_client() {
-        let mut s = ServerState::new("tok".to_string());
+        let mut s = ServerState::new();
         let (c1, sess1) = session("alpha");
         s.clients.insert(c1, sess1);
         assert!(s.project_active_anywhere("alpha"));
@@ -1257,7 +1255,7 @@ mod project_state_tests {
     /// per-buffer state), leaving unrelated projects and their buffers intact.
     #[test]
     fn delete_project_closes_only_its_buffers() {
-        let mut s = ServerState::new("tok".to_string());
+        let mut s = ServerState::new();
         s.projects
             .insert("doomed".to_string(), project_entry("doomed", vec![PathBuf::from("/tmp/d")]));
         s.projects
@@ -1296,7 +1294,7 @@ mod project_state_tests {
     /// scoped to the named project.
     #[test]
     fn buffers_under_path_matches_file_and_dir_prefix() {
-        let mut s = ServerState::new("tok".to_string());
+        let mut s = ServerState::new();
         s.projects
             .insert("proj".to_string(), project_entry("proj", vec![PathBuf::from("/ws")]));
 
@@ -1333,7 +1331,7 @@ mod project_state_tests {
     /// project: small, reuses freed numbers, ignores file buffers, and numbers projects apart.
     #[test]
     fn next_scratch_number_picks_lowest_unused_per_project() {
-        let mut s = ServerState::new("tok".to_string());
+        let mut s = ServerState::new();
         assert_eq!(s.next_scratch_number("proj"), 1, "empty project → 1");
 
         let add_scratch = |s: &mut ServerState, n: u32| {

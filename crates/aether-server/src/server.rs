@@ -16,7 +16,6 @@ use tokio::sync::Mutex;
 
 /// Public entry point: bind the fixed port, manage the runtime file, run the server.
 pub async fn run() -> anyhow::Result<()> {
-    let token = config::resolve_token()?;
     let bind_addr = format!("127.0.0.1:{SERVER_PORT}");
     let listener = TcpListener::bind(&bind_addr)
         .await
@@ -28,7 +27,6 @@ pub async fn run() -> anyhow::Result<()> {
     let info = RuntimeInfo {
         pid: std::process::id(),
         port,
-        token: token.clone(),
         started_at_unix_ms: now_unix_ms(),
     };
     config::write_runtime_info(&runtime_path, &info)?;
@@ -41,7 +39,7 @@ pub async fn run() -> anyhow::Result<()> {
     // Drop guard to clean up the runtime file regardless of how we exit.
     let _guard = RuntimeFileGuard(runtime_path);
 
-    let state = Arc::new(Mutex::new(ServerState::new(token)));
+    let state = Arc::new(Mutex::new(ServerState::new()));
     run_with_listener(listener, state).await
 }
 
@@ -88,25 +86,16 @@ pub async fn run_with_listener(listener: TcpListener, state: SharedState) -> any
 /// Handle to a running server (for in-process embedding by tests). Dropping aborts the server task.
 pub struct ServerHandle {
     pub port: u16,
-    pub token: String,
     pub project_name: String,
     join: tokio::task::JoinHandle<()>,
 }
 
 impl ServerHandle {
-    /// WebSocket URL with the token + a dummy client_version baked into the query string. Tests
-    /// always connect via this — the production flow does the same thing in the TUI client.
+    /// WebSocket URL with a dummy client_version in the query string. Tests connect via this — the
+    /// production flow does the same in the TUI client. No token: auth is by loopback `Host`/`Origin`
+    /// (see `http::is_loopback_authority`), and connecting via `127.0.0.1` satisfies it.
     pub fn ws_url(&self) -> String {
-        format!(
-            "ws://127.0.0.1:{}/?token={}&client_version=test",
-            self.port, self.token
-        )
-    }
-
-    /// Base URL without query-string credentials. Used by the one test that intentionally tries
-    /// a bad token to assert the upgrade rejection path.
-    pub fn ws_url_no_auth(&self) -> String {
-        format!("ws://127.0.0.1:{}", self.port)
+        format!("ws://127.0.0.1:{}/?client_version=test", self.port)
     }
 }
 
@@ -123,18 +112,16 @@ impl Drop for ServerHandle {
 pub async fn spawn_for_test(
     project_name: impl Into<String>,
     project_paths: Vec<PathBuf>,
-    token: impl Into<String>,
 ) -> anyhow::Result<ServerHandle> {
     use crate::state::ProjectEntry;
     use crate::workspace_index::WorkspaceIndex;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let token = token.into();
     let project_name = project_name.into();
     let workspace_index = Arc::new(WorkspaceIndex::new(project_paths.clone()));
 
-    let state = Arc::new(Mutex::new(ServerState::new(token.clone())));
+    let state = Arc::new(Mutex::new(ServerState::new()));
     {
         let mut s = state.lock().await;
         s.projects.insert(
@@ -164,7 +151,6 @@ pub async fn spawn_for_test(
     });
     Ok(ServerHandle {
         port,
-        token,
         project_name,
         join,
     })

@@ -52,10 +52,6 @@ impl RpcError {
         )
     }
 
-    pub fn invalid_token() -> Self {
-        Self::new(ErrorCode::INVALID_TOKEN, "invalid handshake token")
-    }
-
     pub fn no_active_project() -> Self {
         Self::new(
             ErrorCode::NO_ACTIVE_PROJECT,

@@ -56,7 +56,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
-const TEST_TOKEN: &str = "test-token-xyz";
 
 async fn next_text(
     ws: &mut tokio_tungstenite::WebSocketStream<
@@ -158,7 +157,7 @@ async fn hello_then_open_file() {
     let file_path = dir.path().join("hello.rs");
     std::fs::write(&file_path, "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
 
@@ -233,7 +232,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
     }
     std::fs::write(&path, &content).unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -342,7 +341,7 @@ async fn buffer_open_isolates_scroll_per_client() {
     }
     std::fs::write(&path, &content).unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
 
@@ -453,23 +452,61 @@ async fn buffer_open_isolates_scroll_per_client() {
     drop(server);
 }
 
+/// A browser page on another site can't authenticate a WebSocket: its honest `Origin` header isn't
+/// our loopback origin, so the upgrade is refused. This is the cross-site / DNS-rebinding defense on
+/// the WS path (the native TUI sends no `Origin`, which is allowed — see `connects_with_no_origin`).
 #[tokio::test]
-async fn rejects_bad_token() {
+async fn ws_rejects_foreign_origin() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
     let dir = tempfile::tempdir().unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
-    // Token now lives in the URL query string; a bad token fails the WebSocket upgrade itself
-    // (HTTP 401), not via a JSON-RPC error frame.
-    let bad_url = format!(
-        "{}/?token=not-the-real-token&client_version=test",
-        server.ws_url_no_auth()
-    );
-    let result = tokio_tungstenite::connect_async(&bad_url).await;
+
+    let mut req = server.ws_url().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("origin", "http://evil.com".parse().unwrap());
+    let result = tokio_tungstenite::connect_async(req).await;
     assert!(
         result.is_err(),
-        "connect should fail when token is invalid, got Ok"
+        "connect should fail with a cross-site Origin, got Ok"
     );
+}
+
+/// The page served from our own loopback origin *can* connect: its `Origin` matches, so a browser
+/// client served by the daemon authenticates fine.
+#[tokio::test]
+async fn ws_accepts_loopback_origin() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+
+    let mut req = server.ws_url().into_client_request().unwrap();
+    req.headers_mut().insert(
+        "origin",
+        format!("http://127.0.0.1:{}", server.port).parse().unwrap(),
+    );
+    let result = tokio_tungstenite::connect_async(req).await;
+    assert!(
+        result.is_ok(),
+        "connect should succeed from our own loopback origin"
+    );
+}
+
+/// The native TUI is not a browser and sends no `Origin`; that must be accepted (every other test
+/// connects this way via `ws_url`, but pin it explicitly since it's the load-bearing case).
+#[tokio::test]
+async fn connects_with_no_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let result = tokio_tungstenite::connect_async(server.ws_url()).await;
+    assert!(result.is_ok(), "TUI (no Origin) should connect");
 }
 
 #[tokio::test]
@@ -479,7 +516,7 @@ async fn rejects_path_outside_project() {
     let outside = std::env::temp_dir().join("aether-outside-test.txt");
     std::fs::write(&outside, "outside").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -530,7 +567,7 @@ async fn viewport_subscribe_renders_window() {
     // 5 short lines.
     std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\nepsilon\n").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -599,7 +636,7 @@ async fn viewport_subscribe_wraps_long_line() {
     let path = dir.path().join("long.txt");
     std::fs::write(&path, "the quick brown fox jumps over the lazy dog\n").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -681,7 +718,7 @@ async fn viewport_scroll_returns_new_window() {
     }
     std::fs::write(&path, &content).unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -764,7 +801,7 @@ async fn setup_with_buffer(
     // and the OS will clean up /tmp on reboot.
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1021,7 +1058,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn main() { let s = \"hi\"; }\n").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1095,7 +1132,7 @@ async fn match_bracket_motion_jumps_to_pair() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1168,7 +1205,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1229,7 +1266,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1289,7 +1326,7 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1365,7 +1402,7 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() { let x = 1; }\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1425,7 +1462,7 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() {}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1488,7 +1525,7 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1577,7 +1614,7 @@ async fn end_of_unit_works_on_last_function() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn last() {}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1641,7 +1678,7 @@ async fn start_of_unit_extends_back_to_function_start() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() {\n    let x = 1;\n}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1704,7 +1741,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1805,7 +1842,7 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1879,7 +1916,7 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\n\nfn two() {}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -1943,7 +1980,7 @@ async fn nav_motion_jumps_between_top_level_rust_items() {
         "fn one() {\n    let x = 1;\n}\nfn two() {}\nfn three() {}\n",
     )
     .unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2016,7 +2053,7 @@ async fn nav_motion_prev_walks_backward() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2076,7 +2113,7 @@ async fn nav_motion_noop_at_end_of_file() {
     let path = dir.path().join("a.rs");
     // Single function — nothing to navigate to.
     std::fs::write(&path, "fn only() {}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2140,7 +2177,7 @@ async fn nav_motion_inside_python_class_finds_next_method() {
         &path,
         "class Foo:\n    def method1(self):\n        pass\n    def method2(self):\n        pass\n\ndef top_level():\n    pass\n",
     ).unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2204,7 +2241,7 @@ async fn nav_motion_from_last_method_stays_in_class() {
         &path,
         "class Foo:\n    def method1(self):\n        pass\n    def method2(self):\n        pass\n\ndef top_level():\n    pass\n",
     ).unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2271,7 +2308,7 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
         "class Foo:\n    def method1(self):\n        pass\n\ndef top_level():\n    pass\n",
     )
     .unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2332,7 +2369,7 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
         &path,
         "<html>\n  <head>\n    <meta charset=\"utf-8\" />\n    <title>x</title>\n    <link href=\"a.css\" />\n  </head>\n</html>\n",
     ).unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2428,7 +2465,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
     //   4: "```"
     std::fs::write(&path, "# Heading\n\n```rust\nfn main() {}\n```\n").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2497,7 +2534,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let path = dir.path().join("greet.txt");
     std::fs::write(&path, "hello\n").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2611,7 +2648,7 @@ async fn save_preserves_crlf_endings() {
     let path = dir.path().join("windows.txt");
     std::fs::write(&path, "one\r\ntwo\r\nthree\r\n").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -2667,7 +2704,7 @@ async fn save_preserves_crlf_endings() {
 #[tokio::test]
 async fn save_scratch_returns_buffer_has_no_path() {
     let dir = tempfile::tempdir().unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5327,7 +5364,7 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() {\n").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5385,7 +5422,7 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "// note {\n").unwrap();
 
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5452,7 +5489,7 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() {\n  x;\n}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5507,7 +5544,7 @@ async fn newline_and_indent_engine_python_def() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.py");
     std::fs::write(&path, "def foo():\n    pass\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5563,7 +5600,7 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "fn foo() {\n  let x = 1;\n  let y = 2;\n}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5617,7 +5654,7 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.go");
     std::fs::write(&path, "").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5699,7 +5736,7 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "    let x = 1;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5757,7 +5794,7 @@ async fn toggle_comment_strips_when_already_commented() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "    // let x = 1;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5816,7 +5853,7 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.py");
     std::fs::write(&path, "  a = 1\n    b = 2\n  c = 3\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5877,7 +5914,7 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.md");
     std::fs::write(&path, "# Heading\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5935,7 +5972,7 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = foo + bar;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -5994,7 +6031,7 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = /* foo */ + bar;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6055,7 +6092,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.rs");
     std::fs::write(&path, "let a = 1;\nlet b = 2;\nlet c = 3;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6118,7 +6155,7 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = foo + bar;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6181,7 +6218,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.go");
     std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6262,7 +6299,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.ts");
     std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6324,7 +6361,7 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6386,7 +6423,7 @@ async fn toggle_comment_round_trip_partial_selection() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = foo + bar;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6459,7 +6496,7 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = /* foo */ + bar;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6518,7 +6555,7 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.css");
     std::fs::write(&path, "color: red;\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6577,7 +6614,7 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.md");
     std::fs::write(&path, "\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -6626,7 +6663,7 @@ async fn toggle_comment_is_noop_for_json() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.json");
     std::fs::write(&path, "{}\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -7264,7 +7301,7 @@ async fn setup_picker_workspace() -> (
     std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -7605,7 +7642,7 @@ async fn setup_buffer_picker_workspace() -> (
     std::fs::write(dir_path.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
     std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -8361,7 +8398,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -8473,7 +8510,6 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
     let server = spawn_for_test(
         "test-proj",
         vec![a_path.clone(), b_path.clone()],
-        TEST_TOKEN,
     )
     .await
     .unwrap();
@@ -8573,7 +8609,7 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -8646,7 +8682,7 @@ async fn save_as_creates_missing_parent_directories() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -8714,7 +8750,7 @@ async fn save_as_does_not_create_dirs_outside_project() {
     let project_canonical = std::fs::canonicalize(&project).unwrap();
     std::mem::forget(outer);
 
-    let server = spawn_for_test("test-proj", vec![project_canonical.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![project_canonical.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -8775,7 +8811,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("existing.txt"), "old content\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -8848,7 +8884,7 @@ async fn save_as_to_same_path_is_in_place_save() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("doc.txt"), "x\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -8929,7 +8965,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("target.txt"), "original\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -9037,7 +9073,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("file.txt"), "before\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -9127,7 +9163,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -9232,7 +9268,7 @@ async fn buffer_close_drops_buffer() {
     std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
     std::fs::write(dir_path.join("b.txt"), "beta\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -9312,7 +9348,7 @@ async fn buffer_close_last_buffer_returns_none() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("only.txt"), "x\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -9360,7 +9396,7 @@ async fn buffer_close_drops_viewports() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -9591,7 +9627,7 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
     std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -9650,7 +9686,7 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
     std::fs::write(&path, "ab\ncd\n").unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -9708,7 +9744,7 @@ async fn setup_grep_workspace() -> (
     std::fs::write(dir_path.join("README.md"), "no match here\n").unwrap();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -10507,7 +10543,7 @@ async fn setup_explorer_workspace() -> (
     std::fs::write(root.join("README.md"), "hi\n").unwrap();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![root], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![root])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -10731,7 +10767,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
     std::fs::create_dir_all(root.join("src-extra")).unwrap();
     std::fs::write(root.join("src.txt"), "file with src prefix\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![canonical_root.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![canonical_root.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -11198,7 +11234,7 @@ async fn directory_create_refuses_outside_project_boundary() {
     let project_canonical = std::fs::canonicalize(&project).unwrap();
     std::mem::forget(outer);
 
-    let server = spawn_for_test("test-proj", vec![project_canonical.clone()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![project_canonical.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -11369,7 +11405,7 @@ async fn setup_watched_buffer(
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir_path])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -11641,7 +11677,7 @@ async fn buffer_reload_clean_buffer_does_not_require_force() {
 #[tokio::test]
 async fn project_activate_returns_info_and_unlocks_buffer_ops() {
     let dir = tempfile::tempdir().unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -11701,7 +11737,7 @@ async fn project_activate_returns_info_and_unlocks_buffer_ops() {
 #[tokio::test]
 async fn project_activate_rejects_unknown_name() {
     let dir = tempfile::tempdir().unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -11729,7 +11765,7 @@ async fn project_activate_same_project_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("buf.txt");
     std::fs::write(&path, "hello\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12282,7 +12318,7 @@ async fn git_blame_line_reports_committed_author() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "tracked.rs", "fn main() {}\n");
 
-    let server = spawn_for_test("blame-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("blame-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12333,7 +12369,7 @@ async fn git_blame_line_is_none_without_repo() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("loose.rs"), "x\n").unwrap();
 
-    let server = spawn_for_test("norepo-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("norepo-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12380,7 +12416,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
 
-    let server = spawn_for_test("diff-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("diff-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12493,7 +12529,7 @@ async fn git_gutter_marker_present_without_diff_view() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "g.rs", "alpha\nbeta\n");
 
-    let server = spawn_for_test("gutter-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("gutter-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12569,7 +12605,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "nav.rs", "l0\nl1\nl2\nl3\nl4\n");
 
-    let server = spawn_for_test("nav-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("nav-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12709,7 +12745,7 @@ async fn open_and_subscribe(
     root: &std::path::Path,
     rel_path: &str,
 ) -> (aether_server::ServerHandle, Ws) {
-    let server = spawn_for_test(project, vec![root.to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test(project, vec![root.to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -13398,14 +13434,14 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
 
 /// The browser client is served by the same daemon on the same loopback port the WebSocket uses:
 /// a plain HTTP GET returns the web page, while WS upgrades still reach the JSON-RPC handler. This
-/// pins the HTTP-vs-WS routing seam and that the live token is injected into the served page so the
-/// browser can authenticate its socket without reading the runtime discovery file.
+/// pins the HTTP-vs-WS routing seam, that the page is served with no token in it, and that the
+/// stable-named JS bundle is reachable.
 #[tokio::test]
-async fn serves_web_client_over_http_with_injected_token() {
+async fn serves_web_client_over_http() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let dir = tempfile::tempdir().unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
 
@@ -13426,13 +13462,11 @@ async fn serves_web_client_over_http_with_injected_token() {
         &body[..body.len().min(80)]
     );
     assert!(body.contains("text/html"), "should be served as HTML");
-    // The live token is injected so the browser can open an authenticated WS.
-    assert!(body.contains(TEST_TOKEN), "token should be injected into the page");
-    // The placeholder must be fully substituted, not left literal.
-    assert!(!body.contains("__AETHER_TOKEN__"), "placeholder should be replaced");
+    // No token is served anymore: auth is by loopback Host/Origin, not an injected secret.
+    assert!(!body.contains("AETHER_TOKEN"), "no token should appear in the page");
 
-    // When the web client has been built (web/dist), the page links a hashed JS asset; fetch it to
-    // exercise the asset route + mime. Skipped when only the fallback spike page is served.
+    // The fixed shell always links the bundle's JS at a stable path; fetch it to exercise the asset
+    // route + mime (requires web/dist to have been built, which CI/dev does before running tests).
     if let Some(asset) = body
         .split_once("src=\"/")
         .and_then(|(_, rest)| rest.split('"').next())
@@ -13456,6 +13490,35 @@ async fn serves_web_client_over_http_with_injected_token() {
         );
         assert!(js.contains("javascript"), "asset should be served as JS");
     }
+
+    drop(server);
+}
+
+/// DNS-rebinding defense on the HTTP path: a GET whose `Host` isn't our loopback authority — what a
+/// rebound request from a malicious site carries — is refused with 403, so the page can't be read.
+#[tokio::test]
+async fn http_rejects_foreign_host() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: evil.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut body = String::new();
+    stream.read_to_string(&mut body).await.unwrap();
+    assert!(
+        body.starts_with("HTTP/1.1 403"),
+        "foreign Host should be refused, got: {}",
+        &body[..body.len().min(80)]
+    );
 
     drop(server);
 }
@@ -13550,7 +13613,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
     std::fs::write(dir.path().join("b.txt"), "bravo\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
 
@@ -13683,7 +13746,7 @@ async fn nav_back_and_forward_across_files() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "alpha\nsecond\n").unwrap();
     std::fs::write(dir.path().join("b.txt"), "bravo\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
@@ -13737,7 +13800,7 @@ async fn nav_back_and_forward_across_files() {
 async fn nav_back_empty_is_noop() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
@@ -13757,7 +13820,7 @@ async fn nav_back_empty_is_noop() {
 async fn nav_goto_reopens_by_path() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
-    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();

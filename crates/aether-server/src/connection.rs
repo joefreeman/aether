@@ -62,24 +62,20 @@ const OUTBOUND_CHANNEL_CAPACITY: usize = 64;
 /// Extracted from the WebSocket upgrade request's query string.
 #[derive(Default)]
 struct ConnectQuery {
-    token: Option<String>,
     client_version: Option<String>,
 }
 
 impl ConnectQuery {
-    /// Parse `?token=...&client_version=...` (and tolerate missing/extra params). URL-decoding
-    /// is intentionally minimal — these values are produced by our own TUI, which doesn't put
-    /// special characters in either field.
+    /// Parse `?client_version=...` (and tolerate missing/extra params). URL-decoding is
+    /// intentionally minimal — this value is produced by our own clients.
     fn parse(query: &str) -> Self {
         let mut out = Self::default();
         for kv in query.split('&') {
             let Some((k, v)) = kv.split_once('=') else {
                 continue;
             };
-            match k {
-                "token" => out.token = Some(v.to_string()),
-                "client_version" => out.client_version = Some(v.to_string()),
-                _ => {}
+            if k == "client_version" {
+                out.client_version = Some(v.to_string());
             }
         }
         out
@@ -88,24 +84,36 @@ impl ConnectQuery {
 
 pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
     let peer = stream.peer_addr().ok();
-    // Pull the expected token once; the handshake callback compares against it. Cloning out of
-    // the lock keeps the upgrade synchronous.
-    let server_token = state.lock().await.token.clone();
 
+    // Authorization is by loopback identity, not a token. The server binds `127.0.0.1`, so off-host
+    // traffic can't reach it; the remaining browser threat is a malicious site connecting (or, via
+    // DNS rebinding, reading our page). We defend with two header checks:
+    //   * `Host` must name our loopback authority — a rebound request carries the attacker's host.
+    //   * `Origin`, if present, must be our loopback origin. Browsers set `Origin` honestly and
+    //     can't forge it cross-site; the native TUI sends none, which is allowed.
     let mut query = ConnectQuery::default();
     let ws = tokio_tungstenite::accept_hdr_async(
         stream,
         |req: &HsReq, resp: HsResp| -> Result<HsResp, HsErr> {
-            let q = req.uri().query().unwrap_or("");
-            query = ConnectQuery::parse(q);
-            match &query.token {
-                Some(t) if *t == server_token => Ok(resp),
-                _ => {
-                    tracing::warn!(?peer, "rejecting connection: missing or invalid token");
-                    let mut err = HsErr::new(Some("invalid token".into()));
-                    *err.status_mut() = StatusCode::UNAUTHORIZED;
-                    Err(err)
-                }
+            query = ConnectQuery::parse(req.uri().query().unwrap_or(""));
+            let headers = req.headers();
+            let host_ok = headers
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .is_some_and(crate::http::is_loopback_authority);
+            let origin_ok = match headers.get("origin") {
+                None => true,
+                Some(o) => o
+                    .to_str()
+                    .is_ok_and(crate::http::is_loopback_authority),
+            };
+            if host_ok && origin_ok {
+                Ok(resp)
+            } else {
+                tracing::warn!(?peer, host_ok, origin_ok, "rejecting connection: non-loopback host/origin");
+                let mut err = HsErr::new(Some("forbidden".into()));
+                *err.status_mut() = StatusCode::FORBIDDEN;
+                Err(err)
             }
         },
     )
