@@ -19,7 +19,7 @@
 //! is a change of baseline source in [`load_baseline`] plus a `stage` tag on each [`DiffHunk`];
 //! the hunk shape and anchoring below are unaffected.
 
-use aether_protocol::git::BlameInfo;
+use aether_protocol::git::{BlameInfo, CommitInfo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -231,7 +231,6 @@ pub fn compute_blame(repo: &GitRepo, current: &ropey::Rope) -> Option<Vec<Option
                     commit: format!("{oid:.7}"),
                     author: sig.name().unwrap_or("(unknown)").to_string(),
                     timestamp: sig.when().seconds(),
-                    summary: commit.summary().unwrap_or_default().to_string(),
                 })
             });
             match meta {
@@ -239,14 +238,12 @@ pub fn compute_blame(repo: &GitRepo, current: &ropey::Rope) -> Option<Vec<Option
                     commit: m.commit.clone(),
                     author: m.author.clone(),
                     timestamp: m.timestamp,
-                    summary: m.summary.clone(),
                     is_uncommitted: false,
                 },
                 None => BlameInfo {
                     commit: String::new(),
                     author: String::new(),
                     timestamp: 0,
-                    summary: String::new(),
                     is_uncommitted: true,
                 },
             }
@@ -255,12 +252,60 @@ pub fn compute_blame(repo: &GitRepo, current: &ropey::Rope) -> Option<Vec<Option
     Some(out)
 }
 
-/// Resolved author/summary for one commit, cached across the lines that share it.
+/// Resolved author/time for one commit, cached across the lines that share it.
 struct CommitMeta {
     commit: String,
     author: String,
     timestamp: i64,
-    summary: String,
+}
+
+/// Resolve full details for a single commit (the blame "commit details" popover). `rev` is any
+/// revision libgit2 can parse — typically the abbreviated hash from a line's [`BlameInfo`]. Returns
+/// `None` if the repo can't be opened or `rev` doesn't resolve to a commit.
+pub fn commit_info(repo: &GitRepo, rev: &str) -> Option<CommitInfo> {
+    let git_repo = git2::Repository::open(&repo.workdir).ok()?;
+    let commit = git_repo.revparse_single(rev).ok()?.peel_to_commit().ok()?;
+    let sig = commit.author();
+    Some(CommitInfo {
+        commit: commit.id().to_string(),
+        author: sig.name().unwrap_or("(unknown)").to_string(),
+        email: sig.email().unwrap_or_default().to_string(),
+        date: format_commit_time(sig.when()),
+        message: commit.message().unwrap_or_default().trim_end().to_string(),
+    })
+}
+
+/// Format a git signature time in its own recorded timezone as `YYYY-MM-DD HH:MM:SS ±HHMM` (git's
+/// default `log` style), with no external date crate.
+fn format_commit_time(t: git2::Time) -> String {
+    let offset_min = t.offset_minutes() as i64;
+    let local = t.seconds() + offset_min * 60;
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let (hour, minute, second) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let sign = if offset_min < 0 { '-' } else { '+' };
+    let off = offset_min.abs();
+    format!(
+        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {sign}{:02}{:02}",
+        off / 60,
+        off % 60
+    )
+}
+
+/// Days since the Unix epoch → `(year, month, day)`. Howard Hinnant's `civil_from_days` algorithm,
+/// valid across the full range of `i64` day counts.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// A diff line's text with its trailing newline stripped (libgit2 includes it in the content).
@@ -282,6 +327,32 @@ mod tests {
 
     fn rope(s: &str) -> ropey::Rope {
         ropey::Rope::from_str(s)
+    }
+
+    // ---- commit-time formatting (no repo needed) ------------------------------------------------
+
+    #[test]
+    fn format_commit_time_renders_in_recorded_timezone() {
+        // 1_700_000_000 == 2023-11-14 22:13:20 UTC.
+        assert_eq!(
+            format_commit_time(git2::Time::new(1_700_000_000, 0)),
+            "2023-11-14 22:13:20 +0000"
+        );
+        // +60 min offset shifts the wall-clock forward an hour and is rendered as +0100.
+        assert_eq!(
+            format_commit_time(git2::Time::new(1_700_000_000, 60)),
+            "2023-11-14 23:13:20 +0100"
+        );
+        // A negative offset (e.g. US Pacific, -480 min) rolls back across midnight.
+        assert_eq!(
+            format_commit_time(git2::Time::new(1_700_000_000, -480)),
+            "2023-11-14 14:13:20 -0800"
+        );
+        // The Unix epoch itself.
+        assert_eq!(
+            format_commit_time(git2::Time::new(0, 0)),
+            "1970-01-01 00:00:00 +0000"
+        );
     }
 
     // ---- hunks_from_buffers (no repo needed) ----------------------------------------------------
@@ -454,7 +525,6 @@ mod tests {
         let l0 = blame[0].as_ref().expect("line 0 blamed");
         assert_eq!(l0.author, "Test");
         assert!(!l0.is_uncommitted);
-        assert_eq!(l0.summary, "init");
         assert_eq!(l0.commit.len(), 7);
 
         // Line 1 was edited in the buffer → uncommitted.

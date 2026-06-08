@@ -14,8 +14,9 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
-    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitNavigateHunk, GitNavigateHunkParams,
-    GitNavigateHunkResult, GitSetDiffView, GitSetDiffViewParams, HunkDirection,
+    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCommitInfo, GitCommitInfoParams,
+    GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
+    GitSetDiffView, GitSetDiffViewParams, HunkDirection,
 };
 use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::input::{
@@ -12358,8 +12359,26 @@ async fn git_blame_line_reports_committed_author() {
     let blame = res.blame.expect("committed line should have blame");
     assert_eq!(blame.author, "Test");
     assert!(!blame.is_uncommitted);
-    assert_eq!(blame.summary, "init commit");
     assert_eq!(blame.commit.len(), 7);
+
+    // The abbreviated hash from blame resolves to full commit details via `git/commit_info`.
+    let info_res: GitCommitInfoResult = send_request::<GitCommitInfo>(
+        &mut ws,
+        4,
+        &GitCommitInfoParams {
+            buffer_id: open.buffer_id,
+            commit: blame.commit.clone(),
+        },
+    )
+    .await;
+    let info = info_res.info.expect("blame hash should resolve to a commit");
+    assert_eq!(info.author, "Test");
+    assert_eq!(info.message, "init commit");
+    assert!(info.commit.starts_with(&blame.commit)); // full hash extends the abbreviated one
+    // Date is pre-formatted "YYYY-MM-DD HH:MM:SS ±HHMM" (25 chars) in the commit's own timezone.
+    assert_eq!(info.date.len(), 25, "unexpected date format: {}", info.date);
+    assert!(info.date.starts_with("20"));
+    assert!(info.date[20..].starts_with(['+', '-']));
 
     drop(server);
 }

@@ -21,8 +21,8 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    BlameInfo, GitBlameLine, GitBlameLineParams, GitNavigateHunk, GitNavigateHunkParams,
-    GitSetDiffView, GitSetDiffViewParams, HunkDirection,
+    BlameInfo, CommitInfo, GitBlameLine, GitBlameLineParams, GitCommitInfo, GitCommitInfoParams,
+    GitNavigateHunk, GitNavigateHunkParams, GitSetDiffView, GitSetDiffViewParams, HunkDirection,
 };
 use aether_protocol::nav::{
     NavBack, NavForward, NavRecord, NavRecordParams, NavStepParams, NavStepResult,
@@ -1771,6 +1771,7 @@ async fn run_action(
         }
         Action::Hover => lsp_hover(client, state).await?,
         Action::GotoDefinition => lsp_goto_definition(client, state).await?,
+        Action::ShowCommitInfo => show_commit_info(client, state).await?,
         Action::ShowDiagnostic => show_diagnostic(state),
         Action::NextDiagnostic => navigate_diagnostic(client, state, DiagnosticDirection::Next).await?,
         Action::PrevDiagnostic => navigate_diagnostic(client, state, DiagnosticDirection::Prev).await?,
@@ -3377,6 +3378,47 @@ async fn lsp_hover(client: &mut Client, state: &mut AppState) -> Result<()> {
         Err(e) => state.status = StatusMessage::error(format!("hover failed: {e}")),
     }
     Ok(())
+}
+
+/// `Space o` — show the full commit details for the cursor line's blame in the hover popover.
+/// Reuses the cached cursor-line blame for the commit hash (no extra round-trip); an uncommitted or
+/// not-yet-blamed line gets a transient note instead of an empty box.
+async fn show_commit_info(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(ed) = state.editor.as_ref() else {
+        return Ok(());
+    };
+    let buffer_id = ed.buffer_id;
+    let commit = match &ed.blame.info {
+        Some(b) if !b.is_uncommitted => b.commit.clone(),
+        Some(_) => {
+            state.status = StatusMessage::info("Uncommitted line — no commit details");
+            return Ok(());
+        }
+        None => {
+            state.status = StatusMessage::info("No commit details for this line");
+            return Ok(());
+        }
+    };
+    match client
+        .rpc::<GitCommitInfo>(GitCommitInfoParams { buffer_id, commit })
+        .await
+    {
+        Ok(r) => match r.info {
+            Some(info) => state.hover = Some(HoverPopup::plain(format_commit_details(&info))),
+            None => state.status = StatusMessage::info("Commit not found"),
+        },
+        Err(e) => state.status = StatusMessage::error(format!("commit info failed: {e}")),
+    }
+    Ok(())
+}
+
+/// Lay out commit details for the popover, mirroring `git show`'s header (commit / Author / Date,
+/// blank line, then the full message).
+fn format_commit_details(info: &CommitInfo) -> String {
+    format!(
+        "commit {}\nAuthor: {} <{}>\nDate:   {}\n\n{}",
+        info.commit, info.author, info.email, info.date, info.message
+    )
 }
 
 /// `Space d` — resolve the definition of the symbol at the cursor and jump to it (opening the file

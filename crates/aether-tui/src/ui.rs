@@ -2870,18 +2870,13 @@ fn append_eol_blame(spans: &mut Vec<Span<'static>>, blame: Option<&str>) {
     }
 }
 
-/// One-line blame label: `author · 3 days ago · summary`, or a plain marker for a line the user
-/// has edited but not committed.
+/// One-line blame label: `author · 3 days ago`, or a plain marker for a line the user has edited
+/// but not committed. The commit message lives in the `Space o` details popover, not inline.
 fn format_blame(info: &BlameInfo) -> String {
     if info.is_uncommitted {
         return "You · Uncommitted".to_string();
     }
-    format!(
-        "{} · {} · {}",
-        info.author,
-        relative_time(info.timestamp),
-        info.summary
-    )
+    format!("{} · {}", info.author, relative_time(info.timestamp))
 }
 
 /// Coarse "N units ago" rendering of a Unix timestamp against the wall clock. Future timestamps

@@ -87,13 +87,51 @@ pub struct GitBlameLineResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlameInfo {
-    /// Abbreviated (7-char) commit hash. Empty when `is_uncommitted`.
+    /// Abbreviated (7-char) commit hash. Empty when `is_uncommitted`. The full message and metadata
+    /// are fetched on demand via `git/commit_info` (the blame popover), keyed by this hash.
     pub commit: String,
     pub author: String,
     /// Author time as Unix seconds. `0` when `is_uncommitted`.
     pub timestamp: i64,
-    /// First line of the commit message. Empty when `is_uncommitted`.
-    pub summary: String,
     /// The line is a local, not-yet-committed edit (or a brand-new working-tree line).
     pub is_uncommitted: bool,
+}
+
+// ---- git/commit_info ----------------------------------------------------------------------------
+
+/// Full details for a single commit, resolved on demand from a hash the client already has (e.g.
+/// the abbreviated hash in a line's [`BlameInfo`]). Drives the blame "commit details" popover and
+/// is deliberately generic — not blame-specific — so a future log/show view can reuse it.
+pub struct GitCommitInfo;
+impl RpcMethod for GitCommitInfo {
+    const NAME: &'static str = "git/commit_info";
+    type Params = GitCommitInfoParams;
+    type Result = GitCommitInfoResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitCommitInfoParams {
+    /// Used to locate the repo (the commit is resolved in that buffer's repository).
+    pub buffer_id: BufferId,
+    /// Any revision the repo can parse — typically the abbreviated hash from [`BlameInfo::commit`].
+    pub commit: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitCommitInfoResult {
+    /// `None` when there's no repo for the buffer or the revision doesn't resolve to a commit.
+    pub info: Option<CommitInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitInfo {
+    /// Full (40-char) commit hash.
+    pub commit: String,
+    pub author: String,
+    pub email: String,
+    /// Author date, pre-formatted by the server in the commit's own timezone
+    /// (`YYYY-MM-DD HH:MM:SS ±HHMM`), so both clients render it identically without a date library.
+    pub date: String,
+    /// The complete commit message (subject + body), trailing whitespace trimmed.
+    pub message: String,
 }

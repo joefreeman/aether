@@ -46,8 +46,8 @@ use aether_protocol::project::{
     ProjectRemoveRootResult, ProjectRenameParams, ProjectSummary,
 };
 use aether_protocol::git::{
-    GitBlameLineParams, GitBlameLineResult, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitSetDiffViewParams, HunkDirection,
+    GitBlameLineParams, GitBlameLineResult, GitCommitInfoParams, GitCommitInfoResult,
+    GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams, HunkDirection,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -1008,6 +1008,25 @@ pub async fn git_blame_line(
         .get(&params.buffer_id)
         .and_then(|c| c.lines.get(params.line as usize).cloned().flatten());
     Ok(GitBlameLineResult { blame })
+}
+
+/// Full details for a single commit (the blame "commit details" popover). Best-effort: a buffer
+/// with no repo, or a revision that doesn't resolve, yields `info: None` rather than an error.
+pub async fn git_commit_info(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: GitCommitInfoParams,
+) -> Result<GitCommitInfoResult, RpcError> {
+    let s = state.lock().await;
+    if !s.buffers.contains_key(&params.buffer_id) {
+        return Err(RpcError::buffer_not_found(params.buffer_id));
+    }
+    let info = s
+        .git_baseline
+        .get(&params.buffer_id)
+        .and_then(|b| b.repo.as_ref())
+        .and_then(|repo| crate::git::commit_info(repo, &params.commit));
+    Ok(GitCommitInfoResult { info })
 }
 
 /// Toggle the inline diff view for a viewport. Turning it on recomputes the buffer's hunks (they

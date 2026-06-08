@@ -258,6 +258,8 @@ pub enum Action {
     PrevDiagnostic,
     /// Format the whole buffer via the language server.
     Format,
+    /// Show the full commit details for the cursor line's blame in the hover popover.
+    ShowCommitInfo,
 }
 
 impl Action {
@@ -284,6 +286,7 @@ impl Action {
                 | Action::NextDiagnostic
                 | Action::PrevDiagnostic
                 | Action::Format
+                | Action::ShowCommitInfo
                 | Action::ToggleWrap
                 | Action::ToggleDiffView
                 | Action::NextHunk
@@ -653,6 +656,7 @@ static LEADER: &[Binding] = &[
     bind!(LEADER_CTX, ch('i'), Exact(NONE), A::ToggleDiffView, "View", "Toggle inline diff"),
     bind!(LEADER_CTX, ch('h'), Exact(NONE), A::NextHunk, "View", "Next change (hunk)"),
     bind!(LEADER_CTX, ch('h'), Exact(ALT), A::PrevHunk, "View", "Previous change (hunk)"),
+    bind!(LEADER_CTX, ch('o'), Exact(NONE), A::ShowCommitInfo, "View", "Blame commit details"),
     bind!(LEADER_CTX, ch('m'), Exact(NONE), A::Format, "Code", "Format document"),
     bind!(LEADER_CTX, ch('k'), Exact(NONE), A::Hover, "Code", "Hover (type & docs)"),
     bind!(LEADER_CTX, ch('d'), Exact(NONE), A::GotoDefinition, "Code", "Go to definition"),

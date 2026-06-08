@@ -133,6 +133,7 @@ normal and line-scoped in insert (since insert has no selection).
 | `Space d` | Go to definition |
 | `Space k` | Hover (type & docs) |
 | `Space j` | Show diagnostic at cursor |
+| `Space o` | Show Git commit for line |
 | `Space x`/`Space Alt-x` | Next/previous diagnostic |
 | `Space t` | Diagnostics list |
 | `Space m` | Format document |

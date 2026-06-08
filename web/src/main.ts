@@ -39,8 +39,10 @@ import type {
   DiagnosticSeverity,
   Direction,
   BlameInfo,
+  CommitInfo,
   EditResult,
   GitBlameLineResult,
+  GitCommitInfoResult,
   GitNavigateHunkResult,
   LspDiagnosticsChangedParams,
   LspFormatResult,
@@ -169,10 +171,16 @@ function regexEscape(s: string): string {
   return s.replace(/[\\.+*?()|[\]{}^$#&\-~]/g, "\\$&");
 }
 
-/** EOL blame text: "You · Uncommitted" or "author · <relative time> · summary" (mirrors ui.rs). */
+/** EOL blame text: "You · Uncommitted" or "author · <relative time>" (mirrors ui.rs). The commit
+ * message lives in the `Space o` details popover, not inline. */
 function formatBlame(info: BlameInfo): string {
   if (info.is_uncommitted) return "You · Uncommitted";
-  return `${info.author} · ${relativeTime(info.timestamp)} · ${info.summary}`;
+  return `${info.author} · ${relativeTime(info.timestamp)}`;
+}
+
+/** Commit-details popover body, mirroring `git show`'s header (app.rs `format_commit_details`). */
+function formatCommitDetails(info: CommitInfo): string {
+  return `commit ${info.commit}\nAuthor: ${info.author} <${info.email}>\nDate:   ${info.date}\n\n${info.message}`;
 }
 function relativeTime(unixSeconds: number): string {
   const secs = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
@@ -1592,6 +1600,29 @@ class Editor {
       case "showDiagnostic":
         this.showDiagnosticAtCursor();
         break;
+      case "showCommitInfo": {
+        // Blame the cursor line for its commit hash, then resolve full details (the cached EOL
+        // blame keeps only display text, so re-fetch). Mirrors the TUI's `Space o`.
+        const bl = await this.client.rpc<GitBlameLineResult>("git/blame_line", {
+          buffer_id: this.bufferId,
+          line: this.cursor.position.line,
+        });
+        if (!bl.blame) {
+          this.setStatus("No commit details for this line");
+          break;
+        }
+        if (bl.blame.is_uncommitted) {
+          this.setStatus("Uncommitted line — no commit details");
+          break;
+        }
+        const ci = await this.client.rpc<GitCommitInfoResult>("git/commit_info", {
+          buffer_id: this.bufferId,
+          commit: bl.blame.commit,
+        });
+        if (ci.info) this.showHover(formatCommitDetails(ci.info));
+        else this.setStatus("Commit not found");
+        break;
+      }
       case "navigateDiagnostic": {
         const r = await this.client.rpc<LspNavigateDiagnosticResult>("lsp/navigate_diagnostic", {
           buffer_id: this.bufferId,
@@ -2417,8 +2448,18 @@ class Editor {
     this.hoverOpen = true;
     const cell = this.bufferEl.querySelector(".cursor") as HTMLElement | null;
     const r = (cell ?? this.bufferEl).getBoundingClientRect();
-    this.hoverEl.style.left = `${Math.round(r.left)}px`;
-    this.hoverEl.style.top = `${Math.round(r.bottom + 2)}px`;
+    // Measure the box (content + display are set above) and place it so it stays on-screen: below
+    // the cursor when it fits, otherwise flipped above; horizontally clamped to the viewport.
+    const margin = 4;
+    const box = this.hoverEl.getBoundingClientRect();
+    const left = Math.max(margin, Math.min(r.left, window.innerWidth - box.width - margin));
+    let top = r.bottom + margin;
+    if (top + box.height > window.innerHeight - margin) {
+      const above = r.top - box.height - margin;
+      top = above >= margin ? above : Math.max(margin, window.innerHeight - box.height - margin);
+    }
+    this.hoverEl.style.left = `${Math.round(left)}px`;
+    this.hoverEl.style.top = `${Math.round(top)}px`;
   }
 
   private dismissHover(): void {

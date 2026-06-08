@@ -332,11 +332,24 @@ export interface BlameInfo {
   commit: string;
   author: string;
   timestamp: number;
-  summary: string;
   is_uncommitted: boolean;
 }
 export interface GitBlameLineResult {
   blame?: BlameInfo | null;
+}
+export interface GitCommitInfoParams {
+  buffer_id: BufferId;
+  commit: string;
+}
+export interface CommitInfo {
+  commit: string;
+  author: string;
+  email: string;
+  date: string;
+  message: string;
+}
+export interface GitCommitInfoResult {
+  info?: CommitInfo | null;
 }
 
 // ---- grep navigate (cached hits, < / >) ---------------------------------------------------------

@@ -15,8 +15,9 @@ use aether_protocol::envelope::{
     RpcMethod,
 };
 use aether_protocol::git::{
-    BlameInfo, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitNavigateHunk,
-    GitNavigateHunkParams, HunkDirection, GitSetDiffView, GitSetDiffViewParams,
+    BlameInfo, CommitInfo, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCommitInfo,
+    GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams, HunkDirection,
+    GitSetDiffView, GitSetDiffViewParams,
 };
 use aether_protocol::viewport::{
     DiagnosticSeverity, DiagnosticSpan, DiffMarker, LogicalLineRender, VirtualRow, VirtualRowKind,
@@ -97,7 +98,6 @@ fn git_blame_line_result_roundtrip() {
             commit: "a1b2c3d".into(),
             author: "Ada".into(),
             timestamp: 1_700_000_000,
-            summary: "Wire up blame".into(),
             is_uncommitted: false,
         }),
     };
@@ -106,11 +106,45 @@ fn git_blame_line_result_roundtrip() {
     assert_eq!(v["blame"]["author"], "Ada");
     assert_eq!(v["blame"]["timestamp"], 1_700_000_000_i64);
     assert_eq!(v["blame"]["is_uncommitted"], false);
+    // The commit message no longer rides along on blame — it's fetched via `git/commit_info`.
+    assert!(v["blame"].get("summary").is_none());
     let back: GitBlameLineResult = from_value(v).unwrap();
-    assert_eq!(back.blame.unwrap().summary, "Wire up blame");
+    assert_eq!(back.blame.unwrap().author, "Ada");
 
     let none = GitBlameLineResult { blame: None };
     assert_eq!(to_value(&none).unwrap(), json!({"blame": null}));
+}
+
+#[test]
+fn git_commit_info_roundtrip() {
+    let p = GitCommitInfoParams {
+        buffer_id: 7,
+        commit: "a1b2c3d".into(),
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({"buffer_id": 7, "commit": "a1b2c3d"})
+    );
+    assert_eq!(GitCommitInfo::NAME, "git/commit_info");
+
+    let res = GitCommitInfoResult {
+        info: Some(CommitInfo {
+            commit: "a1b2c3d4e5f6".into(),
+            author: "Ada".into(),
+            email: "ada@example.com".into(),
+            date: "2026-06-01 14:32:05 +0100".into(),
+            message: "Wire up blame\n\nLong body.".into(),
+        }),
+    };
+    let v = to_value(&res).unwrap();
+    assert_eq!(v["info"]["commit"], "a1b2c3d4e5f6");
+    assert_eq!(v["info"]["email"], "ada@example.com");
+    assert_eq!(v["info"]["date"], "2026-06-01 14:32:05 +0100");
+    let back: GitCommitInfoResult = from_value(v).unwrap();
+    assert_eq!(back.info.unwrap().message, "Wire up blame\n\nLong body.");
+
+    let none = GitCommitInfoResult { info: None };
+    assert_eq!(to_value(&none).unwrap(), json!({"info": null}));
 }
 
 #[test]

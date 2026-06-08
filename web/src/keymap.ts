@@ -77,6 +77,7 @@ export type Action =
   | { t: "hover" }
   | { t: "gotoDefinition" }
   | { t: "showDiagnostic" }
+  | { t: "showCommitInfo" }
   | { t: "navigateDiagnostic"; dir: "next" | "prev" }
   | { t: "format" }
   // clipboard (system clipboard via navigator.clipboard / the native paste event)
@@ -281,6 +282,7 @@ const LEADER: Binding[] = [
   b("i", exact(), { t: "toggleDiffView" }),
   b("h", exact(false, true), { t: "navigateHunk", dir: "prev" }),
   b("h", exact(), { t: "navigateHunk", dir: "next" }),
+  b("o", exact(), { t: "showCommitInfo" }),
   b("k", exact(), { t: "hover" }),
   b("d", exact(), { t: "gotoDefinition" }),
   b("j", exact(), { t: "showDiagnostic" }),
