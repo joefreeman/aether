@@ -492,9 +492,13 @@ html, body, #app {
   overflow: hidden;
   cursor: pointer;
 }
-/* Subtle hover — underline the label (lighter cue than the keyboard-selection background); not on
-   headers or the selected row. */
-.picker-row:not(.grep-header):not(.selected):hover .picker-main {
+/* File rows are <a> (Ctrl/Cmd/middle-click → new tab); make them indistinguishable from div rows —
+   no link color, no underline, no focus ring (the picker draws its own selection highlight). */
+a.picker-row { color: inherit; text-decoration: none; outline: none; }
+/* Subtle hover — underline the label (lighter cue than the keyboard-selection background). Only on
+   anchor rows, so the underline doubles as a hint for which rows open in a new tab; not the selected
+   row. (Grep headers and other non-openable rows are plain <div>s, so they're excluded already.) */
+a.picker-row:not(.selected):hover .picker-main {
   text-decoration: underline;
 }
 .picker-row.selected {

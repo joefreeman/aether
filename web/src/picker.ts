@@ -48,6 +48,10 @@ export interface PickerOptions {
   onCreatePath?: (absPath: string) => void;
   /** Create + activate a new project (Projects "+ create project"). */
   onCreateProject?: (name: string) => void;
+  /** Opener URL for a picker item, or null. When it returns a URL the row is rendered as an
+   *  `<a href>` so Ctrl/Cmd/middle-click opens it in a new browser tab. `explorerDir` is the current
+   *  explorer directory (for resolving `dir_entry` paths); ignored by the other picker kinds. */
+  fileUrl?: (item: PickerItem, explorerDir: string | null) => string | null;
 }
 
 export class Picker {
@@ -61,6 +65,7 @@ export class Picker {
   private onToast: (message: string, kind?: ToastKind) => void;
   private onCreatePath: (absPath: string) => void;
   private onCreateProject: (name: string) => void;
+  private fileUrl: (item: PickerItem, explorerDir: string | null) => string | null;
 
   private overlay: HTMLElement;
   private pathEl: HTMLElement;
@@ -73,6 +78,9 @@ export class Picker {
   private selected = 0; // absolute index of the highlighted item
   private total = 0;
   private generation = 0;
+  // Generation of the last *processed* update — lets onUpdate tell a same-query re-rank (preserve the
+  // highlighted item) from the first push after a query change (selection already reset to the top).
+  private lastPushGeneration = -1;
   private ticking = false;
   private requestedOffset = 0;
 
@@ -106,6 +114,7 @@ export class Picker {
     this.onToast = opts.onToast ?? (() => {});
     this.onCreatePath = opts.onCreatePath ?? (() => {});
     this.onCreateProject = opts.onCreateProject ?? (() => {});
+    this.fileUrl = opts.fileUrl ?? (() => null);
 
     this.overlay = document.createElement("div");
     this.overlay.className = "overlay";
@@ -178,6 +187,14 @@ export class Picker {
   /** Server-pushed window contents. Discard stale generations (in-flight prior queries). */
   onUpdate(p: PickerUpdateParams): void {
     if (p.kind !== this.kind || p.generation !== this.generation) return;
+    // Across a same-query re-rank — the server re-pushing the window without a query change, e.g. the
+    // buffers list reordering when a buffer is opened (in this or another tab) — keep the highlight on
+    // the same *item* rather than the same index, which would otherwise jump to whatever now sits at
+    // that index. A query change bumps the generation, so prevKey is null then and selection (already
+    // reset to the top by query()) stands.
+    const prevKey =
+      p.generation === this.lastPushGeneration ? this.selectedKeyInWindow() : null;
+    this.lastPushGeneration = p.generation;
     this.items = p.items;
     this.offset = p.offset;
     this.total = p.total_matches;
@@ -194,6 +211,9 @@ export class Picker {
       } else if (!this.ticking) {
         this.pendingSelectMatch = null; // not in the listing — give up
       }
+    } else if (prevKey != null) {
+      const idx = this.items.findIndex((it) => itemKey(it) === prevKey);
+      if (idx >= 0) this.selected = this.offset + idx; // follow the item to its new position
     }
     // No ensureWindow here: the loaded window can legitimately differ from the selection's location
     // (the user scrolled away). Re-centering on the selection here would replace the just-loaded
@@ -205,6 +225,14 @@ export class Picker {
       this.scrollSelectionIntoView();
       this.scrollToSelOnUpdate = false;
     }
+  }
+
+  /** Identity key of the highlighted item, if it's within the loaded window (null otherwise — e.g.
+   *  the selection scrolled out of view, or it's the synthetic "+ create" row). */
+  private selectedKeyInWindow(): string | null {
+    const local = this.selected - this.offset;
+    const it = local >= 0 && local < this.items.length ? this.items[local] : undefined;
+    return it ? itemKey(it) : null;
   }
 
   private async view(reset: boolean, offset: number): Promise<void> {
@@ -495,7 +523,11 @@ export class Picker {
           win.append(section);
         }
       }
-      const row = document.createElement("div");
+      // File-backed rows (Files / Grep / Buffers / Explorer files / Projects) render as anchors so
+      // Ctrl/Cmd/middle-click opens in a new tab natively; a plain click still opens in place (below).
+      const href = this.fileUrl(item, this.explorerDir);
+      const row: HTMLElement = document.createElement(href ? "a" : "div");
+      if (href) (row as HTMLAnchorElement).href = href;
       row.className = i === localSel ? "picker-row selected" : "picker-row";
       if (i === localSel) selectedRow = row;
       const { primary, primaryMatches, meta, prefix, prefixClass, dir } = this.describe(item);
@@ -515,7 +547,9 @@ export class Picker {
         m.textContent = meta;
         row.append(m);
       }
-      row.addEventListener("mousedown", (e) => {
+      row.addEventListener("mousedown", (e: MouseEvent) => {
+        // On an anchor row, let Ctrl/Cmd/middle-click fall through to the browser's open-in-new-tab.
+        if (href && (e.ctrlKey || e.metaKey || e.button === 1)) return;
         e.preventDefault();
         this.selected = this.offset + i;
         this.onEnter();
@@ -740,6 +774,29 @@ function basename(path: string): string {
   const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
   const i = trimmed.lastIndexOf("/");
   return i >= 0 ? trimmed.slice(i + 1) : trimmed;
+}
+
+/** Stable identity of a picker item, so the selection can follow the *item* across a same-query
+ *  re-rank (e.g. the buffers list reordering on open) instead of sticking to a now-stale index. */
+function itemKey(item: PickerItem): string {
+  switch (item.kind) {
+    case "file":
+      return `file\0${item.path_index}\0${item.relative_path}`;
+    case "buffer":
+      return `buffer\0${item.buffer_id}`;
+    case "grep_hit":
+      return `grep\0${item.path_index}\0${item.relative_path}\0${item.line}\0${item.col}`;
+    case "diagnostic":
+      return `diag\0${item.line}\0${item.col}\0${item.message}`;
+    case "project":
+      return `project\0${item.name}`;
+    case "dir_entry":
+      return `dir\0${item.name}`;
+    case "root":
+      return `root\0${item.path_index}`;
+    case "lsp_server":
+      return `lsp\0${item.language}\0${item.workspace_root}`;
+  }
 }
 
 /** Identity of a grep hit (same line/col in the same file) — for centering + selection restore. */

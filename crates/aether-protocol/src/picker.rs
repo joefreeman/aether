@@ -90,6 +90,13 @@ pub enum PickerItem {
         /// for scratch buffers. Also the haystack the matcher scores against.
         display: String,
         dirty: bool,
+        /// Project-relative location (root index + path) for a file-backed buffer that lives inside
+        /// a project root — mirrors `File`'s fields so the client can build an opener URL. Both are
+        /// `None` for scratch buffers and for files outside every root (no `?file=` URL possible).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relative_path: Option<String>,
         /// Indices into `display` (char offsets) covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,

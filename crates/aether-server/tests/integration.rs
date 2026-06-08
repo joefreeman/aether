@@ -7696,6 +7696,27 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         .collect();
     assert_eq!(displays, vec!["src/main.rs", "src/lib.rs", "README.md"]);
 
+    // File-backed buffers also carry their (root index, relative path) so the web client can build
+    // an opener URL. Single-root project here, so the relative path equals the display string.
+    let paths: Vec<(Option<u32>, Option<&str>)> = update
+        .items
+        .iter()
+        .map(|i| {
+            let PickerItem::Buffer { path_index, relative_path, .. } = i else {
+                panic!("expected Buffer, got {i:?}")
+            };
+            (*path_index, relative_path.as_deref())
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            (Some(0), Some("src/main.rs")),
+            (Some(0), Some("src/lib.rs")),
+            (Some(0), Some("README.md")),
+        ]
+    );
+
     drop(server);
 }
 

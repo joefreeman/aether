@@ -26,6 +26,9 @@ pub struct BufferCandidate {
     /// file-backed buffers; `(scratch N)` for scratch buffers.
     pub display: String,
     pub dirty: bool,
+    /// Project-relative location (root index + path) when the buffer is a file inside a root;
+    /// `None` for scratch buffers / out-of-root files. Sent so the client can build an opener URL.
+    pub path: Option<(u32, String)>,
 }
 
 /// One project-picker candidate. Built fresh per `picker/view` from
@@ -223,6 +226,8 @@ impl PickerCandidates {
                     buffer_id: c.buffer_id,
                     display: c.display.clone(),
                     dirty: c.dirty,
+                    path_index: c.path.as_ref().map(|(i, _)| *i),
+                    relative_path: c.path.as_ref().map(|(_, r)| r.clone()),
                     match_indices,
                 }
             }

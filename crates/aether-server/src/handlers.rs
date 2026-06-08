@@ -6903,10 +6903,17 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
             .unwrap_or_else(|| p.display().to_string()),
         None => format!("(scratch {})", buf.scratch_number.map(u64::from).unwrap_or(buf.id)),
     };
+    // The (root index, relative path) the client needs for an opener URL — `None` for scratch
+    // buffers and files outside every root (display still falls back to the absolute path above).
+    let path = buf
+        .canonical_path
+        .as_deref()
+        .and_then(|p| crate::workspace_index::project_relative_parts(p, roots));
     picker_state::BufferCandidate {
         buffer_id: buf.id,
         display,
         dirty: buf.dirty,
+        path,
     }
 }
 

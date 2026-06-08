@@ -129,6 +129,10 @@ function dirname(path: string): string {
   const i = path.lastIndexOf("/");
   return i > 0 ? path.slice(0, i) : "/";
 }
+function joinPath(dir: string, name: string): string {
+  if (!dir) return name;
+  return dir.endsWith("/") ? dir + name : `${dir}/${name}`;
+}
 function lspKey(language: string, workspaceRoot: string): string {
   return `${language}\0${workspaceRoot}`;
 }
@@ -419,6 +423,9 @@ class Editor {
       const urlProject = sp.get("project");
       const urlFile = sp.get("file");
       const urlRoot = Number(sp.get("root")) || 0;
+      const urlBufferRaw = sp.get("buffer");
+      const urlBuffer =
+        urlBufferRaw != null && Number.isInteger(Number(urlBufferRaw)) ? Number(urlBufferRaw) : null;
       const known = list.projects.some((p) => p.name === urlProject);
       const name = (known ? urlProject : null) ?? cfg.project ?? list.projects[0]?.name;
       if (!name) {
@@ -440,6 +447,17 @@ class Editor {
           });
         } catch {
           this.toast(`could not open ${urlFile}`, "warning");
+          open = await this.client.rpc<BufferOpenResult>("buffer/open", lastOrScratch);
+        }
+      } else if (urlBuffer != null) {
+        // A scratch-buffer link (`?buffer=<id>`). The id is session-scoped: if the buffer was closed
+        // or the server restarted it no longer exists, so fall back to the project's last/scratch.
+        try {
+          open = await this.client.rpc<BufferOpenResult>("buffer/open", {
+            buffer_id: urlBuffer,
+            create_if_missing: false,
+          });
+        } catch {
           open = await this.client.rpc<BufferOpenResult>("buffer/open", lastOrScratch);
         }
       } else {
@@ -924,6 +942,7 @@ class Editor {
       kind,
       onConfirm: (item) => this.onPickerConfirm(item),
       onClose: () => this.closePicker(),
+      fileUrl: (item, explorerDir) => this.pickerItemUrl(item, explorerDir),
       explorerInitialDir: kind === "explorer" ? this.explorerInitialDir() : undefined,
       explorerSelectName: kind === "explorer" && this.currentPath ? basename(this.currentPath) : undefined,
       projectPaths: this.projectPaths,
@@ -1074,7 +1093,7 @@ class Editor {
   // survives reconnect and reload), and the URL is kept human-shareable: `?project=…&file=…#L:C`
   // (or `#aL:aC-cL:cC` for a selection, anchor first).
 
-  /** The `?project=&file=` (or `&scratch=`) query reflecting the current buffer. */
+  /** The `?project=&file=` (or `&buffer=`) query reflecting the current buffer. */
   private buildQuery(): string {
     const params = new URLSearchParams();
     if (this.projectName) params.set("project", this.projectName);
@@ -1087,7 +1106,10 @@ class Editor {
         params.set("file", this.currentPath); // outside any root — fall back to the absolute path
       }
     } else if (this.scratchNumber != null) {
-      params.set("scratch", String(this.scratchNumber));
+      // Scratch buffer: no path, so key the URL on the (session-scoped) buffer id — bootstrap and
+      // navState both reopen scratch buffers by id. Stale after a server restart; bootstrap then
+      // falls back to a fresh scratch.
+      params.set("buffer", String(this.bufferId));
     }
     return params.toString();
   }
@@ -1124,6 +1146,55 @@ class Editor {
   private buildUrl(): string {
     const qs = this.buildQuery();
     return `${location.pathname}${qs ? `?${qs}` : ""}${this.cursorFragment()}`;
+  }
+
+  /** `?project=&root=&file=` query for a file at (root index, relative path), mirroring buildQuery. */
+  private fileQuery(pathIndex: number, relativePath: string): string {
+    const params = new URLSearchParams();
+    if (this.projectName) params.set("project", this.projectName);
+    if (pathIndex) params.set("root", String(pathIndex));
+    params.set("file", relativePath);
+    return params.toString();
+  }
+
+  /** Opener URL for a picker item, so the picker can render the row as an `<a>` that opens in a new
+   *  tab on Ctrl/Cmd/middle-click. Returns null when no shareable URL applies (scratch buffers,
+   *  directories, items outside any root — bootstrap only opens files relative to a root).
+   *  - file / file-backed buffer:  `?project=&root=&file=`
+   *  - scratch buffer:  `?project=&buffer=<id>` (session-scoped; bootstrap falls back if stale)
+   *  - grep_hit:        …plus the (0-based) hit position as a 1-based `#L:C` fragment
+   *  - dir_entry:       resolved from `explorerDir + name` (files only)
+   *  - project:         `?project=` alone (bootstrap opens that project's last buffer) */
+  private pickerItemUrl(item: PickerItem, explorerDir: string | null): string | null {
+    const fromPath = (pathIndex: number, relativePath: string, frag = ""): string =>
+      `${location.pathname}?${this.fileQuery(pathIndex, relativePath)}${frag}`;
+    switch (item.kind) {
+      case "file":
+        return fromPath(item.path_index, item.relative_path);
+      case "grep_hit":
+        return fromPath(item.path_index, item.relative_path, `#${item.line + 1}:${item.col + 1}`);
+      case "buffer": {
+        if (item.path_index != null && item.relative_path != null) {
+          return fromPath(item.path_index, item.relative_path);
+        }
+        // Scratch buffer: no path, so link by its (session-scoped) buffer id (see buildQuery).
+        const params = new URLSearchParams();
+        if (this.projectName) params.set("project", this.projectName);
+        params.set("buffer", String(item.buffer_id));
+        return `${location.pathname}?${params.toString()}`;
+      }
+      case "dir_entry": {
+        if (item.is_dir || !explorerDir) return null;
+        const r = this.resolvePath(joinPath(explorerDir, item.name));
+        return r ? fromPath(r.path_index ?? 0, r.relative_path ?? "") : null;
+      }
+      case "project": {
+        const params = new URLSearchParams({ project: item.name });
+        return `${location.pathname}?${params.toString()}`;
+      }
+      default:
+        return null;
+    }
   }
 
   /** The location to stash in `history.state` so `popstate` can restore it via `nav/goto`. */

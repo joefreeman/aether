@@ -487,7 +487,7 @@ export type LspStatus =
  *  are code-point offsets into the row's display string, covered by the fuzzy match. */
 export type PickerItem =
   | { kind: "file"; path_index: number; relative_path: string; match_indices?: number[] }
-  | { kind: "buffer"; buffer_id: BufferId; display: string; dirty: boolean; match_indices?: number[] }
+  | { kind: "buffer"; buffer_id: BufferId; display: string; dirty: boolean; path_index?: number; relative_path?: string; match_indices?: number[] }
   | {
       kind: "grep_hit";
       path_index: number;
