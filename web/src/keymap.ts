@@ -174,12 +174,12 @@ const NORMAL: Binding[] = [
   b("u", ignoreShift(false, true), { t: "pageMotion", dir: "up", half: true }),
   b("u", ignoreShift(), { t: "pageMotion", dir: "up", half: false }),
 
-  b("w", ignoreShift(false, true), { t: "moveWord", dir: "forward", boundary: "word" }),
-  b("w", ignoreShift(), { t: "moveWord", dir: "forward", boundary: "WORD" }),
-  b("b", ignoreShift(false, true), { t: "moveWord", dir: "backward", boundary: "word" }),
-  b("b", ignoreShift(), { t: "moveWord", dir: "backward", boundary: "WORD" }),
-  b("e", ignoreShift(false, true), { t: "moveWordEnd", dir: "forward", boundary: "word" }),
-  b("e", any, { t: "moveWordEnd", dir: "forward", boundary: "WORD" }),
+  b("w", ignoreShift(false, true), { t: "moveWord", dir: "forward", boundary: "WORD" }),
+  b("w", ignoreShift(), { t: "moveWord", dir: "forward", boundary: "word" }),
+  b("b", ignoreShift(false, true), { t: "moveWord", dir: "backward", boundary: "WORD" }),
+  b("b", ignoreShift(), { t: "moveWord", dir: "backward", boundary: "word" }),
+  b("e", ignoreShift(false, true), { t: "moveWordEnd", dir: "forward", boundary: "WORD" }),
+  b("e", any, { t: "moveWordEnd", dir: "forward", boundary: "word" }),
 
   b("f", ignoreShift(false, true), { t: "beginFind", dir: "backward", till: false }),
   b("f", ignoreShift(), { t: "beginFind", dir: "forward", till: false }),

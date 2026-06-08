@@ -512,12 +512,12 @@ static NORMAL: &[Binding] = &[
     bind!(NORMAL_CTX, ch('u'), IgnoreShift(ALT), A::PageMotion { dir: VerticalDirection::Up, half: true }, "Motion", "Cursor up half a page"),
 
     // ---- motions: words ----
-    bind!(NORMAL_CTX, ch('w'), IgnoreShift(ALT), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word forward"),
-    bind!(NORMAL_CTX, ch('w'), IgnoreShift(NONE), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word forward"),
-    bind!(NORMAL_CTX, ch('b'), IgnoreShift(ALT), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::Word }, "Motion", "Small word backward"),
-    bind!(NORMAL_CTX, ch('b'), IgnoreShift(NONE), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::BigWord }, "Motion", "Big word backward"),
-    bind!(NORMAL_CTX, ch('e'), IgnoreShift(ALT), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word end"),
-    bind!(NORMAL_CTX, ch('e'), Any, A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word end"),
+    bind!(NORMAL_CTX, ch('w'), IgnoreShift(ALT), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word forward"),
+    bind!(NORMAL_CTX, ch('w'), IgnoreShift(NONE), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word forward"),
+    bind!(NORMAL_CTX, ch('b'), IgnoreShift(ALT), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::BigWord }, "Motion", "Big word backward"),
+    bind!(NORMAL_CTX, ch('b'), IgnoreShift(NONE), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::Word }, "Motion", "Small word backward"),
+    bind!(NORMAL_CTX, ch('e'), IgnoreShift(ALT), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word end"),
+    bind!(NORMAL_CTX, ch('e'), Any, A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word end"),
 
     // ---- motions: find char ----
     bind!(NORMAL_CTX, ch('f'), IgnoreShift(ALT), A::BeginFind { dir: Direction::Backward, till: false }, "Motion", "Find character backward"),

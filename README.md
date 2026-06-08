@@ -34,9 +34,9 @@ Type `Space ?` for the in-app overlay. Holding the Shift key extends the selecti
 | `h`/`l` | Character left/right |
 | `j`/`Alt-j` | Logical/visual line down |
 | `k`/`Alt-k` | Logical/visual line up |
-| `w`/`Alt-w` | Big/small word forward |
-| `b`/`Alt-b` | Big/small word backward |
-| `e`/`Alt-e` | Big/small word end |
+| `w`/`Alt-w` | Small/big word forward |
+| `b`/`Alt-b` | Small/big word backward |
+| `e`/`Alt-e` | Small/big word end |
 | `0`, `Home` | Logical line start |
 | `Alt-l`, `End` | Logical line end |
 | `Alt-h` | First non-blank of line |
