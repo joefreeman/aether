@@ -98,14 +98,14 @@ interface LineSelection {
   toEnd: boolean;
 }
 
-function makeSpan(text: string, style: CellStyle, insertMode: boolean): Node {
+function makeSpan(text: string, style: CellStyle, cursorClass: string): Node {
   const classes: string[] = [];
   if (style.hl) classes.push(style.hl);
   if (style.bracket) classes.push("match-bracket");
   if (style.diag) classes.push("diag-" + style.diag);
   if (style.search) classes.push("search-hit");
   if (style.sel) classes.push("sel");
-  if (style.cursor) classes.push(insertMode ? "cursor insert" : "cursor");
+  if (style.cursor) classes.push(cursorClass);
   if (classes.length === 0) return document.createTextNode(text);
   const span = document.createElement("span");
   span.className = classes.join(" ");
@@ -145,7 +145,7 @@ function renderVisualRow(
   isLastRow: boolean,
   cursorByte: number | null,
   sel: LineSelection | null,
-  insertMode: boolean,
+  cursorClass: string,
   bracketBytes: number[],
   blame: string | null,
   diffView: boolean,
@@ -261,7 +261,7 @@ function renderVisualRow(
     const style = cellAt(i);
     let j = i + 1;
     while (j < n && sameStyle(style, cellAt(j))) j++;
-    textEl.appendChild(makeSpan(cps.slice(i, j).join(""), style, insertMode));
+    textEl.appendChild(makeSpan(cps.slice(i, j).join(""), style, cursorClass));
     i = j;
   }
 
@@ -270,7 +270,7 @@ function renderVisualRow(
       makeSpan(
         " ",
         { hl: null, diag: null, search: false, sel: selTrailing, cursor: cursorAtEnd, bracket: false },
-        insertMode,
+        cursorClass,
       ),
     );
   }
@@ -321,6 +321,9 @@ export interface RenderOpts {
   window: BufferWindow;
   cursor: CursorState;
   insertMode: boolean;
+  /** Waiting for the next keystroke of a chord (find target, leader, surround, partial count) —
+   *  shown as an underscore cursor, matching the terminal. Takes precedence over insert/normal. */
+  awaitingKey: boolean;
   /** Full content width in px for native horizontal scroll (no-wrap), or 0 to fit the container. */
   contentWidthPx: number;
   /** Full-document scroll height in px (total_visual_rows × lineHeight) — sizes the scroller. */
@@ -335,7 +338,10 @@ export interface RenderOpts {
 
 /** Repaint the whole buffer area from the current window + cursor. */
 export function renderBuffer(container: HTMLElement, opts: RenderOpts): void {
-  const { window, cursor, insertMode, contentWidthPx, spacerHeightPx, contentTopPx, blame, diffView } = opts;
+  const { window, cursor, insertMode, awaitingKey, contentWidthPx, spacerHeightPx, contentTopPx, blame, diffView } = opts;
+  // The cursor's appearance is decided once here: an underscore while waiting for the next key of a
+  // chord (overriding mode), else a bar in Insert, else a block. `makeSpan` just appends this class.
+  const cursorClass = awaitingKey ? "cursor pending" : insertMode ? "cursor insert" : "cursor";
   const isPoint =
     cursor.position.line === cursor.anchor.line && cursor.position.col === cursor.anchor.col;
   const min = lessEq(cursor.anchor, cursor.position) ? cursor.anchor : cursor.position;
@@ -373,7 +379,7 @@ export function renderBuffer(container: HTMLElement, opts: RenderOpts): void {
           isLast,
           cursorByte,
           sel,
-          insertMode,
+          cursorClass,
           bracketBytes,
           blameLine && isLast ? blame : null,
           diffView,

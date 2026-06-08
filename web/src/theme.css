@@ -289,6 +289,10 @@ html, body, #app {
 .sel { background: var(--nord10); }
 .cursor { background: var(--nord4); color: var(--nord0); }
 .cursor.insert { background: transparent; color: inherit; box-shadow: inset 1.5px 0 0 var(--nord8); }
+/* Waiting for the next key of a chord (after f/t, Space, surround, or a partial count): an underscore
+   under the cell, matching the terminal's SteadyUnderScore. Like the insert caret, the glyph stays
+   visible (transparent fill, inherited fg) with the NORD8 accent on the bottom edge. */
+.cursor.pending { background: transparent; color: inherit; box-shadow: inset 0 -2px 0 var(--nord8); }
 
 /* Matching bracket (cursor on/inside a bracket pair) — bold orange, matching the terminal. */
 .match-bracket { color: var(--nord12); font-weight: bold; }

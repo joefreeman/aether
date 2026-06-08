@@ -567,6 +567,17 @@ class Editor {
     this.rows = Math.max(1, Math.floor(this.bufferEl.clientHeight / this.cell.h));
   }
 
+  /** Mid-chord, waiting for the next keystroke to land (find target, leader, surround delimiter, or a
+   *  partially-typed count). Drives the underscore cursor, mirroring the terminal's `awaiting_key`. */
+  private get awaitingKey(): boolean {
+    return (
+      this.pendingLeader ||
+      this.pendingFind !== null ||
+      this.pendingSurround !== null ||
+      this.pendingCount > 0
+    );
+  }
+
   private render(): void {
     if (!this.window) return;
     this.bufferEl.classList.toggle("hscroll", this.wrap === "none"); // enable native horizontal scroll
@@ -578,6 +589,7 @@ class Editor {
       window: this.window,
       cursor: this.cursor,
       insertMode: this.mode === "insert",
+      awaitingKey: this.awaitingKey,
       contentWidthPx: this.wrap === "none" ? this.cell.w * (this.window.max_line_width + 2) : 0,
       spacerHeightPx: this.window.total_visual_rows * this.cell.h + BUFFER_PAD * 2,
       contentTopPx: this.window.first_visual_row * this.cell.h + BUFFER_PAD,
@@ -764,10 +776,14 @@ class Editor {
         return;
       }
     }
+    const wasAwaiting = this.awaitingKey;
     const decision = this.classify(e);
     if (decision.handled) e.preventDefault();
     // Keep focus on the capture textarea (Tab would otherwise move it, breaking the next paste).
     else if (e.key === "Tab") e.preventDefault();
+    // Arming or clearing a chord (f/t, Space, surround, count) is pure state with no RPC, so nothing
+    // else would repaint the cursor — refresh here whenever the underscore-cursor state flips.
+    if (this.awaitingKey !== wasAwaiting) this.render();
     if (decision.run) (decision.noSync ? this.enqueueNoSync(decision.run) : this.enqueue(decision.run));
   }
 
