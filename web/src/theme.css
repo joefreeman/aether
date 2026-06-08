@@ -19,6 +19,10 @@
   --git-added-bg: #2d3a2d;
   --git-modified-bg: #3a3628;
   --git-deleted-bg: #3b2226;
+
+  /* Current-line tint, ~40% from NORD0 toward NORD1: subtler than NORD1 (which the status line
+     uses) so the cursorline doesn't read as a panel. Off-palette — Nord has no shade in between. */
+  --cursor-line-bg: #343a48;
 }
 
 html, body, #app {
@@ -234,6 +238,10 @@ html, body, #app {
 .row.added-bg { background: var(--git-added-bg); }
 .row.modified-bg { background: var(--git-modified-bg); }
 .row.deleted-phantom { background: var(--git-deleted-bg); color: var(--nord11); }
+/* Current-line highlight (Vim's `cursorline`). A subtle custom tint (see --cursor-line-bg), kept
+   distinct from the status line's NORD1. Ordered after the diff tints so it wins on the cursor's
+   changed line. */
+.row.cursor-line { background: var(--cursor-line-bg); }
 
 /* Native change-bar: a colored left border in the gutter column (no text glyph). The transparent
    border on every gutter keeps the text start aligned whether or not a line is changed. */
@@ -269,10 +277,15 @@ html, body, #app {
 .content { flex: 1 1 auto; }
 .cont-marker { color: var(--nord3); }
 
-/* Matches the terminal: search matches use NORD2 (gray-blue), the selection paints over them in the
-   more saturated NORD10 (deep blue) so it stands out. Precedence is source order (all single-class):
-   search-hit < selection < cursor — so a match inside a selection reads as selected, cursor wins. */
-.search-hit { background: var(--nord2); }
+/* Matches the terminal: a search match is a quiet NORD3 fill — the brightest of Nord's Polar Night
+   shades, so it stays visible on the NORD1 current-line tint while sitting below the selection. The
+   selection paints over it in the more saturated NORD10, and the cursor over that. Precedence is
+   source order (all single-class): search-hit < selection < cursor. */
+.search-hit { background: var(--nord3); }
+/* Comments are themed NORD3 too, so a match inside one would be invisible on the NORD3 fill. Lift
+   just that text to the normal foreground (the italic from .hl-comment stays); the compound selector
+   outranks .hl-comment so this wins. Every other syntax color reads fine on NORD3. */
+.search-hit.hl-comment { color: var(--nord4); }
 .sel { background: var(--nord10); }
 .cursor { background: var(--nord4); color: var(--nord0); }
 .cursor.insert { background: transparent; color: inherit; box-shadow: inset 1.5px 0 0 var(--nord8); }

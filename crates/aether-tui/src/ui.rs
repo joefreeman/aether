@@ -78,6 +78,12 @@ const GIT_DELETED_BG: Color = Color::Rgb(59, 34, 38); // dark muted red
 const GIT_ADDED_BG: Color = Color::Rgb(45, 58, 45); // dark muted green
 const GIT_MODIFIED_BG: Color = Color::Rgb(58, 54, 40); // dark muted olive
 
+// Current-line highlight (Vim's `cursorline`). A custom tint ~40% of the way from the NORD0
+// background to NORD1: subtler than NORD1 (which the status line uses, so the cursorline doesn't
+// read as heavy as a panel) while still clearly marking the line. Off-palette by necessity — Nord
+// has no shade between NORD0 and NORD1.
+const CURSOR_LINE_BG: Color = Color::Rgb(52, 58, 72);
+
 pub fn draw(f: &mut Frame, state: &AppState) {
     // The status row carries activation feedback, save-as / new-file prompts, and the dirty +
     // cursor indicator for an active editor. The add-root prompt lives *inside* the settings
@@ -2643,7 +2649,13 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             Some(DiffMarker::Deleted) if diff_view => None,
             other => other,
         };
-        let line_tint = if diff_view {
+        // The cursor's line gets a subtle current-line tint that applies to every visual row of the
+        // logical line (so it stays whole under soft wrap). It takes precedence over the diff-view
+        // tint on that one line — the gutter change-bar still marks it as changed. Selection and
+        // search keep their own span backgrounds, so they paint over the tint via `apply_line_tint`.
+        let line_tint = if logical_line == cursor_line {
+            Some(CURSOR_LINE_BG)
+        } else if diff_view {
             render.diff_marker.and_then(diff_marker_bg)
         } else {
             None
@@ -3205,10 +3217,16 @@ fn build_spans(
         if byte_is_match_bracket[byte_idx] {
             style = style.fg(NORD12).add_modifier(Modifier::BOLD);
         }
-        // Match bg first; the active selection paints over it with a more saturated blue so the
-        // selection stands out from the surrounding match highlights.
+        // Search match: a quiet NORD3 fill behind the normal syntax text. NORD3 is the brightest of
+        // Nord's Polar Night shades, so it stays visible on the NORD1 current-line tint while still
+        // sitting clearly below the more saturated NORD10 selection, which paints over it.
         if byte_in_match[byte_idx] {
-            style = style.bg(NORD2);
+            style = style.bg(NORD3);
+            // Comments are themed NORD3 too, so a match inside one would be invisible (same fg/bg).
+            // Lift just that text to the normal foreground; every other syntax color reads fine.
+            if style.fg == Some(NORD3) {
+                style = style.fg(NORD4);
+            }
         }
         if let Some((s, e)) = sel {
             if byte_idx >= s as usize && byte_idx < e as usize {

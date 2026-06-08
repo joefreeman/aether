@@ -159,6 +159,11 @@ function renderVisualRow(
   // always on (matching the terminal / the protocol's intent).
   if (diffView && line.diff_marker === "added") rowEl.classList.add("added-bg");
   else if (diffView && line.diff_marker === "modified") rowEl.classList.add("modified-bg");
+  // Current-line highlight (Vim's `cursorline`). `cursorByte` is non-null on exactly the cursor's
+  // logical line, so every visual row of that line (under soft wrap) gets tinted as a whole. The CSS
+  // rule is ordered after the diff tints so it wins on the cursor's changed line; the gutter
+  // change-bar still marks it. Selection/search/cursor backgrounds sit on inner spans, over the tint.
+  if (cursorByte !== null) rowEl.classList.add("cursor-line");
 
   rowEl.appendChild(gutter(line.diff_marker ?? null, diffView));
 
