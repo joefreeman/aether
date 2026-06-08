@@ -435,6 +435,13 @@ export interface BufferCloseResult {
   next_buffer_id?: BufferId | null;
 }
 
+/** `buffer/closed` push: another client (or a path/project deletion) closed a buffer we have open.
+ *  Switch to `next_buffer_id`, or open a fresh scratch when absent. */
+export interface BufferClosedParams {
+  buffer_id: BufferId;
+  next_buffer_id?: BufferId | null;
+}
+
 /** JSON-RPC error codes the client branches on (crates/aether-protocol/src/error.rs). */
 export const WOULD_OVERWRITE = -32016;
 export const WOULD_DISCARD_CHANGES = -32021;

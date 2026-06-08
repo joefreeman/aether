@@ -12,7 +12,8 @@ use crate::surround;
 use crate::wrap;
 use std::borrow::Cow;
 use aether_protocol::buffer::{
-    BufferCloseParams, BufferCopyParams, BufferCopyResult, BufferCutResult, BufferOpenParams,
+    BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopyParams, BufferCopyResult,
+    BufferCutResult, BufferOpenParams,
     BufferOpenResult, BufferReloadParams, BufferReloadResult, BufferSaveParams, BufferSaveResult,
     BufferState, BufferStateParams, CopyScope,
 };
@@ -406,6 +407,8 @@ pub async fn project_remove_root(
         return Err(err);
     }
 
+    // Other clients viewing any of these buffers must be told to switch — capture before teardown.
+    let other_clients = clients_viewing_buffers(&s, &affected, client_id);
     // Close the affected buffers (clean ones). Same teardown as buffer/close.
     for &id in &affected {
         s.close_buffer(id);
@@ -427,17 +430,10 @@ pub async fn project_remove_root(
 
     // Next buffer for the requesting client: top of project MRU, else any remaining buffer in
     // the project. Mirrors buffer/close.
-    let next_buffer_id = s
-        .active_project(client_id)
-        .and_then(|p| p.mru_buffers.front().copied())
-        .or_else(|| {
-            s.buffer_projects
-                .iter()
-                .find(|(_, name)| name.as_str() == project_name)
-                .map(|(id, _)| *id)
-        });
+    let next_buffer_id = next_buffer_for_client(&s, client_id);
     let watcher = s.watcher.clone();
-    let pushes = refresh_buffer_pickers(&mut s);
+    let mut pushes = refresh_buffer_pickers(&mut s);
+    pushes.extend(buffer_closed_pushes(&s, &other_clients));
     drop(s);
 
     crate::config::write_project_config(&updated)
@@ -636,6 +632,8 @@ pub async fn path_delete(
         });
     };
     let closed = s.buffers_under_path(&project_name, &canonical);
+    // Other clients viewing any of these buffers must be told to switch — capture before teardown.
+    let other_clients = clients_viewing_buffers(&s, &closed, client_id);
     for &id in &closed {
         s.close_buffer(id);
     }
@@ -644,16 +642,9 @@ pub async fn path_delete(
     if let Some(p) = s.projects.get(&project_name) {
         p.workspace_index.invalidate();
     }
-    let next_buffer_id = s
-        .active_project(client_id)
-        .and_then(|p| p.mru_buffers.front().copied())
-        .or_else(|| {
-            s.buffer_projects
-                .iter()
-                .find(|(_, name)| name.as_str() == project_name)
-                .map(|(id, _)| *id)
-        });
-    let pushes = refresh_buffer_pickers(&mut s);
+    let next_buffer_id = next_buffer_for_client(&s, client_id);
+    let mut pushes = refresh_buffer_pickers(&mut s);
+    pushes.extend(buffer_closed_pushes(&s, &other_clients));
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -2359,6 +2350,70 @@ fn byte_to_logical(buf: &Buffer, byte_idx: usize) -> aether_protocol::LogicalPos
     }
 }
 
+/// The buffer a client should land on after its current one is closed: the top of its active
+/// project's MRU, else any remaining buffer in that project, else `None` (caller opens a scratch).
+/// Shared by `buffer/close` and the deletion paths so the requesting client and any other clients
+/// that were viewing the buffer resolve their next buffer identically.
+fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<BufferId> {
+    let project_name = s.active_project(client_id).map(|p| p.name.clone());
+    s.active_project(client_id)
+        .and_then(|p| p.mru_buffers.front().copied())
+        .or_else(|| {
+            project_name.as_deref().and_then(|name| {
+                s.buffer_projects
+                    .iter()
+                    .find(|(_, pname)| pname.as_str() == name)
+                    .map(|(id, _)| *id)
+            })
+        })
+}
+
+/// `(client, buffer)` pairs for every client *other than* `except` that currently has a viewport
+/// on one of `buffer_ids`. Capture this BEFORE tearing the buffers down — teardown drops the very
+/// viewports this reads. One entry per affected client (the buffer of theirs that is closing).
+fn clients_viewing_buffers(
+    s: &ServerState,
+    buffer_ids: &[BufferId],
+    except: ClientId,
+) -> Vec<(ClientId, BufferId)> {
+    let targets: std::collections::HashSet<BufferId> = buffer_ids.iter().copied().collect();
+    let mut seen: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for vp in s.viewports.values() {
+        if vp.client_id != except && targets.contains(&vp.buffer_id) && seen.insert(vp.client_id) {
+            out.push((vp.client_id, vp.buffer_id));
+        }
+    }
+    out
+}
+
+/// Build the `buffer/closed` pushes for the clients captured by [`clients_viewing_buffers`],
+/// telling each which buffer to switch to. Call AFTER teardown so each next-buffer reflects the
+/// settled MRU. Clients that have since disconnected are skipped.
+fn buffer_closed_pushes(
+    s: &ServerState,
+    affected: &[(ClientId, BufferId)],
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    affected
+        .iter()
+        .filter_map(|&(client_id, buffer_id)| {
+            let session = s.clients.get(&client_id)?;
+            let params = BufferClosedParams {
+                buffer_id,
+                next_buffer_id: next_buffer_for_client(s, client_id),
+            };
+            Some((
+                session.outbound.clone(),
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: BufferClosed::NAME.into(),
+                    params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
+                },
+            ))
+        })
+        .collect()
+}
+
 // ---- buffer/close -------------------------------------------------------------------------------
 
 /// Close a buffer globally. Drops the buffer from the server, plus all viewports subscribed
@@ -2378,27 +2433,19 @@ pub async fn buffer_close(
     if !s.buffers.contains_key(&params.buffer_id) {
         return Err(RpcError::buffer_not_found(params.buffer_id));
     }
+    // Any *other* client viewing this buffer is about to have it pulled out from under it — capture
+    // them before teardown drops their viewports, so we can tell them to switch (see below).
+    let affected = clients_viewing_buffers(&s, &[params.buffer_id], client_id);
     // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
     // clears diagnostics, and tears down the language server if this was its last buffer).
     let stopped_server = s.close_buffer(params.buffer_id);
     // Pick the next buffer for the requesting client: top of the active project's MRU after
     // cleanup, or — if that's empty — any remaining buffer in the project. The client uses this
     // to attach without an extra RPC round-trip.
-    let project_name = s
-        .active_project(client_id)
-        .map(|p| p.name.clone());
-    let next_buffer_id = s
-        .active_project(client_id)
-        .and_then(|p| p.mru_buffers.front().copied())
-        .or_else(|| {
-            project_name.as_deref().and_then(|name| {
-                s.buffer_projects
-                    .iter()
-                    .find(|(_, pname)| pname.as_str() == name)
-                    .map(|(id, _)| *id)
-            })
-        });
+    let next_buffer_id = next_buffer_for_client(&s, client_id);
     let mut pushes = refresh_buffer_pickers(&mut s);
+    // Tell the other clients their active buffer vanished (each switches to its own next buffer).
+    pushes.extend(buffer_closed_pushes(&s, &affected));
     // If closing this buffer shut its language server down, refresh any open "LSP servers"
     // picker so the now-gone server drops out of the list.
     if stopped_server.is_some() {

@@ -128,6 +128,29 @@ pub struct BufferCloseResult {
     pub next_buffer_id: Option<BufferId>,
 }
 
+// ---- buffer/closed (notification) ---------------------------------------------------------------
+
+/// Pushed to a client when a buffer it currently has open is closed by *another* client (a plain
+/// `buffer/close`, or a path/project deletion that tore the buffer down). The receiving client
+/// switches to `next_buffer_id` (its MRU top after the close), or opens a fresh scratch when
+/// `None` — the same convention as [`BufferCloseResult`]. Only sent to clients that had a viewport
+/// on the buffer; the client that initiated the close learns the outcome from its RPC result
+/// instead.
+pub struct BufferClosed;
+impl NotificationMethod for BufferClosed {
+    const NAME: &'static str = "buffer/closed";
+    type Params = BufferClosedParams;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferClosedParams {
+    /// The buffer that was closed out from under this client.
+    pub buffer_id: BufferId,
+    /// The buffer the client should switch to, or `None` to open a fresh scratch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_buffer_id: Option<BufferId>,
+}
+
 // ---- buffer/reload ------------------------------------------------------------------------------
 
 pub struct BufferReload;

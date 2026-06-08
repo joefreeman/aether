@@ -817,6 +817,29 @@ fn buffer_open_scratch_form() {
 }
 
 #[test]
+fn buffer_closed_notification_shape() {
+    use aether_protocol::buffer::BufferClosedParams;
+    // With a next buffer to switch to.
+    let some = to_value(BufferClosedParams {
+        buffer_id: 4,
+        next_buffer_id: Some(7),
+    })
+    .unwrap();
+    assert_eq!(some, json!({"buffer_id": 4, "next_buffer_id": 7}));
+    // No buffers remain — `next_buffer_id` is omitted, signalling "open a fresh scratch".
+    let none = to_value(BufferClosedParams {
+        buffer_id: 4,
+        next_buffer_id: None,
+    })
+    .unwrap();
+    assert_eq!(none, json!({"buffer_id": 4}));
+    // And it deserializes back when the field is absent.
+    let parsed: BufferClosedParams = from_value(json!({"buffer_id": 9})).unwrap();
+    assert_eq!(parsed.buffer_id, 9);
+    assert_eq!(parsed.next_buffer_id, None);
+}
+
+#[test]
 fn unit_result_round_trips() {
     // BufferClose and ViewportUnsubscribe have Result = (). The JSON unit value is `null`.
     let unit: () = ();
@@ -964,6 +987,8 @@ fn picker_update_round_trips_through_notification() {
         total_matches: 1,
         total_candidates: 1,
         ticking: false,
+        grep_display_offset: None,
+        grep_total_display_rows: None,
     };
     let notif = Notification {
         jsonrpc: JsonRpc,

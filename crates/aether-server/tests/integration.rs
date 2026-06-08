@@ -2,7 +2,8 @@
 //! handshake and `buffer/open`.
 
 use aether_protocol::buffer::{
-    BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
+    BufferClose, BufferCloseParams, BufferCloseResult, BufferClosed, BufferClosedParams, BufferCopy,
+    BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
     BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferSaveResult,
     BufferState, BufferStateParams, CopyScope,
 };
@@ -9198,8 +9199,6 @@ async fn in_place_save_after_save_as_targets_new_path() {
 
 // -------- buffer/close ---------------------------------------------------------------------------
 
-use aether_protocol::buffer::{BufferClose, BufferCloseParams, BufferCloseResult};
-
 /// Closing a buffer drops it from the server. After close, opening by id fails.
 #[tokio::test]
 async fn buffer_close_drops_buffer() {
@@ -13514,6 +13513,94 @@ async fn viewport_total_visual_rows_counts_wrapped_rows() {
     );
     // Soft wrap never overflows horizontally, so no max-line-width is reported.
     assert_eq!(sub.window.max_line_width, 0);
+
+    drop(server);
+}
+
+/// Two clients open the same buffer; when one closes it, the *other* must be told (via a
+/// `buffer/closed` push) so it can switch off the now-gone buffer rather than holding a dead
+/// viewport. The push carries the recipient's next buffer (its MRU top after the close).
+#[tokio::test]
+async fn closing_a_buffer_notifies_other_clients_viewing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "bravo\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()], TEST_TOKEN)
+        .await
+        .unwrap();
+
+    // Subscribe a viewport on `buffer_id` over `ws` (so the client counts as "viewing" it).
+    async fn subscribe(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        id: u64,
+        buffer_id: u64,
+    ) {
+        let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+            ws,
+            id,
+            &ViewportSubscribeParams {
+                buffer_id,
+                cols: 80,
+                rows: 10,
+                overscan_rows: 0,
+                scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+                wrap: WrapMode::Soft,
+                continuation_marker_width: 0,
+                tab_width: 4,
+            },
+        )
+        .await;
+    }
+
+    async fn open(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        id: u64,
+        file: &str,
+    ) -> BufferOpenResult {
+        send_request::<BufferOpen>(
+            ws,
+            id,
+            &BufferOpenParams {
+                buffer_id: None,
+                path_index: Some(0),
+                relative_path: Some(file.into()),
+                language: None,
+                create_if_missing: false,
+                jump_to: None,
+            },
+        )
+        .await
+    }
+
+    let activate = ProjectActivateParams { name: "test-proj".into() };
+
+    // Client A: open a.txt (the shared buffer) and b.txt (so a next buffer exists after the close).
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(&mut ws_a, 1, &activate).await;
+    let buf_a = open(&mut ws_a, 2, "a.txt").await.buffer_id;
+    subscribe(&mut ws_a, 3, buf_a).await;
+    let buf_b = open(&mut ws_a, 4, "b.txt").await.buffer_id;
+
+    // Client B: open and view the same shared buffer.
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(&mut ws_b, 1, &activate).await;
+    let buf_a_b = open(&mut ws_b, 2, "a.txt").await.buffer_id;
+    assert_eq!(buf_a_b, buf_a, "same file dedups to one buffer across clients");
+    subscribe(&mut ws_b, 3, buf_a).await;
+
+    // Client A closes the shared buffer. It gets its next buffer in the RPC result...
+    let result: BufferCloseResult =
+        send_request::<BufferClose>(&mut ws_a, 5, &BufferCloseParams { buffer_id: buf_a }).await;
+    assert_eq!(result.next_buffer_id, Some(buf_b));
+
+    // ...and client B is pushed `buffer/closed` for the buffer it was viewing, with its own next.
+    let pushed: BufferClosedParams = expect_notification::<BufferClosed>(&mut ws_b).await;
+    assert_eq!(pushed.buffer_id, buf_a);
+    assert_eq!(pushed.next_buffer_id, Some(buf_b));
 
     drop(server);
 }

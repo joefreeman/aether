@@ -7,7 +7,8 @@ use crate::keymap::{self, Action, InsertWhere, ScrollDir, ScrollUnit};
 use crate::text_input::PromptKeyOutcome;
 use crate::ui;
 use aether_protocol::buffer::{
-    BufferClose, BufferCloseParams, BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut,
+    BufferClose, BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopy, BufferCopyParams,
+    BufferCopyResult, BufferCut,
     BufferCutResult, BufferOpen, BufferOpenParams, BufferOpenResult, BufferReload,
     BufferReloadParams, BufferSave, BufferSaveParams, BufferState, BufferStateParams, CopyScope,
 };
@@ -264,6 +265,11 @@ pub struct AppState {
     pub hover: Option<HoverPopup>,
     /// Per-buffer diagnostic counts from `lsp/diagnostics_changed`, for the status-bar summary.
     pub diagnostic_counts: std::collections::HashMap<BufferId, DiagnosticCounts>,
+    /// Set by a `buffer/closed` push — another client (or a path/project deletion) closed the
+    /// buffer we have open. Drained by `flush_pending_external_close` in the main loop, which
+    /// switches us to the indicated next buffer (or a scratch). Can't act here: `apply_notification`
+    /// is synchronous and switching needs an RPC.
+    pub pending_external_close: Option<BufferClosedParams>,
 }
 
 /// One block of hover-popup content. `severity` colors the block to match the gutter dot (for
@@ -666,6 +672,7 @@ pub async fn bootstrap(
         lsp_status: std::collections::HashMap::new(),
         hover: None,
         diagnostic_counts: std::collections::HashMap::new(),
+        pending_external_close: None,
     };
 
     // Seed the Explorer picker's remembered directory before the auto-open so it lists the
@@ -704,6 +711,7 @@ fn empty_app_state(viewport_cols: u32, viewport_rows: u32) -> AppState {
         lsp_status: std::collections::HashMap::new(),
         hover: None,
         diagnostic_counts: std::collections::HashMap::new(),
+        pending_external_close: None,
     }
 }
 
@@ -918,6 +926,7 @@ pub async fn run(
             }
         }
         apply_pending_notifications(state, client);
+        flush_pending_external_close(client, state).await?;
         flush_pending_scroll(client, state).await?;
         flush_pending_picker_scroll(client, state).await?;
         refresh_blame(client, state).await?;
@@ -1083,6 +1092,25 @@ fn apply_pending_notifications(state: &mut AppState, client: &mut Client) {
     }
 }
 
+/// Handle a `buffer/closed` push (another client, or a path/project deletion, closed the buffer we
+/// had open): switch to the server-indicated next buffer — its MRU top — or a fresh scratch when
+/// none remain. Best-effort: if attaching the next buffer fails (e.g. it raced closed too), fall
+/// back to a scratch so we never strand the user on a dead buffer.
+async fn flush_pending_external_close(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(p) = state.pending_external_close.take() else {
+        return Ok(());
+    };
+    // Guard against having already moved off the buffer between the push and this drain.
+    if !state.has_editor() || state.ed().buffer_id != p.buffer_id {
+        return Ok(());
+    }
+    state.status = StatusMessage::warning("buffer closed by another client");
+    match p.next_buffer_id {
+        Some(next) if attach_buffer(client, state, next).await.is_ok() => Ok(()),
+        _ => new_scratch(client, state).await,
+    }
+}
+
 fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notification) {
     // LSP status is project-scoped, not editor-bound — record it regardless of editor presence so
     // the status-bar indicator is fresh the moment a buffer appears.
@@ -1153,6 +1181,16 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
             Err(e) => {
                 state.status = StatusMessage::error(format!("bad search/state_changed params: {e}"))
             }
+        }
+    } else if n.method == BufferClosed::NAME {
+        match serde_json::from_value::<BufferClosedParams>(n.params) {
+            // Only react if it's the buffer we're actually on; switching needs an RPC, so stash it
+            // for `flush_pending_external_close` to handle in the async loop.
+            Ok(p) if state.ed_mut().buffer_id == p.buffer_id => {
+                state.pending_external_close = Some(p);
+            }
+            Ok(_) => {}
+            Err(e) => state.status = StatusMessage::error(format!("bad buffer/closed params: {e}")),
         }
     } else if n.method == PickerUpdate::NAME {
         match serde_json::from_value::<PickerUpdateParams>(n.params) {
@@ -5832,6 +5870,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
+        pending_external_close: None,
         };
         assert_eq!(terminal_title(&state), "Aether");
     }
@@ -5858,6 +5897,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
+        pending_external_close: None,
         };
         assert_eq!(terminal_title(&state), "[demo]");
         // Once a buffer exists, the title grows to include the file label.
@@ -5887,6 +5927,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
+        pending_external_close: None,
         };
         // Clean buffer → no marker.
         assert_eq!(terminal_title(&state), "[demo] src/main.rs");

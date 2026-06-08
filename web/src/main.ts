@@ -22,6 +22,7 @@ import {
   type ScrollUnit,
 } from "./keymap";
 import type {
+  BufferClosedParams,
   BufferCopyResult,
   BufferCutResult,
   BufferOpenParams,
@@ -2268,6 +2269,16 @@ class Editor {
         this.revision = p.revision;
         this.render();
         this.revealCursor();
+      }
+    } else if (method === "buffer/closed") {
+      // Another client (or a path/project deletion) closed a buffer; if it's the one we're on,
+      // switch to the server-indicated next buffer (or a fresh scratch when none remain).
+      const p = params as BufferClosedParams;
+      if (p.buffer_id === this.bufferId) {
+        this.toast("buffer closed by another client", "warning");
+        this.enqueue(() =>
+          this.switchBuffer({ buffer_id: p.next_buffer_id ?? null, create_if_missing: false }),
+        );
       }
     } else if (method === "picker/update") {
       this.picker?.onUpdate(params as PickerUpdateParams);
