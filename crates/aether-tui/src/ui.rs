@@ -119,7 +119,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // overlay paints: each overlay `Clear`s and repaints its own box opaquely, so only the area
     // *behind* the dialog ends up dimmed.
     let modal_open = state.picker.open || state.project_settings.is_some() || state.help.open;
-    if modal_open {
+    // Status-bar prompts dim the editor too, so attention moves to the prompt: the save-as path
+    // input and the y/N confirm prompts. Search is deliberately excluded — it live-highlights
+    // matches in the buffer, so the editor must stay legible (and it sets neither flag below).
+    let status_prompt_open = state.save_prompt.is_some() || state.confirm_prompt.is_some();
+    if modal_open || status_prompt_open {
         dim_backdrop(f.buffer_mut(), chunks[0]);
     }
     // The unified picker overlay sits on top of either screen — same renderer for Files /
