@@ -227,7 +227,6 @@ html, body, #app {
   box-shadow: 0 3px 12px rgba(0, 0, 0, 0.22);
   padding: 5px 10px;
 }
-.search-prompt { color: var(--nord8); flex: 0 0 auto; }
 .search-input {
   flex: 1 1 auto;
   min-width: 0;
@@ -235,9 +234,14 @@ html, body, #app {
   outline: none;
   background: transparent;
   color: var(--nord6);
-  font: inherit;
+  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
-.search-count { color: var(--nord3); flex: 0 0 auto; }
+.search-input::placeholder { color: var(--nord3); }
+.search-count {
+  color: var(--nord4);
+  flex: 0 0 auto;
+  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
 
 .row { display: flex; min-height: 1.4em; } /* keep blank lines from collapsing to zero height */
 .row.added-bg { background: var(--git-added-bg); }

@@ -376,7 +376,6 @@ class Editor {
 
   // Search state.
   private searchBar: HTMLElement;
-  private searchPrompt: HTMLElement;
   private searchInput: HTMLInputElement;
   private searchCountEl: HTMLElement;
   private searchOpen = false;
@@ -416,19 +415,17 @@ class Editor {
       if (!this.composing) this.flushTypedText();
     });
 
-    // Search bar (hidden until `/`): prompt + query input + match count, above the status row.
+    // Search bar (hidden until `/`): query input + match count, above the status row.
     this.searchBar = document.createElement("div");
     this.searchBar.id = "searchbar";
     this.searchBar.style.display = "none";
-    this.searchPrompt = document.createElement("span");
-    this.searchPrompt.className = "search-prompt";
     this.searchInput = document.createElement("input");
     this.searchInput.className = "search-input";
     this.searchInput.spellcheck = false;
     this.searchInput.autocomplete = "off";
     this.searchCountEl = document.createElement("span");
     this.searchCountEl.className = "search-count";
-    this.searchBar.append(this.searchPrompt, this.searchInput, this.searchCountEl);
+    this.searchBar.append(this.searchInput, this.searchCountEl);
 
     this.statusEl = document.createElement("div");
     this.statusEl.id = "status";
@@ -2270,7 +2267,7 @@ class Editor {
     this.historyIndex = null;
     this.historyDraft = "";
     this.searchInput.value = "";
-    this.searchPrompt.textContent = extend ? "?" : "/";
+    this.searchInput.placeholder = "Find in buffer…";
     this.searchCountEl.textContent = "";
     // Float just above the status bar (its height varies with font/zoom, so measure it).
     this.searchBar.style.bottom = `${this.statusEl.offsetHeight + 8}px`;
