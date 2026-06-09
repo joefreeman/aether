@@ -66,6 +66,53 @@ impl GitChangeCounts {
     }
 }
 
+/// Buffer-level Git status for the status bar: the branch, and the change counts split into staged
+/// (HEAD → index) and unstaged (index → working buffer). `Some` for any file inside a repo (the
+/// counts are zero for a clean / untracked file); `None` outside a repo. The counts here match
+/// `git diff --cached` (staged) and `git diff` (unstaged), so the status bar agrees with the
+/// terminal. Distinct from the per-line gutter markers, which the viewport window carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBufferStatus {
+    /// Branch name, or a short commit hash when HEAD is detached. `None` only when it can't be
+    /// resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Staged changes: HEAD → index (`git diff --cached`).
+    #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
+    pub staged: GitChangeCounts,
+    /// Unstaged changes: index → working buffer (`git diff`).
+    #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
+    pub unstaged: GitChangeCounts,
+}
+
+// ---- git/set_diff_base --------------------------------------------------------------------------
+
+/// Which committed-side baseline the gutter / inline diff compares the working buffer against.
+/// `Head` (default) shows all uncommitted changes (`git diff HEAD`); `Index` shows only unstaged
+/// changes (`git diff`), so a staged hunk disappears from the diff. Per-viewport, client-toggled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffBase {
+    #[default]
+    Head,
+    Index,
+}
+
+pub struct GitSetDiffBase;
+impl RpcMethod for GitSetDiffBase {
+    const NAME: &'static str = "git/set_diff_base";
+    type Params = GitSetDiffBaseParams;
+    /// The freshly re-rendered window: changing the base changes the gutter markers and the inline
+    /// diff's phantom rows, so the whole window is resent (like `git/set_diff_view`).
+    type Result = ViewportWindowResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitSetDiffBaseParams {
+    pub viewport_id: ViewportId,
+    pub base: DiffBase,
+}
+
 // ---- git/set_diff_view --------------------------------------------------------------------------
 
 pub struct GitSetDiffView;

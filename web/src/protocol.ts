@@ -93,6 +93,8 @@ export interface BufferWindow {
   max_line_width: number;
   /** Buffer-wide Git change summary for the status bar. Absent on the wire when the buffer is clean. */
   git_changes?: GitChangeCounts;
+  /** Buffer-level Git status (branch + staged/unstaged counts) for the status bar; absent outside a repo. */
+  git_status?: GitBufferStatus;
   lines: LogicalLineRender[];
 }
 
@@ -101,6 +103,16 @@ export interface GitChangeCounts {
   added: number;
   modified: number;
   deleted: number;
+}
+
+/** Which committed-side baseline the gutter/diff compares the working buffer against. */
+export type DiffBase = "head" | "index";
+
+/** Buffer-level Git status: branch + staged (HEAD→index) and unstaged (index→buffer) counts. */
+export interface GitBufferStatus {
+  branch?: string | null;
+  staged?: GitChangeCounts;
+  unstaged?: GitChangeCounts;
 }
 
 // ---- cursor -------------------------------------------------------------------------------------
@@ -631,4 +643,6 @@ export interface ViewportLinesChangedParams {
   max_line_width: number;
   /** Recomputed buffer-wide Git change summary. Absent on the wire when the buffer is clean. */
   git_changes?: GitChangeCounts;
+  /** Recomputed buffer-level Git status (branch + staged/unstaged counts). Absent outside a repo. */
+  git_status?: GitBufferStatus;
 }

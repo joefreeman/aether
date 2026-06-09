@@ -76,6 +76,10 @@ pub struct ServerState {
     /// Empty / absent for scratch buffers, untracked files, and files outside a repo. Shared by
     /// all clients viewing the buffer (the baseline is a property of the file, not the viewer).
     pub git_hunks: HashMap<BufferId, Vec<crate::git::DiffHunk>>,
+    /// Per-buffer *unstaged* diff hunks: the live buffer against its **index** content (`git diff`),
+    /// computed on the same triggers as `git_hunks`. `git_hunks` (vs HEAD) drives the `diff_base =
+    /// Head` gutter; this drives `diff_base = Index` and the unstaged change count.
+    pub git_unstaged_hunks: HashMap<BufferId, Vec<crate::git::DiffHunk>>,
     /// Per-buffer cached Git baseline: resolved repo location + the committed (HEAD) content,
     /// LF-normalized. Populated on open, refreshed when HEAD changes (the watcher), and read by
     /// the per-edit `diff_hunks` so editing never re-runs repo discovery or re-reads the blob.
@@ -226,6 +230,7 @@ impl ServerState {
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
             git_hunks: HashMap::new(),
+            git_unstaged_hunks: HashMap::new(),
             git_baseline: HashMap::new(),
             git_blame: HashMap::new(),
             matcher: picker_state::make_matcher(),
@@ -361,6 +366,7 @@ impl ServerState {
         self.searches.retain(|(_, b), _| *b != id);
         self.last_scroll.retain(|(_, b), _| *b != id);
         self.git_hunks.remove(&id);
+        self.git_unstaged_hunks.remove(&id);
         self.git_baseline.remove(&id);
         self.git_blame.remove(&id);
         self.diagnostics.remove(&id);
@@ -1154,6 +1160,9 @@ pub struct Viewport {
     /// buffer's Git hunks and the buffer's hunks are recomputed on every edit. Per-viewport so
     /// two views of the same buffer can differ. Toggled by `git/set_diff_view`.
     pub diff_view: bool,
+    /// Which committed-side baseline the gutter / inline diff compares against: `Head` (all
+    /// uncommitted changes) or `Index` (unstaged only). Per-viewport, set by `git/set_diff_base`.
+    pub diff_base: aether_protocol::git::DiffBase,
 }
 
 #[cfg(test)]

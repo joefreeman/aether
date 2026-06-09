@@ -71,6 +71,7 @@ export type Action =
   | { t: "unsurround"; target: SurroundTarget }
   // git
   | { t: "toggleDiffView" }
+  | { t: "toggleDiffBase" }
   | { t: "navigateHunk"; dir: HunkDirection }
   | { t: "grepNavigate"; dir: Direction }
   // LSP
@@ -280,6 +281,7 @@ const LEADER: Binding[] = [
   b("n", exact(), { t: "newScratch" }),
   b("w", exact(), { t: "toggleWrap" }),
   b("i", exact(), { t: "toggleDiffView" }),
+  b("i", exact(false, true), { t: "toggleDiffBase" }),
   b("h", exact(false, true), { t: "navigateHunk", dir: "prev" }),
   b("h", exact(), { t: "navigateHunk", dir: "next" }),
   b("o", exact(), { t: "showCommitInfo" }),

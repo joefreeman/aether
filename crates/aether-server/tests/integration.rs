@@ -14,9 +14,10 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
-    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCommitInfo, GitCommitInfoParams,
-    GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitSetDiffView, GitSetDiffViewParams, HunkDirection,
+    DiffBase, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCommitInfo,
+    GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams,
+    GitNavigateHunkResult, GitSetDiffBase, GitSetDiffBaseParams, GitSetDiffView,
+    GitSetDiffViewParams, HunkDirection,
 };
 use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::input::{
@@ -12780,6 +12781,177 @@ async fn git_change_counts_ride_the_window() {
         (0, 1, 0),
         "one modified line after editing line 0"
     );
+
+    drop(server);
+}
+
+/// Stage the file's current working-tree content (`git add <name>`).
+fn git_stage_file(dir: &std::path::Path, name: &str) {
+    let repo = git2::Repository::open(dir).unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new(name)).unwrap();
+    index.write().unwrap();
+}
+
+#[tokio::test]
+async fn git_status_splits_staged_and_unstaged() {
+    // HEAD: 3 lines. Stage a modification of line 2 (HEAD→index), then add line 4 in the working
+    // tree on top (index→buffer). The status bar should report one staged modification and one
+    // unstaged addition — matching `git diff --cached` and `git diff`.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    git_stage_file(dir.path(), "edit.rs");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\ndelta\n").unwrap();
+
+    let server = spawn_for_test("status-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "status-proj".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("edit.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+
+    let gs = sub
+        .window
+        .git_status
+        .expect("a tracked file in a repo carries git status");
+    assert!(
+        gs.branch.as_deref().is_some_and(|b| !b.is_empty()),
+        "branch should be resolved, got {:?}",
+        gs.branch
+    );
+    assert_eq!(
+        (gs.staged.added, gs.staged.modified, gs.staged.deleted),
+        (0, 1, 0),
+        "one staged modification (line 2)"
+    );
+    assert_eq!(
+        (gs.unstaged.added, gs.unstaged.modified, gs.unstaged.deleted),
+        (1, 0, 0),
+        "one unstaged addition (line 4)"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn set_diff_base_switches_gutter_between_head_and_index() {
+    // Same fixture: a staged line-2 modification plus an unstaged line-4 addition.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    git_stage_file(dir.path(), "edit.rs");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\ndelta\n").unwrap();
+
+    let server = spawn_for_test("base-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "base-proj".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("edit.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    // Default base = HEAD: the gutter shows both the staged modification and the unstaged addition.
+    assert_eq!(
+        (sub.window.git_changes.modified, sub.window.git_changes.added),
+        (1, 1),
+        "HEAD base shows all uncommitted changes"
+    );
+
+    // Switch to the index base: the staged modification drops out, leaving only the unstaged add.
+    let res: ViewportWindowResult = send_request::<GitSetDiffBase>(
+        &mut ws,
+        4,
+        &GitSetDiffBaseParams {
+            viewport_id: sub.viewport_id,
+            base: DiffBase::Index,
+        },
+    )
+    .await;
+    assert_eq!(
+        (res.window.git_changes.modified, res.window.git_changes.added),
+        (0, 1),
+        "index base shows only unstaged changes"
+    );
+    // The branch + staged/unstaged summary is independent of the base toggle.
+    let gs = res.window.git_status.expect("git status present");
+    assert_eq!((gs.staged.modified, gs.unstaged.added), (1, 1));
 
     drop(server);
 }

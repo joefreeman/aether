@@ -71,6 +71,15 @@ pub struct GitBaseline {
     /// HEAD content of the file, **LF-normalized** so a CRLF-committed file doesn't read as
     /// "every line modified". `None` when untracked / not committed / no repo.
     pub blob: Option<Vec<u8>>,
+    /// Index (staging-area) content of the file, LF-normalized like `blob`. `None` when the file
+    /// has no index entry (untracked, or a staged whole-file deletion). The unstaged diff is the
+    /// buffer against this; the staged diff is this against `blob`.
+    pub index_blob: Option<Vec<u8>>,
+    /// Current branch name (or short commit hash when detached). `None` outside a repo.
+    pub branch: Option<String>,
+    /// Staged diff (HEAD → index), computed once here since it's independent of the live buffer and
+    /// only changes when HEAD or the index does (i.e. on the same refresh trigger as the blobs).
+    pub staged_hunks: Vec<DiffHunk>,
 }
 
 /// Resolve a path's repo and read its HEAD baseline. The expensive part — discovery plus reading
@@ -93,10 +102,48 @@ pub fn load_baseline(path: &Path) -> GitBaseline {
     };
     let rel_path = rel.to_path_buf();
     let blob = head_blob_bytes(&repo, &rel_path).map(normalize_lf);
+    let index_blob = index_blob_bytes(&repo, &rel_path).map(normalize_lf);
+    // Staged diff is HEAD → index; absent sides count as empty (a staged add has no HEAD side, a
+    // staged whole-file delete has no index side).
+    let staged_hunks =
+        hunks_from_buffers(blob.as_deref().unwrap_or(b""), index_blob.as_deref().unwrap_or(b""));
     GitBaseline {
         repo: Some(GitRepo { workdir, rel_path }),
         blob,
+        index_blob,
+        branch: current_branch(&repo),
+        staged_hunks,
     }
+}
+
+/// The file's staged (index) content as raw bytes, or `None` when it has no index entry. Stage `0`
+/// is the normal, non-conflict slot; during a merge conflict there's no stage-0 entry and we fall
+/// back to `None` (staged/unstaged for conflicted files is out of scope).
+fn index_blob_bytes(repo: &git2::Repository, rel: &Path) -> Option<Vec<u8>> {
+    let index = repo.index().ok()?;
+    let entry = index.get_path(rel, 0)?;
+    let blob = repo.find_blob(entry.id).ok()?;
+    Some(blob.content().to_vec())
+}
+
+/// Current branch name, or a short commit hash when HEAD is detached. Handles an unborn branch
+/// (fresh repo, no commits yet) by reading the symbolic `HEAD` target. `None` only on error.
+fn current_branch(repo: &git2::Repository) -> Option<String> {
+    if let Ok(head) = repo.head() {
+        if head.is_branch() {
+            return head.shorthand().map(String::from);
+        }
+        if let Some(oid) = head.target() {
+            let s = oid.to_string();
+            return Some(s[..7.min(s.len())].to_string());
+        }
+    }
+    // Unborn branch: HEAD is a symbolic ref to a branch that has no commit yet.
+    repo.find_reference("HEAD")
+        .ok()?
+        .symbolic_target()
+        .and_then(|t| t.strip_prefix("refs/heads/"))
+        .map(String::from)
 }
 
 /// The file's committed (HEAD) content as raw bytes, or `None` when untracked / not committed.

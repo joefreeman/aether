@@ -21,8 +21,9 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    BlameInfo, CommitInfo, GitBlameLine, GitBlameLineParams, GitChangeCounts, GitCommitInfo,
-    GitCommitInfoParams, GitNavigateHunk, GitNavigateHunkParams, GitSetDiffView,
+    BlameInfo, CommitInfo, DiffBase, GitBlameLine, GitBlameLineParams, GitBufferStatus,
+    GitChangeCounts, GitCommitInfo, GitCommitInfoParams, GitNavigateHunk, GitNavigateHunkParams,
+    GitSetDiffBase, GitSetDiffBaseParams, GitSetDiffView,
     GitSetDiffViewParams, HunkDirection,
 };
 use aether_protocol::nav::{
@@ -444,6 +445,9 @@ pub struct EditorState {
     /// Buffer-wide Git change summary (added/modified/deleted line counts vs HEAD) for the status
     /// bar, refreshed alongside `line_count` from every window the server sends.
     pub git_changes: GitChangeCounts,
+    /// Buffer-level Git status (branch + staged/unstaged counts) for the status bar; `None` outside
+    /// a repo. Refreshed from every window, like `git_changes`.
+    pub git_status: Option<GitBufferStatus>,
     /// Highest legal `scroll_logical_line` — server-computed so it accounts for wrap, putting
     /// the buffer's last visual row at the bottom of the viewport.
     pub max_scroll_logical_line: u32,
@@ -452,6 +456,10 @@ pub struct EditorState {
     /// keybinding can flip it. When on, the server interleaves phantom "deleted" rows into the
     /// pushed window.
     pub diff_view: bool,
+    /// Diff baseline the gutter compares against: `Head` (all uncommitted) or `Index` (unstaged
+    /// only). Server-authoritative (per-viewport); mirrored here so the keybinding can flip it and
+    /// so it can be re-applied (sticky) on the next buffer's subscribe.
+    pub diff_base: DiffBase,
     /// Horizontal scroll, in bytes. Only meaningful when `wrap == WrapMode::None`; reset to 0
     /// when soft wrap is on (wrapped content never overflows). Client-only.
     pub scroll_col: u32,
@@ -811,6 +819,8 @@ async fn open_buffer_and_subscribe(
         root_labels,
         open,
         WrapMode::Soft,
+        false,            // bootstrap: inline diff starts off
+        DiffBase::Head,   // and compares against HEAD
     )
     .await
 }
@@ -840,6 +850,8 @@ async fn build_editor_state_from_open(
     root_labels: &[String],
     open: BufferOpenResult,
     wrap: WrapMode,
+    diff_view: bool,
+    diff_base: DiffBase,
 ) -> Result<(EditorState, BufferStatusSnapshot)> {
     // Initial scroll: prefer a restored value (a buffer we'd seen before), otherwise centre
     // the viewport on the cursor. For a default cursor at (0,0) that's still line 0; for a
@@ -865,6 +877,26 @@ async fn build_editor_state_from_open(
             tab_width: ui::TAB_WIDTH,
         })
         .await?;
+    // Re-apply the sticky view toggles: a fresh viewport starts at the server defaults (diff off,
+    // base = HEAD), so if the user had changed either we re-apply now — before the first paint, so
+    // no flash — and use the re-rendered window. Mirrors how `wrap` is carried across switches.
+    let viewport_id = sub.viewport_id;
+    let mut window = sub.window;
+    if diff_base != DiffBase::Head {
+        let r = client
+            .rpc::<GitSetDiffBase>(GitSetDiffBaseParams { viewport_id, base: diff_base })
+            .await?;
+        window = r.window;
+    }
+    if diff_view {
+        let r = client
+            .rpc::<GitSetDiffView>(GitSetDiffViewParams {
+                viewport_id,
+                enabled: true,
+            })
+            .await?;
+        window = r.window;
+    }
     let file_label = match open.path.as_deref() {
         Some(p) => project_relative_label(p, project_paths, root_labels),
         None => format!(
@@ -875,17 +907,19 @@ async fn build_editor_state_from_open(
     let editor = EditorState {
         mode: EditorMode::Normal,
         buffer_id: open.buffer_id,
-        viewport_id: sub.viewport_id,
+        viewport_id,
         cursor: open.cursor,
         scroll_logical_line: initial_scroll.logical_line,
         scroll_skip_rows: 0,
-        window_first_logical_line: sub.window.first_logical_line,
-        lines: sub.window.lines,
-        line_count: sub.window.line_count,
-        git_changes: sub.window.git_changes,
-        max_scroll_logical_line: sub.window.max_scroll_logical_line,
+        window_first_logical_line: window.first_logical_line,
+        lines: window.lines,
+        line_count: window.line_count,
+        git_changes: window.git_changes,
+        git_status: window.git_status,
+        max_scroll_logical_line: window.max_scroll_logical_line,
         wrap,
-        diff_view: false,
+        diff_view,
+        diff_base,
         scroll_col: 0,
         pending_scroll_lines: 0,
         drag_anchor: None,
@@ -1253,6 +1287,7 @@ fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
     state.ed_mut().revision = p.revision;
     state.ed_mut().line_count = p.line_count;
     state.ed_mut().git_changes = p.git_changes;
+    state.ed_mut().git_status = p.git_status;
     state.ed_mut().max_scroll_logical_line = p.max_scroll_logical_line;
     let local_start =
         (p.range.start_logical_line as i64) - (state.ed_mut().window_first_logical_line as i64);
@@ -1719,6 +1754,7 @@ async fn run_action(
         Action::Redo => redo(client, state, count).await?,
         Action::ToggleWrap => toggle_wrap(client, state).await?,
         Action::ToggleDiffView => toggle_diff_view(client, state).await?,
+        Action::ToggleDiffBase => toggle_diff_base(client, state).await?,
         Action::NextHunk => navigate_hunk(client, state, HunkDirection::Next).await?,
         Action::PrevHunk => navigate_hunk(client, state, HunkDirection::Prev).await?,
         Action::MoveLines(dir) => move_lines(client, state, dir, count).await?,
@@ -3138,8 +3174,11 @@ async fn subscribe_to_buffer(
     state: &mut AppState,
     open: BufferOpenResult,
 ) -> Result<()> {
-    // Inherit wrap from the current editor so switching buffers keeps the user's wrap setting.
+    // Inherit wrap and the inline-diff toggle from the current editor so switching buffers keeps
+    // both of the user's view settings sticky for the session.
     let wrap = state.ed_mut().wrap;
+    let diff_view = state.ed_mut().diff_view;
+    let diff_base = state.ed_mut().diff_base;
     // Snapshot labels before passing into the builder so we can hand the builder pure slices —
     // it doesn't need (and shouldn't borrow) the full AppState.
     let project_paths = state.project_paths.clone();
@@ -3152,6 +3191,8 @@ async fn subscribe_to_buffer(
         &root_labels,
         open,
         wrap,
+        diff_view,
+        diff_base,
     )
     .await?;
     let buffer_id = editor.buffer_id;
@@ -4031,6 +4072,7 @@ async fn handle_resize(
     ed.window_first_logical_line = r.window.first_logical_line;
     ed.line_count = r.window.line_count;
     ed.git_changes = r.window.git_changes;
+    ed.git_status = r.window.git_status.clone();
     ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
     ed.lines = r.window.lines;
     ed.scroll_skip_rows = 0; // visual heights changed; re-align the top line
@@ -5637,10 +5679,44 @@ async fn toggle_diff_view(client: &mut Client, state: &mut AppState) -> Result<(
     ed.window_first_logical_line = r.window.first_logical_line;
     ed.line_count = r.window.line_count;
     ed.git_changes = r.window.git_changes;
+    ed.git_status = r.window.git_status.clone();
     ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
     ed.lines = r.window.lines;
     ed.scroll_skip_rows = 0; // phantom rows appeared/vanished; re-align the top line
     state.status = StatusMessage::info(format!("diff: {}", if enabled { "on" } else { "off" }));
+    Ok(())
+}
+
+/// `Space Alt-i` — flip the diff baseline between HEAD (all uncommitted changes) and index (unstaged
+/// only). Server re-renders against the chosen base; we mirror it locally so it stays sticky across
+/// buffer switches.
+async fn toggle_diff_base(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let base = match state.ed_mut().diff_base {
+        DiffBase::Head => DiffBase::Index,
+        DiffBase::Index => DiffBase::Head,
+    };
+    let r = client
+        .rpc::<GitSetDiffBase>(GitSetDiffBaseParams {
+            viewport_id: state.ed_mut().viewport_id,
+            base,
+        })
+        .await?;
+    let ed = state.ed_mut();
+    ed.diff_base = base;
+    ed.window_first_logical_line = r.window.first_logical_line;
+    ed.line_count = r.window.line_count;
+    ed.git_changes = r.window.git_changes;
+    ed.git_status = r.window.git_status.clone();
+    ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
+    ed.lines = r.window.lines;
+    ed.scroll_skip_rows = 0; // phantom rows differ between bases; re-align the top line
+    state.status = StatusMessage::info(format!(
+        "diff base: {}",
+        match base {
+            DiffBase::Head => "HEAD",
+            DiffBase::Index => "index",
+        }
+    ));
     Ok(())
 }
 
@@ -5837,6 +5913,7 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
     state.ed_mut().window_first_logical_line = r.window.first_logical_line;
     state.ed_mut().line_count = r.window.line_count;
     state.ed_mut().git_changes = r.window.git_changes;
+    state.ed_mut().git_status = r.window.git_status.clone();
     state.ed_mut().max_scroll_logical_line = r.window.max_scroll_logical_line;
     state.ed_mut().lines = r.window.lines;
     Ok(())
@@ -6126,9 +6203,11 @@ mod tests {
             lines: Vec::new(),
             line_count: 0,
             git_changes: GitChangeCounts::default(),
+            git_status: None,
             max_scroll_logical_line: 0,
             wrap: aether_protocol::viewport::WrapMode::None,
             diff_view: false,
+            diff_base: DiffBase::Head,
             scroll_col: 0,
             pending_scroll_lines: 0,
             drag_anchor: None,

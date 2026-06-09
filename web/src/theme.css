@@ -99,6 +99,8 @@ html, body, #app {
 .git-added { color: var(--nord14); }
 .git-modified { color: var(--nord13); }
 .git-deleted { color: var(--nord11); }
+.git-branch { color: var(--nord9); }  /* Frost blue — secondary, distinct from the nord4 path */
+.git-base { color: var(--nord9); }    /* Frost blue — current diff base [HEAD]/[index] */
 .status-icon {
   width: 1.05em;
   height: 1.05em;

@@ -6,7 +6,7 @@ use crate::app::{
 };
 use crate::keymap;
 use aether_protocol::cursor::CursorState;
-use aether_protocol::git::{BlameInfo, GitStatus};
+use aether_protocol::git::{BlameInfo, DiffBase, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::PickerItem;
 use aether_protocol::search::SearchMatchRange;
@@ -3546,7 +3546,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 
         // Left: the Git change counts sit next to the file label (they're about the file's VCS
         // state). Diagnostics moved to the right segment, by the position indicator.
-        let git_spans = git_count_spans(state);
+        let git_spans = git_status_spans(state);
 
         // Right segment, left→right: search/grep counters, diagnostic counts, the position /
         // selection indicator, then the LSP glyph pinned to the far edge. A double space precedes
@@ -3736,11 +3736,11 @@ fn build_editor_status_spans(
     } else {
         spans.push(Span::styled(left_pre.to_string(), base_style));
         used += left_pre.width();
-        // Git change counts sit right after the dirty marker (a space, then the colored counts).
+        // Git cluster sits after the file label, set off by a 3-space gap.
         let badge_w: usize = left_badges.iter().map(|s| s.content.width()).sum();
-        if badge_w > 0 && used + 1 + badge_w <= left_max {
-            spans.push(Span::styled(" ".to_string(), base_style));
-            used += 1;
+        if badge_w > 0 && used + 3 + badge_w <= left_max {
+            spans.push(Span::styled("   ".to_string(), base_style));
+            used += 3;
             for s in left_badges {
                 used += s.content.width();
                 spans.push(s);
@@ -3773,23 +3773,52 @@ fn build_editor_status_spans(
 /// deleted, vs HEAD), matching the gutter change-bar colors. Empty when the buffer is clean,
 /// untracked, or outside a repo. Segments are separated by a space; a class is shown only when its
 /// count is non-zero.
-fn git_count_spans(state: &AppState) -> Vec<Span<'static>> {
+/// The status-bar Git cluster for a tracked file: `⎇  branch  [base]  +u(s) ~u(s) -u(s)`. Branch and
+/// base are a light, legible grey; each per-class count combines unstaged and staged as `+u(s)` —
+/// the unstaged count then the staged count in parentheses, each omitted when zero (so `+1(2)` is
+/// one unstaged + two staged additions, `+3` three unstaged, `+(3)` three staged). Empty classes
+/// are skipped; the whole cluster is empty for files outside a repo. Reads `git_status` (server-
+/// computed) and the local `diff_base`.
+fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
     let bg = Style::default().bg(NORD1);
+    let meta = bg.fg(NORD9); // branch / base: Frost blue — secondary, distinct from the nord4 path
     let mut parts: Vec<Span<'static>> = Vec::new();
-    let Some(counts) = state.editor.as_ref().map(|ed| ed.git_changes) else {
+    let Some(ed) = state.editor.as_ref() else {
         return parts;
     };
-    for (n, sigil, color) in [
-        (counts.added, '+', NORD14),
-        (counts.modified, '~', NORD13),
-        (counts.deleted, '-', NORD11),
+    let Some(status) = ed.git_status.as_ref() else {
+        return parts;
+    };
+    if let Some(branch) = &status.branch {
+        parts.push(Span::styled(format!("⎇  {branch}"), meta));
+    }
+    // Base right after the branch — `index` means staged hunks are hidden from the gutter.
+    let base = match ed.diff_base {
+        DiffBase::Head => "HEAD",
+        DiffBase::Index => "index",
+    };
+    if !parts.is_empty() {
+        parts.push(Span::styled(" ".to_string(), bg));
+    }
+    parts.push(Span::styled(format!("[{base}]"), meta));
+    // Combined per-class counts: unstaged then `(staged)`.
+    for (sigil, color, unstaged, staged) in [
+        ('+', NORD14, status.unstaged.added, status.staged.added),
+        ('~', NORD13, status.unstaged.modified, status.staged.modified),
+        ('-', NORD11, status.unstaged.deleted, status.staged.deleted),
     ] {
-        if n > 0 {
-            if !parts.is_empty() {
-                parts.push(Span::styled(" ".to_string(), bg));
-            }
-            parts.push(Span::styled(format!("{sigil}{n}"), bg.fg(color)));
+        if unstaged == 0 && staged == 0 {
+            continue;
         }
+        let mut tok = sigil.to_string();
+        if unstaged > 0 {
+            tok.push_str(&unstaged.to_string());
+        }
+        if staged > 0 {
+            tok.push_str(&format!("({staged})"));
+        }
+        parts.push(Span::styled(" ".to_string(), bg));
+        parts.push(Span::styled(tok, bg.fg(color)));
     }
     parts
 }

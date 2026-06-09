@@ -47,8 +47,8 @@ use aether_protocol::project::{
 };
 use aether_protocol::git::{
     GitBlameLineParams, GitBlameLineResult, GitChangeCounts, GitCommitInfoParams,
-    GitCommitInfoResult, GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams,
-    HunkDirection,
+    GitCommitInfoResult, GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffBaseParams,
+    GitSetDiffViewParams, GitBufferStatus, DiffBase, HunkDirection,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -894,10 +894,12 @@ pub async fn buffer_open(
     // re-diff cheaply without touching the repo. Best-effort; untracked / no-repo → empty.
     let git_baseline = crate::git::load_baseline(&canonical);
     let git_hunks = crate::git::diff_hunks(git_baseline.blob.as_deref(), &buf.text);
+    let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &buf.text);
     s.buffers.insert(id, buf);
     s.buffer_projects.insert(id, active_project_name.clone());
     s.git_baseline.insert(id, git_baseline);
     s.git_hunks.insert(id, git_hunks);
+    s.git_unstaged_hunks.insert(id, git_unstaged);
 
     // LSP: ensure a language server for this file's language and open the document against it.
     // `ensure` returns a launch request when it created a fresh (Starting) handle; we spawn the
@@ -1044,7 +1046,7 @@ pub async fn git_set_diff_view(
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.diff_view = params.enabled;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_base) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -1053,6 +1055,7 @@ pub async fn git_set_diff_view(
         vp.tab_width,
         vp.buffer_id,
         vp.scroll_logical_line,
+        vp.diff_base,
     );
 
     // Refresh hunks so the first diff frame is accurate; clearing the view leaves them as-is
@@ -1068,7 +1071,7 @@ pub async fn git_set_diff_view(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks(&s, buffer_id);
+    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
@@ -1084,6 +1087,68 @@ pub async fn git_set_diff_view(
         params.enabled,
         hunks,
         diagnostics,
+        buffer_git_status(&s, buffer_id),
+    );
+
+    let vp = s
+        .viewports
+        .get_mut(&params.viewport_id)
+        .expect("just checked");
+    vp.first_logical_line = first;
+    vp.last_logical_line_exclusive = last_excl;
+    Ok(ViewportWindowResult { window })
+}
+
+/// Toggle which committed-side baseline this viewport's gutter / inline diff compares against
+/// (`Head` = all uncommitted changes, `Index` = unstaged only), re-rendering the window with the
+/// base-appropriate hunks. Both diffs are already cached per buffer, so this is just a re-select
+/// and re-render — no repo I/O. Mirrors `git/set_diff_view`.
+pub async fn git_set_diff_base(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitSetDiffBaseParams,
+) -> Result<ViewportWindowResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
+    vp.diff_base = params.base;
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view, diff_base) = (
+        vp.cols,
+        vp.rows,
+        vp.overscan_rows,
+        vp.wrap,
+        vp.continuation_marker_width,
+        vp.tab_width,
+        vp.buffer_id,
+        vp.scroll_logical_line,
+        vp.diff_view,
+        vp.diff_base,
+    );
+
+    let buf = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let line_count = buf.line_count();
+    let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
+    let search = s.searches.get(&(client_id, buffer_id));
+    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
+    let diagnostics = buffer_diagnostics(&s, buffer_id);
+    let buf = &s.buffers[&buffer_id];
+    let window = render_window(
+        buf,
+        first,
+        last_excl,
+        cols,
+        wrap,
+        marker_width,
+        tab_width,
+        rows,
+        search,
+        diff_view,
+        hunks,
+        diagnostics,
+        buffer_git_status(&s, buffer_id),
     );
 
     let vp = s
@@ -1558,7 +1623,7 @@ pub async fn lsp_format(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
@@ -1732,15 +1797,17 @@ pub(crate) fn refresh_git_for_buffer(
     };
     let revision = buf.revision;
 
-    // Re-read the committed baseline (the expensive part), then re-diff the live buffer against it.
+    // Re-read the committed baseline (the expensive part), then re-diff the live buffer against both
+    // the HEAD and index blobs (the latter also picks up staging done outside the editor).
     let baseline = crate::git::load_baseline(&path);
     let hunks = crate::git::diff_hunks(baseline.blob.as_deref(), &buf.text);
+    let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &buf.text);
     s.git_baseline.insert(buffer_id, baseline);
     s.git_hunks.insert(buffer_id, hunks);
+    s.git_unstaged_hunks.insert(buffer_id, unstaged);
     s.git_blame.remove(&buffer_id); // committed history changed → recompute on next request
 
     let buf = &s.buffers[&buffer_id];
-    let hunks = buffer_hunks(s, buffer_id);
     let diagnostics = buffer_diagnostics(s, buffer_id);
     let mut pushes = Vec::new();
     for vp in s.viewports.values() {
@@ -1753,7 +1820,15 @@ pub(crate) fn refresh_git_for_buffer(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf, vp, revision, search, hunks, diagnostics),
+            build_lines_changed_notif(
+                buf,
+                vp,
+                revision,
+                search,
+                buffer_hunks_for_base(s, buffer_id, vp.diff_base),
+                diagnostics,
+                buffer_git_status(s, buffer_id),
+            ),
         ));
     }
     pushes
@@ -2178,7 +2253,6 @@ fn collect_viewport_refresh(
     };
     let revision = buf.revision;
     let search_entry = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks(s, buffer_id);
     let diagnostics = buffer_diagnostics(s, buffer_id);
     for vp in s.viewports.values() {
         if vp.client_id != client_id || vp.buffer_id != buffer_id {
@@ -2204,8 +2278,9 @@ fn collect_viewport_refresh(
             vp.rows,
             search_entry,
             vp.diff_view,
-            hunks,
+            buffer_hunks_for_base(s, buffer_id, vp.diff_base),
             diagnostics,
+            buffer_git_status(s, buffer_id),
         );
         let params = ViewportLinesChangedParams {
             viewport_id: vp.id,
@@ -2221,6 +2296,7 @@ fn collect_viewport_refresh(
             line_count,
             max_scroll_logical_line: window.max_scroll_logical_line,
             git_changes: window.git_changes,
+            git_status: window.git_status,
         };
         pushes.push((
             sender,
@@ -2766,7 +2842,7 @@ pub async fn buffer_cut(
         let search = s.searches.get(&(vp.client_id, params.buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, params.buffer_id), buffer_diagnostics(&s, params.buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, params.buffer_id, vp.diff_base), buffer_diagnostics(&s, params.buffer_id), buffer_git_status(&s, params.buffer_id)),
         ));
     }
 
@@ -3104,7 +3180,7 @@ pub(crate) fn reload_buffer_locked(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -3166,6 +3242,7 @@ pub async fn viewport_subscribe(
         false,
         hunks,
         diagnostics,
+        buffer_git_status(&s, buffer_id),
     );
 
     let viewport_id = s.allocate_viewport_id();
@@ -3184,6 +3261,7 @@ pub async fn viewport_subscribe(
         first_logical_line: first,
         last_logical_line_exclusive: last_excl,
         diff_view: false,
+        diff_base: DiffBase::default(),
     };
     s.viewports.insert(viewport_id, viewport);
     s.last_scroll.insert((client_id, buffer_id), params.scroll);
@@ -3220,7 +3298,7 @@ pub async fn viewport_resize(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.cols = params.cols;
     vp.rows = params.rows;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view, diff_base) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -3230,6 +3308,7 @@ pub async fn viewport_resize(
         vp.buffer_id,
         vp.scroll_logical_line,
         vp.diff_view,
+        vp.diff_base,
     );
 
     let buf = s
@@ -3239,7 +3318,7 @@ pub async fn viewport_resize(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks(&s, buffer_id);
+    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
@@ -3255,6 +3334,7 @@ pub async fn viewport_resize(
         diff_view,
         hunks,
         diagnostics,
+        buffer_git_status(&s, buffer_id),
     );
 
     let vp = s
@@ -3274,7 +3354,7 @@ pub async fn viewport_scroll_to_row(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, diff_view) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, diff_view, diff_base) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -3283,8 +3363,9 @@ pub async fn viewport_scroll_to_row(
         vp.tab_width,
         vp.buffer_id,
         vp.diff_view,
+        vp.diff_base,
     );
-    let hunks = buffer_hunks(&s, buffer_id);
+    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
     let buf = s
         .buffers
         .get(&buffer_id)
@@ -3306,12 +3387,13 @@ pub async fn viewport_scroll_to_row(
     );
     let (first, last_excl) = pushed_range(top_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks(&s, buffer_id);
+    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
         buf, first, last_excl, cols, wrap, marker_width, tab_width, rows, search, diff_view, hunks,
         diagnostics,
+        buffer_git_status(&s, buffer_id),
     );
     let vp = s
         .viewports
@@ -3333,7 +3415,7 @@ pub async fn viewport_set_wrap(
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.wrap = params.wrap;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view, diff_base) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -3343,6 +3425,7 @@ pub async fn viewport_set_wrap(
         vp.buffer_id,
         vp.scroll_logical_line,
         vp.diff_view,
+        vp.diff_base,
     );
 
     let buf = s
@@ -3352,7 +3435,7 @@ pub async fn viewport_set_wrap(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks(&s, buffer_id);
+    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
@@ -3368,6 +3451,7 @@ pub async fn viewport_set_wrap(
         diff_view,
         hunks,
         diagnostics,
+        buffer_git_status(&s, buffer_id),
     );
 
     let vp = s
@@ -3389,7 +3473,7 @@ pub async fn viewport_scroll(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.scroll_logical_line = params.scroll.logical_line;
     vp.scroll_sub_row = params.scroll.sub_row;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view, diff_base) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -3399,6 +3483,7 @@ pub async fn viewport_scroll(
         vp.buffer_id,
         vp.scroll_logical_line,
         vp.diff_view,
+        vp.diff_base,
     );
 
     let buf = s
@@ -3408,7 +3493,7 @@ pub async fn viewport_scroll(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks(&s, buffer_id);
+    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
@@ -3424,6 +3509,7 @@ pub async fn viewport_scroll(
         diff_view,
         hunks,
         diagnostics,
+        buffer_git_status(&s, buffer_id),
     );
 
     let vp = s
@@ -3532,9 +3618,15 @@ fn recompute_diff_hunks_if_viewed(s: &mut ServerState, buffer_id: BufferId) {
     let Some(buf) = s.buffers.get(&buffer_id) else {
         return;
     };
-    let baseline = s.git_baseline.get(&buffer_id).and_then(|b| b.blob.as_deref());
-    let hunks = crate::git::diff_hunks(baseline, &buf.text);
+    let Some(baseline) = s.git_baseline.get(&buffer_id) else {
+        return;
+    };
+    // Re-diff against both blobs. The index blob is cached, so this stays a per-edit in-memory diff
+    // with no repo I/O — same cost model as the HEAD diff.
+    let hunks = crate::git::diff_hunks(baseline.blob.as_deref(), &buf.text);
+    let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &buf.text);
     s.git_hunks.insert(buffer_id, hunks);
+    s.git_unstaged_hunks.insert(buffer_id, unstaged);
 }
 
 /// The phantom "deleted" rows each anchor line shows above it, derived from the buffer's diff
@@ -3613,6 +3705,40 @@ fn buffer_hunks(s: &ServerState, buffer_id: BufferId) -> &[crate::git::DiffHunk]
         .get(&buffer_id)
         .map(Vec::as_slice)
         .unwrap_or(&[])
+}
+
+/// The buffer's *unstaged* diff hunks (vs the index), or an empty slice when none are cached.
+fn buffer_unstaged_hunks(s: &ServerState, buffer_id: BufferId) -> &[crate::git::DiffHunk] {
+    s.git_unstaged_hunks
+        .get(&buffer_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// The diff hunks that drive the gutter / inline diff for a viewport, per its `diff_base`:
+/// `Head` → buffer-vs-HEAD (all uncommitted), `Index` → buffer-vs-index (unstaged only).
+fn buffer_hunks_for_base(
+    s: &ServerState,
+    buffer_id: BufferId,
+    base: DiffBase,
+) -> &[crate::git::DiffHunk] {
+    match base {
+        DiffBase::Head => buffer_hunks(s, buffer_id),
+        DiffBase::Index => buffer_unstaged_hunks(s, buffer_id),
+    }
+}
+
+/// Buffer-level Git status for the status bar: branch + staged (HEAD→index) and unstaged
+/// (index→buffer) change counts. `Some` for any file inside a repo; `None` otherwise. Staged counts
+/// come from the baseline's cached HEAD→index diff; unstaged from the per-edit index→buffer diff.
+fn buffer_git_status(s: &ServerState, buffer_id: BufferId) -> Option<GitBufferStatus> {
+    let baseline = s.git_baseline.get(&buffer_id)?;
+    baseline.repo.as_ref()?; // only file-backed buffers inside a repo carry status
+    Some(GitBufferStatus {
+        branch: baseline.branch.clone(),
+        staged: git_change_counts(&baseline.staged_hunks),
+        unstaged: git_change_counts(buffer_unstaged_hunks(s, buffer_id)),
+    })
 }
 
 /// The buffer's language-server diagnostics, or an empty slice when none are known.
@@ -3725,7 +3851,6 @@ pub fn set_diagnostics_and_refresh(
     }
     let buf = &s.buffers[&buffer_id];
     let revision = buf.revision;
-    let hunks = buffer_hunks(s, buffer_id);
     let diags = buffer_diagnostics(s, buffer_id);
     let counts = diagnostic_counts(diags);
     let mut pushes = Vec::new();
@@ -3745,7 +3870,15 @@ pub fn set_diagnostics_and_refresh(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf, vp, revision, search, hunks, diags),
+            build_lines_changed_notif(
+                buf,
+                vp,
+                revision,
+                search,
+                buffer_hunks_for_base(s, buffer_id, vp.diff_base),
+                diags,
+                buffer_git_status(s, buffer_id),
+            ),
         ));
     }
     pushes
@@ -3960,6 +4093,7 @@ fn render_window(
     diff_view: bool,
     hunks: &[crate::git::DiffHunk],
     diagnostics: &[crate::lsp::diagnostics::BufferDiagnostic],
+    git_status: Option<GitBufferStatus>,
 ) -> Window {
     let mut lines: Vec<LogicalLineRender> = Vec::with_capacity((last_excl - first) as usize);
 
@@ -4040,6 +4174,7 @@ fn render_window(
         first_visual_row,
         max_line_width,
         git_changes: git_change_counts(hunks),
+        git_status,
         lines,
     }
 }
@@ -5348,7 +5483,7 @@ async fn apply_toggle_comment(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -5805,7 +5940,7 @@ async fn apply_indent_or_dedent(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -5985,7 +6120,7 @@ pub async fn input_move_lines(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -6176,7 +6311,7 @@ pub async fn input_join_lines(
                 continue;
             };
             let search = s.searches.get(&(vp.client_id, buffer_id));
-            pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id))));
+            pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id))));
         }
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
         let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
@@ -6305,7 +6440,7 @@ async fn apply_undo_or_redo(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -6824,7 +6959,7 @@ async fn apply_edit(
             continue;
         };
         let search = s.searches.get(&(vp.client_id, buffer_id));
-        let notif = build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id));
+        let notif = build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id));
         pushes.push((sender, notif));
     }
 
@@ -6867,6 +7002,7 @@ fn build_lines_changed_notif(
     search: Option<&SearchEntry>,
     hunks: &[crate::git::DiffHunk],
     diagnostics: &[crate::lsp::diagnostics::BufferDiagnostic],
+    git_status: Option<GitBufferStatus>,
 ) -> Notification {
     let line_count = buffer.line_count();
     let new_first = vp.first_logical_line.min(line_count);
@@ -6887,6 +7023,7 @@ fn build_lines_changed_notif(
         vp.diff_view,
         hunks,
         diagnostics,
+        git_status,
     );
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
@@ -6902,6 +7039,7 @@ fn build_lines_changed_notif(
         line_count,
         max_scroll_logical_line: window.max_scroll_logical_line,
         git_changes: window.git_changes,
+        git_status: window.git_status,
     };
     Notification {
         jsonrpc: JsonRpc,

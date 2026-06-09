@@ -262,6 +262,7 @@ fn git_change_counts_omitted_when_empty() {
         first_visual_row: 0,
         max_line_width: 0,
         git_changes,
+        git_status: None,
         lines: vec![],
     };
     let clean = to_value(mk_window(GitChangeCounts::default())).unwrap();
@@ -284,11 +285,33 @@ fn git_change_counts_omitted_when_empty() {
         first_visual_row: 0,
         max_line_width: 0,
         git_changes: GitChangeCounts { added: 1, modified: 3, deleted: 0 },
+        git_status: None,
     };
     let v = to_value(&params).unwrap();
     assert_eq!(v["git_changes"], json!({"added": 1, "modified": 3, "deleted": 0}));
     let back: ViewportLinesChangedParams = from_value(v).unwrap();
     assert_eq!(back.git_changes.modified, 3);
+}
+
+#[test]
+fn git_buffer_status_shape() {
+    use aether_protocol::git::GitBufferStatus;
+    // Clean / outside a repo: branch None, both sides empty → empty object on the wire.
+    assert_eq!(to_value(GitBufferStatus::default()).unwrap(), json!({}));
+
+    // Branch + a staged modification + an unstaged addition; empty count side is omitted.
+    let s = GitBufferStatus {
+        branch: Some("main".into()),
+        staged: GitChangeCounts { added: 0, modified: 1, deleted: 0 },
+        unstaged: GitChangeCounts { added: 2, modified: 0, deleted: 0 },
+    };
+    let v = to_value(&s).unwrap();
+    assert_eq!(v["branch"], "main");
+    assert_eq!(v["staged"], json!({"added": 0, "modified": 1, "deleted": 0}));
+    assert_eq!(v["unstaged"], json!({"added": 2, "modified": 0, "deleted": 0}));
+    let back: GitBufferStatus = from_value(v).unwrap();
+    assert_eq!(back.branch.as_deref(), Some("main"));
+    assert_eq!((back.staged.modified, back.unstaged.added), (1, 2));
 }
 
 #[test]

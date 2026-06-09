@@ -189,6 +189,7 @@ pub enum Action {
     Redo,
     ToggleWrap,
     ToggleDiffView,
+    ToggleDiffBase,
     NextHunk,
     PrevHunk,
     MoveLines(VerticalDirection),
@@ -289,6 +290,7 @@ impl Action {
                 | Action::ShowCommitInfo
                 | Action::ToggleWrap
                 | Action::ToggleDiffView
+                | Action::ToggleDiffBase
                 | Action::NextHunk
                 | Action::PrevHunk
                 | Action::NavBack
@@ -654,6 +656,7 @@ static LEADER: &[Binding] = &[
     bind!(LEADER_CTX, ch('n'), Exact(NONE), A::NewScratch, "App", "New scratch buffer"),
     bind!(LEADER_CTX, ch('w'), Exact(NONE), A::ToggleWrap, "View", "Toggle soft wrap"),
     bind!(LEADER_CTX, ch('i'), Exact(NONE), A::ToggleDiffView, "View", "Toggle inline diff"),
+    bind!(LEADER_CTX, ch('i'), Exact(ALT), A::ToggleDiffBase, "View", "Toggle diff base (HEAD/index)"),
     bind!(LEADER_CTX, ch('h'), Exact(NONE), A::NextHunk, "View", "Next change (hunk)"),
     bind!(LEADER_CTX, ch('h'), Exact(ALT), A::PrevHunk, "View", "Previous change (hunk)"),
     bind!(LEADER_CTX, ch('o'), Exact(NONE), A::ShowCommitInfo, "View", "Blame commit details"),

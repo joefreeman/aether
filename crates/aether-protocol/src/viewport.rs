@@ -1,7 +1,7 @@
 //! Viewport messages — §7 of the protocol doc.
 
 use crate::envelope::{NotificationMethod, RpcMethod};
-use crate::git::GitChangeCounts;
+use crate::git::{GitBufferStatus, GitChangeCounts};
 use crate::lsp::{DiagnosticCounts, LspServerStatus};
 use crate::search::SearchMatchRange;
 use crate::{BufferId, Revision, ViewportId};
@@ -151,6 +151,10 @@ pub struct Window {
     /// HEAD). Omitted from the wire when the buffer is clean / untracked / outside a repo.
     #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
     pub git_changes: GitChangeCounts,
+    /// Buffer-level Git status (branch + staged/unstaged counts) for the status bar. `None` outside
+    /// a repo. Rides the window so it updates live on edits, the same way `git_changes` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<GitBufferStatus>,
     pub lines: Vec<LogicalLineRender>,
 }
 
@@ -335,4 +339,7 @@ pub struct ViewportLinesChangedParams {
     /// clean / untracked / outside a repo.
     #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
     pub git_changes: GitChangeCounts,
+    /// Recomputed buffer-level Git status (branch + staged/unstaged counts). `None` outside a repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<GitBufferStatus>,
 }

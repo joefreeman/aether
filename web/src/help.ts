@@ -150,6 +150,7 @@ const TABS: Tab[] = [
         rows: [
           ["Space w", "toggle soft wrap"],
           ["Space i", "toggle inline diff"],
+          ["Space Alt-i", "toggle diff base (HEAD/index)"],
           ["Space h  Alt-h", "next / prev hunk"],
         ],
       },

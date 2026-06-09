@@ -37,6 +37,7 @@ import type {
   CursorUndoResult,
   DiagnosticCounts,
   DiagnosticSeverity,
+  DiffBase,
   Direction,
   BlameInfo,
   CommitInfo,
@@ -362,6 +363,7 @@ class Editor {
   private externallyModified = false;
   private externallyDeleted = false;
   private diffView = false;
+  private diffBase: DiffBase = "head";
   // LSP: this buffer's server key, statuses by (language, workspace_root), and diagnostic counts.
   private lspServerRef: LspServerRef | null = null;
   private lspStatuses = new Map<string, LspServerStatus>();
@@ -581,6 +583,8 @@ class Editor {
       this.viewportId = sub.viewport_id;
       this.window = sub.window;
       this.seedBufferStatus(sub.buffer_status);
+      await this.reapplyDiffBase();
+      await this.reapplyDiffView();
       // Restore the cursor/selection from the URL fragment (a reloaded/shared link), clamped server-
       // side. Best-effort — a stale fragment just leaves the cursor at the server's default.
       const frag = this.parseFragment(location.hash);
@@ -664,6 +668,8 @@ class Editor {
       this.viewportId = sub.viewport_id;
       this.window = sub.window;
       this.seedBufferStatus(sub.buffer_status);
+      await this.reapplyDiffBase();
+      await this.reapplyDiffView();
       try {
         this.cursor = await this.client.rpc<CursorState>("cursor/set", {
           buffer_id: this.bufferId,
@@ -804,27 +810,65 @@ class Editor {
     }
   }
 
+  /** Re-apply the sticky inline-diff toggle after a (re)subscribe: a fresh viewport starts with it
+   *  off server-side, so if the user had it on we turn it back on and use the re-rendered window.
+   *  Runs before the next paint, so there's no flash. Mirrors how the terminal client carries it. */
+  private async reapplyDiffView(): Promise<void> {
+    if (!this.diffView) return;
+    const r = await this.client.rpc<ViewportWindowResult>("git/set_diff_view", {
+      viewport_id: this.viewportId,
+      enabled: true,
+    });
+    this.window = r.window;
+  }
+
+  /** Re-apply the sticky diff base after a (re)subscribe (a fresh viewport defaults to HEAD). */
+  private async reapplyDiffBase(): Promise<void> {
+    if (this.diffBase === "head") return;
+    const r = await this.client.rpc<ViewportWindowResult>("git/set_diff_base", {
+      viewport_id: this.viewportId,
+      base: this.diffBase,
+    });
+    this.window = r.window;
+  }
+
   private renderStatusBar(): void {
     const left = document.createElement("span");
     left.className = "status-left";
     const proj = this.projectName ? `[${this.projectName}] ` : "";
     left.append(`${proj}${this.label}${this.statusMarker()}`);
-    // Git change counts (`+added ~modified -deleted` vs HEAD) sit next to the file label. Each
-    // class is shown only when non-zero; absent/clean → nothing. (Diagnostics live on the right.)
-    const gc = this.window?.git_changes;
-    if (gc) {
-      const gitGroups: [number, string, string][] = [
-        [gc.added, "+", "git-added"],
-        [gc.modified, "~", "git-modified"],
-        [gc.deleted, "-", "git-deleted"],
-      ];
-      for (const [n, sigil, cls] of gitGroups) {
-        if (n > 0) {
-          const s = document.createElement("span");
-          s.className = `status-git ${cls}`;
-          s.append(`${sigil}${n}`);
-          left.append(s);
-        }
+    // Git cluster next to the file label (tracked files only): `⎇  branch  [base]  +u(s) ~u(s)`,
+    // where each per-class count combines the unstaged count with the staged count in parens (each
+    // omitted when zero). (Diagnostics live on the right.)
+    const gs = this.window?.git_status;
+    if (gs) {
+      if (gs.branch) {
+        const b = document.createElement("span");
+        b.className = "status-git git-branch";
+        b.append(`⎇  ${gs.branch}`);
+        left.append(b);
+      }
+      // Base right after the branch — `index` means staged hunks are hidden from the gutter.
+      const base = document.createElement("span");
+      base.className = "status-git git-base";
+      base.append(this.diffBase === "index" ? "[index]" : "[HEAD]");
+      left.append(base);
+      // Combined per-class counts: unstaged then `(staged)`.
+      const u = gs.unstaged;
+      const s = gs.staged;
+      for (const [sigil, cls, un, st] of [
+        ["+", "git-added", u?.added ?? 0, s?.added ?? 0],
+        ["~", "git-modified", u?.modified ?? 0, s?.modified ?? 0],
+        ["-", "git-deleted", u?.deleted ?? 0, s?.deleted ?? 0],
+      ] as [string, string, number, number][]) {
+        if (!un && !st) continue;
+        let tok = sigil;
+        if (un > 0) tok += String(un);
+        if (st > 0) tok += `(${st})`;
+        const el = document.createElement("span");
+        el.className = `status-git ${cls}`;
+        el.append(tok);
+        left.append(el);
       }
     }
 
@@ -1259,7 +1303,8 @@ class Editor {
     this.savedRevision = open.saved_revision;
     this.externallyModified = false;
     this.externallyDeleted = false;
-    this.diffView = false;
+    // diffView is intentionally not reset here — it's sticky for the session (re-applied after
+    // each subscribe via reapplyDiffView), matching the terminal client.
     this.blame = null;
     this.lspServerRef = open.lsp_server ?? null;
     this.diagCounts = null;
@@ -1450,6 +1495,8 @@ class Editor {
     this.viewportId = sub.viewport_id;
     this.window = sub.window;
     this.seedBufferStatus(sub.buffer_status);
+    await this.reapplyDiffBase();
+    await this.reapplyDiffView();
     if (oldViewport && oldViewport !== sub.viewport_id) {
       void this.client.rpc<null>("viewport/unsubscribe", { viewport_id: oldViewport }).catch(() => {});
     }
@@ -1712,6 +1759,17 @@ class Editor {
         this.diffView = !this.diffView;
         this.window = r.window;
         this.setStatus(`diff: ${this.diffView ? "on" : "off"}`);
+        break;
+      }
+      case "toggleDiffBase": {
+        const base: DiffBase = this.diffBase === "head" ? "index" : "head";
+        const r = await this.client.rpc<ViewportWindowResult>("git/set_diff_base", {
+          viewport_id: this.viewportId,
+          base,
+        });
+        this.diffBase = base;
+        this.window = r.window;
+        this.setStatus(`diff base: ${base === "index" ? "index" : "HEAD"}`);
         break;
       }
       case "navigateHunk": {
@@ -2721,6 +2779,7 @@ class Editor {
           first_visual_row: p.first_visual_row,
           max_line_width: p.max_line_width,
           git_changes: p.git_changes,
+          git_status: p.git_status,
           lines: p.replacement_lines,
         };
         // Keep the revision in sync for edits that only arrive via this notification (e.g. LSP
