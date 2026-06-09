@@ -2048,7 +2048,10 @@ class Editor {
         break;
       }
       case "firstLineStart":
+        // First non-blank of the first line of the selection (consistent with `Alt-h`):
+        // park on the line, then resolve the column via the same motion `Alt-h` uses.
         await this.setCursor({ line: Math.min(pos.line, anchor.line), col: 0 });
+        await this.moveMotion({ kind: "line_first_nonblank" }, false);
         break;
       case "lastLineEnd":
         await this.setCursor({ line: Math.max(pos.line, anchor.line), col: LINE_END_COL });

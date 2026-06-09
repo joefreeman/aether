@@ -4278,8 +4278,28 @@ async fn enter_insert_at(
             return Ok(());
         }
         InsertWhere::FirstLineStart => {
+            // First non-blank of the first line of the selection (consistent with `Alt-h`).
+            // Park the cursor on that line, then let the server resolve the first non-blank
+            // column via the same motion `Alt-h` uses.
             let line = pos.line.min(cursor.anchor.line);
-            LogicalPosition { line, col: 0 }
+            let start = LogicalPosition { line, col: 0 };
+            let _ = client
+                .rpc::<CursorSet>(CursorSetParams {
+                    buffer_id,
+                    position: start,
+                    anchor: start,
+                })
+                .await?;
+            let new = client
+                .rpc::<CursorMove>(CursorMoveParams {
+                    buffer_id,
+                    motion: Motion::LineFirstNonblank,
+                    extend_selection: false,
+                })
+                .await?;
+            state.ed_mut().cursor = new;
+            enter_insert_mode(state);
+            return Ok(());
         }
         InsertWhere::LastLineEnd => {
             let line = pos.line.max(cursor.anchor.line);

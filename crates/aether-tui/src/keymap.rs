@@ -96,7 +96,7 @@ pub enum InsertWhere {
     SelectionStart,
     /// `a` — after the cursor (or at the upper end of the selection).
     SelectionEnd,
-    /// `Alt-i` — column 0 of the first line of the selection (or the cursor's line).
+    /// `Alt-i` — first non-blank of the first line of the selection (or the cursor's line).
     FirstLineStart,
     /// `Alt-a` — end of the last line of the selection (or the cursor's line).
     LastLineEnd,
@@ -547,7 +547,7 @@ static NORMAL: &[Binding] = &[
     // ---- mode transitions ----
     bind!(NORMAL_CTX, ch('i'), Exact(NONE), A::EnterInsert(InsertWhere::SelectionStart), "Mode", "Insert at selection start"),
     bind!(NORMAL_CTX, ch('a'), Exact(NONE), A::EnterInsert(InsertWhere::SelectionEnd), "Mode", "Insert at selection end"),
-    bind!(NORMAL_CTX, ch('i'), Exact(ALT), A::EnterInsert(InsertWhere::FirstLineStart), "Mode", "Insert at first line start"),
+    bind!(NORMAL_CTX, ch('i'), Exact(ALT), A::EnterInsert(InsertWhere::FirstLineStart), "Mode", "Insert at first non-blank of line"),
     bind!(NORMAL_CTX, ch('a'), Exact(ALT), A::EnterInsert(InsertWhere::LastLineEnd), "Mode", "Insert at last line end"),
 
     // ---- viewport scroll ----
