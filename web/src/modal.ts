@@ -69,35 +69,55 @@ export interface LspInfoData {
   workspaceRoot: string;
   state: string;
   message?: string | null;
+  /** Active `$/progress` work, pre-formatted one line per operation (e.g. "cargo check 28%"). */
+  progress?: string[];
+}
+
+/** A showing LSP-info dialog: `result` resolves with the chosen action; `update` re-renders it in
+ *  place with fresh status/progress (so the caller can keep it live as `lsp/status_changed` lands). */
+export interface LspInfoHandle {
+  result: Promise<"restart" | "close">;
+  update: (info: LspInfoData) => void;
 }
 
 /** Read-only LSP-server detail with a Restart action. Escape / Enter / backdrop = close, `r` =
- *  restart. Resolves the chosen action so the caller can fire the restart RPC. */
-export function lspInfoDialog(info: LspInfoData): Promise<"restart" | "close"> {
-  return new Promise((resolve) => {
+ *  restart. Resolves the chosen action so the caller can fire the restart RPC. Live-updatable via
+ *  the returned `update` while it stays open. */
+export function lspInfoDialog(info: LspInfoData): LspInfoHandle {
+  let update: (info: LspInfoData) => void = () => {};
+  const result = new Promise<"restart" | "close">((resolve) => {
     const ov = overlay();
     ov.classList.add("confirm-overlay"); // same top offset as the confirmation dialogs
     const box = document.createElement("div");
     box.className = "modal lsp-info";
     const title = document.createElement("div");
     title.className = "modal-message";
-    title.textContent = info.name;
 
     const rows = document.createElement("div");
     rows.className = "lsp-info-rows";
-    const addRow = (label: string, value: string, valueCls?: string) => {
-      const k = document.createElement("div");
-      k.className = "lsp-info-key";
-      k.textContent = label;
-      const v = document.createElement("div");
-      v.className = valueCls ? `lsp-info-val ${valueCls}` : "lsp-info-val";
-      v.textContent = value;
-      rows.append(k, v);
+    // Rebuild the title + rows from `info`; called once at open and again on each live update.
+    const render = (info: LspInfoData) => {
+      title.textContent = info.name;
+      rows.replaceChildren();
+      const addRow = (label: string, value: string, valueCls?: string) => {
+        const k = document.createElement("div");
+        k.className = "lsp-info-key";
+        k.textContent = label;
+        const v = document.createElement("div");
+        v.className = valueCls ? `lsp-info-val ${valueCls}` : "lsp-info-val";
+        v.textContent = value;
+        rows.append(k, v);
+      };
+      addRow("Language", info.language);
+      addRow("Workspace", info.workspaceRoot);
+      addRow("Status", info.state, `lsp-${info.state}`);
+      if (info.message) addRow("Error", info.message, "sev-error");
+      for (const [i, p] of (info.progress ?? []).entries()) {
+        addRow(i === 0 ? "Working" : "", p, "lsp-busy");
+      }
     };
-    addRow("Language", info.language);
-    addRow("Workspace", info.workspaceRoot);
-    addRow("Status", info.state, `lsp-${info.state}`);
-    if (info.message) addRow("Error", info.message, "sev-error");
+    render(info);
+    update = render;
 
     const row = document.createElement("div");
     row.className = "modal-buttons";
@@ -132,6 +152,7 @@ export function lspInfoDialog(info: LspInfoData): Promise<"restart" | "close"> {
     box.tabIndex = -1;
     box.focus();
   });
+  return { result, update };
 }
 
 export interface SaveAsResult {

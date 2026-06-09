@@ -3,7 +3,7 @@
 //! the highlight on reopen via `view { center_on }`.
 
 use crate::scroll::ScrollState;
-use aether_protocol::lsp::LspStatus;
+use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{PickerItem, PickerKind};
 use std::collections::HashMap;
 
@@ -93,13 +93,17 @@ pub struct PickerState {
 
 /// Drill-down detail for one LSP server, shown in place of the LSP-servers list. Built client-side
 /// from the highlighted picker row (which already carries the server's `status`, incl. a crash
-/// message), so no extra server round-trip is needed.
+/// message), so no extra server round-trip is needed. `status` and `progress` are refreshed live
+/// from `lsp/status_changed` while the detail is open (matched by language + workspace root), with
+/// `scroll` preserved across updates.
 #[derive(Debug)]
 pub struct LspServerDetail {
     pub name: String,
     pub language: String,
     pub workspace_root: String,
     pub status: LspStatus,
+    /// Active `$/progress` operations, refreshed live while the detail is open.
+    pub progress: Vec<LspProgress>,
     /// Scroll position of the (possibly long) detail body. Interior-mutable: the renderer records
     /// the geometry, the key handler reads it back to clamp (see [`ScrollState`]).
     pub scroll: ScrollState,

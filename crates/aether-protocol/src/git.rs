@@ -44,6 +44,28 @@ pub struct GitNavigateHunkResult {
     pub moved: bool,
 }
 
+// ---- change counts (status-bar summary) ---------------------------------------------------------
+
+/// Buffer-wide Git change summary for the status bar: how many buffer lines fall into each change
+/// class, measured against the HEAD baseline (Phase 1 — staged and unstaged combined, matching
+/// `git diff HEAD`). Mirrors the gutter change-bars: `added` / `modified` count the new-side lines
+/// of Added / Modified hunks; `deleted` counts the lines removed by pure deletions. A clean file
+/// (or one with no repo / untracked) reports all zeros. Rides the per-viewport `Window` and
+/// `viewport/lines_changed` rather than a dedicated notification, since the counts only change when
+/// a window is (re)rendered — on open, edit, or external HEAD change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitChangeCounts {
+    pub added: u32,
+    pub modified: u32,
+    pub deleted: u32,
+}
+
+impl GitChangeCounts {
+    pub fn is_empty(&self) -> bool {
+        self.added == 0 && self.modified == 0 && self.deleted == 0
+    }
+}
+
 // ---- git/set_diff_view --------------------------------------------------------------------------
 
 pub struct GitSetDiffView;

@@ -21,8 +21,9 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    BlameInfo, CommitInfo, GitBlameLine, GitBlameLineParams, GitCommitInfo, GitCommitInfoParams,
-    GitNavigateHunk, GitNavigateHunkParams, GitSetDiffView, GitSetDiffViewParams, HunkDirection,
+    BlameInfo, CommitInfo, GitBlameLine, GitBlameLineParams, GitChangeCounts, GitCommitInfo,
+    GitCommitInfoParams, GitNavigateHunk, GitNavigateHunkParams, GitSetDiffView,
+    GitSetDiffViewParams, HunkDirection,
 };
 use aether_protocol::nav::{
     NavBack, NavForward, NavRecord, NavRecordParams, NavStepParams, NavStepResult,
@@ -49,8 +50,8 @@ use aether_protocol::search::{
     SearchSetParams, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::viewport::{
-    DiagnosticSeverity, LogicalLineRender, ScrollPosition, ViewportLinesChanged,
-    ViewportLinesChangedParams,
+    BufferStatusSnapshot, DiagnosticSeverity, LogicalLineRender, ScrollPosition,
+    ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSetWrap,
     ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
     WrapMode,
@@ -440,6 +441,9 @@ pub struct EditorState {
     /// Total logical lines in the buffer, kept fresh from every viewport response /
     /// `viewport/lines_changed` notification.
     pub line_count: u32,
+    /// Buffer-wide Git change summary (added/modified/deleted line counts vs HEAD) for the status
+    /// bar, refreshed alongside `line_count` from every window the server sends.
+    pub git_changes: GitChangeCounts,
     /// Highest legal `scroll_logical_line` — server-computed so it accounts for wrap, putting
     /// the buffer's last visual row at the bottom of the viewport.
     pub max_scroll_logical_line: u32,
@@ -616,7 +620,7 @@ pub async fn bootstrap(
     //      to that buffer rather than spawning a fresh scratch every launch.
     //   3. Otherwise → fresh scratch.
     let root_labels = crate::labels::root_labels(&project_paths);
-    let editor = match open_file {
+    let (editor, bootstrap_status) = match open_file {
         Some((path_index, relative_path)) => {
             open_buffer_and_subscribe(
                 client,
@@ -655,6 +659,7 @@ pub async fn bootstrap(
         }
     };
 
+    let bootstrap_buffer_id = editor.buffer_id;
     let mut state = AppState {
         project_name: activated.project.name,
         project_paths,
@@ -677,6 +682,8 @@ pub async fn bootstrap(
         diagnostic_counts: std::collections::HashMap::new(),
         pending_external_close: None,
     };
+    // Seed the buffer-level status caches (diagnostics, LSP health) from the bootstrap subscribe.
+    seed_buffer_status_maps(&mut state, bootstrap_buffer_id, &bootstrap_status);
 
     // Seed the Explorer picker's remembered directory before the auto-open so it lists the
     // right place. `open_picker` would otherwise compute a default (parent of current file →
@@ -762,7 +769,7 @@ async fn activate_project_and_rebuild_editor(
     };
     let project_paths = state.project_paths.clone();
     let root_labels = state.root_labels.clone();
-    let editor = open_buffer_and_subscribe(
+    let (editor, status) = open_buffer_and_subscribe(
         client,
         state.viewport_cols,
         state.viewport_rows,
@@ -771,7 +778,9 @@ async fn activate_project_and_rebuild_editor(
         open_params,
     )
     .await?;
+    let buffer_id = editor.buffer_id;
     state.editor = Some(editor);
+    seed_buffer_status_maps(state, buffer_id, &status);
     state.status = StatusMessage::success(format!("activated project {}", state.project_name));
     // The picker was open when we entered (cursor = bar); now an editor's attached in normal
     // mode, so the cursor needs to flip back to block. Without this, the bar persists after the
@@ -790,7 +799,7 @@ async fn open_buffer_and_subscribe(
     project_paths: &[String],
     root_labels: &[String],
     open_params: aether_protocol::buffer::BufferOpenParams,
-) -> Result<EditorState> {
+) -> Result<(EditorState, BufferStatusSnapshot)> {
     let open: BufferOpenResult = client
         .rpc::<aether_protocol::buffer::BufferOpen>(open_params)
         .await?;
@@ -806,6 +815,19 @@ async fn open_buffer_and_subscribe(
     .await
 }
 
+/// Seed the `AppState`-level caches (per-buffer diagnostic counts, per-server LSP health) from a
+/// subscribe snapshot, so a buffer's status-bar state is correct the instant it's shown — not only
+/// after the next change-notification. External-change flags live on the editor itself and are set
+/// in `build_editor_state_from_open`. Idempotent: re-subscribing overwrites with the fresh values.
+fn seed_buffer_status_maps(state: &mut AppState, buffer_id: BufferId, status: &BufferStatusSnapshot) {
+    state.diagnostic_counts.insert(buffer_id, status.diagnostics);
+    if let Some(s) = status.lsp_status.clone() {
+        state
+            .lsp_status
+            .insert((s.language.clone(), s.workspace_root.clone()), s);
+    }
+}
+
 /// Subscribe a fresh viewport for `open.buffer_id` and build the `EditorState` describing it.
 /// Shared by bootstrap and by `subscribe_to_buffer`; pure construction with no side effects
 /// on the broader `AppState`. The caller picks `wrap` (bootstrap defaults to Soft; runtime
@@ -818,7 +840,7 @@ async fn build_editor_state_from_open(
     root_labels: &[String],
     open: BufferOpenResult,
     wrap: WrapMode,
-) -> Result<EditorState> {
+) -> Result<(EditorState, BufferStatusSnapshot)> {
     // Initial scroll: prefer a restored value (a buffer we'd seen before), otherwise centre
     // the viewport on the cursor. For a default cursor at (0,0) that's still line 0; for a
     // `buffer/open { jump_to }` open (e.g. a grep-picker selection landing in a fresh file),
@@ -850,7 +872,7 @@ async fn build_editor_state_from_open(
             open.scratch_number.map(u64::from).unwrap_or(open.buffer_id)
         ),
     };
-    Ok(EditorState {
+    let editor = EditorState {
         mode: EditorMode::Normal,
         buffer_id: open.buffer_id,
         viewport_id: sub.viewport_id,
@@ -860,6 +882,7 @@ async fn build_editor_state_from_open(
         window_first_logical_line: sub.window.first_logical_line,
         lines: sub.window.lines,
         line_count: sub.window.line_count,
+        git_changes: sub.window.git_changes,
         max_scroll_logical_line: sub.window.max_scroll_logical_line,
         wrap,
         diff_view: false,
@@ -868,8 +891,10 @@ async fn build_editor_state_from_open(
         drag_anchor: None,
         revision: open.revision,
         saved_revision: open.saved_revision,
-        externally_modified: false,
-        externally_deleted: false,
+        // External-change flags come from the subscribe snapshot (the server's current view), so a
+        // buffer that was already flagged before this client started showing it renders correctly.
+        externally_modified: sub.buffer_status.externally_modified,
+        externally_deleted: sub.buffer_status.externally_deleted,
         pending_count: 0,
         pending_find: None,
         pending_surround: None,
@@ -880,7 +905,8 @@ async fn build_editor_state_from_open(
         file_label,
         language: open.language,
         lsp_server: open.lsp_server,
-    })
+    };
+    Ok((editor, sub.buffer_status))
 }
 
 pub async fn run(
@@ -1213,6 +1239,10 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
                 if applied {
                     ensure_picker_selected_visible(state);
                 }
+                // Keep an open LSP detail drill-down live: the LSP picker re-pushes on each status /
+                // progress change (the only path that reaches a subscribed client), so refresh the
+                // detail from the matching server's fresh row. Scroll is preserved.
+                refresh_lsp_detail_from_items(state);
             }
             Err(e) => state.status = StatusMessage::error(format!("bad picker/update params: {e}")),
         }
@@ -1222,6 +1252,7 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
 fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
     state.ed_mut().revision = p.revision;
     state.ed_mut().line_count = p.line_count;
+    state.ed_mut().git_changes = p.git_changes;
     state.ed_mut().max_scroll_logical_line = p.max_scroll_logical_line;
     let local_start =
         (p.range.start_logical_line as i64) - (state.ed_mut().window_first_logical_line as i64);
@@ -3113,18 +3144,19 @@ async fn subscribe_to_buffer(
     // it doesn't need (and shouldn't borrow) the full AppState.
     let project_paths = state.project_paths.clone();
     let root_labels = state.root_labels.clone();
-    state.editor = Some(
-        build_editor_state_from_open(
-            client,
-            state.viewport_cols,
-            state.viewport_rows,
-            &project_paths,
-            &root_labels,
-            open,
-            wrap,
-        )
-        .await?,
-    );
+    let (editor, status) = build_editor_state_from_open(
+        client,
+        state.viewport_cols,
+        state.viewport_rows,
+        &project_paths,
+        &root_labels,
+        open,
+        wrap,
+    )
+    .await?;
+    let buffer_id = editor.buffer_id;
+    state.editor = Some(editor);
+    seed_buffer_status_maps(state, buffer_id, &status);
     apply_cursor_style(state);
     // Cover the case where the restored scroll disagrees with the cursor (e.g. a `jump_to`
     // override on a buffer we've already opened before, so the stored scroll wasn't computed
@@ -3216,7 +3248,7 @@ pub(crate) fn strip_longest_root(abs: &str, project_paths: &[String]) -> Option<
 /// Drill into the highlighted LSP server's status/error detail (`Enter` in the LSP-servers picker).
 /// A snapshot from the row, which already carries the server's `status` (incl. any crash message).
 fn open_lsp_detail(state: &mut AppState) {
-    if let Some(PickerItem::LspServer { name, language, workspace_root, status, .. }) =
+    if let Some(PickerItem::LspServer { name, language, workspace_root, status, progress, .. }) =
         state.picker.highlighted()
     {
         state.picker.lsp_detail = Some(crate::picker::LspServerDetail {
@@ -3224,8 +3256,37 @@ fn open_lsp_detail(state: &mut AppState) {
             language: language.clone(),
             workspace_root: workspace_root.clone(),
             status: status.clone(),
+            progress: progress.clone(),
             scroll: crate::scroll::ScrollState::default(),
         });
+    }
+}
+
+/// Refresh an open LSP detail drill-down from the picker's latest rows: find the server it's
+/// showing (by language + workspace root) and copy its fresh `status` + `progress` in, preserving
+/// scroll. No-op when no detail is open or the server isn't in the current rows. Called on each
+/// `picker/update` so the detail tracks status / progress live (the picker re-pushes on every
+/// change, and only to clients with the picker open — so this is the subscription-scoped path).
+fn refresh_lsp_detail_from_items(state: &mut AppState) {
+    let Some((lang, root)) = state
+        .picker
+        .lsp_detail
+        .as_ref()
+        .map(|d| (d.language.clone(), d.workspace_root.clone()))
+    else {
+        return;
+    };
+    let fresh = state.picker.items.iter().find_map(|it| match it {
+        PickerItem::LspServer { language, workspace_root, status, progress, .. }
+            if *language == lang && *workspace_root == root =>
+        {
+            Some((status.clone(), progress.clone()))
+        }
+        _ => None,
+    });
+    if let (Some((status, progress)), Some(d)) = (fresh, state.picker.lsp_detail.as_mut()) {
+        d.status = status;
+        d.progress = progress;
     }
 }
 
@@ -3465,10 +3526,13 @@ fn show_diagnostic(state: &mut AppState) {
     let diags: Vec<(DiagnosticSeverity, String)> = if local >= 0 && (local as usize) < ed.lines.len()
     {
         let line = &ed.lines[local as usize];
+        // A span covers the column when `start <= col < end`, widening a zero-width point
+        // (`start == end`, common for rust-analyzer "expected …" errors) to one cell so the cursor
+        // can still land "on" it. Matches the web client.
         let under: Vec<(DiagnosticSeverity, String)> = line
             .diagnostics
             .iter()
-            .filter(|d| cursor.col >= d.start && cursor.col <= d.end)
+            .filter(|d| cursor.col >= d.start && cursor.col < d.end.max(d.start + 1))
             .map(|d| (d.severity, d.message.clone()))
             .collect();
         if under.is_empty() {
@@ -3966,6 +4030,7 @@ async fn handle_resize(
     let ed = state.ed_mut();
     ed.window_first_logical_line = r.window.first_logical_line;
     ed.line_count = r.window.line_count;
+    ed.git_changes = r.window.git_changes;
     ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
     ed.lines = r.window.lines;
     ed.scroll_skip_rows = 0; // visual heights changed; re-align the top line
@@ -5571,6 +5636,7 @@ async fn toggle_diff_view(client: &mut Client, state: &mut AppState) -> Result<(
     ed.diff_view = enabled;
     ed.window_first_logical_line = r.window.first_logical_line;
     ed.line_count = r.window.line_count;
+    ed.git_changes = r.window.git_changes;
     ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
     ed.lines = r.window.lines;
     ed.scroll_skip_rows = 0; // phantom rows appeared/vanished; re-align the top line
@@ -5770,6 +5836,7 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
     state.ed_mut().scroll_skip_rows = 0;
     state.ed_mut().window_first_logical_line = r.window.first_logical_line;
     state.ed_mut().line_count = r.window.line_count;
+    state.ed_mut().git_changes = r.window.git_changes;
     state.ed_mut().max_scroll_logical_line = r.window.max_scroll_logical_line;
     state.ed_mut().lines = r.window.lines;
     Ok(())
@@ -5787,6 +5854,7 @@ mod tests {
             language: "rust".into(),
             workspace_root: "/p".into(),
             status: aether_protocol::lsp::LspStatus::Ready,
+            progress: Vec::new(),
         })
         .unwrap();
         apply_notification(
@@ -6057,6 +6125,7 @@ mod tests {
             window_first_logical_line: 0,
             lines: Vec::new(),
             line_count: 0,
+            git_changes: GitChangeCounts::default(),
             max_scroll_logical_line: 0,
             wrap: aether_protocol::viewport::WrapMode::None,
             diff_view: false,

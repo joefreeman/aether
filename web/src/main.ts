@@ -69,6 +69,7 @@ import type {
   ScrollPosition,
   SearchNavResult,
   SearchSetResult,
+  BufferStatusSnapshot,
   SearchSummary,
   UndoResult,
   ViewportLinesChangedParams,
@@ -117,6 +118,19 @@ function measureCell(buffer: HTMLElement): Cell {
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+/** Capitalized severity word for the diagnostic hover (matches the terminal client). */
+function severityLabel(s: DiagnosticSeverity): string {
+  switch (s) {
+    case "error":
+      return "Error";
+    case "warning":
+      return "Warning";
+    case "information":
+      return "Info";
+    case "hint":
+      return "Hint";
+  }
 }
 function basename(path: string): string {
   const i = path.lastIndexOf("/");
@@ -566,6 +580,7 @@ class Editor {
       });
       this.viewportId = sub.viewport_id;
       this.window = sub.window;
+      this.seedBufferStatus(sub.buffer_status);
       // Restore the cursor/selection from the URL fragment (a reloaded/shared link), clamped server-
       // side. Best-effort — a stale fragment just leaves the cursor at the server's default.
       const frag = this.parseFragment(location.hash);
@@ -648,6 +663,7 @@ class Editor {
       });
       this.viewportId = sub.viewport_id;
       this.window = sub.window;
+      this.seedBufferStatus(sub.buffer_status);
       try {
         this.cursor = await this.client.rpc<CursorState>("cursor/set", {
           buffer_id: this.bufferId,
@@ -772,23 +788,41 @@ class Editor {
   /** Status bar matching the TUI: left = `[project] file [+]` + colored diagnostic counts; right =
    *  search counter, cursor/selection position, and the LSP status glyph. Mode is shown by the
    *  cursor shape (block vs caret), not text. */
+  /** Seed buffer-level status from a viewport/subscribe snapshot, so the status bar is correct the
+   *  moment a buffer is shown — not only after the next change-notification. Live updates still
+   *  arrive via buffer/state, lsp/diagnostics_changed, and lsp/status_changed. */
+  private seedBufferStatus(status: BufferStatusSnapshot | undefined): void {
+    if (!status) return;
+    this.externallyModified = status.externally_modified ?? false;
+    this.externallyDeleted = status.externally_deleted ?? false;
+    this.diagCounts = status.diagnostics ?? null;
+    if (status.lsp_status) {
+      this.lspStatuses.set(
+        lspKey(status.lsp_status.language, status.lsp_status.workspace_root),
+        status.lsp_status,
+      );
+    }
+  }
+
   private renderStatusBar(): void {
     const left = document.createElement("span");
     left.className = "status-left";
     const proj = this.projectName ? `[${this.projectName}] ` : "";
     left.append(`${proj}${this.label}${this.statusMarker()}`);
-    if (this.diagCounts) {
-      const groups: [number, IconKind, string][] = [
-        [this.diagCounts.errors, "error", "sev-error"],
-        [this.diagCounts.warnings, "warning", "sev-warning"],
-        [this.diagCounts.infos, "info", "sev-information"],
-        [this.diagCounts.hints, "hint", "sev-hint"],
+    // Git change counts (`+added ~modified -deleted` vs HEAD) sit next to the file label. Each
+    // class is shown only when non-zero; absent/clean → nothing. (Diagnostics live on the right.)
+    const gc = this.window?.git_changes;
+    if (gc) {
+      const gitGroups: [number, string, string][] = [
+        [gc.added, "+", "git-added"],
+        [gc.modified, "~", "git-modified"],
+        [gc.deleted, "-", "git-deleted"],
       ];
-      for (const [n, kind, cls] of groups) {
+      for (const [n, sigil, cls] of gitGroups) {
         if (n > 0) {
           const s = document.createElement("span");
-          s.className = `status-diag ${cls}`;
-          s.append(statusIcon(kind), ` ${n}`);
+          s.className = `status-git ${cls}`;
+          s.append(`${sigil}${n}`);
           left.append(s);
         }
       }
@@ -806,6 +840,26 @@ class Editor {
       const g = document.createElement("span");
       g.textContent = `grep ${grep.current}/${grep.total}`;
       right.append(g);
+    }
+    // Diagnostic counts, grouped as one flex item so they stay tight, just left of the position.
+    if (this.diagCounts) {
+      const groups: [number, IconKind, string][] = [
+        [this.diagCounts.errors, "error", "sev-error"],
+        [this.diagCounts.warnings, "warning", "sev-warning"],
+        [this.diagCounts.infos, "info", "sev-information"],
+        [this.diagCounts.hints, "hint", "sev-hint"],
+      ];
+      const diagGroup = document.createElement("span");
+      diagGroup.className = "status-diag-group";
+      for (const [n, kind, cls] of groups) {
+        if (n > 0) {
+          const s = document.createElement("span");
+          s.className = cls;
+          s.append(statusIcon(kind), ` ${n}`);
+          diagGroup.append(s);
+        }
+      }
+      if (diagGroup.childElementCount > 0) right.append(diagGroup);
     }
     const pos = document.createElement("span");
     pos.textContent = this.positionLabel();
@@ -892,7 +946,10 @@ class Editor {
     if (!s) return null;
     switch (s.status.state) {
       case "ready":
-        return { kind: "lsp-ready", cls: "lsp-ready" };
+        // Background work in flight (indexing, cargo check) → busy spinner, like the TUI.
+        return (s.progress?.length ?? 0) > 0
+          ? { kind: "lsp-busy", cls: "lsp-busy" }
+          : { kind: "lsp-ready", cls: "lsp-ready" };
       case "crashed":
         return { kind: "lsp-crashed", cls: "lsp-crashed" };
       case "stopped":
@@ -1392,6 +1449,7 @@ class Editor {
     });
     this.viewportId = sub.viewport_id;
     this.window = sub.window;
+    this.seedBufferStatus(sub.buffer_status);
     if (oldViewport && oldViewport !== sub.viewport_id) {
       void this.client.rpc<null>("viewport/unsubscribe", { viewport_id: oldViewport }).catch(() => {});
     }
@@ -2567,6 +2625,27 @@ class Editor {
     else this.hoverEl.textContent = text;
     this.hoverEl.className = opts?.severity ? `sev-${opts.severity}` : "";
     this.hoverEl.classList.toggle("markdown", !!opts?.markdown);
+    this.placeHover();
+  }
+
+  /** Show several diagnostics stacked in the hover box, each line colored by its severity (the
+   *  multi-diagnostic counterpart to `showHover`; matches the terminal's `Space j` popup). */
+  private showDiagnosticsHover(items: { severity: DiagnosticSeverity; message: string }[]): void {
+    this.hoverEl.className = "";
+    this.hoverEl.classList.remove("markdown");
+    const frag = document.createDocumentFragment();
+    for (const it of items) {
+      const row = document.createElement("div");
+      row.className = `sev-${it.severity}`;
+      row.textContent = `${severityLabel(it.severity)}: ${it.message}`;
+      frag.append(row);
+    }
+    this.hoverEl.replaceChildren(frag);
+    this.placeHover();
+  }
+
+  /** Reveal the hover box (content already set) and position it relative to the cursor cell. */
+  private placeHover(): void {
     this.hoverEl.style.display = "block";
     this.hoverOpen = true;
     const cell = this.bufferEl.querySelector(".cursor") as HTMLElement | null;
@@ -2591,15 +2670,20 @@ class Editor {
     this.hoverEl.style.display = "none";
   }
 
-  /** `Space j`: show the diagnostic under the cursor (or the first on the line) in the hover box. */
+  /** `Space j`: show the diagnostics under the cursor — all of them — in the hover box, falling
+   *  back to every diagnostic on the cursor's line when none sit under the column. Mirrors the
+   *  terminal client so both show the same set. A span covers the column when `start <= col < end`,
+   *  widening a zero-width point (`start == end`, common for rust-analyzer "expected …" errors) to
+   *  one cell so it's still reachable. */
   private showDiagnosticAtCursor(): void {
     if (!this.window) return;
     const line = this.window.lines.find((l) => l.logical_line === this.cursor.position.line);
     const diags = line?.diagnostics ?? [];
     const col = this.cursor.position.col;
-    const hit = diags.find((d) => col >= d.start && col < d.end) ?? diags[0];
-    if (hit) this.showHover(hit.message, { severity: hit.severity });
-    else this.toast("No diagnostic at cursor");
+    const under = diags.filter((d) => col >= d.start && col < Math.max(d.end, d.start + 1));
+    const shown = under.length > 0 ? under : diags;
+    if (shown.length > 0) this.showDiagnosticsHover(shown);
+    else this.toast("No diagnostics on this line");
   }
 
   private onResize(): void {
@@ -2636,6 +2720,7 @@ class Editor {
           total_visual_rows: p.total_visual_rows,
           first_visual_row: p.first_visual_row,
           max_line_width: p.max_line_width,
+          git_changes: p.git_changes,
           lines: p.replacement_lines,
         };
         // Keep the revision in sync for edits that only arrive via this notification (e.g. LSP

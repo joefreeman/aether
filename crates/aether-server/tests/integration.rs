@@ -12695,6 +12695,96 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
 }
 
 #[tokio::test]
+async fn git_change_counts_ride_the_window() {
+    // The status-bar summary (added/modified/deleted line counts vs HEAD) is computed server-side
+    // and carried on every window the client receives — clean on open, updated after an edit.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+
+    let server = spawn_for_test("counts-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "counts-proj".into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("edit.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    // The freshly opened buffer matches HEAD → no changes.
+    assert!(
+        sub.window.git_changes.is_empty(),
+        "clean buffer reports no changes, got {:?}",
+        sub.window.git_changes
+    );
+
+    // Modify line 0 in the live buffer (insert "X" at its start) → one Modified line.
+    let _edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: open.buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    // Any window-returning RPC carries the recomputed summary; turning the diff view on re-renders.
+    let on: ViewportWindowResult = send_request::<GitSetDiffView>(
+        &mut ws,
+        5,
+        &GitSetDiffViewParams {
+            viewport_id: sub.viewport_id,
+            enabled: true,
+        },
+    )
+    .await;
+    let c = on.window.git_changes;
+    assert_eq!(
+        (c.added, c.modified, c.deleted),
+        (0, 1, 0),
+        "one modified line after editing line 0"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn git_gutter_marker_present_without_diff_view() {
     // The change-bar gutter is always on: editing a line tags it with a `diff_marker` in the
     // pushed window even though the inline diff view was never enabled.

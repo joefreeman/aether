@@ -27,9 +27,18 @@ pub fn from_lsp(diagnostics: &Value, text: &Rope, encoding: PositionEncoding) ->
     let Some(arr) = diagnostics.as_array() else {
         return Vec::new();
     };
-    arr.iter()
-        .filter_map(|d| convert_one(d, text, encoding))
-        .collect()
+    // Drop exact duplicates. Servers (rust-analyzer especially) sometimes publish the same
+    // diagnostic twice in one batch — e.g. a file pulled in by multiple crates, or proc-macro
+    // expansion — and a verbatim repeat is never useful. Dedup here so every surface (squiggles,
+    // gutter counts, the diagnostics picker, the `Space j` hover) shows each once. Distinct
+    // diagnostics that merely read alike differ in range and are kept. O(n²), but n is small.
+    let mut out: Vec<BufferDiagnostic> = Vec::new();
+    for d in arr.iter().filter_map(|d| convert_one(d, text, encoding)) {
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
 }
 
 fn convert_one(d: &Value, text: &Rope, encoding: PositionEncoding) -> Option<BufferDiagnostic> {
@@ -101,6 +110,22 @@ mod tests {
         assert_eq!(got[0].start, LogicalPosition { line: 1, col: 4 });
         assert_eq!(got[0].end, LogicalPosition { line: 1, col: 5 });
         assert_eq!(got[0].message, "unused variable");
+    }
+
+    #[test]
+    fn drops_exact_duplicates_but_keeps_distinct_ranges() {
+        let text = Rope::from_str("fn () {}\n");
+        // Two verbatim "expected identifier" at the same zero-width point → one survives. A third
+        // with the same message but a different range is a distinct diagnostic → kept.
+        let arr = json!([
+            diag(0, 3, 0, 3, 1, "expected identifier"),
+            diag(0, 3, 0, 3, 1, "expected identifier"),
+            diag(0, 5, 0, 5, 1, "expected identifier"),
+        ]);
+        let got = from_lsp(&arr, &text, PositionEncoding::Utf8);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].start.col, 3);
+        assert_eq!(got[1].start.col, 5);
     }
 
     #[test]

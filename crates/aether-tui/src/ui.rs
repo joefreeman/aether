@@ -7,7 +7,7 @@ use crate::app::{
 use crate::keymap;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::{BlameInfo, GitStatus};
-use aether_protocol::lsp::LspStatus;
+use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::PickerItem;
 use aether_protocol::search::SearchMatchRange;
 use aether_protocol::viewport::{
@@ -1600,6 +1600,22 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
             Span::styled(label, Style::default().fg(label_color)),
         ]),
     ];
+    if !detail.progress.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("working", Style::default().fg(NORD3))));
+        for p in &detail.progress {
+            let mut text = format!("  {}", p.title);
+            if let Some(pct) = p.percentage {
+                text.push_str(&format!(" {pct}%"));
+            }
+            if let Some(msg) = &p.message {
+                text.push_str(&format!("  {msg}"));
+            }
+            for w in wrap_words(&text, text_w as usize) {
+                lines.push(Line::from(Span::styled(w, Style::default().fg(NORD13))));
+            }
+        }
+    }
     if let LspStatus::Crashed { code, message } = &detail.status {
         lines.push(Line::from(""));
         for w in wrap_words(message, text_w as usize) {
@@ -2017,6 +2033,9 @@ fn picker_item_spans(
     }
     if let PickerItem::Diagnostic {
         line,
+        col,
+        end_line,
+        end_col,
         severity,
         message,
         match_indices,
@@ -2025,6 +2044,9 @@ fn picker_item_spans(
     {
         return diagnostic_item_spans(
             *line,
+            *col,
+            *end_line,
+            *end_col,
             *severity,
             message,
             match_indices,
@@ -2037,6 +2059,7 @@ fn picker_item_spans(
         language,
         root_label,
         status,
+        progress,
         match_indices,
         ..
     } = item
@@ -2046,6 +2069,7 @@ fn picker_item_spans(
             language,
             root_label,
             status,
+            progress,
             match_indices,
             highlighted,
             max_width,
@@ -2343,6 +2367,9 @@ fn grep_hit_spans(
 /// and the line number dim; fuzzy matches in the message are highlighted.
 fn diagnostic_item_spans(
     line: u32,
+    col: u32,
+    end_line: u32,
+    end_col: u32,
     severity: DiagnosticSeverity,
     message: &str,
     match_indices: &[u32],
@@ -2351,10 +2378,10 @@ fn diagnostic_item_spans(
 ) -> Vec<Span<'static>> {
     let bg = if highlighted { NORD2 } else { NORD0 };
     // The message itself is colored by severity (matching the squiggle/popup); fuzzy matches stay
-    // the bright accent so they remain visible. The line number trails in gray parentheses.
+    // the bright accent so they remain visible. The range trails in gray parentheses.
     let base = Style::default().fg(diag_color(severity)).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
-    let line_suffix = format!(" ({})", line + 1);
+    let line_suffix = format!(" ({})", diag_range_label(line, col, end_line, end_col));
     let msg_budget = max_width.saturating_sub(line_suffix.width());
 
     let truncated: String = message
@@ -2407,6 +2434,18 @@ fn diagnostic_item_spans(
     spans
 }
 
+/// A diagnostic's range as a compact `line:col` label (1-based), collapsing to `line:col-endcol`
+/// when start and end share a line and to a single `line:col` for a zero-width point.
+fn diag_range_label(line: u32, col: u32, end_line: u32, end_col: u32) -> String {
+    if line == end_line && col == end_col {
+        format!("{}:{}", line + 1, col + 1)
+    } else if line == end_line {
+        format!("{}:{}-{}", line + 1, col + 1, end_col + 1)
+    } else {
+        format!("{}:{}-{}:{}", line + 1, col + 1, end_line + 1, end_col + 1)
+    }
+}
+
 /// One LSP-servers picker row: a health glyph (the same `●`/`◐`/`✗`/`○` + color as the status-bar
 /// indicator), the server name with fuzzy-match highlights, and the language dimmed at the tail.
 /// The glyph re-renders live as `lsp/status_changed` re-pushes the picker.
@@ -2415,12 +2454,15 @@ fn lsp_server_item_spans(
     language: &str,
     root_label: &str,
     status: &LspStatus,
+    progress: &[LspProgress],
     match_indices: &[u32],
     highlighted: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = if highlighted { NORD2 } else { NORD0 };
-    let (glyph, glyph_color) = lsp_status_glyph(status);
+    // A ready server with active `$/progress` work shows the busy spinner (same as the status bar).
+    let busy = matches!(status, LspStatus::Ready) && !progress.is_empty();
+    let (glyph, glyph_color) = if busy { ("◐", NORD13) } else { lsp_status_glyph(status) };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
     // Dim tail: the language, plus the project-relative root when the server isn't at the project
@@ -2430,11 +2472,14 @@ fn lsp_server_item_spans(
     } else {
         format!("  {language}  {root_label}")
     };
-    // Glyph + a trailing space, then the name fills the budget left after the glyph and the tail.
+    // Live progress hint (e.g. "  cargo check 28% +1"), rendered in the activity color after the tail.
+    let hint = lsp_progress_hint(progress);
+    // Glyph + a trailing space, then the name fills the budget left after the glyph, tail, and hint.
     let glyph_cols = glyph.width() + 1;
     let name_budget = max_width
         .saturating_sub(glyph_cols)
-        .saturating_sub(tail.width());
+        .saturating_sub(tail.width())
+        .saturating_sub(hint.width());
 
     let truncated: String = name
         .chars()
@@ -2484,7 +2529,25 @@ fn lsp_server_item_spans(
         }
     }
     spans.push(Span::styled(tail, Style::default().fg(NORD3).bg(bg)));
+    if !hint.is_empty() {
+        spans.push(Span::styled(hint, Style::default().fg(NORD13).bg(bg)));
+    }
     spans
+}
+
+/// A compact one-line summary of a server's active `$/progress` work for a picker row: the
+/// (alphabetically first) operation's title, its percentage when known, and `+N` when more are
+/// running. Empty when the server is idle.
+fn lsp_progress_hint(progress: &[LspProgress]) -> String {
+    let Some(first) = progress.first() else { return String::new() };
+    let mut s = format!("  {}", first.title);
+    if let Some(pct) = first.percentage {
+        s.push_str(&format!(" {pct}%"));
+    }
+    if progress.len() > 1 {
+        s.push_str(&format!(" +{}", progress.len() - 1));
+    }
+    s
 }
 
 /// One Explorer entry row: leaf name with a trailing `/` for directories, NORD8 (frost blue)
@@ -3475,29 +3538,52 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // left of the position. When the row is narrow we truncate the right edge of the left
         // segment with `…` so the right segment stays whole and the position never gets
         // painted over.
-        let counter_parts: Vec<String> = [search_counter_label(state), grep_counter_label(state)]
-            .into_iter()
-            .flatten()
-            .collect();
-        let pos = format_position(state);
-        let right = if counter_parts.is_empty() {
-            pos
-        } else {
-            format!("{}  {}", counter_parts.join(" "), pos)
-        };
-
         let mut left_pre = format!("[{}] {}", state.project_name, state.ed().file_label);
         if !dirty_marker.is_empty() {
             left_pre.push(' ');
             left_pre.push_str(dirty_marker);
         }
 
+        // Left: the Git change counts sit next to the file label (they're about the file's VCS
+        // state). Diagnostics moved to the right segment, by the position indicator.
+        let git_spans = git_count_spans(state);
+
+        // Right segment, left→right: search/grep counters, diagnostic counts, the position /
+        // selection indicator, then the LSP glyph pinned to the far edge. A double space precedes
+        // each group so they don't run together.
+        let base = Style::default().bg(NORD1).fg(NORD4);
+        let mut right_spans: Vec<Span<'static>> = Vec::new();
+        let gap = |spans: &mut Vec<Span<'static>>| {
+            if !spans.is_empty() {
+                spans.push(Span::styled("  ".to_string(), base));
+            }
+        };
+        let counter_parts: Vec<String> = [search_counter_label(state), grep_counter_label(state)]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !counter_parts.is_empty() {
+            right_spans.push(Span::styled(counter_parts.join(" "), base));
+        }
+        let diag_spans = diagnostic_count_spans(state);
+        if !diag_spans.is_empty() {
+            gap(&mut right_spans);
+            right_spans.extend(diag_spans);
+        }
+        gap(&mut right_spans);
+        right_spans.push(Span::styled(format_position(state), base));
+        if let Some(glyph) = lsp_indicator_span(state) {
+            // Leading gap + trailing space give the fat `●` room at the screen edge.
+            right_spans.push(Span::styled(" ".to_string(), base));
+            right_spans.push(glyph);
+            right_spans.push(Span::styled(" ".to_string(), base));
+        }
+
         Line::from(build_editor_status_spans(
             &left_pre,
-            diagnostic_count_spans(state),
+            git_spans,
             &state.status,
-            &right,
-            lsp_indicator_span(state),
+            right_spans,
             area.width as usize,
         ))
     };
@@ -3628,17 +3714,15 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
 /// The right segment is never truncated — the cursor position is more useful than the message.
 fn build_editor_status_spans(
     left_pre: &str,
-    diag_spans: Vec<Span<'static>>,
+    left_badges: Vec<Span<'static>>,
     status: &crate::app::StatusMessage,
-    right: &str,
-    lsp: Option<Span<'static>>,
+    right_spans: Vec<Span<'static>>,
     total_width: usize,
 ) -> Vec<Span<'static>> {
     let base_style = Style::default().bg(NORD1).fg(NORD4);
-    // Right segment: the counters/position, then the LSP glyph pinned to the far edge. Reserve the
-    // glyph's width plus a leading gap and a trailing space (the latter gives the fat `●` room).
-    let lsp_w = lsp.as_ref().map(|s| s.content.width() + 2).unwrap_or(0);
-    let right_w = right.width() + lsp_w;
+    // The right segment (counters / diagnostics / position / LSP glyph) is pre-built by the caller,
+    // already including its internal gaps and the glyph's edge padding.
+    let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
     // Always keep at least one cell of gap between the left content and the right segment.
     let left_max = total_width.saturating_sub(right_w + 1);
 
@@ -3652,12 +3736,12 @@ fn build_editor_status_spans(
     } else {
         spans.push(Span::styled(left_pre.to_string(), base_style));
         used += left_pre.width();
-        // Diagnostic counts sit right after the dirty marker (a space, then the colored counts).
-        let diag_w: usize = diag_spans.iter().map(|s| s.content.width()).sum();
-        if diag_w > 0 && used + 1 + diag_w <= left_max {
+        // Git change counts sit right after the dirty marker (a space, then the colored counts).
+        let badge_w: usize = left_badges.iter().map(|s| s.content.width()).sum();
+        if badge_w > 0 && used + 1 + badge_w <= left_max {
             spans.push(Span::styled(" ".to_string(), base_style));
             used += 1;
-            for s in diag_spans {
+            for s in left_badges {
                 used += s.content.width();
                 spans.push(s);
             }
@@ -3681,13 +3765,33 @@ fn build_editor_status_spans(
 
     let pad_w = total_width.saturating_sub(used + right_w);
     spans.push(Span::styled(" ".repeat(pad_w), base_style));
-    spans.push(Span::styled(right.to_string(), base_style));
-    if let Some(glyph) = lsp {
-        spans.push(Span::styled(" ".to_string(), base_style));
-        spans.push(glyph);
-        spans.push(Span::styled(" ".to_string(), base_style));
-    }
+    spans.extend(right_spans);
     spans
+}
+
+/// Git change counts for the current buffer as colored spans (`+N` added / `~N` modified / `-N`
+/// deleted, vs HEAD), matching the gutter change-bar colors. Empty when the buffer is clean,
+/// untracked, or outside a repo. Segments are separated by a space; a class is shown only when its
+/// count is non-zero.
+fn git_count_spans(state: &AppState) -> Vec<Span<'static>> {
+    let bg = Style::default().bg(NORD1);
+    let mut parts: Vec<Span<'static>> = Vec::new();
+    let Some(counts) = state.editor.as_ref().map(|ed| ed.git_changes) else {
+        return parts;
+    };
+    for (n, sigil, color) in [
+        (counts.added, '+', NORD14),
+        (counts.modified, '~', NORD13),
+        (counts.deleted, '-', NORD11),
+    ] {
+        if n > 0 {
+            if !parts.is_empty() {
+                parts.push(Span::styled(" ".to_string(), bg));
+            }
+            parts.push(Span::styled(format!("{sigil}{n}"), bg.fg(color)));
+        }
+    }
+    parts
 }
 
 /// Diagnostic severity counts for the current buffer, worst-first, as colored spans (e.g. a red
@@ -3730,7 +3834,13 @@ fn lsp_indicator_span(state: &AppState) -> Option<Span<'static>> {
     let status = state
         .lsp_status
         .get(&(server.language.clone(), server.workspace_root.clone()))?;
-    let (glyph, color) = lsp_status_glyph(&status.status);
+    // A ready server doing background work (`$/progress` — indexing, `cargo check`) shows the busy
+    // spinner instead of the steady ●, so the bar reflects that diagnostics/results may still land.
+    let (glyph, color) = if matches!(status.status, LspStatus::Ready) && !status.progress.is_empty() {
+        ("◐", NORD13)
+    } else {
+        lsp_status_glyph(&status.status)
+    };
     Some(Span::styled(
         glyph.to_string(),
         Style::default().bg(NORD1).fg(color),
@@ -4554,7 +4664,7 @@ mod tests {
     #[test]
     fn editor_status_spans_no_status_pads_to_right_edge() {
         let status = crate::app::StatusMessage::default();
-        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, "12:5", None, 30);
+        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, vec![Span::raw("12:5")],30);
         let text = spans_text(&spans);
         assert!(text.starts_with("[proj] file.rs"));
         assert!(text.ends_with("12:5"));
@@ -4564,7 +4674,7 @@ mod tests {
     #[test]
     fn editor_status_spans_renders_status_with_color() {
         let status = crate::app::StatusMessage::success("saved (rev 1)");
-        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, "12:5", None, 60);
+        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, vec![Span::raw("12:5")],60);
         // Status text should appear, sandwiched between the left bit and the padding/right.
         let text = spans_text(&spans);
         assert!(text.contains("[proj] file.rs"));
@@ -4583,7 +4693,7 @@ mod tests {
         // total=30, right="12:5" (4) + gap(1) = 5 reserved; left_max=25. left_pre="[proj] file.rs" (14)
         // + separator(4) = 18 used. Status budget = 25 - 18 = 7. So a long status truncates.
         let status = crate::app::StatusMessage::info("a much longer status message");
-        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, "12:5", None, 30);
+        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, vec![Span::raw("12:5")],30);
         let status_span = spans
             .iter()
             .find(|s| s.style.fg == Some(NORD4) && s.content.contains('…'))
@@ -4599,7 +4709,7 @@ mod tests {
         // total=12, right=4, gap=1 → left_max=7. left_pre="[proj] file.rs" (14) > 7, so it
         // gets truncated and the status is dropped entirely.
         let status = crate::app::StatusMessage::error("save failed: disk full");
-        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, "12:5", None, 12);
+        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, vec![Span::raw("12:5")],12);
         let text = spans_text(&spans);
         // No part of the status text should make it into the rendered line.
         assert!(
@@ -4693,6 +4803,23 @@ mod tests {
             ("✗", NORD11)
         );
         assert_eq!(lsp_status_glyph(&LspStatus::Stopped), ("○", NORD3));
+    }
+
+    #[test]
+    fn lsp_progress_hint_summarizes_active_work() {
+        let mk = |title: &str, pct: Option<u32>| LspProgress {
+            title: title.into(),
+            message: None,
+            percentage: pct,
+        };
+        assert_eq!(lsp_progress_hint(&[]), "");
+        assert_eq!(lsp_progress_hint(&[mk("Indexing", None)]), "  Indexing");
+        assert_eq!(lsp_progress_hint(&[mk("cargo check", Some(28))]), "  cargo check 28%");
+        // Several concurrent operations → first (with %) plus a "+N" overflow marker.
+        assert_eq!(
+            lsp_progress_hint(&[mk("cargo check", Some(28)), mk("Indexing", None)]),
+            "  cargo check 28% +1"
+        );
     }
 
     #[test]

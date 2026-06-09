@@ -12,7 +12,7 @@
 use crate::cursor::Direction;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::git::GitStatus;
-use crate::lsp::LspStatus;
+use crate::lsp::{LspProgress, LspStatus};
 use crate::viewport::DiagnosticSeverity;
 use crate::{BufferId, LogicalPosition};
 use serde::{Deserialize, Serialize};
@@ -129,10 +129,15 @@ pub enum PickerItem {
     },
     /// One diagnostic in the current buffer. Identity is `(line, col, message)`. The matcher
     /// haystack is `message`; `match_indices` are char offsets into it. Selecting jumps to
-    /// `(line, col)`.
+    /// `(line, col)`. `(line, col)` is the range start; `(end_line, end_col)` the (exclusive) end —
+    /// the picker shows the full range so distinct diagnostics that read alike are tellable apart.
     Diagnostic {
         line: u32,
         col: u32,
+        #[serde(default)]
+        end_line: u32,
+        #[serde(default)]
+        end_col: u32,
         severity: DiagnosticSeverity,
         message: String,
         #[serde(default)]
@@ -188,6 +193,10 @@ pub enum PickerItem {
         #[serde(default)]
         root_label: String,
         status: LspStatus,
+        /// Work the server is currently doing (`$/progress`), so the picker row can show a busy
+        /// indicator and the active operation(s). Empty when idle.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        progress: Vec<LspProgress>,
         #[serde(default)]
         match_indices: Vec<u32>,
     },

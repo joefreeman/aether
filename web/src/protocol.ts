@@ -91,7 +91,16 @@ export interface BufferWindow {
   first_visual_row: number;
   /** Display cols of the widest line — sizes the native horizontal scroller (no-wrap). 0 under soft wrap. */
   max_line_width: number;
+  /** Buffer-wide Git change summary for the status bar. Absent on the wire when the buffer is clean. */
+  git_changes?: GitChangeCounts;
   lines: LogicalLineRender[];
+}
+
+/** Buffer-wide Git change line counts vs HEAD, for the status bar (`+added ~modified -deleted`). */
+export interface GitChangeCounts {
+  added: number;
+  modified: number;
+  deleted: number;
 }
 
 // ---- cursor -------------------------------------------------------------------------------------
@@ -175,12 +184,20 @@ export interface LspDiagnosticsChangedParams {
   buffer_id: BufferId;
   counts: DiagnosticCounts;
 }
+/** One in-flight `$/progress` work-done operation reported by a server. */
+export interface LspProgress {
+  title: string;
+  message?: string | null;
+  percentage?: number | null;
+}
 /** lsp/status_changed payload (also a row in lsp/server_status). */
 export interface LspServerStatus {
   name: string;
   language: string;
   workspace_root: string;
   status: LspStatus;
+  /** Active `$/progress` work (indexing, cargo check, …). Non-empty ⇒ busy. Absent when idle. */
+  progress?: LspProgress[];
 }
 
 export interface ViewportSubscribeParams {
@@ -196,6 +213,18 @@ export interface ViewportSubscribeParams {
 export interface ViewportSubscribeResult {
   viewport_id: ViewportId;
   window: BufferWindow;
+  /** Buffer-level status snapshotted at subscribe time — see the server's BufferStatusSnapshot.
+   *  Lets a client seed external-change flags, diagnostic counts, and LSP health the moment it
+   *  starts showing a buffer, rather than waiting for the next change-notification. */
+  buffer_status?: BufferStatusSnapshot;
+}
+
+/** Buffer-level state delivered with viewport/subscribe (counterpart to the server struct). */
+export interface BufferStatusSnapshot {
+  externally_modified?: boolean;
+  externally_deleted?: boolean;
+  diagnostics?: DiagnosticCounts;
+  lsp_status?: LspServerStatus | null;
 }
 
 export interface ViewportResizeParams {
@@ -515,7 +544,7 @@ export type PickerItem =
       preview: string;
       match_indices?: number[];
     }
-  | { kind: "diagnostic"; line: number; col: number; severity: DiagnosticSeverity; message: string; match_indices?: number[] }
+  | { kind: "diagnostic"; line: number; col: number; end_line?: number; end_col?: number; severity: DiagnosticSeverity; message: string; match_indices?: number[] }
   | { kind: "project"; name: string; match_indices?: number[] }
   | { kind: "dir_entry"; name: string; is_dir: boolean; match_indices?: number[]; git_status?: GitStatus }
   | { kind: "root"; path_index: number; match_indices?: number[] }
@@ -526,6 +555,7 @@ export type PickerItem =
       workspace_root: string;
       root_label?: string;
       status: LspStatus;
+      progress?: LspProgress[];
       match_indices?: number[];
     };
 
@@ -599,4 +629,6 @@ export interface ViewportLinesChangedParams {
   total_visual_rows: number;
   first_visual_row: number;
   max_line_width: number;
+  /** Recomputed buffer-wide Git change summary. Absent on the wire when the buffer is clean. */
+  git_changes?: GitChangeCounts;
 }

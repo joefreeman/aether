@@ -54,6 +54,9 @@ pub async fn initialize(
                 "synchronization": { "dynamicRegistration": false, "didSave": true },
                 "publishDiagnostics": { "relatedInformation": true },
             },
+            // Let servers report background work (indexing, `cargo check`, …) via `$/progress`,
+            // which we surface as the status-bar busy glyph and in the LSP picker.
+            "window": { "workDoneProgress": true },
         },
     });
     if let Some(opts) = init_options {

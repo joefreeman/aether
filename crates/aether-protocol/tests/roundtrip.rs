@@ -15,12 +15,13 @@ use aether_protocol::envelope::{
     RpcMethod,
 };
 use aether_protocol::git::{
-    BlameInfo, CommitInfo, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCommitInfo,
-    GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams, HunkDirection,
-    GitSetDiffView, GitSetDiffViewParams,
+    BlameInfo, CommitInfo, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitChangeCounts,
+    GitCommitInfo, GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams,
+    HunkDirection, GitSetDiffView, GitSetDiffViewParams,
 };
 use aether_protocol::viewport::{
-    DiagnosticSeverity, DiagnosticSpan, DiffMarker, LogicalLineRender, VirtualRow, VirtualRowKind,
+    BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, LogicalLineRender,
+    VirtualRow, VirtualRowKind, Window,
 };
 use aether_protocol::input::{InputSurround, InputSurroundParams, InputText, InputTextParams};
 use aether_protocol::search::{SearchSet, SearchSetParams};
@@ -34,7 +35,8 @@ use aether_protocol::lsp::{
     LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServer, LspServerStatus,
     LspServerStatusList, LspStatus, LspStatusChanged,
 };
-use aether_protocol::viewport::ViewportLinesChanged;
+use aether_protocol::viewport::{ViewportLinesChanged, ViewportLinesChangedParams};
+use aether_protocol::viewport::LogicalLineRange;
 use aether_protocol::LogicalPosition;
 use serde_json::{from_str, from_value, json, to_value};
 
@@ -202,6 +204,91 @@ fn logical_line_render_virtual_rows_shape() {
     assert_eq!(back.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
     assert_eq!(back.diff_marker, Some(DiffMarker::Modified));
     assert_eq!(back.diagnostics[0].severity, DiagnosticSeverity::Error);
+}
+
+#[test]
+fn buffer_status_snapshot_shape() {
+    use aether_protocol::lsp::{DiagnosticCounts, LspServerStatus, LspStatus};
+
+    // A clean, unbacked buffer: flags false, empty diagnostics and no LSP status drop off the wire.
+    let empty = BufferStatusSnapshot::default();
+    let v = to_value(&empty).unwrap();
+    assert_eq!(v["externally_modified"], false);
+    assert_eq!(v["externally_deleted"], false);
+    assert!(v.get("diagnostics").is_none(), "empty counts omitted");
+    assert!(v.get("lsp_status").is_none(), "no server → omitted");
+
+    // A populated snapshot serializes every component, and round-trips back.
+    let full = BufferStatusSnapshot {
+        externally_modified: true,
+        externally_deleted: false,
+        diagnostics: DiagnosticCounts { errors: 2, warnings: 1, infos: 0, hints: 0 },
+        lsp_status: Some(LspServerStatus {
+            name: "rust-analyzer".into(),
+            language: "rust".into(),
+            workspace_root: "/ws".into(),
+            status: LspStatus::Ready,
+            progress: Vec::new(),
+        }),
+    };
+    let v = to_value(&full).unwrap();
+    assert_eq!(v["externally_modified"], true);
+    assert_eq!(v["diagnostics"]["errors"], 2);
+    assert_eq!(v["lsp_status"]["name"], "rust-analyzer");
+    let back: BufferStatusSnapshot = from_value(v).unwrap();
+    assert!(back.externally_modified);
+    assert_eq!(back.diagnostics.errors, 2);
+    assert_eq!(back.lsp_status.unwrap().language, "rust");
+
+    // Absent on the wire (older server) → defaults, so deserialization never fails.
+    let bare: BufferStatusSnapshot = from_value(json!({})).unwrap();
+    assert!(bare.diagnostics.is_empty() && bare.lsp_status.is_none());
+}
+
+#[test]
+fn git_change_counts_omitted_when_empty() {
+    // A clean buffer's counts are all-zero and drop off the wire (forward-compat: an older client
+    // sees no field and defaults to empty), while a non-empty summary serializes its fields.
+    let counts = GitChangeCounts::default();
+    assert!(counts.is_empty());
+    assert_eq!(to_value(&counts).unwrap(), json!({"added": 0, "modified": 0, "deleted": 0}));
+
+    let mk_window = |git_changes| Window {
+        first_logical_line: 0,
+        last_logical_line_exclusive: 1,
+        line_count: 1,
+        max_scroll_logical_line: 0,
+        total_visual_rows: 1,
+        first_visual_row: 0,
+        max_line_width: 0,
+        git_changes,
+        lines: vec![],
+    };
+    let clean = to_value(mk_window(GitChangeCounts::default())).unwrap();
+    assert!(clean.get("git_changes").is_none(), "empty summary omitted from wire");
+
+    let dirty = to_value(mk_window(GitChangeCounts { added: 2, modified: 0, deleted: 5 })).unwrap();
+    assert_eq!(dirty["git_changes"], json!({"added": 2, "modified": 0, "deleted": 5}));
+    let back: Window = from_value(dirty).unwrap();
+    assert_eq!((back.git_changes.added, back.git_changes.deleted), (2, 5));
+
+    // Same field on the per-edit notification, with the same omit-when-empty behavior.
+    let params = ViewportLinesChangedParams {
+        viewport_id: 1,
+        revision: 7,
+        range: LogicalLineRange { start_logical_line: 0, end_logical_line_exclusive: 1 },
+        replacement_lines: vec![],
+        line_count: 1,
+        max_scroll_logical_line: 0,
+        total_visual_rows: 1,
+        first_visual_row: 0,
+        max_line_width: 0,
+        git_changes: GitChangeCounts { added: 1, modified: 3, deleted: 0 },
+    };
+    let v = to_value(&params).unwrap();
+    assert_eq!(v["git_changes"], json!({"added": 1, "modified": 3, "deleted": 0}));
+    let back: ViewportLinesChangedParams = from_value(v).unwrap();
+    assert_eq!(back.git_changes.modified, 3);
 }
 
 #[test]
@@ -624,12 +711,32 @@ fn lsp_server_status_shape() {
         language: "rust".into(),
         workspace_root: "/home/joe/proj".into(),
         status: LspStatus::Initializing,
+        progress: Vec::new(),
     };
     let v = to_value(&st).unwrap();
     assert_eq!(v["name"], "rust-analyzer");
     assert_eq!(v["language"], "rust");
     assert_eq!(v["workspace_root"], "/home/joe/proj");
     assert_eq!(v["status"], json!({"state": "initializing"}));
+    assert!(v.get("progress").is_none(), "idle server omits progress");
+
+    // A busy server carries its active work-done operations.
+    use aether_protocol::lsp::LspProgress;
+    let busy = LspServerStatus {
+        progress: vec![LspProgress {
+            title: "cargo check".into(),
+            message: Some("1/4".into()),
+            percentage: Some(25),
+        }],
+        ..st
+    };
+    let v = to_value(&busy).unwrap();
+    assert_eq!(v["progress"][0]["title"], "cargo check");
+    assert_eq!(v["progress"][0]["message"], "1/4");
+    assert_eq!(v["progress"][0]["percentage"], 25);
+    let back: LspServerStatus = from_value(v).unwrap();
+    assert_eq!(back.progress.len(), 1);
+    assert_eq!(back.progress[0].percentage, Some(25));
 }
 
 #[test]
@@ -642,6 +749,7 @@ fn lsp_status_changed_notification_roundtrip() {
             language: "go".into(),
             workspace_root: "/x".into(),
             status: LspStatus::Ready,
+            progress: Vec::new(),
         })
         .unwrap(),
     };
@@ -983,6 +1091,8 @@ fn picker_item_diagnostic_is_tagged() {
     let item = PickerItem::Diagnostic {
         line: 12,
         col: 4,
+        end_line: 12,
+        end_col: 9,
         severity: DiagnosticSeverity::Error,
         message: "mismatched types".into(),
         match_indices: vec![0, 1],
@@ -990,10 +1100,20 @@ fn picker_item_diagnostic_is_tagged() {
     let v = to_value(&item).unwrap();
     assert_eq!(v["kind"], "diagnostic");
     assert_eq!(v["line"], 12);
+    assert_eq!(v["col"], 4);
+    assert_eq!(v["end_line"], 12);
+    assert_eq!(v["end_col"], 9);
     assert_eq!(v["severity"], "error");
     assert_eq!(v["message"], "mismatched types");
     let back: PickerItem = from_value(v).unwrap();
     assert_eq!(back, item);
+
+    // The range fields default when an older server omits them (back-compat).
+    let bare: PickerItem = from_value(json!({
+        "kind": "diagnostic", "line": 3, "col": 0, "severity": "warning", "message": "unused"
+    }))
+    .unwrap();
+    assert!(matches!(bare, PickerItem::Diagnostic { end_line: 0, end_col: 0, .. }));
 }
 
 #[test]
@@ -1006,6 +1126,7 @@ fn picker_item_lsp_server_is_tagged() {
         workspace_root: "/proj".into(),
         root_label: String::new(),
         status: LspStatus::Ready,
+        progress: vec![],
         match_indices: vec![0, 1],
     };
     let v = to_value(&item).unwrap();

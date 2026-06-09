@@ -93,8 +93,12 @@ html, body, #app {
 }
 .status-left { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-right { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; }
-.status-diag { margin-left: 5px; white-space: nowrap; } /* tight spacing between diagnostic counts */
-.status-diag:first-of-type { margin-left: 18px; } /* but a clear gap from the buffer name/marker */
+.status-diag-group { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; } /* tight diagnostic cluster on the right, by the position */
+.status-git { margin-left: 5px; white-space: nowrap; } /* git change counts, before diagnostics */
+.status-git:first-of-type { margin-left: 18px; } /* clear gap from the buffer name/marker */
+.git-added { color: var(--nord14); }
+.git-modified { color: var(--nord13); }
+.git-deleted { color: var(--nord11); }
 .status-icon {
   width: 1.05em;
   height: 1.05em;

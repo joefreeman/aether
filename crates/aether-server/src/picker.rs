@@ -8,7 +8,7 @@
 //! walk, switch to `nucleo::Nucleo` and a per-picker tick task.
 
 use crate::workspace_index::CachedFile;
-use aether_protocol::lsp::LspStatus;
+use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams};
 use aether_protocol::viewport::DiagnosticSeverity;
 use aether_protocol::{BufferId, LogicalPosition};
@@ -93,6 +93,8 @@ pub struct GrepHitCandidate {
 pub struct DiagnosticCandidate {
     pub line: u32,
     pub col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
     pub severity: DiagnosticSeverity,
     pub message: String,
     pub abs_path: String,
@@ -111,6 +113,8 @@ pub struct LspServerCandidate {
     /// Display-only (see [`PickerItem::LspServer`]).
     pub root_label: String,
     pub status: LspStatus,
+    /// Active `$/progress` work-done operations (empty when idle).
+    pub progress: Vec<LspProgress>,
 }
 
 /// How a candidate set turns a non-empty query into a ranked subset. Each `PickerCandidates`
@@ -273,6 +277,8 @@ impl PickerCandidates {
                 PickerItem::Diagnostic {
                     line: c.line,
                     col: c.col,
+                    end_line: c.end_line,
+                    end_col: c.end_col,
                     severity: c.severity,
                     message: c.message.clone(),
                     match_indices,
@@ -286,6 +292,7 @@ impl PickerCandidates {
                     workspace_root: c.workspace_root.clone(),
                     root_label: c.root_label.clone(),
                     status: c.status.clone(),
+                    progress: c.progress.clone(),
                     match_indices,
                 }
             }
@@ -706,6 +713,7 @@ mod tests {
                 workspace_root: "/proj".into(),
                 root_label: String::new(),
                 status: LspStatus::Ready,
+                progress: Vec::new(),
             },
             LspServerCandidate {
                 name: "gopls".into(),
@@ -713,6 +721,7 @@ mod tests {
                 workspace_root: "/proj/svc".into(),
                 root_label: "svc".into(),
                 status: LspStatus::Starting,
+                progress: Vec::new(),
             },
         ])
     }
@@ -732,6 +741,7 @@ mod tests {
                 workspace_root,
                 root_label,
                 status,
+                progress: _,
                 match_indices,
             } => {
                 assert_eq!(name, "rust-analyzer");
@@ -762,6 +772,7 @@ mod tests {
             workspace_root: "/elsewhere".into(),
             root_label: "elsewhere".into(),
             status: LspStatus::Ready,
+            progress: vec![],
             match_indices: vec![],
         };
         assert_eq!(c.position_of(&elsewhere), None);

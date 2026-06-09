@@ -1,6 +1,8 @@
 //! Viewport messages — §7 of the protocol doc.
 
 use crate::envelope::{NotificationMethod, RpcMethod};
+use crate::git::GitChangeCounts;
+use crate::lsp::{DiagnosticCounts, LspServerStatus};
 use crate::search::SearchMatchRange;
 use crate::{BufferId, Revision, ViewportId};
 use serde::{Deserialize, Serialize};
@@ -145,6 +147,10 @@ pub struct Window {
     /// Display width (in cols) of the buffer's widest line, for sizing a native horizontal scroll
     /// container under `WrapMode::None`. `0` under soft wrap (content always fits `cols`).
     pub max_line_width: u32,
+    /// Buffer-wide Git change summary for the status bar (added/modified/deleted line counts vs
+    /// HEAD). Omitted from the wire when the buffer is clean / untracked / outside a repo.
+    #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
+    pub git_changes: GitChangeCounts,
     pub lines: Vec<LogicalLineRender>,
 }
 
@@ -186,6 +192,33 @@ pub struct ViewportSubscribeParams {
 pub struct ViewportSubscribeResult {
     pub viewport_id: ViewportId,
     pub window: Window,
+    /// Buffer-level status, snapshotted at subscribe time. Subscribing is the act of *showing* a
+    /// buffer, so it's where a client seeds the buffer-wide state it can't derive from the window:
+    /// external-change flags, diagnostic counts, and language-server health. Carried in the
+    /// response (not a follow-up notification) so it arrives atomically with the window, with no
+    /// ordering race against the editor switch. Live updates then flow through `buffer/state`,
+    /// `lsp/diagnostics_changed`, and `lsp/status_changed`.
+    #[serde(default)]
+    pub buffer_status: BufferStatusSnapshot,
+}
+
+/// The buffer-level state a client needs to start showing a buffer, beyond the rendered window —
+/// see [`ViewportSubscribeResult::buffer_status`].
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct BufferStatusSnapshot {
+    /// File changed on disk while the buffer was dirty (the watcher couldn't silently reload).
+    #[serde(default)]
+    pub externally_modified: bool,
+    /// File was removed on disk.
+    #[serde(default)]
+    pub externally_deleted: bool,
+    /// Per-severity diagnostic counts for the status bar. Empty when none / no language server.
+    #[serde(default, skip_serializing_if = "DiagnosticCounts::is_empty")]
+    pub diagnostics: DiagnosticCounts,
+    /// Health of the language server backing this buffer, if one is attached. `None` for an
+    /// unbacked buffer (no server configured / no workspace root / not yet started).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_status: Option<LspServerStatus>,
 }
 
 // ---- viewport/resize ----------------------------------------------------------------------------
@@ -298,4 +331,8 @@ pub struct ViewportLinesChangedParams {
     pub first_visual_row: u32,
     /// Recomputed widest-line width (cols) after the edit, for native horizontal scroll sizing.
     pub max_line_width: u32,
+    /// Recomputed buffer-wide Git change summary for the status bar. Omitted when the buffer is
+    /// clean / untracked / outside a repo.
+    #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
+    pub git_changes: GitChangeCounts,
 }

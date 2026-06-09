@@ -46,8 +46,9 @@ use aether_protocol::project::{
     ProjectRemoveRootResult, ProjectRenameParams, ProjectSummary,
 };
 use aether_protocol::git::{
-    GitBlameLineParams, GitBlameLineResult, GitCommitInfoParams, GitCommitInfoResult,
-    GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams, HunkDirection,
+    GitBlameLineParams, GitBlameLineResult, GitChangeCounts, GitCommitInfoParams,
+    GitCommitInfoResult, GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams,
+    HunkDirection,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -61,7 +62,8 @@ use aether_protocol::search::{
     SearchSetResult, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::viewport::{
-    DiagnosticSpan, DiffMarker, LogicalLineRange, LogicalLineRender, ViewportLinesChanged,
+    BufferStatusSnapshot, DiagnosticSpan, DiffMarker, LogicalLineRange, LogicalLineRender,
+    ViewportLinesChanged,
     ViewportLinesChangedParams, ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams,
     ViewportSubscribeParams, ViewportSubscribeResult, ViewportUnsubscribeParams,
     ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
@@ -2218,6 +2220,7 @@ fn collect_viewport_refresh(
             replacement_lines: window.lines,
             line_count,
             max_scroll_logical_line: window.max_scroll_logical_line,
+            git_changes: window.git_changes,
         };
         pushes.push((
             sender,
@@ -3186,9 +3189,24 @@ pub async fn viewport_subscribe(
     s.last_scroll.insert((client_id, buffer_id), params.scroll);
     tracing::debug!(%client_id, viewport_id, buffer_id, first, last_excl, "viewport subscribed");
 
+    // Snapshot the buffer-level status the client can't derive from the window: external-change
+    // flags, diagnostic counts, and language-server health. These otherwise only reach a client via
+    // change-notifications (`buffer/state`, `lsp/diagnostics_changed`, `lsp/status_changed`), so a
+    // viewport that subscribes *after* the relevant change already happened would show stale state
+    // until the next change. Returning it in the response (vs a follow-up push) keeps it atomic with
+    // the window and free of any ordering race against the client's editor switch.
+    let buf = &s.buffers[&buffer_id];
+    let buffer_status = BufferStatusSnapshot {
+        externally_modified: buf.externally_modified,
+        externally_deleted: buf.externally_deleted,
+        diagnostics: diagnostic_counts(buffer_diagnostics(&s, buffer_id)),
+        lsp_status: s.lsp.status_for_buffer(buffer_id),
+    };
+
     Ok(ViewportSubscribeResult {
         viewport_id,
         window,
+        buffer_status,
     })
 }
 
@@ -3572,6 +3590,23 @@ fn diff_markers_by_line(hunks: &[crate::git::DiffHunk], line_count: u32) -> Hash
     map
 }
 
+/// The buffer-wide change summary for the status bar: line counts by change class. `added` /
+/// `modified` count the new-side lines of Added / Modified hunks (matching the gutter bars);
+/// `deleted` counts the lines a pure deletion removed. A Modified hunk's replaced old-side lines
+/// are represented by its `modified` count, not counted again as deletions.
+fn git_change_counts(hunks: &[crate::git::DiffHunk]) -> GitChangeCounts {
+    use crate::git::ChangeKind;
+    let mut c = GitChangeCounts::default();
+    for h in hunks {
+        match h.kind {
+            ChangeKind::Added => c.added += h.new_lines,
+            ChangeKind::Modified => c.modified += h.new_lines,
+            ChangeKind::Deleted => c.deleted += h.deleted.len() as u32,
+        }
+    }
+    c
+}
+
 /// The buffer's diff hunks, or an empty slice when none are cached (no repo / untracked / clean).
 fn buffer_hunks(s: &ServerState, buffer_id: BufferId) -> &[crate::git::DiffHunk] {
     s.git_hunks
@@ -3627,6 +3662,8 @@ fn build_diagnostic_candidates(
         .map(|d| picker_state::DiagnosticCandidate {
             line: d.start.line,
             col: d.start.col,
+            end_line: d.end.line,
+            end_col: d.end.col,
             severity: d.severity,
             message: d.message.clone(),
             abs_path: abs_path.clone(),
@@ -3652,6 +3689,7 @@ fn build_lsp_server_candidates(
             language: st.language,
             workspace_root: st.workspace_root,
             status: st.status,
+            progress: st.progress,
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.language.cmp(&b.language)));
@@ -4001,6 +4039,7 @@ fn render_window(
         total_visual_rows,
         first_visual_row,
         max_line_width,
+        git_changes: git_change_counts(hunks),
         lines,
     }
 }
@@ -6862,6 +6901,7 @@ fn build_lines_changed_notif(
         replacement_lines: window.lines,
         line_count,
         max_scroll_logical_line: window.max_scroll_logical_line,
+        git_changes: window.git_changes,
     };
     Notification {
         jsonrpc: JsonRpc,
@@ -8010,6 +8050,121 @@ mod diff_anchor_tests {
         ];
         let map = diff_markers_by_line(&hunks, 100);
         assert_eq!(map.get(&3), Some(&DiffMarker::Modified));
+    }
+
+    #[test]
+    fn change_counts_tally_lines_by_class() {
+        // Added/Modified count new-side lines (`new_lines`); Deleted counts removed lines
+        // (`deleted.len()`). A Modified hunk's replaced old lines ride its `modified` count and are
+        // *not* also tallied as deletions.
+        let hunks = vec![
+            hunk(ChangeKind::Added, 5, 3, &[]),                  // +3
+            hunk(ChangeKind::Modified, 2, 1, &["a", "b"]),       // ~1 (2 old lines → 1 new)
+            hunk(ChangeKind::Modified, 10, 2, &["c"]),           // ~2
+            hunk(ChangeKind::Deleted, 9, 0, &["x", "y", "z"]),   // -3
+        ];
+        let c = git_change_counts(&hunks);
+        assert_eq!((c.added, c.modified, c.deleted), (3, 3, 3));
+        assert!(git_change_counts(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod subscribe_snapshot_tests {
+    use super::*;
+    use crate::lsp::diagnostics::BufferDiagnostic;
+    use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, WrapMode};
+    use aether_protocol::LogicalPosition;
+    use tokio::sync::Mutex;
+
+    fn diag(line: u32, severity: DiagnosticSeverity) -> BufferDiagnostic {
+        BufferDiagnostic {
+            start: LogicalPosition { line, col: 0 },
+            end: LogicalPosition { line, col: 1 },
+            severity,
+            message: "m".into(),
+        }
+    }
+
+    /// State with one file-text buffer carrying `diags` and the given external-change flags. No
+    /// language server is attached (so `lsp_status` snapshots as `None`). `viewport_subscribe` reads
+    /// only buffer/diagnostic/lsp state, so no client session registration is needed.
+    fn setup(
+        diags: Vec<BufferDiagnostic>,
+        externally_modified: bool,
+        externally_deleted: bool,
+    ) -> (SharedState, ClientId, BufferId) {
+        let mut st = ServerState::new();
+        let buffer_id = st.allocate_buffer_id();
+        let mut buf = Buffer::scratch(buffer_id, None, 1);
+        buf.text = ropey::Rope::from_str("alpha\nbeta\n");
+        buf.externally_modified = externally_modified;
+        buf.externally_deleted = externally_deleted;
+        st.buffers.insert(buffer_id, buf);
+        if !diags.is_empty() {
+            st.diagnostics.insert(buffer_id, diags);
+        }
+        (Arc::new(Mutex::new(st)), uuid::Uuid::new_v4(), buffer_id)
+    }
+
+    fn sub_params(buffer_id: BufferId) -> ViewportSubscribeParams {
+        ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_snapshots_existing_diagnostic_counts() {
+        // The regression: diagnostics computed before this viewport subscribed must still reach the
+        // status bar. They now ride the subscribe response, not only the change-notification.
+        let (state, client_id, buffer_id) = setup(
+            vec![
+                diag(0, DiagnosticSeverity::Error),
+                diag(1, DiagnosticSeverity::Warning),
+                diag(1, DiagnosticSeverity::Warning),
+            ],
+            false,
+            false,
+        );
+        let mut ctx = ConnectionCtx { client_id };
+        let res = viewport_subscribe(&state, &mut ctx, sub_params(buffer_id))
+            .await
+            .unwrap();
+        let c = res.buffer_status.diagnostics;
+        assert_eq!((c.errors, c.warnings), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn subscribe_snapshots_external_change_flags() {
+        // A client that starts showing a buffer the watcher already flagged externally-modified must
+        // see the flag immediately, not only on the next disk event.
+        let (state, client_id, buffer_id) = setup(Vec::new(), true, false);
+        let mut ctx = ConnectionCtx { client_id };
+        let res = viewport_subscribe(&state, &mut ctx, sub_params(buffer_id))
+            .await
+            .unwrap();
+        assert!(res.buffer_status.externally_modified);
+        assert!(!res.buffer_status.externally_deleted);
+    }
+
+    #[tokio::test]
+    async fn subscribe_to_clean_unbacked_buffer_snapshots_empty_status() {
+        let (state, client_id, buffer_id) = setup(Vec::new(), false, false);
+        let mut ctx = ConnectionCtx { client_id };
+        let res = viewport_subscribe(&state, &mut ctx, sub_params(buffer_id))
+            .await
+            .unwrap();
+        let s = &res.buffer_status;
+        assert!(s.diagnostics.is_empty());
+        assert!(!s.externally_modified && !s.externally_deleted);
+        assert!(s.lsp_status.is_none());
     }
 }
 

@@ -235,6 +235,24 @@ pub struct LspServerStatus {
     /// Absolute workspace root the server was launched against.
     pub workspace_root: String,
     pub status: LspStatus,
+    /// Work the server is currently doing, from `$/progress` (e.g. indexing, `cargo check`). One
+    /// entry per active progress token — servers run several at once. Non-empty means "busy": the
+    /// status-bar glyph shows the busy spinner, and the LSP picker lists these. Empty when idle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress: Vec<LspProgress>,
+}
+
+/// One in-flight `$/progress` work-done operation reported by a language server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspProgress {
+    /// Short title from the `begin` message, e.g. `"Indexing"` or `"cargo check"`.
+    pub title: String,
+    /// Latest detail message from `begin`/`report`, when the server sends one (e.g. `"1/430"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Completion percentage (0–100) when the server reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentage: Option<u32>,
 }
 
 /// Lifecycle of a single language server. Internally tagged on `state` for a flat wire shape:

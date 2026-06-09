@@ -13,9 +13,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
-use aether_protocol::lsp::{LspServerStatus, LspStatus, LspStatusChanged};
+use aether_protocol::lsp::{LspProgress, LspServerStatus, LspStatus, LspStatusChanged};
 use aether_protocol::BufferId;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -52,6 +53,13 @@ pub struct LspHandle {
     /// Buffers that want this server but were registered before it became `Ready`; opened in bulk
     /// once the handshake lands.
     pub registered_buffers: HashSet<BufferId>,
+    /// Active `$/progress` work-done operations, keyed by the (stringified) progress token. A
+    /// server runs several at once (indexing, `cargo check`, …); non-empty means "busy". Drives the
+    /// status-bar busy glyph and the LSP picker's progress display.
+    pub progress: HashMap<String, LspProgress>,
+    /// When we last pushed a progress update for this server, used to throttle the rapid `report`
+    /// stream (see [`handle_progress`]). `None` until the first push.
+    pub last_progress_push: Option<Instant>,
     /// Kept alive so the subprocess isn't reaped (`kill_on_drop`); dropping the handle kills it.
     child: Option<tokio::process::Child>,
 }
@@ -86,6 +94,8 @@ impl LspManager {
                 document_formatting: false,
                 open_buffers: HashSet::new(),
                 registered_buffers: HashSet::new(),
+                progress: HashMap::new(),
+                last_progress_push: None,
                 child: None,
             },
         );
@@ -160,6 +170,14 @@ impl LspManager {
         }
     }
 
+    /// The current status of the language server backing `buffer_id`, if one is attached. Lets a
+    /// freshly-subscribing client seed the status-bar health glyph without waiting for the next
+    /// `lsp/status_changed` transition.
+    pub fn status_for_buffer(&self, buffer_id: BufferId) -> Option<LspServerStatus> {
+        let key = self.doc_server.get(&buffer_id)?;
+        self.servers.get(key).map(handle_status)
+    }
+
     /// Snapshot of every server whose root falls under one of `project_roots` — drives
     /// `lsp/server_status`.
     pub fn status_for_roots(&self, project_roots: &[PathBuf]) -> Vec<LspServerStatus> {
@@ -172,11 +190,15 @@ impl LspManager {
 }
 
 fn handle_status(h: &LspHandle) -> LspServerStatus {
+    // Sort progress by title for a stable display order (the map's iteration order isn't).
+    let mut progress: Vec<LspProgress> = h.progress.values().cloned().collect();
+    progress.sort_by(|a, b| a.title.cmp(&b.title));
     LspServerStatus {
         name: h.server_name.clone(),
         language: h.language.clone(),
         workspace_root: h.workspace_root.display().to_string(),
         status: h.status.clone(),
+        progress,
     }
 }
 
@@ -344,6 +366,10 @@ async fn inbound_loop(
                 tracing::debug!(server = %key.language, count, "lsp diagnostics");
                 handle_publish_diagnostics(&state, &key, &params).await;
             }
+            LspInbound::Notification { method, params } if method == "$/progress" => {
+                let pushes = handle_progress(&state, &key, &params).await;
+                send_all(pushes).await;
+            }
             LspInbound::Notification { method, .. } => {
                 tracing::debug!(server = %key.language, %method, "lsp notification");
             }
@@ -381,6 +407,95 @@ fn server_request_response(method: &str, params: &Value) -> Value {
         }
         _ => Value::Null,
     }
+}
+
+/// Smallest gap between successive `report`-driven picker refreshes for one server. Servers stream
+/// `$/progress` reports rapidly during indexing / `cargo check`; coalescing to this rate keeps the
+/// percentage roughly live without flooding the WebSocket (the map is always current, so the next
+/// push that does go out carries the latest value).
+const PROGRESS_PUSH_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Whether a throttled `report` push is due: always for the first one, otherwise once the minimum
+/// interval has elapsed since the last progress push.
+fn report_due(last: Option<Instant>, now: Instant, min_interval: Duration) -> bool {
+    match last {
+        Some(t) => now.saturating_duration_since(t) >= min_interval,
+        None => true,
+    }
+}
+
+/// Apply a `$/progress` work-done notification and return the pushes that surface it. A `begin`
+/// adds an entry (keyed by the progress token), `report` updates its message/percentage, `end`
+/// removes it; ignored for an unknown server, a missing token, or a `report`/`end` for a token we
+/// never saw begin.
+///
+/// Fan-out is split by kind to keep the socket quiet. `begin`/`end` change the *busy* state (the
+/// progress map goes non-empty / empty), so they broadcast `lsp/status_changed` to every project
+/// client (the status-bar glyph) and refresh open LSP pickers. A `report` changes only the
+/// percentage/message — not busy-ness — so it skips the broadcast entirely and only refreshes open
+/// LSP pickers (the detail / dialog), and even that is throttled, since reports stream rapidly.
+/// In the common case (no LSP picker open anywhere) a `report` produces no messages at all.
+async fn handle_progress(
+    state: &SharedState,
+    key: &LspServerKey,
+    params: &Value,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    let token = match params.get("token") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(), // numeric tokens → their JSON form
+        None => return Vec::new(),
+    };
+    let Some(value) = params.get("value") else { return Vec::new() };
+    let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
+    let message = || value.get("message").and_then(Value::as_str).map(str::to_string);
+    let percentage = || value.get("percentage").and_then(Value::as_u64).map(|p| p as u32);
+    let now = Instant::now();
+
+    let mut guard = state.lock().await;
+    let Some(h) = guard.lsp.servers.get_mut(key) else { return Vec::new() };
+    // Update the in-memory map (always — so any later push carries the current value), and note
+    // whether this was a `report` (busy unchanged → throttled, picker-only fan-out).
+    let report_only = match kind {
+        "begin" => {
+            let title = value
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("working")
+                .to_string();
+            h.progress.insert(token, LspProgress { title, message: message(), percentage: percentage() });
+            false
+        }
+        "report" => {
+            let Some(entry) = h.progress.get_mut(&token) else { return Vec::new() };
+            if let Some(m) = message() {
+                entry.message = Some(m);
+            }
+            if let Some(p) = percentage() {
+                entry.percentage = Some(p);
+            }
+            true
+        }
+        "end" => {
+            if h.progress.remove(&token).is_none() {
+                return Vec::new();
+            }
+            false
+        }
+        _ => return Vec::new(),
+    };
+    if report_only && !report_due(h.last_progress_push, now, PROGRESS_PUSH_MIN_INTERVAL) {
+        return Vec::new();
+    }
+    h.last_progress_push = Some(now);
+
+    let mut out = Vec::new();
+    if !report_only {
+        // Busy ↔ idle changed: tell every project client so their status-bar glyph updates.
+        out.extend(collect_status_pushes(&guard, key));
+    }
+    // Refresh the LSP picker for clients that have it open — the only ones showing the detail / %.
+    out.extend(crate::handlers::refresh_lsp_server_pickers(&mut guard));
+    out
 }
 
 /// Resolve a `publishDiagnostics` payload to a buffer, convert it to buffer coordinates using the
@@ -680,6 +795,8 @@ mod tests {
             document_formatting: true,
             open_buffers: HashSet::new(),
             registered_buffers: HashSet::new(),
+            progress: HashMap::new(),
+            last_progress_push: None,
             child: None,
         };
         (handle, ev_rx)
@@ -690,6 +807,100 @@ mod tests {
             .await
             .expect("timed out")
             .expect("closed")
+    }
+
+    /// A `Ready` handle with no client/process attached — enough to exercise progress tracking,
+    /// which only touches the in-memory map.
+    fn clientless_ready_handle(key: &LspServerKey) -> LspHandle {
+        LspHandle {
+            language: key.language.clone(),
+            workspace_root: key.root.clone(),
+            server_name: "mock".into(),
+            status: LspStatus::Ready,
+            generation: 0,
+            client: None,
+            position_encoding: PositionEncoding::Utf8,
+            document_formatting: false,
+            open_buffers: HashSet::new(),
+            registered_buffers: HashSet::new(),
+            progress: HashMap::new(),
+            last_progress_push: None,
+            child: None,
+        }
+    }
+
+    #[test]
+    fn report_due_throttles_to_the_min_interval() {
+        let t0 = Instant::now();
+        let interval = Duration::from_millis(100);
+        // First report always goes out.
+        assert!(report_due(None, t0, interval));
+        // Within the window → suppressed; at/after the window → due again.
+        assert!(!report_due(Some(t0), t0 + Duration::from_millis(40), interval));
+        assert!(!report_due(Some(t0), t0 + Duration::from_millis(99), interval));
+        assert!(report_due(Some(t0), t0 + Duration::from_millis(100), interval));
+        assert!(report_due(Some(t0), t0 + Duration::from_millis(250), interval));
+    }
+
+    #[tokio::test]
+    async fn progress_begin_report_end_tracks_active_work() {
+        let key = LspServerKey { root: PathBuf::from("/proj"), language: "rust".into() };
+        let mut st = ServerState::new();
+        st.lsp.servers.insert(key.clone(), clientless_ready_handle(&key));
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(st));
+
+        let progress = |state: &SharedState, key: &LspServerKey, params: Value| {
+            let state = state.clone();
+            let key = key.clone();
+            async move {
+                let _ = handle_progress(&state, &key, &params).await;
+            }
+        };
+
+        // begin → one active operation, captured title.
+        progress(&state, &key, json!({
+            "token": "idx", "value": { "kind": "begin", "title": "Indexing", "percentage": 0 }
+        })).await;
+        {
+            let g = state.lock().await;
+            let p = handle_status(&g.lsp.servers[&key]).progress;
+            assert_eq!(p.len(), 1);
+            assert_eq!(p[0].title, "Indexing");
+            assert_eq!(p[0].percentage, Some(0));
+        }
+
+        // A second concurrent token, plus a report that updates the first.
+        progress(&state, &key, json!({
+            "token": "chk", "value": { "kind": "begin", "title": "cargo check" }
+        })).await;
+        progress(&state, &key, json!({
+            "token": "idx", "value": { "kind": "report", "message": "120/430", "percentage": 28 }
+        })).await;
+        {
+            let g = state.lock().await;
+            let p = handle_status(&g.lsp.servers[&key]).progress; // sorted by title
+            assert_eq!(p.len(), 2);
+            assert_eq!(p[0].title, "Indexing");
+            assert_eq!(p[0].message.as_deref(), Some("120/430"));
+            assert_eq!(p[0].percentage, Some(28));
+            assert_eq!(p[1].title, "cargo check");
+        }
+
+        // end removes just that token; the other stays active (still busy).
+        progress(&state, &key, json!({ "token": "idx", "value": { "kind": "end" } })).await;
+        {
+            let g = state.lock().await;
+            let p = handle_status(&g.lsp.servers[&key]).progress;
+            assert_eq!(p.len(), 1);
+            assert_eq!(p[0].title, "cargo check");
+        }
+
+        // Final end → idle (no progress, glyph goes back to ●).
+        progress(&state, &key, json!({ "token": "chk", "value": { "kind": "end" } })).await;
+        {
+            let g = state.lock().await;
+            assert!(handle_status(&g.lsp.servers[&key]).progress.is_empty());
+        }
     }
 
     #[tokio::test]

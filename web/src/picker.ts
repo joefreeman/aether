@@ -14,7 +14,8 @@
 
 import type { RpcClient } from "./client";
 import { confirmDialog, lspInfoDialog } from "./modal";
-import type { GitStatus, PickerItem, PickerKind, PickerUpdateParams, PickerViewResult } from "./protocol";
+import type { LspInfoData } from "./modal";
+import type { GitStatus, LspProgress, PickerItem, PickerKind, PickerUpdateParams, PickerViewResult } from "./protocol";
 
 type ToastKind = "info" | "error" | "warning" | "success";
 
@@ -72,6 +73,10 @@ export class Picker {
   private input: HTMLInputElement;
   private listEl: HTMLElement;
   private countEl: HTMLElement;
+
+  // Open LSP-info dialog (if any) plus the server it's showing, so status/progress pushes can
+  // refresh it live. Cleared when the dialog closes.
+  private lspModal: { update: (info: LspInfoData) => void; language: string; root: string } | null = null;
 
   private items: PickerItem[] = [];
   private offset = 0; // absolute index of items[0] in the full result set
@@ -219,6 +224,16 @@ export class Picker {
     // (the user scrolled away). Re-centering on the selection here would replace the just-loaded
     // scroll window, making results flash and vanish. ensureWindow runs only when the selection moves.
     this.renderList();
+    // Keep an open LSP-info dialog live: the LSP picker re-pushes on every `lsp/status_changed`, so
+    // refresh the dialog from the matching server's fresh row when one's in the loaded window.
+    if (this.lspModal) {
+      const m = this.lspModal;
+      const fresh = this.items.find(
+        (it): it is Extract<PickerItem, { kind: "lsp_server" }> =>
+          it.kind === "lsp_server" && it.language === m.language && it.workspace_root === m.root,
+      );
+      if (fresh) m.update(this.lspInfoFromItem(fresh));
+    }
     // Scroll to the selection only for selection-driven updates (centering / a pending move) — never
     // for plain scroll-fetches, which would yank the view back to the selection.
     if (resolved || this.scrollToSelOnUpdate) {
@@ -357,16 +372,26 @@ export class Picker {
     }
   }
 
-  /** Open the highlighted LSP server's status in a modal; Restart fires lsp/restart_server. */
-  private async showLspInfo(item: PickerItem): Promise<void> {
-    if (item.kind !== "lsp_server") return;
-    const choice = await lspInfoDialog({
+  /** Build the dialog's data from an LSP-server picker item. */
+  private lspInfoFromItem(item: Extract<PickerItem, { kind: "lsp_server" }>): LspInfoData {
+    return {
       name: item.name,
       language: item.language,
       workspaceRoot: item.workspace_root,
       state: item.status.state,
       message: item.status.state === "crashed" ? item.status.message : null,
-    });
+      progress: (item.progress ?? []).map(lspProgressLine),
+    };
+  }
+
+  /** Open the highlighted LSP server's status in a modal; Restart fires lsp/restart_server. The
+   *  dialog stays live: `onUpdate` refreshes it as the picker's status/progress pushes arrive. */
+  private async showLspInfo(item: PickerItem): Promise<void> {
+    if (item.kind !== "lsp_server") return;
+    const dialog = lspInfoDialog(this.lspInfoFromItem(item));
+    this.lspModal = { update: dialog.update, language: item.language, root: item.workspace_root };
+    const choice = await dialog.result;
+    this.lspModal = null;
     this.input.focus(); // dialog stole focus
     if (choice === "restart") {
       void this.client.rpc<null>("lsp/restart_server", { language: item.language }).catch(() => {});
@@ -750,7 +775,7 @@ export class Picker {
         return {
           primary: item.message.split("\n")[0],
           primaryMatches: item.match_indices,
-          meta: `:${item.line + 1}`,
+          meta: diagRangeLabel(item.line, item.col, item.end_line ?? item.line, item.end_col ?? item.col),
           prefix: "● ",
           prefixClass: `sev-${item.severity}`,
         };
@@ -776,7 +801,10 @@ export class Picker {
         return { primary: item.name, primaryMatches: item.match_indices };
       case "lsp_server": {
         const where = item.root_label ? ` (${item.root_label})` : "";
-        return { primary: item.name, primaryMatches: item.match_indices, meta: `${item.language} · ${item.status.state}${where}` };
+        // When the server is busy, show the active work in place of the bare "ready" state.
+        const hint = lspProgressHint(item.progress);
+        const state = hint || item.status.state;
+        return { primary: item.name, primaryMatches: item.match_indices, meta: `${item.language} · ${state}${where}` };
       }
     }
   }
@@ -795,6 +823,33 @@ interface RowDesc {
   bulletStatus?: GitStatus;
   /** Dim the text to gray — used for `.gitignore`d entries (which carry no bullet). */
   dim?: boolean;
+}
+
+/** A diagnostic's range as a compact 1-based label: "12:5" for a point, "12:5-9" within a line,
+ *  "12:5-14:2" across lines. Lets distinct diagnostics that read alike be told apart. */
+function diagRangeLabel(line: number, col: number, endLine: number, endCol: number): string {
+  if (line === endLine && col === endCol) return `${line + 1}:${col + 1}`;
+  if (line === endLine) return `${line + 1}:${col + 1}-${endCol + 1}`;
+  return `${line + 1}:${col + 1}-${endLine + 1}:${endCol + 1}`;
+}
+
+/** Full one-line description of a single progress op: "cargo check 28%  120/430". */
+function lspProgressLine(p: LspProgress): string {
+  let s = p.title;
+  if (p.percentage != null) s += ` ${p.percentage}%`;
+  if (p.message) s += `  ${p.message}`;
+  return s;
+}
+
+/** Compact busy summary for a picker row: first op (with %) plus "+N" when several run. Empty when
+ *  idle. */
+function lspProgressHint(progress?: LspProgress[]): string {
+  if (!progress || progress.length === 0) return "";
+  const first = progress[0];
+  let s = first.title;
+  if (first.percentage != null) s += ` ${first.percentage}%`;
+  if (progress.length > 1) s += ` +${progress.length - 1}`;
+  return s;
 }
 
 function joinPath(dir: string, name: string): string {
