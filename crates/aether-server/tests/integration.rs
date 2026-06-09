@@ -27,8 +27,9 @@ use aether_protocol::input::{
     InputUnsurround, InputUnsurroundParams, SurroundTarget, UndoResult,
 };
 use aether_protocol::picker::{
-    PickerGrepNavigate, PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHide,
-    PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerSelect,
+    BufferDirtyState, PickerGrepNavigate, PickerGrepNavigateParams, PickerGrepNavigateTarget,
+    PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,
+    PickerSelect,
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
     PickerViewParams,
 };
@@ -8015,11 +8016,11 @@ async fn buffers_picker_pushes_on_dirty_transition() {
     )
     .await;
     let initial: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let initial_dirty = match initial.items.first().unwrap() {
-        PickerItem::Buffer { dirty, .. } => *dirty,
+    let initial_status = match initial.items.first().unwrap() {
+        PickerItem::Buffer { status, .. } => *status,
         other => panic!("expected Buffer, got {other:?}"),
     };
-    assert!(!initial_dirty);
+    assert_eq!(initial_status, BufferDirtyState::Clean);
 
     // Type a char into the buffer — flips dirty true. Picker should push.
     let _: EditResult = send_request::<InputText>(
@@ -8035,17 +8036,21 @@ async fn buffers_picker_pushes_on_dirty_transition() {
     // Drain notifications until we get a picker update (other pushes — viewport lines, etc.
     // — may arrive first).
     let next: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let dirty_after = next
+    let status_after = next
         .items
         .iter()
         .find_map(|i| match i {
             PickerItem::Buffer {
-                buffer_id, dirty, ..
-            } if *buffer_id == opened.buffer_id => Some(*dirty),
+                buffer_id, status, ..
+            } if *buffer_id == opened.buffer_id => Some(*status),
             _ => None,
         })
         .expect("buffer still in items");
-    assert!(dirty_after, "dirty marker should flip after the first edit");
+    assert_eq!(
+        status_after,
+        BufferDirtyState::Unsaved,
+        "dirty dot should flip to unsaved after the first edit"
+    );
 
     drop(server);
 }
@@ -8209,7 +8214,7 @@ async fn buffers_picker_pushes_on_save() {
     )
     .await;
     let dirty_view: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let saw_dirty = dirty_view.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, dirty, .. } if *buffer_id == opened.buffer_id && *dirty));
+    let saw_dirty = dirty_view.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Unsaved));
     assert!(saw_dirty, "main.rs should be dirty after the edit");
 
     let _: BufferSaveResult = send_request::<BufferSave>(
@@ -8224,7 +8229,7 @@ async fn buffers_picker_pushes_on_save() {
     )
     .await;
     let clean: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let saw_clean = clean.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, dirty, .. } if *buffer_id == opened.buffer_id && !*dirty));
+    let saw_clean = clean.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Clean));
     assert!(
         saw_clean,
         "save should flip dirty back off and re-push the picker"

@@ -241,6 +241,8 @@ fn handle_buffer_event(
             }
             buf.externally_deleted = true;
             pushes.extend(collect_buffer_state_pushes(s, buf_id));
+            // Refresh any open buffer picker so its status dot reflects the deletion live.
+            pushes.extend(crate::handlers::refresh_buffer_pickers(s));
         }
         Category::Create | Category::Modify => {
             // Self-save filter: if disk mtime matches our recorded one, this is our own write.
@@ -277,6 +279,8 @@ fn handle_buffer_event(
                 buf.externally_deleted = false;
                 if modified_changed || deleted_changed {
                     pushes.extend(collect_buffer_state_pushes(s, buf_id));
+                    // Refresh any open buffer picker so its status dot updates live.
+                    pushes.extend(crate::handlers::refresh_buffer_pickers(s));
                 }
             }
         }

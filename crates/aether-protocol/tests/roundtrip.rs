@@ -1256,11 +1256,11 @@ fn picker_select_result_is_tagged() {
 
 #[test]
 fn picker_item_buffer_is_tagged() {
-    use aether_protocol::picker::PickerItem;
+    use aether_protocol::picker::{BufferDirtyState, PickerItem};
     let item = PickerItem::Buffer {
         buffer_id: 7,
         display: "src/main.rs".into(),
-        dirty: true,
+        status: BufferDirtyState::ExternallyModified,
         path_index: Some(0),
         relative_path: Some("src/main.rs".into()),
         match_indices: vec![0, 4],
@@ -1272,25 +1272,33 @@ fn picker_item_buffer_is_tagged() {
             "kind": "buffer",
             "buffer_id": 7,
             "display": "src/main.rs",
-            "dirty": true,
+            "status": "externally_modified",
             "path_index": 0,
             "relative_path": "src/main.rs",
             "match_indices": [0, 4],
         })
     );
 
-    // Scratch buffer: no path → both fields skipped on the wire.
+    // Scratch buffer: no path → both fields skipped; clean status → `status` skipped too.
     let scratch = PickerItem::Buffer {
         buffer_id: 9,
         display: "(scratch 1)".into(),
-        dirty: false,
+        status: BufferDirtyState::Clean,
         path_index: None,
         relative_path: None,
         match_indices: vec![],
     };
     let sv = to_value(&scratch).unwrap();
+    assert!(sv.get("status").is_none(), "clean buffer omits status");
     assert!(sv.get("path_index").is_none(), "scratch buffer omits path_index");
     assert!(sv.get("relative_path").is_none(), "scratch buffer omits relative_path");
+
+    // A clean status absent on the wire deserializes back to `Clean` (serde default).
+    let back: PickerItem = from_value(json!({
+        "kind": "buffer", "buffer_id": 9, "display": "(scratch 1)"
+    }))
+    .unwrap();
+    assert_eq!(back, scratch);
 }
 
 #[test]

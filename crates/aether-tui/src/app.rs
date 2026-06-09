@@ -521,13 +521,21 @@ pub struct BlameState {
 
 pub use crate::save_prompt::SavePromptState;
 
-impl EditorState {
-    /// Mirror of the status bar's dirty indicator. `true` when the buffer has unsaved local
-    /// changes (`revision != saved_revision`) or the server flagged it as externally-changed
-    /// in a way the user needs to address.
-    pub fn dirty_marker_visible(&self) -> bool {
-        self.revision != self.saved_revision || self.externally_modified || self.externally_deleted
-    }
+
+/// Dot used as the buffer-state indicator (status bar + terminal title). The heavier `●` (same
+/// glyph as the LSP status indicator), which reads more clearly than the lighter bullet.
+pub const BUFFER_STATUS_DOT: &str = "●";
+
+/// Which dirty / external-change condition applies to the active buffer, in precedence order.
+/// Rendered as a colour-coded dot in the status bar; the colours match the web client's favicon.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BufferStatusKind {
+    /// Unsaved local edits (`revision != saved_revision`).
+    Unsaved,
+    /// The file changed on disk underneath us.
+    ExternallyModified,
+    /// The file was removed on disk.
+    ExternallyDeleted,
 }
 
 impl AppState {
@@ -553,23 +561,23 @@ impl AppState {
             .expect("BUG: AppState::ed_mut() called without an active editor")
     }
 
-    /// Single-character buffer-state marker, mirroring the status row:
-    ///   `[x]` — file removed on disk; `[!]` — file modified on disk; `[+]` — unsaved local
-    /// edits; `""` — clean. Highest-precedence wins so the user always sees the most urgent
-    /// flag. Empty when no editor is attached.
-    pub fn buffer_status_marker(&self) -> &'static str {
+    /// Buffer-state for the status indicator, highest-precedence first so the user always sees
+    /// the most urgent flag: removed on disk → changed on disk → unsaved local edits → `None`
+    /// when clean (or no editor is attached). The status bar renders this as a colour-coded dot
+    /// (see `buffer_status_color`); the terminal title shows a leading plain dot.
+    pub fn buffer_status(&self) -> Option<BufferStatusKind> {
         if !self.has_editor() {
-            return "";
+            return None;
         }
         let ed = self.ed();
         if ed.externally_deleted {
-            "[x]"
+            Some(BufferStatusKind::ExternallyDeleted)
         } else if ed.externally_modified {
-            "[!]"
+            Some(BufferStatusKind::ExternallyModified)
         } else if ed.revision != ed.saved_revision {
-            "[+]"
+            Some(BufferStatusKind::Unsaved)
         } else {
-            ""
+            None
         }
     }
 }
@@ -1051,10 +1059,12 @@ fn refresh_terminal_title(state: &mut AppState) {
 }
 
 /// Derive the terminal title from the current state. Mirrors the left segment of the editor
-/// status row — `[{project}] {file_label}` with an optional ` {marker}` — so the title
-/// answers "what am I editing?" at a glance. Before any project is active we fall back to a
-/// bare `Aether` placeholder; without a buffer (transient project-switch window) we just show
-/// the project name.
+/// status row — `[{project}] {file_label}` — with a leading dot when the buffer is dirty or
+/// changed on disk, so the title answers "what am I editing, and is it saved?" at a glance. The
+/// dot leads (not trails) to match the favicon's position in the web client's tab; a terminal
+/// title can't carry colour, so every non-clean state shows the same plain dot (the status bar
+/// colour-codes it). Before any project is active we fall back to a bare `Aether` placeholder;
+/// without a buffer (transient project-switch window) we just show the project name.
 fn terminal_title(state: &AppState) -> String {
     if state.project_name.is_empty() {
         return "Aether".to_string();
@@ -1062,17 +1072,16 @@ fn terminal_title(state: &AppState) -> String {
     if !state.has_editor() {
         return format!("[{}]", state.project_name);
     }
-    let marker = state.buffer_status_marker();
-    let marker_suffix = if marker.is_empty() {
-        String::new()
+    let prefix = if state.buffer_status().is_some() {
+        format!("{BUFFER_STATUS_DOT} ")
     } else {
-        format!(" {marker}")
+        String::new()
     };
     format!(
-        "[{}] {}{}",
+        "{}[{}] {}",
+        prefix,
         state.project_name,
-        state.ed().file_label,
-        marker_suffix
+        state.ed().file_label
     )
 }
 
@@ -6171,7 +6180,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_title_appends_dirty_marker() {
+    fn terminal_title_prepends_status_dot() {
         let mut state = AppState {
             project_name: "demo".into(),
             project_paths: vec!["/tmp/demo".into()],
@@ -6194,18 +6203,18 @@ mod tests {
             diagnostic_counts: std::collections::HashMap::new(),
         pending_external_close: None,
         };
-        // Clean buffer → no marker.
+        // Clean buffer → no dot.
         assert_eq!(terminal_title(&state), "[demo] src/main.rs");
-        // Local edits → `[+]`.
+        // Local edits → leading dot.
         if let Some(ed) = state.editor.as_mut() {
             ed.revision = 5;
         }
-        assert_eq!(terminal_title(&state), "[demo] src/main.rs [+]");
-        // External delete trumps `[+]`.
+        assert_eq!(terminal_title(&state), "● [demo] src/main.rs");
+        // External delete is still a (single, plain) leading dot — the title can't colour-code it.
         if let Some(ed) = state.editor.as_mut() {
             ed.externally_deleted = true;
         }
-        assert_eq!(terminal_title(&state), "[demo] src/main.rs [x]");
+        assert_eq!(terminal_title(&state), "● [demo] src/main.rs");
     }
 
     /// Minimal `EditorState` for title tests — only the fields the title code reads matter

@@ -7,7 +7,7 @@ import { RpcClient, RpcError } from "./client";
 import type { ConnState } from "./client";
 import { renderMarkdown } from "./markdown";
 import { renderBuffer } from "./render";
-import { Picker } from "./picker";
+import { Picker, bufferStatusDot } from "./picker";
 import { decodeRow } from "./text";
 import { readClipboard, writeClipboard } from "./clipboard";
 import { confirmDialog, saveAsDialog } from "./modal";
@@ -791,7 +791,8 @@ class Editor {
       });
   }
 
-  /** Status bar matching the TUI: left = `[project] file [+]` + colored diagnostic counts; right =
+  /** Status bar matching the TUI: left = `[project] file •` (colour-coded dirty dot) + colored
+   *  diagnostic counts; right =
    *  search counter, cursor/selection position, and the LSP status glyph. Mode is shown by the
    *  cursor shape (block vs caret), not text. */
   /** Seed buffer-level status from a viewport/subscribe snapshot, so the status bar is correct the
@@ -835,8 +836,12 @@ class Editor {
   private renderStatusBar(): void {
     const left = document.createElement("span");
     left.className = "status-left";
+    // Buffer-state dot leads the row, before the project name — matching the terminal title and
+    // the tab favicon.
+    const dot = this.statusDot();
+    if (dot) left.append(dot);
     const proj = this.projectName ? `[${this.projectName}] ` : "";
-    left.append(`${proj}${this.label}${this.statusMarker()}`);
+    left.append(`${proj}${this.label}`);
     // Git cluster next to the file label (tracked files only): `⎇  branch  [base]  +u(s) ~u(s)`,
     // where each per-class count combines the unstaged count with the staged count in parens (each
     // omitted when zero). (Diagnostics live on the right.)
@@ -921,18 +926,21 @@ class Editor {
     this.updateFavicon();
   }
 
-  /** Dirty / external-change marker for the on-screen status bar. (In the browser tab this state is
-   *  carried by the favicon instead — see `updateFavicon` — so the title omits the marker.) */
-  private statusMarker(): string {
-    if (this.externallyDeleted) return " [deleted]";
-    if (this.externallyModified) return " [changed]";
-    if (this.revision !== this.savedRevision) return " [+]";
-    return "";
+  /** Buffer-state dot for the on-screen status bar, placed just after the file label and colour-
+   *  coded to match the tab favicon (see `bufferStateColor`). `null` when the buffer is clean. The
+   *  browser-tab equivalent of this state is the favicon — see `updateFavicon`. */
+  private statusDot(): SVGSVGElement | null {
+    const color = this.bufferStateColor();
+    if (!color) return null;
+    const dot = bufferStatusDot();
+    dot.classList.add("status-dot");
+    dot.style.color = color;
+    return dot;
   }
 
-  /** Buffer-state accent colour for the tab favicon (Nord palette), same precedence as the status
-   *  marker: deleted-on-disk → changed-on-disk → unsaved edits. `null` when clean — a clean buffer
-   *  shows the plain "ae" app mark instead of a status dot. */
+  /** Buffer-state accent colour for the tab favicon and the status-bar dot (Nord palette), in
+   *  precedence order: deleted-on-disk → changed-on-disk → unsaved edits. `null` when clean — a
+   *  clean buffer shows the plain "ae" app mark / no dot. */
   private bufferStateColor(): string | null {
     if (this.externallyDeleted) return "#bf616a"; // aurora red — gone on disk
     if (this.externallyModified) return "#d08770"; // aurora orange — changed on disk

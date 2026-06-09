@@ -15,7 +15,7 @@
 import type { RpcClient } from "./client";
 import { confirmDialog, lspInfoDialog } from "./modal";
 import type { LspInfoData } from "./modal";
-import type { GitStatus, LspProgress, PickerItem, PickerKind, PickerUpdateParams, PickerViewResult } from "./protocol";
+import type { BufferDirtyState, GitStatus, LspProgress, PickerItem, PickerKind, PickerUpdateParams, PickerViewResult } from "./protocol";
 
 type ToastKind = "info" | "error" | "warning" | "success";
 
@@ -555,7 +555,7 @@ export class Picker {
       if (href) (row as HTMLAnchorElement).href = href;
       row.className = i === localSel ? "picker-row selected" : "picker-row";
       if (i === localSel) selectedRow = row;
-      const { primary, primaryMatches, meta, prefix, prefixClass, dir, bullet, bulletStatus, dim } = this.describe(item);
+      const { primary, primaryMatches, meta, prefix, prefixClass, dir, bullet, bulletStatus, dim, dirtyDot } = this.describe(item);
       if (bullet) {
         // Fixed-width cell (empty when clean/ignored) so entry names stay aligned across rows; the
         // `•` glyph and its colour appear only on a real change.
@@ -582,6 +582,11 @@ export class Picker {
         m.className = "picker-meta";
         m.textContent = meta;
         row.append(m);
+      }
+      if (dirtyDot && dirtyDot !== "clean") {
+        const d = bufferStatusDot();
+        d.classList.add("picker-dirty-dot", `picker-dirty-${dirtyDot}`);
+        row.append(d);
       }
       row.addEventListener("mousedown", (e: MouseEvent) => {
         // On an anchor row, let Ctrl/Cmd/middle-click fall through to the browser's open-in-new-tab.
@@ -763,7 +768,9 @@ export class Picker {
           bulletStatus: item.git_status,
         };
       case "buffer":
-        return { primary: item.display, primaryMatches: item.match_indices, prefix: item.dirty ? "● " : "  " };
+        // Buffer-state dot on the right (colour-coded), matching the editor status bar and the
+        // terminal client's buffer picker. Clean buffers (`status` omitted → "clean") show nothing.
+        return { primary: item.display, primaryMatches: item.match_indices, dirtyDot: item.status };
       case "grep_hit":
         return {
           // The file is shown in the group header; the row carries the line number + preview.
@@ -823,6 +830,19 @@ interface RowDesc {
   bulletStatus?: GitStatus;
   /** Dim the text to gray — used for `.gitignore`d entries (which carry no bullet). */
   dim?: boolean;
+  /** Right-aligned buffer-state dot (buffer rows). `"clean"`/undefined → no dot. */
+  dirtyDot?: BufferDirtyState;
+}
+
+/** Filled-circle SVG dot for a buffer's dirty state — the same circle the tab favicon uses. The
+ *  colour comes from `currentColor`, set by the caller (an inline style in the editor status bar,
+ *  a `picker-dirty-*` class in the picker). Shared so both surfaces draw an identical icon. */
+export function bufferStatusDot(): SVGSVGElement {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("class", "buffer-status-dot");
+  svg.innerHTML = '<circle cx="8" cy="8" r="4.5" fill="currentColor"/>';
+  return svg;
 }
 
 /** A diagnostic's range as a compact 1-based label: "12:5" for a point, "12:5-9" within a line,

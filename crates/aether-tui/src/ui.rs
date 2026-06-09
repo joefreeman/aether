@@ -1,14 +1,14 @@
 //! Ratatui rendering. The buffer fills the screen except for the bottom status row.
 
 use crate::app::{
-    grep_counter_label, search_counter_label, search_match_count_label, AppState, EditorMode,
-    HelpTab,
+    grep_counter_label, search_counter_label, search_match_count_label, AppState, BufferStatusKind,
+    EditorMode, HelpTab, BUFFER_STATUS_DOT,
 };
 use crate::keymap;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::{BlameInfo, DiffBase, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus};
-use aether_protocol::picker::PickerItem;
+use aether_protocol::picker::{BufferDirtyState, PickerItem};
 use aether_protocol::search::SearchMatchRange;
 use aether_protocol::viewport::{
     DiagnosticSeverity, DiagnosticSpan, DiffMarker, Highlight, VisualRow, WrapMode,
@@ -1190,19 +1190,22 @@ fn draw_settings_rows(
                 lines.push(Line::from(vec![leading, body]));
                 continue;
             }
-            let dirty_marker = if root_has_dirty_buffer(state, root) {
-                " [+]"
-            } else {
-                ""
-            };
-            let body = format!("{root}{dirty_marker}");
-            let truncated = truncate_middle(&body, text_budget);
+            // A colour-coded dot when the active buffer under this root is dirty / changed on
+            // disk (` •`), reserving its width so the path truncates to leave room.
+            let status = root_buffer_status(state, root);
+            let dot_w = if status.is_some() { 2 } else { 0 };
+            let truncated = truncate_middle(root, text_budget.saturating_sub(dot_w));
             let bg = if highlighted { NORD2 } else { NORD0 };
             let path_style = Style::default().fg(NORD4).bg(bg);
-            lines.push(Line::from(vec![
-                leading,
-                Span::styled(truncated, path_style),
-            ]));
+            let mut spans = vec![leading, Span::styled(truncated, path_style)];
+            if let Some(kind) = status {
+                spans.push(Span::styled(" ".to_string(), path_style));
+                spans.push(Span::styled(
+                    BUFFER_STATUS_DOT.to_string(),
+                    path_style.fg(buffer_status_color(kind)),
+                ));
+            }
+            lines.push(Line::from(spans));
         } else {
             // Input row: no highlight regardless of selection. Placeholder when empty, plain
             // text otherwise; ratatui clips past the right edge for very long inputs.
@@ -1359,24 +1362,17 @@ fn truncate_right(s: &str, max_w: usize) -> String {
     out
 }
 
-/// Mirror of the editor's `[+]` marker, applied per-root: a root has a dirty buffer if any
-/// open editor (any client, since AppState only sees its own — but file_path is informative
-/// enough) has a path under it and unsaved changes. This client only knows about its own
-/// active editor, so the marker reflects "your active buffer is under this root and is dirty."
-/// Server-side dirty buffers from other clients won't show. Acceptable for v1.
-fn root_has_dirty_buffer(state: &AppState, root: &str) -> bool {
-    let Some(ed) = state.editor.as_ref() else {
-        return false;
-    };
-    if !ed.dirty_marker_visible() {
-        return false;
-    }
-    let Some(path) = ed.file_path.as_deref() else {
-        return false;
-    };
+/// Mirror of the editor's status dot, applied per-root: returns the active buffer's state when
+/// that buffer lives under `root` and is dirty / changed on disk, else `None`. This client only
+/// knows about its own active editor, so the dot reflects "your active buffer is under this root
+/// and is non-clean." Server-side dirty buffers from other clients won't show. Acceptable for v1.
+fn root_buffer_status(state: &AppState, root: &str) -> Option<BufferStatusKind> {
+    let ed = state.editor.as_ref()?;
+    let status = state.buffer_status()?;
+    let path = ed.file_path.as_deref()?;
     let root_path = std::path::Path::new(root);
     let buf_path = std::path::Path::new(path);
-    buf_path == root_path || buf_path.starts_with(root_path)
+    (buf_path == root_path || buf_path.starts_with(root_path)).then_some(status)
 }
 
 /// Empty no-project view: a centered hint telling the user how to open the project picker.
@@ -2080,23 +2076,23 @@ fn picker_item_spans(
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
 
-    // Trailing dirty marker for buffer items — matches the status bar's `[+]` indicator. Goes
-    // after the display so it doesn't shift `match_indices` (which index into the display).
-    let (display_raw, match_indices, dirty_suffix) = match item {
+    // Trailing buffer-state dot — matches the status bar's colour-coded indicator. Goes after the
+    // display so it doesn't shift `match_indices` (which index into the display). `None` = clean.
+    let (display_raw, match_indices, dot_color) = match item {
         PickerItem::Buffer {
             display,
-            dirty,
+            status,
             match_indices,
             ..
         } => (
             display.as_str(),
             match_indices.as_slice(),
-            if *dirty { " [+]" } else { "" },
+            buffer_dirty_dot_color(*status),
         ),
         PickerItem::Project {
             name,
             match_indices,
-        } => (name.as_str(), match_indices.as_slice(), ""),
+        } => (name.as_str(), match_indices.as_slice(), None),
         PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
         | PickerItem::DirEntry { .. }
@@ -2105,7 +2101,10 @@ fn picker_item_spans(
         | PickerItem::LspServer { .. } => unreachable!("handled above"),
     };
 
-    let text_budget = max_width.saturating_sub(dirty_suffix.len());
+    // The dot renders as ` •` (leading space + glyph) — reserve its width so the path truncates
+    // to leave room for it.
+    let dot_w = if dot_color.is_some() { 2 } else { 0 };
+    let text_budget = max_width.saturating_sub(dot_w);
     let (display, indices) = truncate_path_with_indices(display_raw, match_indices, text_budget);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -2138,10 +2137,22 @@ fn picker_item_spans(
             ));
         }
     }
-    if !dirty_suffix.is_empty() {
-        spans.push(Span::styled(dirty_suffix.to_string(), base.fg(NORD13)));
+    if let Some(color) = dot_color {
+        spans.push(Span::styled(" ".to_string(), base));
+        spans.push(Span::styled(BUFFER_STATUS_DOT.to_string(), base.fg(color)));
     }
     spans
+}
+
+/// Buffer-state dot colour for a picker row, matching the editor status bar / web favicon.
+/// `None` for a clean buffer (no dot).
+fn buffer_dirty_dot_color(status: BufferDirtyState) -> Option<Color> {
+    match status {
+        BufferDirtyState::Clean => None,
+        BufferDirtyState::Unsaved => Some(NORD9),             // frost blue — unsaved edits
+        BufferDirtyState::ExternallyModified => Some(NORD12), // aurora orange — changed on disk
+        BufferDirtyState::ExternallyDeleted => Some(NORD11),  // aurora red — gone on disk
+    }
 }
 
 /// Header row above each file's hits in the Grep picker. Renders as `{label}: {relative}` with
@@ -3532,17 +3543,20 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         };
         Line::from(vec![Span::raw(text)])
     } else {
-        let dirty_marker = state.buffer_status_marker();
-        // Project / file / dirty / transient status sit on the left; counter (search and/or
+        // Project / file / dirty-dot / transient status sit on the left; counter (search and/or
         // grep, in that order) and cursor position sit on the right, with the counter to the
         // left of the position. When the row is narrow we truncate the right edge of the left
         // segment with `…` so the right segment stays whole and the position never gets
         // painted over.
-        let mut left_pre = format!("[{}] {}", state.project_name, state.ed().file_label);
-        if !dirty_marker.is_empty() {
-            left_pre.push(' ');
-            left_pre.push_str(dirty_marker);
-        }
+        let left_pre = format!("[{}] {}", state.project_name, state.ed().file_label);
+        // Buffer-state dot just after the file label — colour-coded (unsaved / changed / deleted
+        // on disk), matching the web client's favicon colours.
+        let status_dot = state.buffer_status().map(|kind| {
+            Span::styled(
+                BUFFER_STATUS_DOT.to_string(),
+                Style::default().bg(NORD1).fg(buffer_status_color(kind)),
+            )
+        });
 
         // Left: the Git change counts sit next to the file label (they're about the file's VCS
         // state). Diagnostics moved to the right segment, by the position indicator.
@@ -3581,6 +3595,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 
         Line::from(build_editor_status_spans(
             &left_pre,
+            status_dot,
             git_spans,
             &state.status,
             right_spans,
@@ -3706,14 +3721,16 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
     Style::default().bg(NORD1).fg(fg)
 }
 
-/// Build the spans for the default editor status row: `left_pre` on the left in the base
-/// style, optional colored status message after a `    ` separator, then padding pushing the
-/// right segment flush to the row edge. When the row is too narrow:
-///   - the status text truncates first (`…`), preserving the project/file/dirty bit;
+/// Build the spans for the default editor status row: an optional leading buffer-state dot, then
+/// `left_pre` (project/file) in the base style, an optional colored status message after a `    `
+/// separator, then padding pushing the right segment flush to the row edge. When the row is too
+/// narrow:
+///   - the status text truncates first (`…`), preserving the dot and project/file;
 ///   - if even `left_pre` can't fit, that gets truncated and the status is dropped entirely.
 /// The right segment is never truncated — the cursor position is more useful than the message.
 fn build_editor_status_spans(
     left_pre: &str,
+    status_dot: Option<Span<'static>>,
     left_badges: Vec<Span<'static>>,
     status: &crate::app::StatusMessage,
     right_spans: Vec<Span<'static>>,
@@ -3728,9 +3745,20 @@ fn build_editor_status_spans(
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
-    if left_pre.width() >= left_max {
+    // Buffer-state dot leads the row, before the project name — matching the terminal title and
+    // the web favicon. Reserve its width (glyph + a trailing space) before laying out the rest.
+    if let Some(dot) = status_dot {
+        let dot_w = dot.content.width();
+        if dot_w + 1 <= left_max {
+            spans.push(dot);
+            spans.push(Span::styled(" ".to_string(), base_style));
+            used += dot_w + 1;
+        }
+    }
+    let pre_budget = left_max.saturating_sub(used);
+    if left_pre.width() >= pre_budget {
         // Even the project/file segment overflows — truncate it and drop the rest.
-        let t = truncate_to_width(left_pre, left_max);
+        let t = truncate_to_width(left_pre, pre_budget);
         used += t.width();
         spans.push(Span::styled(t, base_style));
     } else {
@@ -3767,6 +3795,15 @@ fn build_editor_status_spans(
     spans.push(Span::styled(" ".repeat(pad_w), base_style));
     spans.extend(right_spans);
     spans
+}
+
+/// Accent colour for the buffer-state dot, matching the web client's favicon palette.
+fn buffer_status_color(kind: BufferStatusKind) -> Color {
+    match kind {
+        BufferStatusKind::ExternallyDeleted => NORD11, // aurora red — gone on disk
+        BufferStatusKind::ExternallyModified => NORD12, // aurora orange — changed on disk
+        BufferStatusKind::Unsaved => NORD9,             // frost blue — unsaved edits
+    }
 }
 
 /// Git change counts for the current buffer as colored spans (`+N` added / `~N` modified / `-N`
@@ -4693,7 +4730,7 @@ mod tests {
     #[test]
     fn editor_status_spans_no_status_pads_to_right_edge() {
         let status = crate::app::StatusMessage::default();
-        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, vec![Span::raw("12:5")],30);
+        let spans = build_editor_status_spans("[proj] file.rs", None, Vec::new(), &status, vec![Span::raw("12:5")],30);
         let text = spans_text(&spans);
         assert!(text.starts_with("[proj] file.rs"));
         assert!(text.ends_with("12:5"));
@@ -4701,9 +4738,29 @@ mod tests {
     }
 
     #[test]
+    fn editor_status_spans_renders_buffer_status_dot() {
+        let status = crate::app::StatusMessage::default();
+        let dot = Span::styled(
+            BUFFER_STATUS_DOT.to_string(),
+            Style::default().fg(buffer_status_color(BufferStatusKind::Unsaved)),
+        );
+        let spans =
+            build_editor_status_spans("[proj] file.rs", Some(dot), Vec::new(), &status, vec![], 30);
+        // The dot leads the row, before the project name, in the unsaved (frost-blue) colour.
+        let text = spans_text(&spans);
+        assert!(text.starts_with(&format!("{BUFFER_STATUS_DOT} [proj] file.rs")));
+        let dot_span = spans
+            .iter()
+            .find(|s| s.content.contains(BUFFER_STATUS_DOT))
+            .expect("status dot span present");
+        assert_eq!(dot_span.style.fg, Some(NORD9));
+        assert_eq!(spans_total_width(&spans), 30);
+    }
+
+    #[test]
     fn editor_status_spans_renders_status_with_color() {
         let status = crate::app::StatusMessage::success("saved (rev 1)");
-        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, vec![Span::raw("12:5")],60);
+        let spans = build_editor_status_spans("[proj] file.rs", None, Vec::new(), &status, vec![Span::raw("12:5")],60);
         // Status text should appear, sandwiched between the left bit and the padding/right.
         let text = spans_text(&spans);
         assert!(text.contains("[proj] file.rs"));
@@ -4722,7 +4779,7 @@ mod tests {
         // total=30, right="12:5" (4) + gap(1) = 5 reserved; left_max=25. left_pre="[proj] file.rs" (14)
         // + separator(4) = 18 used. Status budget = 25 - 18 = 7. So a long status truncates.
         let status = crate::app::StatusMessage::info("a much longer status message");
-        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, vec![Span::raw("12:5")],30);
+        let spans = build_editor_status_spans("[proj] file.rs", None, Vec::new(), &status, vec![Span::raw("12:5")],30);
         let status_span = spans
             .iter()
             .find(|s| s.style.fg == Some(NORD4) && s.content.contains('…'))
@@ -4738,7 +4795,7 @@ mod tests {
         // total=12, right=4, gap=1 → left_max=7. left_pre="[proj] file.rs" (14) > 7, so it
         // gets truncated and the status is dropped entirely.
         let status = crate::app::StatusMessage::error("save failed: disk full");
-        let spans = build_editor_status_spans("[proj] file.rs", Vec::new(), &status, vec![Span::raw("12:5")],12);
+        let spans = build_editor_status_spans("[proj] file.rs", None, Vec::new(), &status, vec![Span::raw("12:5")],12);
         let text = spans_text(&spans);
         // No part of the status text should make it into the rendered line.
         assert!(

@@ -36,9 +36,9 @@ use aether_protocol::input::{
     InputUnsurroundParams, SurroundTarget, UndoResult,
 };
 use aether_protocol::picker::{
-    PickerGrepFileJumpParams, PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHideParams,
-    PickerItem, PickerKind, PickerQueryParams, PickerSelectParams, PickerSelectResult, PickerUpdate,
-    PickerUpdateParams, PickerViewParams, PickerViewResult,
+    BufferDirtyState, PickerGrepFileJumpParams, PickerGrepNavigateParams, PickerGrepNavigateTarget,
+    PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerSelectParams,
+    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams, PickerViewResult,
 };
 use aether_protocol::project::{
     ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
@@ -7109,15 +7109,32 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
     picker_state::BufferCandidate {
         buffer_id: buf.id,
         display,
-        dirty: buf.dirty,
+        status: buffer_dirty_state(buf),
         path,
+    }
+}
+
+/// Map a buffer's save/disk flags to the picker's [`BufferDirtyState`], highest precedence first:
+/// removed on disk → changed on disk → unsaved local edits → clean. Mirrors the editor status
+/// bar's dot so the picker and the status line always agree.
+fn buffer_dirty_state(buf: &Buffer) -> BufferDirtyState {
+    if buf.externally_deleted {
+        BufferDirtyState::ExternallyDeleted
+    } else if buf.externally_modified {
+        BufferDirtyState::ExternallyModified
+    } else if buf.dirty {
+        BufferDirtyState::Unsaved
+    } else {
+        BufferDirtyState::Clean
     }
 }
 
 /// Rebuild candidates for every subscribed `Buffers` picker, re-rank under the existing query,
 /// and collect the resulting `picker/update` pushes. Caller sends them after dropping the lock.
 /// Cheap when no picker is open: a HashMap scan over `pickers` and an early return.
-fn refresh_buffer_pickers(s: &mut ServerState) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+pub(crate) fn refresh_buffer_pickers(
+    s: &mut ServerState,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
     // Collect client_ids with a *subscribed* Buffers picker. Skip the rest — they may still
     // have persisted state from a prior session, but they're not waiting for pushes.
     let client_ids: Vec<ClientId> = s

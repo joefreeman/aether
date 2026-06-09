@@ -65,6 +65,30 @@ impl PickerKind {
     }
 }
 
+/// Save/disk state of an open buffer, shown as a colour-coded dot in the buffer picker and
+/// mirrored by the editor status bar. Precedence when several conditions hold (highest first):
+/// deleted-on-disk → changed-on-disk → unsaved local edits → clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BufferDirtyState {
+    /// Saved and matching disk — no dot.
+    #[default]
+    Clean,
+    /// Unsaved local edits (`revision != saved_revision`).
+    Unsaved,
+    /// The file changed on disk underneath us.
+    ExternallyModified,
+    /// The file was removed on disk.
+    ExternallyDeleted,
+}
+
+impl BufferDirtyState {
+    /// `true` for the clean state — used to skip the field on the wire.
+    pub fn is_clean(&self) -> bool {
+        matches!(self, BufferDirtyState::Clean)
+    }
+}
+
 /// A pickable item. Tagged enum so different pickers can carry the data they need; match-index
 /// highlighting rides in `match_indices` (char positions within the display string).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,14 +112,17 @@ pub enum PickerItem {
         git_status: Option<GitStatus>,
     },
     /// An open buffer. Identity is `buffer_id` — stable across rename / Save-As, where the
-    /// `display` string would change. `dirty` is captured at row-build time and may go stale
-    /// between pushes (an active picker re-pushes on dirty transitions).
+    /// `display` string would change. `status` is captured at row-build time and may go stale
+    /// between pushes (an active picker re-pushes on status transitions).
     Buffer {
         buffer_id: BufferId,
         /// What the row renders: project-relative path for file-backed buffers, `(scratch N)`
         /// for scratch buffers. Also the haystack the matcher scores against.
         display: String,
-        dirty: bool,
+        /// Save/disk state, rendered as a colour-coded dot. Omitted on the wire (and defaulting
+        /// to `Clean`) for a clean buffer — the common case.
+        #[serde(default, skip_serializing_if = "BufferDirtyState::is_clean")]
+        status: BufferDirtyState,
         /// Project-relative location (root index + path) for a file-backed buffer that lives inside
         /// a project root — mirrors `File`'s fields so the client can build an opener URL. Both are
         /// `None` for scratch buffers and for files outside every root (no `?file=` URL possible).

@@ -61,6 +61,10 @@ export type DiffMarker = "added" | "modified" | "deleted";
  *  `GitStatus` enum. */
 export type GitStatus = "conflicted" | "deleted" | "modified" | "added" | "untracked" | "ignored";
 
+/** Mirrors aether-protocol::picker::BufferDirtyState. Save/disk state of a buffer-picker row,
+ *  rendered as a colour-coded dot. Omitted on the wire (→ `clean`) for a clean buffer. */
+export type BufferDirtyState = "clean" | "unsaved" | "externally_modified" | "externally_deleted";
+
 export type DiagnosticSeverity = "error" | "warning" | "information" | "hint";
 
 export interface DiagnosticSpan {
@@ -546,7 +550,7 @@ export type LspStatus =
  *  are code-point offsets into the row's display string, covered by the fuzzy match. */
 export type PickerItem =
   | { kind: "file"; path_index: number; relative_path: string; match_indices?: number[]; git_status?: GitStatus }
-  | { kind: "buffer"; buffer_id: BufferId; display: string; dirty: boolean; path_index?: number; relative_path?: string; match_indices?: number[] }
+  | { kind: "buffer"; buffer_id: BufferId; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[] }
   | {
       kind: "grep_hit";
       path_index: number;

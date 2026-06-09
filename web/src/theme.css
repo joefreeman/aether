@@ -92,6 +92,9 @@ html, body, #app {
   box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.15);
 }
 .status-left { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Buffer-state dot (SVG circle, colour via currentColor). Shared by the status bar and picker. */
+.buffer-status-dot { flex: 0 0 auto; width: 0.7em; height: 0.7em; vertical-align: -0.06em; }
+.status-dot { margin-right: 0.5em; } /* leads the row; a bit of space before the project name. Colour set inline */
 .status-right { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; }
 .status-diag-group { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; } /* tight diagnostic cluster on the right, by the position */
 .status-git { margin-left: 5px; white-space: nowrap; } /* git change counts, before diagnostics */
@@ -548,6 +551,12 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-bullet-modified { color: var(--nord13); }
 .picker-bullet-deleted,
 .picker-bullet-conflicted { color: var(--nord11); }
+/* Right-aligned buffer-state dot (buffer rows): `margin-left: auto` pushes it to the far edge.
+   Colours match the editor status bar / favicon. Sizing comes from `.buffer-status-dot`. */
+.picker-dirty-dot { margin-left: auto; }
+.picker-dirty-unsaved { color: var(--nord9); }
+.picker-dirty-externally_modified { color: var(--nord12); }
+.picker-dirty-externally_deleted { color: var(--nord11); }
 .picker-row.create .picker-main { color: var(--nord14); } /* "+ create …" row in green */
 /* Grep file-group header — non-selectable, bold; the path in frost blue (matches the terminal). */
 /* Same box as a normal row (so it's exactly one display row tall, keeping virtual-scroll aligned).

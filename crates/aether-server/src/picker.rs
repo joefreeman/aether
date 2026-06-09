@@ -9,7 +9,9 @@
 
 use crate::workspace_index::CachedFile;
 use aether_protocol::lsp::{LspProgress, LspStatus};
-use aether_protocol::picker::{PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams};
+use aether_protocol::picker::{
+    BufferDirtyState, PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams,
+};
 use aether_protocol::viewport::DiagnosticSeverity;
 use aether_protocol::{BufferId, LogicalPosition};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -25,7 +27,7 @@ pub struct BufferCandidate {
     /// Display string used for both rendering and fuzzy matching. Project-relative for
     /// file-backed buffers; `(scratch N)` for scratch buffers.
     pub display: String,
-    pub dirty: bool,
+    pub status: BufferDirtyState,
     /// Project-relative location (root index + path) when the buffer is a file inside a root;
     /// `None` for scratch buffers / out-of-root files. Sent so the client can build an opener URL.
     pub path: Option<(u32, String)>,
@@ -238,7 +240,7 @@ impl PickerCandidates {
                 PickerItem::Buffer {
                     buffer_id: c.buffer_id,
                     display: c.display.clone(),
-                    dirty: c.dirty,
+                    status: c.status,
                     path_index: c.path.as_ref().map(|(i, _)| *i),
                     relative_path: c.path.as_ref().map(|(_, r)| r.clone()),
                     match_indices,
