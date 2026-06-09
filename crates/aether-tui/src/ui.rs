@@ -6,7 +6,7 @@ use crate::app::{
 };
 use crate::keymap;
 use aether_protocol::cursor::CursorState;
-use aether_protocol::git::BlameInfo;
+use aether_protocol::git::{BlameInfo, GitStatus};
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerItem;
 use aether_protocol::search::SearchMatchRange;
@@ -60,6 +60,7 @@ const NORD0: Color = Color::Rgb(46, 52, 64); // Polar Night — main background
 const NORD1: Color = Color::Rgb(59, 66, 82); // Polar Night — status line / panel
 const NORD2: Color = Color::Rgb(67, 76, 94); // Polar Night — selection background
 const NORD3: Color = Color::Rgb(76, 86, 106); // Polar Night — comments / dim
+const NORD3_BRIGHT: Color = Color::Rgb(97, 110, 136); // Polar Night — lighter dim (ignored entries)
 const NORD4: Color = Color::Rgb(216, 222, 233); // Snow Storm — main foreground
 const NORD7: Color = Color::Rgb(143, 188, 187); // Frost — types
 const NORD8: Color = Color::Rgb(136, 192, 208); // Frost — functions, accents
@@ -1977,9 +1978,10 @@ fn picker_item_spans(
         name,
         is_dir,
         match_indices,
+        git_status,
     } = item
     {
-        return dir_entry_spans(name, *is_dir, match_indices, highlighted, max_width);
+        return dir_entry_spans(name, *is_dir, *git_status, match_indices, highlighted, max_width);
     }
     // File rows get a leading dim `{label}: ` prefix; everything else falls through with the
     // legacy single-string display.
@@ -1987,12 +1989,14 @@ fn picker_item_spans(
         path_index,
         relative_path,
         match_indices,
+        git_status,
     } = item
     {
         return file_item_spans(
             *path_index,
             relative_path,
             match_indices,
+            *git_status,
             root_labels,
             highlighted,
             max_width,
@@ -2163,6 +2167,7 @@ fn file_item_spans(
     path_index: u32,
     relative_path: &str,
     match_indices: &[u32],
+    git_status: Option<GitStatus>,
     root_labels: &[String],
     highlighted: bool,
     max_width: usize,
@@ -2178,10 +2183,11 @@ fn file_item_spans(
         format!("{label}: ")
     };
     let prefix_w = prefix.width();
-    let relative_budget = max_width.saturating_sub(prefix_w);
+    // Two-col leading status bullet, like the explorer; subtract it (and the prefix) from the budget.
+    let relative_budget = max_width.saturating_sub(2).saturating_sub(prefix_w);
     let (display, indices) =
         truncate_path_with_indices(relative_path, match_indices, relative_budget);
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = vec![git_status_bullet_span(git_status, bg)];
     if !prefix.is_empty() {
         spans.push(Span::styled(prefix, label_style));
     }
@@ -2485,22 +2491,54 @@ fn lsp_server_item_spans(
 /// for directories, fuzzy-match highlights overlaid the same way the Files picker does. The
 /// `/` suffix is appended *after* the name proper so `match_indices` (which index into the
 /// name) don't have to know about it.
+/// Status-bullet colour for a Git status: green for new, yellow for modified, red for
+/// removed/conflict. `None` for ignored (and clean) entries — they carry no bullet (ignored is
+/// dimmed via its text colour instead).
+fn git_status_bullet_color(s: GitStatus) -> Option<Color> {
+    match s {
+        GitStatus::Added | GitStatus::Untracked => Some(NORD14),
+        GitStatus::Modified => Some(NORD13),
+        GitStatus::Deleted | GitStatus::Conflicted => Some(NORD11),
+        GitStatus::Ignored => None,
+    }
+}
+
+/// The leading status-indicator cell shared by explorer entries and file-picker rows: a coloured
+/// `•` for a change, or two blank columns otherwise (fixed width so row text stays aligned).
+fn git_status_bullet_span(git_status: Option<GitStatus>, bg: Color) -> Span<'static> {
+    match git_status.and_then(git_status_bullet_color) {
+        Some(color) => Span::styled("• ".to_string(), Style::default().fg(color).bg(bg)),
+        None => Span::styled("  ".to_string(), Style::default().bg(bg)),
+    }
+}
+
 fn dir_entry_spans(
     name: &str,
     is_dir: bool,
+    git_status: Option<GitStatus>,
     match_indices: &[u32],
     highlighted: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = if highlighted { NORD2 } else { NORD0 };
-    let fg = if is_dir { NORD8 } else { NORD4 };
+    // Leading status indicator: a coloured `•` for a changed entry, a blank cell otherwise so every
+    // row's text stays column-aligned. Two cols wide (bullet + space).
+    let bullet_span = git_status_bullet_span(git_status, bg);
+    // Text colour keeps the frost-blue dir / snow-white file scheme; ignored entries dim to a
+    // lighter gray (legible on both the normal and selected backgrounds).
+    let fg = match git_status {
+        Some(GitStatus::Ignored) => NORD3_BRIGHT,
+        _ if is_dir => NORD8,
+        _ => NORD4,
+    };
     let base = Style::default().fg(fg).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
     let suffix = if is_dir { "/" } else { "" };
-    let text_budget = max_width.saturating_sub(suffix.len());
+    // The bullet cell takes two columns off the budget; the rest is text + the `/` suffix.
+    let text_budget = max_width.saturating_sub(2).saturating_sub(suffix.len());
     let (display, indices) = truncate_path_with_indices(name, match_indices, text_budget);
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = vec![bullet_span];
     if indices.is_empty() {
         spans.push(Span::styled(display, base));
     } else {

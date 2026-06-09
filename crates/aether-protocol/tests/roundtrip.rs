@@ -942,6 +942,7 @@ fn picker_item_file_is_tagged() {
         path_index: 0,
         relative_path: "src/main.rs".into(),
         match_indices: vec![0, 4],
+        git_status: None,
     };
     let v = to_value(&item).unwrap();
     assert_eq!(
@@ -951,8 +952,25 @@ fn picker_item_file_is_tagged() {
             "path_index": 0,
             "relative_path": "src/main.rs",
             "match_indices": [0, 4],
-        })
+        }),
+        "git_status is omitted from the wire when None"
     );
+}
+
+#[test]
+fn picker_item_file_carries_git_status() {
+    use aether_protocol::git::GitStatus;
+    use aether_protocol::picker::PickerItem;
+    let item = PickerItem::File {
+        path_index: 0,
+        relative_path: "src/main.rs".into(),
+        match_indices: vec![],
+        git_status: Some(GitStatus::Modified),
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(v["git_status"], "modified");
+    let back: PickerItem = serde_json::from_value(v).unwrap();
+    assert_eq!(back, item);
 }
 
 #[test]
@@ -1035,6 +1053,7 @@ fn picker_view_params_center_on_serialized() {
             path_index: 0,
             relative_path: "x".into(),
             match_indices: vec![],
+            git_status: None,
         }),
         center_on_cursor_grep_hit: None,
         directory_path: None,
@@ -1058,6 +1077,7 @@ fn picker_update_round_trips_through_notification() {
             path_index: 0,
             relative_path: "a".into(),
             match_indices: vec![0],
+            git_status: None,
         }],
         total_matches: 1,
         total_candidates: 1,
@@ -1251,6 +1271,7 @@ fn picker_item_dir_entry_is_tagged() {
         name: "src".into(),
         is_dir: true,
         match_indices: vec![0, 1],
+        git_status: None,
     };
     let v = to_value(&item).unwrap();
     assert_eq!(
@@ -1260,8 +1281,35 @@ fn picker_item_dir_entry_is_tagged() {
             "name": "src",
             "is_dir": true,
             "match_indices": [0, 1],
+        }),
+        "git_status is omitted from the wire when None"
+    );
+}
+
+#[test]
+fn picker_item_dir_entry_carries_git_status() {
+    use aether_protocol::git::GitStatus;
+    use aether_protocol::picker::PickerItem;
+    let item = PickerItem::DirEntry {
+        name: "target".into(),
+        is_dir: true,
+        match_indices: vec![],
+        git_status: Some(GitStatus::Ignored),
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "kind": "dir_entry",
+            "name": "target",
+            "is_dir": true,
+            "match_indices": [],
+            "git_status": "ignored",
         })
     );
+    // Round-trips back to the same value.
+    let back: PickerItem = serde_json::from_value(v).unwrap();
+    assert_eq!(back, item);
 }
 
 #[test]

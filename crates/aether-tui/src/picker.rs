@@ -296,6 +296,8 @@ impl PickerState {
                     // flag never reaches the navigate-into-dir path in `select_picker_item`.
                     is_dir: false,
                     match_indices: Vec::new(),
+                    // A synthetic action affordance, not a filesystem entry — never coloured.
+                    git_status: None,
                 }
             }
             _ => return,
@@ -407,6 +409,7 @@ mod tests {
             name: name.into(),
             is_dir,
             match_indices: Vec::new(),
+            git_status: None,
         }
     }
 

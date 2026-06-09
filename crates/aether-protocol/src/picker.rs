@@ -11,6 +11,7 @@
 
 use crate::cursor::Direction;
 use crate::envelope::{NotificationMethod, RpcMethod};
+use crate::git::GitStatus;
 use crate::lsp::LspStatus;
 use crate::viewport::DiagnosticSeverity;
 use crate::{BufferId, LogicalPosition};
@@ -80,6 +81,11 @@ pub enum PickerItem {
         /// part of the fuzzy match.
         #[serde(default)]
         match_indices: Vec<u32>,
+        /// Git status used to colour a leading indicator, or `None` when clean / outside a repo.
+        /// `.gitignore`d files don't appear in the Files picker at all (the walker skips them), so
+        /// this is never `Ignored` here. Absent on the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_status: Option<GitStatus>,
     },
     /// An open buffer. Identity is `buffer_id` — stable across rename / Save-As, where the
     /// `display` string would change. `dirty` is captured at row-build time and may go stale
@@ -152,6 +158,11 @@ pub enum PickerItem {
         /// Char offsets into `name` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
+        /// Git status used to colour the entry, or `None` when clean / outside a repo. For a
+        /// directory this is the highest-priority status among its descendants (folder
+        /// aggregation). Absent on the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_status: Option<GitStatus>,
     },
     /// One of the project's roots, shown in the Explorer's Roots mode (entered by `Alt-Backspace`
     /// at the top of a root). Identity is `path_index`; the client knows the absolute path via

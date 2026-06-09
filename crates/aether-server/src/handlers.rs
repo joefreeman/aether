@@ -7149,6 +7149,9 @@ pub(crate) fn build_explorer_candidates_for_canonical(
             None
         }
     });
+    // One repo-wide status pass per listing, keyed by leaf name (directories carry their
+    // descendants' aggregated status). Empty when the directory isn't in a Git repo.
+    let git_status = crate::git::dir_statuses(canonical);
     let mut entries: Vec<picker_state::ExplorerEntry> = Vec::new();
     let read = std::fs::read_dir(canonical).map_err(RpcError::file_io)?;
     for ent in read {
@@ -7161,7 +7164,12 @@ pub(crate) fn build_explorer_candidates_for_canonical(
             Err(_) => continue,
         };
         let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        entries.push(picker_state::ExplorerEntry { name, is_dir });
+        let git_status = git_status.get(&name).copied();
+        entries.push(picker_state::ExplorerEntry {
+            name,
+            is_dir,
+            git_status,
+        });
     }
     // Directories first, then files, each alphabetical — same order the file browser used.
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
@@ -7306,6 +7314,55 @@ pub(crate) fn refresh_explorers_for_dirs(
     pushes
 }
 
+/// Listed paths of every subscribed Explorer picker whose directory sits inside one of `workdirs`.
+/// The watcher feeds these back into its `affected_dirs` set so explorer entry colours refresh
+/// after a Git operation (commit / stage / checkout) that changed status without touching any
+/// working-tree file — the file-modify path already covers ordinary edits via the parent dir.
+pub(crate) fn explorer_dirs_in_workdirs(
+    s: &ServerState,
+    workdirs: &std::collections::HashSet<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    s.pickers
+        .iter()
+        .filter_map(|((_, kind), picker)| {
+            if *kind != PickerKind::Explorer || picker.subscribed.is_none() {
+                return None;
+            }
+            let path = match &picker.candidates {
+                picker_state::PickerCandidates::Explorer(e) => std::path::PathBuf::from(&e.path),
+                _ => return None,
+            };
+            workdirs
+                .iter()
+                .any(|wd| path.starts_with(wd))
+                .then_some(path)
+        })
+        .collect()
+}
+
+/// Per-file Git status for the Files picker, aligned to `files` by index. Resolves each project
+/// root's repo status once (one `statuses()` per root), then looks each file up by its
+/// root-relative path — no per-file repo discovery. `None` at an index for a clean file, a file
+/// whose root isn't in a repo, or any libgit2 error.
+fn build_file_git_status(
+    files: &[crate::workspace_index::CachedFile],
+    roots: &[std::path::PathBuf],
+) -> Vec<Option<aether_protocol::git::GitStatus>> {
+    let per_root: Vec<Option<crate::git::RepoStatus>> = roots
+        .iter()
+        .map(|r| crate::git::repo_status_for_root(r))
+        .collect();
+    files
+        .iter()
+        .map(|f| {
+            per_root
+                .get(f.path_index as usize)
+                .and_then(|rs| rs.as_ref())
+                .and_then(|rs| rs.status_of(&f.relative_path))
+        })
+        .collect()
+}
+
 pub async fn picker_view(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -7329,11 +7386,16 @@ pub async fn picker_view(
         PickerKind::Files => {
             // Walk the workspace outside the global lock — on first call it can take seconds.
             // The `Arc<WorkspaceIndex>` clone is cheap; the walk itself is memoized inside.
-            let workspace_index = {
+            let (workspace_index, roots) = {
                 let s = state.lock().await;
-                s.active_project_or_err(client_id)?.workspace_index.clone()
+                let p = s.active_project_or_err(client_id)?;
+                (p.workspace_index.clone(), p.paths.clone())
             };
-            picker_state::PickerCandidates::Files(workspace_index.files().await)
+            let files = workspace_index.files().await;
+            // One Git status pass per project root, aligned to the file snapshot by index, computed
+            // off the lock (statuses() walks the worktree). Empty for roots that aren't in a repo.
+            let git_status = std::sync::Arc::new(build_file_git_status(&files, &roots));
+            picker_state::PickerCandidates::Files { files, git_status }
         }
         PickerKind::Buffers => {
             let s = state.lock().await;
@@ -7434,8 +7496,8 @@ pub async fn picker_view(
         // (directory contents may have changed), so always re-bind and rerank.
         let preserve_existing = match (&p.candidates, &candidates) {
             (
-                picker_state::PickerCandidates::Files(a),
-                picker_state::PickerCandidates::Files(b),
+                picker_state::PickerCandidates::Files { files: a, .. },
+                picker_state::PickerCandidates::Files { files: b, .. },
             ) => Arc::ptr_eq(a, b),
             (picker_state::PickerCandidates::Grep(_), picker_state::PickerCandidates::Grep(_)) => {
                 true

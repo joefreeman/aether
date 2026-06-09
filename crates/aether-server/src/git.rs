@@ -19,7 +19,7 @@
 //! is a change of baseline source in [`load_baseline`] plus a `stage` tag on each [`DiffHunk`];
 //! the hunk shape and anchoring below are unaffected.
 
-use aether_protocol::git::{BlameInfo, CommitInfo};
+use aether_protocol::git::{BlameInfo, CommitInfo, GitStatus};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -273,6 +273,160 @@ pub fn commit_info(repo: &GitRepo, rev: &str) -> Option<CommitInfo> {
         date: format_commit_time(sig.when()),
         message: commit.message().unwrap_or_default().trim_end().to_string(),
     })
+}
+
+/// Git status of each immediate child of `dir`, keyed by leaf name, for colouring the file
+/// explorer. One repo-wide [`git2::Repository::statuses`] call per listing — repo discovery (the
+/// expensive part) runs here, never on the keystroke path: the explorer only rebuilds candidates
+/// on open and directory navigation, not on filter input.
+///
+/// A directory child takes the **highest-priority** status among everything beneath it: each
+/// status entry's repo-relative path is bucketed under its first path component below `dir`, so a
+/// change deep in a subtree colours the top-level folder (folder aggregation). Untracked and
+/// ignored subtrees are left collapsed (`recurse_*_dirs` off), so `node_modules/` is a single gray
+/// bucket rather than a walk of thousands of files.
+///
+/// Best-effort: no repo, `dir` outside any repo, or any libgit2 error → an empty map, and the
+/// explorer falls back to its default colours.
+pub fn dir_statuses(dir: &Path) -> HashMap<String, GitStatus> {
+    let mut out: HashMap<String, GitStatus> = HashMap::new();
+    let Ok(canonical) = dir.canonicalize() else {
+        return out;
+    };
+    let Ok(repo) = git2::Repository::discover(&canonical) else {
+        return out;
+    };
+    let Some(workdir) = repo.workdir().and_then(|w| w.canonicalize().ok()) else {
+        return out;
+    };
+    // The listed directory relative to the repo root — an empty path when listing the root itself,
+    // which `strip_prefix` below treats as "every entry is in scope".
+    let Ok(rel_dir) = canonical.strip_prefix(&workdir) else {
+        return out;
+    };
+
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .include_ignored(true)
+        .recurse_untracked_dirs(false)
+        .recurse_ignored_dirs(false)
+        .exclude_submodules(true);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return out;
+    };
+
+    for entry in statuses.iter() {
+        let Some(path) = entry.path() else { continue };
+        // Keep only entries inside the listed directory, then bucket each under the immediate child
+        // of `dir` it lives in (a file → itself; a deeper path → the top folder).
+        let Ok(suffix) = Path::new(path).strip_prefix(rel_dir) else {
+            continue;
+        };
+        let Some(child) = suffix.components().next() else {
+            continue;
+        };
+        let Some(status) = classify_status(entry.status()) else {
+            continue;
+        };
+        let name = child.as_os_str().to_string_lossy().into_owned();
+        out.entry(name)
+            .and_modify(|cur| {
+                if status_rank(status) < status_rank(*cur) {
+                    *cur = status;
+                }
+            })
+            .or_insert(status);
+    }
+    out
+}
+
+/// A repo's per-file status, scoped to one project root, for the Files picker. Holds the root's
+/// own path within the repo plus a `repo-relative path → status` map, so a file's status is a
+/// single lookup keyed by its root-relative path (no per-file repo discovery or canonicalisation).
+pub struct RepoStatus {
+    /// The project root's path relative to the repo workdir (empty when the root *is* the repo
+    /// root). Joined with a file's root-relative path to form its repo-relative key.
+    root_rel: PathBuf,
+    map: HashMap<PathBuf, GitStatus>,
+}
+
+impl RepoStatus {
+    /// Status of a file given its path relative to the project root (forward-slash separated, as
+    /// stored in the workspace index). `None` when the file is clean.
+    pub fn status_of(&self, root_rel_path: &str) -> Option<GitStatus> {
+        self.map.get(&self.root_rel.join(root_rel_path)).copied()
+    }
+}
+
+/// Resolve the Git status of every changed file under `root` in one `statuses()` pass, for the
+/// Files picker. Untracked directories are recursed so each untracked file is reported
+/// individually (the picker lists individual files); ignored files are excluded — the workspace
+/// walker already skips them, so they never reach the picker. Best-effort: `None` when `root`
+/// isn't in a repo or any libgit2 call fails.
+pub fn repo_status_for_root(root: &Path) -> Option<RepoStatus> {
+    let canonical = root.canonicalize().ok()?;
+    let repo = git2::Repository::discover(&canonical).ok()?;
+    let workdir = repo.workdir().and_then(|w| w.canonicalize().ok())?;
+    let root_rel = canonical.strip_prefix(&workdir).ok()?.to_path_buf();
+
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let statuses = repo.statuses(Some(&mut opts)).ok()?;
+
+    let mut map = HashMap::new();
+    for entry in statuses.iter() {
+        if let Some(path) = entry.path() {
+            if let Some(status) = classify_status(entry.status()) {
+                map.insert(PathBuf::from(path), status);
+            }
+        }
+    }
+    Some(RepoStatus { root_rel, map })
+}
+
+/// Fold libgit2's per-path status bitflags into the one [`GitStatus`] we colour with, in priority
+/// order (conflict beats deletion beats modification beats add beats untracked beats ignored).
+/// `None` for an entry that carries no flag we render (e.g. a path that is exactly current).
+fn classify_status(s: git2::Status) -> Option<GitStatus> {
+    use git2::Status as S;
+    if s.contains(S::CONFLICTED) {
+        Some(GitStatus::Conflicted)
+    } else if s.intersects(S::INDEX_DELETED | S::WT_DELETED) {
+        Some(GitStatus::Deleted)
+    } else if s.intersects(
+        S::INDEX_MODIFIED
+            | S::WT_MODIFIED
+            | S::INDEX_RENAMED
+            | S::WT_RENAMED
+            | S::INDEX_TYPECHANGE
+            | S::WT_TYPECHANGE,
+    ) {
+        Some(GitStatus::Modified)
+    } else if s.contains(S::INDEX_NEW) {
+        Some(GitStatus::Added)
+    } else if s.contains(S::WT_NEW) {
+        Some(GitStatus::Untracked)
+    } else if s.contains(S::IGNORED) {
+        Some(GitStatus::Ignored)
+    } else {
+        None
+    }
+}
+
+/// Aggregation priority — lower is higher-priority (wins folder roll-up). Mirrors the declaration
+/// order of [`GitStatus`].
+fn status_rank(s: GitStatus) -> u8 {
+    match s {
+        GitStatus::Conflicted => 0,
+        GitStatus::Deleted => 1,
+        GitStatus::Modified => 2,
+        GitStatus::Added => 3,
+        GitStatus::Untracked => 4,
+        GitStatus::Ignored => 5,
+    }
 }
 
 /// Format a git signature time in its own recorded timezone as `YYYY-MM-DD HH:MM:SS ±HHMM` (git's
@@ -541,5 +695,136 @@ mod tests {
         let file = dir.path().join("loose.rs");
         std::fs::write(&file, "x\n").unwrap();
         assert!(load_baseline(&file).repo.is_none());
+    }
+
+    // ---- dir_statuses (explorer colouring) ------------------------------------------------------
+
+    /// Init a repo at `root`, write each `(path, content)`, stage them all, and commit. Paths may
+    /// be nested (`sub/x.rs`); intermediate dirs are created.
+    fn repo_with_files(root: &Path, files: &[(&str, &str)]) {
+        let repo = git2::Repository::init(root).unwrap();
+        let mut index = repo.index().unwrap();
+        for (rel, content) in files {
+            let abs = root.join(rel);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&abs, content).unwrap();
+            index.add_path(Path::new(rel)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "t@e.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn dir_statuses_colours_children_by_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(
+            root,
+            &[
+                ("clean.rs", "clean\n"),
+                ("mod.rs", "before\n"),
+                ("sub/deep.rs", "deep\n"),
+            ],
+        );
+        // Working-tree changes on disk — `statuses` reads the disk, not a live buffer.
+        std::fs::write(root.join("mod.rs"), "after\n").unwrap(); // tracked → Modified
+        std::fs::write(root.join("sub/deep.rs"), "changed\n").unwrap(); // change beneath sub/
+        std::fs::write(root.join("new.rs"), "new\n").unwrap(); // Untracked
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.join("debug.log"), "noise\n").unwrap(); // Ignored
+
+        let st = dir_statuses(root);
+        assert_eq!(st.get("clean.rs"), None, "unchanged tracked file is uncoloured");
+        assert_eq!(st.get("mod.rs"), Some(&GitStatus::Modified));
+        assert_eq!(
+            st.get("sub"),
+            Some(&GitStatus::Modified),
+            "folder inherits a descendant's change (aggregation)"
+        );
+        assert_eq!(st.get("new.rs"), Some(&GitStatus::Untracked));
+        assert_eq!(st.get("debug.log"), Some(&GitStatus::Ignored));
+    }
+
+    #[test]
+    fn dir_statuses_folder_prefers_real_change_over_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(
+            root,
+            &[("pkg/tracked.rs", "v1\n"), (".gitignore", "pkg/*.log\n")],
+        );
+        std::fs::write(root.join("pkg/tracked.rs"), "v2\n").unwrap(); // Modified
+        std::fs::write(root.join("pkg/out.log"), "noise\n").unwrap(); // Ignored, same folder
+
+        let st = dir_statuses(root);
+        assert_eq!(
+            st.get("pkg"),
+            Some(&GitStatus::Modified),
+            "a real change outranks an ignored sibling in the same folder"
+        );
+    }
+
+    #[test]
+    fn dir_statuses_lists_a_subdirectory() {
+        // The explorer listing `sub/` keys statuses by the names visible there, not repo-relative.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(root, &[("sub/deep.rs", "deep\n"), ("top.rs", "top\n")]);
+        std::fs::write(root.join("sub/deep.rs"), "changed\n").unwrap();
+
+        let st = dir_statuses(&root.join("sub"));
+        assert_eq!(st.get("deep.rs"), Some(&GitStatus::Modified));
+        assert_eq!(st.get("top.rs"), None, "a sibling outside the listed dir is absent");
+    }
+
+    #[test]
+    fn dir_statuses_no_repo_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        assert!(dir_statuses(dir.path()).is_empty());
+    }
+
+    // ---- repo_status_for_root (Files picker) ----------------------------------------------------
+
+    #[test]
+    fn repo_status_for_root_reports_per_file_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(
+            root,
+            &[("clean.rs", "clean\n"), ("sub/mod.rs", "before\n")],
+        );
+        std::fs::write(root.join("sub/mod.rs"), "after\n").unwrap(); // modified, nested
+        std::fs::write(root.join("new.rs"), "new\n").unwrap(); // untracked at root
+
+        let rs = repo_status_for_root(root).expect("root is in a repo");
+        // Keyed by the path relative to the project root (which == repo root here).
+        assert_eq!(rs.status_of("clean.rs"), None, "clean file has no status");
+        assert_eq!(rs.status_of("sub/mod.rs"), Some(GitStatus::Modified));
+        assert_eq!(rs.status_of("new.rs"), Some(GitStatus::Untracked));
+    }
+
+    #[test]
+    fn repo_status_for_root_keys_relative_to_a_subdir_root() {
+        // When the project root is a subdirectory of the repo, lookups are still keyed by the
+        // path relative to that root — the repo-relative prefix is handled internally.
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        repo_with_files(repo_root, &[("pkg/mod.rs", "before\n"), ("top.rs", "top\n")]);
+        std::fs::write(repo_root.join("pkg/mod.rs"), "after\n").unwrap();
+
+        let rs = repo_status_for_root(&repo_root.join("pkg")).expect("subdir is in the repo");
+        assert_eq!(rs.status_of("mod.rs"), Some(GitStatus::Modified));
+    }
+
+    #[test]
+    fn repo_status_for_root_no_repo_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(repo_status_for_root(dir.path()).is_none());
     }
 }

@@ -16,8 +16,8 @@
 //! project's roots, so cold projects don't waste an inotify slot.
 
 use crate::handlers::{
-    collect_buffer_state_pushes, refresh_explorers_for_dirs, refresh_git_for_buffer,
-    reload_buffer_locked,
+    collect_buffer_state_pushes, explorer_dirs_in_workdirs, refresh_explorers_for_dirs,
+    refresh_git_for_buffer, reload_buffer_locked,
 };
 use crate::state::{ServerState, SharedState};
 use aether_protocol::envelope::Notification;
@@ -174,6 +174,12 @@ async fn handle_event(state: &SharedState, event: Event) {
                 .collect();
             for id in affected {
                 pushes.extend(refresh_git_for_buffer(&mut s, id));
+            }
+            // A commit / stage / checkout changes entry colours without touching any working-tree
+            // file, so the parent-dir refresh above wouldn't catch open explorers in the repo.
+            // Re-list them too by folding their listed dirs into `affected_dirs`.
+            for dir in explorer_dirs_in_workdirs(&s, &git_workdirs) {
+                affected_dirs.insert(dir);
             }
         }
         let picker_pushes = refresh_explorers_for_dirs(&mut s, &affected_dirs);

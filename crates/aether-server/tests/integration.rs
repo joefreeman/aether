@@ -7544,6 +7544,7 @@ async fn picker_resume_centers_on_remembered_item() {
                 path_index: 0,
                 relative_path: "src/lib.rs".into(),
                 match_indices: vec![],
+                git_status: None,
             }),
             center_on_cursor_grep_hit: None,
             directory_path: None,
@@ -11006,6 +11007,7 @@ async fn picker_explorer_select_file_returns_absolute_path() {
                 name: "lib.rs".into(),
                 is_dir: false,
                 match_indices: vec![],
+                git_status: None,
             },
         },
     )
@@ -11054,6 +11056,7 @@ async fn picker_explorer_select_directory_errors() {
                 name: "src".into(),
                 is_dir: true,
                 match_indices: vec![],
+                git_status: None,
             },
         },
     )
@@ -11324,6 +11327,156 @@ async fn picker_explorer_resumes_last_directory() {
         Some(target.to_str().unwrap()),
         "second view without directory_path should resume the prior dir"
     );
+    drop(server);
+}
+
+/// Set up a project rooted at a Git repo with: a committed-and-clean file, a committed-then-
+/// modified file, an untracked file, an ignored file, and a subdirectory whose committed file is
+/// modified on disk. Returns the canonical root so the test can open the Explorer there.
+async fn setup_explorer_git_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    std::path::PathBuf,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
+
+    // Commit clean.rs, mod.rs, sub/deep.rs, and .gitignore (ignoring *.log).
+    let repo = git2::Repository::init(&root).unwrap();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("clean.rs"), "clean\n").unwrap();
+    std::fs::write(root.join("mod.rs"), "before\n").unwrap();
+    std::fs::write(root.join("sub/deep.rs"), "deep\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    let mut index = repo.index().unwrap();
+    for rel in ["clean.rs", "mod.rs", "sub/deep.rs", ".gitignore"] {
+        index.add_path(std::path::Path::new(rel)).unwrap();
+    }
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "t@e.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+    drop(tree);
+    drop(index);
+    drop(repo);
+
+    // Working-tree changes after the commit.
+    std::fs::write(root.join("mod.rs"), "after\n").unwrap(); // modified
+    std::fs::write(root.join("sub/deep.rs"), "changed\n").unwrap(); // change beneath sub/
+    std::fs::write(root.join("new.rs"), "new\n").unwrap(); // untracked
+    std::fs::write(root.join("debug.log"), "noise\n").unwrap(); // ignored
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    (server, ws, canonical_root)
+}
+
+/// The Explorer tags each entry with its Git status for colouring: modified / untracked / ignored
+/// files, a clean file left untagged, and a directory aggregating its descendant's change (the
+/// folder-roll-up property the explorer colouring relies on).
+#[tokio::test]
+async fn picker_explorer_tags_entries_with_git_status() {
+    use aether_protocol::git::GitStatus;
+    let (server, mut ws, _root) = setup_explorer_git_workspace().await;
+    let _view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    let status_of = |target: &str| -> Option<GitStatus> {
+        update
+            .items
+            .iter()
+            .find_map(|it| match it {
+                PickerItem::DirEntry { name, git_status, .. } if name == target => Some(*git_status),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("entry {target:?} not in listing"))
+    };
+
+    assert_eq!(status_of("sub"), Some(GitStatus::Modified), "folder aggregates its descendant's change");
+    assert_eq!(status_of("mod.rs"), Some(GitStatus::Modified));
+    assert_eq!(status_of("new.rs"), Some(GitStatus::Untracked));
+    assert_eq!(status_of("debug.log"), Some(GitStatus::Ignored));
+    assert_eq!(status_of("clean.rs"), None, "an unchanged tracked file is untagged");
+
+    drop(server);
+}
+
+/// The Files picker tags each row with its Git status (modified / untracked), leaves clean files
+/// untagged, and never surfaces `.gitignore`d files at all (the workspace walker skips them).
+#[tokio::test]
+async fn picker_files_tags_entries_with_git_status() {
+    use aether_protocol::git::GitStatus;
+    let (server, mut ws, _root) = setup_explorer_git_workspace().await;
+    let _view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    let status_of = |target: &str| -> Option<GitStatus> {
+        update
+            .items
+            .iter()
+            .find_map(|it| match it {
+                PickerItem::File { relative_path, git_status, .. } if relative_path == target => {
+                    Some(*git_status)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("file {target:?} not in listing: {:?}", update.items))
+    };
+
+    assert_eq!(status_of("mod.rs"), Some(GitStatus::Modified));
+    assert_eq!(status_of("sub/deep.rs"), Some(GitStatus::Modified), "nested change tagged");
+    assert_eq!(status_of("new.rs"), Some(GitStatus::Untracked));
+    assert_eq!(status_of("clean.rs"), None, "an unchanged tracked file is untagged");
+    assert!(
+        !update
+            .items
+            .iter()
+            .any(|it| matches!(it, PickerItem::File { relative_path, .. } if relative_path == "debug.log")),
+        "ignored files never appear in the Files picker"
+    );
+
     drop(server);
 }
 

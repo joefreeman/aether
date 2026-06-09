@@ -2091,6 +2091,8 @@ fn default_explorer_center_on(state: &AppState) -> Option<PickerItem> {
         name,
         is_dir: false,
         match_indices: Vec::new(),
+        // Identity-only (matched by name on resume); never rendered, so colour is irrelevant.
+        git_status: None,
     })
 }
 
@@ -2185,6 +2187,8 @@ async fn picker_navigate_to_dir(
             // name) — `true` is a sensible default since we only pre-select directories.
             is_dir: true,
             match_indices: Vec::new(),
+            // Identity-only (matched by name on resume); never rendered.
+            git_status: None,
         }
     });
     state.picker.resume_row_offset = None;

@@ -56,6 +56,11 @@ export interface VirtualRow {
 
 export type DiffMarker = "added" | "modified" | "deleted";
 
+/** Git status of a file-explorer entry, used to colour it. For a directory this is the
+ *  highest-priority status among its descendants (folder aggregation). Mirrors the server's
+ *  `GitStatus` enum. */
+export type GitStatus = "conflicted" | "deleted" | "modified" | "added" | "untracked" | "ignored";
+
 export type DiagnosticSeverity = "error" | "warning" | "information" | "hint";
 
 export interface DiagnosticSpan {
@@ -499,7 +504,7 @@ export type LspStatus =
 /** Mirrors aether-protocol::picker::PickerItem (serde tag = "kind", snake_case). `match_indices`
  *  are code-point offsets into the row's display string, covered by the fuzzy match. */
 export type PickerItem =
-  | { kind: "file"; path_index: number; relative_path: string; match_indices?: number[] }
+  | { kind: "file"; path_index: number; relative_path: string; match_indices?: number[]; git_status?: GitStatus }
   | { kind: "buffer"; buffer_id: BufferId; display: string; dirty: boolean; path_index?: number; relative_path?: string; match_indices?: number[] }
   | {
       kind: "grep_hit";
@@ -512,7 +517,7 @@ export type PickerItem =
     }
   | { kind: "diagnostic"; line: number; col: number; severity: DiagnosticSeverity; message: string; match_indices?: number[] }
   | { kind: "project"; name: string; match_indices?: number[] }
-  | { kind: "dir_entry"; name: string; is_dir: boolean; match_indices?: number[] }
+  | { kind: "dir_entry"; name: string; is_dir: boolean; match_indices?: number[]; git_status?: GitStatus }
   | { kind: "root"; path_index: number; match_indices?: number[] }
   | {
       kind: "lsp_server";

@@ -135,3 +135,30 @@ pub struct CommitInfo {
     /// The complete commit message (subject + body), trailing whitespace trimmed.
     pub message: String,
 }
+
+// ---- file status (explorer colouring) -----------------------------------------------------------
+
+/// The Git status of a single file-explorer entry, used to colour it. Folded from libgit2's
+/// per-path status flags into one value per entry (the working-tree + index state vs HEAD, matching
+/// the gutter's "vs HEAD" model — staged and unstaged are not distinguished here).
+///
+/// For a **directory** entry this is the highest-priority status among its descendants, so a folder
+/// inherits the colour of whatever changed inside it. The priority order is the declaration order
+/// below (`Conflicted` highest, `Ignored` lowest): a real change always wins over an ignored
+/// sibling, so a tracked folder holding a build artifact still reads as changed rather than gray.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitStatus {
+    /// A merge conflict (both sides modified the path).
+    Conflicted,
+    /// Removed from the working tree and/or staged for deletion.
+    Deleted,
+    /// Tracked and changed (working-tree and/or staged modification, or a rename).
+    Modified,
+    /// Newly staged (in the index, not in HEAD).
+    Added,
+    /// Present in the working tree but not tracked.
+    Untracked,
+    /// Excluded by a `.gitignore` rule (e.g. `target/`, `node_modules/`).
+    Ignored,
+}

@@ -4,6 +4,7 @@
   --nord1: #3b4252; /* status line / panel */
   --nord2: #434c5e; /* selection background */
   --nord3: #4c566a; /* comments / dim */
+  --nord3-bright: #616e88; /* lighter dim (ignored explorer entries) */
   --nord4: #d8dee9; /* main foreground */
   --nord6: #eceff4; /* Snow Storm — brightest (picker text) */
   --nord7: #8fbcbb; /* types */
@@ -493,8 +494,8 @@ html, body, #app {
 .picker-row.create { position: absolute; left: 0; right: 0; }
 .picker-row {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
   padding: 3px 12px;
   white-space: pre;
   overflow: hidden;
@@ -519,6 +520,24 @@ a.picker-row:not(.selected):hover .picker-main {
 .sev-hint { color: var(--nord3); }
 .picker-main { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
 .picker-dir { color: var(--nord8); } /* directories in frost blue, matching the terminal UI */
+/* Dimmed explorer entries — .gitignore'd files/folders. A lighter gray, legible on both the normal
+   and selected backgrounds. */
+.picker-dim { color: var(--nord3-bright); }
+/* Left status-bullet for explorer entries: a fixed-width cell (so names align) holding a coloured
+   `•` on a real change — green = new, yellow = modified, red = removed/conflict. */
+.picker-bullet {
+  flex: 0 0 auto;
+  width: 1ch;
+  text-align: center;
+  /* Enlarge the `•` without growing the row: scale up and pin the line box to 0. */
+  font-size: 1.5em;
+  line-height: 0;
+}
+.picker-bullet-added,
+.picker-bullet-untracked { color: var(--nord14); }
+.picker-bullet-modified { color: var(--nord13); }
+.picker-bullet-deleted,
+.picker-bullet-conflicted { color: var(--nord11); }
 .picker-row.create .picker-main { color: var(--nord14); } /* "+ create …" row in green */
 /* Grep file-group header — non-selectable, bold; the path in frost blue (matches the terminal). */
 /* Same box as a normal row (so it's exactly one display row tall, keeping virtual-scroll aligned).

@@ -46,6 +46,9 @@ pub struct ProjectCandidate {
 pub struct ExplorerEntry {
     pub name: String,
     pub is_dir: bool,
+    /// Git status for colouring, or `None` when clean / outside a repo. Directories carry the
+    /// aggregated status of their descendants (see [`crate::git::dir_statuses`]).
+    pub git_status: Option<aether_protocol::git::GitStatus>,
 }
 
 /// The directory listing the explorer picker is currently matching against. `path` is the
@@ -130,9 +133,14 @@ pub enum MatchStrategy {
 /// error, not a runtime branch.
 #[derive(Debug, Clone)]
 pub enum PickerCandidates {
-    /// Workspace files. Shared `Arc` because the walk produces one snapshot per refresh and
-    /// every picker that touches it borrows the same slice.
-    Files(Arc<Vec<CachedFile>>),
+    /// Workspace files, plus a per-file Git status aligned by index (`git_status[i]` is the status
+    /// of `files[i]`). The files are a shared `Arc` (one snapshot per refresh, borrowed by every
+    /// picker that touches it); the status vector is computed per `picker/view` against that same
+    /// snapshot and carried alongside so `make_item` can colour each row.
+    Files {
+        files: Arc<Vec<CachedFile>>,
+        git_status: Arc<Vec<Option<aether_protocol::git::GitStatus>>>,
+    },
     /// Open buffers in MRU order (most-recent first). Cheap to rebuild — small N, no I/O.
     Buffers(Vec<BufferCandidate>),
     /// Grep matches in walker + line order. Grows as the streaming search runs; rerank is a
@@ -169,7 +177,7 @@ pub struct RootCandidate {
 impl PickerCandidates {
     pub fn len(&self) -> usize {
         match self {
-            PickerCandidates::Files(v) => v.len(),
+            PickerCandidates::Files { files, .. } => files.len(),
             PickerCandidates::Buffers(v) => v.len(),
             PickerCandidates::Grep(v) => v.len(),
             PickerCandidates::Explorer(e) => e.entries.len(),
@@ -182,7 +190,7 @@ impl PickerCandidates {
 
     pub fn kind(&self) -> PickerKind {
         match self {
-            PickerCandidates::Files(_) => PickerKind::Files,
+            PickerCandidates::Files { .. } => PickerKind::Files,
             PickerCandidates::Buffers(_) => PickerKind::Buffers,
             PickerCandidates::Grep(_) => PickerKind::Grep,
             PickerCandidates::Explorer(_) => PickerKind::Explorer,
@@ -199,7 +207,7 @@ impl PickerCandidates {
     /// it's only consulted by the fuzzy matcher, which we skip for Grep.
     pub fn display_at(&self, idx: usize) -> &str {
         match self {
-            PickerCandidates::Files(v) => &v[idx].relative_path,
+            PickerCandidates::Files { files, .. } => &files[idx].relative_path,
             PickerCandidates::Buffers(v) => &v[idx].display,
             PickerCandidates::Grep(v) => &v[idx].preview,
             PickerCandidates::Explorer(e) => &e.entries[idx].name,
@@ -215,10 +223,11 @@ impl PickerCandidates {
     /// already carries the ripgrep-computed match positions, which we use verbatim).
     pub fn make_item(&self, idx: usize, match_indices: Vec<u32>) -> PickerItem {
         match self {
-            PickerCandidates::Files(v) => PickerItem::File {
-                path_index: v[idx].path_index,
-                relative_path: v[idx].relative_path.clone(),
+            PickerCandidates::Files { files, git_status } => PickerItem::File {
+                path_index: files[idx].path_index,
+                relative_path: files[idx].relative_path.clone(),
                 match_indices,
+                git_status: git_status.get(idx).copied().flatten(),
             },
             PickerCandidates::Buffers(v) => {
                 let c = &v[idx];
@@ -248,6 +257,7 @@ impl PickerCandidates {
                     name: entry.name.clone(),
                     is_dir: entry.is_dir,
                     match_indices,
+                    git_status: entry.git_status,
                 }
             }
             PickerCandidates::ExplorerRoots(v) => PickerItem::Root {
@@ -287,13 +297,13 @@ impl PickerCandidates {
     pub fn position_of(&self, item: &PickerItem) -> Option<usize> {
         match (self, item) {
             (
-                PickerCandidates::Files(v),
+                PickerCandidates::Files { files, .. },
                 PickerItem::File {
                     path_index,
                     relative_path,
                     ..
                 },
-            ) => v
+            ) => files
                 .iter()
                 .position(|c| c.path_index == *path_index && c.relative_path == *relative_path),
             (PickerCandidates::Buffers(v), PickerItem::Buffer { buffer_id, .. }) => {
@@ -350,7 +360,7 @@ impl PickerCandidates {
     /// dispatch through one switch instead of scattered `matches!(..., Grep|Explorer)` checks.
     pub fn match_strategy(&self) -> MatchStrategy {
         match self {
-            PickerCandidates::Files(_)
+            PickerCandidates::Files { .. }
             | PickerCandidates::Buffers(_)
             | PickerCandidates::Projects(_)
             | PickerCandidates::Diagnostics(_)
@@ -369,8 +379,8 @@ impl PickerCandidates {
     /// which the client should navigate into (via `picker/view`) instead of selecting.
     pub fn select_result(&self, idx: usize) -> Option<PickerSelectResult> {
         match self {
-            PickerCandidates::Files(v) => Some(PickerSelectResult::File {
-                path: v[idx].abs.clone(),
+            PickerCandidates::Files { files, .. } => Some(PickerSelectResult::File {
+                path: files[idx].abs.clone(),
             }),
             PickerCandidates::Buffers(v) => Some(PickerSelectResult::Buffer {
                 buffer_id: v[idx].buffer_id,

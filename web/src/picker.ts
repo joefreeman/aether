@@ -14,7 +14,7 @@
 
 import type { RpcClient } from "./client";
 import { confirmDialog, lspInfoDialog } from "./modal";
-import type { PickerItem, PickerKind, PickerUpdateParams, PickerViewResult } from "./protocol";
+import type { GitStatus, PickerItem, PickerKind, PickerUpdateParams, PickerViewResult } from "./protocol";
 
 type ToastKind = "info" | "error" | "warning" | "success";
 
@@ -530,7 +530,15 @@ export class Picker {
       if (href) (row as HTMLAnchorElement).href = href;
       row.className = i === localSel ? "picker-row selected" : "picker-row";
       if (i === localSel) selectedRow = row;
-      const { primary, primaryMatches, meta, prefix, prefixClass, dir } = this.describe(item);
+      const { primary, primaryMatches, meta, prefix, prefixClass, dir, bullet, bulletStatus, dim } = this.describe(item);
+      if (bullet) {
+        // Fixed-width cell (empty when clean/ignored) so entry names stay aligned across rows; the
+        // `•` glyph and its colour appear only on a real change.
+        const b = document.createElement("span");
+        b.className = bulletStatus ? `picker-bullet picker-bullet-${bulletStatus}` : "picker-bullet";
+        b.textContent = bulletStatus ? "•" : "";
+        row.append(b);
+      }
       if (prefix) {
         const p = document.createElement("span");
         p.className = prefixClass ? `picker-prefix ${prefixClass}` : "picker-prefix";
@@ -538,7 +546,10 @@ export class Picker {
         row.append(p);
       }
       const main = document.createElement("span");
-      main.className = dir ? "picker-main picker-dir" : "picker-main";
+      const mainClass = ["picker-main"];
+      if (dim) mainClass.push("picker-dim");
+      else if (dir) mainClass.push("picker-dir");
+      main.className = mainClass.join(" ");
       main.append(matched(primary, primaryMatches));
       row.append(main);
       if (meta) {
@@ -718,7 +729,14 @@ export class Picker {
   private describe(item: PickerItem): RowDesc {
     switch (item.kind) {
       case "file":
-        return { primary: item.relative_path, primaryMatches: item.match_indices };
+        // Same left status-bullet as the explorer (ignored files never reach this picker — the
+        // workspace walker skips them — so there's no `dim` case here).
+        return {
+          primary: item.relative_path,
+          primaryMatches: item.match_indices,
+          bullet: true,
+          bulletStatus: item.git_status,
+        };
       case "buffer":
         return { primary: item.display, primaryMatches: item.match_indices, prefix: item.dirty ? "● " : "  " };
       case "grep_hit":
@@ -736,12 +754,20 @@ export class Picker {
           prefix: "● ",
           prefixClass: `sev-${item.severity}`,
         };
-      case "dir_entry":
+      case "dir_entry": {
+        // Reserve a status-bullet column on every explorer entry (`bullet`); colour the `•` for a
+        // real change (`bulletStatus`); ignored entries carry no bullet but dim their text (`dim`).
+        const st = item.git_status;
+        const changed = st && st !== "ignored" ? st : undefined;
         return {
           primary: item.is_dir ? `${item.name}/` : item.name,
           primaryMatches: item.match_indices,
           dir: item.is_dir,
+          bullet: true,
+          bulletStatus: changed,
+          dim: st === "ignored",
         };
+      }
       case "root": {
         const p = this.projectPaths[item.path_index];
         return { primary: `${p ? basename(p) : `root ${item.path_index}`}/`, primaryMatches: item.match_indices, dir: true };
@@ -763,6 +789,12 @@ interface RowDesc {
   prefix?: string;
   prefixClass?: string;
   dir?: boolean;
+  /** Reserve the left status-bullet column (explorer entries), keeping text aligned across rows. */
+  bullet?: boolean;
+  /** Colour the bullet for a real Git change (modified/added/untracked/deleted/conflicted). */
+  bulletStatus?: GitStatus;
+  /** Dim the text to gray — used for `.gitignore`d entries (which carry no bullet). */
+  dim?: boolean;
 }
 
 function joinPath(dir: string, name: string): string {
