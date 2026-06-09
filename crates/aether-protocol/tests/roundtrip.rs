@@ -1140,6 +1140,37 @@ fn picker_item_diagnostic_is_tagged() {
 }
 
 #[test]
+fn picker_item_reference_is_tagged() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    assert_eq!(to_value(PickerKind::References).unwrap(), json!("references"));
+    let item = PickerItem::Reference {
+        path: "/home/u/proj/src/lib.rs".into(),
+        display_path: "src/lib.rs".into(),
+        line: 41,
+        col: 7,
+        preview: "    helper();".into(),
+        match_indices: vec![4, 5],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(v["kind"], "reference");
+    assert_eq!(v["path"], "/home/u/proj/src/lib.rs");
+    assert_eq!(v["display_path"], "src/lib.rs");
+    assert_eq!(v["line"], 41);
+    assert_eq!(v["col"], 7);
+    assert_eq!(v["preview"], "    helper();");
+    assert_eq!(v["match_indices"], json!([4, 5]));
+    let back: PickerItem = from_value(v).unwrap();
+    assert_eq!(back, item);
+
+    // match_indices defaults to empty when omitted (matches the other item variants).
+    let bare: PickerItem = from_value(json!({
+        "kind": "reference", "path": "/a", "display_path": "a", "line": 0, "col": 0, "preview": ""
+    }))
+    .unwrap();
+    assert!(matches!(bare, PickerItem::Reference { ref match_indices, .. } if match_indices.is_empty()));
+}
+
+#[test]
 fn picker_item_lsp_server_is_tagged() {
     use aether_protocol::picker::{PickerItem, PickerKind};
     assert_eq!(to_value(PickerKind::LspServers).unwrap(), json!("lsp_servers"));

@@ -1813,6 +1813,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Projects) => "Switch project…",
         Some(aether_protocol::picker::PickerKind::Diagnostics) => "Filter diagnostics…",
         Some(aether_protocol::picker::PickerKind::LspServers) => "Filter servers…",
+        Some(aether_protocol::picker::PickerKind::References) => "Filter references…",
         None => "Search…",
     }
 }
@@ -1837,6 +1838,29 @@ fn draw_picker_separator(f: &mut Frame, box_area: Rect, area: Rect) {
 }
 
 fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
+    // References resolves asynchronously (an LSP round-trip), so it opens empty. A blank pane
+    // would read as a broken picker — show progress while it loads, and an explicit "none" once
+    // it finishes empty. (The result-set kinds that are never empty-by-design skip this.)
+    if state.picker.items.is_empty()
+        && state.picker.kind == Some(aether_protocol::picker::PickerKind::References)
+    {
+        let msg = if state.picker.ticking {
+            "Finding references…"
+        } else {
+            "No references found"
+        };
+        f.render_widget(
+            Paragraph::new(msg).style(
+                Style::default()
+                    .bg(NORD0)
+                    .fg(NORD3)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            area,
+        );
+        return;
+    }
+
     // Reserve the rightmost column for the scroll indicator when the result set is taller than
     // the visible window. Otherwise use the full width for paths.
     let needs_scrollbar = state.picker.total_matches as u16 > area.height;
@@ -2075,6 +2099,23 @@ fn picker_item_spans(
             max_width,
         );
     }
+    if let PickerItem::Reference {
+        display_path,
+        line,
+        preview,
+        match_indices,
+        ..
+    } = item
+    {
+        return reference_item_spans(
+            display_path,
+            *line,
+            preview,
+            match_indices,
+            highlighted,
+            max_width,
+        );
+    }
 
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
@@ -2102,7 +2143,8 @@ fn picker_item_spans(
         | PickerItem::DirEntry { .. }
         | PickerItem::Root { .. }
         | PickerItem::Diagnostic { .. }
-        | PickerItem::LspServer { .. } => unreachable!("handled above"),
+        | PickerItem::LspServer { .. }
+        | PickerItem::Reference { .. } => unreachable!("handled above"),
     };
 
     // The dot renders as ` •` (leading space + glyph) — reserve its width so the path truncates
@@ -2459,6 +2501,84 @@ fn diag_range_label(line: u32, col: u32, end_line: u32, end_col: u32) -> String 
     } else {
         format!("{}:{}-{}:{}", line + 1, col + 1, end_line + 1, end_col + 1)
     }
+}
+
+/// One references-picker row: a dim `path:line` location prefix (path middle-truncated when long,
+/// so the filename + line stay visible), then the referenced line's preview with `match_indices`
+/// highlighted — the same fuzzy-match tinting the grep/diagnostics rows use.
+fn reference_item_spans(
+    display_path: &str,
+    line: u32,
+    preview: &str,
+    match_indices: &[u32],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let base = Style::default().fg(NORD4).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let loc_style = base.fg(NORD3);
+
+    // Reserve up to half the row for the location prefix; the path truncates (middle) to fit so the
+    // filename and line number — the bits that identify the reference — survive.
+    let line_part = format!(":{} ", line + 1);
+    let prefix_budget = max_width / 2;
+    let path_budget = prefix_budget.saturating_sub(line_part.width());
+    let path_shown = truncate_middle(display_path, path_budget);
+    let prefix = format!("{path_shown}{line_part}");
+    let preview_budget = max_width.saturating_sub(prefix.width());
+
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, loc_style)];
+
+    // Truncate the preview from the right when it overflows; drop match indices past the cut
+    // (same approach as the grep row).
+    let truncated: String = preview
+        .chars()
+        .scan(0usize, |w, c| {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if *w + cw > preview_budget {
+                None
+            } else {
+                *w += cw;
+                Some(c)
+            }
+        })
+        .collect();
+    let kept_char_count = truncated.chars().count() as u32;
+    let kept_indices: Vec<u32> = match_indices
+        .iter()
+        .copied()
+        .filter(|&i| i < kept_char_count)
+        .collect();
+
+    if kept_indices.is_empty() {
+        spans.push(Span::styled(truncated, base));
+    } else {
+        let mut current = String::new();
+        let mut current_is_match = false;
+        let mut idx_iter = kept_indices.iter().copied().peekable();
+        for (ci, ch) in truncated.chars().enumerate() {
+            let is_match = idx_iter.peek().copied() == Some(ci as u32);
+            if is_match {
+                idx_iter.next();
+            }
+            if is_match != current_is_match && !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    if current_is_match { match_style } else { base },
+                ));
+            }
+            current_is_match = is_match;
+            current.push(ch);
+        }
+        if !current.is_empty() {
+            spans.push(Span::styled(
+                current,
+                if current_is_match { match_style } else { base },
+            ));
+        }
+    }
+    spans
 }
 
 /// One LSP-servers picker row: a health glyph (the same `●`/`◐`/`✗`/`○` + color as the status-bar

@@ -1176,7 +1176,7 @@ class Editor {
       explorerInitialDir: kind === "explorer" ? this.explorerInitialDir() : undefined,
       explorerSelectName: kind === "explorer" && this.currentPath ? basename(this.currentPath) : undefined,
       projectPaths: this.projectPaths,
-      diagnosticsBufferId: kind === "diagnostics" ? this.bufferId : undefined,
+      scopedBufferId: kind === "diagnostics" || kind === "references" ? this.bufferId : undefined,
       activeBufferId: kind === "grep" ? this.bufferId : undefined,
       onToast: (msg, k) => this.toast(msg, k),
       onCreatePath: (p) => this.onCreatePath(p),

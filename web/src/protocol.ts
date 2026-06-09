@@ -539,7 +539,8 @@ export type PickerKind =
   | "explorer"
   | "projects"
   | "diagnostics"
-  | "lsp_servers";
+  | "lsp_servers"
+  | "references";
 
 /** Mirrors aether-protocol::lsp::LspStatus (serde internally tagged on `state`). */
 export type LspStatus =
@@ -573,6 +574,18 @@ export type PickerItem =
       status: LspStatus;
       progress?: LspProgress[];
       match_indices?: number[];
+    }
+  | {
+      kind: "reference";
+      /** Absolute path to the file containing the reference (fed into buffer/open on select). */
+      path: string;
+      /** Row label: project-relative path (references are filtered to project roots server-side). */
+      display_path: string;
+      line: number;
+      col: number;
+      /** The referenced line's text; the fuzzy haystack + preview. */
+      preview: string;
+      match_indices?: number[];
     };
 
 export interface PickerViewParams {
@@ -584,7 +597,8 @@ export interface PickerViewParams {
   directory_path?: string | null;
   /** Explorer: list the project roots instead of a directory. */
   explorer_roots?: boolean;
-  /** Diagnostics: the buffer whose diagnostics to list (required on reset open). */
+  /** Diagnostics: the buffer whose diagnostics to list (required on reset open). References: the
+   *  buffer whose cursor to resolve references at (required on reset open; the resolve is async). */
   buffer_id?: BufferId;
   /** Frame the window so this item is visible (used to pre-select a row on open / navigation). */
   center_on?: PickerItem | null;

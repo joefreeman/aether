@@ -26,6 +26,7 @@ const PLACEHOLDER: Record<string, string> = {
   files: "Find files",
   buffers: "Switch buffer",
   grep: "Grep workspace",
+  references: "Filter references",
 };
 
 export interface PickerOptions {
@@ -39,8 +40,9 @@ export interface PickerOptions {
   explorerSelectName?: string;
   /** Project roots, for resolving Root rows in the Explorer's roots mode. */
   projectPaths?: string[];
-  /** Diagnostics: the buffer whose diagnostics to list. */
-  diagnosticsBufferId?: number;
+  /** Diagnostics / References: the buffer the candidate set is scoped to (diagnostics to list;
+   *  cursor to resolve references at). Passed as `buffer_id` on the reset open. */
+  scopedBufferId?: number;
   /** Grep: the active buffer, so the picker opens centered on the cursor's nearest hit. */
   activeBufferId?: number;
   /** Surface a transient message (deletion result / errors). */
@@ -61,7 +63,7 @@ export class Picker {
   private onConfirm: (item: PickerItem) => void;
   private onClose: () => void;
   private projectPaths: string[];
-  private diagnosticsBufferId: number | undefined;
+  private scopedBufferId: number | undefined;
   private activeBufferId: number | undefined;
   private onToast: (message: string, kind?: ToastKind) => void;
   private onCreatePath: (absPath: string) => void;
@@ -114,7 +116,7 @@ export class Picker {
     this.onConfirm = opts.onConfirm;
     this.onClose = opts.onClose;
     this.projectPaths = opts.projectPaths ?? [];
-    this.diagnosticsBufferId = opts.diagnosticsBufferId;
+    this.scopedBufferId = opts.scopedBufferId;
     this.activeBufferId = opts.activeBufferId;
     this.onToast = opts.onToast ?? (() => {});
     this.onCreatePath = opts.onCreatePath ?? (() => {});
@@ -157,6 +159,10 @@ export class Picker {
     } else if (this.kind === "grep") {
       void this.viewGrepOpen();
     } else {
+      // References resolves asynchronously (an LSP round-trip); open in the loading state so the
+      // first render — if it beats the server's initial push — reads "Finding references…" rather
+      // than "No references found".
+      if (this.kind === "references") this.ticking = true;
       void this.view(true, 0);
     }
   }
@@ -257,8 +263,11 @@ export class Picker {
       reset,
       offset,
       limit: LIMIT,
-      // Diagnostics are scoped to a buffer, required when (re)opening the candidate set.
-      buffer_id: reset && this.kind === "diagnostics" ? this.diagnosticsBufferId : undefined,
+      // Diagnostics and References are scoped to a buffer, required when (re)opening the set.
+      buffer_id:
+        reset && (this.kind === "diagnostics" || this.kind === "references")
+          ? this.scopedBufferId
+          : undefined,
     });
     if (reset) this.generation = r.generation;
   }
@@ -520,6 +529,17 @@ export class Picker {
   }
 
   private renderList(): void {
+    // References opens empty while it resolves (an LSP round-trip), so a blank list would read as a
+    // broken picker — show progress while loading and an explicit "none" once it finishes empty.
+    if (this.kind === "references" && this.items.length === 0) {
+      const msg = document.createElement("div");
+      msg.className = "picker-empty";
+      msg.textContent = this.ticking ? "Finding references…" : "No references found";
+      this.listEl.replaceChildren(msg);
+      this.countEl.textContent = "";
+      this.updatePath();
+      return;
+    }
     // Virtual scroll: a full-height spacer (total rows) with the loaded window absolutely
     // positioned `offset` rows down, so the native scrollbar spans all results and mouse scrolling
     // reveals unloaded ranges (onListScroll fetches them).
@@ -813,6 +833,16 @@ export class Picker {
         const state = hint || item.status.state;
         return { primary: item.name, primaryMatches: item.match_indices, meta: `${item.language} · ${state}${where}` };
       }
+      case "reference":
+        // Dim `path:line` location prefix (the distinguishing bit, since reference previews often
+        // repeat), then the preview line with the fuzzy-match highlights. No leading-whitespace
+        // trim — `match_indices` index into the preview the server sent.
+        return {
+          primary: item.preview,
+          primaryMatches: item.match_indices,
+          prefix: `${item.display_path}:${item.line + 1}`,
+          prefixClass: "picker-loc",
+        };
     }
   }
 }
@@ -903,6 +933,8 @@ function itemKey(item: PickerItem): string {
       return `root\0${item.path_index}`;
     case "lsp_server":
       return `lsp\0${item.language}\0${item.workspace_root}`;
+    case "reference":
+      return `reference\0${item.path}\0${item.line}\0${item.col}`;
   }
 }
 

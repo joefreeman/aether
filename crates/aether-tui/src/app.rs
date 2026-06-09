@@ -2051,9 +2051,11 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
     // evaluate `state.ed_mut().buffer_id` for non-Grep kinds — Projects opens before any editor
     // exists.
     let center_on_cursor_grep_hit = (kind == PickerKind::Grep).then(|| state.ed_mut().buffer_id);
-    // The diagnostics picker is scoped to the current buffer; the server builds its candidates from
-    // that buffer's diagnostics on open.
-    let diagnostics_buffer = (kind == PickerKind::Diagnostics).then(|| state.ed_mut().buffer_id);
+    // The diagnostics and references pickers are scoped to the current buffer; the server builds
+    // their candidates from that buffer on open (diagnostics from the buffer's set; references from
+    // a `textDocument/references` request at its cursor).
+    let scoped_buffer = matches!(kind, PickerKind::Diagnostics | PickerKind::References)
+        .then(|| state.ed_mut().buffer_id);
     let view = client
         .rpc::<PickerView>(PickerViewParams {
             kind,
@@ -2063,7 +2065,7 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
             center_on: center_on.clone(),
             center_on_cursor_grep_hit,
             directory_path: explorer_path_for_view,
-            buffer_id: diagnostics_buffer,
+            buffer_id: scoped_buffer,
             explorer_roots: false,
         })
         .await?;

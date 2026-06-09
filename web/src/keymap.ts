@@ -287,6 +287,7 @@ const LEADER: Binding[] = [
   b("o", exact(), { t: "showCommitInfo" }),
   b("k", exact(), { t: "hover" }),
   b("d", exact(), { t: "gotoDefinition" }),
+  b("d", exact(false, true), { t: "openPicker", kind: "references" }),
   b("j", exact(), { t: "showDiagnostic" }),
   b("m", exact(), { t: "format" }),
   b("x", exact(false, true), { t: "navigateDiagnostic", dir: "prev" }),

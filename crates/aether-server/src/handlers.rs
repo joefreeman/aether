@@ -1738,14 +1738,23 @@ fn parse_definition(
         serde_json::Value::Object(_) => v,
         _ => return None,
     };
-    let (uri, range) = if let Some(u) = first.get("uri") {
-        (u.as_str()?, first.get("range")?)
+    parse_location_entry(first, encoding)
+}
+
+/// Parse a single LSP `Location` / `LocationLink` object into a location in editor coordinates.
+/// Shared by `parse_definition` (first entry only) and `parse_references` (every entry).
+fn parse_location_entry(
+    entry: &serde_json::Value,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> Option<LspLocation> {
+    let (uri, range) = if let Some(u) = entry.get("uri") {
+        (u.as_str()?, entry.get("range")?)
     } else {
         // LocationLink: prefer the precise selection range, fall back to the full target range.
-        let u = first.get("targetUri")?.as_str()?;
-        let range = first
+        let u = entry.get("targetUri")?.as_str()?;
+        let range = entry
             .get("targetSelectionRange")
-            .or_else(|| first.get("targetRange"))?;
+            .or_else(|| entry.get("targetRange"))?;
         (u, range)
     };
     let start = range.get("start")?;
@@ -1757,6 +1766,22 @@ fn parse_definition(
         path: path.display().to_string(),
         position: LogicalPosition { line, col },
     })
+}
+
+/// Parse an LSP `textDocument/references` response (`Location[]`, `LocationLink[]`, or null) into
+/// every reference location, converting positions into the buffer's byte columns. Entries that
+/// fail to parse are skipped.
+fn parse_references(
+    v: &serde_json::Value,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> Vec<LspLocation> {
+    match v {
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|e| parse_location_entry(e, encoding))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Convert a target position's `character` (in the server's encoding) to a byte column. For UTF-8
@@ -3797,6 +3822,142 @@ fn build_diagnostic_candidates(
         .collect();
     out.sort_by_key(|c| (c.line, c.col));
     out
+}
+
+/// Build the references-picker candidates: ask the language server for every reference to the
+/// symbol at the cursor (`textDocument/references`, including the declaration), then attach a
+/// line-text preview and a display label to each. Returns empty when there's no ready server, the
+/// server resolves nothing, or the request fails. Async (off the lock): an LSP round-trip plus
+/// reading each referenced file's line from disk.
+async fn build_reference_candidates(
+    state: &SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Vec<picker_state::ReferenceCandidate> {
+    // Resolve the LSP request and the project roots under the lock, then release it for the I/O.
+    let (req, roots) = {
+        let s = state.lock().await;
+        let roots = s
+            .active_project(client_id)
+            .map(|p| p.paths.clone())
+            .unwrap_or_default();
+        (lsp_cursor_request(&s, client_id, buffer_id), roots)
+    };
+    let Some(req) = req else {
+        return Vec::new();
+    };
+    let params_json = serde_json::json!({
+        "textDocument": { "uri": req.uri },
+        "position": { "line": req.line, "character": req.character },
+        "context": { "includeDeclaration": true },
+    });
+    let locations = match req.client.request("textDocument/references", params_json).await {
+        Ok(v) => parse_references(&v, req.encoding),
+        Err(e) => {
+            tracing::debug!(error = %e, "lsp references request failed");
+            return Vec::new();
+        }
+    };
+
+    // Cache each referenced file's lines so a file with many references is read only once. `None`
+    // marks a file we couldn't read — its previews fall back to empty.
+    let mut file_lines: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    let mut out: Vec<picker_state::ReferenceCandidate> = locations
+        .into_iter()
+        // Project-only: a reference that doesn't live under any project root (a dependency, the
+        // stdlib, generated code outside the tree) is dropped — `project_relative_parts` is the
+        // gate, and its relative path becomes the display label.
+        .filter_map(|loc| {
+            let (_, display_path) = crate::workspace_index::project_relative_parts(
+                std::path::Path::new(&loc.path),
+                &roots,
+            )?;
+            let lines = file_lines
+                .entry(loc.path.clone())
+                .or_insert_with(|| std::fs::read_to_string(&loc.path).ok().map(|c| {
+                    c.lines().map(str::to_string).collect()
+                }));
+            let preview = lines
+                .as_ref()
+                .and_then(|ls| ls.get(loc.position.line as usize))
+                .map(|l| l.trim_end().to_string())
+                .unwrap_or_default();
+            Some(picker_state::ReferenceCandidate {
+                abs_path: loc.path,
+                display_path,
+                line: loc.position.line,
+                col: loc.position.col,
+                preview,
+            })
+        })
+        .collect();
+    // Stable, file-grouped order: by display path, then position. Dedup identical locations (some
+    // servers return the declaration twice, or overlapping ranges collapse to the same start).
+    out.sort_by(|a, b| {
+        a.display_path
+            .cmp(&b.display_path)
+            .then_with(|| (a.line, a.col).cmp(&(b.line, b.col)))
+    });
+    out.dedup_by(|a, b| a.abs_path == b.abs_path && a.line == b.line && a.col == b.col);
+    out
+}
+
+/// Monotonic token minted per References resolve, stored on the picker as `pending_async_load`.
+/// Lets a spawned resolve detect that its picker was reset/reopened (a newer epoch) and drop its
+/// now-stale result instead of populating the wrong cursor's references.
+static REFERENCES_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_references_epoch() -> u64 {
+    REFERENCES_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolve the References picker's candidates in the background (an LSP round-trip + file reads,
+/// off the lock) and push them into the already-open picker. The picker opens empty + `ticking`;
+/// this is what fills it. Detached/fire-and-forget. Drops its result if the picker was hidden,
+/// closed, or reset (the `pending_async_load` epoch moved past `epoch`) while resolving. On a
+/// match it reranks against whatever query the user has typed in the meantime and clears the
+/// loading flag, so a filter entered during the load applies to the arriving results.
+pub fn spawn_reference_resolve(
+    state: SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    epoch: u64,
+) {
+    tokio::spawn(async move {
+        let candidates = build_reference_candidates(&state, client_id, buffer_id).await;
+        let mut s = state.lock().await;
+        let key = (client_id, PickerKind::References);
+        let Some(picker) = s.pickers.get_mut(&key) else {
+            return; // picker gone (closed/reset)
+        };
+        if picker.pending_async_load != Some(epoch) {
+            return; // superseded by a newer open, or already applied
+        }
+        picker.pending_async_load = None;
+        picker.candidates = picker_state::PickerCandidates::References(candidates);
+        let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
+        let ServerState {
+            pickers, matcher, ..
+        } = &mut *s;
+        let picker = pickers.get_mut(&key).expect("checked above");
+        // Rank against the current query — the user may have typed a filter while we resolved.
+        picker.rerank(matcher);
+        // The pending offset may now be past the end of the (newly non-empty) result set. Clamp.
+        if let Some(window) = picker.subscribed.as_mut() {
+            let total = picker.ranked.len() as u32;
+            if window.offset >= total {
+                window.offset = total.saturating_sub(window.limit);
+            }
+        }
+        let mut update = picker_state::build_update(picker, matcher);
+        if let Some(ref mut u) = update {
+            u.ticking = false; // resolve finished
+        }
+        drop(s);
+        if let (Some(sender), Some(params)) = (outbound, update) {
+            let _ = sender.send(picker_update_notif(params)).await;
+        }
+    });
 }
 
 /// Build the LSP-servers-picker candidates: one per language server whose workspace root falls
@@ -7634,6 +7795,11 @@ pub async fn picker_view(
             let roots = s.active_project_or_err(client_id)?.paths.clone();
             picker_state::PickerCandidates::LspServers(build_lsp_server_candidates(&s, &roots))
         }
+        // References always starts empty: the `textDocument/references` resolve is slow (an LSP
+        // round-trip), so the picker opens immediately and a spawned task (below, after the lock
+        // is set up) fills it. On a fresh open the empty set is installed here; on a resume/scroll
+        // re-view `preserve_existing` keeps the prior snapshot.
+        PickerKind::References => picker_state::PickerCandidates::References(Vec::new()),
     };
 
     let mut s = state.lock().await;
@@ -7703,6 +7869,12 @@ pub async fn picker_view(
                 picker_state::PickerCandidates::Diagnostics(_),
                 picker_state::PickerCandidates::Diagnostics(_),
             ) => true,
+            // References: keep the one-shot LSP snapshot across scroll/resume re-views (the
+            // re-view sends an empty placeholder), like Diagnostics and Grep.
+            (
+                picker_state::PickerCandidates::References(_),
+                picker_state::PickerCandidates::References(_),
+            ) => true,
             _ => false,
         };
         if !preserve_existing {
@@ -7711,6 +7883,19 @@ pub async fn picker_view(
         }
     }
     let picker = pickers.get_mut(&key).expect("populated above");
+
+    // References: a fresh open (`buffer_id` present, vs `None` on scroll/resume re-views) kicks
+    // off the async `textDocument/references` resolve. Mint an epoch, mark the picker loading, and
+    // remember what to spawn once the lock is released — the picker is pushed empty + `ticking`
+    // now, and the spawned task fills it.
+    let references_resolve: Option<(BufferId, u64)> = match (params.kind, params.buffer_id) {
+        (PickerKind::References, Some(buffer_id)) => {
+            let epoch = next_references_epoch();
+            picker.pending_async_load = Some(epoch);
+            Some((buffer_id, epoch))
+        }
+        _ => None,
+    };
 
     // Cursor-derived centering for Grep: resolve the nearest cached hit at-or-after the
     // cursor's leading selection edge and use it as the effective center_on (overriding any
@@ -7767,7 +7952,14 @@ pub async fn picker_view(
 
     // Build the initial push so the client doesn't have to wait for an async update to arrive
     // before it can render. Caller will treat the response and the notification as redundant.
-    let update = picker_state::build_update(picker, matcher);
+    let mut update = picker_state::build_update(picker, matcher);
+    // References opens empty while it resolves — mark the push `ticking` so the client shows the
+    // loading state instead of an empty result set.
+    if references_resolve.is_some() {
+        if let Some(ref mut u) = update {
+            u.ticking = true;
+        }
+    }
     let (directory_path, directory_parent) = match &picker.candidates {
         picker_state::PickerCandidates::Explorer(e) => (Some(e.path.clone()), e.parent.clone()),
         _ => (None, None),
@@ -7786,6 +7978,11 @@ pub async fn picker_view(
 
     if let (Some(sender), Some(params)) = (outbound, update) {
         let _ = sender.send(picker_update_notif(params)).await;
+    }
+
+    // Kick off the references resolve now that the empty + loading state is on the wire.
+    if let Some((buffer_id, epoch)) = references_resolve {
+        spawn_reference_resolve(state.clone(), client_id, buffer_id, epoch);
     }
 
     Ok(result)
@@ -7838,6 +8035,10 @@ pub async fn picker_query(
         }
     }
 
+    // References whose async resolve is still outstanding: a filter typed mid-load reranks the
+    // (still empty) candidates, so without this the push would report "finished, 0 matches" and
+    // the picker would flash "No references found" until the resolve lands. Keep it ticking.
+    let references_loading = picker.pending_async_load.is_some();
     let mut update = picker_state::build_update(picker, matcher);
     let query_for_grep = picker.query.clone();
     let generation = picker.generation;
@@ -7847,7 +8048,8 @@ pub async fn picker_query(
     // Mark the initial push as ticking when we're about to spawn the search. Without this the
     // client would briefly see "0 hits, search finished" between sending the query and the
     // coordinator's first batch landing.
-    if will_spawn_grep_search {
+    if will_spawn_grep_search || (matches!(params.kind, PickerKind::References) && references_loading)
+    {
         if let Some(ref mut u) = update {
             u.ticking = true;
         }
@@ -8530,6 +8732,35 @@ mod lsp_parse_tests {
     fn definition_null_and_empty_is_none() {
         assert!(parse_definition(&json!(null), PositionEncoding::Utf8).is_none());
         assert!(parse_definition(&json!([]), PositionEncoding::Utf8).is_none());
+    }
+
+    #[test]
+    fn references_parses_every_location() {
+        // A `Location[]` with entries in two files — all are kept, in response order.
+        let v = json!([
+            {"uri": "file:///p/a.rs", "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9}}},
+            {"uri": "file:///p/b.rs", "range": {"start": {"line": 4, "character": 8}, "end": {"line": 4, "character": 14}}},
+        ]);
+        let refs = parse_references(&v, PositionEncoding::Utf8);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].path, "/p/a.rs");
+        assert_eq!(refs[0].position, LogicalPosition { line: 0, col: 3 });
+        assert_eq!(refs[1].path, "/p/b.rs");
+        assert_eq!(refs[1].position, LogicalPosition { line: 4, col: 8 });
+    }
+
+    #[test]
+    fn references_null_and_non_array_is_empty() {
+        // `textDocument/references` returns `Location[] | null`; both null and a stray object
+        // yield no references rather than erroring.
+        assert!(parse_references(&json!(null), PositionEncoding::Utf8).is_empty());
+        assert!(parse_references(&json!({"uri": "file:///p/a.rs"}), PositionEncoding::Utf8).is_empty());
+        // Unparseable entries are skipped, not fatal.
+        let v = json!([
+            {"uri": "file:///p/a.rs", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}},
+            {"garbage": true},
+        ]);
+        assert_eq!(parse_references(&v, PositionEncoding::Utf8).len(), 1);
     }
 
     #[test]

@@ -276,6 +276,7 @@ impl Action {
                 | Action::OpenPicker(PickerKind::Explorer)
                 | Action::OpenPicker(PickerKind::Diagnostics)
                 | Action::OpenPicker(PickerKind::LspServers)
+                | Action::OpenPicker(PickerKind::References)
                 | Action::CloseBuffer
                 | Action::Save
                 | Action::SaveAs
@@ -663,6 +664,7 @@ static LEADER: &[Binding] = &[
     bind!(LEADER_CTX, ch('m'), Exact(NONE), A::Format, "Code", "Format document"),
     bind!(LEADER_CTX, ch('k'), Exact(NONE), A::Hover, "Code", "Hover (type & docs)"),
     bind!(LEADER_CTX, ch('d'), Exact(NONE), A::GotoDefinition, "Code", "Go to definition"),
+    bind!(LEADER_CTX, ch('d'), Exact(ALT), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(LEADER_CTX, ch('j'), Exact(NONE), A::ShowDiagnostic, "Code", "Show diagnostic at cursor"),
     bind!(LEADER_CTX, ch('t'), Exact(NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics list"),
     bind!(LEADER_CTX, ch('l'), Exact(NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),

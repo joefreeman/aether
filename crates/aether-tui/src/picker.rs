@@ -352,6 +352,13 @@ pub enum ItemKey<'a> {
         line: u32,
         col: u32,
     },
+    /// A reference location, identified by `(path, line, col)` — stable across resume even if the
+    /// preview line text drifts after editing (mirrors the Grep key's rationale).
+    Reference {
+        path: &'a str,
+        line: u32,
+        col: u32,
+    },
     /// An LSP server, identified by its `(language, workspace_root)` key — stable across the
     /// status changes that drive the picker's live re-pushes.
     LspServer {
@@ -389,6 +396,13 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             path_index: *path_index,
         },
         PickerItem::Diagnostic { line, col, .. } => ItemKey::Diagnostic {
+            line: *line,
+            col: *col,
+        },
+        PickerItem::Reference {
+            path, line, col, ..
+        } => ItemKey::Reference {
+            path: path.as_str(),
             line: *line,
             col: *col,
         },

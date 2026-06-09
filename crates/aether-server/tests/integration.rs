@@ -13712,6 +13712,88 @@ async fn lsp_goto_definition_resolves() {
     assert_eq!(loc.position.line, 0, "helper is defined on line 0");
 }
 
+/// Phase 6: the References picker resolves `textDocument/references` at the cursor and streams the
+/// candidates in asynchronously — `picker/view` returns immediately with an empty, `ticking` push,
+/// then a spawned task fills it via a follow-up push once the LSP request completes. `helper` is
+/// declared on line 0 and called on line 4, so we expect two project-local hits, each with a line
+/// preview. Re-opens until rust-analyzer has indexed enough to answer (the resolve before that
+/// returns empty).
+#[tokio::test]
+#[ignore = "needs rust-analyzer"]
+async fn references_picker_lists_all_uses() {
+    use std::time::Duration;
+    require_server_on_path("rust-analyzer");
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
+        ("main.rs", "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n"),
+    ]);
+    let (server, mut ws) = open_and_subscribe("refs-rust", dir.path(), "main.rs").await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
+        language: None, create_if_missing: false, jump_to: None,
+    }).await;
+    let buffer_id = open.buffer_id;
+    set_cursor(&mut ws, 11, buffer_id, 0, 3).await; // on the `helper` declaration
+
+    let final_update = tokio::time::timeout(Duration::from_secs(90), async {
+        let mut id = 100;
+        loop {
+            // Each open mints a fresh resolve; the initial push is empty + ticking, then the
+            // spawned task pushes the resolved set with ticking: false.
+            let view = send_request::<PickerView>(&mut ws, id, &PickerViewParams {
+                kind: PickerKind::References,
+                reset: true,
+                offset: 0,
+                limit: 30,
+                center_on: None,
+                center_on_cursor_grep_hit: None,
+                directory_path: None,
+                buffer_id: Some(buffer_id),
+                explorer_roots: false,
+            }).await;
+            id += 1;
+            assert_eq!(view.total_candidates, 0, "references opens empty, then streams in");
+            // Drain until the resolve completes (ticking: false). The first push is the empty
+            // ticking placeholder.
+            let done = loop {
+                let p: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+                if p.kind == PickerKind::References && !p.ticking {
+                    break p;
+                }
+            };
+            if done.total_matches > 0 {
+                return done;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    })
+    .await
+    .expect("references did not resolve within 90s");
+    drop(server);
+
+    assert_eq!(final_update.kind, PickerKind::References);
+    assert!(
+        final_update.total_matches >= 2,
+        "expected the declaration + call site, got {}",
+        final_update.total_matches
+    );
+    let lines: Vec<u32> = final_update
+        .items
+        .iter()
+        .map(|i| {
+            let PickerItem::Reference { path, display_path, line, preview, .. } = i else {
+                panic!("expected Reference item, got {i:?}")
+            };
+            assert!(path.ends_with("main.rs"), "unexpected path: {path}");
+            assert_eq!(display_path, "main.rs", "project-relative display path");
+            assert!(!preview.is_empty(), "reference rows carry a line preview");
+            *line
+        })
+        .collect();
+    assert!(lines.contains(&0), "helper is declared on line 0");
+    assert!(lines.contains(&4), "helper is called on line 4");
+}
+
 /// Phase 5: `lsp/format` reformats the buffer via rust-analyzer (rustfmt). Polls until the server
 /// is ready enough to return edits, then saves and checks the on-disk text is canonically
 /// formatted. A second format must leave that canonical text untouched (no corruption from

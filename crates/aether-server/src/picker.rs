@@ -102,6 +102,22 @@ pub struct DiagnosticCandidate {
     pub abs_path: String,
 }
 
+/// One references-picker candidate — a single reference location from `textDocument/references`.
+/// `preview` is the fuzzy haystack; `abs_path` + `(line, col)` drive the `FileAt` jump on select.
+/// Cross-file, so it carries its own `abs_path` and a precomputed `display_path` label rather than
+/// a project-root index (references may point outside every root).
+#[derive(Debug, Clone)]
+pub struct ReferenceCandidate {
+    /// Absolute canonical path of the file containing the reference.
+    pub abs_path: String,
+    /// Row label: project-relative when inside a root, else the absolute path.
+    pub display_path: String,
+    pub line: u32,
+    pub col: u32,
+    /// The referenced line's text (trailing newline trimmed). Haystack + preview.
+    pub preview: String,
+}
+
 /// One LSP-servers-picker candidate — a language server for the active project. `name` is the
 /// fuzzy haystack; `language` is the key the client restarts by. Rebuilt on every `picker/view`
 /// and on each `lsp/status_changed` (the list is tiny and the status changes), so the row's
@@ -168,6 +184,10 @@ pub enum PickerCandidates {
     /// The active project's language servers. Rebuilt on every view and on each status change
     /// (small N), so it's never preserved — the row glyphs reflect live status.
     LspServers(Vec<LspServerCandidate>),
+    /// References to the cursor's symbol. Built on open from a one-shot `textDocument/references`
+    /// snapshot; preserved across non-reset re-views (like Diagnostics) so scrolling doesn't
+    /// rebuild against a possibly-changed set.
+    References(Vec<ReferenceCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -191,6 +211,7 @@ impl PickerCandidates {
             PickerCandidates::Projects(v) => v.len(),
             PickerCandidates::Diagnostics(v) => v.len(),
             PickerCandidates::LspServers(v) => v.len(),
+            PickerCandidates::References(v) => v.len(),
         }
     }
 
@@ -204,6 +225,7 @@ impl PickerCandidates {
             PickerCandidates::Projects(_) => PickerKind::Projects,
             PickerCandidates::Diagnostics(_) => PickerKind::Diagnostics,
             PickerCandidates::LspServers(_) => PickerKind::LspServers,
+            PickerCandidates::References(_) => PickerKind::References,
         }
     }
 
@@ -221,6 +243,7 @@ impl PickerCandidates {
             PickerCandidates::Projects(v) => &v[idx].name,
             PickerCandidates::Diagnostics(v) => &v[idx].message,
             PickerCandidates::LspServers(v) => &v[idx].name,
+            PickerCandidates::References(v) => &v[idx].preview,
         }
     }
 
@@ -298,6 +321,17 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::References(v) => {
+                let c = &v[idx];
+                PickerItem::Reference {
+                    path: c.abs_path.clone(),
+                    display_path: c.display_path.clone(),
+                    line: c.line,
+                    col: c.col,
+                    preview: c.preview.clone(),
+                    match_indices,
+                }
+            }
         }
     }
 
@@ -360,6 +394,14 @@ impl PickerCandidates {
             ) => v
                 .iter()
                 .position(|c| c.language == *language && c.workspace_root == *workspace_root),
+            (
+                PickerCandidates::References(v),
+                PickerItem::Reference {
+                    path, line, col, ..
+                },
+            ) => v
+                .iter()
+                .position(|c| c.abs_path == *path && c.line == *line && c.col == *col),
             _ => None,
         }
     }
@@ -373,7 +415,8 @@ impl PickerCandidates {
             | PickerCandidates::Buffers(_)
             | PickerCandidates::Projects(_)
             | PickerCandidates::Diagnostics(_)
-            | PickerCandidates::LspServers(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::LspServers(_)
+            | PickerCandidates::References(_) => MatchStrategy::Fuzzy,
             PickerCandidates::Explorer(_) | PickerCandidates::ExplorerRoots(_) => {
                 MatchStrategy::PrefixSmartcase
             }
@@ -435,6 +478,16 @@ impl PickerCandidates {
             // LSP servers aren't a jump target — the client restarts the highlighted server via
             // `lsp/restart_server` (Ctrl-r). `select` never fires for this kind.
             PickerCandidates::LspServers(_) => None,
+            PickerCandidates::References(v) => {
+                let c = &v[idx];
+                Some(PickerSelectResult::FileAt {
+                    path: c.abs_path.clone(),
+                    position: LogicalPosition {
+                        line: c.line,
+                        col: c.col,
+                    },
+                })
+            }
         }
     }
 }
@@ -453,6 +506,15 @@ pub struct PickerState {
     pub candidates: PickerCandidates,
     /// `Some` while the client has the picker open and is receiving pushes. `None` after `hide`.
     pub subscribed: Option<SubscribedWindow>,
+    /// References only: tracks an in-flight async resolve (the `textDocument/references` round-trip
+    /// runs off the lock, so the picker opens empty and is populated by a spawned task). `Some(epoch)`
+    /// while a resolve is outstanding; the epoch is a monotonic token so a stale task — one whose
+    /// picker was reset/reopened (minting a newer epoch) — notices the mismatch on completion and
+    /// drops its result instead of clobbering the current load. `is_some()` also drives the
+    /// "loading" (`ticking`) state for the row count + spinner. Cleared to `None` when the matching
+    /// task applies its result. Distinct from `generation` (which a *query* change bumps): a query
+    /// while loading must re-filter the pending result, not cancel the resolve.
+    pub pending_async_load: Option<u64>,
     /// Grep only: the query whose walk last completed (`ticking: false` push went out). When the
     /// next `picker/query` arrives with the same string, the candidates are still valid — skip
     /// the wipe + respawn and just re-emit the current window. Cleared whenever a new search
@@ -477,6 +539,7 @@ impl PickerState {
             ranked,
             candidates,
             subscribed: None,
+            pending_async_load: None,
             last_completed_query: None,
         }
     }
@@ -778,6 +841,82 @@ mod tests {
             match_indices: vec![],
         };
         assert_eq!(c.position_of(&elsewhere), None);
+    }
+
+    fn reference_candidates() -> PickerCandidates {
+        PickerCandidates::References(vec![
+            ReferenceCandidate {
+                abs_path: "/proj/src/lib.rs".into(),
+                display_path: "src/lib.rs".into(),
+                line: 4,
+                col: 8,
+                preview: "    helper();".into(),
+            },
+            ReferenceCandidate {
+                abs_path: "/proj/src/main.rs".into(),
+                display_path: "src/main.rs".into(),
+                line: 0,
+                col: 3,
+                preview: "fn helper() {}".into(),
+            },
+        ])
+    }
+
+    #[test]
+    fn reference_candidates_round_trip_to_items() {
+        let c = reference_candidates();
+        assert_eq!(c.kind(), PickerKind::References);
+        assert_eq!(c.len(), 2);
+        // The preview line is the fuzzy haystack, like the grep preview.
+        assert_eq!(c.display_at(0), "    helper();");
+        assert_eq!(c.match_strategy(), MatchStrategy::Fuzzy);
+        match c.make_item(0, vec![4, 5]) {
+            PickerItem::Reference {
+                path,
+                display_path,
+                line,
+                col,
+                preview,
+                match_indices,
+            } => {
+                assert_eq!(path, "/proj/src/lib.rs");
+                assert_eq!(display_path, "src/lib.rs");
+                assert_eq!(line, 4);
+                assert_eq!(col, 8);
+                assert_eq!(preview, "    helper();");
+                assert_eq!(match_indices, vec![4, 5]);
+            }
+            other => panic!("expected Reference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_identity_is_path_line_col() {
+        let c = reference_candidates();
+        // Round-trips by (path, line, col).
+        assert_eq!(c.position_of(&c.make_item(1, vec![])), Some(1));
+        // Same file, different line → no match (the preview text is irrelevant to identity).
+        let elsewhere = PickerItem::Reference {
+            path: "/proj/src/lib.rs".into(),
+            display_path: "src/lib.rs".into(),
+            line: 99,
+            col: 8,
+            preview: "ignored".into(),
+            match_indices: vec![],
+        };
+        assert_eq!(c.position_of(&elsewhere), None);
+    }
+
+    #[test]
+    fn reference_selects_to_file_at() {
+        // Selecting a reference jumps to its location (path + start position).
+        match reference_candidates().select_result(1) {
+            Some(PickerSelectResult::FileAt { path, position }) => {
+                assert_eq!(path, "/proj/src/main.rs");
+                assert_eq!(position, LogicalPosition { line: 0, col: 3 });
+            }
+            other => panic!("expected FileAt, got {other:?}"),
+        }
     }
 
     #[test]

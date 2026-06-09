@@ -501,6 +501,12 @@ html, body, #app {
   flex: 1 1 auto;
   position: relative;
 }
+/* Empty/loading message (References while resolving, or after an empty resolve). */
+.picker-empty {
+  padding: 6px 12px;
+  color: var(--nord3);
+  font-style: italic;
+}
 /* Virtual scroll: spacer spans all results; the loaded window is positioned within it. */
 .picker-spacer { position: relative; width: 100%; }
 .picker-window { position: absolute; left: 0; right: 0; top: 0; }
@@ -527,6 +533,16 @@ a.picker-row:not(.selected):hover .picker-main {
   background: var(--nord2);
 }
 .picker-prefix { color: var(--nord13); flex: 0 0 auto; }
+/* References location prefix (`path:line`): dim, and allowed to ellipsize up to ~half the row so a
+   long path can't crowd out the preview. Brightens on the selected row, like the meta column. */
+.picker-prefix.picker-loc {
+  color: var(--nord3);
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-right: 0.4em;
+}
+.picker-row.selected .picker-prefix.picker-loc { color: var(--nord4); }
 .sev-error { color: var(--nord11); }
 .sev-warning { color: var(--nord13); }
 .sev-information { color: var(--nord8); }

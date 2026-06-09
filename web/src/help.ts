@@ -158,7 +158,7 @@ const TABS: Tab[] = [
         title: "Code — LSP (Space …)",
         rows: [
           ["Space k", "hover"],
-          ["Space d", "go to definition"],
+          ["Space d  Alt-d", "go to definition / references"],
           ["Space j", "show diagnostic"],
           ["Space x  Alt-x", "next / prev diagnostic"],
           ["Space m", "format document"],

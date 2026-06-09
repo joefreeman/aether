@@ -50,6 +50,14 @@ pub enum PickerKind {
     /// other kinds this isn't a jump target: the client restarts the highlighted server in place
     /// (`Ctrl-r` → `lsp/restart_server`) and the list live-updates as statuses change.
     LspServers,
+    /// References to the symbol at the cursor, gathered via the language server's
+    /// `textDocument/references` (`PickerViewParams::buffer_id` scopes the request — the server
+    /// resolves them against that buffer's cursor when the picker opens). Cross-file: each
+    /// candidate is one reference location with a preview of its line. Fuzzy-matched on the
+    /// preview text; selecting one jumps to its position (via `FileAt`). The candidate set is a
+    /// one-shot LSP snapshot taken on open and preserved across scroll/resume re-views (like
+    /// Diagnostics) — it doesn't live-update as the buffer changes.
+    References,
 }
 
 impl PickerKind {
@@ -202,6 +210,27 @@ pub enum PickerItem {
     /// disambiguator is client-derived and not part of the haystack.
     Root {
         path_index: u32,
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One reference location from `textDocument/references`. Identity is `(path, line, col)`.
+    /// Cross-file, so it carries its own absolute `path` (fed into `buffer/open` on select) plus a
+    /// server-computed `display_path` for the row label — project-relative when the file lives
+    /// inside a root, otherwise the absolute path (references can point into dependencies / stdlib
+    /// outside every root, where no `path_index`/root label applies). The matcher haystack is
+    /// `preview`; `match_indices` are char offsets into it.
+    Reference {
+        /// Absolute canonical path to the file containing the reference.
+        path: String,
+        /// Row label: project-relative path when inside a root, else the absolute path.
+        display_path: String,
+        /// 0-based line number within the file.
+        line: u32,
+        /// 0-based byte offset of the reference within the line.
+        col: u32,
+        /// The text of the referenced line, trailing newline trimmed. Fuzzy haystack + preview.
+        preview: String,
+        /// Char offsets into `preview` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
     },
