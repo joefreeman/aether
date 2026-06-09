@@ -19,6 +19,14 @@
 
   --git-added-bg: #2d3a2d;
   --git-modified-bg: #3a3628;
+  /* Staged variants keep each kind's hue, dimmed — hue says *what* changed, brightness says
+     whether it still needs staging (bright = unstaged, muted = in the index). */
+  --git-staged-added: #6e8060; /* dimmed nord14 */
+  --git-staged-modified: #9e8a62; /* dimmed nord13 */
+  --git-staged-deleted: #844c53; /* dimmed nord11 */
+  --git-staged-added-bg: #2f3631; /* staged line tints, likewise dimmer */
+  --git-staged-modified-bg: #35342d;
+  --git-staged-deleted-bg: #33252a; /* staged phantom rows */
   --git-deleted-bg: #3b2226;
 
   /* Current-line tint, ~40% from NORD0 toward NORD1: subtler than NORD1 (which the status line
@@ -28,6 +36,9 @@
      cursor's line still reads as added/modified rather than the plain blue cursorline hiding it. */
   --cursor-line-added-bg: #3a4d3a;
   --cursor-line-modified-bg: #4a4632;
+  /* ...and staged counterparts, so the cursor on a staged line keeps its dimmer identity. */
+  --cursor-line-staged-added-bg: #3a453c;
+  --cursor-line-staged-modified-bg: #434138;
 }
 
 html, body, #app {
@@ -255,7 +266,10 @@ html, body, #app {
 .row { display: flex; min-height: 1.4em; } /* keep blank lines from collapsing to zero height */
 .row.added-bg { background: var(--git-added-bg); }
 .row.modified-bg { background: var(--git-modified-bg); }
+.row.added-bg.staged { background: var(--git-staged-added-bg); }
+.row.modified-bg.staged { background: var(--git-staged-modified-bg); }
 .row.deleted-phantom { background: var(--git-deleted-bg); color: var(--nord11); }
+.row.deleted-phantom.staged { background: var(--git-staged-deleted-bg); color: var(--git-staged-deleted); }
 /* Current-line highlight (Vim's `cursorline`). A subtle custom tint (see --cursor-line-bg), kept
    distinct from the status line's NORD1. Ordered after the diff tints so it wins on the cursor's
    changed line. On a changed line under the diff view, a green/olive variant keeps the diff colour
@@ -264,6 +278,8 @@ html, body, #app {
 .row.cursor-line { background: var(--cursor-line-bg); }
 .row.cursor-line.added-bg { background: var(--cursor-line-added-bg); }
 .row.cursor-line.modified-bg { background: var(--cursor-line-modified-bg); }
+.row.cursor-line.added-bg.staged { background: var(--cursor-line-staged-added-bg); }
+.row.cursor-line.modified-bg.staged { background: var(--cursor-line-staged-modified-bg); }
 
 /* Native change-bar: a colored left border in the gutter column (no text glyph). The transparent
    border on every gutter keeps the text start aligned whether or not a line is changed. */
@@ -281,6 +297,12 @@ html, body, #app {
 .gutter.added { border-left-color: var(--nord14); }
 .gutter.modified { border-left-color: var(--nord13); }
 .gutter.phantom { border-left-color: var(--nord11); }
+/* Staged dims the kind colour. The two-class rules out-rank the single-class kind rules, so the
+   stage wins where both apply. */
+.gutter.added.staged { border-left-color: var(--git-staged-added); }
+.gutter.modified.staged { border-left-color: var(--git-staged-modified); }
+.gutter.phantom.staged { border-left-color: var(--git-staged-deleted); }
+.gutter.deleted.staged::before { border-left-color: var(--git-staged-deleted); }
 /* Pure deletion with the diff view off: a small triangle straddling the line boundary (the removed
    lines sit "between" this line and the one above), rather than a misleading bar on this line. */
 .gutter.deleted::before {

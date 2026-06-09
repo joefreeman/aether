@@ -15,13 +15,14 @@ use aether_protocol::envelope::{
     RpcMethod,
 };
 use aether_protocol::git::{
-    BlameInfo, CommitInfo, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitChangeCounts,
+    ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams,
+    GitApplyHunkResult, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitChangeCounts,
     GitCommitInfo, GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams,
-    HunkDirection, GitSetDiffView, GitSetDiffViewParams,
+    HunkAction, HunkDirection, GitSetDiffView, GitSetDiffViewParams,
 };
 use aether_protocol::viewport::{
-    BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, LogicalLineRender,
-    VirtualRow, VirtualRowKind, Window,
+    BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
+    LogicalLineRender, VirtualRow, VirtualRowKind, Window,
 };
 use aether_protocol::input::{InputSurround, InputSurroundParams, InputText, InputTextParams};
 use aether_protocol::search::{SearchSet, SearchSetParams};
@@ -150,6 +151,36 @@ fn git_commit_info_roundtrip() {
 }
 
 #[test]
+fn git_apply_hunk_roundtrip() {
+    let p = GitApplyHunkParams {
+        buffer_id: 4,
+        action: HunkAction::Toggle,
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({"buffer_id": 4, "action": "toggle"})
+    );
+    assert_eq!(GitApplyHunk::NAME, "git/apply_hunk");
+
+    // The status reports which direction a toggle resolved to.
+    for (status, wire) in [
+        (ApplyHunkStatus::Staged, "staged"),
+        (ApplyHunkStatus::Unstaged, "unstaged"),
+        (ApplyHunkStatus::Reverted, "reverted"),
+        (ApplyHunkStatus::DirtyBuffer, "dirty_buffer"),
+    ] {
+        let res = GitApplyHunkResult {
+            cursor: CursorState::default(),
+            status,
+        };
+        let v = to_value(&res).unwrap();
+        assert_eq!(v["status"], wire);
+        let back: GitApplyHunkResult = from_value(v).unwrap();
+        assert_eq!(back.status, status);
+    }
+}
+
+#[test]
 fn git_set_diff_view_params_shape() {
     let p = GitSetDiffViewParams {
         viewport_id: 9,
@@ -168,11 +199,13 @@ fn logical_line_render_virtual_rows_shape() {
         search_matches: vec![],
         virtual_rows_above: vec![],
         diff_marker: None,
+        diff_stage: DiffStage::Unstaged,
         diagnostics: vec![],
     };
     let v = to_value(&bare).unwrap();
     assert!(v.get("virtual_rows_above").is_none(), "empty omitted from wire");
     assert!(v.get("diff_marker").is_none(), "None marker omitted from wire");
+    assert!(v.get("diff_stage").is_none(), "unstaged stage omitted from wire");
     assert!(v.get("diagnostics").is_none(), "empty diagnostics omitted from wire");
 
     let with_del = LogicalLineRender {
@@ -182,8 +215,10 @@ fn logical_line_render_virtual_rows_shape() {
         virtual_rows_above: vec![VirtualRow {
             text: "old line".into(),
             kind: VirtualRowKind::Deleted,
+            stage: DiffStage::Staged,
         }],
         diff_marker: Some(DiffMarker::Modified),
+        diff_stage: DiffStage::Staged,
         diagnostics: vec![DiagnosticSpan {
             start: 4,
             end: 9,
@@ -194,7 +229,9 @@ fn logical_line_render_virtual_rows_shape() {
     let v = to_value(&with_del).unwrap();
     assert_eq!(v["virtual_rows_above"][0]["text"], "old line");
     assert_eq!(v["virtual_rows_above"][0]["kind"], "deleted");
+    assert_eq!(v["virtual_rows_above"][0]["stage"], "staged");
     assert_eq!(v["diff_marker"], "modified");
+    assert_eq!(v["diff_stage"], "staged");
     assert_eq!(v["diagnostics"][0]["start"], 4);
     assert_eq!(v["diagnostics"][0]["end"], 9);
     assert_eq!(v["diagnostics"][0]["severity"], "error");
@@ -202,7 +239,9 @@ fn logical_line_render_virtual_rows_shape() {
     let back: LogicalLineRender = from_value(v).unwrap();
     assert_eq!(back.virtual_rows_above.len(), 1);
     assert_eq!(back.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
+    assert_eq!(back.virtual_rows_above[0].stage, DiffStage::Staged);
     assert_eq!(back.diff_marker, Some(DiffMarker::Modified));
+    assert_eq!(back.diff_stage, DiffStage::Staged);
     assert_eq!(back.diagnostics[0].severity, DiagnosticSeverity::Error);
 }
 
@@ -246,51 +285,12 @@ fn buffer_status_snapshot_shape() {
 }
 
 #[test]
-fn git_change_counts_omitted_when_empty() {
-    // A clean buffer's counts are all-zero and drop off the wire (forward-compat: an older client
-    // sees no field and defaults to empty), while a non-empty summary serializes its fields.
+fn git_change_counts_shape() {
+    // The counts only ride `GitBufferStatus` (staged/unstaged halves); each empty side drops off
+    // the wire there — pinned in `git_buffer_status_shape` below.
     let counts = GitChangeCounts::default();
     assert!(counts.is_empty());
-    assert_eq!(to_value(&counts).unwrap(), json!({"added": 0, "modified": 0, "deleted": 0}));
-
-    let mk_window = |git_changes| Window {
-        first_logical_line: 0,
-        last_logical_line_exclusive: 1,
-        line_count: 1,
-        max_scroll_logical_line: 0,
-        total_visual_rows: 1,
-        first_visual_row: 0,
-        max_line_width: 0,
-        git_changes,
-        git_status: None,
-        lines: vec![],
-    };
-    let clean = to_value(mk_window(GitChangeCounts::default())).unwrap();
-    assert!(clean.get("git_changes").is_none(), "empty summary omitted from wire");
-
-    let dirty = to_value(mk_window(GitChangeCounts { added: 2, modified: 0, deleted: 5 })).unwrap();
-    assert_eq!(dirty["git_changes"], json!({"added": 2, "modified": 0, "deleted": 5}));
-    let back: Window = from_value(dirty).unwrap();
-    assert_eq!((back.git_changes.added, back.git_changes.deleted), (2, 5));
-
-    // Same field on the per-edit notification, with the same omit-when-empty behavior.
-    let params = ViewportLinesChangedParams {
-        viewport_id: 1,
-        revision: 7,
-        range: LogicalLineRange { start_logical_line: 0, end_logical_line_exclusive: 1 },
-        replacement_lines: vec![],
-        line_count: 1,
-        max_scroll_logical_line: 0,
-        total_visual_rows: 1,
-        first_visual_row: 0,
-        max_line_width: 0,
-        git_changes: GitChangeCounts { added: 1, modified: 3, deleted: 0 },
-        git_status: None,
-    };
-    let v = to_value(&params).unwrap();
-    assert_eq!(v["git_changes"], json!({"added": 1, "modified": 3, "deleted": 0}));
-    let back: ViewportLinesChangedParams = from_value(v).unwrap();
-    assert_eq!(back.git_changes.modified, 3);
+    assert_eq!(to_value(counts).unwrap(), json!({"added": 0, "modified": 0, "deleted": 0}));
 }
 
 #[test]

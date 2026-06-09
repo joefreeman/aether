@@ -20,7 +20,7 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::git::{
-    GitBlameLine, GitCommitInfo, GitNavigateHunk, GitSetDiffBase, GitSetDiffView,
+    GitApplyHunk, GitBlameLine, GitCommitInfo, GitNavigateHunk, GitSetDiffView,
 };
 use aether_protocol::nav::{NavBack, NavForward, NavGoto, NavRecord};
 use aether_protocol::lsp::{
@@ -324,8 +324,8 @@ async fn dispatch(
         GitBlameLine::NAME => run!(GitBlameLine, handlers::git_blame_line),
         GitCommitInfo::NAME => run!(GitCommitInfo, handlers::git_commit_info),
         GitSetDiffView::NAME => run!(GitSetDiffView, handlers::git_set_diff_view),
-        GitSetDiffBase::NAME => run!(GitSetDiffBase, handlers::git_set_diff_base),
         GitNavigateHunk::NAME => run!(GitNavigateHunk, handlers::git_navigate_hunk),
+        GitApplyHunk::NAME => run!(GitApplyHunk, handlers::git_apply_hunk),
         LspServerStatusList::NAME => run!(LspServerStatusList, handlers::lsp_server_status),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),

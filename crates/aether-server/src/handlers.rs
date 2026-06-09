@@ -6,7 +6,8 @@ use crate::grep;
 use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
-    BlameCache, Buffer, EditKindTag, NavEntry, SearchEntry, ServerState, SharedState, Viewport,
+    BlameCache, Buffer, EditKindTag, LineEnding, NavEntry, SearchEntry, ServerState, SharedState,
+    Viewport,
 };
 use crate::surround;
 use crate::wrap;
@@ -46,9 +47,10 @@ use aether_protocol::project::{
     ProjectRemoveRootResult, ProjectRenameParams, ProjectSummary,
 };
 use aether_protocol::git::{
-    GitBlameLineParams, GitBlameLineResult, GitChangeCounts, GitCommitInfoParams,
-    GitCommitInfoResult, GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffBaseParams,
-    GitSetDiffViewParams, GitBufferStatus, DiffBase, HunkDirection,
+    ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBlameLineParams,
+    GitBlameLineResult, GitChangeCounts, GitCommitInfoParams, GitCommitInfoResult,
+    GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams,
+    GitBufferStatus, HunkAction, HunkDirection,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -62,8 +64,8 @@ use aether_protocol::search::{
     SearchSetResult, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::viewport::{
-    BufferStatusSnapshot, DiagnosticSpan, DiffMarker, LogicalLineRange, LogicalLineRender,
-    ViewportLinesChanged,
+    BufferStatusSnapshot, DiagnosticSpan, DiffMarker, DiffStage, LogicalLineRange,
+    LogicalLineRender, ViewportLinesChanged,
     ViewportLinesChangedParams, ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams,
     ViewportSubscribeParams, ViewportSubscribeResult, ViewportUnsubscribeParams,
     ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
@@ -893,13 +895,13 @@ pub async fn buffer_open(
     // buffer against it, so git-aware views have hunks from the first frame and later edits can
     // re-diff cheaply without touching the repo. Best-effort; untracked / no-repo → empty.
     let git_baseline = crate::git::load_baseline(&canonical);
-    let git_hunks = crate::git::diff_hunks(git_baseline.blob.as_deref(), &buf.text);
     let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &buf.text);
+    let git_both = crate::git::compose_both(&git_baseline.staged_hunks, &git_unstaged);
     s.buffers.insert(id, buf);
     s.buffer_projects.insert(id, active_project_name.clone());
     s.git_baseline.insert(id, git_baseline);
-    s.git_hunks.insert(id, git_hunks);
     s.git_unstaged_hunks.insert(id, git_unstaged);
+    s.git_both_hunks.insert(id, git_both);
 
     // LSP: ensure a language server for this file's language and open the document against it.
     // `ensure` returns a launch request when it created a fresh (Starting) handle; we spawn the
@@ -1046,7 +1048,7 @@ pub async fn git_set_diff_view(
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.diff_view = params.enabled;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_base) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -1055,7 +1057,6 @@ pub async fn git_set_diff_view(
         vp.tab_width,
         vp.buffer_id,
         vp.scroll_logical_line,
-        vp.diff_base,
     );
 
     // Refresh hunks so the first diff frame is accurate; clearing the view leaves them as-is
@@ -1071,7 +1072,7 @@ pub async fn git_set_diff_view(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
+    let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
@@ -1085,67 +1086,6 @@ pub async fn git_set_diff_view(
         rows,
         search,
         params.enabled,
-        hunks,
-        diagnostics,
-        buffer_git_status(&s, buffer_id),
-    );
-
-    let vp = s
-        .viewports
-        .get_mut(&params.viewport_id)
-        .expect("just checked");
-    vp.first_logical_line = first;
-    vp.last_logical_line_exclusive = last_excl;
-    Ok(ViewportWindowResult { window })
-}
-
-/// Toggle which committed-side baseline this viewport's gutter / inline diff compares against
-/// (`Head` = all uncommitted changes, `Index` = unstaged only), re-rendering the window with the
-/// base-appropriate hunks. Both diffs are already cached per buffer, so this is just a re-select
-/// and re-render — no repo I/O. Mirrors `git/set_diff_view`.
-pub async fn git_set_diff_base(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: GitSetDiffBaseParams,
-) -> Result<ViewportWindowResult, RpcError> {
-    let client_id = ctx.client_id;
-    let mut s = state.lock().await;
-    let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
-    vp.diff_base = params.base;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view, diff_base) = (
-        vp.cols,
-        vp.rows,
-        vp.overscan_rows,
-        vp.wrap,
-        vp.continuation_marker_width,
-        vp.tab_width,
-        vp.buffer_id,
-        vp.scroll_logical_line,
-        vp.diff_view,
-        vp.diff_base,
-    );
-
-    let buf = s
-        .buffers
-        .get(&buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
-    let line_count = buf.line_count();
-    let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
-    let diagnostics = buffer_diagnostics(&s, buffer_id);
-    let buf = &s.buffers[&buffer_id];
-    let window = render_window(
-        buf,
-        first,
-        last_excl,
-        cols,
-        wrap,
-        marker_width,
-        tab_width,
-        rows,
-        search,
-        diff_view,
         hunks,
         diagnostics,
         buffer_git_status(&s, buffer_id),
@@ -1178,16 +1118,23 @@ pub async fn git_navigate_hunk(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
 
-    // Diff against the cached baseline — cheap (no repo I/O) and correct regardless of whether a
-    // viewport is currently driving the per-edit recompute.
-    let hunks = {
+    // Diff against the cached baselines — cheap (no repo I/O) and correct regardless of whether a
+    // viewport is currently driving the per-edit recompute. The anchors are the union of the
+    // HEAD and index diffs, so navigation reaches every change the combined view can show —
+    // including a region reverted back to HEAD's content but staged differently (in the index
+    // diff only).
+    let anchors = {
         let buf = &s.buffers[&params.buffer_id];
-        let baseline = s.git_baseline.get(&params.buffer_id).and_then(|b| b.blob.as_deref());
-        crate::git::diff_hunks(baseline, &buf.text)
+        let baseline = s.git_baseline.get(&params.buffer_id);
+        let head = crate::git::diff_hunks(baseline.and_then(|b| b.blob.as_deref()), &buf.text);
+        let unstaged =
+            crate::git::diff_hunks(baseline.and_then(|b| b.index_blob.as_deref()), &buf.text);
+        let mut anchors: Vec<u32> =
+            head.iter().chain(unstaged.iter()).map(|h| h.anchor_line).collect();
+        anchors.sort_unstable();
+        anchors.dedup();
+        anchors
     };
-    let mut anchors: Vec<u32> = hunks.iter().map(|h| h.anchor_line).collect();
-    anchors.sort_unstable();
-    anchors.dedup();
     let target = match params.direction {
         HunkDirection::Next => anchors.iter().find(|&&a| a > params.from_line).copied(),
         HunkDirection::Prev => anchors.iter().rev().find(|&&a| a < params.from_line).copied(),
@@ -1226,6 +1173,235 @@ pub async fn git_navigate_hunk(
         cursor: response,
         moved: true,
     })
+}
+
+/// Toggle the staged state of — or revert — the change under the cursor (bare cursor → the whole
+/// hunk it sits on) or the selected lines (any wider selection, snapped to whole lines). The
+/// server resolves the client's cursor/selection authoritatively — no positions in the params.
+///
+/// - **Toggle** flips the region's staged state, unstaged-first: anything unstaged is staged
+///   (index ← buffer, resolved against the index→buffer diff); otherwise the region's staged
+///   change is pulled back out (index region ← HEAD, resolved against the HEAD→index diff with
+///   the cursor/selection carried from buffer to index coordinates across any unstaged edits).
+///   Requires a non-dirty buffer: the index must never hold content that exists nowhere on disk.
+///   The result status reports which direction it resolved to.
+/// - **Revert** peels the top layer of the HEAD→index→buffer stack as an ordinary undoable
+///   buffer edit: unstaged changes revert to the index's content; a staged-only region reverts
+///   to HEAD's. Works on a dirty buffer.
+pub async fn git_apply_hunk(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitApplyHunkParams,
+) -> Result<GitApplyHunkResult, RpcError> {
+    let client_id = ctx.client_id;
+    let buffer_id = params.buffer_id;
+    let mut s = state.lock().await;
+
+    // Echo the (wrap-adjusted) current cursor with a non-`Applied` status — mirrors `lsp/format`.
+    let outcome = |s: &ServerState, status: ApplyHunkStatus| -> GitApplyHunkResult {
+        let cursor = s
+            .cursors
+            .get(&(client_id, buffer_id))
+            .copied()
+            .unwrap_or_default();
+        GitApplyHunkResult {
+            cursor: wrap_for_response(s, client_id, buffer_id, cursor),
+            status,
+        }
+    };
+
+    let buf = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let (dirty, line_ending) = (buf.dirty, buf.line_ending);
+    let buffer_text = buf.text.to_string();
+
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
+    // Bare cursor (the editor's resting single-char selection) addresses the whole hunk; anything
+    // wider snaps to its line span and stages/reverts at line granularity.
+    let sel = if cursor.is_point() {
+        crate::git::HunkSelection::WholeHunkAt(cursor.position.line)
+    } else {
+        crate::git::HunkSelection::Lines {
+            lo: cursor.anchor.line.min(cursor.position.line),
+            hi: cursor.anchor.line.max(cursor.position.line),
+        }
+    };
+
+    let Some(baseline) = s.git_baseline.get(&buffer_id) else {
+        return Ok(outcome(&s, ApplyHunkStatus::Unavailable));
+    };
+    let Some(repo) = baseline.repo.clone() else {
+        return Ok(outcome(&s, ApplyHunkStatus::Unavailable));
+    };
+    let head_blob = baseline.blob.clone();
+    let index_blob = baseline.index_blob.clone();
+
+    match params.action {
+        HunkAction::Toggle => {
+            if dirty {
+                return Ok(outcome(&s, ApplyHunkStatus::DirtyBuffer));
+            }
+            let index_bytes = index_blob.as_deref().unwrap_or(b"");
+            // Unstaged-first, mirroring revert's layering: stage anything unstaged in the region
+            // (index ← buffer; an untracked file's empty index baseline makes this the hunk-wise
+            // `git add`). When the region holds nothing unstaged, pull its staged change back out
+            // (index region ← HEAD) — the cursor/selection lives in buffer lines, so carry it to
+            // index lines across the unstaged (index→buffer) diff first.
+            let staged_merge =
+                crate::git::merge_selected(index_bytes, buffer_text.as_bytes(), &sel, true);
+            let (merged, status) = match staged_merge {
+                Some(content) => (content, ApplyHunkStatus::Staged),
+                None => {
+                    let unstaged =
+                        crate::git::diff_hunks(Some(index_bytes), &s.buffers[&buffer_id].text);
+                    let sel_index = match sel {
+                        crate::git::HunkSelection::WholeHunkAt(l) => {
+                            crate::git::HunkSelection::WholeHunkAt(crate::git::map_line_to_old(
+                                &unstaged, l, false,
+                            ))
+                        }
+                        crate::git::HunkSelection::Lines { lo, hi } => {
+                            crate::git::HunkSelection::Lines {
+                                lo: crate::git::map_line_to_old(&unstaged, lo, false),
+                                hi: crate::git::map_line_to_old(&unstaged, hi, true),
+                            }
+                        }
+                    };
+                    match crate::git::merge_selected(
+                        head_blob.as_deref().unwrap_or(b""),
+                        index_bytes,
+                        &sel_index,
+                        false,
+                    ) {
+                        Some(content) => (content, ApplyHunkStatus::Unstaged),
+                        None => return Ok(outcome(&s, ApplyHunkStatus::NoChange)),
+                    }
+                }
+            };
+            // The in-memory baselines are LF-normalized; restore the file's real endings so the
+            // index blob matches what a save writes (mirrors `Buffer::save_to_disk`).
+            let mut content = merged;
+            if line_ending == LineEnding::Crlf {
+                content = crate::git::denormalize_crlf(&content);
+            }
+            if crate::git::write_index_blob(&repo, &content).is_none() {
+                return Ok(outcome(&s, ApplyHunkStatus::Unavailable));
+            }
+            // Reload the baseline and re-push every viewport on the buffer — gutter markers,
+            // phantom rows, and the staged/unstaged status-bar counts all just changed.
+            let pushes = refresh_git_for_buffer(&mut s, buffer_id);
+            let result = outcome(&s, status);
+            drop(s);
+            for (sender, notif) in pushes {
+                let _ = sender.send(notif).await;
+            }
+            Ok(result)
+        }
+        HunkAction::Revert => {
+            // Peel the top layer of the HEAD→index→buffer change stack: an unstaged change
+            // reverts to the index's content; if the selection touches nothing unstaged, a
+            // staged-only region (buffer == index ≠ HEAD) reverts to HEAD's. Pressing again on a
+            // re-modified region therefore peels unstaged first, then staged. A layer with no
+            // blob (untracked, staged whole-file delete) is simply skipped.
+            let merged = index_blob
+                .as_deref()
+                .and_then(|index| {
+                    crate::git::merge_selected(index, buffer_text.as_bytes(), &sel, false)
+                })
+                .or_else(|| {
+                    head_blob.as_deref().and_then(|head| {
+                        crate::git::merge_selected(head, buffer_text.as_bytes(), &sel, false)
+                    })
+                });
+            let Some(content) = merged else {
+                return Ok(outcome(&s, ApplyHunkStatus::NoChange));
+            };
+            let new_text = String::from_utf8_lossy(&content).into_owned();
+            if buffer_text == new_text {
+                return Ok(outcome(&s, ApplyHunkStatus::NoChange));
+            }
+
+            // Apply as one whole-document replacement (a single undo step) and refresh exactly
+            // like `lsp/format` does.
+            let buf = &s.buffers[&buffer_id];
+            let was_dirty = buf.dirty;
+            let old_len = buf.text.len_chars();
+            let cursors_before: HashMap<ClientId, CursorState> = s
+                .cursors
+                .iter()
+                .filter_map(|((c, b), cs)| (*b == buffer_id).then_some((*c, *cs)))
+                .collect();
+            let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+            let revision =
+                buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Revert, cursors_before);
+
+            // Clamp every cursor on the buffer into the reverted rope.
+            let cursor_ids: Vec<ClientId> = s
+                .cursors
+                .keys()
+                .filter_map(|(c, b)| (*b == buffer_id).then_some(*c))
+                .collect();
+            for cid in cursor_ids {
+                if let Some(cur) = s.cursors.get(&(cid, buffer_id)).copied() {
+                    let clamped = clamp_cursor(&s.buffers[&buffer_id], cur);
+                    s.cursors.insert((cid, buffer_id), clamped);
+                }
+            }
+            s.clear_motion_history_for_buffer(buffer_id);
+            s.clear_tree_selection_history_for_buffer(buffer_id);
+            s.clear_virtual_col_for_buffer(buffer_id);
+
+            let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+            let new_line_count = s.buffers[&buffer_id].line_count();
+            // Also recomputes the cached hunks, so the pushed gutter markers are post-revert.
+            refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+            notify_lsp_change(&mut s, buffer_id);
+
+            let buf_ref = &s.buffers[&buffer_id];
+            let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+            for vp in s.viewports.values() {
+                if vp.buffer_id != buffer_id {
+                    continue;
+                }
+                let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+                    continue;
+                };
+                let search = s.searches.get(&(vp.client_id, buffer_id));
+                pushes.push((
+                    sender,
+                    build_lines_changed_notif(
+                        buf_ref,
+                        vp,
+                        revision,
+                        search,
+                        buffer_both_hunks(&s, buffer_id),
+                        buffer_diagnostics(&s, buffer_id),
+                        buffer_git_status(&s, buffer_id),
+                    ),
+                ));
+            }
+            let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+
+            let result = outcome(&s, ApplyHunkStatus::Reverted);
+            drop(s);
+            for (sender, notif) in pushes {
+                let _ = sender.send(notif).await;
+            }
+            for (sender, notif) in search_summary_pushes {
+                let _ = sender.send(notif).await;
+            }
+            for (sender, notif) in picker_pushes {
+                let _ = sender.send(notif).await;
+            }
+            Ok(result)
+        }
+    }
 }
 
 // ---- lsp/* --------------------------------------------------------------------------------------
@@ -1623,7 +1799,7 @@ pub async fn lsp_format(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
@@ -1825,11 +2001,11 @@ pub(crate) fn refresh_git_for_buffer(
     // Re-read the committed baseline (the expensive part), then re-diff the live buffer against both
     // the HEAD and index blobs (the latter also picks up staging done outside the editor).
     let baseline = crate::git::load_baseline(&path);
-    let hunks = crate::git::diff_hunks(baseline.blob.as_deref(), &buf.text);
     let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &buf.text);
+    let both = crate::git::compose_both(&baseline.staged_hunks, &unstaged);
     s.git_baseline.insert(buffer_id, baseline);
-    s.git_hunks.insert(buffer_id, hunks);
     s.git_unstaged_hunks.insert(buffer_id, unstaged);
+    s.git_both_hunks.insert(buffer_id, both);
     s.git_blame.remove(&buffer_id); // committed history changed → recompute on next request
 
     let buf = &s.buffers[&buffer_id];
@@ -1850,7 +2026,7 @@ pub(crate) fn refresh_git_for_buffer(
                 vp,
                 revision,
                 search,
-                buffer_hunks_for_base(s, buffer_id, vp.diff_base),
+                buffer_both_hunks(s, buffer_id),
                 diagnostics,
                 buffer_git_status(s, buffer_id),
             ),
@@ -2303,7 +2479,7 @@ fn collect_viewport_refresh(
             vp.rows,
             search_entry,
             vp.diff_view,
-            buffer_hunks_for_base(s, buffer_id, vp.diff_base),
+            buffer_both_hunks(s, buffer_id),
             diagnostics,
             buffer_git_status(s, buffer_id),
         );
@@ -2320,7 +2496,6 @@ fn collect_viewport_refresh(
             replacement_lines: window.lines,
             line_count,
             max_scroll_logical_line: window.max_scroll_logical_line,
-            git_changes: window.git_changes,
             git_status: window.git_status,
         };
         pushes.push((
@@ -2867,7 +3042,7 @@ pub async fn buffer_cut(
         let search = s.searches.get(&(vp.client_id, params.buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, params.buffer_id, vp.diff_base), buffer_diagnostics(&s, params.buffer_id), buffer_git_status(&s, params.buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, params.buffer_id), buffer_diagnostics(&s, params.buffer_id), buffer_git_status(&s, params.buffer_id)),
         ));
     }
 
@@ -3205,7 +3380,7 @@ pub(crate) fn reload_buffer_locked(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -3249,7 +3424,7 @@ pub async fn viewport_subscribe(
         line_count,
     );
     let search = s.searches.get(&(client_id, params.buffer_id));
-    let hunks = buffer_hunks(&s, params.buffer_id);
+    let hunks = buffer_both_hunks(&s, params.buffer_id);
     let diagnostics = buffer_diagnostics(&s, params.buffer_id);
     let buf = &s.buffers[&params.buffer_id];
     // A freshly subscribed viewport starts with the diff view off, but still carries gutter
@@ -3286,7 +3461,6 @@ pub async fn viewport_subscribe(
         first_logical_line: first,
         last_logical_line_exclusive: last_excl,
         diff_view: false,
-        diff_base: DiffBase::default(),
     };
     s.viewports.insert(viewport_id, viewport);
     s.last_scroll.insert((client_id, buffer_id), params.scroll);
@@ -3323,7 +3497,7 @@ pub async fn viewport_resize(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.cols = params.cols;
     vp.rows = params.rows;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view, diff_base) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -3333,7 +3507,6 @@ pub async fn viewport_resize(
         vp.buffer_id,
         vp.scroll_logical_line,
         vp.diff_view,
-        vp.diff_base,
     );
 
     let buf = s
@@ -3343,7 +3516,7 @@ pub async fn viewport_resize(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
+    let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
@@ -3379,7 +3552,7 @@ pub async fn viewport_scroll_to_row(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, diff_view, diff_base) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, diff_view) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -3388,9 +3561,8 @@ pub async fn viewport_scroll_to_row(
         vp.tab_width,
         vp.buffer_id,
         vp.diff_view,
-        vp.diff_base,
     );
-    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
+    let hunks = buffer_both_hunks(&s, buffer_id);
     let buf = s
         .buffers
         .get(&buffer_id)
@@ -3412,7 +3584,7 @@ pub async fn viewport_scroll_to_row(
     );
     let (first, last_excl) = pushed_range(top_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
+    let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
@@ -3440,7 +3612,7 @@ pub async fn viewport_set_wrap(
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.wrap = params.wrap;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view, diff_base) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -3450,7 +3622,6 @@ pub async fn viewport_set_wrap(
         vp.buffer_id,
         vp.scroll_logical_line,
         vp.diff_view,
-        vp.diff_base,
     );
 
     let buf = s
@@ -3460,7 +3631,7 @@ pub async fn viewport_set_wrap(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
+    let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
@@ -3498,7 +3669,7 @@ pub async fn viewport_scroll(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.scroll_logical_line = params.scroll.logical_line;
     vp.scroll_sub_row = params.scroll.sub_row;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view, diff_base) = (
+    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line, diff_view) = (
         vp.cols,
         vp.rows,
         vp.overscan_rows,
@@ -3508,7 +3679,6 @@ pub async fn viewport_scroll(
         vp.buffer_id,
         vp.scroll_logical_line,
         vp.diff_view,
-        vp.diff_base,
     );
 
     let buf = s
@@ -3518,7 +3688,7 @@ pub async fn viewport_scroll(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
-    let hunks = buffer_hunks_for_base(&s, buffer_id, diff_base);
+    let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
@@ -3646,18 +3816,22 @@ fn recompute_diff_hunks_if_viewed(s: &mut ServerState, buffer_id: BufferId) {
     let Some(baseline) = s.git_baseline.get(&buffer_id) else {
         return;
     };
-    // Re-diff against both blobs. The index blob is cached, so this stays a per-edit in-memory diff
-    // with no repo I/O — same cost model as the HEAD diff.
-    let hunks = crate::git::diff_hunks(baseline.blob.as_deref(), &buf.text);
+    // Re-diff against the cached index blob — a per-edit in-memory diff with no repo I/O. The
+    // combined view recomposes from the cached staged hunks (they only change on git events, not
+    // buffer edits) + the fresh unstaged.
     let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &buf.text);
-    s.git_hunks.insert(buffer_id, hunks);
+    let both = crate::git::compose_both(&baseline.staged_hunks, &unstaged);
     s.git_unstaged_hunks.insert(buffer_id, unstaged);
+    s.git_both_hunks.insert(buffer_id, both);
 }
 
 /// The phantom "deleted" rows each anchor line shows above it, derived from the buffer's diff
 /// hunks. Only hunks with removed text (Modified / Deleted) contribute; pure additions have none.
 /// A deletion past the last line is clamped onto the final line index, so a newline-terminated
-/// file shows it above its trailing empty line.
+/// file shows it above its trailing empty line. Each row carries its hunk's `DiffStage`; where a
+/// staged and an unstaged layer would stack at one anchor (a region modified, staged, then
+/// modified again), only the unstaged rows are kept — what's shown deleted is exactly what a
+/// revert would restore, and HEAD's text resurfaces once the top layer is staged or reverted.
 fn deleted_rows_by_anchor(
     hunks: &[crate::git::DiffHunk],
     line_count: u32,
@@ -3673,19 +3847,50 @@ fn deleted_rows_by_anchor(
         rows.extend(h.deleted.iter().map(|text| VirtualRow {
             text: text.clone(),
             kind: VirtualRowKind::Deleted,
+            stage: h.stage,
         }));
+    }
+    for rows in map.values_mut() {
+        if rows.iter().any(|r| r.stage == DiffStage::Unstaged) {
+            rows.retain(|r| r.stage == DiffStage::Unstaged);
+        }
     }
     map
 }
 
-/// The Git change marker for each affected buffer line, for the gutter change-bar. Added/modified
-/// hunks mark their new-side lines `Added`/`Modified`; a pure deletion marks the single line it
-/// sits above as `Deleted` (clamped onto the last line for an end-of-buffer deletion), without
-/// overriding an Added/Modified marker that's already there.
-fn diff_markers_by_line(hunks: &[crate::git::DiffHunk], line_count: u32) -> HashMap<u32, DiffMarker> {
+/// The Git change marker (and its stage) for each affected buffer line, for the gutter
+/// change-bar. Added/modified hunks mark their new-side lines `Added`/`Modified`; a pure deletion
+/// marks the single line it sits above as `Deleted` (clamped onto the last line for an
+/// end-of-buffer deletion), without overriding an Added/Modified marker that's already there.
+/// Where a staged and an unstaged hunk cover the same line (modified, staged, modified again),
+/// the unstaged layer wins both kind and stage — the line reads as plain unstaged, since that's
+/// the content on screen and the layer `git/apply_hunk` acts on.
+fn diff_markers_by_line(
+    hunks: &[crate::git::DiffHunk],
+    line_count: u32,
+) -> HashMap<u32, (DiffMarker, DiffStage)> {
     use crate::git::ChangeKind;
     let last_line = line_count.saturating_sub(1);
-    let mut map = HashMap::new();
+    let mut map: HashMap<u32, (DiffMarker, DiffStage)> = HashMap::new();
+    let put = |map: &mut HashMap<u32, (DiffMarker, DiffStage)>,
+                   line: u32,
+                   marker: DiffMarker,
+                   stage: DiffStage| {
+        map.entry(line)
+            .and_modify(|(k, s)| {
+                // A staged hunk never overrides an unstaged marker (the top layer wins)...
+                if *s == DiffStage::Unstaged && stage == DiffStage::Staged {
+                    return;
+                }
+                // ...while Added/Modified outrank a Deleted-above flag (which never downgrades
+                // them), and an unstaged write takes the stage with it.
+                if marker != DiffMarker::Deleted {
+                    *k = marker;
+                }
+                *s = stage;
+            })
+            .or_insert((marker, stage));
+    };
     for h in hunks {
         match h.kind {
             ChangeKind::Added | ChangeKind::Modified => {
@@ -3695,12 +3900,11 @@ fn diff_markers_by_line(hunks: &[crate::git::DiffHunk], line_count: u32) -> Hash
                     DiffMarker::Modified
                 };
                 for line in h.anchor_line..h.anchor_line.saturating_add(h.new_lines) {
-                    map.insert(line, marker);
+                    put(&mut map, line, marker, h.stage);
                 }
             }
             ChangeKind::Deleted => {
-                map.entry(h.anchor_line.min(last_line))
-                    .or_insert(DiffMarker::Deleted);
+                put(&mut map, h.anchor_line.min(last_line), DiffMarker::Deleted, h.stage);
             }
         }
     }
@@ -3724,14 +3928,6 @@ fn git_change_counts(hunks: &[crate::git::DiffHunk]) -> GitChangeCounts {
     c
 }
 
-/// The buffer's diff hunks, or an empty slice when none are cached (no repo / untracked / clean).
-fn buffer_hunks(s: &ServerState, buffer_id: BufferId) -> &[crate::git::DiffHunk] {
-    s.git_hunks
-        .get(&buffer_id)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
 /// The buffer's *unstaged* diff hunks (vs the index), or an empty slice when none are cached.
 fn buffer_unstaged_hunks(s: &ServerState, buffer_id: BufferId) -> &[crate::git::DiffHunk] {
     s.git_unstaged_hunks
@@ -3740,17 +3936,13 @@ fn buffer_unstaged_hunks(s: &ServerState, buffer_id: BufferId) -> &[crate::git::
         .unwrap_or(&[])
 }
 
-/// The diff hunks that drive the gutter / inline diff for a viewport, per its `diff_base`:
-/// `Head` → buffer-vs-HEAD (all uncommitted), `Index` → buffer-vs-index (unstaged only).
-fn buffer_hunks_for_base(
-    s: &ServerState,
-    buffer_id: BufferId,
-    base: DiffBase,
-) -> &[crate::git::DiffHunk] {
-    match base {
-        DiffBase::Head => buffer_hunks(s, buffer_id),
-        DiffBase::Index => buffer_unstaged_hunks(s, buffer_id),
-    }
+/// The combined staged+unstaged hunks that drive the gutter / inline diff (each tagged with its
+/// `DiffStage`), or an empty slice when none are cached (no repo / untracked / clean).
+fn buffer_both_hunks(s: &ServerState, buffer_id: BufferId) -> &[crate::git::DiffHunk] {
+    s.git_both_hunks
+        .get(&buffer_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
 }
 
 /// Buffer-level Git status for the status bar: branch + staged (HEAD→index) and unstaged
@@ -4036,7 +4228,7 @@ pub fn set_diagnostics_and_refresh(
                 vp,
                 revision,
                 search,
-                buffer_hunks_for_base(s, buffer_id, vp.diff_base),
+                buffer_both_hunks(s, buffer_id),
                 diags,
                 buffer_git_status(s, buffer_id),
             ),
@@ -4307,7 +4499,10 @@ fn render_window(
         if let Some(rows) = deleted_rows.get(&i) {
             render.virtual_rows_above = rows.clone();
         }
-        render.diff_marker = markers.get(&i).copied();
+        if let Some((marker, stage)) = markers.get(&i).copied() {
+            render.diff_marker = Some(marker);
+            render.diff_stage = stage;
+        }
         render.diagnostics = diagnostic_spans_on_line(diagnostics, i, text.len() as u32);
         lines.push(render);
     }
@@ -4334,7 +4529,6 @@ fn render_window(
         total_visual_rows,
         first_visual_row,
         max_line_width,
-        git_changes: git_change_counts(hunks),
         git_status,
         lines,
     }
@@ -5644,7 +5838,7 @@ async fn apply_toggle_comment(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -6101,7 +6295,7 @@ async fn apply_indent_or_dedent(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -6281,7 +6475,7 @@ pub async fn input_move_lines(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -6472,7 +6666,7 @@ pub async fn input_join_lines(
                 continue;
             };
             let search = s.searches.get(&(vp.client_id, buffer_id));
-            pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id))));
+            pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id))));
         }
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
         let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
@@ -6601,7 +6795,7 @@ async fn apply_undo_or_redo(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
         ));
     }
 
@@ -7120,7 +7314,7 @@ async fn apply_edit(
             continue;
         };
         let search = s.searches.get(&(vp.client_id, buffer_id));
-        let notif = build_lines_changed_notif(buf_ref, vp, revision, search, buffer_hunks_for_base(&s, buffer_id, vp.diff_base), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id));
+        let notif = build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id));
         pushes.push((sender, notif));
     }
 
@@ -7199,7 +7393,6 @@ fn build_lines_changed_notif(
         replacement_lines: window.lines,
         line_count,
         max_scroll_logical_line: window.max_scroll_logical_line,
-        git_changes: window.git_changes,
         git_status: window.git_status,
     };
     Notification {
@@ -8353,6 +8546,8 @@ mod diff_anchor_tests {
             anchor_line,
             new_lines,
             deleted: deleted.iter().map(|s| s.to_string()).collect(),
+            old_start: 0, // irrelevant for render-anchoring tests
+            stage: aether_protocol::viewport::DiffStage::Unstaged,
         }
     }
 
@@ -8391,11 +8586,12 @@ mod diff_anchor_tests {
             hunk(ChangeKind::Deleted, 9, 0, &["x"]),    // line 9 → Deleted (gutter flag)
         ];
         let map = diff_markers_by_line(&hunks, 100);
-        assert_eq!(map.get(&2), Some(&DiffMarker::Modified));
-        assert_eq!(map.get(&5), Some(&DiffMarker::Added));
-        assert_eq!(map.get(&7), Some(&DiffMarker::Added));
+        let unstaged = aether_protocol::viewport::DiffStage::Unstaged;
+        assert_eq!(map.get(&2), Some(&(DiffMarker::Modified, unstaged)));
+        assert_eq!(map.get(&5), Some(&(DiffMarker::Added, unstaged)));
+        assert_eq!(map.get(&7), Some(&(DiffMarker::Added, unstaged)));
         assert_eq!(map.get(&8), None);
-        assert_eq!(map.get(&9), Some(&DiffMarker::Deleted));
+        assert_eq!(map.get(&9), Some(&(DiffMarker::Deleted, unstaged)));
     }
 
     #[test]
@@ -8406,7 +8602,45 @@ mod diff_anchor_tests {
             hunk(ChangeKind::Modified, 3, 1, &["was"]),
         ];
         let map = diff_markers_by_line(&hunks, 100);
-        assert_eq!(map.get(&3), Some(&DiffMarker::Modified));
+        let unstaged = aether_protocol::viewport::DiffStage::Unstaged;
+        assert_eq!(map.get(&3), Some(&(DiffMarker::Modified, unstaged)));
+    }
+
+    #[test]
+    fn overlapping_staged_and_unstaged_hunks_read_as_unstaged() {
+        use aether_protocol::viewport::DiffStage;
+        // Composed-view collision: line 3 staged-modified then modified again. The unstaged top
+        // layer wins outright — the line reads as plain unstaged (no third state), regardless of
+        // which order the hunks arrive in. Surrounding staged-only lines stay Staged.
+        let mut staged = hunk(ChangeKind::Modified, 2, 3, &["a", "b", "c"]); // lines 2,3,4
+        staged.stage = DiffStage::Staged;
+        let unstaged = hunk(ChangeKind::Modified, 3, 1, &["b'"]); // line 3 only
+        let map = diff_markers_by_line(&[staged.clone(), unstaged.clone()], 100);
+        assert_eq!(map.get(&2), Some(&(DiffMarker::Modified, DiffStage::Staged)));
+        assert_eq!(map.get(&3), Some(&(DiffMarker::Modified, DiffStage::Unstaged)));
+        assert_eq!(map.get(&4), Some(&(DiffMarker::Modified, DiffStage::Staged)));
+        // Order-independent: a staged hunk processed after the unstaged one changes nothing.
+        let reversed = diff_markers_by_line(&[unstaged, staged], 100);
+        assert_eq!(reversed.get(&3), Some(&(DiffMarker::Modified, DiffStage::Unstaged)));
+    }
+
+    #[test]
+    fn deleted_rows_keep_only_the_unstaged_layer_at_a_shared_anchor() {
+        use aether_protocol::viewport::DiffStage;
+        // A staged and an unstaged deletion anchored at the same line: only the index's (unstaged)
+        // text is shown — it's what a revert would restore. A staged deletion elsewhere keeps its
+        // rows (with the staged tag).
+        let mut staged = hunk(ChangeKind::Deleted, 1, 0, &["head text"]);
+        staged.stage = DiffStage::Staged;
+        let unstaged = hunk(ChangeKind::Deleted, 1, 0, &["index text"]);
+        let mut staged_elsewhere = hunk(ChangeKind::Deleted, 5, 0, &["solo head text"]);
+        staged_elsewhere.stage = DiffStage::Staged;
+        let map = deleted_rows_by_anchor(&[staged, unstaged, staged_elsewhere], 10);
+        let rows = &map[&1];
+        assert_eq!(rows.len(), 1, "staged layer suppressed at the shared anchor");
+        assert_eq!((rows[0].text.as_str(), rows[0].stage), ("index text", DiffStage::Unstaged));
+        let solo = &map[&5];
+        assert_eq!((solo[0].text.as_str(), solo[0].stage), ("solo head text", DiffStage::Staged));
     }
 
     #[test]

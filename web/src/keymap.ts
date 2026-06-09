@@ -6,7 +6,7 @@
 //! Browser remap: Aether's `Ctrl-T` (toggle comment) is reserved by browsers, so it's `Ctrl-/`
 //! here (the only keymap change the web client needs — see docs/web-client.md §2.4).
 
-import type { Direction, HunkDirection, PickerKind, SurroundTarget, VerticalDirection, WordBoundary } from "./protocol";
+import type { Direction, HunkAction, HunkDirection, PickerKind, SurroundTarget, VerticalDirection, WordBoundary } from "./protocol";
 
 export type InsertWhere = "selectionStart" | "selectionEnd" | "firstLineStart" | "lastLineEnd";
 export type ScrollDir = "up" | "down" | "left" | "right";
@@ -71,8 +71,8 @@ export type Action =
   | { t: "unsurround"; target: SurroundTarget }
   // git
   | { t: "toggleDiffView" }
-  | { t: "toggleDiffBase" }
   | { t: "navigateHunk"; dir: HunkDirection }
+  | { t: "applyHunk"; action: HunkAction }
   | { t: "grepNavigate"; dir: Direction }
   // LSP
   | { t: "hover" }
@@ -281,9 +281,10 @@ const LEADER: Binding[] = [
   b("n", exact(), { t: "newScratch" }),
   b("w", exact(), { t: "toggleWrap" }),
   b("i", exact(), { t: "toggleDiffView" }),
-  b("i", exact(false, true), { t: "toggleDiffBase" }),
   b("h", exact(false, true), { t: "navigateHunk", dir: "prev" }),
   b("h", exact(), { t: "navigateHunk", dir: "next" }),
+  b("a", exact(), { t: "applyHunk", action: "toggle" }),
+  b("v", exact(), { t: "applyHunk", action: "revert" }),
   b("o", exact(), { t: "showCommitInfo" }),
   b("k", exact(), { t: "hover" }),
   b("d", exact(), { t: "gotoDefinition" }),

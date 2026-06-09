@@ -14,10 +14,11 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
-    DiffBase, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCommitInfo,
+    ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameLine,
+    GitBlameLineParams, GitBlameLineResult, GitCommitInfo,
     GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams,
-    GitNavigateHunkResult, GitSetDiffBase, GitSetDiffBaseParams, GitSetDiffView,
-    GitSetDiffViewParams, HunkDirection,
+    GitNavigateHunkResult, GitSetDiffView,
+    GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::input::{
@@ -12701,8 +12702,8 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
 }
 
 #[tokio::test]
-async fn git_change_counts_ride_the_window() {
-    // The status-bar summary (added/modified/deleted line counts vs HEAD) is computed server-side
+async fn git_status_counts_ride_the_window() {
+    // The status-bar summary (staged/unstaged per-class line counts) is computed server-side
     // and carried on every window the client receives — clean on open, updated after an edit.
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
@@ -12752,11 +12753,11 @@ async fn git_change_counts_ride_the_window() {
         },
     )
     .await;
-    // The freshly opened buffer matches HEAD → no changes.
+    // The freshly opened buffer matches HEAD → no changes in either half of the status counts.
+    let gs = sub.window.git_status.expect("tracked file carries git status");
     assert!(
-        sub.window.git_changes.is_empty(),
-        "clean buffer reports no changes, got {:?}",
-        sub.window.git_changes
+        gs.staged.is_empty() && gs.unstaged.is_empty(),
+        "clean buffer reports no changes, got {gs:?}"
     );
 
     // Modify line 0 in the live buffer (insert "X" at its start) → one Modified line.
@@ -12780,11 +12781,11 @@ async fn git_change_counts_ride_the_window() {
         },
     )
     .await;
-    let c = on.window.git_changes;
+    let gs = on.window.git_status.expect("git status present");
     assert_eq!(
-        (c.added, c.modified, c.deleted),
+        (gs.unstaged.added, gs.unstaged.modified, gs.unstaged.deleted),
         (0, 1, 0),
-        "one modified line after editing line 0"
+        "one unstaged modified line after editing line 0"
     );
 
     drop(server);
@@ -12879,8 +12880,9 @@ async fn git_status_splits_staged_and_unstaged() {
 }
 
 #[tokio::test]
-async fn set_diff_base_switches_gutter_between_head_and_index() {
-    // Same fixture: a staged line-2 modification plus an unstaged line-4 addition.
+async fn combined_view_tags_staged_and_unstaged_markers() {
+    // Same fixture: a staged line-2 modification plus an unstaged line-4 addition. The (only)
+    // view composes both diffs, telling them apart per line via the stage tag.
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
     std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
@@ -12932,31 +12934,496 @@ async fn set_diff_base_switches_gutter_between_head_and_index() {
         },
     )
     .await;
-    // Default base = HEAD: the gutter shows both the staged modification and the unstaged addition.
+    let marker_of = |w: &aether_protocol::viewport::Window, line: u32| {
+        w.lines
+            .iter()
+            .find(|l| l.logical_line == line)
+            .map(|l| (l.diff_marker, l.diff_stage))
+            .unwrap()
+    };
+    use aether_protocol::viewport::DiffStage;
     assert_eq!(
-        (sub.window.git_changes.modified, sub.window.git_changes.added),
-        (1, 1),
-        "HEAD base shows all uncommitted changes"
+        marker_of(&sub.window, 1),
+        (Some(DiffMarker::Modified), DiffStage::Staged),
+        "staged modification tagged Staged"
     );
+    assert_eq!(
+        marker_of(&sub.window, 3),
+        (Some(DiffMarker::Added), DiffStage::Unstaged),
+        "unstaged addition stays the default colour"
+    );
+    // The status-bar summary splits the same two changes by stage.
+    let gs = sub.window.git_status.expect("git status present");
+    assert_eq!((gs.staged.modified, gs.unstaged.added), (1, 1));
 
-    // Switch to the index base: the staged modification drops out, leaving only the unstaged add.
-    let res: ViewportWindowResult = send_request::<GitSetDiffBase>(
+    drop(server);
+}
+
+// -------- git/apply_hunk (stage / unstage / revert) ----------------------------------------------
+
+/// Spawn a server over `dir`, activate a project, and open `name`. Shared scaffolding for the
+/// `git/apply_hunk` tests, which all start from "a repo-backed buffer is open".
+async fn setup_git_apply(
+    dir: &std::path::Path,
+    proj: &str,
+    name: &str,
+) -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u64, // buffer_id
+) {
+    let server = spawn_for_test(proj, vec![dir.to_path_buf()]).await.unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult =
+        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: proj.into() })
+            .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
-        4,
-        &GitSetDiffBaseParams {
-            viewport_id: sub.viewport_id,
-            base: DiffBase::Index,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some(name.into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
+    (server, ws, open.buffer_id)
+}
+
+/// Select the inclusive line span `[anchor_line, line]` (column 0 at both ends).
+async fn select_lines(ws: &mut Ws, id: u64, buffer_id: u64, anchor_line: u32, line: u32) {
+    let _: CursorState = send_request::<CursorSet>(
+        ws,
+        id,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line, col: 0 },
+            anchor: LogicalPosition { line: anchor_line, col: 0 },
+        },
+    )
+    .await;
+}
+
+async fn apply_hunk(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    buffer_id: u64,
+    action: HunkAction,
+) -> GitApplyHunkResult {
+    send_request::<GitApplyHunk>(ws, id, &GitApplyHunkParams { buffer_id, action }).await
+}
+
+/// The file's staged (index) content, or `None` when it has no index entry.
+fn index_text(dir: &std::path::Path, name: &str) -> Option<String> {
+    let repo = git2::Repository::open(dir).unwrap();
+    let index = repo.index().unwrap();
+    let entry = index.get_path(std::path::Path::new(name), 0)?;
+    let blob = repo.find_blob(entry.id).unwrap();
+    Some(String::from_utf8(blob.content().to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn apply_hunk_toggle_round_trips_a_modification() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "stage-proj", "edit.rs").await;
+
+    // Bare cursor anywhere on the changed line addresses the whole hunk; the first toggle stages.
+    set_cursor(&mut ws, 3, buffer_id, 1, 2).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "alpha\nBETA\ngamma\n");
+
+    // The region now holds nothing unstaged, so a second toggle pulls it back out.
+    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Unstaged);
+    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "alpha\nbeta\ngamma\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_stage_requires_clean_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\n");
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "dirty-proj", "edit.rs").await;
+
+    // An unsaved edit makes the buffer dirty; the index must never hold content that isn't on disk.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams { buffer_id, text: "X".into(), select_pasted: false },
+    )
+    .await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::DirtyBuffer);
     assert_eq!(
-        (res.window.git_changes.modified, res.window.git_changes.added),
-        (0, 1),
-        "index base shows only unstaged changes"
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "alpha\nbeta\n",
+        "index untouched by the refusal"
     );
-    // The branch + staged/unstaged summary is independent of the base toggle.
-    let gs = res.window.git_status.expect("git status present");
-    assert_eq!((gs.staged.modified, gs.unstaged.added), (1, 1));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_stages_selected_lines_of_a_block() {
+    // The block x/y/z is one added hunk; a selection covering only x and y stages just those
+    // lines (anchor and cursor columns are irrelevant — the span snaps to whole lines).
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "a\n");
+    std::fs::write(dir.path().join("edit.rs"), "a\nx\ny\nz\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "lines-proj", "edit.rs").await;
+
+    select_lines(&mut ws, 3, buffer_id, 1, 2).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "a\nx\ny\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_stages_deletion_via_its_anchor_line() {
+    // b removed: the deletion belongs to the surviving line below it (c), not the line above.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "a\nb\nc\n");
+    std::fs::write(dir.path().join("edit.rs"), "a\nc\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "del-proj", "edit.rs").await;
+
+    set_cursor(&mut ws, 3, buffer_id, 0, 0).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::NoChange, "line above does not own the deletion");
+
+    set_cursor(&mut ws, 5, buffer_id, 1, 0).await;
+    let r = apply_hunk(&mut ws, 6, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "a\nc\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_stages_eof_deletion_from_last_line() {
+    // The removed tail has no line below it; the last content line owns it.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "a\nb\n");
+    std::fs::write(dir.path().join("edit.rs"), "a\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "eof-proj", "edit.rs").await;
+
+    set_cursor(&mut ws, 3, buffer_id, 0, 0).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "a\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_stages_untracked_file() {
+    // An untracked file diffs against an empty index baseline: the whole file is one added hunk,
+    // and staging it is a hunk-wise `git add`.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "other.rs", "x\n");
+    std::fs::write(dir.path().join("new.rs"), "hello\nworld\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "untracked-proj", "new.rs").await;
+
+    assert!(index_text(dir.path(), "new.rs").is_none(), "no index entry before staging");
+    set_cursor(&mut ws, 3, buffer_id, 0, 0).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(index_text(dir.path(), "new.rs").unwrap(), "hello\nworld\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_unstages_region_back_to_head() {
+    // A staged modification, clean working tree on top: unstage restores HEAD in the index.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    git_stage_file(dir.path(), "edit.rs");
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "unstage-proj", "edit.rs").await;
+
+    set_cursor(&mut ws, 3, buffer_id, 1, 0).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Unstaged);
+    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "alpha\nbeta\ngamma\n");
+
+    // Unstaging re-opened the buffer-vs-index difference, so the next toggle stages it again.
+    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "alpha\nBETA\ngamma\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_unstage_maps_cursor_through_unstaged_edits() {
+    // The staged change (beta → BETA, index line 1) sits below two unstaged lines added at the
+    // top of the working tree, so its buffer line is 3 — the selection must be carried from
+    // buffer to index coordinates across the unstaged diff.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    git_stage_file(dir.path(), "edit.rs");
+    std::fs::write(dir.path().join("edit.rs"), "one\ntwo\nalpha\nBETA\ngamma\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "unmap-proj", "edit.rs").await;
+
+    set_cursor(&mut ws, 3, buffer_id, 3, 0).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Unstaged);
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "alpha\nbeta\ngamma\n",
+        "index back to HEAD; the unstaged top-of-file addition is untouched"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_reverts_modification_and_is_undoable() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "revert-proj", "edit.rs").await;
+
+    set_cursor(&mut ws, 3, buffer_id, 1, 2).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Revert).await;
+    assert_eq!(r.status, ApplyHunkStatus::Reverted);
+    assert_eq!(buffer_text(&mut ws, 5, buffer_id).await, "alpha\nbeta\ngamma\n");
+
+    // The revert is an ordinary edit: one undo step brings the change back.
+    let _: UndoResult =
+        send_request::<InputUndo>(&mut ws, 7, &BufferOnlyParams { buffer_id }).await;
+    assert_eq!(buffer_text(&mut ws, 8, buffer_id).await, "alpha\nBETA\ngamma\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_revert_reinserts_deleted_block() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "a\nb\nc\nd\n");
+    std::fs::write(dir.path().join("edit.rs"), "a\nd\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "redel-proj", "edit.rs").await;
+
+    // The deleted block renders above d (buffer line 1), which owns it.
+    set_cursor(&mut ws, 3, buffer_id, 1, 0).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Revert).await;
+    assert_eq!(r.status, ApplyHunkStatus::Reverted);
+    assert_eq!(buffer_text(&mut ws, 5, buffer_id).await, "a\nb\nc\nd\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_revert_peels_unstaged_before_staged() {
+    // Staged BETA, unstaged trailing delta. Reverting the unstaged delta restores the *index*
+    // content (the staged BETA stays); reverting at BETA afterwards peels the staged layer,
+    // restoring HEAD's text — the buffer then carries an unstaged change cancelling the staged
+    // one.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    git_stage_file(dir.path(), "edit.rs");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\ndelta\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "rebase-proj", "edit.rs").await;
+
+    set_cursor(&mut ws, 3, buffer_id, 3, 0).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Revert).await;
+    assert_eq!(r.status, ApplyHunkStatus::Reverted);
+    assert_eq!(buffer_text(&mut ws, 5, buffer_id).await, "alpha\nBETA\ngamma\n");
+
+    // BETA is now staged-only (buffer == index ≠ HEAD): the next revert peels to HEAD.
+    set_cursor(&mut ws, 7, buffer_id, 1, 0).await;
+    let r = apply_hunk(&mut ws, 8, buffer_id, HunkAction::Revert).await;
+    assert_eq!(r.status, ApplyHunkStatus::Reverted);
+    assert_eq!(buffer_text(&mut ws, 9, buffer_id).await, "alpha\nbeta\ngamma\n");
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "alpha\nBETA\ngamma\n",
+        "the index still holds the staged version — revert edits only the buffer"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_revert_works_on_dirty_buffer() {
+    // Revert is a buffer edit, not an index write — no save required.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\n");
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "rdirty-proj", "edit.rs").await;
+
+    set_cursor(&mut ws, 3, buffer_id, 1, 0).await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams { buffer_id, text: "X".into(), select_pasted: false },
+    )
+    .await;
+    set_cursor(&mut ws, 5, buffer_id, 1, 0).await;
+    let r = apply_hunk(&mut ws, 6, buffer_id, HunkAction::Revert).await;
+    assert_eq!(r.status, ApplyHunkStatus::Reverted);
+    assert_eq!(buffer_text(&mut ws, 7, buffer_id).await, "alpha\nbeta\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_outside_a_repo_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("loose.rs"), "x\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "norepo2-proj", "loose.rs").await;
+
+    let r = apply_hunk(&mut ws, 3, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Unavailable);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn apply_hunk_stage_refreshes_status_counts() {
+    // With a viewport subscribed, the index write must push a re-rendered window whose
+    // staged/unstaged split reflects the new index — no client polling.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "counts-proj", "edit.rs").await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+
+    set_cursor(&mut ws, 4, buffer_id, 1, 0).await;
+    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+
+    let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    let gs = notif.git_status.expect("git status rides the refresh");
+    assert_eq!((gs.staged.modified, gs.unstaged.modified), (1, 0), "change moved to staged");
+    // The combined view (default base) re-tags the hunk in place: same marker, now Staged — this
+    // is the "stage a hunk and its colour flips" interaction.
+    let line1 = notif
+        .replacement_lines
+        .iter()
+        .find(|l| l.logical_line == 1)
+        .expect("changed line in the refreshed window");
+    assert_eq!(line1.diff_marker, Some(DiffMarker::Modified));
+    assert_eq!(line1.diff_stage, aether_protocol::viewport::DiffStage::Staged);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn remodified_staged_line_reads_as_unstaged() {
+    // beta → BETA staged, then BETA → BETA2 in the working tree: the line is both staged and
+    // unstaged at once, and reads as plain unstaged — the top layer is what's on screen and what
+    // the next toggle acts on.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    git_stage_file(dir.path(), "edit.rs");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA2\ngamma\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "mixed-proj", "edit.rs").await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    use aether_protocol::viewport::DiffStage;
+    let line1 = sub.window.lines.iter().find(|l| l.logical_line == 1).unwrap();
+    assert_eq!(line1.diff_marker, Some(DiffMarker::Modified));
+    assert_eq!(line1.diff_stage, DiffStage::Unstaged);
+    // Neighbours stay unmarked.
+    let line0 = sub.window.lines.iter().find(|l| l.logical_line == 0).unwrap();
+    assert_eq!(line0.diff_marker, None);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn shared_anchor_phantom_rows_show_only_the_unstaged_layer() {
+    // HEAD a b c → staged deletion of b (index: a c) → unstaged deletion of a (buffer: c).
+    // Both deletions anchor above the surviving "c"; only the index's (unstaged) removed text is
+    // shown — it's what a revert would restore. HEAD's resurfaces once the top layer is dealt
+    // with.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "a\nb\nc\n");
+    std::fs::write(dir.path().join("edit.rs"), "a\nc\n").unwrap();
+    git_stage_file(dir.path(), "edit.rs");
+    std::fs::write(dir.path().join("edit.rs"), "c\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "stack-proj", "edit.rs").await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    let on: ViewportWindowResult = send_request::<GitSetDiffView>(
+        &mut ws,
+        4,
+        &GitSetDiffViewParams {
+            viewport_id: sub.viewport_id,
+            enabled: true,
+        },
+    )
+    .await;
+    use aether_protocol::viewport::DiffStage;
+    let line0 = on.window.lines.iter().find(|l| l.logical_line == 0).unwrap();
+    let rows: Vec<(&str, DiffStage)> = line0
+        .virtual_rows_above
+        .iter()
+        .map(|v| (v.text.as_str(), v.stage))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("a", DiffStage::Unstaged)],
+        "the staged (HEAD) layer is suppressed where the unstaged layer stacks on it"
+    );
 
     drop(server);
 }

@@ -18,7 +18,7 @@ buffer, see each other's cursors, and share a single undo stack.
 - Undo and redo stacks for edits and cursor/selection motions
 - Fuzzy pickers for files/buffers/projects, file explorer, project-wide grep
 - Mouse support, soft wrap, system-clipboard integration
-- Git integration (gutter, diff, blame)
+- Git integration (gutter, inline diff, blame, hunk staging)
 - LSP (diagnostics, hover, go-to-definition, format)
 - Terminal and web clients
 
@@ -48,6 +48,7 @@ Type `Space ?` for the in-app overlay. Holding the Shift key extends the selecti
 | `m`/`Alt-m` | Matching bracket/inner matching bracket |
 | `]`/`[` | Next/previous navigation unit |
 | `}`/`{` | Select to end/start of unit |
+| `Alt-Left`/`Alt-Right` | Jump back/forward (cross-file history) |
 
 ### Selection & history (normal mode)
 
@@ -66,6 +67,7 @@ Type `Space ?` for the in-app overlay. Holding the Shift key extends the selecti
 | Key | Action |
 | --- | --- |
 | `/` | Search |
+| `?` | Search, selecting from the cursor to the match |
 | `Alt-/` | Search for current selection |
 | `n`/`Alt-n` | Next/previous match |
 | `>`/`<` | Next/previous grep result |
@@ -98,7 +100,7 @@ normal and line-scoped in insert (since insert has no selection).
 | Key | Action |
 | --- | --- |
 | `i`/`a` | Insert at selection start/end |
-| `Alt-i`/`Alt-a` | Insert at first line start/last line end |
+| `Alt-i`/`Alt-a` | Insert at first non-blank of line/last line end |
 | `Esc` | Leave insert mode |
 
 ### Application
@@ -123,17 +125,24 @@ normal and line-scoped in insert (since insert has no selection).
 | Chord | Action |
 | --- | --- |
 | `Space w` | Toggle soft wrap |
-| `Space i` | Toggle inline Git diff |
-| `Space h`/`Space Alt-h` | Next/previous Git hunk |
+
+### Git
+
+| Chord | Action |
+| --- | --- |
+| `Space a` | Stage/unstage the change under the cursor (or selected lines) |
+| `Space v` | Revert the change under the cursor (or selected lines) |
+| `Space h`/`Space Alt-h` | Next/previous hunk |
+| `Space i` | Toggle inline diff |
+| `Space o` | Blame commit details for the cursor line |
 
 ### Code / LSP
 
 | Chord | Action |
 | --- | --- |
-| `Space d` | Go to definition |
+| `Space d`/`Space Alt-d` | Go to definition/references |
 | `Space k` | Hover (type & docs) |
 | `Space j` | Show diagnostic at cursor |
-| `Space o` | Show Git commit for line |
 | `Space x`/`Space Alt-x` | Next/previous diagnostic |
 | `Space t` | Diagnostics list |
 | `Space m` | Format document |

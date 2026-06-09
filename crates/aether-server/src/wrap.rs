@@ -49,6 +49,7 @@ pub fn render_line(
         search_matches: Vec::new(),
         virtual_rows_above: Vec::new(),
         diff_marker: None,
+        diff_stage: Default::default(),
         diagnostics: Vec::new(),
     }
 }

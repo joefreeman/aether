@@ -13,13 +13,15 @@
 //! it on external commit/checkout/stage). Per-edit work is just [`diff_hunks`], an in-memory diff
 //! of the cached baseline against the buffer — no repo I/O on the keystroke path.
 //!
-//! ## Staged vs unstaged (planned)
-//! Today the baseline is **HEAD**, surfacing all uncommitted changes (staged + unstaged),
-//! matching `git diff HEAD`. A later split — unstaged = buffer vs index, staged = index vs HEAD —
-//! is a change of baseline source in [`load_baseline`] plus a `stage` tag on each [`DiffHunk`];
-//! the hunk shape and anchoring below are unaffected.
+//! ## Staged vs unstaged
+//! [`load_baseline`] caches both blobs: HEAD (`git diff HEAD`, the default gutter base) and the
+//! index (`git diff`, the unstaged-only base), plus the staged HEAD→index hunks for the status
+//! bar. Hunk-wise staging/unstaging/reverting builds on the same hunks via [`merge_selected`] —
+//! stage and unstage rewrite the file's index entry ([`write_index_blob`]); revert is an ordinary
+//! buffer edit driven by the handler.
 
 use aether_protocol::git::{BlameInfo, CommitInfo, GitStatus};
+use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +45,15 @@ pub struct DiffHunk {
     /// Baseline lines removed or replaced by this hunk, in order, newline-free. Empty for a pure
     /// addition. The inline diff renders these as phantom "deleted" rows above `anchor_line`.
     pub deleted: Vec<String>,
+    /// Where this hunk sits on the **old (baseline) side**, 0-based: the first removed baseline
+    /// line, or — for a pure addition — the baseline line the new text is inserted *before*.
+    /// Lets [`merge_selected`] splice hunks back into the baseline without re-walking the patch.
+    pub old_start: u32,
+    /// Display tag for the combined staged+unstaged view. Hunks straight from a diff are
+    /// `Unstaged` (the renderer's single-colour default); [`compose_both`] tags the HEAD→index
+    /// hunks it folds in as `Staged`. Where the two layers overlap, the marker/row builders
+    /// resolve in favour of the unstaged side (the top layer).
+    pub stage: DiffStage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,15 +241,274 @@ fn hunks_from_buffers(old: &[u8], new: &[u8]) -> Vec<DiffHunk> {
         } else {
             hunk.new_start().saturating_sub(1)
         };
+        // Same trick on the old side: for a pure addition `old_start` is the 1-based line the
+        // insertion sits after == the 0-based line it sits before.
+        let old_start = if hunk.old_lines() == 0 {
+            hunk.old_start()
+        } else {
+            hunk.old_start().saturating_sub(1)
+        };
 
         hunks.push(DiffHunk {
             kind,
             anchor_line,
             new_lines,
             deleted,
+            old_start,
+            stage: DiffStage::Unstaged,
         });
     }
     hunks
+}
+
+/// Which changes a hunk operation (stage / unstage / revert) targets, in **new-side** 0-based
+/// line coordinates of the diff being operated on (buffer lines for stage/revert, index lines
+/// for unstage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HunkSelection {
+    /// Bare cursor: the single hunk covering this line. `Added`/`Modified` hunks cover their
+    /// new-side lines; a pure deletion belongs to the line its phantom rows render above
+    /// (`anchor_line`), or to the last content line when it sits at end-of-buffer.
+    WholeHunkAt(u32),
+    /// An inclusive line span (a selection snapped to whole lines). Added lines are taken
+    /// individually; a hunk's removed block is all-or-nothing, owned by the line it renders above.
+    Lines { lo: u32, hi: u32 },
+}
+
+/// Merge the old and new sides of a diff, taking the **selected** changes from one side and
+/// leaving everything else as the other: with `keep_selected`, selected changes are applied onto
+/// `old` (staging); without, selected changes are *excluded* from `new` (unstaging, reverting).
+/// Unchanged regions are identical either way.
+///
+/// Returns `None` when the selection covers no change at all — the caller reports "nothing here"
+/// rather than rewriting content with a no-op.
+///
+/// Both sides are treated as LF text (the baselines are stored LF-normalized and buffers are LF
+/// internally); a missing trailing newline is preserved exactly, and gets repaired to `\n` when
+/// content is spliced in after a final newline-less line.
+pub fn merge_selected(
+    old: &[u8],
+    new: &[u8],
+    sel: &HunkSelection,
+    keep_selected: bool,
+) -> Option<Vec<u8>> {
+    let hunks = hunks_from_buffers(old, new);
+    let new_content_lines = content_line_count(new);
+
+    // Bare-cursor mode resolves to exactly one hunk up front; no hunk under the cursor → None.
+    let target: Option<usize> = match sel {
+        HunkSelection::WholeHunkAt(line) => Some(
+            hunks
+                .iter()
+                .position(|h| hunk_covers_line(h, *line, new_content_lines))?,
+        ),
+        HunkSelection::Lines { .. } => None,
+    };
+
+    let old_lines: Vec<&[u8]> = old.split_inclusive(|&b| b == b'\n').collect();
+    let new_lines: Vec<&[u8]> = new.split_inclusive(|&b| b == b'\n').collect();
+
+    // Whether this hunk's removed block / one of its added lines is selected.
+    let del_selected = |i: usize, h: &DiffHunk| match (sel, target) {
+        (HunkSelection::WholeHunkAt(_), t) => t == Some(i),
+        (HunkSelection::Lines { lo, hi }, _) => {
+            deletion_covered(h.anchor_line, *lo, *hi, new_content_lines)
+        }
+    };
+    let add_selected = |i: usize, line: u32| match (sel, target) {
+        (HunkSelection::WholeHunkAt(_), t) => t == Some(i),
+        (HunkSelection::Lines { lo, hi }, _) => *lo <= line && line <= *hi,
+    };
+
+    let mut emitted: Vec<&[u8]> = Vec::with_capacity(old_lines.len().max(new_lines.len()));
+    let mut old_pos = 0usize;
+    let mut any_selected = false;
+    for (i, h) in hunks.iter().enumerate() {
+        // Lines untouched by any hunk are common to both sides; emit them from the old side.
+        emitted.extend(&old_lines[old_pos..h.old_start as usize]);
+        old_pos = h.old_start as usize;
+
+        let removed = h.deleted.len();
+        if removed > 0 {
+            let selected = del_selected(i, h);
+            any_selected |= selected;
+            // The removal is applied when (selected ⊕ !keep_selected); otherwise the old lines
+            // survive. Slices come from `old` itself, not `h.deleted`, to preserve exact newlines.
+            if selected != keep_selected {
+                emitted.extend(&old_lines[old_pos..old_pos + removed]);
+            }
+            old_pos += removed;
+        }
+        for line in h.anchor_line..h.anchor_line + h.new_lines {
+            let selected = add_selected(i, line);
+            any_selected |= selected;
+            if selected == keep_selected {
+                emitted.push(new_lines[line as usize]);
+            }
+        }
+    }
+    emitted.extend(&old_lines[old_pos..]);
+
+    if !any_selected {
+        return None;
+    }
+
+    // Join, repairing a missing `\n` on any line that is no longer final (only an original final
+    // line can lack one).
+    let mut out = Vec::with_capacity(old.len().max(new.len()));
+    for (i, line) in emitted.iter().enumerate() {
+        out.extend_from_slice(line);
+        if i + 1 < emitted.len() && !line.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+    }
+    Some(out)
+}
+
+/// Whether a bare cursor on `line` addresses this hunk.
+fn hunk_covers_line(h: &DiffHunk, line: u32, new_content_lines: u32) -> bool {
+    if h.new_lines > 0 {
+        h.anchor_line <= line && line < h.anchor_line + h.new_lines
+    } else {
+        deletion_covered(h.anchor_line, line, line, new_content_lines)
+    }
+}
+
+/// Whether the inclusive line span `[lo, hi]` covers a removed block anchored at `anchor`. The
+/// block belongs to the line it renders above; an end-of-buffer deletion has no line below it, so
+/// it belongs to the last content line instead (a cursor on the trailing empty line also counts).
+fn deletion_covered(anchor: u32, lo: u32, hi: u32, new_content_lines: u32) -> bool {
+    if anchor >= new_content_lines {
+        hi + 1 >= new_content_lines
+    } else {
+        lo <= anchor && anchor <= hi
+    }
+}
+
+/// Number of content lines in `bytes` — what `split_inclusive` yields, i.e. a trailing newline
+/// does **not** open a final empty line (unlike ropey's `len_lines`).
+fn content_line_count(bytes: &[u8]) -> u32 {
+    bytes.split_inclusive(|&b| b == b'\n').count() as u32
+}
+
+/// Map a 0-based line in new-side coordinates to the old side, given the hunks between them.
+/// A line inside a changed region clamps to the region's old span — its start, or its end with
+/// `round_up` — so mapping a span's endpoints covers every old line the span overlaps. Used to
+/// carry a buffer-coordinate selection into index coordinates for unstaging.
+pub fn map_line_to_old(hunks: &[DiffHunk], line: u32, round_up: bool) -> u32 {
+    let mut shift: i64 = 0; // new minus old, accumulated over hunks fully above `line`
+    for h in hunks {
+        if line < h.anchor_line {
+            break;
+        }
+        let removed = h.deleted.len() as i64;
+        if h.new_lines > 0 && line < h.anchor_line + h.new_lines {
+            return if round_up {
+                (h.old_start as i64 + (removed - 1).max(0)) as u32
+            } else {
+                h.old_start
+            };
+        }
+        shift += h.new_lines as i64 - removed;
+    }
+    ((line as i64) - shift).max(0) as u32
+}
+
+/// The inverse of [`map_line_to_old`]: map a 0-based old-side line to new-side coordinates. A
+/// line inside a changed region clamps to the region's new span (start, or end with `round_up`;
+/// a pure deletion has no new span, so both clamp onto its anchor). Used to place the staged
+/// (HEAD→index) hunks — which live in index coordinates — onto buffer lines, across the
+/// unstaged (index→buffer) diff.
+pub fn map_line_to_new(hunks: &[DiffHunk], line: u32, round_up: bool) -> u32 {
+    let mut shift: i64 = 0; // new minus old, accumulated over hunks fully above `line`
+    for h in hunks {
+        let removed = h.deleted.len() as u32;
+        if line < h.old_start {
+            break;
+        }
+        if removed > 0 && line < h.old_start + removed {
+            return if round_up && h.new_lines > 0 {
+                h.anchor_line + h.new_lines - 1
+            } else {
+                h.anchor_line
+            };
+        }
+        shift += h.new_lines as i64 - removed as i64;
+    }
+    ((line as i64) + shift).max(0) as u32
+}
+
+/// Compose the combined staged+unstaged hunk list (what the gutter / inline diff renders): the unstaged (index→buffer) hunks verbatim,
+/// plus the staged (HEAD→index) hunks carried from index into buffer coordinates and tagged
+/// `Staged`. Sorted by anchor with staged-first ties, so phantom rows sharing an anchor stack
+/// oldest layer (HEAD's text) on top. Per-line classification falls out exactly: a buffer line in
+/// an unstaged hunk is unstaged whatever sits beneath it; a staged hunk's span maps onto the
+/// buffer lines it still corresponds to, clamped to the enclosing unstaged block where the region
+/// was re-modified (those lines then read as plain unstaged — the top layer wins).
+pub fn compose_both(staged: &[DiffHunk], unstaged: &[DiffHunk]) -> Vec<DiffHunk> {
+    let mut out: Vec<DiffHunk> = Vec::with_capacity(staged.len() + unstaged.len());
+    for h in staged {
+        let mut mapped = h.clone();
+        mapped.stage = DiffStage::Staged;
+        if h.new_lines > 0 {
+            let start = map_line_to_new(unstaged, h.anchor_line, false);
+            let end = map_line_to_new(unstaged, h.anchor_line + h.new_lines - 1, true);
+            mapped.anchor_line = start;
+            mapped.new_lines = end.saturating_sub(start) + 1;
+        } else {
+            // A staged pure deletion anchors above an index line; its buffer anchor is wherever
+            // that line ended up (or the unstaged block that replaced it).
+            mapped.anchor_line = map_line_to_new(unstaged, h.anchor_line, false);
+        }
+        out.push(mapped);
+    }
+    out.extend(unstaged.iter().cloned());
+    // Stable sort: equal anchors keep staged (pushed first) ahead of unstaged.
+    out.sort_by_key(|h| h.anchor_line);
+    out
+}
+
+/// Replace the file's index (staged) entry with `content`, creating the entry when the file is
+/// untracked. The caller is responsible for line-ending fidelity (CRLF files want CRLF content —
+/// the in-memory baselines are LF-normalized). `None` on any libgit2 failure.
+pub fn write_index_blob(repo: &GitRepo, content: &[u8]) -> Option<()> {
+    let git_repo = git2::Repository::open(&repo.workdir).ok()?;
+    let mut index = git_repo.index().ok()?;
+    let entry = match index.get_path(&repo.rel_path, 0) {
+        Some(e) => e,
+        // Untracked: a minimal regular-file entry. `add_frombuffer` fills in the blob id; the
+        // zeroed stat fields just force git to content-compare against the working tree.
+        None => git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100_644,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: git2::Oid::zero(),
+            flags: 0,
+            flags_extended: 0,
+            path: repo.rel_path.to_str()?.as_bytes().to_vec(),
+        },
+    };
+    index.add_frombuffer(&entry, content).ok()?;
+    index.write().ok()?;
+    Some(())
+}
+
+/// LF → CRLF, for writing index content of a file that was loaded with CRLF endings (the inverse
+/// of [`normalize_lf`], mirroring `Buffer::save_to_disk`).
+pub fn denormalize_crlf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
+    for &b in bytes {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    out
 }
 
 /// Blame the whole file, one entry per 0-based buffer line (`None` for a line with no blame, e.g.
@@ -616,6 +886,223 @@ mod tests {
         assert_eq!(hunks[0].deleted, vec!["b".to_string()]);
         assert_eq!(hunks[1].anchor_line, 4);
         assert_eq!(hunks[1].deleted, vec!["e".to_string()]);
+    }
+
+    // ---- merge_selected (stage / unstage / revert core) -----------------------------------------
+
+    fn merged_str(old: &str, new: &str, sel: HunkSelection, keep: bool) -> Option<String> {
+        merge_selected(old.as_bytes(), new.as_bytes(), &sel, keep)
+            .map(|b| String::from_utf8(b).unwrap())
+    }
+
+    #[test]
+    fn merge_stages_whole_hunk_under_cursor() {
+        // Two hunks; cursor on the first only stages the first.
+        let old = "a\nb\nc\n";
+        let new = "a\nB\nc\nextra\n";
+        let got = merged_str(old, new, HunkSelection::WholeHunkAt(1), true).unwrap();
+        assert_eq!(got, "a\nB\nc\n", "modification staged, trailing addition left out");
+        let got = merged_str(old, new, HunkSelection::WholeHunkAt(3), true).unwrap();
+        assert_eq!(got, "a\nb\nc\nextra\n", "addition staged, modification left out");
+    }
+
+    #[test]
+    fn merge_no_hunk_under_cursor_is_none() {
+        assert!(merged_str("a\nb\n", "a\nB\n", HunkSelection::WholeHunkAt(0), true).is_none());
+        // Identical sides: nothing anywhere.
+        assert!(merged_str("a\n", "a\n", HunkSelection::WholeHunkAt(0), true).is_none());
+    }
+
+    #[test]
+    fn merge_stages_line_subset_of_added_block() {
+        // Lines x,y,z added; selecting y..z stages just those.
+        let old = "a\n";
+        let new = "a\nx\ny\nz\n";
+        let got = merged_str(old, new, HunkSelection::Lines { lo: 2, hi: 3 }, true).unwrap();
+        assert_eq!(got, "a\ny\nz\n");
+    }
+
+    #[test]
+    fn merge_selection_not_touching_any_hunk_is_none() {
+        let got = merged_str("a\nb\nc\n", "a\nb\nC\n", HunkSelection::Lines { lo: 0, hi: 1 }, true);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn merge_stages_deletion_via_anchor_line() {
+        // b removed; the deletion belongs to the line below (c, buffer line 1).
+        let old = "a\nb\nc\n";
+        let new = "a\nc\n";
+        let got = merged_str(old, new, HunkSelection::WholeHunkAt(1), true).unwrap();
+        assert_eq!(got, "a\nc\n");
+        // Cursor on `a` does not address it.
+        assert!(merged_str(old, new, HunkSelection::WholeHunkAt(0), true).is_none());
+    }
+
+    #[test]
+    fn merge_stages_eof_deletion_from_last_content_line() {
+        // Trailing b removed: anchored past the last content line, so the last line owns it.
+        let old = "a\nb\n";
+        let new = "a\n";
+        let got = merged_str(old, new, HunkSelection::WholeHunkAt(0), true).unwrap();
+        assert_eq!(got, "a\n");
+        // A line-span selection ending on the last content line also covers it.
+        let got = merged_str(old, new, HunkSelection::Lines { lo: 0, hi: 0 }, true).unwrap();
+        assert_eq!(got, "a\n");
+    }
+
+    #[test]
+    fn merge_unselected_takes_new_side_when_not_keeping() {
+        // Revert/unstage orientation: selected hunks roll back to old, others keep the new side.
+        let old = "a\nb\nc\n";
+        let new = "A\nb\nC\n";
+        let got = merged_str(old, new, HunkSelection::WholeHunkAt(0), false).unwrap();
+        assert_eq!(got, "a\nb\nC\n", "first hunk reverted, second untouched");
+    }
+
+    #[test]
+    fn merge_revert_reinserts_deleted_block() {
+        let old = "a\nb\nc\nd\n";
+        let new = "a\nd\n";
+        let got = merged_str(old, new, HunkSelection::WholeHunkAt(1), false).unwrap();
+        assert_eq!(got, "a\nb\nc\nd\n");
+    }
+
+    #[test]
+    fn merge_repairs_missing_trailing_newline_when_splicing_after_it() {
+        // Old final line has no newline; staging only the added line after it must not glue them.
+        let old = "a";
+        let new = "a\nb\n";
+        // The diff reads this as a modification of `a` plus addition — select only line 1 (`b`).
+        let got = merged_str(old, new, HunkSelection::Lines { lo: 1, hi: 1 }, true).unwrap();
+        assert!(
+            got == "a\nb\n" || got == "a\nb",
+            "lines must stay separate, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn merge_preserves_missing_trailing_newline_on_revert() {
+        let old = "a\nb"; // no trailing newline
+        let new = "a\n";
+        let got = merged_str(old, new, HunkSelection::WholeHunkAt(0), false).unwrap();
+        assert_eq!(got, "a\nb", "exact baseline bytes restored");
+    }
+
+    // ---- map_line_to_old ------------------------------------------------------------------------
+
+    #[test]
+    fn map_line_shifts_past_hunks_and_clamps_inside() {
+        // old: a b c d e ; new: a X Y c e   (b -> X,Y modified; d deleted)
+        let old = b"a\nb\nc\nd\ne\n";
+        let new = b"a\nX\nY\nc\ne\n";
+        let hunks = hunks_from_buffers(old, new);
+        assert_eq!(map_line_to_old(&hunks, 0, false), 0, "before any hunk");
+        assert_eq!(map_line_to_old(&hunks, 1, false), 1, "inside hunk clamps to old start");
+        assert_eq!(map_line_to_old(&hunks, 2, true), 1, "round_up clamps to old end");
+        assert_eq!(map_line_to_old(&hunks, 3, false), 2, "after +1 hunk shifts back");
+        assert_eq!(map_line_to_old(&hunks, 4, false), 4, "after the deletion shifts forward");
+    }
+
+    // ---- map_line_to_new / compose_both (combined staged+unstaged view) -------------------------
+
+    #[test]
+    fn map_line_to_new_shifts_and_clamps() {
+        // old: a b c d e ; new: a X Y c e   (b -> X,Y modified; d deleted above e)
+        let hunks = hunks_from_buffers(b"a\nb\nc\nd\ne\n", b"a\nX\nY\nc\ne\n");
+        assert_eq!(map_line_to_new(&hunks, 0, false), 0, "before any hunk");
+        assert_eq!(map_line_to_new(&hunks, 1, false), 1, "inside clamps to new start");
+        assert_eq!(map_line_to_new(&hunks, 1, true), 2, "round_up clamps to new end");
+        assert_eq!(map_line_to_new(&hunks, 2, false), 3, "after a +1 hunk shifts forward");
+        assert_eq!(map_line_to_new(&hunks, 3, false), 4, "deleted old line clamps to its anchor");
+        assert_eq!(map_line_to_new(&hunks, 4, false), 4, "after the deletion shifts back");
+    }
+
+    #[test]
+    fn compose_keeps_disjoint_hunks_in_order() {
+        // HEAD a b c ; index a B c (staged mod) ; buffer a B c d (unstaged add)
+        let staged = hunks_from_buffers(b"a\nb\nc\n", b"a\nB\nc\n");
+        let unstaged = hunks_from_buffers(b"a\nB\nc\n", b"a\nB\nc\nd\n");
+        let both = compose_both(&staged, &unstaged);
+        assert_eq!(both.len(), 2);
+        assert_eq!((both[0].anchor_line, both[0].stage), (1, DiffStage::Staged));
+        assert_eq!((both[1].anchor_line, both[1].stage), (3, DiffStage::Unstaged));
+    }
+
+    #[test]
+    fn compose_clamps_remodified_staged_hunk_onto_unstaged_block() {
+        // HEAD a b c ; index a B c ; buffer a Z c — line 1 staged then modified again.
+        let staged = hunks_from_buffers(b"a\nb\nc\n", b"a\nB\nc\n");
+        let unstaged = hunks_from_buffers(b"a\nB\nc\n", b"a\nZ\nc\n");
+        let both = compose_both(&staged, &unstaged);
+        assert_eq!(both.len(), 2);
+        // Staged-first at the shared anchor, both covering buffer line 1.
+        assert_eq!((both[0].anchor_line, both[0].new_lines, both[0].stage), (1, 1, DiffStage::Staged));
+        assert_eq!((both[1].anchor_line, both[1].new_lines, both[1].stage), (1, 1, DiffStage::Unstaged));
+    }
+
+    #[test]
+    fn compose_carries_staged_deletion_anchor_across_unstaged_insert() {
+        // HEAD a b c ; index a c (staged deletion of b, anchored above index line 1) ;
+        // buffer x a c — an unstaged line added at the top pushes the anchor to buffer line 2.
+        let staged = hunks_from_buffers(b"a\nb\nc\n", b"a\nc\n");
+        let unstaged = hunks_from_buffers(b"a\nc\n", b"x\na\nc\n");
+        let both = compose_both(&staged, &unstaged);
+        let staged_del = both.iter().find(|h| h.stage == DiffStage::Staged).unwrap();
+        assert_eq!(staged_del.kind, ChangeKind::Deleted);
+        assert_eq!(staged_del.anchor_line, 2, "anchor shifted by the unstaged insert above");
+        assert_eq!(staged_del.deleted, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn compose_preserves_eof_staged_deletion_anchor() {
+        // HEAD a b ; index a (staged EOF deletion, anchor past the last content line) ; buffer a.
+        let staged = hunks_from_buffers(b"a\nb\n", b"a\n");
+        let unstaged: Vec<DiffHunk> = Vec::new();
+        let both = compose_both(&staged, &unstaged);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].anchor_line, 1, "EOF anchor preserved (past last content line)");
+        assert_eq!(both[0].stage, DiffStage::Staged);
+    }
+
+    // ---- write_index_blob -----------------------------------------------------------------------
+
+    #[test]
+    fn write_index_blob_updates_tracked_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\n");
+        let repo = load_baseline(&file).repo.expect("repo resolved");
+
+        write_index_blob(&repo, b"one\nTWO\n").expect("index write");
+
+        let baseline = load_baseline(&file);
+        assert_eq!(baseline.index_blob.as_deref(), Some(&b"one\nTWO\n"[..]));
+        assert_eq!(baseline.blob.as_deref(), Some(&b"one\ntwo\n"[..]), "HEAD untouched");
+        assert_eq!(baseline.staged_hunks.len(), 1, "staged diff now has the change");
+    }
+
+    #[test]
+    fn write_index_blob_creates_entry_for_untracked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Repo with one commit so HEAD exists, plus an untracked file.
+        repo_with_committed_file(dir.path(), "other.rs", "x\n");
+        let file = dir.path().join("new.rs");
+        std::fs::write(&file, "hello\n").unwrap();
+        let repo = load_baseline(&file).repo.expect("repo resolved");
+        assert!(load_baseline(&file).index_blob.is_none(), "untracked → no entry yet");
+
+        write_index_blob(&repo, b"hello\n").expect("index write");
+
+        let baseline = load_baseline(&file);
+        assert_eq!(baseline.index_blob.as_deref(), Some(&b"hello\n"[..]));
+        assert!(baseline.blob.is_none(), "still not in HEAD");
+    }
+
+    #[test]
+    fn denormalize_crlf_round_trips_normalize() {
+        let crlf = b"one\r\ntwo\r\n".to_vec();
+        let lf = normalize_lf(crlf.clone());
+        assert_eq!(denormalize_crlf(&lf), crlf);
     }
 
     // ---- compute_hunks against a real repo ------------------------------------------------------

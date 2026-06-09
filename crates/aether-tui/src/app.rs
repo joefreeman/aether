@@ -21,10 +21,10 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    BlameInfo, CommitInfo, DiffBase, GitBlameLine, GitBlameLineParams, GitBufferStatus,
-    GitChangeCounts, GitCommitInfo, GitCommitInfoParams, GitNavigateHunk, GitNavigateHunkParams,
-    GitSetDiffBase, GitSetDiffBaseParams, GitSetDiffView,
-    GitSetDiffViewParams, HunkDirection,
+    ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams,
+    GitBlameLine, GitBlameLineParams, GitBufferStatus,
+    GitCommitInfo, GitCommitInfoParams, GitNavigateHunk, GitNavigateHunkParams,
+    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::nav::{
     NavBack, NavForward, NavRecord, NavRecordParams, NavStepParams, NavStepResult,
@@ -444,7 +444,7 @@ pub struct EditorState {
     pub line_count: u32,
     /// Buffer-wide Git change summary (added/modified/deleted line counts vs HEAD) for the status
     /// bar, refreshed alongside `line_count` from every window the server sends.
-    pub git_changes: GitChangeCounts,
+
     /// Buffer-level Git status (branch + staged/unstaged counts) for the status bar; `None` outside
     /// a repo. Refreshed from every window, like `git_changes`.
     pub git_status: Option<GitBufferStatus>,
@@ -459,7 +459,6 @@ pub struct EditorState {
     /// Diff baseline the gutter compares against: `Head` (all uncommitted) or `Index` (unstaged
     /// only). Server-authoritative (per-viewport); mirrored here so the keybinding can flip it and
     /// so it can be re-applied (sticky) on the next buffer's subscribe.
-    pub diff_base: DiffBase,
     /// Horizontal scroll, in bytes. Only meaningful when `wrap == WrapMode::None`; reset to 0
     /// when soft wrap is on (wrapped content never overflows). Client-only.
     pub scroll_col: u32,
@@ -827,8 +826,7 @@ async fn open_buffer_and_subscribe(
         root_labels,
         open,
         WrapMode::Soft,
-        false,            // bootstrap: inline diff starts off
-        DiffBase::Head,   // and compares against HEAD
+        false, // bootstrap: inline diff starts off
     )
     .await
 }
@@ -859,7 +857,6 @@ async fn build_editor_state_from_open(
     open: BufferOpenResult,
     wrap: WrapMode,
     diff_view: bool,
-    diff_base: DiffBase,
 ) -> Result<(EditorState, BufferStatusSnapshot)> {
     // Initial scroll: prefer a restored value (a buffer we'd seen before), otherwise centre
     // the viewport on the cursor. For a default cursor at (0,0) that's still line 0; for a
@@ -885,17 +882,11 @@ async fn build_editor_state_from_open(
             tab_width: ui::TAB_WIDTH,
         })
         .await?;
-    // Re-apply the sticky view toggles: a fresh viewport starts at the server defaults (diff off,
-    // base = HEAD), so if the user had changed either we re-apply now — before the first paint, so
-    // no flash — and use the re-rendered window. Mirrors how `wrap` is carried across switches.
+    // Re-apply the sticky inline-diff toggle: a fresh viewport starts with it off, so if the user
+    // had it on we re-apply now — before the first paint, so no flash — and use the re-rendered
+    // window. Mirrors how `wrap` is carried across switches.
     let viewport_id = sub.viewport_id;
     let mut window = sub.window;
-    if diff_base != DiffBase::Head {
-        let r = client
-            .rpc::<GitSetDiffBase>(GitSetDiffBaseParams { viewport_id, base: diff_base })
-            .await?;
-        window = r.window;
-    }
     if diff_view {
         let r = client
             .rpc::<GitSetDiffView>(GitSetDiffViewParams {
@@ -922,12 +913,10 @@ async fn build_editor_state_from_open(
         window_first_logical_line: window.first_logical_line,
         lines: window.lines,
         line_count: window.line_count,
-        git_changes: window.git_changes,
         git_status: window.git_status,
         max_scroll_logical_line: window.max_scroll_logical_line,
         wrap,
         diff_view,
-        diff_base,
         scroll_col: 0,
         pending_scroll_lines: 0,
         drag_anchor: None,
@@ -1295,7 +1284,6 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
 fn splice_lines(state: &mut AppState, p: ViewportLinesChangedParams) {
     state.ed_mut().revision = p.revision;
     state.ed_mut().line_count = p.line_count;
-    state.ed_mut().git_changes = p.git_changes;
     state.ed_mut().git_status = p.git_status;
     state.ed_mut().max_scroll_logical_line = p.max_scroll_logical_line;
     let local_start =
@@ -1763,9 +1751,10 @@ async fn run_action(
         Action::Redo => redo(client, state, count).await?,
         Action::ToggleWrap => toggle_wrap(client, state).await?,
         Action::ToggleDiffView => toggle_diff_view(client, state).await?,
-        Action::ToggleDiffBase => toggle_diff_base(client, state).await?,
         Action::NextHunk => navigate_hunk(client, state, HunkDirection::Next).await?,
         Action::PrevHunk => navigate_hunk(client, state, HunkDirection::Prev).await?,
+        Action::ToggleStageHunk => apply_hunk(client, state, HunkAction::Toggle).await?,
+        Action::RevertHunk => apply_hunk(client, state, HunkAction::Revert).await?,
         Action::MoveLines(dir) => move_lines(client, state, dir, count).await?,
         Action::JoinLines => join_lines(client, state, count).await?,
         Action::Indent => indent(client, state, count).await?,
@@ -3189,7 +3178,6 @@ async fn subscribe_to_buffer(
     // both of the user's view settings sticky for the session.
     let wrap = state.ed_mut().wrap;
     let diff_view = state.ed_mut().diff_view;
-    let diff_base = state.ed_mut().diff_base;
     // Snapshot labels before passing into the builder so we can hand the builder pure slices —
     // it doesn't need (and shouldn't borrow) the full AppState.
     let project_paths = state.project_paths.clone();
@@ -3203,7 +3191,6 @@ async fn subscribe_to_buffer(
         open,
         wrap,
         diff_view,
-        diff_base,
     )
     .await?;
     let buffer_id = editor.buffer_id;
@@ -4082,7 +4069,6 @@ async fn handle_resize(
     let ed = state.ed_mut();
     ed.window_first_logical_line = r.window.first_logical_line;
     ed.line_count = r.window.line_count;
-    ed.git_changes = r.window.git_changes;
     ed.git_status = r.window.git_status.clone();
     ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
     ed.lines = r.window.lines;
@@ -5709,45 +5695,11 @@ async fn toggle_diff_view(client: &mut Client, state: &mut AppState) -> Result<(
     ed.diff_view = enabled;
     ed.window_first_logical_line = r.window.first_logical_line;
     ed.line_count = r.window.line_count;
-    ed.git_changes = r.window.git_changes;
     ed.git_status = r.window.git_status.clone();
     ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
     ed.lines = r.window.lines;
     ed.scroll_skip_rows = 0; // phantom rows appeared/vanished; re-align the top line
     state.status = StatusMessage::info(format!("diff: {}", if enabled { "on" } else { "off" }));
-    Ok(())
-}
-
-/// `Space Alt-i` — flip the diff baseline between HEAD (all uncommitted changes) and index (unstaged
-/// only). Server re-renders against the chosen base; we mirror it locally so it stays sticky across
-/// buffer switches.
-async fn toggle_diff_base(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let base = match state.ed_mut().diff_base {
-        DiffBase::Head => DiffBase::Index,
-        DiffBase::Index => DiffBase::Head,
-    };
-    let r = client
-        .rpc::<GitSetDiffBase>(GitSetDiffBaseParams {
-            viewport_id: state.ed_mut().viewport_id,
-            base,
-        })
-        .await?;
-    let ed = state.ed_mut();
-    ed.diff_base = base;
-    ed.window_first_logical_line = r.window.first_logical_line;
-    ed.line_count = r.window.line_count;
-    ed.git_changes = r.window.git_changes;
-    ed.git_status = r.window.git_status.clone();
-    ed.max_scroll_logical_line = r.window.max_scroll_logical_line;
-    ed.lines = r.window.lines;
-    ed.scroll_skip_rows = 0; // phantom rows differ between bases; re-align the top line
-    state.status = StatusMessage::info(format!(
-        "diff base: {}",
-        match base {
-            DiffBase::Head => "HEAD",
-            DiffBase::Index => "index",
-        }
-    ));
     Ok(())
 }
 
@@ -5770,6 +5722,40 @@ async fn navigate_hunk(
     if !r.moved {
         state.status = StatusMessage::info("no more changes".to_string());
     }
+    Ok(())
+}
+
+/// `Space a` / `Space v` — toggle the staged state of, or revert, the change under the cursor
+/// (bare cursor → whole hunk; a wider selection → those lines). The server resolves the
+/// cursor/selection and applies authoritatively; refreshed gutters/counts ride the usual pushes,
+/// and a revert's buffer edit lands like any other edit. We adopt the returned cursor and narrate
+/// the outcome on the status row — the toggle's direction comes back in the status.
+async fn apply_hunk(client: &mut Client, state: &mut AppState, action: HunkAction) -> Result<()> {
+    let r = client
+        .rpc::<GitApplyHunk>(GitApplyHunkParams {
+            buffer_id: state.ed_mut().buffer_id,
+            action,
+        })
+        .await?;
+    state.ed_mut().cursor = r.cursor;
+    state.status = match r.status {
+        ApplyHunkStatus::Staged => StatusMessage::success("staged change".to_string()),
+        ApplyHunkStatus::Unstaged => StatusMessage::success("unstaged change".to_string()),
+        ApplyHunkStatus::Reverted => StatusMessage::success("reverted change".to_string()),
+        ApplyHunkStatus::NoChange => StatusMessage::info(
+            match action {
+                HunkAction::Toggle => "no change here",
+                HunkAction::Revert => "no change to revert here",
+            }
+            .to_string(),
+        ),
+        ApplyHunkStatus::DirtyBuffer => {
+            StatusMessage::warning("unsaved changes — save first".to_string())
+        }
+        ApplyHunkStatus::Unavailable => {
+            StatusMessage::info("not in a git repository".to_string())
+        }
+    };
     Ok(())
 }
 
@@ -5943,7 +5929,6 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
     state.ed_mut().scroll_skip_rows = 0;
     state.ed_mut().window_first_logical_line = r.window.first_logical_line;
     state.ed_mut().line_count = r.window.line_count;
-    state.ed_mut().git_changes = r.window.git_changes;
     state.ed_mut().git_status = r.window.git_status.clone();
     state.ed_mut().max_scroll_logical_line = r.window.max_scroll_logical_line;
     state.ed_mut().lines = r.window.lines;
@@ -6233,12 +6218,10 @@ mod tests {
             window_first_logical_line: 0,
             lines: Vec::new(),
             line_count: 0,
-            git_changes: GitChangeCounts::default(),
             git_status: None,
             max_scroll_logical_line: 0,
             wrap: aether_protocol::viewport::WrapMode::None,
             diff_view: false,
-            diff_base: DiffBase::Head,
             scroll_col: 0,
             pending_scroll_lines: 0,
             drag_anchor: None,
@@ -6282,9 +6265,11 @@ mod tests {
                 .map(|_| VirtualRow {
                     text: String::new(),
                     kind: VirtualRowKind::Deleted,
+                    stage: Default::default(),
                 })
                 .collect(),
             diff_marker: None,
+            diff_stage: Default::default(),
             diagnostics: vec![],
         };
 

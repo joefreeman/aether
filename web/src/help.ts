@@ -149,9 +149,16 @@ const TABS: Tab[] = [
         title: "View (Space …)",
         rows: [
           ["Space w", "toggle soft wrap"],
-          ["Space i", "toggle inline diff"],
-          ["Space Alt-i", "toggle diff base (HEAD/index)"],
+        ],
+      },
+      {
+        title: "Git (Space …)",
+        rows: [
+          ["Space a", "stage/unstage change (hunk/selection)"],
+          ["Space v", "revert change"],
           ["Space h  Alt-h", "next / prev hunk"],
+          ["Space i", "toggle inline diff"],
+          ["Space o", "blame commit details"],
         ],
       },
       {

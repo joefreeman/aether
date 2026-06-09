@@ -1,7 +1,7 @@
 //! Viewport messages — §7 of the protocol doc.
 
 use crate::envelope::{NotificationMethod, RpcMethod};
-use crate::git::{GitBufferStatus, GitChangeCounts};
+use crate::git::GitBufferStatus;
 use crate::lsp::{DiagnosticCounts, LspServerStatus};
 use crate::search::SearchMatchRange;
 use crate::{BufferId, Revision, ViewportId};
@@ -44,6 +44,12 @@ pub struct LogicalLineRender {
     /// the line background while the diff view is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_marker: Option<DiffMarker>,
+    /// Qualifies `diff_marker`: whether the line's change is staged or unstaged. A line holding
+    /// both at once (modified, staged, then modified again) reads as `Unstaged` — the visible
+    /// text is the unstaged top layer, and that's the layer `git/apply_hunk` acts on. Drives the
+    /// marker / tint colour split. Omitted from the wire when `Unstaged`.
+    #[serde(default, skip_serializing_if = "DiffStage::is_unstaged")]
+    pub diff_stage: DiffStage,
     /// Language-server diagnostics intersecting this logical line, as byte ranges within the line
     /// (already converted from the server's LSP position encoding). A diagnostic spanning multiple
     /// lines contributes one entry — carrying the full message — to each line it touches, so the
@@ -85,12 +91,40 @@ pub enum DiffMarker {
     Deleted,
 }
 
+/// Which side of the index a change sits on, in the combined staged+unstaged view. Tags both
+/// per-line markers ([`LogicalLineRender::diff_stage`]) and phantom rows ([`VirtualRow::stage`]).
+/// `Unstaged` is the default and is omitted from the wire, so a stage-unaware renderer degrades
+/// to a single-colour look. Deliberately binary: where the two layers overlap, the unstaged top
+/// layer wins — bright means "`Space a` will stage this", dim means "staged; `Space a` pulls it
+/// back out".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffStage {
+    /// The buffer's content here differs from the index (`B ≠ I`).
+    #[default]
+    Unstaged,
+    /// Staged and untouched since (`B == I ≠ HEAD`).
+    Staged,
+}
+
+impl DiffStage {
+    pub fn is_unstaged(&self) -> bool {
+        matches!(self, DiffStage::Unstaged)
+    }
+}
+
 /// A rendered row that doesn't correspond to any buffer line — see
 /// [`LogicalLineRender::virtual_rows_above`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtualRow {
     pub text: String,
     pub kind: VirtualRowKind,
+    /// Staged (the row's text is HEAD's, already replaced in the index) vs unstaged (the text is
+    /// the index's, still present there). At most one layer per anchor: where both would stack,
+    /// the server sends only the unstaged rows, so what's shown deleted is exactly what a revert
+    /// would restore.
+    #[serde(default, skip_serializing_if = "DiffStage::is_unstaged")]
+    pub stage: DiffStage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,12 +181,8 @@ pub struct Window {
     /// Display width (in cols) of the buffer's widest line, for sizing a native horizontal scroll
     /// container under `WrapMode::None`. `0` under soft wrap (content always fits `cols`).
     pub max_line_width: u32,
-    /// Buffer-wide Git change summary for the status bar (added/modified/deleted line counts vs
-    /// HEAD). Omitted from the wire when the buffer is clean / untracked / outside a repo.
-    #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
-    pub git_changes: GitChangeCounts,
     /// Buffer-level Git status (branch + staged/unstaged counts) for the status bar. `None` outside
-    /// a repo. Rides the window so it updates live on edits, the same way `git_changes` does.
+    /// a repo. Rides the window so it updates live on edits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_status: Option<GitBufferStatus>,
     pub lines: Vec<LogicalLineRender>,
@@ -335,10 +365,6 @@ pub struct ViewportLinesChangedParams {
     pub first_visual_row: u32,
     /// Recomputed widest-line width (cols) after the edit, for native horizontal scroll sizing.
     pub max_line_width: u32,
-    /// Recomputed buffer-wide Git change summary for the status bar. Omitted when the buffer is
-    /// clean / untracked / outside a repo.
-    #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
-    pub git_changes: GitChangeCounts,
     /// Recomputed buffer-level Git status (branch + staged/unstaged counts). `None` outside a repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_status: Option<GitBufferStatus>,

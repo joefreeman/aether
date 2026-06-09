@@ -189,9 +189,13 @@ pub enum Action {
     Redo,
     ToggleWrap,
     ToggleDiffView,
-    ToggleDiffBase,
     NextHunk,
     PrevHunk,
+    /// Toggle the staged state of the change under the cursor (whole hunk) or the selected lines:
+    /// stage anything unstaged there, otherwise pull the staged change back out of the index.
+    ToggleStageHunk,
+    /// Discard the change under the cursor / selection in the buffer (undoable edit).
+    RevertHunk,
     MoveLines(VerticalDirection),
     JoinLines,
     Indent,
@@ -291,9 +295,10 @@ impl Action {
                 | Action::ShowCommitInfo
                 | Action::ToggleWrap
                 | Action::ToggleDiffView
-                | Action::ToggleDiffBase
                 | Action::NextHunk
                 | Action::PrevHunk
+                | Action::ToggleStageHunk
+                | Action::RevertHunk
                 | Action::NavBack
                 | Action::NavForward
         )
@@ -656,11 +661,12 @@ static LEADER: &[Binding] = &[
     bind!(LEADER_CTX, ch('r'), Exact(NONE), A::Reload, "App", "Reload from disk"),
     bind!(LEADER_CTX, ch('n'), Exact(NONE), A::NewScratch, "App", "New scratch buffer"),
     bind!(LEADER_CTX, ch('w'), Exact(NONE), A::ToggleWrap, "View", "Toggle soft wrap"),
-    bind!(LEADER_CTX, ch('i'), Exact(NONE), A::ToggleDiffView, "View", "Toggle inline diff"),
-    bind!(LEADER_CTX, ch('i'), Exact(ALT), A::ToggleDiffBase, "View", "Toggle diff base (HEAD/index)"),
-    bind!(LEADER_CTX, ch('h'), Exact(NONE), A::NextHunk, "View", "Next change (hunk)"),
-    bind!(LEADER_CTX, ch('h'), Exact(ALT), A::PrevHunk, "View", "Previous change (hunk)"),
-    bind!(LEADER_CTX, ch('o'), Exact(NONE), A::ShowCommitInfo, "View", "Blame commit details"),
+    bind!(LEADER_CTX, ch('a'), Exact(NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
+    bind!(LEADER_CTX, ch('v'), Exact(NONE), A::RevertHunk, "Git", "Revert change"),
+    bind!(LEADER_CTX, ch('h'), Exact(NONE), A::NextHunk, "Git", "Next change (hunk)"),
+    bind!(LEADER_CTX, ch('h'), Exact(ALT), A::PrevHunk, "Git", "Previous change (hunk)"),
+    bind!(LEADER_CTX, ch('i'), Exact(NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
+    bind!(LEADER_CTX, ch('o'), Exact(NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
     bind!(LEADER_CTX, ch('m'), Exact(NONE), A::Format, "Code", "Format document"),
     bind!(LEADER_CTX, ch('k'), Exact(NONE), A::Hover, "Code", "Hover (type & docs)"),
     bind!(LEADER_CTX, ch('d'), Exact(NONE), A::GotoDefinition, "Code", "Go to definition"),

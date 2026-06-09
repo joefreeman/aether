@@ -52,9 +52,17 @@ export type VirtualRowKind = "deleted";
 export interface VirtualRow {
   text: string;
   kind: VirtualRowKind;
+  /** Staged (text is HEAD's, already replaced in the index) vs unstaged (text is the index's).
+   *  Omitted on the wire when "unstaged". */
+  stage?: DiffStage;
 }
 
 export type DiffMarker = "added" | "modified" | "deleted";
+
+/** Which side of the index a change sits on. Binary by design: where staged and unstaged
+ *  overlap (modified, staged, modified again), the unstaged top layer wins. Omitted when
+ *  "unstaged". */
+export type DiffStage = "unstaged" | "staged";
 
 /** Git status of a file-explorer entry, used to colour it. For a directory this is the
  *  highest-priority status among its descendants (folder aggregation). Mirrors the server's
@@ -81,6 +89,8 @@ export interface LogicalLineRender {
   search_matches?: SearchMatchRange[];
   virtual_rows_above?: VirtualRow[];
   diff_marker?: DiffMarker | null;
+  /** Qualifies diff_marker in the combined view; omitted when "unstaged". */
+  diff_stage?: DiffStage;
   diagnostics?: DiagnosticSpan[];
 }
 
@@ -95,8 +105,6 @@ export interface BufferWindow {
   first_visual_row: number;
   /** Display cols of the widest line — sizes the native horizontal scroller (no-wrap). 0 under soft wrap. */
   max_line_width: number;
-  /** Buffer-wide Git change summary for the status bar. Absent on the wire when the buffer is clean. */
-  git_changes?: GitChangeCounts;
   /** Buffer-level Git status (branch + staged/unstaged counts) for the status bar; absent outside a repo. */
   git_status?: GitBufferStatus;
   lines: LogicalLineRender[];
@@ -108,9 +116,6 @@ export interface GitChangeCounts {
   modified: number;
   deleted: number;
 }
-
-/** Which committed-side baseline the gutter/diff compares the working buffer against. */
-export type DiffBase = "head" | "index";
 
 /** Buffer-level Git status: branch + staged (HEAD→index) and unstaged (index→buffer) counts. */
 export interface GitBufferStatus {
@@ -373,6 +378,18 @@ export interface GitNavigateHunkParams {
 export interface GitNavigateHunkResult {
   cursor: CursorState;
   moved: boolean;
+}
+export type HunkAction = "toggle" | "revert";
+export type ApplyHunkStatus =
+  | "staged"
+  | "unstaged"
+  | "reverted"
+  | "no_change"
+  | "dirty_buffer"
+  | "unavailable";
+export interface GitApplyHunkResult {
+  cursor: CursorState;
+  status: ApplyHunkStatus;
 }
 export interface GitSetDiffViewParams {
   viewport_id: ViewportId;
@@ -659,8 +676,6 @@ export interface ViewportLinesChangedParams {
   total_visual_rows: number;
   first_visual_row: number;
   max_line_width: number;
-  /** Recomputed buffer-wide Git change summary. Absent on the wire when the buffer is clean. */
-  git_changes?: GitChangeCounts;
   /** Recomputed buffer-level Git status (branch + staged/unstaged counts). Absent outside a repo. */
   git_status?: GitBufferStatus;
 }

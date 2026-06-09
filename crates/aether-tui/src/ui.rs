@@ -6,12 +6,12 @@ use crate::app::{
 };
 use crate::keymap;
 use aether_protocol::cursor::CursorState;
-use aether_protocol::git::{BlameInfo, DiffBase, GitStatus};
+use aether_protocol::git::{BlameInfo, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{BufferDirtyState, PickerItem};
 use aether_protocol::search::SearchMatchRange;
 use aether_protocol::viewport::{
-    DiagnosticSeverity, DiagnosticSpan, DiffMarker, Highlight, VisualRow, WrapMode,
+    DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, Highlight, VisualRow, WrapMode,
 };
 use aether_protocol::LogicalPosition;
 use crossterm::event::KeyCode;
@@ -78,6 +78,14 @@ const NORD15: Color = Color::Rgb(180, 142, 173); // Aurora purple — numbers, c
 const GIT_DELETED_BG: Color = Color::Rgb(59, 34, 38); // dark muted red
 const GIT_ADDED_BG: Color = Color::Rgb(45, 58, 45); // dark muted green
 const GIT_MODIFIED_BG: Color = Color::Rgb(58, 54, 40); // dark muted olive
+// Staged variants keep each kind's hue but dimmed/desaturated — hue says *what* changed,
+// brightness says whether it still needs staging (bright = unstaged, muted = in the index).
+const GIT_STAGED_ADDED: Color = Color::Rgb(110, 128, 96); // dimmed NORD14
+const GIT_STAGED_MODIFIED: Color = Color::Rgb(158, 138, 98); // dimmed NORD13
+const GIT_STAGED_DELETED: Color = Color::Rgb(132, 76, 83); // dimmed NORD11
+const GIT_STAGED_ADDED_BG: Color = Color::Rgb(47, 54, 49); // staged line tints, likewise dimmer
+const GIT_STAGED_MODIFIED_BG: Color = Color::Rgb(53, 52, 45);
+const GIT_STAGED_DELETED_BG: Color = Color::Rgb(51, 37, 42); // staged phantom rows
 
 // Current-line highlight (Vim's `cursorline`). A custom tint ~40% of the way from the NORD0
 // background to NORD1: subtler than NORD1 (which the status line uses, so the cursorline doesn't
@@ -88,6 +96,10 @@ const CURSOR_LINE_BG: Color = Color::Rgb(52, 58, 72);
 // line still reads as added/modified instead of the plain blue cursorline hiding the diff tint.
 const CURSOR_LINE_ADDED_BG: Color = Color::Rgb(58, 77, 58);
 const CURSOR_LINE_MODIFIED_BG: Color = Color::Rgb(74, 70, 50);
+// ...and their staged counterparts, lifted from the staged tints the same way — so the cursor
+// landing on a staged line doesn't make it flare back up to the unstaged brightness.
+const CURSOR_LINE_STAGED_ADDED_BG: Color = Color::Rgb(58, 69, 60);
+const CURSOR_LINE_STAGED_MODIFIED_BG: Color = Color::Rgb(67, 65, 56);
 
 pub fn draw(f: &mut Frame, state: &AppState) {
     // The status row carries activation feedback, save-as / new-file prompts, and the dirty +
@@ -2877,9 +2889,12 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if lines.len() >= viewport_rows {
                 break 'outer;
             }
-            let mut spans = deleted_virtual_row_spans(&vrow.text, viewport_cols);
-            // Two-col gutter: red deletion bar (git column) + blank diagnostic column.
-            spans.insert(0, gutter_bar(NORD11));
+            let mut spans = deleted_virtual_row_spans(&vrow.text, viewport_cols, vrow.stage);
+            // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
+            spans.insert(
+                0,
+                gutter_bar(stage_color(vrow.stage, NORD11, GIT_STAGED_DELETED)),
+            );
             lines.push(Line::from(spans));
         }
         // The gutter change-bar reflects this line's marker (always on). With the diff view on, a
@@ -2896,9 +2911,11 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         // over the tint via `apply_line_tint`.
         let line_tint = if logical_line == cursor_line {
             let marker = if diff_view { render.diff_marker } else { None };
-            Some(cursor_line_bg(marker))
+            Some(cursor_line_bg(marker, render.diff_stage))
         } else if diff_view {
-            render.diff_marker.and_then(diff_marker_bg)
+            render
+                .diff_marker
+                .and_then(|m| diff_marker_bg(m, render.diff_stage))
         } else {
             None
         };
@@ -2930,7 +2947,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
                     append_eol_blame(&mut spans, show_blame.then(|| blame_text.as_deref()).flatten());
                     apply_line_tint(&mut spans, line_tint, viewport_cols);
-                    lines.push(prepend_gutter(gutter_mark, spans));
+                    lines.push(prepend_gutter(gutter_mark, render.diff_stage, spans));
                     continue;
                 }
             };
@@ -3017,7 +3034,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
             append_eol_blame(&mut spans, show_blame.then(|| blame_text.as_deref()).flatten());
             apply_line_tint(&mut spans, line_tint, viewport_cols);
-            lines.push(prepend_gutter(gutter_mark, spans));
+            lines.push(prepend_gutter(gutter_mark, render.diff_stage, spans));
         }
         logical_line = match logical_line.checked_add(1) {
             Some(n) => n,
@@ -3037,15 +3054,17 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 /// fill that spans the content width so the deletion reads as a distinct band. Tabs expand to
 /// spaces for stable width; content wider than the viewport is clipped. The gutter cell is added
 /// separately by [`prepend_gutter`].
-fn deleted_virtual_row_spans(text: &str, width: u16) -> Vec<Span<'static>> {
+fn deleted_virtual_row_spans(text: &str, width: u16, stage: DiffStage) -> Vec<Span<'static>> {
     let expanded = text.replace('\t', &" ".repeat(TAB_WIDTH as usize));
     let mut shown: String = expanded.chars().take(width as usize).collect();
     let used = shown.chars().count();
     shown.push_str(&" ".repeat((width as usize).saturating_sub(used)));
-    vec![Span::styled(
-        shown,
-        Style::default().fg(NORD11).bg(GIT_DELETED_BG),
-    )]
+    let style = if stage == DiffStage::Staged {
+        Style::default().fg(GIT_STAGED_DELETED).bg(GIT_STAGED_DELETED_BG)
+    } else {
+        Style::default().fg(NORD11).bg(GIT_DELETED_BG)
+    };
+    vec![Span::styled(shown, style)]
 }
 
 /// A solid change-bar cell in the given color (`GUTTER_WIDTH` cols).
@@ -3053,41 +3072,67 @@ fn gutter_bar(color: Color) -> Span<'static> {
     Span::styled("▎".to_string(), Style::default().fg(color))
 }
 
+/// Colour for a change-bar / marker: hue follows the change kind (`bright` and `dim` are the
+/// unstaged/staged variants of the same hue), brightness follows the stage — bright still needs
+/// staging, dim is in the index.
+fn stage_color(stage: DiffStage, bright: Color, dim: Color) -> Color {
+    match stage {
+        DiffStage::Unstaged => bright,
+        DiffStage::Staged => dim,
+    }
+}
+
 /// The git column of the gutter: a colored bar for added/modified lines, a top marker for a line
-/// with deletions just above it, or blank. One col wide.
-fn git_gutter_cell(mark: Option<DiffMarker>) -> Span<'static> {
+/// with deletions just above it, or blank. One col wide. The stage dims the kind colour when the
+/// change is staged.
+fn git_gutter_cell(mark: Option<DiffMarker>, stage: DiffStage) -> Span<'static> {
     match mark {
-        Some(DiffMarker::Added) => gutter_bar(NORD14), // green bar
-        Some(DiffMarker::Modified) => gutter_bar(NORD13), // yellow bar (matches modified tint)
+        Some(DiffMarker::Added) => gutter_bar(stage_color(stage, NORD14, GIT_STAGED_ADDED)),
+        Some(DiffMarker::Modified) => {
+            gutter_bar(stage_color(stage, NORD13, GIT_STAGED_MODIFIED))
+        }
         Some(DiffMarker::Deleted) => {
-            Span::styled("▔".to_string(), Style::default().fg(NORD11)) // red "removed above"
+            // "removed above" top marker
+            Span::styled(
+                "▔".to_string(),
+                Style::default().fg(stage_color(stage, NORD11, GIT_STAGED_DELETED)),
+            )
         }
         None => Span::styled(" ".to_string(), Style::default().fg(NORD0)), // unchanged → blank
     }
 }
 
 /// Prepend the gutter cell (git change column) to a row's content spans, producing the final `Line`.
-fn prepend_gutter(mark: Option<DiffMarker>, mut spans: Vec<Span<'static>>) -> Line<'static> {
-    spans.insert(0, git_gutter_cell(mark));
+fn prepend_gutter(
+    mark: Option<DiffMarker>,
+    stage: DiffStage,
+    mut spans: Vec<Span<'static>>,
+) -> Line<'static> {
+    spans.insert(0, git_gutter_cell(mark, stage));
     Line::from(spans)
 }
 
 /// The background tint for an inline-diff line: added/modified get a tint, deleted-anchor lines
-/// (unchanged content) get none.
-fn diff_marker_bg(marker: DiffMarker) -> Option<Color> {
-    match marker {
-        DiffMarker::Added => Some(GIT_ADDED_BG),
-        DiffMarker::Modified => Some(GIT_MODIFIED_BG),
-        DiffMarker::Deleted => None,
+/// (unchanged content) get none. A staged line gets the dimmer variant of its kind tint.
+fn diff_marker_bg(marker: DiffMarker, stage: DiffStage) -> Option<Color> {
+    match (marker, stage) {
+        (DiffMarker::Deleted, _) => None,
+        (DiffMarker::Added, DiffStage::Staged) => Some(GIT_STAGED_ADDED_BG),
+        (DiffMarker::Modified, DiffStage::Staged) => Some(GIT_STAGED_MODIFIED_BG),
+        (DiffMarker::Added, _) => Some(GIT_ADDED_BG),
+        (DiffMarker::Modified, _) => Some(GIT_MODIFIED_BG),
     }
 }
 
 /// Background tint for the cursor's current line. On an added/modified line (diff view on) it's a
-/// green/olive cursorline variant so the line still reads as changed; otherwise the plain cursorline.
-fn cursor_line_bg(diff_marker: Option<DiffMarker>) -> Color {
-    match diff_marker {
-        Some(DiffMarker::Added) => CURSOR_LINE_ADDED_BG,
-        Some(DiffMarker::Modified) => CURSOR_LINE_MODIFIED_BG,
+/// green/olive cursorline variant so the line still reads as changed — dimmed further when the
+/// change is staged, matching the tint scheme; otherwise the plain cursorline.
+fn cursor_line_bg(diff_marker: Option<DiffMarker>, stage: DiffStage) -> Color {
+    match (diff_marker, stage) {
+        (Some(DiffMarker::Added), DiffStage::Staged) => CURSOR_LINE_STAGED_ADDED_BG,
+        (Some(DiffMarker::Modified), DiffStage::Staged) => CURSOR_LINE_STAGED_MODIFIED_BG,
+        (Some(DiffMarker::Added), _) => CURSOR_LINE_ADDED_BG,
+        (Some(DiffMarker::Modified), _) => CURSOR_LINE_MODIFIED_BG,
         _ => CURSOR_LINE_BG,
     }
 }
@@ -3934,12 +3979,12 @@ fn buffer_status_color(kind: BufferStatusKind) -> Color {
 /// deleted, vs HEAD), matching the gutter change-bar colors. Empty when the buffer is clean,
 /// untracked, or outside a repo. Segments are separated by a space; a class is shown only when its
 /// count is non-zero.
-/// The status-bar Git cluster for a tracked file: `⎇  branch  [base]  +u(s) ~u(s) -u(s)`. Branch and
-/// base are a light, legible grey; each per-class count combines unstaged and staged as `+u(s)` —
-/// the unstaged count then the staged count in parentheses, each omitted when zero (so `+1(2)` is
+/// The status-bar Git cluster for a tracked file: `⎇  branch  +u(s) ~u(s) -u(s)`. The branch is a
+/// light, legible grey; each per-class count combines unstaged and staged as `+u(s)` — the
+/// unstaged count then the staged count in parentheses, each omitted when zero (so `+1(2)` is
 /// one unstaged + two staged additions, `+3` three unstaged, `+(3)` three staged). Empty classes
-/// are skipped; the whole cluster is empty for files outside a repo. Reads `git_status` (server-
-/// computed) and the local `diff_base`.
+/// are skipped; the whole cluster is empty for files outside a repo. Reads `git_status`
+/// (server-computed).
 fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
     let bg = Style::default().bg(NORD1);
     let meta = bg.fg(NORD9); // branch / base: Frost blue — secondary, distinct from the nord4 path
@@ -3953,15 +3998,6 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
     if let Some(branch) = &status.branch {
         parts.push(Span::styled(format!("⎇  {branch}"), meta));
     }
-    // Base right after the branch — `index` means staged hunks are hidden from the gutter.
-    let base = match ed.diff_base {
-        DiffBase::Head => "HEAD",
-        DiffBase::Index => "index",
-    };
-    if !parts.is_empty() {
-        parts.push(Span::styled(" ".to_string(), bg));
-    }
-    parts.push(Span::styled(format!("[{base}]"), meta));
     // Combined per-class counts: unstaged then `(staged)`.
     for (sigil, color, unstaged, staged) in [
         ('+', NORD14, status.unstaged.added, status.staged.added),
@@ -5045,13 +5081,27 @@ mod tests {
 
     #[test]
     fn cursor_line_bg_uses_diff_variant_on_changed_lines() {
+        use aether_protocol::viewport::DiffStage::{Staged, Unstaged};
         // An added/modified cursor line gets the green/olive variant, not the plain cursorline —
         // and crucially not the diff tint itself, so it reads as "cursor here AND changed".
-        assert_eq!(cursor_line_bg(Some(DiffMarker::Added)), CURSOR_LINE_ADDED_BG);
-        assert_eq!(cursor_line_bg(Some(DiffMarker::Modified)), CURSOR_LINE_MODIFIED_BG);
-        assert_ne!(cursor_line_bg(Some(DiffMarker::Added)), GIT_ADDED_BG);
+        assert_eq!(cursor_line_bg(Some(DiffMarker::Added), Unstaged), CURSOR_LINE_ADDED_BG);
+        assert_eq!(
+            cursor_line_bg(Some(DiffMarker::Modified), Unstaged),
+            CURSOR_LINE_MODIFIED_BG
+        );
+        assert_ne!(cursor_line_bg(Some(DiffMarker::Added), Unstaged), GIT_ADDED_BG);
+        // A staged line keeps its dimmer identity under the cursor instead of flaring back up to
+        // the unstaged brightness.
+        assert_eq!(
+            cursor_line_bg(Some(DiffMarker::Added), Staged),
+            CURSOR_LINE_STAGED_ADDED_BG
+        );
+        assert_eq!(
+            cursor_line_bg(Some(DiffMarker::Modified), Staged),
+            CURSOR_LINE_STAGED_MODIFIED_BG
+        );
         // Deleted (no real-line tint) and unchanged lines fall back to the plain cursorline.
-        assert_eq!(cursor_line_bg(Some(DiffMarker::Deleted)), CURSOR_LINE_BG);
-        assert_eq!(cursor_line_bg(None), CURSOR_LINE_BG);
+        assert_eq!(cursor_line_bg(Some(DiffMarker::Deleted), Unstaged), CURSOR_LINE_BG);
+        assert_eq!(cursor_line_bg(None, Unstaged), CURSOR_LINE_BG);
     }
 }

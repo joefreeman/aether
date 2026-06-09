@@ -71,15 +71,16 @@ pub struct ServerState {
     /// TUI's `nav/back`/`nav/forward`. The web client rides native browser history instead, so its
     /// entries here go unused — but recording stays uniform across clients. Cleared on disconnect.
     pub nav_history: HashMap<ClientId, NavHistory>,
-    /// Per-buffer Git diff hunks: the live buffer's text against its committed (HEAD) content.
-    /// Populated on `buffer/open` for file-backed buffers; recomputed as the buffer changes.
-    /// Empty / absent for scratch buffers, untracked files, and files outside a repo. Shared by
-    /// all clients viewing the buffer (the baseline is a property of the file, not the viewer).
-    pub git_hunks: HashMap<BufferId, Vec<crate::git::DiffHunk>>,
-    /// Per-buffer *unstaged* diff hunks: the live buffer against its **index** content (`git diff`),
-    /// computed on the same triggers as `git_hunks`. `git_hunks` (vs HEAD) drives the `diff_base =
-    /// Head` gutter; this drives `diff_base = Index` and the unstaged change count.
+    /// Per-buffer *unstaged* diff hunks: the live buffer against its **index** content
+    /// (`git diff`). Populated on `buffer/open` for file-backed buffers; recomputed as the buffer
+    /// changes. Empty / absent for scratch buffers and files outside a repo. Shared by all clients
+    /// viewing the buffer (the baseline is a property of the file, not the viewer). Drives the
+    /// unstaged half of the status-bar counts and one side of the combined view.
     pub git_unstaged_hunks: HashMap<BufferId, Vec<crate::git::DiffHunk>>,
+    /// Per-buffer **combined** view hunks (what the gutter / inline diff renders): the unstaged
+    /// hunks plus the staged (HEAD→index) hunks carried into buffer coordinates, each tagged with
+    /// its `DiffStage`. Composed by `git::compose_both` on the same triggers as the unstaged set.
+    pub git_both_hunks: HashMap<BufferId, Vec<crate::git::DiffHunk>>,
     /// Per-buffer cached Git baseline: resolved repo location + the committed (HEAD) content,
     /// LF-normalized. Populated on open, refreshed when HEAD changes (the watcher), and read by
     /// the per-edit `diff_hunks` so editing never re-runs repo discovery or re-reads the blob.
@@ -229,8 +230,8 @@ impl ServerState {
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
-            git_hunks: HashMap::new(),
             git_unstaged_hunks: HashMap::new(),
+            git_both_hunks: HashMap::new(),
             git_baseline: HashMap::new(),
             git_blame: HashMap::new(),
             matcher: picker_state::make_matcher(),
@@ -365,8 +366,8 @@ impl ServerState {
         self.tree_selection_history.retain(|(_, b), _| *b != id);
         self.searches.retain(|(_, b), _| *b != id);
         self.last_scroll.retain(|(_, b), _| *b != id);
-        self.git_hunks.remove(&id);
         self.git_unstaged_hunks.remove(&id);
+        self.git_both_hunks.remove(&id);
         self.git_baseline.remove(&id);
         self.git_blame.remove(&id);
         self.diagnostics.remove(&id);
@@ -645,6 +646,8 @@ pub enum EditKindTag {
     /// Whole-buffer formatting (`lsp/format`). Its own tag so a format is always a single undo
     /// step and never coalesces into an adjacent typing/delete burst.
     Format,
+    /// Hunk revert (`git/apply_hunk`). Like `Format`: one revert, one undo step.
+    Revert,
 }
 
 struct UndoEntry {
@@ -1160,9 +1163,6 @@ pub struct Viewport {
     /// buffer's Git hunks and the buffer's hunks are recomputed on every edit. Per-viewport so
     /// two views of the same buffer can differ. Toggled by `git/set_diff_view`.
     pub diff_view: bool,
-    /// Which committed-side baseline the gutter / inline diff compares against: `Head` (all
-    /// uncommitted changes) or `Index` (unstaged only). Per-viewport, set by `git/set_diff_base`.
-    pub diff_base: aether_protocol::git::DiffBase,
 }
 
 #[cfg(test)]

@@ -46,13 +46,10 @@ pub struct GitNavigateHunkResult {
 
 // ---- change counts (status-bar summary) ---------------------------------------------------------
 
-/// Buffer-wide Git change summary for the status bar: how many buffer lines fall into each change
-/// class, measured against the HEAD baseline (Phase 1 — staged and unstaged combined, matching
-/// `git diff HEAD`). Mirrors the gutter change-bars: `added` / `modified` count the new-side lines
-/// of Added / Modified hunks; `deleted` counts the lines removed by pure deletions. A clean file
-/// (or one with no repo / untracked) reports all zeros. Rides the per-viewport `Window` and
-/// `viewport/lines_changed` rather than a dedicated notification, since the counts only change when
-/// a window is (re)rendered — on open, edit, or external HEAD change.
+/// Per-class Git change counts: how many buffer lines fall into each change class for one diff.
+/// `added` / `modified` count the new-side lines of Added / Modified hunks; `deleted` counts the
+/// lines removed by pure deletions. A clean file (or one with no repo / untracked) reports all
+/// zeros. Used as the staged/unstaged halves of [`GitBufferStatus`] (the status bar).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitChangeCounts {
     pub added: u32,
@@ -85,34 +82,6 @@ pub struct GitBufferStatus {
     pub unstaged: GitChangeCounts,
 }
 
-// ---- git/set_diff_base --------------------------------------------------------------------------
-
-/// Which committed-side baseline the gutter / inline diff compares the working buffer against.
-/// `Head` (default) shows all uncommitted changes (`git diff HEAD`); `Index` shows only unstaged
-/// changes (`git diff`), so a staged hunk disappears from the diff. Per-viewport, client-toggled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiffBase {
-    #[default]
-    Head,
-    Index,
-}
-
-pub struct GitSetDiffBase;
-impl RpcMethod for GitSetDiffBase {
-    const NAME: &'static str = "git/set_diff_base";
-    type Params = GitSetDiffBaseParams;
-    /// The freshly re-rendered window: changing the base changes the gutter markers and the inline
-    /// diff's phantom rows, so the whole window is resent (like `git/set_diff_view`).
-    type Result = ViewportWindowResult;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GitSetDiffBaseParams {
-    pub viewport_id: ViewportId,
-    pub base: DiffBase,
-}
-
 // ---- git/set_diff_view --------------------------------------------------------------------------
 
 pub struct GitSetDiffView;
@@ -129,6 +98,73 @@ impl RpcMethod for GitSetDiffView {
 pub struct GitSetDiffViewParams {
     pub viewport_id: ViewportId,
     pub enabled: bool,
+}
+
+// ---- git/apply_hunk -----------------------------------------------------------------------------
+
+/// Toggle the staged state of — or revert — the change under the cursor or the selected lines.
+/// Cursor-relative like the input commands: the server resolves the client's cursor/selection,
+/// so no positions ride the wire. A bare cursor (anchor == position) addresses the whole hunk it
+/// sits on (a pure deletion belongs to the line its phantom rows render above, or the last line
+/// at end-of-buffer); a wider selection is snapped to whole lines and taken at line granularity.
+///
+/// Toggle writes the repository index and requires a non-dirty buffer (the index must not hold
+/// content that exists nowhere on disk — the client tells the user to save first). Revert is an
+/// ordinary buffer edit through the undo stack and works on a dirty buffer. The result's
+/// [`ApplyHunkStatus`] reports which direction a toggle resolved to.
+pub struct GitApplyHunk;
+impl RpcMethod for GitApplyHunk {
+    const NAME: &'static str = "git/apply_hunk";
+    type Params = GitApplyHunkParams;
+    type Result = GitApplyHunkResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitApplyHunkParams {
+    pub buffer_id: BufferId,
+    pub action: HunkAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HunkAction {
+    /// Flip the addressed change's staged state, unstaged-first (mirroring `Revert`'s layering):
+    /// anything unstaged in the region is staged (index ← buffer, `git add -p`-style); when the
+    /// region holds nothing unstaged, its staged change is pulled back out (index ← HEAD). The
+    /// region's stage is visible in the combined view's colours, so the direction is readable
+    /// before pressing — and reported back via [`ApplyHunkStatus`] after.
+    Toggle,
+    /// Restore baseline content in the buffer for the addressed change (undoable edit). Peels the
+    /// top layer of the H→I→B change stack: an unstaged change reverts to the index's content;
+    /// a staged-only region (buffer == index ≠ HEAD) reverts to HEAD's — pressing again on a
+    /// re-modified region therefore peels unstaged first, then staged. View-independent, like
+    /// `Toggle`.
+    Revert,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitApplyHunkResult {
+    /// Cursor after the action — unchanged for a toggle, clamped into the edited text for
+    /// revert. Always echoed so the client can adopt it unconditionally (mirrors `lsp/format`).
+    pub cursor: CursorState,
+    pub status: ApplyHunkStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyHunkStatus {
+    /// A toggle staged the region's unstaged change(s).
+    Staged,
+    /// A toggle pulled the region's staged change(s) back out of the index.
+    Unstaged,
+    /// A revert restored baseline content in the buffer.
+    Reverted,
+    /// No matching change under the cursor / in the selection, in either direction.
+    NoChange,
+    /// Toggle refused because the buffer has unsaved edits — save first.
+    DirtyBuffer,
+    /// The buffer isn't in a Git repository (or the index write failed).
+    Unavailable,
 }
 
 // ---- git/blame_line -----------------------------------------------------------------------------

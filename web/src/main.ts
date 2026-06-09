@@ -37,13 +37,13 @@ import type {
   CursorUndoResult,
   DiagnosticCounts,
   DiagnosticSeverity,
-  DiffBase,
   Direction,
   BlameInfo,
   CommitInfo,
   EditResult,
   GitBlameLineResult,
   GitCommitInfoResult,
+  GitApplyHunkResult,
   GitNavigateHunkResult,
   LspDiagnosticsChangedParams,
   LspFormatResult,
@@ -363,7 +363,6 @@ class Editor {
   private externallyModified = false;
   private externallyDeleted = false;
   private diffView = false;
-  private diffBase: DiffBase = "head";
   // LSP: this buffer's server key, statuses by (language, workspace_root), and diagnostic counts.
   private lspServerRef: LspServerRef | null = null;
   private lspStatuses = new Map<string, LspServerStatus>();
@@ -583,7 +582,6 @@ class Editor {
       this.viewportId = sub.viewport_id;
       this.window = sub.window;
       this.seedBufferStatus(sub.buffer_status);
-      await this.reapplyDiffBase();
       await this.reapplyDiffView();
       // Restore the cursor/selection from the URL fragment (a reloaded/shared link), clamped server-
       // side. Best-effort — a stale fragment just leaves the cursor at the server's default.
@@ -668,7 +666,6 @@ class Editor {
       this.viewportId = sub.viewport_id;
       this.window = sub.window;
       this.seedBufferStatus(sub.buffer_status);
-      await this.reapplyDiffBase();
       await this.reapplyDiffView();
       try {
         this.cursor = await this.client.rpc<CursorState>("cursor/set", {
@@ -823,16 +820,6 @@ class Editor {
     this.window = r.window;
   }
 
-  /** Re-apply the sticky diff base after a (re)subscribe (a fresh viewport defaults to HEAD). */
-  private async reapplyDiffBase(): Promise<void> {
-    if (this.diffBase === "head") return;
-    const r = await this.client.rpc<ViewportWindowResult>("git/set_diff_base", {
-      viewport_id: this.viewportId,
-      base: this.diffBase,
-    });
-    this.window = r.window;
-  }
-
   private renderStatusBar(): void {
     const left = document.createElement("span");
     left.className = "status-left";
@@ -853,11 +840,6 @@ class Editor {
         b.append(`⎇  ${gs.branch}`);
         left.append(b);
       }
-      // Base right after the branch — `index` means staged hunks are hidden from the gutter.
-      const base = document.createElement("span");
-      base.className = "status-git git-base";
-      base.append(this.diffBase === "index" ? "[index]" : "[HEAD]");
-      left.append(base);
       // Combined per-class counts: unstaged then `(staged)`.
       const u = gs.unstaged;
       const s = gs.staged;
@@ -1503,7 +1485,6 @@ class Editor {
     this.viewportId = sub.viewport_id;
     this.window = sub.window;
     this.seedBufferStatus(sub.buffer_status);
-    await this.reapplyDiffBase();
     await this.reapplyDiffView();
     if (oldViewport && oldViewport !== sub.viewport_id) {
       void this.client.rpc<null>("viewport/unsubscribe", { viewport_id: oldViewport }).catch(() => {});
@@ -1769,15 +1750,22 @@ class Editor {
         this.setStatus(`diff: ${this.diffView ? "on" : "off"}`);
         break;
       }
-      case "toggleDiffBase": {
-        const base: DiffBase = this.diffBase === "head" ? "index" : "head";
-        const r = await this.client.rpc<ViewportWindowResult>("git/set_diff_base", {
-          viewport_id: this.viewportId,
-          base,
+      case "applyHunk": {
+        const r = await this.client.rpc<GitApplyHunkResult>("git/apply_hunk", {
+          buffer_id: this.bufferId,
+          action: action.action,
         });
-        this.diffBase = base;
-        this.window = r.window;
-        this.setStatus(`diff base: ${base === "index" ? "index" : "HEAD"}`);
+        this.cursor = r.cursor;
+        // The toggle's direction comes back in the status.
+        const messages: Record<string, string> = {
+          staged: "staged change",
+          unstaged: "unstaged change",
+          reverted: "reverted change",
+          no_change: action.action === "revert" ? "no change to revert here" : "no change here",
+        };
+        if (r.status === "dirty_buffer") this.setStatus("unsaved changes — save first", true);
+        else if (r.status === "unavailable") this.setStatus("not in a git repository");
+        else this.setStatus(messages[r.status] ?? r.status);
         break;
       }
       case "navigateHunk": {
@@ -2789,7 +2777,6 @@ class Editor {
           total_visual_rows: p.total_visual_rows,
           first_visual_row: p.first_visual_row,
           max_line_width: p.max_line_width,
-          git_changes: p.git_changes,
           git_status: p.git_status,
           lines: p.replacement_lines,
         };

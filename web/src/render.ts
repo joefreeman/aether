@@ -9,6 +9,7 @@ import type {
   BufferWindow,
   CursorState,
   DiagnosticSeverity,
+  DiffStage,
   LogicalLineRender,
   LogicalPosition,
   VisualRow,
@@ -156,16 +157,19 @@ function renderVisualRow(
   rowEl.dataset.line = String(line.logical_line);
   rowEl.dataset.byte = String(row.byte_offset);
   // Line-background tint is only shown while the inline diff view is on; the gutter change-bar is
-  // always on (matching the terminal / the protocol's intent).
+  // always on (matching the terminal / the protocol's intent). A staged line gets the dimmer
+  // variant of its kind tint (via the extra "staged" class).
+  const stage = line.diff_stage ?? "unstaged";
   if (diffView && line.diff_marker === "added") rowEl.classList.add("added-bg");
   else if (diffView && line.diff_marker === "modified") rowEl.classList.add("modified-bg");
+  if (diffView && stage === "staged") rowEl.classList.add("staged");
   // Current-line highlight (Vim's `cursorline`). `cursorByte` is non-null on exactly the cursor's
   // logical line, so every visual row of that line (under soft wrap) gets tinted as a whole. The CSS
   // rule is ordered after the diff tints so it wins on the cursor's changed line; the gutter
   // change-bar still marks it. Selection/search/cursor backgrounds sit on inner spans, over the tint.
   if (cursorByte !== null) rowEl.classList.add("cursor-line");
 
-  rowEl.appendChild(gutter(line.diff_marker ?? null, diffView));
+  rowEl.appendChild(gutter(line.diff_marker ?? null, diffView, stage));
 
   const content = document.createElement("span");
   content.className = "content";
@@ -292,19 +296,29 @@ function renderVisualRow(
 /** The change-bar gutter: a native colored left border for added/modified (always shown). A pure
  *  deletion shows a triangle between the lines — but only when the diff view is off; with it on, the
  *  removed lines render as phantom rows above, so no marker is needed on the anchor line. */
-function gutter(marker: "added" | "modified" | "deleted" | null, diffView: boolean): HTMLElement {
+function gutter(
+  marker: "added" | "modified" | "deleted" | null,
+  diffView: boolean,
+  stage: DiffStage,
+): HTMLElement {
   const g = document.createElement("span");
   g.className = "gutter";
   if (marker === "added" || marker === "modified") g.classList.add(marker);
   else if (marker === "deleted" && !diffView) g.classList.add("deleted");
+  // A staged change dims the bar to the muted variant of its kind colour.
+  if (marker && stage === "staged") g.classList.add("staged");
   return g;
 }
 
-function phantomRow(text: string): HTMLElement {
+function phantomRow(text: string, stage: DiffStage): HTMLElement {
   const rowEl = document.createElement("div");
   rowEl.className = "row deleted-phantom";
   const g = document.createElement("span");
-  g.className = "gutter phantom"; // solid red bar marking the removed content
+  g.className = "gutter phantom"; // solid bar marking the removed content (red, cyan when staged)
+  if (stage === "staged") {
+    rowEl.classList.add("staged");
+    g.classList.add("staged");
+  }
   rowEl.appendChild(g);
   const content = document.createElement("span");
   content.className = "content";
@@ -350,7 +364,7 @@ export function renderBuffer(container: HTMLElement, opts: RenderOpts): void {
 
   const frag = document.createDocumentFragment();
   for (const line of window.lines) {
-    for (const v of line.virtual_rows_above ?? []) frag.appendChild(phantomRow(v.text));
+    for (const v of line.virtual_rows_above ?? []) frag.appendChild(phantomRow(v.text, v.stage ?? "unstaged"));
 
     const L = line.logical_line;
     const cursorByte = cursor.position.line === L ? cursor.position.col : null;
