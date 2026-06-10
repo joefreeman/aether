@@ -141,6 +141,7 @@ const TABS: Tab[] = [
           ["Space e", "explorer"],
           ["Space p  t  l", "projects / diagnostics / LSP servers"],
           ["Alt-j/k  Enter  Esc", "move / open / close (in a picker)"],
+          ["Ctrl-Enter", "open in new tab (in a picker)"],
           ["Alt-l  Alt-h", "enter dir / up (explorer); grep file jump"],
           ["Delete", "delete highlighted (files/explorer/projects)"],
         ],

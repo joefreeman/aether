@@ -650,7 +650,10 @@ export class Picker {
       this.onClose();
     } else if (e.key === "Enter") {
       e.preventDefault();
-      this.onEnter();
+      // Ctrl/Cmd-Enter opens the highlighted item in a new browser tab — the keyboard twin of
+      // Ctrl/Cmd-clicking its row.
+      if (e.ctrlKey || e.metaKey) this.openInNewTab();
+      else this.onEnter();
     } else if (
       e.ctrlKey &&
       !e.altKey &&
@@ -731,6 +734,16 @@ export class Picker {
 
   private highlighted(): PickerItem | undefined {
     return this.items[this.selected - this.offset];
+  }
+
+  /** Ctrl/Cmd-Enter: open the highlighted item in a new tab, leaving the picker open — same as
+   *  Ctrl/Cmd-clicking the row. No-op for rows without an opener URL (LSP servers, the
+   *  synthetic create row, …). */
+  private openInNewTab(): void {
+    const item = this.highlighted();
+    if (!item) return;
+    const href = this.fileUrl(item, this.explorerDir);
+    if (href) window.open(href, "_blank", "noopener");
   }
 
   private onEnter(): void {
