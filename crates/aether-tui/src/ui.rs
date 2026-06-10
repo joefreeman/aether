@@ -1927,11 +1927,15 @@ fn picker_chip_spans(state: &AppState, max_w: usize) -> (Vec<Span<'static>>, usi
         return (Vec::new(), 0);
     }
     let selected = state.picker.chip_selected.map(|s| s.min(chips.len() - 1));
-    // Display labels: middle-truncate long values (dir paths, globs) so one chip can't eat
-    // the row. Width per chip = label + the trailing gap.
+    // Display labels: shrink long values so one chip can't eat the row. Dir chips use the
+    // standardised segment elision (keeps the leaf dir); globs and flags middle-truncate —
+    // a glob's significant syntax sits at both ends. Width per chip = label + trailing gap.
     let labels: Vec<String> = chips
         .iter()
-        .map(|c| truncate_middle(&c.label, 24))
+        .map(|c| match c.id {
+            crate::picker::ChipId::Dir(_) => truncate_path_with_indices(&c.label, &[], 24).0,
+            _ => truncate_middle(&c.label, 24),
+        })
         .collect();
     let chip_w = |label: &String| label.width() + 1;
     let mut width: usize = labels.iter().map(chip_w).sum();
@@ -2026,26 +2030,16 @@ fn explorer_input_prefix(state: &AppState, available: usize) -> (String, String)
     if total_w <= max {
         return (label_part, path_part);
     }
-    // Over budget. Sacrifice the label first (the path is more useful), then left-truncate the
-    // path with a leading `…` if it's still over budget on its own.
+    // Over budget. Sacrifice the label first (the path is more useful), then shrink the path
+    // itself via the standardised segment elision (the trailing `/` is re-appended — it's the
+    // breadcrumb's "you're inside this dir" cue, not a path segment).
     let path_w = path_part.width();
     if path_w <= max {
         return (String::new(), path_part);
     }
-    let chars: Vec<char> = path_part.chars().collect();
-    let budget = max.saturating_sub(1); // 1 cell for the leading `…`
-    let mut kept_w = 0;
-    let mut kept_start = chars.len();
-    for (i, c) in chars.iter().enumerate().rev() {
-        let cw = UnicodeWidthChar::width(*c).unwrap_or(0);
-        if kept_w + cw > budget {
-            break;
-        }
-        kept_w += cw;
-        kept_start = i;
-    }
-    let kept: String = chars[kept_start..].iter().collect();
-    (String::new(), format!("…{kept}"))
+    let bare = path_part.strip_suffix('/').unwrap_or(&path_part);
+    let (shrunk, _) = truncate_path_with_indices(bare, &[], max.saturating_sub(1));
+    (String::new(), format!("{shrunk}/"))
 }
 
 /// Placeholder for the picker's query input: the picker's action, ellipsised. Kept in sync with
@@ -2762,12 +2756,12 @@ fn reference_item_spans(
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
     let loc_style = base.fg(picker_dim_fg(highlighted));
 
-    // Reserve up to half the row for the location prefix; the path truncates (middle) to fit so the
-    // filename and line number — the bits that identify the reference — survive.
+    // Reserve up to half the row for the location prefix; the path truncates (segment-elided)
+    // to fit so the filename and line number — the bits that identify the reference — survive.
     let line_part = format!(":{} ", line + 1);
     let prefix_budget = max_width / 2;
     let path_budget = prefix_budget.saturating_sub(line_part.width());
-    let path_shown = truncate_middle(display_path, path_budget);
+    let (path_shown, _) = truncate_path_with_indices(display_path, &[], path_budget);
     let prefix = format!("{path_shown}{line_part}");
     let preview_budget = max_width.saturating_sub(prefix.width());
 
@@ -3020,6 +3014,20 @@ fn dir_entry_spans(
 /// Trim `path` from the left (preserving the filename) when it overflows `max_width`, prefixing
 /// the trimmed result with `…`. Match indices that fall inside the dropped prefix are removed;
 /// surviving ones are shifted to reflect their new position in the displayed string.
+/// The standardised path truncation (shared shape with the web client's `truncatePath`).
+/// Shrinks `path` into `max_width` cells through a segment-aware ladder:
+///
+///  1. Fits → unchanged.
+///  2. Elide whole *middle* segments to a single `…` (`crates/…/src/handlers.rs`): the last
+///     segment (the filename) always survives, and among the candidates that fit we keep as
+///     many segments as possible, ties broken toward the tail — the file's parents identify
+///     it better than leading dirs do.
+///  3. Floor: char-level left-cut with a leading `…`, keeping the end of the string — the
+///     filename's tail is the last thing to go.
+///
+/// `match_indices` (char offsets into `path`) are remapped into the display; indices falling
+/// inside an elided span drop out. Strings without `/` skip straight to the floor, so any
+/// single-line label can pass through here safely.
 fn truncate_path_with_indices(
     path: &str,
     match_indices: &[u32],
@@ -3028,11 +3036,60 @@ fn truncate_path_with_indices(
     if max_width == 0 {
         return (String::new(), Vec::new());
     }
-    let total_w = path.width();
-    if total_w <= max_width {
+    if path.width() <= max_width {
         return (path.to_string(), match_indices.to_vec());
     }
-    // Keep characters from the end until we've filled max_width - 1 (leave 1 cell for `…`).
+
+    // Rung 2: segment elision. Candidates keep the first `l` and last `t` segments around one
+    // `…` part; pick the fitting candidate with the most segments, preferring tail on ties.
+    let segs: Vec<&str> = path.split('/').collect();
+    let n = segs.len();
+    if n >= 2 {
+        let seg_w: Vec<usize> = segs.iter().map(|s| s.width()).collect();
+        let mut best: Option<(usize, usize)> = None; // (lead, tail), tail ≥ 1
+        for t in 1..n {
+            for l in 0..=(n - 1 - t) {
+                let w: usize = seg_w[..l].iter().sum::<usize>()
+                    + seg_w[n - t..].iter().sum::<usize>()
+                    + (l + t) // one `/` per kept segment (around the `…` part)
+                    + 1; // the `…` itself
+                if w <= max_width && best.is_none_or(|(bl, bt)| (l + t, t) > (bl + bt, bt)) {
+                    best = Some((l, t));
+                }
+            }
+        }
+        if let Some((l, t)) = best {
+            let lead = segs[..l].join("/");
+            let tail = segs[n - t..].join("/");
+            let display = if l == 0 {
+                format!("…/{tail}")
+            } else {
+                format!("{lead}/…/{tail}")
+            };
+            // Remap: the kept lead is an exact prefix of the original, the kept tail an exact
+            // suffix; everything between (the elided span and its separators) drops out.
+            let lead_chars = lead.chars().count();
+            let orig_tail_start = path.chars().count() - tail.chars().count();
+            let display_tail_start = if l == 0 { 2 } else { lead_chars + 3 }; // past `…/` / `/…/`
+            let new_indices: Vec<u32> = match_indices
+                .iter()
+                .filter_map(|&i| {
+                    let i = i as usize;
+                    if l > 0 && i < lead_chars {
+                        Some(i as u32)
+                    } else if i >= orig_tail_start {
+                        Some((i - orig_tail_start + display_tail_start) as u32)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            return (display, new_indices);
+        }
+    }
+
+    // Rung 3 (floor): keep characters from the end until we've filled max_width - 1 (one cell
+    // for the `…`).
     let chars: Vec<char> = path.chars().collect();
     let budget = max_width.saturating_sub(1);
     let mut kept_w = 0;
@@ -4161,8 +4218,9 @@ fn build_editor_status_spans(
     }
     let pre_budget = left_max.saturating_sub(used);
     if left_pre.width() >= pre_budget {
-        // Even the project/file segment overflows — truncate it and drop the rest.
-        let t = truncate_to_width(left_pre, pre_budget);
+        // Even the project/file segment overflows — shrink it (segment elision keeps the
+        // filename end visible; the old right-cut lost exactly that) and drop the rest.
+        let (t, _) = truncate_path_with_indices(left_pre, &[], pre_budget);
         used += t.width();
         spans.push(Span::styled(t, base_style));
     } else {
@@ -5201,6 +5259,49 @@ mod tests {
             (collapsed.x, collapsed.y, collapsed.width),
             (full.x, full.y, full.width)
         );
+    }
+
+    #[test]
+    fn truncate_path_elides_middle_segments() {
+        let p = "crates/aether-server/src/handlers.rs";
+        // Fits → unchanged.
+        assert_eq!(
+            truncate_path_with_indices(p, &[], 40).0,
+            "crates/aether-server/src/handlers.rs"
+        );
+        // Over budget: whole middle segments collapse to one `…`, filename always survives,
+        // and the candidate keeping the most segments wins.
+        assert_eq!(truncate_path_with_indices(p, &[], 30).0, "crates/…/src/handlers.rs");
+        // Tighter: the tail is preferred over leading dirs.
+        assert_eq!(truncate_path_with_indices(p, &[], 20).0, "…/src/handlers.rs");
+        assert_eq!(truncate_path_with_indices(p, &[], 16).0, "…/handlers.rs");
+        // Tighter than `…/{filename}`: char-level floor keeps the filename's tail.
+        assert_eq!(truncate_path_with_indices(p, &[], 8).0, "…lers.rs");
+        // Non-paths skip straight to the floor.
+        assert_eq!(truncate_path_with_indices("a long project name", &[], 8).0, "…ct name");
+    }
+
+    #[test]
+    fn truncate_path_prefers_tail_on_ties() {
+        // Both (lead 1, tail 2) and (lead 0, tail 3) keep three segments; the tail-heavy
+        // candidate wins when it fits.
+        let p = "aa/bb/cc/dd/ee.rs";
+        assert_eq!(truncate_path_with_indices(p, &[], 15).0, "…/cc/dd/ee.rs");
+    }
+
+    #[test]
+    fn truncate_path_remaps_match_indices() {
+        let p = "crates/aether-server/src/handlers.rs";
+        // Matches: "cra" (0..3), "ser" inside aether-server (14..17), "han" (25..28).
+        let indices: Vec<u32> = vec![0, 1, 2, 14, 15, 16, 25, 26, 27];
+        let (display, mapped) = truncate_path_with_indices(p, &indices, 30);
+        assert_eq!(display, "crates/…/src/handlers.rs");
+        // Kept-lead indices map identity; elided-span indices drop; tail indices shift onto
+        // the display's tail.
+        let chars: Vec<char> = display.chars().collect();
+        let shown: String = mapped.iter().map(|&i| chars[i as usize]).collect();
+        assert_eq!(shown, "crahan");
+        assert_eq!(mapped, vec![0, 1, 2, 13, 14, 15]);
     }
 
     #[test]

@@ -3872,9 +3872,10 @@ async fn subscribe_replacing_scratch(
 
 /// Format `abs` as `"{root_label}: {relative}"` against the longest-matching project root, or
 /// fall back to the raw absolute path when nothing matches. `root_labels` must be aligned by
-/// index with `project_paths`. The label is always included (even single-root) so the format is
-/// consistent across surfaces. Use this for display — see `project_relative_path` for the
-/// typeable-path variant that the save-as prefill needs.
+/// index with `project_paths`. Single-root projects get a bare relative path — their label is
+/// `""` (see `labels::root_labels`), so the prefix only appears when it disambiguates. Use this
+/// for display — see `project_relative_path` for the typeable-path variant that the save-as
+/// prefill needs.
 fn project_relative_label(abs: &str, project_paths: &[String], root_labels: &[String]) -> String {
     match strip_longest_root(abs, project_paths) {
         Some((i, rel)) => {
@@ -6097,7 +6098,26 @@ async fn handle_save_prompt_key(
             prompt.alt_k(&project_paths);
             TransitionHint::None
         }
+        // Tab and Alt-l both accept the ghost suggestion (and, in SelectingRoot, commit the
+        // root) — the same accept gesture as the pickers' dir editor.
+        (KeyCode::Tab, m) if m.is_empty() => prompt.tab(&project_paths),
         (KeyCode::Char('l'), m) if m == KeyModifiers::ALT => prompt.tab(&project_paths),
+        // `:` on a *completed* root label confirms it and moves into the path — it's the
+        // separator you'd type next (mirrors the dir editor; swallowed on an incomplete
+        // label, which `:` can never extend). In Editing, `:` falls through to the generic
+        // char arm — filenames may contain it. Shift allowed: `:` arrives as Shift+; on most
+        // layouts.
+        (KeyCode::Char(':'), m)
+            if !m.contains(KeyModifiers::CONTROL)
+                && !m.contains(KeyModifiers::ALT)
+                && matches!(prompt.mode, crate::save_prompt::PromptMode::SelectingRoot(_)) =>
+        {
+            if prompt.ghost_suffix(&project_paths).as_deref() == Some("") {
+                prompt.tab(&project_paths)
+            } else {
+                TransitionHint::None
+            }
+        }
         (KeyCode::Backspace, m) if m == KeyModifiers::ALT => prompt.alt_backspace(&project_paths),
         (KeyCode::Backspace, _) => prompt.backspace(&project_paths),
         (KeyCode::Left, _) => {

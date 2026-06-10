@@ -14,6 +14,7 @@
 
 import type { RpcClient } from "./client";
 import { rootLabels } from "./labels";
+import { charBudget, truncatePath } from "./paths";
 import { confirmDialog, lspInfoDialog } from "./modal";
 import type { LspInfoData } from "./modal";
 import { lspStateClass, statusIcon } from "./icons";
@@ -1759,12 +1760,14 @@ export class Picker {
           h.className = "picker-row grep-header";
           // Multi-root projects prefix the root's name: `root: path`, all in the header colour.
           // The *disambiguated* label, not the raw basename — two roots sharing a basename
-          // would otherwise render identical headers (the case rootLabels exists for).
+          // would otherwise render identical headers (the case rootLabels exists for). The
+          // path segment-elides to the row budget so the filename always survives.
           if (this.projectPaths.length > 1) {
-            const label = rootLabels(this.projectPaths)[item.path_index];
-            h.textContent = `${label ?? `root ${item.path_index}`}: ${item.relative_path}`;
+            const label = rootLabels(this.projectPaths)[item.path_index] ?? `root ${item.path_index}`;
+            const budget = this.listPathBudget([...label].length + 2);
+            h.textContent = `${label}: ${truncatePath(item.relative_path, undefined, budget).display}`;
           } else {
-            h.textContent = item.relative_path;
+            h.textContent = truncatePath(item.relative_path, undefined, this.listPathBudget(0)).display;
           }
           section.append(h);
           win.append(section);
@@ -2013,11 +2016,30 @@ export class Picker {
       }
     });
     if (bestIdx < 0) return `${dir}/`;
-    const rel = dir === best ? "" : `${dir.slice(best.length + 1)}/`;
     // The *disambiguated* root label, not the basename — colliding basenames would read alike.
     const label =
       this.projectPaths.length > 1 ? `${rootLabels(this.projectPaths)[bestIdx]}/` : "";
-    return label + rel;
+    if (dir === best) return label;
+    // Segment-elide the path to the breadcrumb's share of the input row (its CSS max-width is
+    // 55%); the trailing `/` is the "you're inside this dir" cue, re-appended after.
+    const row = this.pathEl.parentElement;
+    const style = getComputedStyle(this.pathEl);
+    const px = (row ? row.clientWidth : 400) * 0.55;
+    const budget = Math.max(
+      8,
+      charBudget(px, `${style.fontSize} ${style.fontFamily}`) - [...label].length,
+    );
+    const rel = truncatePath(dir.slice(best.length + 1), undefined, budget).display;
+    return `${label}${rel}/`;
+  }
+
+  /** Approximate character budget for path text in the result list: the list's pixel width
+   *  through the shared estimator, minus `reservedChars` for siblings (bullet, suffix, meta).
+   *  CSS `text-overflow: ellipsis` stays as the safety net for the estimate's error margin. */
+  private listPathBudget(reservedChars: number): number {
+    const style = getComputedStyle(this.listEl);
+    const px = this.listEl.clientWidth - 24; // row padding
+    return Math.max(8, charBudget(px, `${style.fontSize} ${style.fontFamily}`) - reservedChars);
   }
 
   private describe(item: PickerItem): RowDesc {
@@ -2027,15 +2049,18 @@ export class Picker {
         // workspace walker skips them — so there's no `dim` case here). Multi-root projects show
         // the root's *disambiguated* label dimly after the path, matching the terminal client
         // (the raw basename would read alike for roots that share one).
+        const suffix =
+          this.projectPaths.length > 1
+            ? rootLabels(this.projectPaths)[item.path_index] ?? `root ${item.path_index}`
+            : undefined;
+        const budget = this.listPathBudget(2 + (suffix ? [...suffix].length + 2 : 0));
+        const { display, indices } = truncatePath(item.relative_path, item.match_indices, budget);
         return {
-          primary: item.relative_path,
-          primaryMatches: item.match_indices,
+          primary: display,
+          primaryMatches: indices,
           bullet: true,
           bulletStatus: item.git_status,
-          suffix:
-            this.projectPaths.length > 1
-              ? rootLabels(this.projectPaths)[item.path_index] ?? `root ${item.path_index}`
-              : undefined,
+          suffix,
         };
       }
       case "buffer":
@@ -2103,16 +2128,24 @@ export class Picker {
           bulletIcon: statusIcon(dot, dot === "lsp-busy"),
         };
       }
-      case "reference":
+      case "reference": {
         // Dim `path:line` location prefix (the distinguishing bit, since reference previews often
         // repeat), then the preview line with the fuzzy-match highlights. No leading-whitespace
-        // trim — `match_indices` index into the preview the server sent.
+        // trim — `match_indices` index into the preview the server sent. The path takes at most
+        // half the row, segment-elided so the filename + line number survive.
+        const linePart = `:${item.line + 1}`;
+        const pathBudget = Math.max(
+          8,
+          Math.floor(this.listPathBudget(0) / 2) - [...linePart].length,
+        );
+        const { display } = truncatePath(item.display_path, undefined, pathBudget);
         return {
           primary: item.preview,
           primaryMatches: item.match_indices,
-          prefix: `${item.display_path}:${item.line + 1}`,
+          prefix: `${display}${linePart}`,
           prefixClass: "picker-loc",
         };
+      }
     }
   }
 }

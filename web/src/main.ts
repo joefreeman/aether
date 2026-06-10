@@ -15,6 +15,7 @@ import { confirmDialog, saveAsDialog } from "./modal";
 import { showHelp } from "./help";
 import { lspStateClass, statusIcon } from "./icons";
 import type { IconKind } from "./icons";
+import { charBudget, truncatePath } from "./paths";
 import { WOULD_DISCARD_CHANGES, WOULD_OVERWRITE } from "./protocol";
 import {
   chordOf,
@@ -758,7 +759,15 @@ class Editor {
     const dot = this.statusDot();
     if (dot) left.append(dot);
     const proj = this.projectName ? `[${this.projectName}] ` : "";
-    left.append(`${proj}${this.label}`);
+    // The file label takes at most the left half of the bar, segment-elided so the filename
+    // survives (CSS ellipsis remains as the safety net and would otherwise eat exactly it).
+    const barStyle = getComputedStyle(this.statusEl);
+    const labelBudget = Math.max(
+      12,
+      charBudget(this.statusEl.clientWidth * 0.5, `${barStyle.fontSize} ${barStyle.fontFamily}`) -
+        [...proj].length,
+    );
+    left.append(`${proj}${truncatePath(this.label, undefined, labelBudget).display}`);
     // Git cluster next to the file label (tracked files only): `⎇  branch  [base]  +u(s) ~u(s)`,
     // where each per-class count combines the unstaged count with the staged count in parens (each
     // omitted when zero). (Diagnostics live on the right.)

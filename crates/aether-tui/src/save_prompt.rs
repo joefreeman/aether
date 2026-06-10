@@ -4,16 +4,18 @@
 //!
 //! - `Editing`: the common case. The user types a project-relative path into a single input
 //!   field. A ghost-style suggestion (gray text after the cursor) shows the first matching
-//!   directory entry; Alt-j/Alt-k cycles matches; Alt-l commits the ghost into the input. The
-//!   typed `/` is just a separator — there's no "committed path prefix" concept any more.
-//!   Alt-Backspace deletes the rightmost path segment (fish-style); at empty input it peels
+//!   directory entry; Alt-j/Alt-k cycles matches; Tab / Alt-l commits the ghost into the
+//!   input (the same accept gesture as the pickers' dir editor). The typed `/` is just a
+//!   separator — there's no "committed path prefix" concept any more. Alt-Backspace deletes
+//!   the rightmost path segment (fish-style); at empty input it (and plain Backspace) peels
 //!   into `SelectingRoot` (multi-root only).
 //!
-//! - `SelectingRoot`: only entered in multi-root projects, when the user has Alt-Backspaced
-//!   past the empty input. The user picks one of the project roots — by cycling via Alt-j/k or
-//!   by typing a smartcase prefix filter against root labels. Alt-l / Enter commits.
-//!   Alt-Backspace clears any typed filter / cycled candidate back to the bare just-peeled
-//!   state.
+//! - `SelectingRoot`: only entered in multi-root projects, when the user has Backspaced past
+//!   the empty input. The user picks one of the project roots — by cycling via Alt-j/k
+//!   (wrapping, like the dir editor's root typeahead) or by typing a smartcase prefix filter
+//!   against root labels. Tab / Alt-l / Enter commits, as does typing `:` on a completed
+//!   label. Alt-Backspace clears any typed filter / cycled candidate back to the bare
+//!   just-peeled state.
 //!
 //! In multi-root projects the chosen root's label renders as a blue committed prefix to the
 //! left of the editable area. The label is not part of the input — you can't type into it.
@@ -183,7 +185,9 @@ impl SavePromptState {
     }
 
     /// Backspace: deletes one char from `input`. If the dir portion shrank (the deleted char
-    /// was a `/`, or backspacing into a previous segment), trigger a refetch.
+    /// was a `/`, or backspacing into a previous segment), trigger a refetch. At an *empty*
+    /// Editing input, peels into `SelectingRoot` (multi-root only) — the same leftward
+    /// gesture the dir editor uses to step from the path back into the root segment.
     pub fn backspace(&mut self, project_paths: &[String]) -> TransitionHint {
         match &mut self.mode {
             PromptMode::SelectingRoot(sr) => {
@@ -192,6 +196,16 @@ impl SavePromptState {
                 TransitionHint::None
             }
             PromptMode::Editing(e) => {
+                if self.input.text.is_empty() {
+                    if project_paths.len() > 1 {
+                        let from_root = e.path_index;
+                        self.mode = PromptMode::SelectingRoot(SelectingRoot {
+                            from_root,
+                            suggestion_idx: from_root as usize,
+                        });
+                    }
+                    return TransitionHint::None;
+                }
                 let dir_before = dir_of_input(&self.input.text).to_string();
                 self.input.backspace();
                 e.suggestion_idx = 0;
@@ -426,8 +440,10 @@ impl SavePromptState {
     }
 
     /// Step one position through the filtered project roots (used by Alt-j / Alt-k in
-    /// SelectingRoot). Same shape as the Editing ghost cycle: clamp to `[0, matches.len() - 1]`,
-    /// no wrap.
+    /// SelectingRoot). Wraps at both ends, matching the dir editor's root typeahead — the
+    /// root set is small and cycling round beats bumping into an edge. (The Editing ghost
+    /// cycle still clamps: directory listings can be long, and wrapping there loses track of
+    /// where you are.)
     fn cycle_root(&mut self, project_paths: &[String], delta: i32) {
         let PromptMode::SelectingRoot(sr) = &mut self.mode else {
             return;
@@ -440,9 +456,9 @@ impl SavePromptState {
         if matches.is_empty() {
             return;
         }
-        let new =
-            (sr.suggestion_idx as i64 + delta as i64).clamp(0, matches.len() as i64 - 1) as usize;
-        sr.suggestion_idx = new;
+        let n = matches.len() as i64;
+        let sel = (sr.suggestion_idx as i64).min(n - 1);
+        sr.suggestion_idx = (sel + delta as i64).rem_euclid(n) as usize;
     }
 
     /// Transition from `SelectingRoot` back to a fresh `Editing` at the chosen root. Input is
@@ -836,6 +852,45 @@ mod tests {
         s.input.set("src");
         s.alt_backspace(&paths());
         assert_eq!(s.input.text, "");
+    }
+
+    #[test]
+    fn plain_backspace_at_empty_input_peels_into_selecting_root() {
+        // The same leftward gesture the dir editor uses to step from the path back into the
+        // root segment; single-root projects no-op (there's no root to pick).
+        let multi = vec!["/a".into(), "/b".into()];
+        let mut s = SavePromptState::open_for_scratch(&multi).0;
+        let h = s.backspace(&multi);
+        assert_eq!(h, TransitionHint::None);
+        assert!(matches!(s.mode, PromptMode::SelectingRoot(_)));
+        let mut single = editing_at_root(&paths());
+        single.backspace(&paths());
+        assert!(matches!(single.mode, PromptMode::Editing(_)));
+    }
+
+    #[test]
+    fn selecting_root_cycle_wraps() {
+        // Root cycling wraps at both ends, matching the dir editor's root typeahead.
+        let multi = vec!["/a".into(), "/b".into(), "/c".into()];
+        let mut s = editing_at_root(&multi);
+        s.alt_backspace(&multi); // → SelectingRoot, suggestion on from_root (= /a, idx 0)
+        s.alt_k(&multi); // up from the first match wraps to the last
+        assert_eq!(s.ghost_suffix(&multi).as_deref(), Some("c"));
+        s.alt_j(&multi); // and back down wraps to the first
+        assert_eq!(s.ghost_suffix(&multi).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn selecting_root_completed_label_has_empty_ghost_suffix() {
+        // The `:`-commits-a-completed-root binding keys off ghost_suffix == "" — typing the
+        // full label leaves nothing for the ghost to add.
+        let multi = vec!["/apple".into(), "/banana".into()];
+        let mut s = editing_at_root(&multi);
+        s.alt_backspace(&multi);
+        for c in "apple".chars() {
+            s.type_char(c, &multi);
+        }
+        assert_eq!(s.ghost_suffix(&multi).as_deref(), Some(""));
     }
 
     #[test]
