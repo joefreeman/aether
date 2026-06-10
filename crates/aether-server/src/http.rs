@@ -8,12 +8,14 @@
 //! downstream handler (the WS handshake, or our own request reader) re-reads the full request.
 //!
 //! Serving: the server owns a fixed `index.html` (the `INDEX_HTML` shell below) and serves only the
-//! built JS/CSS bundle from `web/dist/assets/*` on disk. The shell references stable, unhashed asset
+//! built JS/CSS bundle from `web/dist/assets/*`. The shell references stable, unhashed asset
 //! paths (`/assets/index.js`, `/assets/index.css` — pinned in `web/vite.config.ts`), so it never
-//! changes between builds: `index.html` isn't a build artifact, only the bundle is. The dist path is
-//! baked from `CARGO_MANIFEST_DIR`, so a rebuilt bundle is picked up with no rebuild of the daemon
-//! (fine for a single-machine personal editor; not relocatable). Asset responses carry
-//! `Cache-Control: no-store` since the unhashed names can't cache-bust.
+//! changes between builds: `index.html` isn't a build artifact, only the bundle is. **Release
+//! builds embed the bundle in the executable** (`include_bytes!`), making the binary
+//! self-contained and relocatable; **debug builds read `web/dist` from disk** on every request
+//! (path baked from `CARGO_MANIFEST_DIR`), so a rebuilt bundle is picked up with no rebuild of
+//! the daemon. Asset responses carry `Cache-Control: no-store` since the unhashed names can't
+//! cache-bust.
 //!
 //! Authorization: there is no token. The listener is loopback-only, and both transports reject any
 //! request whose `Host` (and, for browser clients, `Origin`) isn't our loopback authority — see
@@ -23,11 +25,13 @@
 
 use crate::state::SharedState;
 use anyhow::Context;
-use std::path::{Path, PathBuf};
+use std::borrow::Cow;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Built web-client output directory (just the JS/CSS bundle), resolved at compile time.
+/// Debug builds serve from here; release builds embed the files instead.
+#[cfg(debug_assertions)]
 const WEB_DIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/dist");
 
 /// The page served at `/`: a fixed shell that loads the stable-named bundle from `web/dist/assets`.
@@ -115,9 +119,14 @@ async fn serve_http(mut stream: TcpStream) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load a built asset by its URL-relative path (e.g. `assets/index.js`) from `web/dist`.
-/// Returns the bytes and a content type, or `None` if the path escapes the dist dir or is missing.
-fn load_asset(rel: &str) -> Option<(Vec<u8>, &'static str)> {
+/// Load a built asset by its URL-relative path (e.g. `assets/index.js`). Returns the bytes and a
+/// content type, or `None` for anything that isn't a known asset.
+///
+/// Debug: read from `web/dist` on disk, so an `npm run build` is served immediately. The asset
+/// set is open-ended here (any file under dist), with a `..`-traversal guard.
+#[cfg(debug_assertions)]
+fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
+    use std::path::{Path, PathBuf};
     if rel.contains("..") {
         return None;
     }
@@ -132,7 +141,28 @@ fn load_asset(rel: &str) -> Option<(Vec<u8>, &'static str)> {
         Some("woff") => "font/woff",
         _ => "application/octet-stream",
     };
-    Some((bytes, content_type))
+    Some((Cow::Owned(bytes), content_type))
+}
+
+/// Release: the bundle is embedded in the executable at compile time — the binary is fully
+/// self-contained and `web/dist` need not exist on the running machine. The asset set is the
+/// stable two-file contract pinned in `web/vite.config.ts` (and referenced by `INDEX_HTML`); a
+/// new asset needs a new arm here, and a missing dist fails the release build loudly. Cargo
+/// tracks the included files, so a rebuilt bundle triggers a daemon rebuild on its own.
+#[cfg(not(debug_assertions))]
+fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
+    let (bytes, content_type): (&'static [u8], &'static str) = match rel {
+        "assets/index.js" => (
+            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/dist/assets/index.js")),
+            "text/javascript; charset=utf-8",
+        ),
+        "assets/index.css" => (
+            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/dist/assets/index.css")),
+            "text/css; charset=utf-8",
+        ),
+        _ => return None,
+    };
+    Some((Cow::Borrowed(bytes), content_type))
 }
 
 /// Read until the end of the HTTP header block (`\r\n\r\n`). We only serve GETs with no body, so
