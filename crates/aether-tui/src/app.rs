@@ -1264,6 +1264,7 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
                     p.total_matches,
                     p.total_candidates,
                     p.ticking,
+                    p.grep_total_display_rows,
                 );
                 // `apply_update` may snap `selected` (resume re-anchor, or `pending_offset`
                 // reconciliation) without touching `visible_start`. Slide the window now so the
@@ -2281,10 +2282,12 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
     }
 
     // LSP-servers detail drill-down: the body shows one server's status/error. Keys scroll it;
-    // Esc returns to the list (the picker stays open). Read-only — all other keys are swallowed.
+    // Esc returns to the list (the picker stays open); `r` restarts the server (matching the web
+    // dialog's shortcut). All other keys are swallowed.
     if state.picker.lsp_detail.is_some() {
         match k.code {
             KeyCode::Esc => state.picker.lsp_detail = None,
+            KeyCode::Char('r') => lsp_detail_restart(client, state).await?,
             KeyCode::Up => detail_scroll(state, -1),
             KeyCode::Down => detail_scroll(state, 1),
             KeyCode::PageUp => detail_page(state, false),
@@ -3351,6 +3354,22 @@ async fn lsp_picker_restart(client: &mut Client, state: &mut AppState) -> Result
     };
     let language = language.clone();
     let name = name.clone();
+    client
+        .rpc::<LspRestartServer>(LspRestartServerParams { language })
+        .await?;
+    state.status = StatusMessage::info(format!("restarting {name}"));
+    Ok(())
+}
+
+/// Restart the server shown in the LSP detail drill-down (`r`, the web dialog's shortcut).
+/// Fire-and-forget like the list's Ctrl-r; the detail stays open and the server's
+/// `lsp/status_changed` pushes re-render it live.
+async fn lsp_detail_restart(client: &mut Client, state: &mut AppState) -> Result<()> {
+    let Some(d) = state.picker.lsp_detail.as_ref() else {
+        return Ok(());
+    };
+    let language = d.language.clone();
+    let name = d.name.clone();
     client
         .rpc::<LspRestartServer>(LspRestartServerParams { language })
         .await?;

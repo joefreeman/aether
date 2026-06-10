@@ -2,6 +2,8 @@
 //! user's choice, so callers can `await` them. The caller is responsible for suspending the editor
 //! keymap while one is open (Editor.modalOpen); these handle their own keys (Enter/Esc/buttons).
 
+import { lspStateClass, statusIcon } from "./icons";
+
 function overlay(): HTMLElement {
   const el = document.createElement("div");
   el.className = "overlay"; // same top offset as pickers (confirmDialog adds confirm-overlay to sit lower)
@@ -97,7 +99,14 @@ export function lspInfoDialog(info: LspInfoData): LspInfoHandle {
     rows.className = "lsp-info-rows";
     // Rebuild the title + rows from `info`; called once at open and again on each live update.
     const render = (info: LspInfoData) => {
-      title.textContent = info.name;
+      // Status icon + bold name title — the same SVG icon (and colour) as the status bar and
+      // the picker rows (busy = ready + active progress, spinning like the status bar).
+      const busy = info.state === "ready" && (info.progress?.length ?? 0) > 0;
+      const kind = busy ? "lsp-busy" : lspStateClass(info.state);
+      const dot = document.createElement("span");
+      dot.className = `lsp-info-dot ${kind}`;
+      dot.append(statusIcon(kind, kind === "lsp-busy"));
+      title.replaceChildren(dot, info.name);
       rows.replaceChildren();
       const addRow = (label: string, value: string, valueCls?: string) => {
         const k = document.createElement("div");
@@ -108,9 +117,9 @@ export function lspInfoDialog(info: LspInfoData): LspInfoHandle {
         v.textContent = value;
         rows.append(k, v);
       };
+      // No Status row — the title dot's colour plus the Error/Working rows already say it.
       addRow("Language", info.language);
       addRow("Workspace", info.workspaceRoot);
-      addRow("Status", info.state, `lsp-${info.state}`);
       if (info.message) addRow("Error", info.message, "sev-error");
       for (const [i, p] of (info.progress ?? []).entries()) {
         addRow(i === 0 ? "Working" : "", p, "lsp-busy");

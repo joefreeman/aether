@@ -12,6 +12,8 @@ import { decodeRow } from "./text";
 import { readClipboard, writeClipboard } from "./clipboard";
 import { confirmDialog, saveAsDialog } from "./modal";
 import { showHelp } from "./help";
+import { lspStateClass, statusIcon } from "./icons";
+import type { IconKind } from "./icons";
 import { WOULD_DISCARD_CHANGES, WOULD_OVERWRITE } from "./protocol";
 import {
   chordOf,
@@ -292,36 +294,7 @@ function relativeTime(unixSeconds: number): string {
   return "just now";
 }
 
-// Status-bar icons — drawn as inline SVG (currentColor, so the severity/LSP colour classes apply).
-type IconKind =
-  | "error"
-  | "warning"
-  | "info"
-  | "hint"
-  | "lsp-ready"
-  | "lsp-busy"
-  | "lsp-crashed"
-  | "lsp-stopped";
-
-const ICONS: Record<IconKind, string> = {
-  error: '<circle cx="8" cy="8" r="6.25"/><path d="M5.6 5.6l4.8 4.8M10.4 5.6l-4.8 4.8"/>',
-  warning:
-    '<path d="M8 2.4l6.1 11H1.9z"/><path d="M8 6.7v3"/><circle cx="8" cy="11.4" r="0.75" fill="currentColor" stroke="none"/>',
-  info: '<circle cx="8" cy="8" r="6.25"/><path d="M8 7.7v3.1"/><circle cx="8" cy="5.2" r="0.75" fill="currentColor" stroke="none"/>',
-  hint: '<path d="M8 2.4a3.6 3.6 0 0 0-2.2 6.5c.4.3.6.7.6 1.1v.4h3.2v-.4c0-.4.2-.8.6-1.1A3.6 3.6 0 0 0 8 2.4z"/><path d="M6.8 12.6h2.4M7.3 13.9h1.4"/>',
-  "lsp-ready": '<path d="M3.8 8.5l2.7 2.6L12.2 5.2"/>',
-  "lsp-busy": '<path d="M8 2.7a5.3 5.3 0 1 1-5 3.6"/>',
-  "lsp-crashed": '<path d="M5.2 5.2l5.6 5.6M10.8 5.2l-5.6 5.6"/>',
-  "lsp-stopped": '<circle cx="8" cy="8" r="4.2"/>',
-};
-
-function statusIcon(kind: IconKind, spin = false): SVGSVGElement {
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", "0 0 16 16");
-  svg.setAttribute("class", spin ? "status-icon spin" : "status-icon");
-  svg.innerHTML = ICONS[kind];
-  return svg;
-}
+// Status-bar icons live in icons.ts (shared with the LSP picker rows and info dialog).
 
 interface PendingFind {
   dir: Direction;
@@ -978,19 +951,10 @@ class Editor {
     if (!this.lspServerRef) return null;
     const s = this.lspStatuses.get(lspKey(this.lspServerRef.language, this.lspServerRef.workspace_root));
     if (!s) return null;
-    switch (s.status.state) {
-      case "ready":
-        // Background work in flight (indexing, cargo check) → busy spinner, like the TUI.
-        return (s.progress?.length ?? 0) > 0
-          ? { kind: "lsp-busy", cls: "lsp-busy" }
-          : { kind: "lsp-ready", cls: "lsp-ready" };
-      case "crashed":
-        return { kind: "lsp-crashed", cls: "lsp-crashed" };
-      case "stopped":
-        return { kind: "lsp-stopped", cls: "lsp-stopped" };
-      default:
-        return { kind: "lsp-busy", cls: "lsp-busy" }; // starting / initializing / restarting
-    }
+    // Background work in flight (indexing, cargo check) → busy spinner, like the TUI.
+    const busy = s.status.state === "ready" && (s.progress?.length ?? 0) > 0;
+    const kind = busy ? "lsp-busy" : lspStateClass(s.status.state);
+    return { kind, cls: kind };
   }
 
   // ---- keyboard -------------------------------------------------------------------------------

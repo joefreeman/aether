@@ -244,10 +244,11 @@ fn hover_layout(state: &AppState, area: Rect) -> Option<HoverLayout> {
         return None;
     }
     let needs_scrollbar = full.len() as u16 > max_body;
+    // The scrollbar takes the last column plus a blank gap column before it.
     let (lines, text_w) = if needs_scrollbar {
         (
-            hover_display_lines(&hover.blocks, content_w.saturating_sub(1) as usize),
-            content_w - 1,
+            hover_display_lines(&hover.blocks, content_w.saturating_sub(2) as usize),
+            content_w.saturating_sub(2),
         )
     } else {
         (full, content_w)
@@ -413,13 +414,14 @@ fn draw_help_overlay(f: &mut Frame, state: &AppState, area: Rect) {
         height: content.height - 2,
         ..content
     };
-    // Reserve the rightmost column for a scrollbar when the tab is taller than the body (same cue
-    // as the picker). Decided from a full-width layout; if the scrollbar is shown we re-wrap to the
-    // narrower text area, which can only add lines (so the bar stays warranted).
+    // Reserve the rightmost column for a scrollbar (plus a blank gap column before it) when the
+    // tab is taller than the body (same cue as the picker). Decided from a full-width layout; if
+    // the scrollbar is shown we re-wrap to the narrower text area, which can only add lines (so
+    // the bar stays warranted).
     let full = help_lines(state.help.tab, body.width as usize);
     let needs_scrollbar = full.len() as u16 > body.height;
     let (lines, text_width) = if needs_scrollbar {
-        let tw = body.width.saturating_sub(1);
+        let tw = body.width.saturating_sub(2);
         (help_lines(state.help.tab, tw as usize), tw)
     } else {
         (full, body.width)
@@ -439,7 +441,7 @@ fn draw_help_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     f.render_widget(para, text_area);
     if needs_scrollbar {
         let bar = Rect {
-            x: body.x + text_width,
+            x: body.x + body.width.saturating_sub(1),
             width: 1,
             ..body
         };
@@ -1460,6 +1462,36 @@ fn picker_box_rect(area: Rect) -> Rect {
     }
 }
 
+/// Rows the full result set needs in the results pane — what the picker box collapses to when
+/// that's shorter than the full-size box (mirroring the web client, whose list shrinks to fit
+/// content). Grep uses the server-reported display-row total (hits + per-file headers); the
+/// References empty states need one row for their message; the client-side synthetic
+/// "Create …" row isn't counted in `total_matches`.
+fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
+    use aether_protocol::picker::PickerKind;
+    if picker.kind == Some(PickerKind::References) && picker.items.is_empty() {
+        return 1; // "Finding references…" / "No references found"
+    }
+    if picker.kind == Some(PickerKind::Grep) {
+        return picker.total_display_rows.unwrap_or(picker.total_matches);
+    }
+    picker.total_matches + picker.synthetic_create_idx.is_some() as u32
+}
+
+/// The picker box, collapsed to its content when the result set is shorter than the full-size
+/// box (matching the web client). The top edge stays where the full-size box's top is — only
+/// the bottom edge moves — so the input row doesn't jump as the result count changes. Chrome
+/// around the results pane is 4 rows (borders + input + separator); with no content at all the
+/// separator is dropped too, since it would double up against the bottom border.
+fn collapsed_picker_box_rect(area: Rect, content_rows: u32) -> Rect {
+    let full = picker_box_rect(area);
+    let chrome: u32 = if content_rows == 0 { 3 } else { 4 };
+    let height = content_rows
+        .saturating_add(chrome)
+        .min(full.height as u32) as u16;
+    Rect { height, ..full }
+}
+
 /// Scale one box dimension: returns `dim` itself when `dim <= min` (no padding), `dim *
 /// target_pct/100` when `dim >= max` (full padding), and interpolates the percentage linearly
 /// from 100% down to `target_pct` in between.
@@ -1549,8 +1581,17 @@ pub fn picker_visible_item_count_from(
 }
 
 fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
-    let box_area = picker_box_rect(area);
-    if box_area.width < 4 || box_area.height < 4 {
+    // The LSP drill-down keeps the full-size box (its content is wrapped prose, not result
+    // rows); everything else collapses to its content.
+    let lsp_detail_open = state.picker.kind
+        == Some(aether_protocol::picker::PickerKind::LspServers)
+        && state.picker.lsp_detail.is_some();
+    let box_area = if lsp_detail_open {
+        picker_box_rect(area)
+    } else {
+        collapsed_picker_box_rect(area, picker_content_rows(&state.picker))
+    };
+    if box_area.width < 4 || box_area.height < 3 {
         return; // Too small to draw anything meaningful.
     }
     f.render_widget(Clear, box_area);
@@ -1587,58 +1628,49 @@ fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     draw_picker_results(f, state, pad_horizontal(rows[2]));
 }
 
-/// The LSP-server detail drill-down: a single scrollable region holding the title (health glyph +
-/// name + language), then the workspace root, state, and — for a crashed server — the captured
-/// error (e.g. typescript-language-server's "Could not find a valid TypeScript installation").
-/// No input/separator split, so it doesn't masquerade as a filter box. Pre-wrapped so the
-/// scrollbar geometry is exact.
+/// The LSP-server detail drill-down: a status dot + bold name title, then labelled rows —
+/// Language / Workspace / Error (crashed only) / Working (active progress) — matching the web
+/// client's dialog field-for-field. The lifecycle state itself has no row: the dot's colour and
+/// the presence of an Error/Working row already say it. No input/separator split, so it doesn't
+/// masquerade as a filter box. Pre-wrapped so the scrollbar geometry is exact.
 fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area: Rect) {
-    let text_w = area.width.saturating_sub(1).max(1); // reserve a column for the scrollbar
-    let (glyph, glyph_color) = lsp_status_glyph(&detail.status);
-    let (label, label_color) = lsp_status_label(&detail.status);
+    let text_w = area.width.saturating_sub(2).max(1); // reserve the scrollbar column + a gap
+    let busy = matches!(detail.status, LspStatus::Ready) && !detail.progress.is_empty();
+    let dot_color = if busy {
+        NORD13
+    } else {
+        lsp_status_color(&detail.status)
+    };
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-            Span::styled(detail.name.clone(), Style::default().fg(NORD4).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {}", detail.language), Style::default().fg(NORD3)),
+            Span::styled("• ".to_string(), Style::default().fg(dot_color)),
+            Span::styled(
+                detail.name.clone(),
+                Style::default().fg(NORD4).add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("root    {}", detail.workspace_root),
-            Style::default().fg(NORD3),
-        )),
-        Line::from(vec![
-            Span::styled("status  ", Style::default().fg(NORD3)),
-            Span::styled(label, Style::default().fg(label_color)),
-        ]),
     ];
-    if !detail.progress.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("working", Style::default().fg(NORD3))));
-        for p in &detail.progress {
-            let mut text = format!("  {}", p.title);
-            if let Some(pct) = p.percentage {
-                text.push_str(&format!(" {pct}%"));
-            }
-            if let Some(msg) = &p.message {
-                text.push_str(&format!("  {msg}"));
-            }
-            for w in wrap_words(&text, text_w as usize) {
-                lines.push(Line::from(Span::styled(w, Style::default().fg(NORD13))));
-            }
-        }
-    }
+    let w = text_w as usize;
+    push_lsp_detail_row(&mut lines, "Language", &detail.language, NORD4, w);
+    push_lsp_detail_row(&mut lines, "Workspace", &detail.workspace_root, NORD4, w);
     if let LspStatus::Crashed { code, message } = &detail.status {
-        lines.push(Line::from(""));
-        for w in wrap_words(message, text_w as usize) {
-            lines.push(Line::from(Span::styled(w, Style::default().fg(NORD11))));
-        }
+        let mut msg = message.clone();
         if let Some(c) = code {
-            lines.push(Line::from(Span::styled(
-                format!("exit code {c}"),
-                Style::default().fg(NORD3),
-            )));
+            msg.push_str(&format!(" (exit code {c})"));
         }
+        push_lsp_detail_row(&mut lines, "Error", &msg, NORD11, w);
+    }
+    for (i, p) in detail.progress.iter().enumerate() {
+        let mut text = p.title.clone();
+        if let Some(pct) = p.percentage {
+            text.push_str(&format!(" {pct}%"));
+        }
+        if let Some(msg) = &p.message {
+            text.push_str(&format!("  {msg}"));
+        }
+        // The label appears once; further operations keep the value column.
+        push_lsp_detail_row(&mut lines, if i == 0 { "Working" } else { "" }, &text, NORD13, w);
     }
     let total = lines.len() as u16;
     let body_h = area.height;
@@ -1655,15 +1687,24 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
     }
 }
 
-/// Word label + color for an LSP server's lifecycle state (matches the glyph colors).
-fn lsp_status_label(status: &LspStatus) -> (&'static str, Color) {
-    match status {
-        LspStatus::Ready => ("ready", NORD14),
-        LspStatus::Starting => ("starting", NORD13),
-        LspStatus::Initializing => ("initializing", NORD13),
-        LspStatus::Restarting => ("restarting", NORD13),
-        LspStatus::Crashed { .. } => ("crashed", NORD11),
-        LspStatus::Stopped => ("stopped", NORD3),
+/// One labelled row of the LSP detail: a dim `Label` column, then the value in `color`, wrapped
+/// to the remaining width with continuation lines indented to the value column. An empty label
+/// keeps the column (wrap continuations; second and later Working operations).
+fn push_lsp_detail_row(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    value: &str,
+    color: Color,
+    total_w: usize,
+) {
+    const KEY_W: usize = 12; // "Workspace" + gap — mirrors the web dialog's label column
+    let val_w = total_w.saturating_sub(KEY_W).max(8);
+    for (i, wrapped) in wrap_words(value, val_w).into_iter().enumerate() {
+        let lbl = if i == 0 { label } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{lbl:<KEY_W$}"), Style::default().fg(NORD3)),
+            Span::styled(wrapped, Style::default().fg(color)),
+        ]));
     }
 }
 
@@ -1816,16 +1857,18 @@ fn explorer_input_prefix(state: &AppState, available: usize) -> (String, String)
     (String::new(), format!("…{kept}"))
 }
 
+/// Placeholder for the picker's query input: the picker's action, ellipsised. Kept in sync with
+/// the web client's `PLACEHOLDER` map (web/src/picker.ts).
 fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'static str {
     match kind {
-        Some(aether_protocol::picker::PickerKind::Files) => "Search files…",
+        Some(aether_protocol::picker::PickerKind::Files) => "Find files…",
         Some(aether_protocol::picker::PickerKind::Buffers) => "Switch buffer…",
         Some(aether_protocol::picker::PickerKind::Grep) => "Grep workspace…",
-        Some(aether_protocol::picker::PickerKind::Explorer) => "Filter entries…",
+        Some(aether_protocol::picker::PickerKind::Explorer) => "Explore files…",
         Some(aether_protocol::picker::PickerKind::Projects) => "Switch project…",
-        Some(aether_protocol::picker::PickerKind::Diagnostics) => "Filter diagnostics…",
-        Some(aether_protocol::picker::PickerKind::LspServers) => "Filter servers…",
-        Some(aether_protocol::picker::PickerKind::References) => "Filter references…",
+        Some(aether_protocol::picker::PickerKind::Diagnostics) => "List diagnostics…",
+        Some(aether_protocol::picker::PickerKind::LspServers) => "List LSPs…",
+        Some(aether_protocol::picker::PickerKind::References) => "List references…",
         None => "Search…",
     }
 }
@@ -1834,6 +1877,9 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
 /// so the separator visually ties into the outer block — done by writing directly to the frame
 /// buffer because the block has already been rendered.
 fn draw_picker_separator(f: &mut Frame, box_area: Rect, area: Rect) {
+    if area.height == 0 {
+        return; // collapsed empty picker: no separator (its y would sit on the bottom border)
+    }
     let line: String = "─".repeat(area.width as usize);
     f.render_widget(
         Paragraph::new(line).style(Style::default().fg(NORD4).bg(NORD0)),
@@ -1873,11 +1919,11 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         return;
     }
 
-    // Reserve the rightmost column for the scroll indicator when the result set is taller than
-    // the visible window. Otherwise use the full width for paths.
+    // Reserve the rightmost column for the scroll indicator (plus a blank gap column before it)
+    // when the result set is taller than the visible window. Otherwise use the full width.
     let needs_scrollbar = state.picker.total_matches as u16 > area.height;
     let text_width = if needs_scrollbar {
-        area.width.saturating_sub(1)
+        area.width.saturating_sub(2)
     } else {
         area.width
     };
@@ -1959,6 +2005,16 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
                 span.style = span.style.add_modifier(Modifier::ITALIC);
             }
         }
+        // Extend the selection background to the pane's full width — the item spans only carry
+        // their text. (Grep hits already pad to the edge for the right-aligned line number, so
+        // their pad here is zero.)
+        if highlighted {
+            let used: usize = spans.iter().map(|s| s.content.width()).sum();
+            let pad = (text_width as usize).saturating_sub(used);
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), Style::default().bg(NORD2)));
+            }
+        }
         lines.push(Line::from(spans));
     }
     f.render_widget(
@@ -1968,7 +2024,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
 
     if needs_scrollbar {
         let scrollbar = Rect {
-            x: area.x + text_width,
+            x: area.x + area.width.saturating_sub(1), // last column; a gap column sits before it
             y: area.y,
             width: 1,
             height: area.height,
@@ -2213,49 +2269,45 @@ fn buffer_dirty_dot_color(status: BufferDirtyState) -> Option<Color> {
     }
 }
 
-/// Header row above each file's hits in the Grep picker. Renders as `{label}: {relative}` with
-/// the label in NORD4 (white, matches the label style on File rows) and the separator + path in
-/// NORD8 (frost blue) so the file path stays the dominant visual element. Non-selectable; the
-/// picker cursor lives on the GrepHit rows below.
+/// Header row above each file's hits in the Grep picker: `{label}: {relative}` (the label only
+/// for multi-root projects), all in NORD8 (frost blue), bold. Non-selectable; the picker cursor
+/// lives on the GrepHit rows below.
 fn grep_file_header_spans(
     path_index: u32,
     relative_path: &str,
     root_labels: &[String],
     max_width: usize,
 ) -> Vec<Span<'static>> {
-    let label_style = Style::default()
-        .fg(NORD4)
-        .bg(NORD0)
-        .add_modifier(Modifier::BOLD);
-    let path_style = Style::default()
+    let style = Style::default()
         .fg(NORD8)
         .bg(NORD0)
         .add_modifier(Modifier::BOLD);
     let label = root_label_or_blank(root_labels, path_index);
-    if label.is_empty() {
-        let (display, _) = truncate_path_with_indices(relative_path, &[], max_width);
-        return vec![Span::styled(display, path_style)];
-    }
-    // Reserve space for `{label}: ` first; whatever remains goes to the path.
-    let prefix = format!("{label}: ");
-    let prefix_w = prefix.width();
-    if prefix_w >= max_width {
-        // Box is too narrow to hold even the label — fall back to truncating the combined form.
-        let display_raw = format!("{prefix}{relative_path}");
-        let (display, _) = truncate_path_with_indices(&display_raw, &[], max_width);
-        return vec![Span::styled(display, label_style)];
-    }
-    let path_budget = max_width - prefix_w;
-    let (path_display, _) = truncate_path_with_indices(relative_path, &[], path_budget);
-    vec![
-        Span::styled(prefix, label_style),
-        Span::styled(path_display, path_style),
-    ]
+    let combined = if label.is_empty() {
+        relative_path.to_string()
+    } else {
+        format!("{label}: {relative_path}")
+    };
+    let (display, _) = truncate_path_with_indices(&combined, &[], max_width);
+    vec![Span::styled(display, style)]
 }
 
-/// File picker row: `{label}: {relative}` with the label in a dim foreground (NORD3) and the
-/// relative path styled like other picker items, including the fuzzy-match highlight. The
-/// label is plain text — match indices in the protocol always index into `relative_path` only.
+/// Dim foreground for secondary text on a picker row (root labels, line numbers, locations,
+/// metadata tails). NORD3 is a neighbouring Polar Night shade to the NORD2 selection background
+/// and all but vanishes on it, so the highlighted row brightens its dim spans to NORD4 — the
+/// same treatment the web client gives `.picker-row.selected` metadata.
+fn picker_dim_fg(highlighted: bool) -> Color {
+    if highlighted {
+        NORD4
+    } else {
+        NORD3
+    }
+}
+
+/// File picker row: `{relative}  {label}` — the relative path styled like other picker items
+/// (fuzzy-match highlight included), then for multi-root projects the root's label in a dim
+/// foreground (NORD3) after it. The label is plain text — match indices in the protocol always
+/// index into `relative_path` only.
 fn file_item_spans(
     path_index: u32,
     relative_path: &str,
@@ -2268,23 +2320,22 @@ fn file_item_spans(
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
-    let label_style = Style::default().fg(NORD3).bg(bg);
+    let label_style = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
     let label = root_label_or_blank(root_labels, path_index);
-    let prefix = if label.is_empty() {
+    let suffix = if label.is_empty() {
         String::new()
     } else {
-        format!("{label}: ")
+        format!("  {label}")
     };
-    let prefix_w = prefix.width();
-    // Two-col leading status bullet, like the explorer; subtract it (and the prefix) from the budget.
-    let relative_budget = max_width.saturating_sub(2).saturating_sub(prefix_w);
+    // Two-col leading status bullet, like the explorer; subtract it (and the suffix) from the budget.
+    let relative_budget = max_width.saturating_sub(2).saturating_sub(suffix.width());
     let (display, indices) =
         truncate_path_with_indices(relative_path, match_indices, relative_budget);
     let mut spans: Vec<Span<'static>> = vec![git_status_bullet_span(git_status, bg)];
-    if !prefix.is_empty() {
-        spans.push(Span::styled(prefix, label_style));
-    }
     push_styled_with_match_indices(&mut spans, &display, &indices, base, match_style);
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix, label_style));
+    }
     spans
 }
 
@@ -2355,9 +2406,10 @@ fn push_styled_with_match_indices(
     }
 }
 
-/// One Grep hit row: indented under the file header, line number left-padded to a small fixed
-/// width in a dim color, then the preview with `match_indices` highlighted the same way the
-/// fuzzy-match-tinted Files/Buffers rows are.
+/// One Grep hit row: the preview (leading whitespace stripped) with `match_indices` highlighted,
+/// then the line number right-aligned at the row's edge in a dim colour — mirroring the web
+/// client's layout. An overflowing preview is cut with a dim `…` so the line number (plus at
+/// least a 2-col gap) always stays visible, whatever its digit count.
 fn grep_hit_spans(
     line: u32,
     preview: &str,
@@ -2368,67 +2420,55 @@ fn grep_hit_spans(
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
-    let line_style = base.fg(NORD3);
-    let indent = "  ";
-    // Line numbers in this codebase happily fit in 5 cols; widen as needed for huge files.
-    let line_str = format!("{:>5} ", line + 1);
-    let prefix_w = indent.width() + line_str.width();
-    let preview_budget = max_width.saturating_sub(prefix_w);
+    let dim_style = base.fg(picker_dim_fg(highlighted));
+    let gap = 2; // minimum gap between the preview and the line number
 
-    let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(indent.to_string(), base),
-        Span::styled(line_str, line_style),
-    ];
-
-    // Truncate the preview from the right when it overflows; drop match indices that fall past
-    // the cut. Centering on the first match would be a nicer follow-up; for now long lines just
-    // show their head, which is usually where the interesting prefix is anyway.
-    let truncated: String = preview
-        .chars()
-        .scan(0usize, |w, c| {
-            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            if *w + cw > preview_budget {
-                None
-            } else {
-                *w += cw;
-                Some(c)
-            }
-        })
-        .collect();
-    let kept_char_count = truncated.chars().count() as u32;
-    let kept_indices: Vec<u32> = match_indices
+    // Indentation is noise in a flat hit list — strip it. `match_indices` are char offsets into
+    // the untrimmed preview, so shift them down by the stripped char count (indices that fall
+    // inside the stripped whitespace itself drop out).
+    let trimmed = preview.trim_start();
+    let lead_chars = (preview.chars().count() - trimmed.chars().count()) as u32;
+    let shifted: Vec<u32> = match_indices
         .iter()
-        .copied()
-        .filter(|&i| i < kept_char_count)
+        .filter_map(|i| i.checked_sub(lead_chars))
         .collect();
 
-    if kept_indices.is_empty() {
-        spans.push(Span::styled(truncated, base));
+    let line_str = (line + 1).to_string();
+    let preview_budget = max_width.saturating_sub(gap + line_str.width());
+
+    // Truncate the preview from the right when it overflows, marking the cut with a `…` (which
+    // takes one of the budget's columns); drop match indices that fall past the cut.
+    let (shown, ellipsis) = if trimmed.width() <= preview_budget {
+        (trimmed.to_string(), false)
     } else {
-        let mut current = String::new();
-        let mut current_is_match = false;
-        let mut idx_iter = kept_indices.iter().copied().peekable();
-        for (ci, ch) in truncated.chars().enumerate() {
-            let is_match = idx_iter.peek().copied() == Some(ci as u32);
-            if is_match {
-                idx_iter.next();
-            }
-            if is_match != current_is_match && !current.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut current),
-                    if current_is_match { match_style } else { base },
-                ));
-            }
-            current_is_match = is_match;
-            current.push(ch);
-        }
-        if !current.is_empty() {
-            spans.push(Span::styled(
-                current,
-                if current_is_match { match_style } else { base },
-            ));
-        }
+        let text_budget = preview_budget.saturating_sub(1);
+        let cut: String = trimmed
+            .chars()
+            .scan(0usize, |w, c| {
+                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                if *w + cw > text_budget {
+                    None
+                } else {
+                    *w += cw;
+                    Some(c)
+                }
+            })
+            .collect();
+        (cut, true)
+    };
+    let kept_char_count = shown.chars().count() as u32;
+    let kept_indices: Vec<u32> = shifted.into_iter().filter(|&i| i < kept_char_count).collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    push_styled_with_match_indices(&mut spans, &shown, &kept_indices, base, match_style);
+    if ellipsis {
+        spans.push(Span::styled("…".to_string(), dim_style));
     }
+    // Pad out to the right edge (≥ the gap by construction), so the numbers' last digits align
+    // down the file group. The pad carries the row background, like the text.
+    let used = shown.width() + usize::from(ellipsis) + line_str.width();
+    spans.push(Span::styled(" ".repeat(max_width.saturating_sub(used)), base));
+    spans.push(Span::styled(line_str, dim_style));
     spans
 }
 
@@ -2498,7 +2538,7 @@ fn diagnostic_item_spans(
     }
     spans.push(Span::styled(
         line_suffix,
-        Style::default().fg(NORD3).bg(bg),
+        Style::default().fg(picker_dim_fg(highlighted)).bg(bg),
     ));
     spans
 }
@@ -2529,7 +2569,7 @@ fn reference_item_spans(
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
-    let loc_style = base.fg(NORD3);
+    let loc_style = base.fg(picker_dim_fg(highlighted));
 
     // Reserve up to half the row for the location prefix; the path truncates (middle) to fit so the
     // filename and line number — the bits that identify the reference — survive.
@@ -2593,9 +2633,10 @@ fn reference_item_spans(
     spans
 }
 
-/// One LSP-servers picker row: a health glyph (the same `●`/`◐`/`✗`/`○` + color as the status-bar
-/// indicator), the server name with fuzzy-match highlights, and the language dimmed at the tail.
-/// The glyph re-renders live as `lsp/status_changed` re-pushes the picker.
+/// One LSP-servers picker row: a status dot (the same medium `•` cell the file pickers use for
+/// git status, coloured like the status-bar indicator), the server name with fuzzy-match
+/// highlights, and a dim `language · root` tail. The dot re-renders live as
+/// `lsp/status_changed` re-pushes the picker.
 fn lsp_server_item_spans(
     name: &str,
     language: &str,
@@ -2607,24 +2648,24 @@ fn lsp_server_item_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = if highlighted { NORD2 } else { NORD0 };
-    // A ready server with active `$/progress` work shows the busy spinner (same as the status bar).
+    // A ready server with active `$/progress` work shows the busy colour (same as the status bar).
     let busy = matches!(status, LspStatus::Ready) && !progress.is_empty();
-    let (glyph, glyph_color) = if busy { ("◐", NORD13) } else { lsp_status_glyph(status) };
+    let dot_color = if busy { NORD13 } else { lsp_status_color(status) };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
-    // Dim tail: the language, plus the project-relative root when the server isn't at the project
-    // root (empty `root_label` → omitted, so single-root projects show just the language).
+    // Dim tail: `language · root`, the root only when the server isn't at the project root
+    // (empty `root_label` → omitted, so single-root projects show just the language).
     let tail = if root_label.is_empty() {
         format!("  {language}")
     } else {
-        format!("  {language}  {root_label}")
+        format!("  {language} · {root_label}")
     };
     // Live progress hint (e.g. "  cargo check 28% +1"), rendered in the activity color after the tail.
     let hint = lsp_progress_hint(progress);
-    // Glyph + a trailing space, then the name fills the budget left after the glyph, tail, and hint.
-    let glyph_cols = glyph.width() + 1;
+    // Status-dot cell (two cols, like the git bullets), then the name fills the budget left
+    // after the tail and hint.
     let name_budget = max_width
-        .saturating_sub(glyph_cols)
+        .saturating_sub(2)
         .saturating_sub(tail.width())
         .saturating_sub(hint.width());
 
@@ -2645,8 +2686,8 @@ fn lsp_server_item_spans(
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
-        format!("{glyph} "),
-        Style::default().fg(glyph_color).bg(bg),
+        "• ".to_string(),
+        Style::default().fg(dot_color).bg(bg),
     ));
     if kept_indices.is_empty() {
         spans.push(Span::styled(truncated, base));
@@ -2675,7 +2716,10 @@ fn lsp_server_item_spans(
             ));
         }
     }
-    spans.push(Span::styled(tail, Style::default().fg(NORD3).bg(bg)));
+    spans.push(Span::styled(
+        tail,
+        Style::default().fg(picker_dim_fg(highlighted)).bg(bg),
+    ));
     if !hint.is_empty() {
         spans.push(Span::styled(hint, Style::default().fg(NORD13).bg(bg)));
     }
@@ -4052,35 +4096,37 @@ fn diagnostic_count_spans(state: &AppState) -> Vec<Span<'static>> {
     parts
 }
 
-/// The far-right LSP health glyph for the buffer's own server (just the state-colored
-/// `●`/`◐`/`✗`/`○`). `None` when the buffer has no attached server or no status yet. Keyed by the
-/// buffer's `(language, workspace_root)` so it's correct even when several same-language servers run.
+/// The far-right LSP health dot for the buffer's own server — the same state-coloured `•` the
+/// LSP picker rows and detail title use. `None` when the buffer has no attached server or no
+/// status yet. Keyed by the buffer's `(language, workspace_root)` so it's correct even when
+/// several same-language servers run.
 fn lsp_indicator_span(state: &AppState) -> Option<Span<'static>> {
     let server = state.editor.as_ref()?.lsp_server.as_ref()?;
     let status = state
         .lsp_status
         .get(&(server.language.clone(), server.workspace_root.clone()))?;
-    // A ready server doing background work (`$/progress` — indexing, `cargo check`) shows the busy
-    // spinner instead of the steady ●, so the bar reflects that diagnostics/results may still land.
-    let (glyph, color) = if matches!(status.status, LspStatus::Ready) && !status.progress.is_empty() {
-        ("◐", NORD13)
+    // A ready server doing background work (`$/progress` — indexing, `cargo check`) shows the
+    // busy colour, so the bar reflects that diagnostics/results may still land.
+    let color = if matches!(status.status, LspStatus::Ready) && !status.progress.is_empty() {
+        NORD13
     } else {
-        lsp_status_glyph(&status.status)
+        lsp_status_color(&status.status)
     };
     Some(Span::styled(
-        glyph.to_string(),
+        "•".to_string(),
         Style::default().bg(NORD1).fg(color),
     ))
 }
 
-/// Glyph + color for a language-server state. `◐` reads as "busy" for the transitional states (the
-/// loop is event-driven, so it changes when a `lsp/status_changed` arrives rather than animating).
-fn lsp_status_glyph(status: &LspStatus) -> (&'static str, Color) {
+/// State colour for a language-server's status dot (`•`) — shared by the status bar, the LSP
+/// picker rows, and the detail title. The transitional states read as "busy" (the loop is
+/// event-driven, so the colour changes when a `lsp/status_changed` arrives rather than animating).
+fn lsp_status_color(status: &LspStatus) -> Color {
     match status {
-        LspStatus::Ready => ("●", NORD14),
-        LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => ("◐", NORD13),
-        LspStatus::Crashed { .. } => ("✗", NORD11),
-        LspStatus::Stopped => ("○", NORD3),
+        LspStatus::Ready => NORD14,
+        LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => NORD13,
+        LspStatus::Crashed { .. } => NORD11,
+        LspStatus::Stopped => NORD3,
     }
 }
 
@@ -4238,8 +4284,10 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         // point within the query (or at the start, on the placeholder, when empty). For the
         // Explorer picker we offset by the dir-context prefix width — the prefix sits before
         // the typed query and the cursor needs to land after it.
-        let box_area = picker_box_rect(buffer_area);
-        if box_area.width >= 4 && box_area.height >= 4 {
+        // Same rect the overlay drew (collapsed boxes keep the same top edge, so only the
+        // height guard differs from the full-size rect).
+        let box_area = collapsed_picker_box_rect(buffer_area, picker_content_rows(&state.picker));
+        if box_area.width >= 4 && box_area.height >= 3 {
             // Inner = inside the borders; inner padding adds another column on each side.
             let text_x = box_area.x + 2;
             let text_y = box_area.y + 1;
@@ -4877,6 +4925,163 @@ mod tests {
         assert!(out.ends_with('…'));
     }
 
+    // ---- file_item_spans ----
+
+    #[test]
+    fn file_item_root_label_follows_path_dimmed() {
+        let labels = vec!["alpha".to_string(), "beta".to_string()];
+        let spans = file_item_spans(1, "src/main.rs", &[], None, &labels, false, 40);
+        let text = spans_text(&spans);
+        assert!(text.starts_with("  src/main.rs  beta")); // bullet cell, path, then the label
+        let label = spans.last().expect("label span");
+        assert_eq!(label.content.as_ref(), "  beta");
+        assert_eq!(label.style.fg, Some(NORD3));
+    }
+
+    #[test]
+    fn file_item_single_root_has_no_label() {
+        let spans = file_item_spans(0, "src/main.rs", &[], None, &[], false, 40);
+        assert_eq!(spans_text(&spans), "  src/main.rs");
+    }
+
+    // ---- lsp_server_item_spans ----
+
+    #[test]
+    fn lsp_row_status_dot_and_bulleted_tail() {
+        let spans = lsp_server_item_spans(
+            "rust-analyzer",
+            "rust",
+            "backend",
+            &LspStatus::Ready,
+            &[],
+            &[],
+            false,
+            60,
+        );
+        let text = spans_text(&spans);
+        assert!(text.starts_with("• rust-analyzer"));
+        assert!(text.ends_with("rust · backend"));
+        assert_eq!(spans[0].style.fg, Some(NORD14)); // ready → green dot
+        // At the project root the tail is just the language — no separator.
+        let single = lsp_server_item_spans(
+            "rust-analyzer",
+            "rust",
+            "",
+            &LspStatus::Stopped,
+            &[],
+            &[],
+            false,
+            60,
+        );
+        assert!(spans_text(&single).ends_with("  rust"));
+        assert_eq!(single[0].style.fg, Some(NORD3)); // stopped → dim dot
+    }
+
+    // ---- collapsed picker box ----
+
+    #[test]
+    fn collapsed_picker_box_shrinks_to_content_keeping_top() {
+        let area = Rect { x: 0, y: 0, width: 200, height: 60 };
+        let full = picker_box_rect(area);
+        let collapsed = collapsed_picker_box_rect(area, 3);
+        assert_eq!(collapsed.height, 7); // 3 content rows + borders + input + separator
+        assert_eq!(
+            (collapsed.x, collapsed.y, collapsed.width),
+            (full.x, full.y, full.width)
+        );
+    }
+
+    #[test]
+    fn collapsed_picker_box_caps_at_full_size() {
+        let area = Rect { x: 0, y: 0, width: 200, height: 60 };
+        assert_eq!(collapsed_picker_box_rect(area, 10_000), picker_box_rect(area));
+    }
+
+    #[test]
+    fn collapsed_picker_box_drops_separator_row_when_empty() {
+        let area = Rect { x: 0, y: 0, width: 200, height: 60 };
+        assert_eq!(collapsed_picker_box_rect(area, 0).height, 3); // borders + input only
+    }
+
+    #[test]
+    fn picker_content_rows_counts_kind_specifics() {
+        use aether_protocol::picker::PickerKind;
+        let mut p = crate::picker::PickerState::default();
+        p.kind = Some(PickerKind::Files);
+        p.total_matches = 5;
+        assert_eq!(picker_content_rows(&p), 5);
+        // The synthetic "Create …" row is client-side, on top of total_matches.
+        p.synthetic_create_idx = Some(5);
+        assert_eq!(picker_content_rows(&p), 6);
+        // Grep counts the server-reported display rows (per-file headers included).
+        p.synthetic_create_idx = None;
+        p.kind = Some(PickerKind::Grep);
+        p.total_display_rows = Some(8);
+        assert_eq!(picker_content_rows(&p), 8);
+        // References shows a one-row message while empty.
+        p.kind = Some(PickerKind::References);
+        p.total_matches = 0;
+        assert_eq!(picker_content_rows(&p), 1);
+    }
+
+    // ---- grep_hit_spans ----
+
+    #[test]
+    fn grep_hit_line_number_right_aligned() {
+        let spans = grep_hit_spans(41, "let x = 1;", &[], false, 30);
+        let text = spans_text(&spans);
+        assert!(text.starts_with("let x = 1;"));
+        assert!(text.ends_with("42"));
+        assert_eq!(spans_total_width(&spans), 30);
+        // The number is dim; the padding before it carries at least the 2-col gap.
+        assert!(text.contains("let x = 1;  "));
+        let num = spans.last().expect("line-number span");
+        assert_eq!(num.style.fg, Some(NORD3));
+    }
+
+    #[test]
+    fn picker_dim_spans_brighten_on_highlighted_row() {
+        // NORD3 is illegible on the NORD2 selection background — highlighted rows lift their
+        // dim spans (here: the grep line number, the file row's root label) to NORD4.
+        let num = grep_hit_spans(41, "let x = 1;", &[], true, 30);
+        assert_eq!(num.last().unwrap().style.fg, Some(NORD4));
+        let labels = vec!["alpha".to_string(), "beta".to_string()];
+        let file = file_item_spans(1, "src/main.rs", &[], None, &labels, true, 40);
+        assert_eq!(file.last().unwrap().style.fg, Some(NORD4));
+    }
+
+    #[test]
+    fn grep_hit_truncates_long_preview_keeping_line_number() {
+        let preview = "a very long line of code that cannot possibly fit in the row";
+        let spans = grep_hit_spans(99, preview, &[], false, 24);
+        let text = spans_text(&spans);
+        assert!(text.contains('…'));
+        assert!(text.ends_with("100"));
+        assert_eq!(spans_total_width(&spans), 24);
+    }
+
+    #[test]
+    fn grep_hit_strips_leading_whitespace_and_shifts_matches() {
+        // Match on "hel" at chars 4..7 of the untrimmed preview; after stripping the 4-char
+        // indent the highlight must land on the same letters.
+        let spans = grep_hit_spans(0, "    helper();", &[4, 5, 6], false, 40);
+        let text = spans_text(&spans);
+        assert!(text.starts_with("helper();"));
+        let hl: String = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(NORD13))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(hl, "hel");
+    }
+
+    #[test]
+    fn grep_hit_drops_matches_inside_stripped_whitespace() {
+        let spans = grep_hit_spans(0, "    x", &[1, 2], false, 40);
+        assert!(spans.iter().all(|s| s.style.fg != Some(NORD13)));
+        assert!(spans_text(&spans).starts_with("x "));
+    }
+
     // ---- build_editor_status_spans ----
 
     fn spans_text(spans: &[Span<'_>]) -> String {
@@ -5037,18 +5242,18 @@ mod tests {
     }
 
     #[test]
-    fn lsp_status_glyph_maps_states() {
-        assert_eq!(lsp_status_glyph(&LspStatus::Ready), ("●", NORD14));
-        assert_eq!(lsp_status_glyph(&LspStatus::Initializing), ("◐", NORD13));
-        assert_eq!(lsp_status_glyph(&LspStatus::Restarting), ("◐", NORD13));
+    fn lsp_status_color_maps_states() {
+        assert_eq!(lsp_status_color(&LspStatus::Ready), NORD14);
+        assert_eq!(lsp_status_color(&LspStatus::Initializing), NORD13);
+        assert_eq!(lsp_status_color(&LspStatus::Restarting), NORD13);
         assert_eq!(
-            lsp_status_glyph(&LspStatus::Crashed {
+            lsp_status_color(&LspStatus::Crashed {
                 code: None,
                 message: String::new()
             }),
-            ("✗", NORD11)
+            NORD11
         );
-        assert_eq!(lsp_status_glyph(&LspStatus::Stopped), ("○", NORD3));
+        assert_eq!(lsp_status_color(&LspStatus::Stopped), NORD3);
     }
 
     #[test]
@@ -5065,17 +5270,6 @@ mod tests {
         assert_eq!(
             lsp_progress_hint(&[mk("cargo check", Some(28)), mk("Indexing", None)]),
             "  cargo check 28% +1"
-        );
-    }
-
-    #[test]
-    fn lsp_status_label_maps_states() {
-        assert_eq!(lsp_status_label(&LspStatus::Ready), ("ready", NORD14));
-        assert_eq!(lsp_status_label(&LspStatus::Starting), ("starting", NORD13));
-        assert_eq!(lsp_status_label(&LspStatus::Stopped), ("stopped", NORD3));
-        assert_eq!(
-            lsp_status_label(&LspStatus::Crashed { code: Some(1), message: "boom".into() }),
-            ("crashed", NORD11)
         );
     }
 

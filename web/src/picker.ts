@@ -15,18 +15,28 @@
 import type { RpcClient } from "./client";
 import { confirmDialog, lspInfoDialog } from "./modal";
 import type { LspInfoData } from "./modal";
+import { lspStateClass, statusIcon } from "./icons";
 import type { BufferDirtyState, GitStatus, LspProgress, PickerItem, PickerKind, PickerUpdateParams, PickerViewResult } from "./protocol";
 
 type ToastKind = "info" | "error" | "warning" | "success";
 
-const LIMIT = 64; // window size fetched per view
+const LIMIT = 64; // minimum window size fetched per view (see fetchLimit)
 const PAGE = 10; // PageUp/PageDown step
+// Vertical gap (px) between grep file groups, applied as margin-top on every .grep-section (set
+// inline, since the virtual-scroll geometry below has to count these same pixels).
+const GREP_GROUP_GAP = 6;
 
-const PLACEHOLDER: Record<string, string> = {
-  files: "Find files",
-  buffers: "Switch buffer",
-  grep: "Grep workspace",
-  references: "Filter references",
+/** Query-input placeholder per picker: the picker's action, ellipsised. Kept in sync with the
+ *  terminal client's `picker_placeholder` (crates/aether-tui/src/ui.rs). */
+const PLACEHOLDER: Record<PickerKind, string> = {
+  files: "Find files…",
+  buffers: "Switch buffer…",
+  grep: "Grep workspace…",
+  explorer: "Explore files…",
+  projects: "Switch project…",
+  diagnostics: "List diagnostics…",
+  lsp_servers: "List LSPs…",
+  references: "List references…",
 };
 
 export interface PickerOptions {
@@ -104,11 +114,13 @@ export class Picker {
   // server so the spacer counts headers; null for non-grep kinds (which use plain item rows).
   private grepDisplayOffset: number | null = null;
   private grepTotalDisplayRows: number | null = null;
-  // Loaded-window geometry in coordinate rows (display rows for grep, item rows otherwise), set by
-  // renderList and read by onListScroll.
-  private displayTotal = 0;
-  private displayOffset = 0;
-  private displayLen = 0;
+  // Loaded-window geometry in PIXELS, set by renderList's applyGeometry and read by onListScroll.
+  // Px is the one coordinate space where both the scroll position and the loaded window's bounds
+  // are exact regardless of how grep's per-group gaps distribute — row-space comparisons drifted
+  // when gaps clustered unevenly (skewed file-group sizes) and mis-fetched.
+  private winTopPx = 0;
+  private winBottomPx = 0;
+  private spacerPx = 0;
 
   constructor(opts: PickerOptions) {
     this.client = opts.client;
@@ -134,15 +146,16 @@ export class Picker {
     this.pathEl.style.display = "none";
     this.input = document.createElement("input");
     this.input.className = "picker-input";
-    this.input.placeholder = PLACEHOLDER[this.kind] ?? "";
+    this.input.placeholder = PLACEHOLDER[this.kind];
     this.input.spellcheck = false;
     this.input.autocomplete = "off";
-    inputRow.append(this.pathEl, this.input);
+    this.countEl = document.createElement("span");
+    this.countEl.className = "picker-count";
+    // The "X/Y" summary sits to the right of the input, like the terminal UI.
+    inputRow.append(this.pathEl, this.input, this.countEl);
     this.listEl = document.createElement("div");
     this.listEl.className = "picker-list";
-    this.countEl = document.createElement("div");
-    this.countEl.className = "picker-count";
-    box.append(inputRow, this.listEl, this.countEl);
+    box.append(inputRow, this.listEl);
     this.overlay.append(box);
     document.body.append(this.overlay);
 
@@ -174,7 +187,7 @@ export class Picker {
       kind: "grep",
       reset: false,
       offset: 0,
-      limit: LIMIT,
+      limit: this.fetchLimit(),
       center_on_cursor_grep_hit: this.activeBufferId,
     });
     this.generation = r.generation; // adopt the persisted query's generation baseline
@@ -241,9 +254,12 @@ export class Picker {
       if (fresh) m.update(this.lspInfoFromItem(fresh));
     }
     // Scroll to the selection only for selection-driven updates (centering / a pending move) — never
-    // for plain scroll-fetches, which would yank the view back to the selection.
+    // for plain scroll-fetches, which would yank the view back to the selection. Grep centering
+    // targets (reopen on the cursor's nearest hit; Alt-l/h file jump) align to the TOP of the list
+    // — there's context below to read, and the row's scroll-margin keeps it clear of the sticky
+    // file header. Everything else keeps "nearest".
     if (resolved || this.scrollToSelOnUpdate) {
-      this.scrollSelectionIntoView();
+      this.scrollSelectionIntoView(resolved && this.kind === "grep" ? "start" : "nearest");
       this.scrollToSelOnUpdate = false;
     }
   }
@@ -262,7 +278,7 @@ export class Picker {
       kind: this.kind,
       reset,
       offset,
-      limit: LIMIT,
+      limit: this.fetchLimit(),
       // Diagnostics and References are scoped to a buffer, required when (re)opening the set.
       buffer_id:
         reset && (this.kind === "diagnostics" || this.kind === "references")
@@ -286,7 +302,7 @@ export class Picker {
       kind: "explorer",
       reset: true,
       offset: 0,
-      limit: LIMIT,
+      limit: this.fetchLimit(),
       directory_path: opts.roots ? null : opts.directory_path ?? null,
       explorer_roots: opts.roots ?? false,
       center_on: centerOn,
@@ -419,7 +435,7 @@ export class Picker {
       kind: this.kind,
       reset: false,
       offset: 0,
-      limit: LIMIT,
+      limit: this.fetchLimit(),
       center_on: target,
     });
     this.offset = r.effective_offset;
@@ -514,16 +530,27 @@ export class Picker {
     if (inWindow) this.scrollSelectionIntoView();
   }
 
-  private scrollSelectionIntoView(): void {
-    this.selectedRowEl?.scrollIntoView({ block: "nearest" });
+  private scrollSelectionIntoView(block: ScrollLogicalPosition = "nearest"): void {
+    this.selectedRowEl?.scrollIntoView({ block });
+  }
+
+  /** Items per fetched window: at least LIMIT, and at least three viewports' worth of rows, so
+   *  the loaded window always extends well past the visible range plus the fetch margins. (A
+   *  fixed 64 became too tight once grep rows got denser — a tall picker shows ~64 rows, making
+   *  the window ≈ the viewport, which kept both fetch margins permanently armed and refetched on
+   *  every wheel tick.) */
+  private fetchLimit(): number {
+    const visible = Math.ceil(this.listEl.clientHeight / this.rowH);
+    return Math.max(LIMIT, visible * 3);
   }
 
   /** If the selection has left the loaded window, fetch a new window centred on it. */
   private ensureWindow(): void {
     const loaded = this.selected >= this.offset && this.selected < this.offset + this.items.length;
     if (loaded) return;
-    const maxOffset = Math.max(0, this.total - LIMIT);
-    const target = Math.max(0, Math.min(this.selected - Math.floor(LIMIT / 2), maxOffset));
+    const limit = this.fetchLimit();
+    const maxOffset = Math.max(0, this.total - limit);
+    const target = Math.max(0, Math.min(this.selected - Math.floor(limit / 2), maxOffset));
     if (target === this.requestedOffset && this.items.length > 0) return;
     void this.view(false, target).catch(() => {});
   }
@@ -535,11 +562,18 @@ export class Picker {
       const msg = document.createElement("div");
       msg.className = "picker-empty";
       msg.textContent = this.ticking ? "Finding references…" : "No references found";
+      this.listEl.classList.add("filled"); // the message itself needs the separator
       this.listEl.replaceChildren(msg);
       this.countEl.textContent = "";
       this.updatePath();
       return;
     }
+    // Show the input/list separator only when the list will have visible content — without it an
+    // empty list reads as a doubled-up input border.
+    this.listEl.classList.toggle(
+      "filled",
+      this.total > 0 || this.items.length > 0 || this.hasCreate(),
+    );
     // Virtual scroll: a full-height spacer (total rows) with the loaded window absolutely
     // positioned `offset` rows down, so the native scrollbar spans all results and mouse scrolling
     // reveals unloaded ranges (onListScroll fetches them).
@@ -561,9 +595,16 @@ export class Picker {
           headersInWindow++;
           section = document.createElement("div");
           section.className = "grep-section";
+          section.style.marginTop = `${GREP_GROUP_GAP}px`;
           const h = document.createElement("div");
           h.className = "picker-row grep-header";
-          h.textContent = this.grepFileLabel(item.path_index, item.relative_path);
+          // Multi-root projects prefix the root's name: `root: path`, all in the header colour.
+          if (this.projectPaths.length > 1) {
+            const root = this.projectPaths[item.path_index];
+            h.textContent = `${root ? basename(root) : `root ${item.path_index}`}: ${item.relative_path}`;
+          } else {
+            h.textContent = item.relative_path;
+          }
           section.append(h);
           win.append(section);
         }
@@ -574,14 +615,23 @@ export class Picker {
       const row: HTMLElement = document.createElement(href ? "a" : "div");
       if (href) (row as HTMLAnchorElement).href = href;
       row.className = i === localSel ? "picker-row selected" : "picker-row";
+      // Grep hits are code lines — rendered in the editor's mono font (see .grep-hit).
+      if (item.kind === "grep_hit") row.classList.add("grep-hit");
       if (i === localSel) selectedRow = row;
-      const { primary, primaryMatches, meta, prefix, prefixClass, dir, bullet, bulletStatus, dim, dirtyDot } = this.describe(item);
+      const { primary, primaryMatches, meta, prefix, prefixClass, dir, bullet, bulletStatus, bulletClass, bulletIcon, dim, dirtyDot, suffix } = this.describe(item);
       if (bullet) {
         // Fixed-width cell (empty when clean/ignored) so entry names stay aligned across rows; the
-        // `•` glyph and its colour appear only on a real change.
+        // `•` glyph appears only with a colour to show (a git change). LSP rows put the status
+        // bar's SVG icon in the cell instead (bulletIcon).
+        const cls = bulletClass ?? (bulletStatus ? `picker-bullet-${bulletStatus}` : undefined);
         const b = document.createElement("span");
-        b.className = bulletStatus ? `picker-bullet picker-bullet-${bulletStatus}` : "picker-bullet";
-        b.textContent = bulletStatus ? "•" : "";
+        b.className = cls ? `picker-bullet ${cls}` : "picker-bullet";
+        if (bulletIcon) {
+          b.classList.add("icon");
+          b.append(bulletIcon);
+        } else {
+          b.textContent = cls ? "•" : "";
+        }
         row.append(b);
       }
       if (prefix) {
@@ -597,6 +647,12 @@ export class Picker {
       main.className = mainClass.join(" ");
       main.append(matched(primary, primaryMatches));
       row.append(main);
+      if (suffix) {
+        const s = document.createElement("span");
+        s.className = "picker-suffix";
+        s.textContent = suffix;
+        row.append(s);
+      }
       if (meta) {
         const m = document.createElement("span");
         m.className = "picker-meta";
@@ -645,15 +701,27 @@ export class Picker {
     // spacer counts headers and the last file stays reachable; for other kinds they're item rows.
     // The grep window block starts one row above its first hit (the repeated file header sits there).
     const isGrep = this.grepTotalDisplayRows != null;
-    this.displayTotal = isGrep ? this.grepTotalDisplayRows! : this.total + (createRow ? 1 : 0);
-    this.displayOffset = isGrep ? Math.max(0, (this.grepDisplayOffset ?? 1) - 1) : this.offset;
-    this.displayLen = isGrep ? this.items.length + headersInWindow : this.items.length;
+    const displayTotal = isGrep ? this.grepTotalDisplayRows! : this.total + (createRow ? 1 : 0);
+    const displayOffset = isGrep ? Math.max(0, (this.grepDisplayOffset ?? 1) - 1) : this.offset;
+    const displayLen = isGrep ? this.items.length + headersInWindow : this.items.length;
+    // Grep's per-group gaps (each section's margin-top) are extra pixels the row-count geometry
+    // doesn't see: the spacer adds one gap per file group in the whole result set (groups =
+    // display rows minus hits), and the window shifts down by the gaps above it. The window's own
+    // first section's margin supplies its gap, so it isn't counted (hence displayOffset - offset,
+    // the headers *strictly above* the window block) — but it IS inside the window's px extent,
+    // so the bottom bound counts all headersInWindow gaps.
+    const gapsTotal = isGrep ? Math.max(0, displayTotal - this.total) : 0;
+    const gapsAboveWin = isGrep ? Math.max(0, displayOffset - this.offset) : 0;
     // Set geometry from the known row height BEFORE inserting — the window/create rows are absolute,
     // so without an explicit spacer height the container would collapse to ~0 on replaceChildren and
     // the browser would clamp scrollTop back to the top.
     const applyGeometry = () => {
-      win.style.top = `${this.displayOffset * this.rowH}px`;
-      spacer.style.height = `${this.displayTotal * this.rowH}px`;
+      this.winTopPx = displayOffset * this.rowH + gapsAboveWin * GREP_GROUP_GAP;
+      this.winBottomPx =
+        this.winTopPx + displayLen * this.rowH + headersInWindow * GREP_GROUP_GAP;
+      this.spacerPx = displayTotal * this.rowH + gapsTotal * GREP_GROUP_GAP;
+      win.style.top = `${this.winTopPx}px`;
+      spacer.style.height = `${this.spacerPx}px`;
       if (createRow) createRow.style.top = `${this.total * this.rowH}px`;
     };
     applyGeometry();
@@ -678,43 +746,52 @@ export class Picker {
   }
 
   /** Mouse/trackpad scroll: load the window covering the visible range when it nears a loaded edge.
-   *  Works in coordinate rows (display rows for grep); the fetch is by item offset, so the visible
-   *  coordinate row is converted back to an item index (proportionally for grep). */
+   *  Bounds are compared in PIXELS against the loaded window's exact px extent (renderList computed
+   *  it, group gaps included). Converting px to rows first — even via an average gap-aware row
+   *  height — drifts when grep's gaps cluster unevenly, and a drift past the fetch margin either
+   *  strands the viewport in unloaded blank or oscillates fetches (visible flicker). The fetch
+   *  offset is still a proportional estimate (item ≈ px share of the spacer); the next scroll event
+   *  re-checks against the exactly-placed result, so estimates converge instead of compounding. */
   private onListScroll(): void {
     if (this.total === 0 || this.listFetchInFlight) return;
-    const visible = Math.max(1, Math.round(this.listEl.clientHeight / this.rowH));
-    const topRow = Math.round(this.listEl.scrollTop / this.rowH);
-    const margin = Math.floor(LIMIT / 4);
-    const loadedEnd = this.displayOffset + this.displayLen;
-    const needAbove = this.displayOffset > 0 && topRow < this.displayOffset + margin;
-    const needBelow = loadedEnd < this.displayTotal && topRow + visible > loadedEnd - margin;
+    const viewTop = this.listEl.scrollTop;
+    const viewBottom = viewTop + this.listEl.clientHeight;
+    const limit = this.fetchLimit();
+    const marginPx = Math.floor(limit / 4) * this.rowH;
+    const needAbove = this.winTopPx > 0 && viewTop < this.winTopPx + marginPx;
+    // 1px epsilon: the window-bottom and spacer heights are float sums via different expressions.
+    const needBelow = this.winBottomPx < this.spacerPx - 1 && viewBottom > this.winBottomPx - marginPx;
     if (!needAbove && !needBelow) return;
-    const targetRow = Math.max(0, topRow - margin);
-    // Coordinate row → item offset. For grep, display rows include headers, so scale by the
-    // hit/display-row ratio; the window the server returns is then positioned exactly.
-    const isGrep = this.grepTotalDisplayRows != null;
-    const maxOffset = Math.max(0, this.total - LIMIT);
-    let target = isGrep ? Math.round((targetRow * this.total) / Math.max(1, this.displayTotal)) : targetRow;
+    // Estimate the item offset whose row sits ~margin above the viewport, anchored to the loaded
+    // window (whose top px ↔ item offset correspondence is exact): px distance → display rows →
+    // items via the global hits-per-display-row ratio. Anchoring locally keeps the error
+    // proportional to the gap-density deviation over the *distance jumped*, not over the whole
+    // list above (the global version drifted by whole viewports on skewed grep results).
+    const displayTotal = this.grepTotalDisplayRows ?? Math.max(1, this.total);
+    const itemsPerRow = this.total / Math.max(1, displayTotal);
+    const wantPx = Math.max(0, viewTop - marginPx);
+    const maxOffset = Math.max(0, this.total - limit);
+    let target = this.offset + Math.round(((wantPx - this.winTopPx) / this.rowH) * itemsPerRow);
     target = Math.max(0, Math.min(target, maxOffset));
-    // Force progress in the scroll direction: the proportional grep estimate can round back to the
-    // current offset even when we're against the loaded edge, which would wedge (never fetch).
-    if (needBelow && target <= this.offset) target = Math.min(maxOffset, this.offset + Math.floor(LIMIT / 2));
-    if (needAbove && target >= this.offset) target = Math.max(0, this.offset - Math.floor(LIMIT / 2));
+    // Force progress in the scroll direction when the estimate lands back at the current offset
+    // against a loaded edge (which would wedge) — but only when exactly one side needs more.
+    // When both margins are violated at once, the unforced estimate (which covers the viewport
+    // top-down) is right; the old always-on rules fought each other and oscillated.
+    if (needAbove !== needBelow) {
+      if (needBelow && target <= this.offset) target = Math.min(maxOffset, this.offset + Math.floor(limit / 2));
+      if (needAbove && target >= this.offset) target = Math.max(0, this.offset - Math.floor(limit / 2));
+    }
     // Guard against re-fetching what's already loaded / in flight (not just the last requested offset).
     if (target === this.offset || target === this.requestedOffset) return;
     this.listFetchInFlight = true;
     void this.view(false, target).finally(() => {
       this.listFetchInFlight = false;
+      // Re-check once the landed window has been placed (the picker/update push carrying it is
+      // processed by the next frame): if the estimate fell short of covering the viewport, the
+      // next iteration corrects from the new, closer anchor — converging without waiting for
+      // another scroll event. (Previously a short landing left blank rows until the user moved.)
+      requestAnimationFrame(() => this.onListScroll());
     });
-  }
-
-  /** Header label for a grep file group: `root: path` for multi-root projects, else just the path. */
-  private grepFileLabel(pathIndex: number, relativePath: string): string {
-    if (this.projectPaths.length > 1) {
-      const root = this.projectPaths[pathIndex];
-      return `${root ? basename(root) : `root ${pathIndex}`}: ${relativePath}`;
-    }
-    return relativePath;
   }
 
   /** A "+ create" row is offered for Explorer / Projects when a query is typed. */
@@ -778,26 +855,40 @@ export class Picker {
 
   private describe(item: PickerItem): RowDesc {
     switch (item.kind) {
-      case "file":
+      case "file": {
         // Same left status-bullet as the explorer (ignored files never reach this picker — the
-        // workspace walker skips them — so there's no `dim` case here).
+        // workspace walker skips them — so there's no `dim` case here). Multi-root projects show
+        // the root's name dimly after the path, matching the terminal client.
+        const root = this.projectPaths[item.path_index];
         return {
           primary: item.relative_path,
           primaryMatches: item.match_indices,
           bullet: true,
           bulletStatus: item.git_status,
+          suffix:
+            this.projectPaths.length > 1
+              ? root
+                ? basename(root)
+                : `root ${item.path_index}`
+              : undefined,
         };
+      }
       case "buffer":
         // Buffer-state dot on the right (colour-coded), matching the editor status bar and the
         // terminal client's buffer picker. Clean buffers (`status` omitted → "clean") show nothing.
         return { primary: item.display, primaryMatches: item.match_indices, dirtyDot: item.status };
-      case "grep_hit":
+      case "grep_hit": {
+        // The file is shown in the group header; the row carries the line number + preview.
+        // `match_indices` are char offsets into the untrimmed preview, so shift them down by the
+        // stripped leading-whitespace char count (indices inside the whitespace drop out).
+        const trimmed = item.preview.trimStart();
+        const lead = [...item.preview].length - [...trimmed].length;
         return {
-          // The file is shown in the group header; the row carries the line number + preview.
-          primary: item.preview.trim(),
-          primaryMatches: item.match_indices,
+          primary: trimmed.trimEnd(),
+          primaryMatches: item.match_indices?.map((i) => i - lead).filter((i) => i >= 0),
           meta: `${item.line + 1}`,
         };
+      }
       case "diagnostic":
         return {
           primary: item.message.split("\n")[0],
@@ -827,11 +918,25 @@ export class Picker {
       case "project":
         return { primary: item.name, primaryMatches: item.match_indices };
       case "lsp_server": {
-        const where = item.root_label ? ` (${item.root_label})` : "";
-        // When the server is busy, show the active work in place of the bare "ready" state.
+        // LSP state as the status bar's SVG icon in the leading bullet cell. Busy = ready with
+        // active `$/progress` work, like the status bar (spinning, too);
+        // starting/initializing/restarting share the busy icon. The dim meta is
+        // `language · root` (root only when the server runs off the project root), followed by
+        // any live progress hint.
+        const busy = item.status.state === "ready" && (item.progress?.length ?? 0) > 0;
+        const dot = busy ? "lsp-busy" : lspStateClass(item.status.state);
+        const parts = [item.language];
+        if (item.root_label) parts.push(item.root_label);
         const hint = lspProgressHint(item.progress);
-        const state = hint || item.status.state;
-        return { primary: item.name, primaryMatches: item.match_indices, meta: `${item.language} · ${state}${where}` };
+        if (hint) parts.push(hint);
+        return {
+          primary: item.name,
+          primaryMatches: item.match_indices,
+          meta: parts.join(" · "),
+          bullet: true,
+          bulletClass: dot,
+          bulletIcon: statusIcon(dot, dot === "lsp-busy"),
+        };
       }
       case "reference":
         // Dim `path:line` location prefix (the distinguishing bit, since reference previews often
@@ -858,10 +963,18 @@ interface RowDesc {
   bullet?: boolean;
   /** Colour the bullet for a real Git change (modified/added/untracked/deleted/conflicted). */
   bulletStatus?: GitStatus;
+  /** Explicit bullet colour class (LSP rows: `lsp-ready` / `lsp-busy` / …), overriding the
+   *  git-status colouring. */
+  bulletClass?: string;
+  /** SVG status icon rendered in the bullet cell instead of the `•` glyph (LSP rows — the same
+   *  icon the status bar shows, coloured via `bulletClass`). */
+  bulletIcon?: SVGSVGElement;
   /** Dim the text to gray — used for `.gitignore`d entries (which carry no bullet). */
   dim?: boolean;
   /** Right-aligned buffer-state dot (buffer rows). `"clean"`/undefined → no dot. */
   dirtyDot?: BufferDirtyState;
+  /** Dim suffix right after the primary text (multi-root file rows: the root's name). */
+  suffix?: string;
 }
 
 /** Filled-circle SVG dot for a buffer's dirty state — the same circle the tab favicon uses. The

@@ -4,7 +4,11 @@
   --nord1: #3b4252; /* status line / panel */
   --nord2: #434c5e; /* selection background */
   --nord3: #4c566a; /* comments / dim */
-  --nord3-bright: #616e88; /* lighter dim (ignored explorer entries) */
+  --nord3-bright: #616e88; /* lighter dim (the terminal's ignored-entry shade) */
+  /* Off-palette, brighter still: dim-but-legible text on the picker's NORD1 panel. The picker
+     sits on NORD1 (the terminal's picker rows sit on NORD0), so the terminal's dim shades read
+     too dark here — this lifts them while staying clearly subordinate to NORD4/NORD6 text. */
+  --nord3-brighter: #7b88a1;
   --nord4: #d8dee9; /* main foreground */
   --nord6: #eceff4; /* Snow Storm — brightest (picker text) */
   --nord7: #8fbcbb; /* types */
@@ -398,9 +402,12 @@ html, body, #app {
 
 /* LSP server info dialog. */
 .modal.lsp-info { width: min(560px, 88vw); }
+/* Title: status dot (picker-row colours) + bold server name. */
+.modal.lsp-info .modal-message { font-weight: 600; }
+.lsp-info-dot { margin-right: 8px; font-size: 1.2em; }
 .lsp-info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; margin-bottom: 16px; }
-.lsp-info-key { color: var(--nord3); }
-.lsp-info-val { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-word; }
+.lsp-info-key { color: var(--nord3-brighter); }
+.lsp-info-val { word-break: break-word; } /* sans-serif (inherits the modal's font) */
 
 /* Project settings. */
 .modal.project-settings { width: min(640px, 88vw); }
@@ -497,7 +504,6 @@ html, body, #app {
   display: flex;
   align-items: center;
   background: var(--nord0);
-  border-bottom: 1px solid var(--nord3);
   padding: 10px 12px;
 }
 .picker-path {
@@ -523,6 +529,9 @@ html, body, #app {
   flex: 1 1 auto;
   position: relative;
 }
+/* Separator below the input — only when the list has anything to separate (`filled` is toggled by
+   renderList), so an empty picker doesn't show a stray line doubling the input's bottom border. */
+.picker-list.filled { border-top: 1px solid var(--nord3); }
 /* Empty/loading message (References while resolving, or after an empty resolve). */
 .picker-empty {
   padding: 6px 12px;
@@ -570,10 +579,14 @@ a.picker-row:not(.selected):hover .picker-main {
 .sev-information { color: var(--nord8); }
 .sev-hint { color: var(--nord3); }
 .picker-main { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+/* Dim suffix right after the primary text (multi-root file rows: the root's name) — the path
+   shrinks/ellipsizes first, like the terminal's budget math. */
+.picker-suffix { flex: 0 0 auto; color: var(--nord3-brighter); }
 .picker-dir { color: var(--nord8); } /* directories in frost blue, matching the terminal UI */
-/* Dimmed explorer entries — .gitignore'd files/folders. A lighter gray, legible on both the normal
-   and selected backgrounds. */
-.picker-dim { color: var(--nord3-bright); }
+/* Dimmed explorer entries — .gitignore'd files/folders (same shade for both: the trailing `/`
+   already tells dirs apart). A lighter gray, legible on both the normal and selected backgrounds
+   but clearly subordinate to the snow-white files / frost-blue dirs. */
+.picker-dim { color: var(--nord3-brighter); }
 /* Left status-bullet for explorer entries: a fixed-width cell (so names align) holding a coloured
    `•` on a real change — green = new, yellow = modified, red = removed/conflict. */
 .picker-bullet {
@@ -583,6 +596,15 @@ a.picker-row:not(.selected):hover .picker-main {
   /* Enlarge the `•` without growing the row: scale up and pin the line box to 0. */
   font-size: 1.5em;
   line-height: 0;
+}
+/* SVG-icon variant of the bullet cell (LSP rows): the status bar's icons, cell sized to fit
+   (the text `•` cell's font-size/line-height tricks would distort the SVG). */
+.picker-bullet.icon {
+  width: auto;
+  font-size: inherit;
+  line-height: normal;
+  display: inline-flex;
+  align-items: center;
 }
 .picker-bullet-added,
 .picker-bullet-untracked { color: var(--nord14); }
@@ -612,17 +634,34 @@ a.picker-row:not(.selected):hover .picker-main {
   z-index: 1;
   background: var(--nord1);
 }
-/* Keep a hit from being hidden under the sticky header when scrolled into view. */
-.grep-section .picker-row:not(.grep-header) { scroll-margin-top: 1.6em; }
-.picker-meta { color: var(--nord3); flex: 1 1 auto; text-align: right; overflow: hidden; text-overflow: ellipsis; }
+/* Keep a hit from being hidden under the sticky header when scrolled into view (incl. the
+   scroll-to-top on reopen): the header is one 1.5-line-height row + 2px vertical padding. */
+.grep-section .picker-row:not(.grep-header) { scroll-margin-top: calc(1.5em + 2px); }
+/* Grep hits are code lines — the editor's mono font. Scoped to the preview text only; the line
+   number keeps the picker's sans-serif. */
+.picker-row.grep-hit .picker-main { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+/* Tighter vertical rhythm than the standard 3px row padding, so grep's code lines read closer to
+   the editor's line density. Headers must match: the virtual scroll assumes every grep display
+   row (hit or header) has the same measured height. */
+.picker-row.grep-hit,
+.picker-row.grep-header {
+  padding-top: 1px;
+  padding-bottom: 1px;
+}
+/* The line number never shrinks away under a long code line: size to content, pushed to the right
+   edge (the preview is the flexible cell and ellipsizes instead). */
+.picker-row.grep-hit .picker-meta { flex: 0 0 auto; margin-left: auto; }
+.picker-meta { color: var(--nord3-brighter); flex: 1 1 auto; text-align: right; overflow: hidden; text-overflow: ellipsis; }
 .picker-row.selected .picker-meta { color: var(--nord4); }
 .picker .match { color: var(--nord13); font-weight: bold; }
 .picker-row.selected .match { color: var(--nord13); }
+/* Match summary ("X/Y") to the right of the input, like the terminal UI. */
 .picker-count {
-  padding: 4px 12px;
-  border-top: 1px solid var(--nord3);
-  color: var(--nord3);
+  flex: 0 0 auto;
+  margin-left: 12px;
+  color: var(--nord3-brighter);
   font-size: 12px;
+  white-space: nowrap;
 }
 
 /* Syntax highlight kinds — keys match render.ts's HL_CLASS, values mirror ui.rs::lookup_exact. */

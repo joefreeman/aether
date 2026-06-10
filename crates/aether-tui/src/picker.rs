@@ -44,6 +44,10 @@ pub struct PickerState {
     pub total_matches: u32,
     pub total_candidates: u32,
     pub ticking: bool,
+    /// Total display rows the whole result set occupies, when that differs from `total_matches`.
+    /// Server-reported; in practice grep-only (hits + one header per file group — the wire field
+    /// is `grep_total_display_rows`), `None` for the other kinds. Sizes the collapsed picker box.
+    pub total_display_rows: Option<u32>,
     /// Index into `items` of the highlighted row.
     pub selected: usize,
     /// When non-None, the item we're trying to re-anchor on after resume. Cleared once located
@@ -147,6 +151,7 @@ impl PickerState {
         total_matches: u32,
         total_candidates: u32,
         ticking: bool,
+        total_display_rows: Option<u32>,
     ) -> bool {
         if Some(kind) != self.kind {
             return false;
@@ -173,6 +178,7 @@ impl PickerState {
         self.total_matches = total_matches;
         self.total_candidates = total_candidates;
         self.ticking = ticking;
+        self.total_display_rows = total_display_rows;
 
         if shift != 0 {
             // Cache moved by `shift` in absolute coordinates → existing indices into the old
@@ -626,6 +632,7 @@ mod tests {
             3,
             3,
             false,
+            None,
         );
         assert!(ok);
         // Items should be [a.rs, b.rs, c.rs, "Create file …"] — the synthetic re-added
