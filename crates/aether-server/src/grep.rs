@@ -15,11 +15,12 @@ use crate::handlers::picker_update_notif;
 use crate::picker::{self as picker_state, GrepHitCandidate, PickerCandidates};
 use crate::state::SharedState;
 use crate::workspace_index::CachedFile;
-use aether_protocol::picker::PickerKind;
+use aether_protocol::picker::{CaseMode, PickerFilters, PickerKind};
 use aether_protocol::ClientId;
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -36,18 +37,43 @@ const BATCH_SIZE: usize = 64;
 /// backpressure lets the walker stay ahead of the apply path without unbounded memory.
 const CHANNEL_DEPTH: usize = 8;
 
+/// Hard cap on a hit's preview, in chars. Without it a hit on a single-line minified file (or
+/// any long line) ships the whole line per match — multiplied across a result window that's
+/// enough to blow the websocket frame limit and drop the connection, and the candidate cache
+/// holds every hit's preview for the search's lifetime. 256 chars comfortably overfills any
+/// picker row.
+const MAX_PREVIEW_CHARS: usize = 256;
+
+/// How many chars of left context a windowed preview keeps before the match. Enough to read
+/// the surroundings; small enough that the match never scrolls out of a normal picker row.
+const PREVIEW_LEAD_CHARS: usize = 32;
+
 /// Spawn an async search for `query` against the workspace. Detached: the returned future is
 /// fire-and-forget. The coordinator self-terminates when the picker's generation moves past
 /// `generation` (the user typed something new) or when the walker exhausts the file list.
+/// `roots` are the project's root paths — needed when `filters` require a relaxed re-walk
+/// (`+ignored`/`+hidden`) or a per-root Git status pass (`changed`).
 pub fn spawn_search(
     state: SharedState,
     workspace_files: Arc<Vec<CachedFile>>,
+    roots: Vec<PathBuf>,
     client_id: ClientId,
     query: String,
+    filters: PickerFilters,
     generation: u64,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = run_search(state, workspace_files, client_id, query, generation).await {
+        if let Err(e) = run_search(
+            state,
+            workspace_files,
+            roots,
+            client_id,
+            query,
+            filters,
+            generation,
+        )
+        .await
+        {
             tracing::debug!(error = %e, "grep search aborted");
         }
     });
@@ -56,16 +82,37 @@ pub fn spawn_search(
 async fn run_search(
     state: SharedState,
     workspace_files: Arc<Vec<CachedFile>>,
+    roots: Vec<PathBuf>,
     client_id: ClientId,
     query: String,
+    filters: PickerFilters,
     generation: u64,
 ) -> Result<(), String> {
-    // Smart-case regex matching — the query is a regex, same as buffer search (`/`). Invalid
+    // The query is a regex, same as buffer search (`/`), unless the `lit` filter makes it a
+    // literal. Case handling defaults to smart-case; the `case` filter overrides. Invalid
     // patterns mid-typing (`foo[`, trailing `\`, etc.) are silently treated as "no matches" so
     // the picker stays responsive instead of erroring; the spawned search just emits one final
     // non-ticking, zero-hit update and exits.
-    let matcher = match RegexMatcherBuilder::new().case_smart(true).build(&query) {
+    let mut builder = RegexMatcherBuilder::new();
+    match filters.case {
+        CaseMode::Smart => builder.case_smart(true),
+        CaseMode::Sensitive => builder.case_smart(false),
+        CaseMode::Insensitive => builder.case_insensitive(true),
+    };
+    builder
+        .word(filters.whole_word)
+        .fixed_strings(filters.fixed_string);
+    let matcher = match builder.build(&query) {
         Ok(m) => m,
+        Err(_) => {
+            return finalize_with_no_hits(state, client_id, generation).await;
+        }
+    };
+
+    // Compile the glob filter up front — an invalid glob is treated like an invalid regex
+    // (zero hits; the chip stays visible so the user can see what to fix).
+    let overrides = match picker_state::build_overrides(&filters.globs) {
+        Ok(o) => o,
         Err(_) => {
             return finalize_with_no_hits(state, client_id, generation).await;
         }
@@ -74,7 +121,21 @@ async fn run_search(
     let (batch_tx, mut batch_rx) = mpsc::channel::<Vec<GrepHitCandidate>>(CHANNEL_DEPTH);
     let files_for_blocking = workspace_files.clone();
     tokio::task::spawn_blocking(move || {
-        walk_and_search(&files_for_blocking, &matcher, &batch_tx);
+        // `+ignored` / `+hidden` need files the memoized index never contains — run a one-shot
+        // relaxed walk instead. The plain path keeps using the shared snapshot.
+        let relaxed: Vec<CachedFile>;
+        let files: &[CachedFile] = if filters.include_ignored || filters.include_hidden {
+            relaxed = crate::workspace_index::walk_with(
+                &roots,
+                filters.include_ignored,
+                filters.include_hidden,
+            );
+            &relaxed
+        } else {
+            &files_for_blocking
+        };
+        let file_filter = FileFilter::new(&filters, &roots, overrides);
+        walk_and_search(files, &matcher, &batch_tx, &file_filter);
         // Dropping `batch_tx` here signals end-of-stream to the coordinator.
     });
 
@@ -112,14 +173,15 @@ async fn run_search(
                 }
             }
             None => {
-                // Walker done — emit the final, not-ticking push and mark the query as cached
-                // so a re-query with the same string short-circuits the next picker_query call.
+                // Walker done — emit the final, not-ticking push and mark the (query, filters)
+                // pair as cached so an identical re-query short-circuits the next picker_query.
                 let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
                 let crate::state::ServerState {
                     pickers, matcher, ..
                 } = &mut *s;
                 let picker = pickers.get_mut(&key).expect("checked above");
-                picker.last_completed_query = Some(picker.query.clone());
+                picker.last_completed_search =
+                    Some((picker.query.clone(), picker.filters.clone()));
                 let mut update = picker_state::build_update(picker, matcher);
                 if let Some(ref mut u) = update {
                     u.ticking = false;
@@ -156,7 +218,7 @@ async fn finalize_with_no_hits(
     } = &mut *s;
     let picker = pickers.get_mut(&key).expect("checked above");
     // Cache the invalid query too — re-typing the same broken regex shouldn't re-walk the tree.
-    picker.last_completed_query = Some(picker.query.clone());
+    picker.last_completed_search = Some((picker.query.clone(), picker.filters.clone()));
     let mut update = picker_state::build_update(picker, matcher);
     if let Some(ref mut u) = update {
         u.ticking = false;
@@ -168,17 +230,91 @@ async fn finalize_with_no_hits(
     Ok(())
 }
 
+/// Path-level filters applied before a file's contents are searched: root / directory scope,
+/// include+exclude globs, and the changed-only restriction. Built once per search inside the
+/// blocking task (the Git status pass walks the worktree).
+struct FileFilter {
+    /// rg `-g` semantics via `ignore::overrides`: `!`-globs exclude; with ≥1 plain glob
+    /// present, non-matching files are excluded too. `None` when no globs were given.
+    overrides: Option<ignore::overrides::Override>,
+    /// Union of `(path_index, relative_path)` directory scopes — a file passes when it's under
+    /// *any* of them (matching how multiple include globs combine). Empty `relative_path`
+    /// scopes to the whole root; an empty vec means no dir narrowing.
+    directories: Vec<(u32, String)>,
+    /// Per-root repo status, aligned to root index. Only `Some` under `changed_only`; a root
+    /// outside any repo yields `None` inside, which excludes its files (nothing in it is
+    /// "changed").
+    changed: Option<Vec<Option<crate::git::RepoStatus>>>,
+}
+
+impl FileFilter {
+    fn new(
+        filters: &PickerFilters,
+        roots: &[PathBuf],
+        overrides: Option<ignore::overrides::Override>,
+    ) -> FileFilter {
+        FileFilter {
+            overrides,
+            directories: filters
+                .directories
+                .iter()
+                .map(|d| (d.path_index, d.relative_path.clone()))
+                .collect(),
+            changed: filters
+                .changed_only
+                .then(|| roots.iter().map(|r| crate::git::repo_status_for_root(r)).collect()),
+        }
+    }
+
+    fn passes(&self, f: &CachedFile) -> bool {
+        if !self.directories.is_empty()
+            && !self.directories.iter().any(|(path_index, rel)| {
+                crate::picker::under_scope(f.path_index, &f.relative_path, *path_index, rel)
+            })
+        {
+            return false;
+        }
+        if let Some(ov) = &self.overrides {
+            if ov.matched(&f.relative_path, false).is_ignore() {
+                return false;
+            }
+        }
+        if let Some(changed) = &self.changed {
+            let status = changed
+                .get(f.path_index as usize)
+                .and_then(|rs| rs.as_ref())
+                .and_then(|rs| rs.status_of(&f.relative_path));
+            if status.is_none() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Walk the workspace file list, running the matcher against each file's contents and shipping
-/// batches of hits over `batch_tx`. Quits early if the receiver hangs up (the coordinator
-/// noticed a generation bump and dropped it).
+/// batches of hits over `batch_tx`. Files failing `file_filter` are skipped without being
+/// opened. Quits early if the receiver hangs up (the coordinator noticed a generation bump and
+/// dropped it).
 fn walk_and_search(
     files: &[CachedFile],
     matcher: &RegexMatcher,
     batch_tx: &mpsc::Sender<Vec<GrepHitCandidate>>,
+    file_filter: &FileFilter,
 ) {
-    let mut searcher = SearcherBuilder::new().line_number(true).build();
+    // Binary detection mirrors ripgrep's CLI default (the *library* default is `none`!): bail
+    // out of a file at the first NUL byte. Without it, archives like `.xlsx` get searched as
+    // raw bytes — megabyte "lines" of zip data whose control characters (ESC included) would
+    // otherwise reach the terminal and corrupt the display.
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(0))
+        .build();
     let mut batch: Vec<GrepHitCandidate> = Vec::with_capacity(BATCH_SIZE);
     for f in files {
+        if !file_filter.passes(f) {
+            continue;
+        }
         if batch_tx.is_closed() {
             return;
         }
@@ -226,6 +362,7 @@ impl<'a> Sink for HitCollector<'a> {
         // `line_number` is 1-based; we use 0-based internally.
         let line_num = mat.line_number().unwrap_or(1).saturating_sub(1) as u32;
         let preview = preview_from_line(line_bytes);
+        let preview_chars = preview.chars().count();
 
         // Walk every match on this line — one row per match.
         let mut hits_on_line: Vec<(u32, usize, usize)> = Vec::new();
@@ -239,7 +376,11 @@ impl<'a> Sink for HitCollector<'a> {
         });
 
         for (col, byte_start, byte_end) in hits_on_line {
-            let match_indices = byte_range_to_char_offsets(&preview, byte_start, byte_end);
+            let match_chars = byte_range_to_char_offsets(&preview, byte_start, byte_end);
+            // Each hit gets a *bounded* window of the line around its own match — `col` stays
+            // the real byte column (jumps are unaffected; the preview is display-only).
+            let (hit_preview, match_indices) =
+                windowed_preview(&preview, preview_chars, match_chars);
             self.batch.push(GrepHitCandidate {
                 path_index: self.path_index,
                 relative_path: self.relative_path.to_string(),
@@ -247,7 +388,7 @@ impl<'a> Sink for HitCollector<'a> {
                 line: line_num,
                 col,
                 match_byte_len: (byte_end - byte_start) as u32,
-                preview: preview.clone(),
+                preview: hit_preview,
                 match_indices,
             });
         }
@@ -265,7 +406,11 @@ impl<'a> Sink for HitCollector<'a> {
 
 /// Strip the trailing newline (if any) from a line read by `grep-searcher` and produce a
 /// displayable string. Non-UTF-8 bytes are replaced with U+FFFD — practical for source-tree
-/// search where the rare invalid byte shouldn't crash the picker.
+/// search where the rare invalid byte shouldn't crash the picker. ASCII control bytes (tabs
+/// included) become spaces: an embedded ESC would otherwise reach the terminal as a live
+/// escape sequence and corrupt the display, and a raw tab breaks the row's width math. The
+/// replacement is byte-for-byte, so match byte offsets into the raw line stay valid against
+/// the preview.
 fn preview_from_line(line: &[u8]) -> String {
     let trimmed = if line.ends_with(b"\n") {
         let cut = if line.ends_with(b"\r\n") {
@@ -277,7 +422,45 @@ fn preview_from_line(line: &[u8]) -> String {
     } else {
         line
     };
-    String::from_utf8_lossy(trimmed).into_owned()
+    let sanitized: Vec<u8> = trimmed
+        .iter()
+        .map(|&b| if b < 0x20 || b == 0x7f { b' ' } else { b })
+        .collect();
+    String::from_utf8_lossy(&sanitized).into_owned()
+}
+
+/// Bound a hit's preview to a window of [`MAX_PREVIEW_CHARS`] around its match: the window
+/// opens [`PREVIEW_LEAD_CHARS`] before the match's first char (clamped so the window stays
+/// full-size at the line's tail), and a leading `…` marks a left cut. `match_chars` are the
+/// match's char offsets into the full `preview`; the returned offsets index the window. Lines
+/// already within the cap pass through untouched.
+fn windowed_preview(
+    preview: &str,
+    preview_chars: usize,
+    match_chars: Vec<u32>,
+) -> (String, Vec<u32>) {
+    if preview_chars <= MAX_PREVIEW_CHARS {
+        return (preview.to_string(), match_chars);
+    }
+    let first = match_chars.first().copied().unwrap_or(0) as usize;
+    let start = first
+        .saturating_sub(PREVIEW_LEAD_CHARS)
+        .min(preview_chars - MAX_PREVIEW_CHARS);
+    let cut_left = start > 0;
+    let mut out = String::new();
+    if cut_left {
+        out.push('…');
+    }
+    out.extend(preview.chars().skip(start).take(MAX_PREVIEW_CHARS));
+    let shift = usize::from(cut_left);
+    let indices = match_chars
+        .into_iter()
+        .filter_map(|i| {
+            let i = i as usize;
+            (i >= start && i < start + MAX_PREVIEW_CHARS).then(|| (i - start + shift) as u32)
+        })
+        .collect();
+    (out, indices)
 }
 
 /// Convert a byte range within `preview` to the char-index offsets the match covers. Char
@@ -305,6 +488,62 @@ mod tests {
         assert_eq!(preview_from_line(b"hello\n"), "hello");
         assert_eq!(preview_from_line(b"hello\r\n"), "hello");
         assert_eq!(preview_from_line(b"no-newline"), "no-newline");
+    }
+
+    #[test]
+    fn preview_sanitizes_control_bytes() {
+        // ESC must never reach the terminal as a live escape sequence; tabs would break the
+        // row's width math. Both become spaces, byte-for-byte (offsets stay valid).
+        assert_eq!(preview_from_line(b"a\x1b[31mred\tx\n"), "a [31mred x");
+        assert_eq!(preview_from_line(b"nul\x00mid\x7fend"), "nul mid end");
+    }
+
+    #[test]
+    fn windowed_preview_passes_short_lines_through() {
+        let (p, idx) = windowed_preview("let foo = 1;", 12, vec![4, 5, 6]);
+        assert_eq!(p, "let foo = 1;");
+        assert_eq!(idx, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn windowed_preview_caps_long_lines_around_the_match() {
+        // A match deep inside a long line: the window opens PREVIEW_LEAD_CHARS before it and
+        // a leading `…` marks the cut; indices shift into the window.
+        let long: String = "x".repeat(1000);
+        let mut line = long.clone();
+        line.replace_range(500..506, "needle");
+        let match_chars: Vec<u32> = (500..506).collect();
+        let (p, idx) = windowed_preview(&line, 1000, match_chars);
+        assert_eq!(p.chars().count(), MAX_PREVIEW_CHARS + 1, "window + ellipsis");
+        assert!(p.starts_with('…'));
+        let start = 500 - PREVIEW_LEAD_CHARS;
+        let expected: Vec<u32> = (500..506).map(|i| (i - start + 1) as u32).collect();
+        assert_eq!(idx, expected);
+        // The match chars land on "needle" within the window.
+        let chars: Vec<char> = p.chars().collect();
+        let shown: String = idx.iter().map(|&i| chars[i as usize]).collect();
+        assert_eq!(shown, "needle");
+    }
+
+    #[test]
+    fn windowed_preview_clamps_at_line_start_and_tail() {
+        let long: String = "y".repeat(1000);
+        // Match at the very start: no left cut, plain prefix window.
+        let (p, idx) = windowed_preview(&long, 1000, vec![0, 1]);
+        assert_eq!(p.chars().count(), MAX_PREVIEW_CHARS);
+        assert!(!p.starts_with('…'));
+        assert_eq!(idx, vec![0, 1]);
+        // Match at the very end: the window clamps so it stays full-size at the tail and the
+        // match remains inside it.
+        let (p, idx) = windowed_preview(&long, 1000, vec![998, 999]);
+        assert_eq!(p.chars().count(), MAX_PREVIEW_CHARS + 1);
+        let start = 1000 - MAX_PREVIEW_CHARS;
+        assert_eq!(
+            idx,
+            vec![(998 - start + 1) as u32, (999 - start + 1) as u32]
+        );
+        let max_idx = *idx.iter().max().unwrap() as usize;
+        assert!(max_idx < p.chars().count(), "indices stay inside the window");
     }
 
     #[test]

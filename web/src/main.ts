@@ -8,6 +8,7 @@ import type { ConnState } from "./client";
 import { renderMarkdown } from "./markdown";
 import { renderBuffer } from "./render";
 import { Picker, bufferStatusDot } from "./picker";
+import { rootLabels } from "./labels";
 import { decodeRow } from "./text";
 import { readClipboard, writeClipboard } from "./clipboard";
 import { confirmDialog, saveAsDialog } from "./modal";
@@ -59,6 +60,7 @@ import type {
   Motion,
   NavGotoParams,
   NavStepResult,
+  PickerFilters,
   PickerGrepNavigateTarget,
   PickerItem,
   PickerKind,
@@ -148,52 +150,7 @@ function joinPath(dir: string, name: string): string {
   return dir.endsWith("/") ? dir + name : `${dir}/${name}`;
 }
 
-// ---- project-relative path labels (mirrors the TUI's labels.rs + project_relative_label) --------
-// The status bar shows a buffer's path relative to its project root, prefixed by a disambiguating
-// root label when the project has several roots that would otherwise read the same.
-
-/** One label per root, aligned by index. Single root → "" (no prefix needed). Roots that share a
- *  basename grow a parenthesized parent (`api (work)`), deepening until unique. */
-function rootLabels(paths: string[]): string[] {
-  const n = paths.length;
-  if (n === 0) return [];
-  if (n === 1) return [""];
-  const MAX_DEPTH = 16;
-  const depths = new Array<number>(n).fill(0);
-  const labels = new Array<string>(n).fill("");
-  for (let pass = 0; pass <= MAX_DEPTH; pass++) {
-    for (let i = 0; i < n; i++) labels[i] = labelAtDepth(paths[i], depths[i]);
-    const byLabel = new Map<string, number[]>();
-    labels.forEach((l, i) => {
-      const arr = byLabel.get(l);
-      if (arr) arr.push(i);
-      else byLabel.set(l, [i]);
-    });
-    const collisions = [...byLabel.values()].filter((idxs) => idxs.length > 1);
-    if (collisions.length === 0) return labels;
-    let bumped = false;
-    for (const idxs of collisions)
-      for (const i of idxs)
-        if (depths[i] < MAX_DEPTH) {
-          depths[i]++;
-          bumped = true;
-        }
-    if (!bumped) return labels; // every colliding entry maxed out — accept the duplicates
-  }
-  return labels;
-}
-
-/** `{basename}` at depth 0, else `{basename} ({parent…/})` with `depth` parent components. */
-function labelAtDepth(path: string, depth: number): string {
-  const comps = path.split("/").filter((c) => c.length > 0);
-  const base = comps.length ? comps[comps.length - 1] : path;
-  if (depth === 0) return base;
-  const parents: string[] = [];
-  for (let i = comps.length - 2; i >= 0 && parents.length < depth; i--) parents.push(comps[i]);
-  if (parents.length === 0) return base;
-  parents.reverse();
-  return `${base} (${parents.join("/")})`;
-}
+// ---- project-relative path labels (root labels live in labels.ts, shared with the picker) ------
 
 /** Strip the longest matching project root off `abs` → `[rootIndex, relativePath]`, or null when
  *  the path is under no root. Component-aware (a trailing-slash boundary), like the TUI. */
@@ -1112,7 +1069,7 @@ class Editor {
 
   // ---- pickers --------------------------------------------------------------------------------
 
-  private openPicker(kind: PickerKind): void {
+  private openPicker(kind: PickerKind, initialFilters?: PickerFilters): void {
     this.picker = new Picker({
       client: this.client,
       kind,
@@ -1127,7 +1084,16 @@ class Editor {
       onToast: (msg, k) => this.toast(msg, k),
       onCreatePath: (p) => this.onCreatePath(p),
       onCreateProject: (n) => this.onCreateProject(n),
+      onSwitch: (k, filters) => this.onPickerSwitch(k, filters),
+      initialFilters,
     });
+  }
+
+  /** Explorer `Ctrl-g`/`Ctrl-f`: close the explorer (hiding it server-side) and open the
+   *  target picker seeded with the directory scope + translated flags. */
+  private onPickerSwitch(kind: PickerKind, filters: PickerFilters): void {
+    this.closePicker();
+    this.openPicker(kind, filters);
   }
 
   private explorerInitialDir(): string | null {
@@ -1208,7 +1174,10 @@ class Editor {
       this.setStatus("could not open selection", true);
       return;
     }
-    await this.switchBuffer(params, { recordJump: true });
+    // Grep hits get the centered reveal — jumping to a search result wants context around the
+    // match. Other selections keep the minimal reveal.
+    const reveal = kind === "grep" && result.kind === "file_at" ? ("center" as const) : undefined;
+    await this.switchBuffer(params, { recordJump: true, reveal });
     // Opening a grep hit primes the buffer's search with the query so n / Alt-n continue from here.
     if (grepQuery && jumpTo) {
       const res = await this.client.rpc<SearchSetResult>("search/set", {
@@ -1407,14 +1376,14 @@ class Editor {
    *  new browser-history entry (so Alt-←/→ return here); otherwise the current entry is replaced. */
   private async switchBuffer(
     openParams: BufferOpenParams,
-    opts: { recordJump?: boolean } = {},
+    opts: { recordJump?: boolean; reveal?: "center" } = {},
   ): Promise<void> {
     // Flush the origin's live cursor into the current entry before we move, so a pushed back-entry
     // captures exactly where we left (even if the movement debounce hadn't fired yet).
     if (opts.recordJump) this.replaceHistory();
     const originKey = this.locationKey();
     const open = await this.client.rpc<BufferOpenResult>("buffer/open", openParams);
-    await this.applyOpenedBuffer(open);
+    await this.applyOpenedBuffer(open, opts.reveal);
     const moved = this.locationKey() !== originKey;
     if (opts.recordJump && moved) this.pushHistory();
     else this.replaceHistory();
@@ -1427,9 +1396,15 @@ class Editor {
   }
 
   /** Post-`buffer/open` plumbing shared by switchBuffer and nav restore: adopt state, subscribe a
-   *  fresh viewport (dropping the old), paint. Does *not* touch browser history. */
-  private async applyOpenedBuffer(open: BufferOpenResult): Promise<void> {
+   *  fresh viewport (dropping the old), paint. Does *not* touch browser history. `reveal:
+   *  "center"` (grep jumps) centers an off-screen cursor instead of edge-revealing it. */
+  private async applyOpenedBuffer(open: BufferOpenResult, reveal?: "center"): Promise<void> {
     const oldViewport = this.viewportId;
+    // Captured before adoption replaces `bufferId`: a same-buffer open (grep `<`/`>` within
+    // one file, nav back/forward landing where we are) keeps the native scroll position so
+    // the reveal below can *animate* from here — resetting it would teleport via the top of
+    // the document and the smooth-scroll distance cap would always snap.
+    const sameBuffer = open.buffer_id === this.bufferId;
     this.adoptOpenedBuffer(open);
     this.mode = "normal";
     this.scroll = open.scroll ?? {
@@ -1453,9 +1428,19 @@ class Editor {
     if (oldViewport && oldViewport !== sub.viewport_id) {
       void this.client.rpc<null>("viewport/unsubscribe", { viewport_id: oldViewport }).catch(() => {});
     }
-    this.bufferEl.scrollTop = 0; // reset before revealing the new buffer's cursor
+    // Reset before revealing a *different* buffer's cursor — the old document's scroll offset
+    // is meaningless there. Same-buffer opens keep continuity (see above), which is what lets
+    // scrollTopTo's smooth path animate nearby jumps.
+    if (!sameBuffer) this.bufferEl.scrollTop = 0;
     this.render();
-    this.revealCursor();
+    if (reveal === "center") {
+      // Same buffer: center only when off-screen, animated when near (the smooth-distance cap
+      // decides). Different buffer: always center, instantly — deterministic landing, and
+      // there's no meaningful origin to animate from.
+      this.revealCursorCentered({ force: !sameBuffer, smooth: sameBuffer });
+    } else {
+      this.revealCursor();
+    }
   }
 
   /** Restore a jump-list entry on `popstate` (browser back/forward). The server opens the buffer
@@ -1751,7 +1736,7 @@ class Editor {
           const params = this.resolvePath(target.path);
           if (params) {
             params.jump_to = target.position;
-            await this.switchBuffer(params, { recordJump: true });
+            await this.switchBuffer(params, { recordJump: true, reveal: "center" });
             // Prime the buffer's search with the grep query so n / Alt-n continue from here.
             if (target.query) {
               const res = await this.client.rpc<SearchSetResult>("search/set", {
@@ -2363,17 +2348,18 @@ class Editor {
     } else if (e.key === "Enter") {
       e.preventDefault();
       this.commitSearch();
-    } else if (e.key === "ArrowUp") {
+    } else if (e.altKey && e.key === "k") {
       e.preventDefault();
       this.browseHistory(-1);
-    } else if (e.key === "ArrowDown") {
+    } else if (e.altKey && e.key === "j") {
       e.preventDefault();
       this.browseHistory(1);
     }
   }
 
-  /** Browse committed search queries with ↑/↓ in the search bar (a draft of the in-progress query
-   *  is kept so ↓ past the newest returns to it). */
+  /** Browse committed search queries with Alt-k/j in the search bar (a draft of the in-progress
+   *  query is kept so Alt-j past the newest returns to it) — the same chord the picker chip
+   *  editors use for candidate/history selection. */
   private browseHistory(delta: number): void {
     if (this.searchHistory.length === 0) return;
     if (this.historyIndex === null) {
@@ -2557,6 +2543,30 @@ class Editor {
     } else {
       this.bufferEl.scrollTop = target;
     }
+  }
+
+  /** The centered counterpart to revealCursor, for result-navigation jumps (grep): an
+   *  already-visible cursor leaves the view untouched — no scroll churn when stepping between
+   *  nearby matches — while an off-screen one scrolls to the vertical center (the browser
+   *  clamps at the document edges, so near-EOF jumps degrade gracefully). `force` skips the
+   *  visible-check and `smooth: false` skips the animation — cross-file jumps use both, so
+   *  landing in another file is deterministically "match centered, instantly" rather than
+   *  depending on that buffer's restored scroll and the smooth-distance cap. Delegating the
+   *  rest to revealCursor keeps the no-wrap column handling shared; its vertical branch is a
+   *  no-op once the row is visible. */
+  private revealCursorCentered(opts: { force?: boolean; smooth?: boolean } = {}): void {
+    const row = this.cursorAbsoluteVisualRow();
+    if (row !== null) {
+      const topRow = (this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h;
+      const visible = this.visibleRows();
+      if (opts.force || row < topRow || row >= topRow + visible) {
+        this.scrollTopTo(
+          (row - Math.floor(visible / 2)) * this.cell.h + BUFFER_PAD,
+          opts.smooth ?? true,
+        );
+      }
+    }
+    this.revealCursor();
   }
 
   /** Scroll the native container the minimum to bring the cursor's visual row (and, under no-wrap,

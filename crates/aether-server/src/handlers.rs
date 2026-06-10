@@ -7609,6 +7609,7 @@ async fn build_explorer_candidates(
     state: &SharedState,
     client_id: ClientId,
     requested: Option<&str>,
+    filters: &aether_protocol::picker::PickerFilters,
 ) -> Result<picker_state::ExplorerCandidates, RpcError> {
     // Grab everything we need from the lock in one pass: project roots + the explorer's
     // currently-listed path (if any), so we can resolve the fallback without re-locking.
@@ -7636,7 +7637,7 @@ async fn build_explorer_candidates(
     let canonical = std::fs::canonicalize(&raw_path).map_err(|e| {
         RpcError::invalid_path(format!("canonicalizing {}: {e}", raw_path.display()))
     })?;
-    build_explorer_candidates_for_canonical(&canonical, &project_paths)
+    build_explorer_candidates_for_canonical(&canonical, &project_paths, filters)
 }
 
 /// Build the Roots-mode candidate list — one row per project root, sorted by basename. The
@@ -7672,6 +7673,7 @@ async fn build_explorer_roots(
 pub(crate) fn build_explorer_candidates_for_canonical(
     canonical: &std::path::Path,
     project_paths: &[std::path::PathBuf],
+    filters: &aether_protocol::picker::PickerFilters,
 ) -> Result<picker_state::ExplorerCandidates, RpcError> {
     let in_project = |p: &std::path::Path| -> bool {
         project_paths
@@ -7714,6 +7716,21 @@ pub(crate) fn build_explorer_candidates_for_canonical(
         };
         let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let git_status = git_status.get(&name).copied();
+        // Filter chips. The explorer shows hidden + ignored entries by default (colour-tagged),
+        // so its chips *hide* rather than include. `changed` keeps any non-clean, non-ignored
+        // status — for a directory that's the aggregated descendant status, so ancestors of a
+        // change stay navigable.
+        if filters.hide_hidden && name.starts_with('.') {
+            continue;
+        }
+        if filters.hide_ignored && git_status == Some(aether_protocol::git::GitStatus::Ignored) {
+            continue;
+        }
+        if filters.changed_only
+            && !matches!(git_status, Some(s) if s != aether_protocol::git::GitStatus::Ignored)
+        {
+            continue;
+        }
         entries.push(picker_state::ExplorerEntry {
             name,
             is_dir,
@@ -7748,7 +7765,12 @@ pub async fn directory_list(
     let raw = std::path::PathBuf::from(&params.path);
     let canonical = std::fs::canonicalize(&raw)
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
-    let candidates = build_explorer_candidates_for_canonical(&canonical, &project_paths)?;
+    // Prompt listings (save-as cycling) are never filter-scoped — pass the no-op default.
+    let candidates = build_explorer_candidates_for_canonical(
+        &canonical,
+        &project_paths,
+        &aether_protocol::picker::PickerFilters::default(),
+    )?;
     Ok(DirectoryListResult {
         path: candidates.path,
         parent: candidates.parent,
@@ -7802,8 +7824,9 @@ pub(crate) fn refresh_explorers_for_dirs(
     if affected_dirs.is_empty() {
         return Vec::new();
     }
-    // Snapshot which (client, picker_path) pairs need refresh before we mutate.
-    let to_refresh: Vec<(ClientId, std::path::PathBuf)> = s
+    // Snapshot which (client, picker_path, filters) triples need refresh before we mutate —
+    // the rebuilt listing must honour the picker's active filter chips.
+    let to_refresh: Vec<(ClientId, std::path::PathBuf, aether_protocol::picker::PickerFilters)> = s
         .pickers
         .iter()
         .filter_map(|((cid, kind), picker)| {
@@ -7815,7 +7838,7 @@ pub(crate) fn refresh_explorers_for_dirs(
                 _ => return None,
             };
             if affected_dirs.contains(&path) {
-                Some((*cid, path))
+                Some((*cid, path, picker.filters.clone()))
             } else {
                 None
             }
@@ -7825,16 +7848,17 @@ pub(crate) fn refresh_explorers_for_dirs(
         return Vec::new();
     }
     let mut pushes = Vec::new();
-    for (client_id, path) in to_refresh {
+    for (client_id, path, filters) in to_refresh {
         // Each picker's project may differ — re-fetch per client. Skip silently if the client
         // somehow lost its active project between subscribe and refresh.
         let Some(project_paths) = s.active_project(client_id).map(|p| p.paths.clone()) else {
             continue;
         };
-        let new_candidates = match build_explorer_candidates_for_canonical(&path, &project_paths) {
-            Ok(c) => c,
-            Err(_) => continue, // dir removed or no longer in project; skip silently
-        };
+        let new_candidates =
+            match build_explorer_candidates_for_canonical(&path, &project_paths, &filters) {
+                Ok(c) => c,
+                Err(_) => continue, // dir removed or no longer in project; skip silently
+            };
         let ServerState {
             pickers,
             matcher,
@@ -7955,8 +7979,29 @@ pub async fn picker_view(
             if params.explorer_roots {
                 picker_state::PickerCandidates::ExplorerRoots(build_explorer_roots(state, client_id).await?)
             } else {
+                // The listing is built *before* the picker state is (re)hydrated, but it must
+                // honour the filters that will be in effect: the caller's replacement set if
+                // sent, else the persisted set (which `reset` is about to wipe — treat that as
+                // default).
+                let filters = match params.filters.clone() {
+                    Some(f) => f,
+                    None if params.reset => Default::default(),
+                    None => {
+                        let s = state.lock().await;
+                        s.pickers
+                            .get(&(client_id, PickerKind::Explorer))
+                            .map(|p| p.filters.clone())
+                            .unwrap_or_default()
+                    }
+                };
                 picker_state::PickerCandidates::Explorer(
-                    build_explorer_candidates(state, client_id, params.directory_path.as_deref()).await?,
+                    build_explorer_candidates(
+                        state,
+                        client_id,
+                        params.directory_path.as_deref(),
+                        &filters,
+                    )
+                    .await?,
                 )
             }
         }
@@ -8077,6 +8122,20 @@ pub async fn picker_view(
     }
     let picker = pickers.get_mut(&key).expect("populated above");
 
+    // Replace persisted filters when the caller sent a set (`None` keeps what hide left). A
+    // change re-ranks; for Grep it also drops the cached hits — they were produced under the
+    // old filters and the client's follow-up `picker/query` will respawn the search.
+    if let Some(filters) = params.filters {
+        if filters != picker.filters {
+            picker.filters = filters;
+            if let picker_state::PickerCandidates::Grep(_) = picker.candidates {
+                picker.candidates = picker_state::PickerCandidates::Grep(Vec::new());
+                picker.last_completed_search = None;
+            }
+            picker.rerank(matcher);
+        }
+    }
+
     // References: a fresh open (`buffer_id` present, vs `None` on scroll/resume re-views) kicks
     // off the async `textDocument/references` resolve. Mint an epoch, mark the picker loading, and
     // remember what to spawn once the lock is released — the picker is pushed empty + `ticking`
@@ -8165,6 +8224,7 @@ pub async fn picker_view(
         effective_center_on,
         directory_path,
         directory_parent,
+        filters: picker.filters.clone(),
     };
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
     drop(s);
@@ -8197,13 +8257,17 @@ pub async fn picker_query(
         // matches the lenient style of other handlers.
         return Ok(());
     };
-    // Grep cache: if the query matches the one whose walk last completed, the existing
-    // candidates are still valid. Bump generation (so any in-flight worker from a prior query
-    // bails on its next batch) but skip the wipe + respawn. The initial push built below will
-    // carry the cached items.
+    // Grep cache: if the (query, filters) pair matches the search whose walk last completed,
+    // the existing candidates are still valid. Bump generation (so any in-flight worker from a
+    // prior query bails on its next batch) but skip the wipe + respawn. The initial push built
+    // below will carry the cached items.
     let grep_cache_hit = matches!(params.kind, PickerKind::Grep)
-        && picker.last_completed_query.as_deref() == Some(params.query.as_str());
+        && picker
+            .last_completed_search
+            .as_ref()
+            .is_some_and(|(q, f)| *q == params.query && *f == params.filters);
     picker.query = params.query;
+    picker.filters = params.filters;
     picker.generation = params.generation;
     match params.kind {
         // Grep: the query *is* the search. On a cache miss, drop any prior results and let the
@@ -8214,7 +8278,7 @@ pub async fn picker_query(
             if !grep_cache_hit {
                 picker.candidates = picker_state::PickerCandidates::Grep(Vec::new());
                 picker.ranked.clear();
-                picker.last_completed_query = None;
+                picker.last_completed_search = None;
             }
         }
         _ => picker.rerank(matcher),
@@ -8234,6 +8298,7 @@ pub async fn picker_query(
     let references_loading = picker.pending_async_load.is_some();
     let mut update = picker_state::build_update(picker, matcher);
     let query_for_grep = picker.query.clone();
+    let filters_for_grep = picker.filters.clone();
     let generation = picker.generation;
     let will_spawn_grep_search = matches!(params.kind, PickerKind::Grep)
         && query_for_grep.len() >= grep::MIN_QUERY_LEN
@@ -8252,7 +8317,8 @@ pub async fn picker_query(
         // Active-project lookup can fail in the (defensively-handled) case where the client
         // somehow lost its active project between opening the picker and querying it. Skip the
         // grep spawn in that case — there's nothing meaningful to search.
-        s.active_project(client_id).map(|p| p.workspace_index.clone())
+        s.active_project(client_id)
+            .map(|p| (p.workspace_index.clone(), p.paths.clone()))
     } else {
         None
     };
@@ -8263,9 +8329,17 @@ pub async fn picker_query(
     }
 
     if will_spawn_grep_search {
-        if let Some(workspace_index) = workspace_index_for_grep {
+        if let Some((workspace_index, roots)) = workspace_index_for_grep {
             let files = workspace_index.files().await;
-            grep::spawn_search(state.clone(), files, client_id, query_for_grep, generation);
+            grep::spawn_search(
+                state.clone(),
+                files,
+                roots,
+                client_id,
+                query_for_grep,
+                filters_for_grep,
+                generation,
+            );
         }
     }
     Ok(())

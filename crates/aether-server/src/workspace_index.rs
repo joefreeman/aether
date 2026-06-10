@@ -108,6 +108,15 @@ impl WorkspaceIndex {
 }
 
 fn walk(roots: &[PathBuf]) -> Vec<CachedFile> {
+    walk_with(roots, false, false)
+}
+
+/// The workspace walk with the gitignore / hidden-file exclusions optionally relaxed. The
+/// memoized index cache is always built with both exclusions on (`walk`); grep searches carrying
+/// the `+ignored` / `+hidden` filters run this directly for a one-shot relaxed file list.
+/// `.git` directories stay excluded even with `include_hidden` — searching repo internals is
+/// never what those filters mean.
+pub fn walk_with(roots: &[PathBuf], include_ignored: bool, include_hidden: bool) -> Vec<CachedFile> {
     let mut out: Vec<CachedFile> = Vec::new();
 
     for (path_index, root) in roots.iter().enumerate() {
@@ -127,12 +136,13 @@ fn walk(roots: &[PathBuf]) -> Vec<CachedFile> {
 
         let walker = ignore::WalkBuilder::new(root)
             .follow_links(false)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .ignore(true)
-            .parents(true)
+            .hidden(!include_hidden)
+            .git_ignore(!include_ignored)
+            .git_global(!include_ignored)
+            .git_exclude(!include_ignored)
+            .ignore(!include_ignored)
+            .parents(!include_ignored)
+            .filter_entry(|e| e.file_name() != ".git")
             .build();
 
         for entry in walker.flatten() {

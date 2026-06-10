@@ -1435,6 +1435,11 @@ const PICKER_MIN_COLS: u16 = 80;
 const PICKER_MAX_COLS: u16 = 200;
 const PICKER_MIN_ROWS: u16 = 24;
 const PICKER_MAX_ROWS: u16 = 60;
+/// Hard ceiling on the picker's width. The percentage scaling alone has no upper bound — 80%
+/// of an ultrawide terminal is an enormous box whose rows are mostly padding and harder to
+/// scan, so past this the extra terminal width stays with the editor. Mirrors the web client's
+/// `min(720px, 80vw)` cap.
+const PICKER_WIDTH_CAP: u16 = 120;
 
 /// Compute the picker overlay's rectangle inside `area` (the buffer pane).
 fn picker_box_rect(area: Rect) -> Rect {
@@ -1450,7 +1455,7 @@ fn picker_box_rect(area: Rect) -> Rect {
         PICKER_MAX_ROWS,
         PICKER_TARGET_HEIGHT_PCT,
     );
-    let width = width.min(area.width).max(1);
+    let width = width.min(PICKER_WIDTH_CAP).min(area.width).max(1);
     let height = height.min(area.height).max(1);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -1483,9 +1488,10 @@ fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
 /// the bottom edge moves — so the input row doesn't jump as the result count changes. Chrome
 /// around the results pane is 4 rows (borders + input + separator); with no content at all the
 /// separator is dropped too, since it would double up against the bottom border.
-fn collapsed_picker_box_rect(area: Rect, content_rows: u32) -> Rect {
+fn collapsed_picker_box_rect(area: Rect, content_rows: u32, editor_open: bool) -> Rect {
     let full = picker_box_rect(area);
-    let chrome: u32 = if content_rows == 0 { 3 } else { 4 };
+    let chrome: u32 =
+        (if content_rows == 0 { 3 } else { 4 }) + editor_open as u32;
     let height = content_rows
         .saturating_add(chrome)
         .min(full.height as u32) as u16;
@@ -1586,10 +1592,11 @@ fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     let lsp_detail_open = state.picker.kind
         == Some(aether_protocol::picker::PickerKind::LspServers)
         && state.picker.lsp_detail.is_some();
+    let editor_open = state.picker.chip_editor.is_some();
     let box_area = if lsp_detail_open {
         picker_box_rect(area)
     } else {
-        collapsed_picker_box_rect(area, picker_content_rows(&state.picker))
+        collapsed_picker_box_rect(area, picker_content_rows(&state.picker), editor_open)
     };
     if box_area.width < 4 || box_area.height < 3 {
         return; // Too small to draw anything meaningful.
@@ -1603,16 +1610,25 @@ fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     let inner = block.inner(box_area);
     f.render_widget(block, box_area);
 
-    // Inner layout: input row, separator row (full-width, ties into the borders), results. The
-    // input and results panes get one column of horizontal padding so text isn't flush with the
-    // border; the separator deliberately uses the full inner width.
+    // Inner layout: input row, the chip editor line when one is open (revealed *below* the
+    // input so chips + query stay visible while editing), separator row (full-width, ties into
+    // the borders), results. The separator row only exists when there's content to separate —
+    // matching the chrome math in `collapsed_picker_box_rect`. This isn't just cosmetic: an
+    // overconstrained vertical split (more `Length(1)` rows than the collapsed box has) makes
+    // ratatui's solver zero out an *earlier* row, so an unconditional separator constraint in
+    // a content-less box would swallow the editor line and render the separator in its place.
+    let has_content = picker_content_rows(&state.picker) > 0;
+    let mut constraints = vec![Constraint::Length(1)];
+    if editor_open {
+        constraints.push(Constraint::Length(1));
+    }
+    if has_content {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(0));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
+        .constraints(constraints)
         .split(inner);
     // LSP-servers drill-down: one plain box (no input/separator split — that reads as a filter
     // field) with the title and the status/error as a single scrollable region. `Esc` returns to
@@ -1624,8 +1640,16 @@ fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
         return;
     }
     draw_picker_input_row(f, state, pad_horizontal(rows[0]));
-    draw_picker_separator(f, box_area, rows[1]);
-    draw_picker_results(f, state, pad_horizontal(rows[2]));
+    let mut next = 1;
+    if editor_open {
+        draw_chip_editor_row(f, state, pad_horizontal(rows[next]));
+        next += 1;
+    }
+    if has_content {
+        draw_picker_separator(f, box_area, rows[next]);
+        next += 1;
+    }
+    draw_picker_results(f, state, pad_horizontal(rows[next]));
 }
 
 /// The LSP-server detail drill-down: a status dot + bold name title, then labelled rows —
@@ -1725,8 +1749,10 @@ fn pad_horizontal(area: Rect) -> Rect {
 /// Query left-aligned, `N/M` (with a trailing `…` while ticking) right-aligned. When the query
 /// is empty we render a dim placeholder describing what the picker matches against. For the
 /// Explorer picker, an immutable dim prefix shows the directory the listing is for, sitting
-/// flush with the typed query (cursor lands just after the prefix). If the row is too narrow
-/// to hold the counts, they get dropped first so the query stays visible.
+/// flush with the typed query (cursor lands just after the prefix). Filter chips render
+/// between the prefix and the query (see `docs/picker-filters.md`); while the in-row chip
+/// prompt (glob/dir editor) is open it replaces the whole row. If the row is too narrow to
+/// hold the counts, they get dropped first so the query stays visible.
 fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     let base_style = Style::default().fg(NORD4).bg(NORD0);
     let placeholder_style = Style::default()
@@ -1742,11 +1768,12 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     let total_width = area.width as usize;
     let (label_text, path_text) = explorer_input_prefix(state, total_width);
     let prefix_w = label_text.width() + path_text.width();
-    let prefix_has_content = prefix_w > 0;
+    let (chip_spans, chips_w) = picker_chip_spans(state, chip_budget(total_width, prefix_w));
+    let prefix_has_content = prefix_w > 0 || chips_w > 0;
 
     let (left_text, left_style, left_w) = if state.picker.query.is_empty() {
-        // Suppress the placeholder when the explorer prefix is already telling the user where
-        // they are — the path *is* the context. Other pickers keep their placeholder.
+        // Suppress the placeholder when the explorer prefix or a chip row is already telling
+        // the user what's in effect — that *is* the context. Otherwise keep the placeholder.
         if prefix_has_content {
             (String::new(), base_style, 0)
         } else {
@@ -1771,7 +1798,9 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     };
     let counts_w = counts.width();
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Chips lead the row, before the explorer's breadcrumb prefix — the scope they set applies
+    // to everything after them, and the breadcrumb stays flush with the query it prefixes.
+    let mut spans: Vec<Span<'static>> = chip_spans;
     if !label_text.is_empty() {
         spans.push(Span::styled(label_text, label_style));
     }
@@ -1779,13 +1808,175 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         spans.push(Span::styled(path_text, path_style));
     }
     spans.push(Span::styled(left_text, left_style));
-    let used = prefix_w + left_w;
+    let used = prefix_w + chips_w + left_w;
     if !counts.is_empty() && used + counts_w + 1 <= total_width {
         let pad = total_width.saturating_sub(used + counts_w);
         spans.push(Span::styled(" ".repeat(pad), base_style));
         spans.push(Span::styled(counts, base_style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(base_style), area);
+}
+
+/// The chip editor line revealed below the input row (`Alt-g` glob / `Alt-d` dir): builds its
+/// spans plus the caret's x-offset within the line. One function so the renderer and the
+/// caret-placement math can't drift. The dir editor renders as a single `dir:` field — root
+/// segment, `:` separator, path segment — where both segments are ghost-text typeaheads
+/// (save-as style): typed prefix, then the remainder of the current match in gray; Alt-j/k
+/// swap the match — no candidate list, so the candidate count doesn't matter. The focused
+/// segment is wherever the caret sits.
+fn chip_editor_spans(state: &AppState) -> (Vec<Span<'static>>, u16) {
+    use crate::picker::{ChipEditorField, ChipEditorKind};
+    let Some(ed) = state.picker.chip_editor.as_ref() else {
+        return (Vec::new(), 0);
+    };
+    let label_style = Style::default().fg(NORD8).bg(NORD0);
+    let text_style = Style::default().fg(NORD4).bg(NORD0);
+    let ghost_style = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+    // An invalid segment (root matching no label / path that doesn't exist) renders red — the
+    // visible form of "the commit gate will refuse this".
+    let invalid_style = Style::default().fg(NORD11).bg(NORD0);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut w: usize = 0;
+    let mut cursor: usize = 0;
+    let push = |spans: &mut Vec<Span<'static>>, w: &mut usize, text: String, style: Style| {
+        *w += text.width();
+        spans.push(Span::styled(text, style));
+    };
+
+    match ed.kind {
+        ChipEditorKind::Glob { .. } => {
+            push(&mut spans, &mut w, "glob: ".into(), label_style);
+            cursor = w + ed.input.width_to_cursor();
+            push(&mut spans, &mut w, ed.input.text.clone(), text_style);
+        }
+        ChipEditorKind::Dir { .. } => {
+            // One field to the eye: `dir: {root}: {path}` in multi-root projects (the same
+            // `root: path` shape the dir chip and status bar use), `dir: {path}` in
+            // single-root ones. The root segment while unfocused — and the `:` separator —
+            // render in the committed-prefix blue; the focused segment carries the caret;
+            // invalid segments go red instead.
+            let multi_root = state.project_paths.len() > 1;
+            push(&mut spans, &mut w, "dir: ".into(), label_style);
+            if multi_root {
+                let labels = crate::labels::root_labels(&state.project_paths);
+                let invalid = ed.root_invalid(&labels);
+                if ed.field == ChipEditorField::Root {
+                    cursor = w + ed.root_filter.width_to_cursor();
+                    let style = if invalid { invalid_style } else { text_style };
+                    push(&mut spans, &mut w, ed.root_filter.text.clone(), style);
+                    // Ghost = the current match beyond the typed prefix. Nothing matches → no
+                    // ghost; the red typed text is the cue.
+                    if let Some((_, suffix)) = ed.root_ghost(&labels) {
+                        push(&mut spans, &mut w, suffix, ghost_style);
+                    }
+                } else if invalid {
+                    // An unfocused-but-unmatched root shows the raw red filter — not the
+                    // fallback label, which would advertise a commit target the gate refuses.
+                    push(&mut spans, &mut w, ed.root_filter.text.clone(), invalid_style);
+                } else {
+                    let chosen = ed.chosen_root(&labels) as usize;
+                    let label = labels.get(chosen).cloned().unwrap_or_default();
+                    push(&mut spans, &mut w, label, label_style);
+                }
+                // The separator appears once the path is in play (focused, or already holding
+                // text) — a fresh root prompt shouldn't dangle a `:` off an unentered field.
+                if ed.field == ChipEditorField::Path || !ed.input.text.is_empty() {
+                    push(&mut spans, &mut w, ": ".into(), label_style);
+                }
+            }
+            let path_style = if ed.path_invalid() { invalid_style } else { text_style };
+            if ed.field == ChipEditorField::Path || !multi_root {
+                cursor = w + ed.input.width_to_cursor();
+                push(&mut spans, &mut w, ed.input.text.clone(), path_style);
+                // Directory-only ghost suggestion (save-as idiom): the rest of the current
+                // match plus its trailing `/`, gray after the caret.
+                if let Some(suffix) = ed.path_ghost() {
+                    push(&mut spans, &mut w, suffix, ghost_style);
+                }
+            } else {
+                push(&mut spans, &mut w, ed.input.text.clone(), path_style);
+            }
+        }
+    }
+    (spans, cursor as u16)
+}
+
+/// Render the chip editor line (see [`chip_editor_spans`]).
+fn draw_chip_editor_row(f: &mut Frame, state: &AppState, area: Rect) {
+    let base_style = Style::default().fg(NORD4).bg(NORD0);
+    let (spans, _) = chip_editor_spans(state);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(base_style), area);
+}
+
+/// Columns the chip row may occupy: everything after the explorer prefix, minus a reserve so
+/// the query keeps a usable strip. Shared by the renderer and the caret-placement math.
+fn chip_budget(total_width: usize, prefix_w: usize) -> usize {
+    total_width.saturating_sub(prefix_w + 12)
+}
+
+/// Build the filter-chip spans for the picker input row and their total width. Chips render
+/// compact: bare labels (no padding) on a raised background, one column apart; flag chips'
+/// abbreviations are underlined so they read as toggles; the selected chip inverts. Exclude
+/// globs (leading `!`) tint red. When the row overflows `max_w`, leftmost chips collapse into
+/// a dim `…+N` marker — but never the selected chip, so chip-row navigation always shows what
+/// it's acting on.
+fn picker_chip_spans(state: &AppState, max_w: usize) -> (Vec<Span<'static>>, usize) {
+    let chips = state.picker.chips(&state.project_paths);
+    if chips.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let selected = state.picker.chip_selected.map(|s| s.min(chips.len() - 1));
+    // Display labels: middle-truncate long values (dir paths, globs) so one chip can't eat
+    // the row. Width per chip = label + the trailing gap.
+    let labels: Vec<String> = chips
+        .iter()
+        .map(|c| truncate_middle(&c.label, 24))
+        .collect();
+    let chip_w = |label: &String| label.width() + 1;
+    let mut width: usize = labels.iter().map(chip_w).sum();
+    const MARKER_W: usize = 5; // "…+N " worst-case-ish reserve
+    let mut start = 0;
+    while start + 1 < chips.len()
+        && width + if start > 0 { MARKER_W } else { 0 } > max_w
+        && Some(start) != selected
+    {
+        width -= chip_w(&labels[start]);
+        start += 1;
+    }
+
+    let chip_style = Style::default().fg(NORD8).bg(NORD2);
+    let chip_exclude_style = Style::default().fg(NORD11).bg(NORD2);
+    let chip_selected_style = Style::default().fg(NORD0).bg(NORD8);
+    let chip_selected_exclude_style = Style::default().fg(NORD0).bg(NORD11);
+    let gap_style = Style::default().fg(NORD4).bg(NORD0);
+    let marker_style = Style::default().fg(NORD3).bg(NORD0);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut total = 0usize;
+    if start > 0 {
+        let marker = format!("…+{start} ");
+        total += marker.width();
+        spans.push(Span::styled(marker, marker_style));
+    }
+    for (i, label) in labels.iter().enumerate().skip(start) {
+        let exclude = label.starts_with('!');
+        let mut style = match (Some(i) == selected, exclude) {
+            (true, true) => chip_selected_exclude_style,
+            (true, false) => chip_selected_style,
+            (false, true) => chip_exclude_style,
+            (false, false) => chip_style,
+        };
+        // Only the whole-word chip underlines: "wd" alone reads as a stray token; the other
+        // abbreviations (Aa, +ig, Δ, …) carry enough shape on their own.
+        if chips[i].id == crate::picker::ChipId::Word {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        total += label.width() + 1;
+        spans.push(Span::styled(label.clone(), style));
+        spans.push(Span::styled(" ".to_string(), gap_style));
+    }
+    (spans, total)
 }
 
 /// The immutable dir-context prefix for the Explorer picker, split into two segments so the
@@ -4286,17 +4477,38 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         // the typed query and the cursor needs to land after it.
         // Same rect the overlay drew (collapsed boxes keep the same top edge, so only the
         // height guard differs from the full-size rect).
-        let box_area = collapsed_picker_box_rect(buffer_area, picker_content_rows(&state.picker));
+        // No caret while a chip is selected either — there's no insertion point; the inverted
+        // chip is the focus indicator.
+        if state.picker.chip_selected.is_some() {
+            return;
+        }
+        let box_area = collapsed_picker_box_rect(
+            buffer_area,
+            picker_content_rows(&state.picker),
+            state.picker.chip_editor.is_some(),
+        );
         if box_area.width >= 4 && box_area.height >= 3 {
             // Inner = inside the borders; inner padding adds another column on each side.
             let text_x = box_area.x + 2;
             let text_y = box_area.y + 1;
             let text_w = box_area.width.saturating_sub(4);
+            // The chip editor line sits one row below the input; its caret offset comes from
+            // the same span builder the renderer uses.
+            if state.picker.chip_editor.is_some() {
+                let (_, cursor_off) = chip_editor_spans(state);
+                let col = text_x.saturating_add(cursor_off.min(text_w.saturating_sub(1)));
+                f.set_cursor_position((col, text_y + 1));
+                return;
+            }
             let (label_text, path_text) = explorer_input_prefix(state, text_w as usize);
             let prefix_w = (label_text.width() + path_text.width()) as u16;
+            // Mirror the renderer's chip layout so the caret lands after the chip row.
+            let chips_w =
+                picker_chip_spans(state, chip_budget(text_w as usize, prefix_w as usize)).1 as u16;
             let typed_w = state.picker.query.width_to_cursor() as u16;
             let col = text_x
                 .saturating_add(prefix_w)
+                .saturating_add(chips_w)
                 .saturating_add(typed_w.min(text_w.saturating_sub(1)));
             f.set_cursor_position((col, text_y));
         }
@@ -4983,7 +5195,7 @@ mod tests {
     fn collapsed_picker_box_shrinks_to_content_keeping_top() {
         let area = Rect { x: 0, y: 0, width: 200, height: 60 };
         let full = picker_box_rect(area);
-        let collapsed = collapsed_picker_box_rect(area, 3);
+        let collapsed = collapsed_picker_box_rect(area, 3, false);
         assert_eq!(collapsed.height, 7); // 3 content rows + borders + input + separator
         assert_eq!(
             (collapsed.x, collapsed.y, collapsed.width),
@@ -4992,15 +5204,34 @@ mod tests {
     }
 
     #[test]
+    fn picker_box_width_caps_on_wide_terminals() {
+        // Comfortable terminal: percentage scaling, under the cap.
+        let medium = Rect { x: 0, y: 0, width: 100, height: 40 };
+        assert!(picker_box_rect(medium).width < PICKER_WIDTH_CAP);
+        // Ultrawide: 80% would be 240 cols — the cap wins, and the box stays centred.
+        let wide = Rect { x: 0, y: 0, width: 300, height: 60 };
+        let r = picker_box_rect(wide);
+        assert_eq!(r.width, PICKER_WIDTH_CAP);
+        assert_eq!(r.x, (300 - PICKER_WIDTH_CAP) / 2);
+    }
+
+    #[test]
     fn collapsed_picker_box_caps_at_full_size() {
         let area = Rect { x: 0, y: 0, width: 200, height: 60 };
-        assert_eq!(collapsed_picker_box_rect(area, 10_000), picker_box_rect(area));
+        assert_eq!(collapsed_picker_box_rect(area, 10_000, false), picker_box_rect(area));
     }
 
     #[test]
     fn collapsed_picker_box_drops_separator_row_when_empty() {
         let area = Rect { x: 0, y: 0, width: 200, height: 60 };
-        assert_eq!(collapsed_picker_box_rect(area, 0).height, 3); // borders + input only
+        assert_eq!(collapsed_picker_box_rect(area, 0, false).height, 3); // borders + input only
+    }
+
+    #[test]
+    fn collapsed_picker_box_grows_for_open_chip_editor() {
+        let area = Rect { x: 0, y: 0, width: 200, height: 60 };
+        // The chip editor line adds one chrome row below the input.
+        assert_eq!(collapsed_picker_box_rect(area, 3, true).height, 8);
     }
 
     #[test]

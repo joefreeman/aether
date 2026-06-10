@@ -41,9 +41,10 @@ use aether_protocol::lsp::{
     LspRestartServer, LspRestartServerParams, LspServerRef, LspServerStatus, LspStatusChanged,
 };
 use aether_protocol::picker::{
-    PickerGrepNavigate, PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem,
-    PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
+    PickerFilters, PickerGrepNavigate, PickerGrepNavigateParams, PickerHide, PickerHideParams,
+    PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
     PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
+    ScopedPath,
 };
 use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::search::{
@@ -1940,7 +1941,15 @@ async fn grep_navigate(
     let Some(target) = target else {
         return Ok(());
     };
-    open_file_at_path(client, state, target.path, false, Some(target.position)).await?;
+    open_file_at_path(
+        client,
+        state,
+        target.path,
+        false,
+        Some(target.position),
+        Reveal::Center,
+    )
+    .await?;
     if !target.query.is_empty() {
         let buffer_id = state.ed_mut().buffer_id;
         let r = client
@@ -2004,6 +2013,19 @@ fn picker_fetch_limit(state: &AppState) -> u32 {
 }
 
 async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind) -> Result<()> {
+    open_picker_seeded(client, state, kind, None).await
+}
+
+/// `open_picker` with a filter seed: when `Some`, the view request carries the set and the
+/// server replaces its persisted filters before building candidates (and echoes them back, so
+/// the adoption below picks them up). Used by the Explorer→Grep/Files switch to scope the
+/// target picker to the browsed directory.
+async fn open_picker_seeded(
+    client: &mut Client,
+    state: &mut AppState,
+    kind: PickerKind,
+    seed_filters: Option<PickerFilters>,
+) -> Result<()> {
     let pane_rows = picker_pane_rows(state);
     let limit = picker_fetch_limit(state);
     // Pre-selection / centring policy per kind:
@@ -2048,6 +2070,7 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
         .then(|| state.ed_mut().buffer_id);
     let view = client
         .rpc::<PickerView>(PickerViewParams {
+            filters: seed_filters,
             kind,
             reset: !kind.preserves_state(),
             offset: 0,
@@ -2094,6 +2117,13 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
     state.picker.pending_offset = None;
     state.picker.pending_delete = None;
     state.picker.lsp_detail = None;
+    // Adopt the server's persisted filters (Grep resume restores its chips; reset kinds come
+    // back all-default) and drop any in-flight chip editing state from the prior session. The
+    // wire carries no chip order, so restored chips start in canonical order; insertion order
+    // is session-ephemeral.
+    state.picker.adopt_filters(&view.filters);
+    state.picker.chip_selected = None;
+    state.picker.chip_editor = None;
     // Explorer: the server returns the canonical path + parent. Stash them so navigation
     // (Alt-h) and the header row know where they are. For other kinds, clear so a stale
     // explorer dir from a prior session doesn't leak into Files/Buffers/Grep state.
@@ -2115,6 +2145,62 @@ async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind
         }
     }
     Ok(())
+}
+
+/// `Ctrl-g` / `Ctrl-f` in the Explorer: jump to the Grep / Files picker scoped to the
+/// directory being browsed ("grep here"). The explorer's filters carry over where they
+/// translate — see [`seeded_filters_for_switch`]. In Roots mode (no current directory) no dir
+/// scope is seeded, so the target covers the whole project. A no-op outside the Explorer.
+async fn switch_explorer_picker(
+    client: &mut Client,
+    state: &mut AppState,
+    target: PickerKind,
+) -> Result<()> {
+    if !state.picker.open || state.picker.kind != Some(PickerKind::Explorer) {
+        return Ok(());
+    }
+    let dir_scope = state
+        .picker
+        .explorer_dir
+        .as_deref()
+        .and_then(|abs| strip_longest_root(abs, &state.project_paths))
+        .map(|(path_index, relative_path)| ScopedPath {
+            path_index: path_index as u32,
+            relative_path,
+        });
+    let seeded = seeded_filters_for_switch(&state.picker.wire_filters(), dir_scope, target);
+    // Hide the explorer server-side, then open the target carrying the seed (the server
+    // replaces its persisted filters and echoes them through the open flow).
+    let _ = client
+        .rpc::<PickerHide>(PickerHideParams {
+            kind: PickerKind::Explorer,
+        })
+        .await;
+    state.picker.open = false;
+    open_picker_seeded(client, state, target, Some(seeded)).await
+}
+
+/// Translate the Explorer's filter set for a Grep/Files switch. The dir scope is the browsed
+/// directory; changed-only copies as-is. For Grep the ignored/hidden visibility *inverts*:
+/// the explorer's listing shows ignored/hidden entries unless hidden (`hide_*`), grep's walk
+/// excludes them unless included (`include_*`) — flipping the polarity means the search sees
+/// exactly what the listing showed. Files takes only dir + changed-only (it has no
+/// ignored/hidden toggles — index-time exclusion).
+fn seeded_filters_for_switch(
+    explorer: &PickerFilters,
+    dir_scope: Option<ScopedPath>,
+    target: PickerKind,
+) -> PickerFilters {
+    let mut seeded = PickerFilters::default();
+    if let Some(d) = dir_scope {
+        seeded.directories.push(d);
+    }
+    seeded.changed_only = explorer.changed_only;
+    if target == PickerKind::Grep {
+        seeded.include_ignored = !explorer.hide_ignored;
+        seeded.include_hidden = !explorer.hide_hidden;
+    }
+    seeded
 }
 
 /// Compute the prefill string for `Space g` from the active buffer's committed search query.
@@ -2183,6 +2269,7 @@ async fn picker_enter_roots_mode(client: &mut Client, state: &mut AppState) -> R
     let limit = state.picker.limit.max(1);
     let view = client
         .rpc::<PickerView>(PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -2225,6 +2312,9 @@ async fn picker_navigate_to_dir(
     let limit = state.picker.limit.max(1);
     let view = client
         .rpc::<PickerView>(PickerViewParams {
+            // Navigation resets query/highlight but the filter chips ride along — a `-hidden`
+            // toggled while browsing should keep applying in the next directory.
+            filters: Some(state.picker.wire_filters()),
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -2307,6 +2397,62 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
         return Ok(());
     }
 
+    // The chip editor line (glob/dir, revealed below the input) owns the keys while open:
+    // Enter commits a chip, Esc cancels, Alt-h/l move between its fields, Alt-j/k cycle the
+    // root field's typeahead candidates, everything else edits the focused field.
+    if state.picker.chip_editor.is_some() {
+        handle_chip_editor_key(client, state, k).await?;
+        return Ok(());
+    }
+
+    // A selected chip captures the editing keys: Enter edits it, Backspace/Delete removes it,
+    // Left/Right walk the row (Right past the last chip returns to the query text), Esc
+    // deselects, and typing a character deselects back into the query. Anything *else* —
+    // the filter chords (Alt-d, Alt-i, …), Alt-j/k result moves, paging — falls through to
+    // the normal picker vocabulary, so a selected chip doesn't disable it.
+    if let Some(sel) = state.picker.chip_selected {
+        let chips = state.picker.chips(&state.project_paths);
+        if chips.is_empty() {
+            state.picker.chip_selected = None;
+        } else {
+            let sel = sel.min(chips.len() - 1);
+            let mut handled = true;
+            match (k.code, k.modifiers) {
+                (KeyCode::Left, m) if m.is_empty() => {
+                    state.picker.chip_selected = Some(sel.saturating_sub(1));
+                }
+                (KeyCode::Right, m) if m.is_empty() => {
+                    if sel + 1 >= chips.len() {
+                        state.picker.chip_selected = None;
+                        state.picker.query.cursor = 0;
+                    } else {
+                        state.picker.chip_selected = Some(sel + 1);
+                    }
+                }
+                (KeyCode::Esc, _) => state.picker.chip_selected = None,
+                (KeyCode::Backspace, _) | (KeyCode::Delete, _) => {
+                    state.picker.remove_chip(chips[sel].id);
+                    let remaining = chips.len() - 1;
+                    state.picker.chip_selected =
+                        (remaining > 0).then(|| sel.min(remaining - 1));
+                    apply_picker_filter_change(client, state).await?;
+                }
+                (KeyCode::Enter, _) => edit_selected_chip(client, state, chips[sel].id).await?,
+                (KeyCode::Char(c), m)
+                    if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+                {
+                    state.picker.chip_selected = None;
+                    state.picker.query.insert_char(c);
+                    send_picker_query(client, state).await?;
+                }
+                _ => handled = false,
+            }
+            if handled {
+                return Ok(());
+            }
+        }
+    }
+
     // Keep query input case-sensitive (so smartcase works), so skip `normalize_key`.
     match (k.code, k.modifiers) {
         (KeyCode::Esc, _) => hide_picker(client, state).await?,
@@ -2323,6 +2469,14 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
         // never reaches the query-insert arm; a no-op for the other kinds.
         (KeyCode::Char('r'), m) if m == KeyModifiers::CONTROL => {
             lsp_picker_restart(client, state).await?;
+        }
+        // `Ctrl-g` / `Ctrl-f` from the Explorer: switch to the Grep / Files picker scoped to
+        // the browsed directory, explorer filters translated along (no-ops elsewhere).
+        (KeyCode::Char('g'), m) if m == KeyModifiers::CONTROL => {
+            switch_explorer_picker(client, state, PickerKind::Grep).await?;
+        }
+        (KeyCode::Char('f'), m) if m == KeyModifiers::CONTROL => {
+            switch_explorer_picker(client, state, PickerKind::Files).await?;
         }
         // `Alt-k` / `Alt-j` move the highlight up / down. Arrow keys are intentionally not bound
         // — modal navigation keeps the hand on the home row, matching the editor's vim-style
@@ -2362,10 +2516,55 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
                 enter_highlighted_dir(client, state).await?;
             }
         }
-        (KeyCode::Left, _) => state.picker.query.move_left(),
+        // Filter-chip chords (see docs/picker-filters.md). Booleans toggle in place; valued
+        // filters open an in-row prompt (glob/dir) or cycle (root/case). Each is gated to the
+        // kinds the filter applies to inside the helper — a no-op elsewhere.
+        (KeyCode::Char('c'), m) if m == KeyModifiers::ALT => {
+            toggle_picker_filter(client, state, crate::picker::ChipId::Case).await?
+        }
+        (KeyCode::Char('w'), m) if m == KeyModifiers::ALT => {
+            toggle_picker_filter(client, state, crate::picker::ChipId::Word).await?
+        }
+        (KeyCode::Char('e'), m) if m == KeyModifiers::ALT => {
+            toggle_picker_filter(client, state, crate::picker::ChipId::Lit).await?
+        }
+        (KeyCode::Char('i'), m) if m == KeyModifiers::ALT => {
+            toggle_picker_filter(client, state, crate::picker::ChipId::Ignored).await?
+        }
+        (KeyCode::Char('.'), m) if m == KeyModifiers::ALT => {
+            toggle_picker_filter(client, state, crate::picker::ChipId::Hidden).await?
+        }
+        (KeyCode::Char('m'), m) if m == KeyModifiers::ALT => {
+            toggle_picker_filter(client, state, crate::picker::ChipId::Changed).await?
+        }
+        (KeyCode::Char('g'), m) if m == KeyModifiers::ALT => open_glob_prompt(state, None),
+        (KeyCode::Char('d'), m) if m == KeyModifiers::ALT => {
+            open_dir_prompt(client, state, None).await?
+        }
+        // `Left` at the start of the query steps into the chip row (rightmost chip first) —
+        // the same gesture browser tag-inputs use.
+        (KeyCode::Left, _) => {
+            let at_start = state.picker.query.cursor == 0;
+            if at_start {
+                let n = state.picker.chips(&state.project_paths).len();
+                if n > 0 {
+                    state.picker.chip_selected = Some(n - 1);
+                }
+            } else {
+                state.picker.query.move_left();
+            }
+        }
         (KeyCode::Right, _) => state.picker.query.move_right(),
+        // `Backspace` at the start of the query selects the rightmost chip (a second press
+        // deletes it — two-stage, so holding backspace through a query can't silently destroy
+        // a carefully typed glob). Elsewhere it edits the query as before.
         (KeyCode::Backspace, m) if m.is_empty() => {
-            if !state.picker.query.is_empty() {
+            if state.picker.query.cursor == 0 {
+                let n = state.picker.chips(&state.project_paths).len();
+                if n > 0 {
+                    state.picker.chip_selected = Some(n - 1);
+                }
+            } else if !state.picker.query.is_empty() {
                 state.picker.query.backspace();
                 send_picker_query(client, state).await?;
             }
@@ -2390,9 +2589,12 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
 
 /// The picker "back" gesture, shared by `Alt-Backspace` and `Alt-h`:
 ///   1. Non-empty filter → clear the filter (preserving the highlight as a resume anchor).
-///   2. Filter empty + Explorer inside a subdirectory → step up to the parent directory.
-///   3. Filter empty + Explorer at the top of a root → switch to Roots mode (multi-root only).
-///   4. Otherwise → no-op (no further "back" to take).
+///   2. Filter empty + filter chips present → pop the rightmost chip (one per press).
+///   3. Chips empty + Explorer inside a subdirectory → step up to the parent directory.
+///   4. Chips empty + Explorer at the top of a root → switch to Roots mode (multi-root only).
+///   5. Otherwise → no-op (no further "back" to take).
+///
+/// Holding it progressively unwinds the whole picker state: query, then chips, then directory.
 ///
 /// We deliberately leave `resume_row_offset` as `None` on the clear path — a filtered listing
 /// usually has the highlight near the top of the visible window, and pinning that offset onto the
@@ -2404,6 +2606,14 @@ async fn picker_back(client: &mut Client, state: &mut AppState) -> Result<()> {
         state.picker.query.clear();
         send_picker_query(client, state).await?;
         state.picker.resume_target = anchor;
+    } else if let Some(chip) = state
+        .picker
+        .chips(&state.project_paths)
+        .last()
+        .map(|c| c.id)
+    {
+        state.picker.remove_chip(chip);
+        apply_picker_filter_change(client, state).await?;
     } else if matches!(state.picker.kind, Some(PickerKind::Explorer)) {
         if let Some(parent) = state.picker.explorer_parent.clone() {
             let leaving = explorer_leaving_name(state);
@@ -2416,6 +2626,357 @@ async fn picker_back(client: &mut Client, state: &mut AppState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a filter chip applies to the active picker kind: Grep takes everything; Files takes
+/// the scope chips + changed-only; the Explorer takes the visibility chips + changed-only. The
+/// chord handlers run through this so an inapplicable chord is a clean no-op.
+fn filter_applies(kind: Option<PickerKind>, id: crate::picker::ChipId) -> bool {
+    use crate::picker::ChipId;
+    match kind {
+        Some(PickerKind::Grep) => true,
+        Some(PickerKind::Files) => {
+            matches!(id, ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Changed)
+        }
+        Some(PickerKind::Explorer) => {
+            matches!(id, ChipId::Ignored | ChipId::Hidden | ChipId::Changed)
+        }
+        _ => false,
+    }
+}
+
+/// Toggle/cycle the filter a chord (or Enter on a selected chip) names, then push the change.
+/// Booleans flip; `case` cycles smart → sensitive → insensitive → smart. The ignored/hidden
+/// chips map to the per-kind field: include for Grep, hide for the Explorer.
+async fn toggle_picker_filter(
+    client: &mut Client,
+    state: &mut AppState,
+    id: crate::picker::ChipId,
+) -> Result<()> {
+    let kind = state.picker.kind;
+    if !filter_applies(kind, id) {
+        return Ok(());
+    }
+    let explorer = kind == Some(PickerKind::Explorer);
+    // Valued chips (dir, glob) aren't toggled — they're edited via their prompts.
+    if !state.picker.apply_chip_toggle(id, explorer) {
+        return Ok(());
+    }
+    apply_picker_filter_change(client, state).await
+}
+
+/// `Enter` on a selected chip: valued chips re-open their editor pre-filled; everything else
+/// toggles/cycles in place (which for a plain boolean means the chip disappears).
+async fn edit_selected_chip(
+    client: &mut Client,
+    state: &mut AppState,
+    id: crate::picker::ChipId,
+) -> Result<()> {
+    use crate::picker::ChipId;
+    match id {
+        ChipId::Glob(i) => {
+            open_glob_prompt(state, Some(i));
+            Ok(())
+        }
+        ChipId::Dir(i) => open_dir_prompt(client, state, Some(i)).await,
+        _ => toggle_picker_filter(client, state, id).await,
+    }
+}
+
+/// Open the glob editor line. `edit: Some(i)` pre-fills glob `i`; `None` adds a new chip on
+/// commit. Globs use rg `-g` syntax against root-relative paths: `*.rs` includes, `!*_test.rs`
+/// excludes, `src/**` scopes to a tree.
+fn open_glob_prompt(state: &mut AppState, edit: Option<usize>) {
+    if !filter_applies(state.picker.kind, crate::picker::ChipId::Glob(0)) {
+        return;
+    }
+    // The editor owns the keys now; a lingering chip selection would go stale once the commit
+    // reshapes the row.
+    state.picker.chip_selected = None;
+    let prefill = edit
+        .and_then(|i| state.picker.glob_value(i))
+        .map(str::to_string)
+        .unwrap_or_default();
+    state.picker.chip_editor = Some(crate::picker::ChipEditor::glob(prefill, edit));
+}
+
+/// Open the directory-scope editor line. Dir scopes are repeatable like globs: `edit: Some(i)`
+/// re-opens scope `i` pre-filled (path focused); `None` adds a new chip on commit (multi-root
+/// projects focus the root segment — an inline typeahead over the disambiguated root labels —
+/// ahead of the path; single-root projects get the path alone). Kicks off a `directory/list`
+/// so the path field's ghost suggestions are ready when focus lands there.
+async fn open_dir_prompt(
+    client: &mut Client,
+    state: &mut AppState,
+    edit: Option<usize>,
+) -> Result<()> {
+    if !filter_applies(state.picker.kind, crate::picker::ChipId::Dir(0)) {
+        return Ok(());
+    }
+    // The editor owns the keys now; a lingering chip selection would go stale once the commit
+    // reshapes the row.
+    state.picker.chip_selected = None;
+    let current = edit.and_then(|i| state.picker.dir_value(i).cloned());
+    let multi_root = state.project_paths.len() > 1;
+    let root_index = current.as_ref().map(|d| d.path_index).unwrap_or(0);
+    let field = if multi_root && current.is_none() {
+        crate::picker::ChipEditorField::Root
+    } else {
+        crate::picker::ChipEditorField::Path
+    };
+    let mut ed = crate::picker::ChipEditor::dir(
+        current.map(|d| d.relative_path).unwrap_or_default(),
+        field,
+        root_index,
+        edit,
+    );
+    ed.sync_dir_listing(&state.project_paths);
+    state.picker.chip_editor = Some(ed);
+    refresh_chip_editor_listing(client, state).await
+}
+
+/// Fire `directory/list` for the dir-chip editor's current (root, dir-portion) pair and stash
+/// the response (subdirectories only). Errors are swallowed — the editor stays usable, just
+/// without suggestions until the next path change. No-op for glob editors.
+async fn refresh_chip_editor_listing(client: &mut Client, state: &mut AppState) -> Result<()> {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams};
+    let Some(path) = state
+        .picker
+        .chip_editor
+        .as_ref()
+        .and_then(|ed| ed.dir_listing_path(&state.project_paths))
+    else {
+        return Ok(());
+    };
+    match client.rpc::<DirectoryList>(DirectoryListParams { path }).await {
+        Ok(r) => {
+            if let Some(ed) = state.picker.chip_editor.as_mut() {
+                ed.set_dir_listing(r.entries);
+            }
+        }
+        Err(e) => {
+            // Typed-but-nonexistent segment, or a path outside the boundary — the path renders
+            // invalid and the commit gate refuses it until the next change re-syncs.
+            tracing::debug!("directory/list for dir-chip editor failed: {e:#}");
+            if let Some(ed) = state.picker.chip_editor.as_mut() {
+                ed.set_dir_listing_failed();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Key handling while the chip editor line is open. The dir editor reads as one
+/// `dir: root: path` field: Tab / Alt-l accept the focused segment's ghost suggestion (root —
+/// adopting it and moving into the path; path — absorbing the next directory segment), `:` on
+/// a completed root value moves into the path, Alt-j/k cycle the focused segment's matches,
+/// Alt-Backspace deletes the rightmost path segment (then, at an empty path, clears the root
+/// selection), and plain Backspace at an empty path steps back into the root. Everything else
+/// edits the focused field via the shared prompt keymap (Enter commits, Esc cancels).
+async fn handle_chip_editor_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
+    use crate::picker::{root_candidates, ChipEditorField};
+    let (is_dir, field) = {
+        let ed = state.picker.chip_editor.as_ref().expect("caller checked");
+        (ed.is_dir(), ed.field)
+    };
+    let multi_root_dir = is_dir && state.project_paths.len() > 1;
+    let project_paths = state.project_paths.clone();
+    // Whether the path field's suggestion listing went stale and needs a `directory/list`.
+    let mut refresh = false;
+    match (k.code, k.modifiers) {
+        // Tab / Alt-l: accept the focused segment's suggestion. Root — adopt the ghost
+        // completion (save-as muscle memory) and continue right into the path; you've picked
+        // the root, keep composing. Path — absorb the ghost directory segment; the next
+        // segment's suggestions are fetched so repeated presses walk down the tree.
+        (KeyCode::Tab, m) | (KeyCode::Char('l'), m)
+            if is_dir
+                && ((k.code == KeyCode::Tab && m.is_empty())
+                    || (k.code == KeyCode::Char('l') && m == KeyModifiers::ALT)) =>
+        {
+            let labels = crate::labels::root_labels(&project_paths);
+            let ed = state.picker.chip_editor.as_mut().expect("checked above");
+            if multi_root_dir && ed.field == ChipEditorField::Root {
+                refresh = ed.commit_root_field(&labels, &project_paths);
+            } else {
+                refresh = ed.accept_path_suggestion(&project_paths);
+            }
+        }
+        // `:` on a completed root value confirms it and moves into the path — the editor reads
+        // as a single `dir: root: path` field, and `:` is the separator you'd type next. On an
+        // incomplete value it's swallowed (`:` can never extend a root-label prefix match).
+        // Shift is allowed through: `:` arrives as Shift+; on most layouts.
+        (KeyCode::Char(':'), m)
+            if !m.contains(KeyModifiers::CONTROL)
+                && !m.contains(KeyModifiers::ALT)
+                && multi_root_dir
+                && field == ChipEditorField::Root =>
+        {
+            let labels = crate::labels::root_labels(&project_paths);
+            let ed = state.picker.chip_editor.as_mut().expect("checked above");
+            if ed.root_complete(&labels) {
+                refresh = ed.commit_root_field(&labels, &project_paths);
+            }
+        }
+        (KeyCode::Char('h'), m) if m == KeyModifiers::ALT && multi_root_dir => {
+            let ed = state.picker.chip_editor.as_mut().expect("checked above");
+            ed.field = ChipEditorField::Root;
+        }
+        // Alt-Backspace: in the dir editor's path it deletes the rightmost segment, fish-style
+        // (the save-as gesture); at an empty path it clears the root selection (the next rung
+        // of the progressive unwind). In the root and glob fields it clears the field outright.
+        (KeyCode::Backspace, m) if m == KeyModifiers::ALT => {
+            let ed = state.picker.chip_editor.as_mut().expect("checked above");
+            if is_dir && ed.field == ChipEditorField::Path {
+                if ed.input.text.is_empty() {
+                    if multi_root_dir {
+                        ed.field = ChipEditorField::Root;
+                        ed.root_filter.clear();
+                        ed.root_selected = 0;
+                    }
+                } else {
+                    refresh = ed.pop_path_segment(&project_paths);
+                }
+            } else if multi_root_dir && ed.field == ChipEditorField::Root {
+                ed.root_filter.clear();
+                ed.root_selected = 0;
+            } else {
+                ed.input.clear();
+            }
+        }
+        // Backspace at an empty path steps back into the root field — the same leftward
+        // gesture the chip row uses from the query.
+        (KeyCode::Backspace, m)
+            if m.is_empty()
+                && multi_root_dir
+                && field == ChipEditorField::Path
+                && state
+                    .picker
+                    .chip_editor
+                    .as_ref()
+                    .is_some_and(|ed| ed.input.text.is_empty()) =>
+        {
+            let ed = state.picker.chip_editor.as_mut().expect("checked above");
+            ed.field = ChipEditorField::Root;
+        }
+        (KeyCode::Char('j'), m) | (KeyCode::Char('k'), m) if m == KeyModifiers::ALT => {
+            // Cycle the focused segment's matches: root typeahead candidates (wrapping), or
+            // the path field's directory suggestions (clamped, like save-as). Glob: no-op —
+            // reserved for input history, matching the search bar's Alt-j/k.
+            let down = matches!(k.code, KeyCode::Char('j'));
+            let labels = crate::labels::root_labels(&project_paths);
+            let ed = state.picker.chip_editor.as_mut().expect("checked above");
+            if multi_root_dir && ed.field == ChipEditorField::Root {
+                let n = root_candidates(&labels, &ed.root_filter.text).len();
+                if n > 0 {
+                    let sel = ed.root_selected.min(n - 1);
+                    ed.root_selected = if down { (sel + 1) % n } else { (sel + n - 1) % n };
+                    // The chosen root moved — any path text now resolves under it, so the
+                    // suggestion listing (and the validity it vouches for) must follow.
+                    refresh = ed.sync_dir_listing(&project_paths);
+                }
+            } else if is_dir {
+                ed.cycle_path_suggestion(down);
+            }
+        }
+        _ => {
+            let (outcome, root_filter_changed) = {
+                let ed = state.picker.chip_editor.as_mut().expect("checked above");
+                let focused_root = multi_root_dir && ed.field == ChipEditorField::Root;
+                let input = if focused_root {
+                    &mut ed.root_filter
+                } else {
+                    &mut ed.input
+                };
+                let before = input.text.clone();
+                let outcome = crate::text_input::apply_prompt_key(input, k);
+                let edited = input.text != before;
+                if focused_root {
+                    (outcome, edited)
+                } else {
+                    // A path edit may have moved the dir portion (typed `/`, backspaced into a
+                    // previous segment) — resync the suggestion listing.
+                    if is_dir && edited {
+                        refresh = ed.path_edited(&project_paths);
+                    }
+                    (outcome, false)
+                }
+            };
+            if root_filter_changed {
+                // The match set changed under the highlight — snap back to the best match, and
+                // re-sync the path listing: the chosen root may have moved under existing path
+                // text, and validity must be judged against the new root.
+                let ed = state.picker.chip_editor.as_mut().expect("checked above");
+                ed.root_selected = 0;
+                refresh = ed.sync_dir_listing(&project_paths);
+            }
+            match outcome {
+                PromptKeyOutcome::Commit => commit_chip_editor(client, state).await?,
+                PromptKeyOutcome::Cancel => state.picker.chip_editor = None,
+                PromptKeyOutcome::Edited => {}
+            }
+        }
+    }
+    if refresh {
+        refresh_chip_editor_listing(client, state).await?;
+    }
+    Ok(())
+}
+
+/// Commit the chip editor line. Glob: an empty value clears the glob being edited (or cancels
+/// when it wasn't editing one). Dir: the chosen root + trimmed path compose the `ScopedPath`;
+/// an empty path is a whole-root scope in multi-root projects and clears the chip in
+/// single-root ones (where "the whole root" means "no narrowing at all"). A dir editor only
+/// commits a *valid* scope — a root that matches some label and a path that exists (or is
+/// empty); otherwise the editor stays open with the invalid segment rendered red.
+async fn commit_chip_editor(client: &mut Client, state: &mut AppState) -> Result<()> {
+    if let Some(ed) = state.picker.chip_editor.as_ref() {
+        if ed.is_dir() {
+            let root_ok = state.project_paths.len() < 2 || {
+                let labels = crate::labels::root_labels(&state.project_paths);
+                !ed.root_invalid(&labels)
+            };
+            if !root_ok || !ed.path_valid() {
+                return Ok(());
+            }
+        }
+    }
+    let Some(ed) = state.picker.chip_editor.take() else {
+        return Ok(());
+    };
+    // A partially typed leaf commits as its highlighted completion (Enter on a prefix selects
+    // the completion, like the root segment) — `committed_path` is the typed text for glob
+    // editors and whenever there's nothing to complete.
+    let text = ed.committed_path().trim().trim_matches('/').to_string();
+    let changed = match ed.kind {
+        crate::picker::ChipEditorKind::Glob { edit } => {
+            // Normalization: `.rs` → `*.rs`; degenerate match-everything globs (`*`, `**`,
+            // negated too) come back as `None` and behave like an empty commit. The state
+            // method handles add/edit/remove plus duplicate collapse and the insertion order.
+            let normalized = crate::picker::normalize_glob(&ed.input.text);
+            state.picker.commit_glob_edit(normalized, edit)
+        }
+        crate::picker::ChipEditorKind::Dir { edit } => {
+            // Repeatable like globs: an empty value clears the scope being edited (or cancels
+            // when adding — except in multi-root projects, where an empty path is a meaningful
+            // whole-root scope). Duplicate collapse + insertion order live in the state method.
+            let multi_root = state.project_paths.len() > 1;
+            let value = if text.is_empty() && !multi_root {
+                None
+            } else {
+                let labels = crate::labels::root_labels(&state.project_paths);
+                let path_index = if multi_root { ed.chosen_root(&labels) } else { 0 };
+                Some(ScopedPath {
+                    path_index,
+                    relative_path: text,
+                })
+            };
+            state.picker.commit_dir_edit(value, edit)
+        }
+    };
+    if !changed {
+        return Ok(());
+    }
+    apply_picker_filter_change(client, state).await
 }
 
 /// Enter the highlighted directory in the Explorer picker — a subdirectory `DirEntry`, or a root
@@ -2504,6 +3065,7 @@ async fn grep_jump_file(
     let limit = state.picker.limit.max(1);
     let view = client
         .rpc::<PickerView>(PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: false,
             offset: 0,
@@ -2859,6 +3421,7 @@ async fn flush_pending_picker_scroll(client: &mut Client, state: &mut AppState) 
     let limit = state.picker.limit;
     let view = client
         .rpc::<PickerView>(PickerViewParams {
+            filters: None,
             kind,
             reset: false,
             offset: target,
@@ -2897,9 +3460,56 @@ async fn send_picker_query(client: &mut Client, state: &mut AppState) -> Result<
             kind,
             query: state.picker.query.text.clone(),
             generation: state.picker.generation,
+            filters: state.picker.wire_filters(),
         })
         .await?;
     Ok(())
+}
+
+/// Push a filter (chip) change to the server. For Grep/Files a filter change *is* a query
+/// change (same generation mechanics, the server re-runs); for the Explorer the filters apply
+/// when the listing is built, so we re-view the current directory with the replacement set —
+/// the query survives (the server reranks it against the fresh listing). No-op for kinds that
+/// take no filters, and for the Explorer's Roots mode (nothing to filter there).
+async fn apply_picker_filter_change(client: &mut Client, state: &mut AppState) -> Result<()> {
+    match state.picker.kind {
+        Some(PickerKind::Grep) | Some(PickerKind::Files) => {
+            send_picker_query(client, state).await
+        }
+        Some(PickerKind::Explorer) => {
+            if state.picker.explorer_dir.is_none() {
+                return Ok(()); // Roots mode — filters don't apply to the roots listing.
+            }
+            let limit = state.picker.limit.max(1);
+            let view = client
+                .rpc::<PickerView>(PickerViewParams {
+                    filters: Some(state.picker.wire_filters()),
+                    kind: PickerKind::Explorer,
+                    reset: false,
+                    offset: 0,
+                    limit,
+                    center_on: None,
+                    center_on_cursor_grep_hit: None,
+                    directory_path: None,
+                    buffer_id: None,
+                    explorer_roots: false,
+                })
+                .await?;
+            state.picker.generation = view.generation;
+            state.picker.offset = view.effective_offset;
+            state.picker.items.clear();
+            state.picker.visible_start = 0;
+            state.picker.total_matches = 0;
+            state.picker.total_candidates = view.total_candidates;
+            state.picker.ticking = true;
+            state.picker.selected = 0;
+            state.picker.pending_offset = None;
+            state.picker.resume_target = None;
+            state.picker.resume_row_offset = None;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result<()> {
@@ -2979,7 +3589,7 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
 
     match result {
         PickerSelectResult::File { path } => {
-            open_file_at_path(client, state, path, false, None).await?;
+            open_file_at_path(client, state, path, false, None, Reveal::Minimal).await?;
         }
         PickerSelectResult::Buffer { buffer_id } => {
             // Switching to a different buffer is a jump; record the origin first (skip if it's the
@@ -2990,7 +3600,15 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
             attach_buffer(client, state, buffer_id).await?;
         }
         PickerSelectResult::FileAt { path, position } => {
-            open_file_at_path(client, state, path, false, Some(position)).await?;
+            // Grep hits get the centered reveal — jumping to a search result wants context
+            // around the match. Other FileAt sources (references, diagnostics) keep the
+            // minimal reveal for now.
+            let reveal = if kind == PickerKind::Grep {
+                Reveal::Center
+            } else {
+                Reveal::Minimal
+            };
+            open_file_at_path(client, state, path, false, Some(position), reveal).await?;
             // For grep selects, prime the new buffer's search with the picker query so the
             // matches are highlighted and `n` / `Alt-n` step through them. Anchor at the grep
             // hit's position so the server resolves `current_index` to this match.
@@ -3053,7 +3671,7 @@ async fn nav_step(client: &mut Client, state: &mut AppState, forward: bool) -> R
     match res.target {
         Some(open) => {
             state.ed_mut().mode = EditorMode::Normal;
-            subscribe_to_buffer(client, state, open).await?;
+            subscribe_to_buffer(client, state, open, Reveal::Minimal).await?;
             apply_cursor_style(state);
         }
         None => {
@@ -3093,7 +3711,7 @@ async fn attach_buffer(
             jump_to: None,
         })
         .await?;
-    subscribe_to_buffer(client, state, open).await
+    subscribe_to_buffer(client, state, open, Reveal::Minimal).await
 }
 
 /// Create a fresh scratch buffer and switch to it. Empty buffer with no path; saved as a new
@@ -3111,7 +3729,7 @@ async fn new_scratch(client: &mut Client, state: &mut AppState) -> Result<()> {
         })
         .await?;
     // New Scratch is an explicit request for a fresh placeholder — don't discard the one we're on.
-    subscribe_to_buffer(client, state, open).await
+    subscribe_to_buffer(client, state, open, Reveal::Minimal).await
 }
 
 /// Close the active buffer. If it's dirty, opens a confirm prompt first; the user's `y`
@@ -3176,6 +3794,7 @@ async fn subscribe_to_buffer(
     client: &mut Client,
     state: &mut AppState,
     open: BufferOpenResult,
+    reveal: Reveal,
 ) -> Result<()> {
     // Inherit wrap and the inline-diff toggle from the current editor so switching buffers keeps
     // both of the user's view settings sticky for the session.
@@ -3197,13 +3816,33 @@ async fn subscribe_to_buffer(
     )
     .await?;
     let buffer_id = editor.buffer_id;
+    // Whether this open stays in the buffer we were already showing — decides the Center
+    // reveal's visible-check below. Read before the editor is replaced.
+    let same_buffer = state.editor.as_ref().map(|e| e.buffer_id) == Some(buffer_id);
     state.editor = Some(editor);
     seed_buffer_status_maps(state, buffer_id, &status);
     apply_cursor_style(state);
     // Cover the case where the restored scroll disagrees with the cursor (e.g. a `jump_to`
     // override on a buffer we've already opened before, so the stored scroll wasn't computed
     // around the new cursor). Cheap when the cursor is already visible — no RPC.
-    ensure_cursor_in_window(client, state).await
+    match reveal {
+        Reveal::Minimal => ensure_cursor_in_window(client, state).await,
+        Reveal::Center => reveal_cursor_centered(client, state, !same_buffer).await,
+    }
+}
+
+/// How a buffer subscribe positions the viewport around the (possibly jumped) cursor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reveal {
+    /// Scroll-continuity reveal: leave the restored scroll alone unless the cursor is
+    /// off-screen, then bring its line to the viewport edge (`ensure_cursor_in_window`).
+    Minimal,
+    /// Result-navigation reveal (grep jumps). Within the *same* buffer: leave the viewport
+    /// alone when the target is already visible (no churn stepping between nearby matches),
+    /// center it otherwise. Landing in a *different* buffer: always center — the restored
+    /// scroll is wherever the user last was in that file, so "already visible" against it is
+    /// historical accident and makes the landing position feel random.
+    Center,
 }
 
 /// Switch to a freshly opened *file* buffer, then discard the empty placeholder scratch we were on
@@ -3213,11 +3852,12 @@ async fn subscribe_replacing_scratch(
     client: &mut Client,
     state: &mut AppState,
     open: BufferOpenResult,
+    reveal: Reveal,
 ) -> Result<()> {
     // Capture the scratch we're leaving before `subscribe_to_buffer` replaces the editor. Skip it
     // if the buffer we're opening somehow *is* it (defensive — a file buffer has a path).
     let leaving_scratch = empty_scratch_id(state).filter(|&id| id != open.buffer_id);
-    subscribe_to_buffer(client, state, open).await?;
+    subscribe_to_buffer(client, state, open, reveal).await?;
     // Drop the leftover scratch now that the editor has moved to the file; the server prunes it
     // from the project MRU. Best-effort — a failure (e.g. it raced closed) is harmless.
     if let Some(scratch_id) = leaving_scratch {
@@ -3448,6 +4088,7 @@ async fn open_file_at_path(
     abs_path: String,
     create_if_missing: bool,
     jump_to: Option<aether_protocol::LogicalPosition>,
+    reveal: Reveal,
 ) -> Result<()> {
     // Opening a file is a jump (every caller here is a user navigation: goto-def, grep nav, file/
     // grep/explorer/diagnostics picker). Record where we're leaving onto the jump list first.
@@ -3478,7 +4119,7 @@ async fn open_file_at_path(
             jump_to,
         })
         .await?;
-    subscribe_replacing_scratch(client, state, open).await
+    subscribe_replacing_scratch(client, state, open, reveal).await
 }
 
 /// `Space k` — request hover info for the symbol at the cursor and show it in a popup. Empty
@@ -3559,7 +4200,7 @@ async fn lsp_goto_definition(client: &mut Client, state: &mut AppState) -> Resul
         Ok(r) => match r.location {
             Some(loc) => {
                 if let Err(e) =
-                    open_file_at_path(client, state, loc.path.clone(), false, Some(loc.position)).await
+                    open_file_at_path(client, state, loc.path.clone(), false, Some(loc.position), Reveal::Minimal).await
                 {
                     state.status =
                         StatusMessage::warning(format!("definition at {}: {e}", loc.path));
@@ -4101,6 +4742,7 @@ async fn handle_resize(
             let new_limit = picker_fetch_limit(state);
             let view = client
                 .rpc::<PickerView>(PickerViewParams {
+                    filters: None,
                     kind,
                     reset: false,
                     offset: state.picker.offset,
@@ -4965,7 +5607,7 @@ async fn create_file_in_explorer_dir(
             jump_to: None,
         })
         .await?;
-    subscribe_replacing_scratch(client, state, open).await
+    subscribe_replacing_scratch(client, state, open, Reveal::Minimal).await
 }
 
 /// Handle the Explorer's "+ create directory" synthetic row: create the directory via
@@ -5622,19 +6264,7 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
 
     // Horizontal dimension first — only matters when wrap is off. Adjust `scroll_col` so the
     // cursor's column is within `[scroll_col, scroll_col + viewport_cols)`. Pure client-side.
-    if matches!(state.ed_mut().wrap, WrapMode::None) && state.viewport_cols > 0 {
-        let col = state.ed_mut().cursor.position.col;
-        if col < state.ed_mut().scroll_col {
-            state.ed_mut().scroll_col = col;
-        } else if col
-            >= state
-                .ed_mut()
-                .scroll_col
-                .saturating_add(state.viewport_cols)
-        {
-            state.ed_mut().scroll_col = col.saturating_sub(state.viewport_cols.saturating_sub(1));
-        }
-    }
+    ensure_cursor_col_visible(state);
 
     let cursor_line = state.ed_mut().cursor.position.line;
     let top = state.ed_mut().scroll_logical_line;
@@ -5655,6 +6285,51 @@ async fn ensure_cursor_in_window(client: &mut Client, state: &mut AppState) -> R
         scroll_to(client, state, target).await?;
     }
     Ok(())
+}
+
+/// The centered counterpart to `ensure_cursor_in_window`, for result-navigation jumps
+/// (`Reveal::Center`): an already-visible cursor leaves the viewport untouched — no scroll
+/// churn when stepping between nearby matches — while an off-screen one scrolls to the
+/// vertical center (via `center_cursor`, so the EOF clamp and the soft-wrap approximation
+/// match `zz`). `force` skips the visible-check — cross-file jumps center unconditionally,
+/// making the landing position deterministic. Horizontal handling matches the minimal reveal.
+async fn reveal_cursor_centered(
+    client: &mut Client,
+    state: &mut AppState,
+    force: bool,
+) -> Result<()> {
+    // Same preamble as `ensure_cursor_in_window`: settle pending scroll so the visibility
+    // check sees the real viewport, then fix the column (no-wrap only).
+    flush_pending_scroll(client, state).await?;
+    ensure_cursor_col_visible(state);
+    if !force {
+        let cursor_line = state.ed_mut().cursor.position.line;
+        let above = cursor_line < state.ed_mut().scroll_logical_line;
+        let visible = !above && ui::cursor_visual_position(state, state.viewport_rows).is_some();
+        if visible {
+            return Ok(());
+        }
+    }
+    center_cursor(client, state).await
+}
+
+/// Bring the cursor's column inside the horizontal window (no-wrap only; soft wrap never
+/// overflows right). Pure client-side. Shared by both reveal flavours.
+fn ensure_cursor_col_visible(state: &mut AppState) {
+    if !matches!(state.ed_mut().wrap, WrapMode::None) || state.viewport_cols == 0 {
+        return;
+    }
+    let col = state.ed_mut().cursor.position.col;
+    if col < state.ed_mut().scroll_col {
+        state.ed_mut().scroll_col = col;
+    } else if col
+        >= state
+            .ed_mut()
+            .scroll_col
+            .saturating_add(state.viewport_cols)
+    {
+        state.ed_mut().scroll_col = col.saturating_sub(state.viewport_cols.saturating_sub(1));
+    }
 }
 
 /// Scroll the viewport so the cursor's logical line sits at the vertical center. Clamped to
@@ -5957,6 +6632,44 @@ async fn scroll_to(client: &mut Client, state: &mut AppState, target_line: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_switch_seeds_dir_changed_and_inverted_visibility() {
+        let scope = ScopedPath {
+            path_index: 1,
+            relative_path: "src/app".into(),
+        };
+        // Default explorer (showing ignored + hidden, no changed filter) → grep includes both:
+        // the search sees what the listing showed.
+        let seeded = seeded_filters_for_switch(
+            &PickerFilters::default(),
+            Some(scope.clone()),
+            PickerKind::Grep,
+        );
+        assert_eq!(seeded.directories, vec![scope.clone()]);
+        assert!(seeded.include_ignored && seeded.include_hidden);
+        assert!(!seeded.changed_only);
+        // Explorer hiding ignored + filtering to changed → grep keeps ignored excluded
+        // (default), copies changed-only, still includes hidden.
+        let explorer = PickerFilters {
+            hide_ignored: true,
+            changed_only: true,
+            ..Default::default()
+        };
+        let seeded = seeded_filters_for_switch(&explorer, Some(scope.clone()), PickerKind::Grep);
+        assert!(!seeded.include_ignored);
+        assert!(seeded.include_hidden);
+        assert!(seeded.changed_only);
+        // Files has no ignored/hidden toggles — only dir + changed-only carry over.
+        let seeded = seeded_filters_for_switch(&explorer, Some(scope.clone()), PickerKind::Files);
+        assert_eq!(seeded.directories, vec![scope]);
+        assert!(seeded.changed_only);
+        assert!(!seeded.include_ignored && !seeded.include_hidden);
+        // Roots mode: no dir, flags still translate.
+        let seeded = seeded_filters_for_switch(&PickerFilters::default(), None, PickerKind::Grep);
+        assert!(seeded.directories.is_empty());
+        assert!(seeded.include_ignored && seeded.include_hidden);
+    }
 
     #[test]
     fn lsp_status_changed_updates_status_map() {

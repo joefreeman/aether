@@ -524,6 +524,116 @@ html, body, #app {
   min-width: 0;
   padding: 0;
 }
+/* Filter chips, left of the query (docs/picker-filters.md). Selection is virtual (focus stays
+   on the input); the inverted chip is the focus indicator. Exclude globs (leading !) tint red. */
+.picker-chips {
+  display: flex;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  margin-right: 8px;
+}
+.picker-chips:empty { display: none; }
+.picker-chip {
+  background: var(--nord2);
+  color: var(--nord8);
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.picker-chip.exclude { color: var(--nord11); }
+.picker-chip.selected { background: var(--nord8); color: var(--nord0); }
+.picker-chip.selected.exclude { background: var(--nord11); color: var(--nord0); }
+/* Flag chips (boolean/cycling toggles) render their abbreviation underlined. */
+.picker-chip.flag { text-decoration: underline; }
+/* The chip editor line (Alt-g glob / Alt-d dir), revealed below the input row so chips + query
+   stay visible while editing. The multi-root dir editor shows a root typeahead: an input plus
+   the matching root labels inline, highlighted candidate inverted. */
+.picker-editor-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--nord0);
+  padding: 0 12px 8px;
+}
+.picker-editor-label {
+  color: var(--nord8);
+  flex: 0 0 auto;
+}
+.picker-editor-input {
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--nord6);
+  font: inherit;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+}
+/* A ghost-typeahead field (the dir editor's root and path segments): a transparent <input>
+   stacked over a ghost layer. The layer re-renders the typed prefix invisibly (same font, same
+   position → exact glyph metrics, so the gray remainder of the current typeahead match sits
+   flush after the caret with no width estimation), and the input covers the whole area, so
+   clicking anywhere on the ghost focuses it. */
+.picker-editor-rootwrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.picker-editor-input.picker-editor-root {
+  position: relative;
+  width: 100%;
+}
+.picker-editor-ghost {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  white-space: pre;
+  overflow: hidden;
+  color: var(--nord3-brighter);
+}
+.picker-editor-ghost .typed { visibility: hidden; }
+/* An invalid segment (root matching no label / path that doesn't exist) colours red — the
+   visible form of "Enter will refuse this". */
+.picker-editor-input.invalid { color: var(--nord11); }
+/* Content-hugging variant for the dir editor's root segment: the ghost layer becomes the
+   in-flow sizer and the input overlays it, so the segment is exactly as wide as typed text +
+   ghost remainder and the `:` separator sits flush after it — the row reads as one
+   `dir: root: path` field. The ghost must stay an *inline* span here: making it inline-block
+   (with the base rule's overflow: hidden) moves its baseline to its bottom edge, dropping the
+   in-flow ghost text below the overlaid input's text. */
+.picker-editor-rootwrap.hug {
+  flex: 0 0 auto;
+  min-width: 1ch;
+}
+.picker-editor-rootwrap.hug .picker-editor-ghost { position: static; overflow: visible; }
+.picker-editor-rootwrap.hug .picker-editor-input { position: absolute; inset: 0; width: 100%; }
+/* The unfocused dir-editor segment: plain static text (the focused segment is the only
+   <input>). Root reads as a committed blue prefix; `.invalid` (either segment) reads red. */
+.picker-editor-seg {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: text;
+}
+.picker-editor-seg.root { color: var(--nord8); }
+.picker-editor-seg.invalid { color: var(--nord11); }
+/* The root/path separator: committed-prefix blue, pulled against the root segment (the row's
+   flex gap would otherwise read as `beta :`). */
+.picker-editor-sep {
+  color: var(--nord8);
+  flex: 0 0 auto;
+  margin-left: -6px;
+}
 .picker-list {
   overflow-y: auto;
   flex: 1 1 auto;

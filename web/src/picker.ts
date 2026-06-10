@@ -13,10 +13,11 @@
 //! goes through picker/select to resolve the absolute path (true for all kinds here).
 
 import type { RpcClient } from "./client";
+import { rootLabels } from "./labels";
 import { confirmDialog, lspInfoDialog } from "./modal";
 import type { LspInfoData } from "./modal";
 import { lspStateClass, statusIcon } from "./icons";
-import type { BufferDirtyState, GitStatus, LspProgress, PickerItem, PickerKind, PickerUpdateParams, PickerViewResult } from "./protocol";
+import type { BufferDirtyState, CaseMode, DirectoryListResult, GitStatus, LspProgress, PickerFilters, PickerItem, PickerKind, PickerUpdateParams, PickerViewResult, ScopedPath } from "./protocol";
 
 type ToastKind = "info" | "error" | "warning" | "success";
 
@@ -38,6 +39,186 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   lsp_servers: "List LSPs…",
   references: "List references…",
 };
+
+/** `PickerFilters` with every field present — the client's working copy (the wire shape skips
+ *  defaults; normalizing once keeps the chip/toggle logic free of undefined-checks). */
+/** Which filter a chip stands for; `dir` and `glob` carry their index into the chip list (the
+ *  rendered row is the stored list, so row index = storage index). There is no root chip: a
+ *  whole-root scope is a dir chip with an empty relative path. */
+type ChipId =
+  | { t: "dir"; i: number }
+  | { t: "glob"; i: number }
+  | { t: "case" }
+  | { t: "word" }
+  | { t: "lit" }
+  | { t: "ignored" }
+  | { t: "hidden" }
+  | { t: "changed" };
+
+interface Chip {
+  id: ChipId;
+  label: string;
+}
+
+/** One chip, by value — the element of the client's ordered filter state (the single source of
+ *  truth; the wire `PickerFilters` is derived by `wireFilters` and converted back by
+ *  `adoptFilters`). `case` holds "sensitive" | "insensitive" — "smart" is "no chip"; the
+ *  ignored/hidden values record the per-kind direction at creation time (the Explorer hides,
+ *  Grep includes), so the wire conversion needs no kind context. */
+type ChipValue =
+  | { t: "dir"; d: ScopedPath }
+  | { t: "glob"; g: string }
+  | { t: "case"; mode: CaseMode }
+  | { t: "word" }
+  | { t: "lit" }
+  | { t: "ignored"; hide: boolean }
+  | { t: "hidden"; hide: boolean }
+  | { t: "changed" };
+
+function sameScope(a: ScopedPath, b: ScopedPath): boolean {
+  return a.path_index === b.path_index && a.relative_path === b.relative_path;
+}
+
+/** True when two values are the same chip — for the repeatable kinds that means equal values
+ *  (dirs and globs dedupe at commit time), for flags just the kind (`case` mid-cycle and an
+ *  ignored/hidden direction change are the same chip). */
+function sameChip(a: ChipValue, b: ChipValue): boolean {
+  if (a.t !== b.t) return false;
+  if (a.t === "dir" && b.t === "dir") return sameScope(a.d, b.d);
+  if (a.t === "glob" && b.t === "glob") return a.g === b.g;
+  return true;
+}
+
+/** Render the chip row: the stored list, verbatim — insertion order *is* the storage order.
+ *  Mirrors the terminal client's `PickerState::chips` (crates/aether-tui/src/picker.rs). */
+function deriveChips(values: ChipValue[], projectPaths: string[]): Chip[] {
+  return values.map((v, i): Chip => {
+    switch (v.t) {
+      case "dir": {
+        // Compact: the trailing slash implies "directory" (no `dir:` prefix). Multi-root
+        // scopes read like the status bar: `{root label}: {path}/`, with the same
+        // disambiguated root labels; an empty relative path is a whole-root scope.
+        let label: string;
+        if (projectPaths.length > 1) {
+          const rootLabel = rootLabels(projectPaths)[v.d.path_index] ?? "?";
+          label = v.d.relative_path === "" ? rootLabel : `${rootLabel}: ${v.d.relative_path}/`;
+        } else {
+          label = `${v.d.relative_path}/`;
+        }
+        return { id: { t: "dir", i }, label };
+      }
+      case "glob":
+        return { id: { t: "glob", i }, label: v.g };
+      case "case":
+        return { id: { t: "case" }, label: v.mode === "insensitive" ? "aa" : "Aa" };
+      case "word":
+        return { id: { t: "word" }, label: "wd" };
+      case "lit":
+        return { id: { t: "lit" }, label: "lit" };
+      case "ignored":
+        return { id: { t: "ignored" }, label: v.hide ? "-ig" : "+ig" };
+      case "hidden":
+        return { id: { t: "hidden" }, label: v.hide ? "-." : "+." };
+      case "changed":
+        return { id: { t: "changed" }, label: "Δ" };
+    }
+  });
+}
+
+/** Fold a chip list into the wire format — the normalized, unordered `PickerFilters`. */
+function wireFilters(values: ChipValue[]): PickerFilters {
+  const f: PickerFilters = {};
+  for (const v of values) {
+    switch (v.t) {
+      case "dir":
+        (f.directories ??= []).push(v.d);
+        break;
+      case "glob":
+        (f.globs ??= []).push(v.g);
+        break;
+      case "case":
+        f.case = v.mode;
+        break;
+      case "word":
+        f.whole_word = true;
+        break;
+      case "lit":
+        f.fixed_string = true;
+        break;
+      case "ignored":
+        if (v.hide) f.hide_ignored = true;
+        else f.include_ignored = true;
+        break;
+      case "hidden":
+        if (v.hide) f.hide_hidden = true;
+        else f.include_hidden = true;
+        break;
+      case "changed":
+        f.changed_only = true;
+        break;
+    }
+  }
+  return f;
+}
+
+/** Convert a wire filter set into a chip list. The wire carries no order, so adopted chips
+ *  come back in canonical order (dirs, globs, flags) — insertion order is session-ephemeral. */
+function adoptFilters(f?: PickerFilters): ChipValue[] {
+  const values: ChipValue[] = [];
+  for (const d of f?.directories ?? []) values.push({ t: "dir", d });
+  for (const g of f?.globs ?? []) values.push({ t: "glob", g });
+  if (f?.case && f.case !== "smart") values.push({ t: "case", mode: f.case });
+  if (f?.whole_word) values.push({ t: "word" });
+  if (f?.fixed_string) values.push({ t: "lit" });
+  if (f?.include_ignored || f?.hide_ignored)
+    values.push({ t: "ignored", hide: !!f?.hide_ignored });
+  if (f?.include_hidden || f?.hide_hidden) values.push({ t: "hidden", hide: !!f?.hide_hidden });
+  if (f?.changed_only) values.push({ t: "changed" });
+  return values;
+}
+
+// Only the whole-word chip underlines (`.flag`): "wd" alone reads as a stray token; the other
+// abbreviations (Aa, +ig, Δ, …) carry enough shape on their own.
+
+/** Normalize a committed glob. `null` means "don't keep a chip": empty input, or a degenerate
+ *  match-everything glob (`*`, `**`, also negated — `!*` would exclude everything). A glob
+ *  starting with `.` (or `!.`) with no other glob syntax is an extension shorthand:
+ *  `.rs` → `*.rs`. Mirrors the TUI's `normalize_glob`. */
+function normalizeGlob(text: string): string | null {
+  const trimmed = text.trim();
+  const neg = trimmed.startsWith("!") ? "!" : "";
+  const body = neg ? trimmed.slice(1) : trimmed;
+  if (body === "" || body === "*" || body === "**") return null;
+  const extensionShorthand = body.startsWith(".") && !/[*?[/]/.test(body);
+  return extensionShorthand ? `${neg}*${body}` : `${neg}${body}`;
+}
+
+/** Indices of `names` matching `filter` as a smartcase prefix (everything on an empty filter):
+ *  case-insensitive unless the filter contains an uppercase letter. Used for the dir editor's
+ *  root typeahead (mirroring the TUI's `root_candidates`) and its path-field directory
+ *  suggestions (mirroring the save-as prompt's `matching_indices`). */
+function prefixMatchIndices(names: string[], filter: string): number[] {
+  const all = names.map((_, i) => i);
+  if (filter === "") return all;
+  const sensitive = /[A-Z]/.test(filter);
+  const needle = sensitive ? filter : filter.toLowerCase();
+  return all.filter((i) =>
+    (sensitive ? names[i] : names[i].toLowerCase()).startsWith(needle),
+  );
+}
+
+/** The root field's typeahead candidates. */
+function rootCandidates(labels: string[], filter: string): number[] {
+  return prefixMatchIndices(labels, filter);
+}
+
+/** Whether a filter chip applies to this picker kind (chords are clean no-ops elsewhere). */
+function filterApplies(kind: PickerKind, id: ChipId): boolean {
+  if (kind === "grep") return true;
+  if (kind === "files") return id.t === "dir" || id.t === "glob" || id.t === "changed";
+  if (kind === "explorer") return id.t === "ignored" || id.t === "hidden" || id.t === "changed";
+  return false;
+}
 
 export interface PickerOptions {
   client: RpcClient;
@@ -61,6 +242,13 @@ export interface PickerOptions {
   onCreatePath?: (absPath: string) => void;
   /** Create + activate a new project (Projects "+ create project"). */
   onCreateProject?: (name: string) => void;
+  /** Explorer `Ctrl-g`/`Ctrl-f`: switch to the Grep/Files picker carrying the seeded filters
+   *  (the browsed dir as scope, explorer flags translated). The host closes this picker and
+   *  opens the target with `initialFilters`. */
+  onSwitch?: (kind: "grep" | "files", filters: PickerFilters) => void;
+  /** Open with this filter set (replacing whatever the server persisted) — the seeded scope
+   *  from an Explorer switch. */
+  initialFilters?: PickerFilters;
   /** Opener URL for a picker item, or null. When it returns a URL the row is rendered as an
    *  `<a href>` so Ctrl/Cmd/middle-click opens it in a new browser tab. `explorerDir` is the current
    *  explorer directory (for resolving `dir_entry` paths); ignored by the other picker kinds. */
@@ -82,9 +270,51 @@ export class Picker {
 
   private overlay: HTMLElement;
   private pathEl: HTMLElement;
+  private chipsEl: HTMLElement;
   private input: HTMLInputElement;
+  private editorRow: HTMLElement;
   private listEl: HTMLElement;
   private countEl: HTMLElement;
+
+  // Filter chips (docs/picker-filters.md). `chipValues` is the ordered chip list — the single
+  // source of truth for the active filters, in insertion order; the wire `PickerFilters` is
+  // derived per send (wireFilters) and converted back on open/resume (adoptFilters), so the
+  // order itself is session-ephemeral. `chipSelected` indexes the row (= the list) while
+  // chip-editing keys are captured. `chipEditor` is the glob/dir editor revealed on its own
+  // row *below* the input (chips + query stay visible while editing); its fields are real
+  // inputs built per open, so browser focus moves into the row and back to the query input on
+  // close.
+  private chipValues: ChipValue[] = [];
+  private chipSelected: number | null = null;
+  /** Filter set this picker opened with (Explorer switch seed); carried on the open view. */
+  private seedFilters: PickerFilters | undefined;
+  private onSwitch: (kind: "grep" | "files", filters: PickerFilters) => void = () => {};
+  private chipEditor: {
+    kind: "glob" | "dir";
+    edit: number | null;
+    /** Dir: which segment is live (renders the one-and-only <input>); glob is always "path". */
+    field: "root" | "path";
+    rootSelected: number;
+    rootIndex: number;
+    /** Dir: cached `directory/list` names (subdirectories only — files never complete a dir
+     *  scope) for the dir portion of the path field, powering its ghost suggestions. */
+    listing: string[];
+    /** Dir: the absolute path `listing` was last synced against (the staleness key). */
+    listingDirAbs: string;
+    /** Dir: where `listing` stands relative to `listingDirAbs` — only a loaded listing can
+     *  vouch for the typed path's validity; `failed` means the dir portion doesn't exist. */
+    listingState: "pending" | "loaded" | "failed";
+    /** Dir: position within the filtered match set producing the current path ghost. */
+    suggestionIdx: number;
+  } | null = null;
+  private editorRootInput: HTMLInputElement | null = null;
+  private editorPathInput: HTMLInputElement | null = null;
+  private editorGhostEl: HTMLElement | null = null;
+  private editorPathGhostEl: HTMLElement | null = null;
+  private editorSepEl: HTMLElement | null = null;
+  /** The unfocused segment's static text (null while that segment is the live input). */
+  private editorRootSpan: HTMLElement | null = null;
+  private editorPathSpan: HTMLElement | null = null;
 
   // Open LSP-info dialog (if any) plus the server it's showing, so status/progress pushes can
   // refresh it live. Cleared when the dialog closes.
@@ -134,6 +364,7 @@ export class Picker {
     this.onCreatePath = opts.onCreatePath ?? (() => {});
     this.onCreateProject = opts.onCreateProject ?? (() => {});
     this.fileUrl = opts.fileUrl ?? (() => null);
+    this.onSwitch = opts.onSwitch ?? (() => {});
 
     this.overlay = document.createElement("div");
     this.overlay.className = "overlay";
@@ -144,6 +375,8 @@ export class Picker {
     this.pathEl = document.createElement("span");
     this.pathEl.className = "picker-path";
     this.pathEl.style.display = "none";
+    this.chipsEl = document.createElement("span");
+    this.chipsEl.className = "picker-chips";
     this.input = document.createElement("input");
     this.input.className = "picker-input";
     this.input.placeholder = PLACEHOLDER[this.kind];
@@ -151,11 +384,16 @@ export class Picker {
     this.input.autocomplete = "off";
     this.countEl = document.createElement("span");
     this.countEl.className = "picker-count";
-    // The "X/Y" summary sits to the right of the input, like the terminal UI.
-    inputRow.append(this.pathEl, this.input, this.countEl);
+    // The "X/Y" summary sits to the right of the input, like the terminal UI. Chips lead the
+    // row, before the explorer breadcrumb, which stays flush with the query it prefixes.
+    inputRow.append(this.chipsEl, this.pathEl, this.input, this.countEl);
+    // The chip editor line (glob/dir) reveals between the input row and the results.
+    this.editorRow = document.createElement("div");
+    this.editorRow.className = "picker-editor-row";
+    this.editorRow.style.display = "none";
     this.listEl = document.createElement("div");
     this.listEl.className = "picker-list";
-    box.append(inputRow, this.listEl);
+    box.append(inputRow, this.editorRow, this.listEl);
     this.overlay.append(box);
     document.body.append(this.overlay);
 
@@ -167,6 +405,13 @@ export class Picker {
     });
 
     this.input.focus();
+    // A seeded open (Explorer switch) starts from the given filter set: render its chips now
+    // and carry it on the open view so the server replaces its persisted filters.
+    if (opts.initialFilters) {
+      this.seedFilters = opts.initialFilters;
+      this.chipValues = adoptFilters(opts.initialFilters);
+      this.renderChips();
+    }
     if (this.kind === "explorer") {
       void this.viewExplorer({ directory_path: opts.explorerInitialDir ?? null, selectName: opts.explorerSelectName });
     } else if (this.kind === "grep") {
@@ -189,11 +434,17 @@ export class Picker {
       offset: 0,
       limit: this.fetchLimit(),
       center_on_cursor_grep_hit: this.activeBufferId,
+      // A seeded open replaces the persisted filter set (the echo below adopts it back).
+      filters: this.seedFilters,
     });
     this.generation = r.generation; // adopt the persisted query's generation baseline
     this.offset = r.effective_offset;
     this.requestedOffset = r.effective_offset;
     this.input.value = r.query; // restore the persisted query text
+    // Restore the persisted chips alongside the query. The wire carries no order, so restored
+    // chips come back canonical; insertion order is session-ephemeral.
+    this.chipValues = adoptFilters(r.filters);
+    this.renderChips();
     const target = r.effective_center_on;
     if (target) this.pendingSelectMatch = (it) => sameGrepHit(it, target);
     this.renderList();
@@ -284,6 +535,8 @@ export class Picker {
         reset && (this.kind === "diagnostics" || this.kind === "references")
           ? this.scopedBufferId
           : undefined,
+      // A seeded open (Explorer switch) carries its filter set past the reset.
+      filters: reset ? this.seedFilters : undefined,
     });
     if (reset) this.generation = r.generation;
   }
@@ -306,6 +559,9 @@ export class Picker {
       directory_path: opts.roots ? null : opts.directory_path ?? null,
       explorer_roots: opts.roots ?? false,
       center_on: centerOn,
+      // Navigation resets query/highlight but the filter chips ride along — a `-hidden`
+      // toggled while browsing keeps applying in the next directory.
+      filters: this.filters(),
     });
     this.generation = r.generation;
     this.offset = r.effective_offset;
@@ -329,18 +585,116 @@ export class Picker {
     this.items = [];
     this.listEl.scrollTop = 0; // a new query starts at the top of the (now-empty) result list
     void this.client
-      .rpc<null>("picker/query", { kind: this.kind, query: this.input.value, generation: this.generation })
+      .rpc<null>("picker/query", {
+        kind: this.kind,
+        query: this.input.value,
+        generation: this.generation,
+        filters: this.filters(),
+      })
       .catch(() => {});
     this.renderList(); // immediate feedback (clears list + shows the create row as you type)
   }
 
   private onKey(e: KeyboardEvent): void {
+    // A selected chip captures the editing keys (Enter edits, Backspace/Delete removes,
+    // arrows walk the row, Escape deselects, typing deselects back into the query). Anything
+    // *else* — the filter chords (Alt-d, Alt-i, …), Alt-j/k result moves, paging — falls
+    // through to the normal picker vocabulary, so a selected chip doesn't disable it.
+    if (this.chipSelected !== null) {
+      const chips = this.chips();
+      if (chips.length === 0) {
+        this.chipSelected = null;
+      } else {
+        const sel = Math.min(this.chipSelected, chips.length - 1);
+        let handled = true;
+        if (e.key === "ArrowLeft" && !e.altKey) {
+          e.preventDefault();
+          this.chipSelected = Math.max(0, sel - 1);
+          this.renderChips();
+        } else if (e.key === "ArrowRight" && !e.altKey) {
+          e.preventDefault();
+          if (sel + 1 >= chips.length) {
+            this.chipSelected = null;
+            this.input.setSelectionRange(0, 0);
+          } else {
+            this.chipSelected = sel + 1;
+          }
+          this.renderChips();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          this.chipSelected = null;
+          this.renderChips();
+        } else if (e.key === "Backspace" || e.key === "Delete") {
+          e.preventDefault();
+          this.removeChip(chips[sel].id);
+          const remaining = chips.length - 1;
+          this.chipSelected = remaining > 0 ? Math.min(sel, remaining - 1) : null;
+          void this.applyFilterChange();
+        } else if (e.key === "Enter") {
+          e.preventDefault();
+          this.editChip(chips[sel].id);
+        } else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+          // Typing returns to the query — don't preventDefault, the char lands at caret 0.
+          this.chipSelected = null;
+          this.renderChips();
+        } else {
+          handled = false;
+        }
+        if (handled) return;
+      }
+    }
+    const caretAtStart = this.input.selectionStart === 0 && this.input.selectionEnd === 0;
     if (e.key === "Escape") {
       e.preventDefault();
       this.onClose();
     } else if (e.key === "Enter") {
       e.preventDefault();
       this.onEnter();
+    } else if (
+      e.ctrlKey &&
+      !e.altKey &&
+      (e.key === "g" || e.key === "f") &&
+      this.kind === "explorer"
+    ) {
+      // Switch to Grep / Files scoped to the browsed directory ("grep here"). preventDefault
+      // keeps the browser's find / find-again off the screen.
+      e.preventDefault();
+      this.switchTo(e.key === "g" ? "grep" : "files");
+    } else if (e.altKey && e.key === "c") {
+      e.preventDefault();
+      void this.toggleFilter({ t: "case" });
+    } else if (e.altKey && e.key === "w") {
+      e.preventDefault();
+      void this.toggleFilter({ t: "word" });
+    } else if (e.altKey && e.key === "e") {
+      e.preventDefault();
+      void this.toggleFilter({ t: "lit" });
+    } else if (e.altKey && e.key === "i") {
+      e.preventDefault();
+      void this.toggleFilter({ t: "ignored" });
+    } else if (e.altKey && e.key === ".") {
+      e.preventDefault();
+      void this.toggleFilter({ t: "hidden" });
+    } else if (e.altKey && e.key === "m") {
+      e.preventDefault();
+      void this.toggleFilter({ t: "changed" });
+    } else if (e.altKey && e.key === "g") {
+      e.preventDefault();
+      this.openChipEditor("glob", null);
+    } else if (e.altKey && e.key === "d") {
+      e.preventDefault();
+      this.openChipEditor("dir", null);
+    } else if (e.key === "ArrowLeft" && !e.altKey && caretAtStart && this.chips().length > 0) {
+      // Step into the chip row (rightmost chip first) — the browser tag-input gesture.
+      e.preventDefault();
+      this.chipSelected = this.chips().length - 1;
+      this.renderChips();
+    } else if (e.key === "Backspace" && !e.altKey && !e.ctrlKey && caretAtStart && this.chips().length > 0) {
+      // First press selects the rightmost chip; a second deletes it (two-stage, so holding
+      // backspace through the query can't silently destroy a carefully typed glob).
+      e.preventDefault();
+      this.chipSelected = this.chips().length - 1;
+      this.renderChips();
     } else if (e.altKey && e.key === "j") {
       e.preventDefault();
       this.move(1);
@@ -455,11 +809,18 @@ export class Picker {
     }
   }
 
-  /** Alt-h / Alt-Backspace: clear filter, else step up (parent → roots mode). */
+  /** Alt-h / Alt-Backspace: clear filter, else pop the rightmost chip, else step up
+   *  (parent → roots mode). Holding it progressively unwinds the whole picker state. */
   private async back(): Promise<void> {
     if (this.input.value !== "") {
       this.input.value = "";
       this.onQueryInput();
+      return;
+    }
+    const chips = this.chips();
+    if (chips.length > 0) {
+      this.removeChip(chips[chips.length - 1].id);
+      await this.applyFilterChange();
       return;
     }
     if (this.kind !== "explorer") return;
@@ -470,6 +831,804 @@ export class Picker {
     } else if (this.explorerDir && this.projectPaths.length > 1) {
       await this.viewExplorer({ roots: true });
     }
+  }
+
+  // ---- filter chips (docs/picker-filters.md) ----
+
+  private chips(): Chip[] {
+    return deriveChips(this.chipValues, this.projectPaths);
+  }
+
+  /** The wire filter set the active chips fold into — built per send. */
+  private filters(): PickerFilters {
+    return wireFilters(this.chipValues);
+  }
+
+  /** Explorer `Ctrl-g`/`Ctrl-f`: hand the host a seeded filter set for the target picker —
+   *  the browsed directory as a dir scope, changed-only copied, and (grep only) the
+   *  ignored/hidden visibility *inverted*: the explorer's listing shows those entries unless
+   *  hidden, grep's walk excludes them unless included, so flipping the polarity makes the
+   *  search see exactly what the listing showed. Files takes only dir + changed-only. */
+  private switchTo(kind: "grep" | "files"): void {
+    if (this.kind !== "explorer") return;
+    const explorer = this.filters();
+    const seeded: PickerFilters = {};
+    const scope = this.explorerScope();
+    if (scope) seeded.directories = [scope];
+    if (explorer.changed_only) seeded.changed_only = true;
+    if (kind === "grep") {
+      if (!explorer.hide_ignored) seeded.include_ignored = true;
+      if (!explorer.hide_hidden) seeded.include_hidden = true;
+    }
+    this.onSwitch(kind, seeded);
+  }
+
+  /** The browsed directory as a `ScopedPath` — longest project root that contains it, with
+   *  the root itself mapping to an empty relative path (a whole-root scope). Null in Roots
+   *  mode or when the dir sits outside every root. */
+  private explorerScope(): ScopedPath | null {
+    const dir = this.explorerDir;
+    if (!dir) return null;
+    let best: ScopedPath | null = null;
+    let bestLen = -1;
+    this.projectPaths.forEach((root, i) => {
+      const prefix = root.endsWith("/") ? root : `${root}/`;
+      if (dir === root) {
+        if (root.length > bestLen) {
+          bestLen = root.length;
+          best = { path_index: i, relative_path: "" };
+        }
+      } else if (dir.startsWith(prefix) && root.length > bestLen) {
+        bestLen = root.length;
+        best = { path_index: i, relative_path: dir.slice(prefix.length) };
+      }
+    });
+    return best;
+  }
+
+  /** Rebuild the chip row DOM. Cheap (a handful of spans), so it runs wholesale on any filter
+   *  or selection change. Clicking a chip selects it (focus stays on the input — selection is
+   *  virtual, exactly like the keyboard path). */
+  private renderChips(): void {
+    this.chipsEl.textContent = "";
+    const chips = this.chips();
+    if (this.chipSelected !== null && this.chipSelected >= chips.length) {
+      this.chipSelected = chips.length > 0 ? chips.length - 1 : null;
+    }
+    chips.forEach((c, i) => {
+      const el = document.createElement("span");
+      let cls = "picker-chip";
+      if (c.label.startsWith("!")) cls += " exclude";
+      if (i === this.chipSelected) cls += " selected";
+      if (c.id.t === "word") cls += " flag";
+      el.className = cls;
+      el.textContent = c.label;
+      el.addEventListener("mousedown", (ev) => {
+        ev.preventDefault(); // keep focus on the input
+        this.chipSelected = i;
+        this.renderChips();
+      });
+      this.chipsEl.append(el);
+    });
+  }
+
+  /** Reset the filter a chip stands for to its default (the chip disappears on re-derive). */
+  private removeChip(id: ChipId): void {
+    if (id.t === "dir" || id.t === "glob") {
+      if (id.i < this.chipValues.length) this.chipValues.splice(id.i, 1);
+    } else {
+      this.chipValues = this.chipValues.filter((v) => v.t !== id.t);
+    }
+  }
+
+  /** Toggle/cycle the filter a chord (or Enter on a selected chip) names, then push the change.
+   *  `case` cycles smart → sensitive → insensitive. Ignored/hidden map per kind: include for
+   *  grep, hide for the explorer. A chord that doesn't apply to this picker kind is a no-op. */
+  /** Toggle/cycle a flag chip: booleans flip (appearing appends, disappearing drops out);
+   *  `case` cycles smart → sensitive → insensitive → smart *in place* while the chip stays
+   *  visible. The ignored/hidden chips record the per-kind direction in the value. */
+  private async toggleFilter(id: ChipId): Promise<void> {
+    if (!filterApplies(this.kind, id)) return;
+    const explorer = this.kind === "explorer";
+    if (id.t === "glob" || id.t === "dir") return; // valued chips are edited via their prompts
+    if (id.t === "case") {
+      const i = this.chipValues.findIndex((v) => v.t === "case");
+      if (i < 0) this.chipValues.push({ t: "case", mode: "sensitive" });
+      else {
+        const v = this.chipValues[i];
+        if (v.t === "case" && v.mode === "sensitive") {
+          this.chipValues[i] = { t: "case", mode: "insensitive" };
+        } else {
+          this.chipValues.splice(i, 1);
+        }
+      }
+    } else {
+      const value: ChipValue =
+        id.t === "ignored" || id.t === "hidden" ? { t: id.t, hide: explorer } : { t: id.t };
+      const i = this.chipValues.findIndex((v) => v.t === id.t);
+      if (i >= 0) this.chipValues.splice(i, 1);
+      else this.chipValues.push(value);
+    }
+    await this.applyFilterChange();
+  }
+
+  /** `Enter` on a selected chip: valued chips re-open their editor pre-filled; everything else
+   *  toggles/cycles in place (a plain boolean's chip disappears). */
+  private editChip(id: ChipId): void {
+    if (id.t === "glob") {
+      this.openChipEditor("glob", id.i);
+    } else if (id.t === "dir") {
+      this.openChipEditor("dir", id.i);
+    } else {
+      void this.toggleFilter(id);
+    }
+  }
+
+  /** Push a filter change. For grep/files a filter change is a query change (same generation
+   *  mechanics); for the explorer the filters apply when the listing is built, so re-view the
+   *  current directory with the replacement set (the query survives the re-rank). */
+  private async applyFilterChange(): Promise<void> {
+    this.renderChips();
+    if (this.kind === "grep" || this.kind === "files") {
+      this.onQueryInput();
+      return;
+    }
+    if (this.kind !== "explorer" || !this.explorerDir) return; // roots mode: nothing to filter
+    const r = await this.client.rpc<PickerViewResult>("picker/view", {
+      kind: "explorer",
+      reset: false,
+      offset: 0,
+      limit: this.fetchLimit(),
+      filters: this.filters(),
+    });
+    this.offset = r.effective_offset;
+    this.requestedOffset = r.effective_offset;
+    this.selected = 0;
+    this.total = 0;
+    this.items = [];
+    this.listEl.scrollTop = 0;
+    this.renderList();
+  }
+
+  /** Open the chip editor line below the input (chips + query stay visible). The dir editor
+   *  reads as a single `dir:` field — in multi-root projects a root typeahead segment (type a
+   *  prefix, Alt-j/k cycle the matching disambiguated root labels), a `:` separator, then the
+   *  unlabelled root-relative path; single-root projects show the path alone. The path segment
+   *  carries directory-only ghost suggestions in the save-as idiom (Alt-j/k cycle, Tab / Alt-l
+   *  accept a segment, Alt-Backspace pops one). Enter commits from any field; Escape cancels.
+   *  Globs are one plain field using rg `-g` syntax (`!` excludes, `src/**` scopes to a tree). */
+  private openChipEditor(kind: "glob" | "dir", edit: number | null): void {
+    const probe: ChipId = kind === "glob" ? { t: "glob", i: 0 } : { t: "dir", i: 0 };
+    if (!filterApplies(this.kind, probe)) return;
+    this.chipSelected = null;
+    this.renderChips();
+    const editedChip = edit !== null ? this.chipValues[edit] : undefined;
+    const current = kind === "dir" && editedChip?.t === "dir" ? editedChip.d : null;
+    const rootIndex = current?.path_index ?? 0;
+    this.chipEditor = {
+      kind,
+      edit,
+      // Fresh multi-root dir scopes compose left-to-right: start on the root segment.
+      // Editing an existing chip (or any glob/single-root open) starts on the path.
+      field:
+        kind === "dir" && this.projectPaths.length > 1 && current === null ? "root" : "path",
+      rootSelected: rootIndex,
+      rootIndex,
+      listing: [],
+      listingDirAbs: "",
+      listingState: "pending",
+      suggestionIdx: 0,
+    };
+
+    this.editorRow.textContent = "";
+    this.editorRootInput = null;
+    this.editorGhostEl = null;
+    this.editorPathGhostEl = null;
+    this.editorSepEl = null;
+    this.editorRootSpan = null;
+    this.editorPathSpan = null;
+    // The two inputs are created once per open and persist across field switches (their
+    // `.value` is the editor's source of truth); renderDirEditor attaches only the *focused*
+    // one to the DOM — the unfocused segment renders as a plain span, like the TUI.
+    const multiRoot = kind === "dir" && this.projectPaths.length > 1;
+    if (multiRoot) {
+      this.editorRootInput = document.createElement("input");
+      this.editorRootInput.className = "picker-editor-input picker-editor-root";
+      this.editorRootInput.spellcheck = false;
+      this.editorRootInput.autocomplete = "off";
+      this.editorRootInput.addEventListener("keydown", (e) => this.onEditorKey(e));
+      this.editorRootInput.addEventListener("input", () => {
+        // The match set changed under the highlight — snap back to the best match, and
+        // re-sync the path listing: the chosen root may have moved under existing path text.
+        if (this.chipEditor) this.chipEditor.rootSelected = 0;
+        this.renderRootGhost();
+        this.syncEditorListing();
+        this.updateEditorDecorations();
+      });
+    }
+    this.editorPathInput = document.createElement("input");
+    this.editorPathInput.className = "picker-editor-input";
+    this.editorPathInput.spellcheck = false;
+    this.editorPathInput.autocomplete = "off";
+    this.editorPathInput.placeholder = kind === "glob" ? "*.rs · !*_test.rs · src/**" : "";
+    this.editorPathInput.value =
+      kind === "glob"
+        ? editedChip?.t === "glob"
+          ? editedChip.g
+          : ""
+        : current?.relative_path ?? "";
+    this.editorPathInput.addEventListener("keydown", (e) => this.onEditorKey(e));
+    if (kind === "dir") {
+      this.editorPathInput.classList.add("picker-editor-root");
+      this.editorPathInput.addEventListener("input", () => this.onPathInput());
+      this.renderDirEditor();
+      this.syncEditorListing();
+      this.updateEditorDecorations();
+    } else {
+      const label = document.createElement("span");
+      label.className = "picker-editor-label";
+      label.textContent = "glob:";
+      this.editorRow.append(label, this.editorPathInput);
+    }
+    this.editorRow.style.display = "flex";
+    (this.chipEditor.field === "root" ? this.editorRootInput! : this.editorPathInput).focus();
+  }
+
+  /** (Re)build the dir editor row for the current focused field: `dir:` label, root segment,
+   *  `:` separator, path segment. Only the focused segment is an `<input>` (with its ghost
+   *  overlay); the other renders as a plain span — clicking it moves focus there. Called on
+   *  open and on every field switch, never per keystroke (rebuilding under a live input would
+   *  drop its caret). */
+  private renderDirEditor(): void {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir" || !this.editorPathInput) return;
+    const multiRoot = this.projectPaths.length > 1;
+    this.editorRow.textContent = "";
+    this.editorGhostEl = null;
+    this.editorPathGhostEl = null;
+    this.editorSepEl = null;
+    this.editorRootSpan = null;
+    this.editorPathSpan = null;
+    const label = document.createElement("span");
+    label.className = "picker-editor-label";
+    label.textContent = "dir:";
+    this.editorRow.append(label);
+    if (multiRoot && this.editorRootInput) {
+      if (ed.field === "root") {
+        // The focused root segment: a transparent <input> stacked over a ghost layer that
+        // re-renders the typed prefix invisibly (reserving its exact glyph metrics) followed
+        // by the gray remainder of the current typeahead match. The `hug` variant makes the
+        // ghost the in-flow sizer, so the segment is exactly as wide as its content.
+        const wrap = document.createElement("span");
+        wrap.className = "picker-editor-rootwrap hug";
+        this.editorGhostEl = document.createElement("span");
+        this.editorGhostEl.className = "picker-editor-ghost";
+        wrap.append(this.editorGhostEl, this.editorRootInput);
+        this.editorRow.append(wrap);
+        this.renderRootGhost();
+      } else {
+        // Unfocused root: the chosen label in committed-prefix blue — or the raw filter text,
+        // red, when it matches nothing (never a fallback label the commit gate would refuse).
+        const labels = rootLabels(this.projectPaths);
+        const invalid = rootCandidates(labels, this.editorRootInput.value).length === 0;
+        const span = document.createElement("span");
+        span.className = invalid ? "picker-editor-seg invalid" : "picker-editor-seg root";
+        span.textContent = invalid
+          ? this.editorRootInput.value
+          : labels[this.editorChosenRoot()] ?? "";
+        span.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          this.setEditorField("root");
+        });
+        this.editorRootSpan = span;
+        this.editorRow.append(span);
+      }
+      this.editorSepEl = document.createElement("span");
+      this.editorSepEl.className = "picker-editor-sep";
+      this.editorSepEl.textContent = ":";
+      this.editorRow.append(this.editorSepEl);
+    }
+    if (ed.field === "path" || !multiRoot) {
+      // The focused path segment: same ghost layering, stretched over the rest of the row, so
+      // directory suggestions render gray after the typed text.
+      const wrap = document.createElement("span");
+      wrap.className = "picker-editor-rootwrap";
+      this.editorPathGhostEl = document.createElement("span");
+      this.editorPathGhostEl.className = "picker-editor-ghost";
+      wrap.append(this.editorPathGhostEl, this.editorPathInput);
+      this.editorRow.append(wrap);
+      this.renderPathGhost();
+    } else {
+      // Unfocused path: plain text (red when invalid) — no suggestion until it's focused.
+      const span = document.createElement("span");
+      span.className = "picker-editor-seg";
+      span.textContent = this.editorPathInput.value;
+      span.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        this.setEditorField("path");
+      });
+      this.editorPathSpan = span;
+      this.editorRow.append(span);
+    }
+  }
+
+  /** Move focus between the dir editor's segments, swapping which one renders as an input.
+   *  The caret parks at the end of the newly focused input (a reattached input forgets its
+   *  selection anyway). */
+  private setEditorField(field: "root" | "path"): void {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir") return;
+    if (field === "root" && !this.editorRootInput) return;
+    // The path can't be entered under an invalid root (Tab, `:`, or a click on the path
+    // segment) — focus stays pinned to the red root until it matches something.
+    if (field === "path" && this.editorRootInvalid()) return;
+    ed.field = field;
+    this.renderDirEditor();
+    this.updateEditorDecorations();
+    const input = field === "root" ? this.editorRootInput! : this.editorPathInput!;
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
+
+  /** Keys inside the editor line. The dir editor reads as one `dir: root: path` field: Tab /
+   *  Alt-l accept the focused segment's ghost (root — adopting it and moving into the path;
+   *  path — absorbing the next directory segment), `:` on a completed root value moves into
+   *  the path, Alt-j/k cycle the focused segment's matches, Alt-Backspace pops a path segment
+   *  (then, at an empty path, clears the root selection), and plain Backspace at an empty path
+   *  steps back into the root. Enter commits, Escape cancels. */
+  private onEditorKey(e: KeyboardEvent): void {
+    const ed = this.chipEditor;
+    if (!ed) return;
+    // Only the focused segment renders an input, so the field state *is* the focus state.
+    const inRoot = ed.kind === "dir" && ed.field === "root" && this.editorRootInput !== null;
+    const inPath = !inRoot;
+    if (e.key === "Enter") {
+      // A dir editor only commits a *valid* scope — a root matching some label and a path
+      // that exists (or is empty). Otherwise the editor stays open, its invalid segment red.
+      e.preventDefault();
+      if (ed.kind === "dir" && !this.editorScopeValid()) return;
+      this.closeChipEditor(true);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      this.closeChipEditor(false);
+    } else if (e.key === "Tab" || (e.altKey && e.key === "l")) {
+      // Accept the focused segment's suggestion. Root: adopt the ghost completion (save-as
+      // muscle memory) and continue right into the path — you've picked the root, keep
+      // composing. Path: absorb the ghost directory segment; the next segment's suggestions
+      // are fetched so repeated presses walk down the tree. Swallowed in the glob editor (Tab
+      // must not move browser focus out of the line).
+      e.preventDefault();
+      if (ed.kind === "dir" && inRoot) this.commitRootField();
+      else if (ed.kind === "dir" && inPath) this.acceptPathSuggestion();
+    } else if (e.key === ":" && !e.altKey && !e.ctrlKey && inRoot) {
+      // `:` on a completed root value confirms it and moves into the path — the editor reads
+      // as a single `dir: root: path` field, and `:` is the separator you'd type next. On an
+      // incomplete value it's swallowed (`:` can never extend a root-label prefix match).
+      e.preventDefault();
+      if (this.editorRootComplete()) this.commitRootField();
+    } else if (e.altKey && e.key === "h") {
+      e.preventDefault();
+      this.setEditorField("root");
+    } else if (e.altKey && e.key === "Backspace") {
+      e.preventDefault();
+      if (ed.kind === "dir" && inPath && this.editorPathInput) {
+        // Path: delete the rightmost segment, fish-style (the save-as gesture); at an empty
+        // path, clear the root selection — the next rung of the progressive unwind.
+        if (this.editorPathInput.value === "") {
+          if (this.editorRootInput) {
+            this.editorRootInput.value = "";
+            ed.rootSelected = 0;
+            this.setEditorField("root");
+            this.syncEditorListing();
+          }
+        } else {
+          this.popPathSegment();
+        }
+        this.updateEditorDecorations();
+      } else if (inRoot && this.editorRootInput) {
+        this.editorRootInput.value = "";
+        ed.rootSelected = 0;
+        this.renderRootGhost();
+        this.syncEditorListing();
+        this.updateEditorDecorations();
+      } else if (this.editorPathInput) {
+        this.editorPathInput.value = "";
+      }
+    } else if (
+      e.key === "Backspace" &&
+      !e.ctrlKey &&
+      this.editorRootInput &&
+      inPath &&
+      this.editorPathInput?.value === ""
+    ) {
+      // Backspace at an empty path steps back into the root field — the same leftward gesture
+      // the chip row uses from the query.
+      e.preventDefault();
+      this.setEditorField("root");
+    } else if (e.altKey && (e.key === "j" || e.key === "k")) {
+      e.preventDefault();
+      const down = e.key === "j";
+      if (inRoot && this.editorRootInput) {
+        const labels = rootLabels(this.projectPaths);
+        const n = rootCandidates(labels, this.editorRootInput.value).length;
+        if (n > 0) {
+          const sel = Math.min(ed.rootSelected, n - 1);
+          ed.rootSelected = down ? (sel + 1) % n : (sel + n - 1) % n;
+          this.renderRootGhost();
+          // The chosen root moved — any path text now resolves (and validates) under it.
+          this.syncEditorListing();
+          this.updateEditorDecorations();
+        }
+      } else if (ed.kind === "dir" && inPath) {
+        // Path suggestions clamp at both ends, like the save-as prompt.
+        const s = this.pathSuggestionState();
+        if (s && s.matches.length > 0) {
+          const sel = Math.min(ed.suggestionIdx, s.matches.length - 1);
+          ed.suggestionIdx = down ? Math.min(sel + 1, s.matches.length - 1) : Math.max(sel - 1, 0);
+          this.renderPathGhost();
+        }
+      }
+    } else if (e.altKey) {
+      e.preventDefault(); // swallow other chords — they're picker-level, not editor-level
+    }
+  }
+
+  /** True when the root filter prefix-matches no label (an empty filter matches every root).
+   *  Always false in single-root projects (no root segment to invalidate). */
+  private editorRootInvalid(): boolean {
+    if (!this.editorRootInput) return false;
+    return rootCandidates(rootLabels(this.projectPaths), this.editorRootInput.value).length === 0;
+  }
+
+  /** True when the dir editor's scope is committable: a root that prefix-matches some label
+   *  and a path that exists or is empty. */
+  private editorScopeValid(): boolean {
+    return !this.editorRootInvalid() && this.editorPathValid();
+  }
+
+  /** True when the path field holds a committable value: empty (whole-root scope / clear), or
+   *  a path whose dir portion is vouched for by a loaded listing and whose leaf is either
+   *  empty (trailing `/`) or prefixes at least one listed subdirectory — a partial leaf
+   *  commits as its highlighted completion (see editorCommittedPath). A pending listing can't
+   *  vouch, so a commit racing the fetch waits. */
+  private editorPathValid(): boolean {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir" || !this.editorPathInput) return true;
+    const value = this.editorPathInput.value;
+    if (value === "") return true;
+    if (ed.listingState !== "loaded") return false;
+    const slash = value.lastIndexOf("/");
+    const leaf = slash >= 0 ? value.slice(slash + 1) : value;
+    return leaf === "" || prefixMatchIndices(ed.listing, leaf).length > 0;
+  }
+
+  /** The path a commit should adopt: the typed text, with a partially typed leaf completed to
+   *  the highlighted suggestion — Enter on a prefix selects the completion, mirroring the root
+   *  segment, and the ghost shows exactly what will commit. The text comes back as typed when
+   *  the leaf is empty, nothing matches, or the listing can't vouch. */
+  private editorCommittedPath(): string {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir" || !this.editorPathInput) return "";
+    const value = this.editorPathInput.value;
+    if (ed.listingState !== "loaded") return value;
+    const slash = value.lastIndexOf("/");
+    const dir = slash >= 0 ? value.slice(0, slash + 1) : "";
+    const leaf = slash >= 0 ? value.slice(slash + 1) : value;
+    if (leaf === "") return value;
+    const matches = prefixMatchIndices(ed.listing, leaf);
+    if (matches.length === 0) return value;
+    const idx = matches[Math.min(ed.suggestionIdx, matches.length - 1)];
+    return dir + ed.listing[idx];
+  }
+
+  /** True when the path is *definitely* wrong — the red-worthy condition, looser than
+   *  `!editorPathValid()`: the dir portion failed to list, or the loaded listing holds no
+   *  directory the leaf even prefixes. A leaf prefixing an existing directory isn't flagged
+   *  (mid-segment, ghost visible) though the commit still requires an exact match; a pending
+   *  listing isn't flagged either (unknown ≠ invalid). */
+  private editorPathInvalid(): boolean {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir" || !this.editorPathInput) return false;
+    const value = this.editorPathInput.value;
+    if (value === "") return false;
+    if (ed.listingState === "pending") return false;
+    if (ed.listingState === "failed") return true;
+    const slash = value.lastIndexOf("/");
+    const leaf = slash >= 0 ? value.slice(slash + 1) : value;
+    return leaf !== "" && prefixMatchIndices(ed.listing, leaf).length === 0;
+  }
+
+  /** Reflect validity and separator visibility into the DOM: invalid segments (root matching no
+   *  label / path that doesn't exist) colour red — the visible form of "Enter will refuse this"
+   *  — and the `:` separator appears once the path is in play (focused, or already holding
+   *  text), so a fresh root prompt doesn't dangle a `:` off an unentered field. */
+  private updateEditorDecorations(): void {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir") return;
+    const pathText = this.editorPathInput?.value ?? "";
+    if (this.editorSepEl) {
+      this.editorSepEl.style.display = ed.field === "path" || pathText !== "" ? "" : "none";
+    }
+    if (this.editorRootInput) {
+      const labels = rootLabels(this.projectPaths);
+      const invalid = rootCandidates(labels, this.editorRootInput.value).length === 0;
+      // Whichever element currently stands for the segment (live input or static span).
+      (ed.field === "root" ? this.editorRootInput : this.editorRootSpan)?.classList.toggle(
+        "invalid",
+        invalid,
+      );
+    }
+    (ed.field === "path" ? this.editorPathInput : this.editorPathSpan)?.classList.toggle(
+      "invalid",
+      this.editorPathInvalid(),
+    );
+  }
+
+  /** True when the root field holds a complete root label (the current match's ghost suffix is
+   *  empty) — what lets a typed `:` act as the root/path separator. */
+  private editorRootComplete(): boolean {
+    const ed = this.chipEditor;
+    if (!ed || !this.editorRootInput) return false;
+    const typed = this.editorRootInput.value;
+    const labels = rootLabels(this.projectPaths);
+    const candidates = rootCandidates(labels, typed);
+    if (candidates.length === 0) return false;
+    const idx = candidates[Math.min(ed.rootSelected, candidates.length - 1)];
+    return labels[idx].length === typed.length;
+  }
+
+  /** Confirm the root segment (adopting the ghost completion, when one is visible) and move
+   *  focus into the path. Shared by Tab, Alt-l, and `:`-on-a-complete-value. */
+  private commitRootField(): void {
+    const ed = this.chipEditor;
+    if (!ed || !this.editorRootInput || !this.editorPathInput) return;
+    const labels = rootLabels(this.projectPaths);
+    const candidates = rootCandidates(labels, this.editorRootInput.value);
+    // An invalid root refuses to advance — focus stays on the red root field.
+    if (candidates.length === 0) return;
+    const idx = candidates[Math.min(ed.rootSelected, candidates.length - 1)];
+    this.editorRootInput.value = labels[idx];
+    // The full label may still prefix-match several roots ("beta" vs "beta-api") — keep the
+    // highlight on the adopted one.
+    const after = rootCandidates(labels, labels[idx]);
+    ed.rootSelected = Math.max(0, after.indexOf(idx));
+    this.setEditorField("path");
+    // The chosen root may have moved the dir the path resolves under.
+    this.syncEditorListing();
+    this.renderPathGhost();
+    this.updateEditorDecorations();
+  }
+
+  /** A free-form edit to the path field: reset the suggestion highlight and resync the listing
+   *  (the dir portion may have moved — typed `/`, backspaced into a previous segment). */
+  private onPathInput(): void {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir") return;
+    ed.suggestionIdx = 0;
+    this.syncEditorListing();
+    this.renderPathGhost();
+    this.updateEditorDecorations();
+  }
+
+  /** The absolute directory the path field's suggestions should list: the dir portion of the
+   *  typed path (up to the last `/`), resolved under the chosen root. */
+  private editorListingPath(): string | null {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir" || !this.editorPathInput) return null;
+    // No listing target under an invalid root — suggestions fetched beneath the fallback root
+    // would read as silently defaulting to it.
+    if (this.editorRootInvalid()) return null;
+    const rootIdx = this.projectPaths.length > 1 ? this.editorChosenRoot() : 0;
+    const root = this.projectPaths[rootIdx];
+    if (root === undefined) return null;
+    const value = this.editorPathInput.value;
+    const slash = value.lastIndexOf("/");
+    const dirPart = slash >= 0 ? value.slice(0, slash).replace(/^\/+|\/+$/g, "") : "";
+    return dirPart === "" ? root : joinPath(root, dirPart);
+  }
+
+  /** Reconcile the listing key with the current (root, dir-portion) pair, refetching when they
+   *  diverged. The stale listing is cleared immediately so a ghost from the old directory can't
+   *  flash while the fetch is in flight. */
+  private syncEditorListing(): void {
+    const ed = this.chipEditor;
+    const abs = this.editorListingPath();
+    if (!ed || abs === null || abs === ed.listingDirAbs) return;
+    ed.listingDirAbs = abs;
+    ed.listing = [];
+    ed.listingState = "pending";
+    ed.suggestionIdx = 0;
+    void this.refreshEditorListing(abs);
+  }
+
+  /** Fire `directory/list` and stash the response (subdirectories only — a file never completes
+   *  a directory scope). A failure marks the dir portion nonexistent: the path renders invalid
+   *  and the commit gate refuses it until the next change re-syncs. */
+  private async refreshEditorListing(abs: string): Promise<void> {
+    const ed = this.chipEditor;
+    if (!ed) return;
+    try {
+      const r = await this.client.rpc<DirectoryListResult>("directory/list", { path: abs });
+      if (this.chipEditor === ed && ed.listingDirAbs === abs) {
+        ed.listing = r.entries.filter((en) => en.is_dir).map((en) => en.name);
+        ed.listingState = "loaded";
+        ed.suggestionIdx = 0;
+        this.renderPathGhost();
+        this.updateEditorDecorations();
+      }
+    } catch {
+      // Typed-but-nonexistent segment, or a path outside the boundary.
+      if (this.chipEditor === ed && ed.listingDirAbs === abs) {
+        ed.listingState = "failed";
+        this.updateEditorDecorations();
+      }
+    }
+  }
+
+  /** The path field's partial leaf (text after the last `/`) and the listing indices matching
+   *  it as a smartcase prefix. */
+  private pathSuggestionState(): { partial: string; matches: number[] } | null {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir" || !this.editorPathInput) return null;
+    const value = this.editorPathInput.value;
+    const slash = value.lastIndexOf("/");
+    const partial = slash >= 0 ? value.slice(slash + 1) : value;
+    return { partial, matches: prefixMatchIndices(ed.listing, partial) };
+  }
+
+  /** Re-render the path field's ghost layer: the typed text invisibly (reserving its glyph
+   *  metrics), then the rest of the current directory match plus its trailing `/` in gray.
+   *  Nothing matches → no ghost (unlike the root field there's no fallback to cue). */
+  private renderPathGhost(): void {
+    const ed = this.chipEditor;
+    if (!ed || ed.kind !== "dir" || !this.editorPathGhostEl || !this.editorPathInput) return;
+    this.editorPathGhostEl.textContent = "";
+    const prefix = document.createElement("span");
+    prefix.className = "typed";
+    prefix.textContent = this.editorPathInput.value;
+    const suffix = document.createElement("span");
+    const s = this.pathSuggestionState();
+    if (s && s.matches.length > 0) {
+      const idx = s.matches[Math.min(ed.suggestionIdx, s.matches.length - 1)];
+      suffix.textContent = `${ed.listing[idx].slice(s.partial.length)}/`;
+    }
+    this.editorPathGhostEl.append(prefix, suffix);
+  }
+
+  /** Tab / Alt-l in the path field: absorb the ghost into the input. The suffix always ends in
+   *  `/` (suggestions are directories), so the dir portion grew — refetch so the next segment's
+   *  suggestion appears. No-op without a ghost. */
+  private acceptPathSuggestion(): void {
+    const ed = this.chipEditor;
+    const s = this.pathSuggestionState();
+    if (!ed || !s || s.matches.length === 0 || !this.editorPathInput) return;
+    const idx = s.matches[Math.min(ed.suggestionIdx, s.matches.length - 1)];
+    this.editorPathInput.value += `${ed.listing[idx].slice(s.partial.length)}/`;
+    ed.suggestionIdx = 0;
+    this.syncEditorListing();
+    this.renderPathGhost();
+    this.updateEditorDecorations();
+  }
+
+  /** Alt-Backspace in a non-empty path field: drop the rightmost segment, fish-style (the
+   *  save-as gesture), keeping the parent's trailing `/`. */
+  private popPathSegment(): void {
+    const ed = this.chipEditor;
+    if (!ed || !this.editorPathInput) return;
+    const v = this.editorPathInput.value;
+    const stripped = v.endsWith("/") ? v.slice(0, -1) : v;
+    const i = stripped.lastIndexOf("/");
+    this.editorPathInput.value = i >= 0 ? stripped.slice(0, i + 1) : "";
+    ed.suggestionIdx = 0;
+    this.syncEditorListing();
+    this.renderPathGhost();
+    this.updateEditorDecorations();
+  }
+
+  /** Re-render the root field's ghost layer: an invisible copy of the typed prefix (reserving
+   *  its exact glyph metrics) followed by the current match's remainder in gray, sitting under
+   *  the transparent input. No match → no ghost; the typed text colouring red (see
+   *  updateEditorDecorations) is the cue. */
+  private renderRootGhost(): void {
+    const ed = this.chipEditor;
+    if (!ed || !this.editorGhostEl || !this.editorRootInput) return;
+    const typed = this.editorRootInput.value;
+    const labels = rootLabels(this.projectPaths);
+    const candidates = rootCandidates(labels, typed);
+    this.editorGhostEl.textContent = "";
+    const prefix = document.createElement("span");
+    prefix.className = "typed";
+    prefix.textContent = typed;
+    const suffix = document.createElement("span");
+    if (candidates.length > 0) {
+      const idx = candidates[Math.min(ed.rootSelected, candidates.length - 1)];
+      suffix.textContent = labels[idx].slice(typed.length);
+    }
+    this.editorGhostEl.append(prefix, suffix);
+  }
+
+  /** The root the editor would commit: the highlighted typeahead candidate, falling back to
+   *  the root the editor opened with when the filter matches nothing. */
+  private editorChosenRoot(): number {
+    const ed = this.chipEditor;
+    if (!ed) return 0;
+    if (!this.editorRootInput) return ed.rootIndex;
+    const labels = rootLabels(this.projectPaths);
+    const candidates = rootCandidates(labels, this.editorRootInput.value);
+    if (candidates.length === 0) return ed.rootIndex;
+    return candidates[Math.min(ed.rootSelected, candidates.length - 1)];
+  }
+
+  /** Close the editor line, committing when asked. Glob: an empty value clears the glob being
+   *  edited (or cancels when adding). Dir: chosen root + trimmed path compose the ScopedPath;
+   *  an empty path is a whole-root scope in multi-root projects, and clears the chip in
+   *  single-root ones. Focus returns to the query input. */
+  private closeChipEditor(commit: boolean): void {
+    const ed = this.chipEditor;
+    if (!ed) return;
+    // A partially typed dir leaf commits as its highlighted completion (Enter on a prefix
+    // selects the completion, like the root segment).
+    const raw = ed.kind === "dir" ? this.editorCommittedPath() : this.editorPathInput?.value ?? "";
+    const text = raw.trim().replace(/^\/+|\/+$/g, "");
+    let changed = false;
+    if (commit) {
+      // Both editors commit through the same shape (mirrors the TUI's commit_*_edit): a null
+      // value clears the chip being edited (or cancels when adding), duplicates collapse —
+      // committing an existing value is a no-op, editing into one drops the edited entry —
+      // and an in-place edit keeps its position in the row. `ed.edit` indexes the chip list.
+      let value: ChipValue | null;
+      if (ed.kind === "glob") {
+        // Normalization: `.rs` → `*.rs`; degenerate match-everything globs (`*`, `**`,
+        // negated too) come back null and behave like an empty commit.
+        const glob = normalizeGlob(this.editorPathInput?.value ?? "");
+        value = glob === null ? null : { t: "glob", g: glob };
+      } else {
+        // An empty path is a whole-root scope in multi-root projects, and clears the chip in
+        // single-root ones.
+        const multiRoot = this.projectPaths.length > 1;
+        value =
+          text === "" && !multiRoot
+            ? null
+            : {
+                t: "dir",
+                d: { path_index: multiRoot ? this.editorChosenRoot() : 0, relative_path: text },
+              };
+      }
+      const edit = ed.edit !== null && this.chipValues[ed.edit]?.t === ed.kind ? ed.edit : null;
+      if (value === null) {
+        if (edit !== null) {
+          this.chipValues.splice(edit, 1);
+          changed = true;
+        }
+      } else if (edit !== null) {
+        const v = value;
+        if (this.chipValues.some((c, j) => j !== edit && sameChip(c, v))) {
+          this.chipValues.splice(edit, 1);
+        } else {
+          this.chipValues[edit] = v;
+        }
+        changed = true;
+      } else {
+        const v = value;
+        if (!this.chipValues.some((c) => sameChip(c, v))) {
+          this.chipValues.push(v);
+          changed = true;
+        }
+      }
+    }
+    this.chipEditor = null;
+    this.editorRow.style.display = "none";
+    this.editorRow.textContent = "";
+    this.editorRootInput = null;
+    this.editorPathInput = null;
+    this.editorGhostEl = null;
+    this.editorPathGhostEl = null;
+    this.editorSepEl = null;
+    this.editorRootSpan = null;
+    this.editorPathSpan = null;
+    this.input.focus();
+    if (changed) void this.applyFilterChange();
+    else this.renderChips();
   }
 
   /** Delete the highlighted file/dir/project after a confirm dialog, then refresh the list. */
@@ -599,9 +1758,11 @@ export class Picker {
           const h = document.createElement("div");
           h.className = "picker-row grep-header";
           // Multi-root projects prefix the root's name: `root: path`, all in the header colour.
+          // The *disambiguated* label, not the raw basename — two roots sharing a basename
+          // would otherwise render identical headers (the case rootLabels exists for).
           if (this.projectPaths.length > 1) {
-            const root = this.projectPaths[item.path_index];
-            h.textContent = `${root ? basename(root) : `root ${item.path_index}`}: ${item.relative_path}`;
+            const label = rootLabels(this.projectPaths)[item.path_index];
+            h.textContent = `${label ?? `root ${item.path_index}`}: ${item.relative_path}`;
           } else {
             h.textContent = item.relative_path;
           }
@@ -843,13 +2004,19 @@ export class Picker {
     const dir = this.explorerDir;
     if (!dir) return ""; // roots mode — the rows already say "pick a root"
     let best = "";
-    for (const root of this.projectPaths) {
+    let bestIdx = -1;
+    this.projectPaths.forEach((root, i) => {
       const norm = root.endsWith("/") ? root.slice(0, -1) : root;
-      if ((dir === norm || dir.startsWith(norm + "/")) && norm.length > best.length) best = norm;
-    }
-    if (!best) return `${dir}/`;
+      if ((dir === norm || dir.startsWith(norm + "/")) && norm.length > best.length) {
+        best = norm;
+        bestIdx = i;
+      }
+    });
+    if (bestIdx < 0) return `${dir}/`;
     const rel = dir === best ? "" : `${dir.slice(best.length + 1)}/`;
-    const label = this.projectPaths.length > 1 ? `${basename(best)}/` : "";
+    // The *disambiguated* root label, not the basename — colliding basenames would read alike.
+    const label =
+      this.projectPaths.length > 1 ? `${rootLabels(this.projectPaths)[bestIdx]}/` : "";
     return label + rel;
   }
 
@@ -858,8 +2025,8 @@ export class Picker {
       case "file": {
         // Same left status-bullet as the explorer (ignored files never reach this picker — the
         // workspace walker skips them — so there's no `dim` case here). Multi-root projects show
-        // the root's name dimly after the path, matching the terminal client.
-        const root = this.projectPaths[item.path_index];
+        // the root's *disambiguated* label dimly after the path, matching the terminal client
+        // (the raw basename would read alike for roots that share one).
         return {
           primary: item.relative_path,
           primaryMatches: item.match_indices,
@@ -867,9 +2034,7 @@ export class Picker {
           bulletStatus: item.git_status,
           suffix:
             this.projectPaths.length > 1
-              ? root
-                ? basename(root)
-                : `root ${item.path_index}`
+              ? rootLabels(this.projectPaths)[item.path_index] ?? `root ${item.path_index}`
               : undefined,
         };
       }

@@ -639,8 +639,10 @@ static INSERT: &[Binding] = &[
 static SEARCH: &[Binding] = &[
     bind!(SEARCH_CTX, KeyCode::Esc, Any, A::SearchAbort, "Search", "Abort search"),
     bind!(SEARCH_CTX, KeyCode::Enter, Any, A::SearchCommit, "Search", "Commit search"),
-    bind!(SEARCH_CTX, KeyCode::Up, Any, A::SearchHistoryPrev, "Search", "Previous query in history"),
-    bind!(SEARCH_CTX, KeyCode::Down, Any, A::SearchHistoryNext, "Search", "Next query in history"),
+    // Alt-k/j (not Up/Down) browse history — the same chord the picker chip editors will use
+    // for history/candidate selection, so "Alt-j/k selects" reads uniformly across inputs.
+    bind!(SEARCH_CTX, ch('k'), Exact(ALT), A::SearchHistoryPrev, "Search", "Previous query in history"),
+    bind!(SEARCH_CTX, ch('j'), Exact(ALT), A::SearchHistoryNext, "Search", "Next query in history"),
     bind!(SEARCH_CTX, KeyCode::Left, Any, A::SearchCursorLeft, "Search", "Move cursor left"),
     bind!(SEARCH_CTX, KeyCode::Right, Any, A::SearchCursorRight, "Search", "Move cursor right"),
     bind!(SEARCH_CTX, KeyCode::Backspace, Any, A::SearchBackspace, "Search", "Delete character"),

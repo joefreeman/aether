@@ -633,6 +633,8 @@ export interface PickerViewResult {
   directory_path?: string | null;
   /** Explorer: parent directory if still inside the project boundary, else null. */
   directory_parent?: string | null;
+  /** Filters in effect (absent = all-default), echoed so a resumed picker restores its chips. */
+  filters?: PickerFilters;
 }
 export interface PickerSelectParams {
   kind: PickerKind;
@@ -644,10 +646,49 @@ export type PickerSelectResult =
   | { kind: "buffer"; buffer_id: BufferId }
   | { kind: "file_at"; path: string; position: LogicalPosition }
   | { kind: "project"; name: string };
+/** How the grep query treats letter case (smart = insensitive unless an uppercase letter). */
+export type CaseMode = "smart" | "sensitive" | "insensitive";
+/** A directory inside one of the project's roots — the `dir:` filter chip. */
+export interface ScopedPath {
+  path_index: number;
+  relative_path: string;
+}
+/** Result-narrowing filters, surfaced as chips (docs/picker-filters.md). All fields default-
+ *  skipped on the wire; which apply depends on the picker kind (inapplicable ones are ignored). */
+export interface PickerFilters {
+  case?: CaseMode;
+  whole_word?: boolean;
+  fixed_string?: boolean;
+  /** Grep: include gitignored / hidden files (the index excludes them). */
+  include_ignored?: boolean;
+  include_hidden?: boolean;
+  /** Explorer: hide gitignored / hidden entries (the listing shows them by default). */
+  hide_ignored?: boolean;
+  hide_hidden?: boolean;
+  changed_only?: boolean;
+  /** rg `-g` globs against root-relative paths; leading `!` excludes. */
+  globs?: string[];
+  /** Directory scopes, union semantics (repeatable, like globs); an empty relative_path scopes
+   *  to the whole root (no separate root filter). */
+  directories?: ScopedPath[];
+}
 export interface PickerQueryParams {
   kind: PickerKind;
   query: string;
   generation: number;
+  filters?: PickerFilters;
+}
+/** One `directory/list` entry — plain filesystem queries for prompt typeaheads (no candidate
+ *  cache, no per-client state; distinct from the Explorer picker). */
+export interface DirectoryEntry {
+  name: string;
+  is_dir: boolean;
+}
+export interface DirectoryListResult {
+  /** Canonical absolute path of the listed directory. */
+  path: string;
+  parent?: string | null;
+  entries: DirectoryEntry[];
 }
 export interface PickerHideParams {
   kind: PickerKind;

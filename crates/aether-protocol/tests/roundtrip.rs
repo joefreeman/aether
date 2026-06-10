@@ -1206,6 +1206,7 @@ fn picker_view_params_omit_center_on_when_none() {
         directory_path: None,
         buffer_id: None,
         explorer_roots: false,
+        filters: None,
     };
     let v = to_value(&p).unwrap();
     assert!(
@@ -1234,6 +1235,7 @@ fn picker_view_params_center_on_serialized() {
         directory_path: None,
         buffer_id: None,
         explorer_roots: false,
+        filters: None,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["center_on"]["kind"], "file");
@@ -1508,6 +1510,7 @@ fn picker_view_params_directory_path_skipped_when_none() {
         directory_path: None,
         buffer_id: None,
         explorer_roots: false,
+        filters: None,
     };
     let v = to_value(&p).unwrap();
     assert!(
@@ -1529,6 +1532,7 @@ fn picker_view_params_directory_path_serialized() {
         directory_path: Some("/home/x/proj/src".into()),
         buffer_id: None,
         explorer_roots: false,
+        filters: None,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["directory_path"], "/home/x/proj/src");
@@ -1545,11 +1549,16 @@ fn picker_view_result_directory_fields_skipped_when_none() {
         effective_center_on: None,
         directory_path: None,
         directory_parent: None,
+        filters: Default::default(),
     };
     let v = to_value(&r).unwrap();
     assert!(v.get("directory_path").is_none());
     assert!(v.get("directory_parent").is_none());
     assert!(v.get("effective_center_on").is_none());
+    assert!(
+        v.get("filters").is_none(),
+        "all-default filters should be skipped from the wire"
+    );
 }
 
 #[test]
@@ -1563,10 +1572,95 @@ fn picker_view_result_directory_fields_serialized() {
         effective_center_on: None,
         directory_path: Some("/proj/src".into()),
         directory_parent: Some("/proj".into()),
+        filters: Default::default(),
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["directory_path"], "/proj/src");
     assert_eq!(v["directory_parent"], "/proj");
+}
+
+#[test]
+fn picker_filters_default_is_empty_object_and_absent_field_deserializes() {
+    use aether_protocol::picker::{PickerFilters, PickerKind, PickerQueryParams};
+    // All-default filters serialize to an empty object (every field is skipped)...
+    assert_eq!(to_value(PickerFilters::default()).unwrap(), json!({}));
+    // ...and an absent `filters` field on params deserializes to the default set, so the old
+    // wire shape stays valid.
+    let p: PickerQueryParams =
+        from_value(json!({"kind": "grep", "query": "foo", "generation": 3})).unwrap();
+    assert!(p.filters.is_default());
+    let v = to_value(&p).unwrap();
+    assert!(
+        v.get("filters").is_none(),
+        "default filters should be skipped on the wire"
+    );
+}
+
+#[test]
+fn picker_filters_wire_shape() {
+    use aether_protocol::picker::{CaseMode, PickerFilters, ScopedPath};
+    let f = PickerFilters {
+        case: CaseMode::Insensitive,
+        whole_word: true,
+        fixed_string: true,
+        include_ignored: true,
+        include_hidden: true,
+        hide_ignored: true,
+        hide_hidden: true,
+        changed_only: true,
+        globs: vec!["*.rs".into(), "!*_test.rs".into()],
+        directories: vec![
+            ScopedPath {
+                path_index: 1,
+                relative_path: "src/app".into(),
+            },
+            ScopedPath {
+                path_index: 0,
+                relative_path: String::new(),
+            },
+        ],
+    };
+    let v = to_value(&f).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "case": "insensitive",
+            "whole_word": true,
+            "fixed_string": true,
+            "include_ignored": true,
+            "include_hidden": true,
+            "hide_ignored": true,
+            "hide_hidden": true,
+            "changed_only": true,
+            "globs": ["*.rs", "!*_test.rs"],
+            "directories": [
+                {"path_index": 1, "relative_path": "src/app"},
+                {"path_index": 0, "relative_path": ""},
+            ],
+        })
+    );
+    let back: PickerFilters = from_value(v).unwrap();
+    assert_eq!(back, f);
+}
+
+#[test]
+fn picker_view_result_filters_serialized_when_non_default() {
+    use aether_protocol::picker::{PickerFilters, PickerViewResult};
+    let r = PickerViewResult {
+        query: "needle".into(),
+        generation: 2,
+        total_candidates: 3,
+        effective_offset: 0,
+        effective_center_on: None,
+        directory_path: None,
+        directory_parent: None,
+        filters: PickerFilters {
+            whole_word: true,
+            ..Default::default()
+        },
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["filters"], json!({"whole_word": true}));
 }
 
 #[test]

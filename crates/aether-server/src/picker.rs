@@ -10,7 +10,8 @@
 use crate::workspace_index::CachedFile;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{
-    BufferDirtyState, PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams,
+    BufferDirtyState, PickerFilters, PickerItem, PickerKind, PickerSelectResult,
+    PickerUpdateParams,
 };
 use aether_protocol::viewport::DiagnosticSeverity;
 use aether_protocol::{BufferId, LogicalPosition};
@@ -496,6 +497,11 @@ impl PickerCandidates {
 pub struct PickerState {
     pub kind: PickerKind,
     pub query: String,
+    /// Result-narrowing filters (chips client-side). Replaced whole by `picker/query` /
+    /// `picker/view { filters }`; persisted across hide/show like `query`. Grep applies them in
+    /// the spawned search; Files applies them in `rerank`; Explorer applies them when the
+    /// listing is built (so they're consulted in `picker_view`, not here).
+    pub filters: PickerFilters,
     pub generation: u64,
     /// Indices into `candidates` in match-score order (descending). On empty query, this is
     /// the candidate set's natural order — alphabetical for files, MRU for buffers.
@@ -515,17 +521,109 @@ pub struct PickerState {
     /// task applies its result. Distinct from `generation` (which a *query* change bumps): a query
     /// while loading must re-filter the pending result, not cancel the resolve.
     pub pending_async_load: Option<u64>,
-    /// Grep only: the query whose walk last completed (`ticking: false` push went out). When the
-    /// next `picker/query` arrives with the same string, the candidates are still valid — skip
-    /// the wipe + respawn and just re-emit the current window. Cleared whenever a new search
-    /// starts; set by the streaming coordinator's final-push branch.
-    pub last_completed_query: Option<String>,
+    /// Grep only: the `(query, filters)` whose walk last completed (`ticking: false` push went
+    /// out). When the next `picker/query` arrives with the same pair, the candidates are still
+    /// valid — skip the wipe + respawn and just re-emit the current window. Cleared whenever a
+    /// new search starts; set by the streaming coordinator's final-push branch.
+    pub last_completed_search: Option<(String, PickerFilters)>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct SubscribedWindow {
     pub offset: u32,
     pub limit: u32,
+}
+
+/// Compile filter globs into an rg-style override matcher (`!` = exclude; with ≥1 plain glob,
+/// non-matching files are excluded). `Ok(None)` when there are no globs. Globs match against
+/// root-relative paths (the builder root is empty, so relative inputs are compared as-is).
+/// Shared by the Files rerank pass and the grep search worker.
+pub fn build_overrides(
+    globs: &[String],
+) -> Result<Option<ignore::overrides::Override>, ignore::Error> {
+    if globs.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = ignore::overrides::OverrideBuilder::new("");
+    for g in globs {
+        builder.add(g)?;
+    }
+    builder.build().map(Some)
+}
+
+/// The Files picker's filter-chip predicate, applied during `rerank` before fuzzy matching.
+/// Cheap to rebuild per rerank (a handful of globs at most); the git statuses ride alongside
+/// the candidate snapshot, so `changed` is a lookup, not a repo walk.
+struct FilesFilter {
+    overrides: Option<ignore::overrides::Override>,
+    /// An invalid glob rejects everything — mirrors grep's invalid-pattern behavior (the chip
+    /// stays visible so the user can see what to fix).
+    reject_all: bool,
+    /// Union of directory scopes: a file passes when it's under *any* of them (matching how
+    /// multiple include globs combine). Empty `relative_path` scopes to the whole root — root
+    /// scoping is just an entry with no path. An empty vec means no dir narrowing.
+    directories: Vec<(u32, String)>,
+    changed_only: bool,
+}
+
+/// True when `file` sits under the `(path_index, relative_path)` directory scope. An empty
+/// relative path scopes to the whole root. Shared shape with grep's `FileFilter`.
+pub(crate) fn under_scope(
+    file_path_index: u32,
+    file_relative_path: &str,
+    path_index: u32,
+    rel: &str,
+) -> bool {
+    file_path_index == path_index
+        && (rel.is_empty()
+            || (file_relative_path.starts_with(rel)
+                && file_relative_path.as_bytes().get(rel.len()) == Some(&b'/')))
+}
+
+impl FilesFilter {
+    fn new(filters: &PickerFilters) -> FilesFilter {
+        let (overrides, reject_all) = match build_overrides(&filters.globs) {
+            Ok(o) => (o, false),
+            Err(_) => (None, true),
+        };
+        FilesFilter {
+            overrides,
+            reject_all,
+            directories: filters
+                .directories
+                .iter()
+                .map(|d| (d.path_index, d.relative_path.clone()))
+                .collect(),
+            changed_only: filters.changed_only,
+        }
+    }
+
+    fn passes(
+        &self,
+        file: &CachedFile,
+        status: Option<aether_protocol::git::GitStatus>,
+    ) -> bool {
+        if self.reject_all {
+            return false;
+        }
+        if !self.directories.is_empty()
+            && !self.directories.iter().any(|(path_index, rel)| {
+                under_scope(file.path_index, &file.relative_path, *path_index, rel)
+            })
+        {
+            return false;
+        }
+        if let Some(ov) = &self.overrides {
+            if ov.matched(&file.relative_path, false).is_ignore() {
+                return false;
+            }
+        }
+        // The workspace walk never yields ignored files, so any status here is a real change.
+        if self.changed_only && status.is_none() {
+            return false;
+        }
+        true
+    }
 }
 
 impl PickerState {
@@ -535,12 +633,13 @@ impl PickerState {
         Self {
             kind,
             query: String::new(),
+            filters: PickerFilters::default(),
             generation: 0,
             ranked,
             candidates,
             subscribed: None,
             pending_async_load: None,
-            last_completed_query: None,
+            last_completed_search: None,
         }
     }
 
@@ -549,10 +648,35 @@ impl PickerState {
     pub fn rerank(&mut self, matcher: &mut Matcher) {
         self.ranked.clear();
         let strategy = self.candidates.match_strategy();
+        // Files: filter chips narrow the candidate set before (and independently of) the fuzzy
+        // match. The other kinds filter elsewhere — Grep in the search worker, Explorer when
+        // the listing is built — so their predicate is always "pass".
+        let files_filter = match &self.candidates {
+            PickerCandidates::Files { .. } if !self.filters.is_default() => {
+                Some(FilesFilter::new(&self.filters))
+            }
+            _ => None,
+        };
+        let passes = |candidates: &PickerCandidates, i: usize| -> bool {
+            let Some(ff) = files_filter.as_ref() else {
+                return true;
+            };
+            let PickerCandidates::Files { files, git_status } = candidates else {
+                return true;
+            };
+            ff.passes(&files[i], git_status.get(i).copied().flatten())
+        };
         // Two paths converge on "preserve natural order": Grep's strategy is always Preserved,
         // and the other strategies short-circuit to natural order on an empty query.
         if strategy == MatchStrategy::Preserved || self.query.is_empty() {
-            self.ranked.extend(0..self.candidates.len() as u32);
+            let n = self.candidates.len();
+            let mut ranked: Vec<u32> = Vec::with_capacity(n);
+            for i in 0..n {
+                if passes(&self.candidates, i) {
+                    ranked.push(i as u32);
+                }
+            }
+            self.ranked = ranked;
             return;
         }
         match strategy {
@@ -563,6 +687,9 @@ impl PickerState {
                 let n = self.candidates.len();
                 let mut scored: Vec<(u32, u32)> = Vec::with_capacity(n);
                 for i in 0..n {
+                    if !passes(&self.candidates, i) {
+                        continue;
+                    }
                     let haystack = Utf32Str::new(self.candidates.display_at(i), &mut buf);
                     if let Some(score) = pattern.score(haystack, matcher) {
                         scored.push((score, i as u32));

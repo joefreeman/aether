@@ -258,6 +258,101 @@ pub enum PickerItem {
     },
 }
 
+// ---- picker filters -----------------------------------------------------------------------------
+
+/// How the grep query treats letter case. `Smart` is the default everywhere (case-insensitive
+/// unless the query contains an uppercase letter, matching buffer search and the fuzzy pickers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseMode {
+    #[default]
+    Smart,
+    Sensitive,
+    Insensitive,
+}
+
+impl CaseMode {
+    fn is_smart(&self) -> bool {
+        matches!(self, CaseMode::Smart)
+    }
+}
+
+/// A directory inside one of the project's roots — the `dir:` filter chip. Addressed the same
+/// way picker items are (`path_index` + root-relative path) so it survives root reordering no
+/// worse than everything else does. There is deliberately no separate root filter: scoping to
+/// a whole root is this with an empty `relative_path` (a directory always implies its root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedPath {
+    /// Index into the project's root list.
+    pub path_index: u32,
+    /// Path relative to `roots[path_index]`, forward-slash separated, no trailing slash.
+    /// Empty scopes to the root itself.
+    pub relative_path: String,
+}
+
+/// Result-narrowing filters, surfaced as chips in the clients (see `docs/picker-filters.md`).
+/// The full set is sent whole on every `picker/query` — filters are small and "replace, don't
+/// diff" keeps the server stateless about chip edits. Defaults mean "no filtering", so an
+/// all-default struct is equivalent to the field being absent on the wire.
+///
+/// Which fields apply depends on the picker kind: Grep reads everything; Files reads
+/// `globs`/`directories`/`changed_only`; Explorer reads `hide_ignored`/`hide_hidden`/
+/// `changed_only`. Inapplicable fields are ignored, not errors — clients only offer the chips
+/// that apply.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PickerFilters {
+    /// Grep: how the search pattern treats case.
+    #[serde(default, skip_serializing_if = "CaseMode::is_smart")]
+    pub case: CaseMode,
+    /// Grep: match only at word boundaries (ripgrep `-w`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub whole_word: bool,
+    /// Grep: treat the query as a literal string, not a regex (ripgrep `-F`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fixed_string: bool,
+    /// Grep: include `.gitignore`d files (ripgrep `--no-ignore`). Not offered for Files — the
+    /// workspace index excludes ignored files at walk time and re-walking per toggle is too
+    /// costly there. (The Explorer's equivalent is `hide_ignored`, inverted: its listing shows
+    /// ignored entries by default.)
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_ignored: bool,
+    /// Grep: include hidden (dot-) files (ripgrep `--hidden`). Same Files caveat as
+    /// `include_ignored`; the Explorer's equivalent is `hide_hidden`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_hidden: bool,
+    /// Explorer only: drop `.gitignore`d entries from the listing. The explorer shows them by
+    /// default (colour-tagged), unlike Files/Grep whose walks exclude them — so its chip hides
+    /// rather than includes, keeping every field's default equal to current behavior.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_ignored: bool,
+    /// Explorer only: drop hidden (dot-) entries from the listing. Same default rationale as
+    /// `hide_ignored`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_hidden: bool,
+    /// All kinds: restrict to files with uncommitted changes (any non-clean, non-ignored Git
+    /// status). For Explorer, directories with changed descendants stay visible.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub changed_only: bool,
+    /// Grep + Files: ripgrep-style include globs, matched against the root-relative path.
+    /// A leading `!` makes a glob an exclude. With at least one non-`!` glob present, a file
+    /// must match some include glob; independently, it must match no exclude glob.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub globs: Vec<String>,
+    /// Grep + Files: restrict to files under *any* of these directories (union semantics,
+    /// matching how multiple include globs combine; a whole root is an entry with an empty
+    /// `relative_path` — there is no separate root filter). Repeatable, like `globs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directories: Vec<ScopedPath>,
+}
+
+impl PickerFilters {
+    /// True when every field is at its default — i.e. no narrowing is in effect. Used to skip
+    /// the field on the wire and to short-circuit filter passes server-side.
+    pub fn is_default(&self) -> bool {
+        *self == PickerFilters::default()
+    }
+}
+
 // ---- picker/view --------------------------------------------------------------------------------
 
 /// Attach to a picker, declare the scroll window to be pushed, and start receiving updates. If
@@ -312,6 +407,12 @@ pub struct PickerViewParams {
     /// picker (`reset: true`); `None` on resume/scroll re-views (the candidate snapshot is kept).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_id: Option<BufferId>,
+    /// Replace the persisted filters before attaching. `None` keeps whatever the prior
+    /// `view`/`query`/`hide` cycle left behind (the default, no-op filters on first open or
+    /// after `reset`). `Some` is how a client opens a picker pre-scoped (e.g. a future
+    /// "grep this directory").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<PickerFilters>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -346,6 +447,10 @@ pub struct PickerViewResult {
     /// the other picker kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_parent: Option<String>,
+    /// The filters now in effect (all-default on first open or after `reset`). Echoed so a
+    /// resuming client can rebuild its chip row, the same way `query` restores the input text.
+    #[serde(default, skip_serializing_if = "PickerFilters::is_default")]
+    pub filters: PickerFilters,
 }
 
 // ---- picker/query -------------------------------------------------------------------------------
@@ -365,6 +470,12 @@ pub struct PickerQueryParams {
     pub kind: PickerKind,
     pub query: String,
     pub generation: u64,
+    /// The full filter set in effect for this query, sent whole on every change. A filter
+    /// change is a query change: the client bumps `generation` and the server re-runs (for
+    /// Grep, respawning the search worker). All-default (the serde default when absent) means
+    /// no narrowing.
+    #[serde(default, skip_serializing_if = "PickerFilters::is_default")]
+    pub filters: PickerFilters,
 }
 
 // ---- picker/select ------------------------------------------------------------------------------

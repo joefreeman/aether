@@ -28,11 +28,11 @@ use aether_protocol::input::{
     InputUnsurround, InputUnsurroundParams, SurroundTarget, UndoResult,
 };
 use aether_protocol::picker::{
-    BufferDirtyState, PickerGrepNavigate, PickerGrepNavigateParams, PickerGrepNavigateTarget,
-    PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,
-    PickerSelect,
+    BufferDirtyState, CaseMode, PickerFilters, PickerGrepNavigate, PickerGrepNavigateParams,
+    PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
+    PickerQueryParams, PickerSelect,
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
-    PickerViewParams,
+    PickerViewParams, ScopedPath,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
@@ -7329,6 +7329,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Files,
             reset: true,
             offset: 0,
@@ -7380,6 +7381,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Files,
             reset: true,
             offset: 0,
@@ -7398,6 +7400,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Files,
             query: "main".into(),
             generation: 1,
@@ -7435,6 +7438,7 @@ async fn picker_select_returns_absolute_path() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Files,
             reset: true,
             offset: 0,
@@ -7452,6 +7456,7 @@ async fn picker_select_returns_absolute_path() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Files,
             query: "lib".into(),
             generation: 1,
@@ -7500,6 +7505,7 @@ async fn picker_resume_centers_on_remembered_item() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Files,
             reset: true,
             offset: 0,
@@ -7518,6 +7524,7 @@ async fn picker_resume_centers_on_remembered_item() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Files,
             query: "rs".into(),
             generation: 1,
@@ -7539,6 +7546,7 @@ async fn picker_resume_centers_on_remembered_item() {
         &mut ws,
         13,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Files,
             reset: false,
             offset: 0,
@@ -7576,6 +7584,7 @@ async fn picker_reset_wipes_persisted_query() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Files,
             reset: true,
             offset: 0,
@@ -7593,6 +7602,7 @@ async fn picker_reset_wipes_persisted_query() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Files,
             query: "main".into(),
             generation: 1,
@@ -7614,6 +7624,7 @@ async fn picker_reset_wipes_persisted_query() {
         &mut ws,
         13,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Files,
             reset: true,
             offset: 0,
@@ -7713,6 +7724,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Buffers,
             reset: true,
             offset: 0,
@@ -7784,6 +7796,7 @@ async fn buffers_picker_select_returns_buffer_id() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Buffers,
             reset: true,
             offset: 0,
@@ -7893,6 +7906,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Buffers,
             reset: true,
             offset: 0,
@@ -8004,6 +8018,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
         &mut ws,
         4,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Buffers,
             reset: true,
             offset: 0,
@@ -8096,6 +8111,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
         &mut ws,
         4,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Buffers,
             reset: true,
             offset: 0,
@@ -8202,6 +8218,7 @@ async fn buffers_picker_pushes_on_save() {
         &mut ws,
         5,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Buffers,
             reset: true,
             offset: 0,
@@ -8278,6 +8295,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Buffers,
             reset: true,
             offset: 0,
@@ -8366,6 +8384,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
         &mut ws_b,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Buffers,
             reset: true,
             offset: 0,
@@ -9792,6 +9811,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: true,
             offset: 0,
@@ -9810,6 +9830,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Grep,
             query: "needle".into(),
             generation: 1,
@@ -9867,6 +9888,7 @@ async fn picker_grep_short_query_yields_empty_result() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: true,
             offset: 0,
@@ -9885,6 +9907,7 @@ async fn picker_grep_short_query_yields_empty_result() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Grep,
             query: "n".into(), // below MIN_QUERY_LEN
             generation: 1,
@@ -9911,6 +9934,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: true,
             offset: 0,
@@ -9929,6 +9953,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Grep,
             query: "needle".into(),
             generation: 1,
@@ -9953,6 +9978,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
         &mut ws,
         13,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: false,
             offset: 0,
@@ -9984,6 +10010,7 @@ async fn picker_grep_treats_query_as_regex() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: true,
             offset: 0,
@@ -10002,6 +10029,7 @@ async fn picker_grep_treats_query_as_regex() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Grep,
             query: "n.+dle".into(),
             generation: 1,
@@ -10028,6 +10056,7 @@ async fn picker_grep_caches_completed_query() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: true,
             offset: 0,
@@ -10046,6 +10075,7 @@ async fn picker_grep_caches_completed_query() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Grep,
             query: "needle".into(),
             generation: 1,
@@ -10062,6 +10092,7 @@ async fn picker_grep_caches_completed_query() {
         &mut ws,
         12,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Grep,
             query: "needle".into(),
             generation: 2,
@@ -10115,6 +10146,7 @@ async fn setup_grep_with_needle_query() -> (
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: true,
             offset: 0,
@@ -10132,6 +10164,7 @@ async fn setup_grep_with_needle_query() -> (
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Grep,
             query: "needle".into(),
             generation: 1,
@@ -10367,6 +10400,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
         &mut ws,
         22,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: false,
             offset: 0,
@@ -10395,6 +10429,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
         &mut ws,
         24,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: false,
             offset: 0,
@@ -10579,6 +10614,7 @@ async fn picker_explorer_default_lists_project_root() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -10628,6 +10664,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -10671,6 +10708,7 @@ async fn picker_explorer_query_filters_by_prefix() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -10689,6 +10727,7 @@ async fn picker_explorer_query_filters_by_prefix() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Explorer,
             query: "sr".into(),
             generation: 1,
@@ -10731,6 +10770,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -10749,6 +10789,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Explorer,
             query: "rc".into(),
             generation: 1,
@@ -10794,6 +10835,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
         &mut ws,
         2,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -10813,6 +10855,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
         &mut ws,
         3,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Explorer,
             query: "src".into(),
             generation: 1,
@@ -10835,6 +10878,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
         &mut ws,
         4,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Explorer,
             query: "src/".into(),
             generation: 2,
@@ -10868,6 +10912,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -10887,6 +10932,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Explorer,
             query: "sr".into(),
             generation: 1,
@@ -10903,6 +10949,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
         &mut ws,
         12,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Explorer,
             query: String::new(),
             generation: 2,
@@ -10929,6 +10976,7 @@ async fn picker_explorer_query_is_smartcase() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -10948,6 +10996,7 @@ async fn picker_explorer_query_is_smartcase() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Explorer,
             query: "re".into(),
             generation: 1,
@@ -10966,6 +11015,7 @@ async fn picker_explorer_query_is_smartcase() {
         &mut ws,
         12,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Explorer,
             query: "Re".into(),
             generation: 2,
@@ -10991,6 +11041,7 @@ async fn picker_explorer_select_file_returns_absolute_path() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -11040,6 +11091,7 @@ async fn picker_explorer_select_directory_errors() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -11084,6 +11136,7 @@ async fn picker_explorer_rejects_path_outside_project() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -11290,6 +11343,7 @@ async fn picker_explorer_resumes_last_directory() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -11317,6 +11371,7 @@ async fn picker_explorer_resumes_last_directory() {
         &mut ws,
         12,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: false,
             offset: 0,
@@ -11401,6 +11456,7 @@ async fn picker_explorer_tags_entries_with_git_status() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Explorer,
             reset: true,
             offset: 0,
@@ -11445,6 +11501,7 @@ async fn picker_files_tags_entries_with_git_status() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Files,
             reset: true,
             offset: 0,
@@ -11497,6 +11554,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
         &mut ws,
         10,
         &PickerViewParams {
+            filters: None,
             kind: PickerKind::Grep,
             reset: true,
             offset: 0,
@@ -11515,6 +11573,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
         &mut ws,
         11,
         &PickerQueryParams {
+            filters: Default::default(),
             kind: PickerKind::Grep,
             query: "foo[".into(),
             generation: 1,
@@ -14208,6 +14267,7 @@ async fn references_picker_lists_all_uses() {
             // Each open mints a fresh resolve; the initial push is empty + ticking, then the
             // spawned task pushes the resolved set with ticking: false.
             let view = send_request::<PickerView>(&mut ws, id, &PickerViewParams {
+                filters: None,
                 kind: PickerKind::References,
                 reset: true,
                 offset: 0,
@@ -14386,6 +14446,7 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
 
     // Open the diagnostics picker for this buffer.
     let _view = send_request::<PickerView>(&mut ws, 20, &PickerViewParams {
+        filters: None,
         kind: PickerKind::Diagnostics,
         reset: true,
         offset: 0,
@@ -14837,5 +14898,932 @@ async fn nav_goto_reopens_by_path() {
     let target = res.target.expect("goto should open the file");
     assert_eq!(target.path.as_deref().map(|p| p.ends_with("a.txt")), Some(true));
     assert_eq!(target.cursor.position, LogicalPosition { line: 2, col: 1 });
+    drop(server);
+}
+
+// -------- picker filters --------------------------------------------------------------------------
+
+/// Git-backed workspace exercising every grep filter. Contents (and their "needle" hits):
+///
+/// - `src/main.rs`   committed, clean — `needle();` + `needles();`        (2 smart-case hits)
+/// - `src/lib.rs`    committed, clean — `fn needle()` + `"a.b"` + `"axb"` (1 hit)
+/// - `README.md`     committed, clean — `Needle` + `needle`               (2 smart-case hits)
+/// - `changed.rs`    committed then modified — `needle changed`           (1 hit)
+/// - `new.rs`        untracked — `needle new`                             (1 hit)
+/// - `debug.log`     gitignored — `needle ignored`                        (only with +ignored)
+/// - `.hidden.rs`    committed, hidden — `needle hidden`                  (only with +hidden)
+///
+/// Baseline smart-case "needle" over the default walk: 7 hits.
+async fn setup_grep_filter_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let repo = git2::Repository::init(&root).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "fn main() {\n    needle();\n    needles();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "fn needle() {}\nlet pat = \"a.b\";\nlet other = \"axb\";\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("README.md"), "Needle in docs\nneedle again\n").unwrap();
+    std::fs::write(root.join("changed.rs"), "before\n").unwrap();
+    std::fs::write(root.join(".hidden.rs"), "needle hidden\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    let mut index = repo.index().unwrap();
+    for rel in [
+        "src/main.rs",
+        "src/lib.rs",
+        "README.md",
+        "changed.rs",
+        ".hidden.rs",
+        ".gitignore",
+    ] {
+        index.add_path(std::path::Path::new(rel)).unwrap();
+    }
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "t@e.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+    drop(tree);
+    drop(index);
+    drop(repo);
+
+    // Working-tree state after the commit.
+    std::fs::write(root.join("changed.rs"), "needle changed\n").unwrap(); // modified
+    std::fs::write(root.join("new.rs"), "needle new\n").unwrap(); // untracked
+    std::fs::write(root.join("debug.log"), "needle ignored\n").unwrap(); // gitignored
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+
+    // Open the grep picker once; individual tests drive it via picker/query.
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await; // initial empty push
+    (server, ws)
+}
+
+/// Send a grep query carrying `filters` and drain pushes until the matching generation's final
+/// (non-ticking) update arrives.
+async fn grep_with_filters(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    query: &str,
+    filters: PickerFilters,
+    generation: u64,
+) -> PickerUpdateParams {
+    let _: () = send_request::<PickerQuery>(
+        ws,
+        id,
+        &PickerQueryParams {
+            kind: PickerKind::Grep,
+            query: query.into(),
+            generation,
+            filters,
+        },
+    )
+    .await;
+    loop {
+        let params: PickerUpdateParams = expect_notification::<PickerUpdate>(ws).await;
+        if params.generation == generation && !params.ticking {
+            return params;
+        }
+    }
+}
+
+/// The relative paths hit by an update, deduplicated, in result order.
+fn grep_hit_files(update: &PickerUpdateParams) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in &update.items {
+        if let PickerItem::GrepHit { relative_path, .. } = item {
+            if out.last() != Some(relative_path) {
+                out.push(relative_path.clone());
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn grep_filter_baseline_smart_case() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    // All-lowercase query under smart case is case-insensitive: "Needle" in README counts.
+    let update = grep_with_filters(&mut ws, 10, "needle", PickerFilters::default(), 1).await;
+    assert_eq!(update.total_matches, 7, "files: {:?}", grep_hit_files(&update));
+    // An uppercase letter flips smart case to sensitive: only README's "Needle" matches.
+    let update = grep_with_filters(&mut ws, 11, "Needle", PickerFilters::default(), 2).await;
+    assert_eq!(update.total_matches, 1);
+    assert_eq!(grep_hit_files(&update), vec!["README.md"]);
+    drop(server);
+}
+
+#[tokio::test]
+async fn grep_filter_case_modes() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    // Sensitive: lowercase query no longer matches README's "Needle".
+    let filters = PickerFilters {
+        case: CaseMode::Sensitive,
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
+    assert_eq!(update.total_matches, 6);
+    // Insensitive: an all-caps query still matches everything.
+    let filters = PickerFilters {
+        case: CaseMode::Insensitive,
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 11, "NEEDLE", filters, 2).await;
+    assert_eq!(update.total_matches, 7);
+    drop(server);
+}
+
+#[tokio::test]
+async fn grep_filter_whole_word() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    let filters = PickerFilters {
+        whole_word: true,
+        ..Default::default()
+    };
+    // `needles();` in main.rs no longer matches.
+    let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
+    assert_eq!(update.total_matches, 6);
+    drop(server);
+}
+
+#[tokio::test]
+async fn grep_filter_fixed_string() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    // As a regex, `a.b` matches both `"a.b"` and `"axb"` in lib.rs.
+    let update = grep_with_filters(&mut ws, 10, "a.b", PickerFilters::default(), 1).await;
+    assert_eq!(update.total_matches, 2);
+    // As a literal, only `"a.b"`.
+    let filters = PickerFilters {
+        fixed_string: true,
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 11, "a.b", filters, 2).await;
+    assert_eq!(update.total_matches, 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn grep_filter_globs() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    // Include glob: only .rs files searched.
+    let filters = PickerFilters {
+        globs: vec!["*.rs".into()],
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
+    assert_eq!(update.total_matches, 5, "files: {:?}", grep_hit_files(&update));
+    assert!(!grep_hit_files(&update).contains(&"README.md".to_string()));
+    // Exclude glob: everything except .md files.
+    let filters = PickerFilters {
+        globs: vec!["!*.md".into()],
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 11, "needle", filters, 2).await;
+    assert_eq!(update.total_matches, 5);
+    // Include + exclude compose: .rs files outside src/.
+    let filters = PickerFilters {
+        globs: vec!["*.rs".into(), "!src/**".into()],
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 12, "needle", filters, 3).await;
+    assert_eq!(grep_hit_files(&update), vec!["changed.rs", "new.rs"]);
+    drop(server);
+}
+
+#[tokio::test]
+async fn grep_filter_directory_scope() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    let filters = PickerFilters {
+        directories: vec![ScopedPath {
+            path_index: 0,
+            relative_path: "src".into(),
+        }],
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
+    assert_eq!(update.total_matches, 3);
+    assert_eq!(grep_hit_files(&update), vec!["src/lib.rs", "src/main.rs"]);
+    // Multiple scopes are a union: adding a whole-root entry alongside src/ widens back to
+    // everything the unfiltered walk finds (the narrower scope doesn't subtract).
+    let filters = PickerFilters {
+        directories: vec![
+            ScopedPath {
+                path_index: 0,
+                relative_path: "src".into(),
+            },
+            ScopedPath {
+                path_index: 0,
+                relative_path: String::new(),
+            },
+        ],
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 11, "needle", filters, 2).await;
+    assert_eq!(
+        update.total_matches, 7,
+        "union with a whole-root scope matches the unfiltered walk"
+    );
+    drop(server);
+}
+
+/// Binary files (NUL bytes — archives like `.xlsx`) are skipped entirely, and hits on very
+/// long lines ship a *bounded* preview windowed around the match (a leading `…` marks the
+/// cut). Unbounded previews used to blow the websocket frame limit on minified files, and
+/// binary "lines" carried control bytes that corrupted the terminal.
+#[tokio::test]
+async fn grep_skips_binary_files_and_caps_long_line_previews() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    // A zip-like binary: magic + NULs early, with the query embedded in the raw bytes.
+    let mut binary = b"PK\x03\x04\x14\x00\x00\x00".to_vec();
+    binary.extend_from_slice(b"needle buried in zip bytes\x1b[31m");
+    binary.extend_from_slice(&[0u8; 64]);
+    std::fs::write(root.join("sheet.xlsx"), &binary).unwrap();
+    // A single-line "minified" file with the match deep inside.
+    let mut long = "x".repeat(5000);
+    long.push_str("needle");
+    long.push_str(&"y".repeat(5000));
+    std::fs::write(root.join("minified.js"), &long).unwrap();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let update = grep_with_filters(&mut ws, 10, "needle", PickerFilters::default(), 1).await;
+    // Only the text file hits — the binary is skipped, not searched as raw bytes.
+    assert_eq!(grep_hit_files(&update), vec!["minified.js"]);
+    assert_eq!(update.total_matches, 1);
+    match &update.items[0] {
+        PickerItem::GrepHit {
+            preview,
+            match_indices,
+            col,
+            ..
+        } => {
+            let chars: Vec<char> = preview.chars().collect();
+            assert!(
+                chars.len() <= 257,
+                "preview must be windowed, got {} chars",
+                chars.len()
+            );
+            assert_eq!(chars[0], '…', "deep match windows mark the left cut");
+            // The match indices land on the query text inside the window…
+            let shown: String = match_indices.iter().map(|&i| chars[i as usize]).collect();
+            assert_eq!(shown, "needle");
+            // …while `col` stays the real byte column in the file, for the jump.
+            assert_eq!(*col, 5000);
+        }
+        other => panic!("expected GrepHit, got {other:?}"),
+    }
+    drop(server);
+}
+
+/// Regression: a grep push flood + incoming requests must not deadlock the connection. The
+/// writer runs on its own task; before that split, request handlers ran inline on the same
+/// `select!` loop that drained the bounded outbound channel — a handler awaiting
+/// `outbound.send` on a *full* channel (search worker flooding `picker/update`s) parked
+/// forever, because the only drain lived in the select branch that was busy awaiting the
+/// handler. Symptom: the TUI froze waiting for a response that never came, with every thread
+/// idle. This test mimics the trigger — a huge result set streaming while "keystrokes" pile
+/// up unread — and asserts the last query still gets its response.
+#[tokio::test]
+async fn grep_flood_does_not_deadlock_request_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    // ~64k hits: 2000 lines × 32 matches of "ab" each → ~1000 streamed update pushes, far
+    // more than the outbound channel (64) + socket buffers can absorb while we don't read.
+    let line = "ab".repeat(32);
+    let body = vec![line; 2000].join("\n");
+    std::fs::write(root.join("flood.txt"), body).unwrap();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    // Fire a burst of queries *without reading anything back* — like a user typing while the
+    // first query's hits stream in. Each query's handler pushes an immediate update; with the
+    // shared-loop design one of these hit the full channel and froze the connection for good.
+    for (i, query) in ["ab", "ba", "ab", "ba", "ab"].iter().enumerate() {
+        let req = Request {
+            jsonrpc: JsonRpc,
+            id: 10 + i as u64,
+            method: "picker/query".into(),
+            params: Some(
+                serde_json::to_value(PickerQueryParams {
+                    kind: PickerKind::Grep,
+                    query: (*query).into(),
+                    generation: (i + 1) as u64,
+                    filters: PickerFilters::default(),
+                })
+                .unwrap(),
+            ),
+        };
+        ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+            .await
+            .unwrap();
+        // Give the search worker time to flood the outbound channel between keystrokes.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // Now drain. Every queued request must still get its response — a deadlocked connection
+    // never delivers the last one.
+    let last_id = 14;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let text = next_text(&mut ws).await;
+            if let Ok(ClientInbound::Response(r)) = serde_json::from_str::<ClientInbound>(&text) {
+                if r.id == last_id {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("connection deadlocked: response for the final query never arrived");
+    drop(server);
+}
+
+#[tokio::test]
+async fn grep_filter_changed_only() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    let filters = PickerFilters {
+        changed_only: true,
+        ..Default::default()
+    };
+    // Only the modified and untracked files — committed-clean hits drop out.
+    let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
+    assert_eq!(grep_hit_files(&update), vec!["changed.rs", "new.rs"]);
+    assert_eq!(update.total_matches, 2);
+    drop(server);
+}
+
+#[tokio::test]
+async fn grep_filter_include_ignored_and_hidden() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    // +ignored surfaces the gitignored debug.log hit.
+    let filters = PickerFilters {
+        include_ignored: true,
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
+    assert!(
+        grep_hit_files(&update).contains(&"debug.log".to_string()),
+        "files: {:?}",
+        grep_hit_files(&update)
+    );
+    assert_eq!(update.total_matches, 8);
+    // +hidden surfaces the dotfile hit (the ignored file stays excluded).
+    let filters = PickerFilters {
+        include_hidden: true,
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 11, "needle", filters, 2).await;
+    let files = grep_hit_files(&update);
+    assert!(files.contains(&".hidden.rs".to_string()), "files: {files:?}");
+    assert!(!files.contains(&"debug.log".to_string()), "files: {files:?}");
+    assert_eq!(update.total_matches, 8);
+    drop(server);
+}
+
+/// A filter change with an unchanged query must not be served from the completed-search cache —
+/// the candidates were produced under different filters.
+#[tokio::test]
+async fn grep_filter_change_invalidates_completed_search_cache() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    let update = grep_with_filters(&mut ws, 10, "needle", PickerFilters::default(), 1).await;
+    assert_eq!(update.total_matches, 7);
+    // Same query, narrower filters → fresh search, fewer hits.
+    let filters = PickerFilters {
+        globs: vec!["*.md".into()],
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 11, "needle", filters.clone(), 2).await;
+    assert_eq!(update.total_matches, 2);
+    // Same query and same filters again → cache hit is fine; same results either way.
+    let update = grep_with_filters(&mut ws, 12, "needle", filters, 3).await;
+    assert_eq!(update.total_matches, 2);
+    drop(server);
+}
+
+/// Filters persist across hide/resume like the query does, and are echoed by `picker/view` so a
+/// resuming client can rebuild its chip row. `reset: true` wipes them.
+#[tokio::test]
+async fn grep_filters_persist_across_hide_and_reset_wipes() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    let filters = PickerFilters {
+        whole_word: true,
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 10, "needle", filters.clone(), 1).await;
+    assert_eq!(update.total_matches, 6);
+
+    let _: () = send_request::<PickerHide>(
+        &mut ws,
+        11,
+        &PickerHideParams {
+            kind: PickerKind::Grep,
+        },
+    )
+    .await;
+
+    let resume: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        12,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: false,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    assert_eq!(resume.query, "needle");
+    assert_eq!(resume.filters, filters, "filters echo back on resume");
+    assert_eq!(resume.total_candidates, 6, "cached hits survive hide");
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let reset: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        13,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    assert!(reset.filters.is_default(), "reset wipes filters");
+    assert_eq!(reset.query, "");
+    drop(server);
+}
+
+/// `picker/view { filters }` replaces the persisted set and, for grep, drops the cached hits
+/// (they were produced under the old filters).
+#[tokio::test]
+async fn grep_view_with_filters_replaces_and_drops_stale_hits() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    let update = grep_with_filters(&mut ws, 10, "needle", PickerFilters::default(), 1).await;
+    assert_eq!(update.total_matches, 7);
+
+    let scoped = PickerFilters {
+        directories: vec![ScopedPath {
+            path_index: 0,
+            relative_path: "src".into(),
+        }],
+        ..Default::default()
+    };
+    let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        11,
+        &PickerViewParams {
+            filters: Some(scoped.clone()),
+            kind: PickerKind::Grep,
+            reset: false,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    assert_eq!(view.filters, scoped);
+    assert_eq!(
+        view.total_candidates, 0,
+        "stale hits dropped when filters change via view"
+    );
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    // Re-running the same query under the new filters yields the scoped result set.
+    let update = grep_with_filters(&mut ws, 12, "needle", scoped, 2).await;
+    assert_eq!(update.total_matches, 3);
+    drop(server);
+}
+
+/// Root scoping in a two-root project: a directory filter with an empty `relative_path`
+/// (there is no separate root filter) searches only that root.
+#[tokio::test]
+async fn grep_filter_root_scope() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let (root_a, root_b) = (dir_a.path().to_path_buf(), dir_b.path().to_path_buf());
+    std::fs::write(root_a.join("a.txt"), "needle in a\n").unwrap();
+    std::fs::write(root_b.join("b.txt"), "needle in b\n").unwrap();
+    std::mem::forget(dir_a);
+    std::mem::forget(dir_b);
+    let server = spawn_for_test("test-proj", vec![root_a, root_b]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let filters = PickerFilters {
+        directories: vec![ScopedPath {
+            path_index: 1,
+            relative_path: String::new(),
+        }],
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
+    assert_eq!(update.total_matches, 1);
+    match &update.items[0] {
+        PickerItem::GrepHit {
+            path_index,
+            relative_path,
+            ..
+        } => {
+            assert_eq!(*path_index, 1);
+            assert_eq!(relative_path, "b.txt");
+        }
+        other => panic!("expected GrepHit, got {other:?}"),
+    }
+    // Scopes in *different roots* union — the expressiveness globs can't reach (a glob is
+    // root-relative but applies across all roots; only a dir scope pins one).
+    let filters = PickerFilters {
+        directories: vec![
+            ScopedPath {
+                path_index: 0,
+                relative_path: String::new(),
+            },
+            ScopedPath {
+                path_index: 1,
+                relative_path: String::new(),
+            },
+        ],
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 11, "needle", filters, 2).await;
+    assert_eq!(update.total_matches, 2, "both roots' hits under a cross-root union");
+    drop(server);
+}
+
+/// Files-picker filters reuse the grep filter workspace: directory scope, globs, and
+/// changed-only are pure predicates over the cached walk (the walk itself still excludes
+/// hidden + ignored files, so those toggles aren't offered for Files).
+#[tokio::test]
+async fn files_picker_filters_narrow_candidates() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+
+    // Helper: send a files query with filters, return the final update for that generation.
+    async fn files_query(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        id: u64,
+        query: &str,
+        filters: PickerFilters,
+        generation: u64,
+    ) -> PickerUpdateParams {
+        let _: () = send_request::<PickerQuery>(
+            ws,
+            id,
+            &PickerQueryParams {
+                kind: PickerKind::Files,
+                query: query.into(),
+                generation,
+                filters,
+            },
+        )
+        .await;
+        loop {
+            let params: PickerUpdateParams = expect_notification::<PickerUpdate>(ws).await;
+            if params.generation == generation && !params.ticking {
+                return params;
+            }
+        }
+    }
+
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let first = expect_notification::<PickerUpdate>(&mut ws).await;
+    // Default walk: src/main.rs, src/lib.rs, README.md, changed.rs, new.rs (hidden + ignored
+    // files excluded at index time).
+    assert_eq!(first.total_matches, 5);
+
+    // Directory scope: only src/ files.
+    let filters = PickerFilters {
+        directories: vec![ScopedPath {
+            path_index: 0,
+            relative_path: "src".into(),
+        }],
+        ..Default::default()
+    };
+    let update = files_query(&mut ws, 11, "", filters, 1).await;
+    assert_eq!(update.total_matches, 2);
+
+    // Glob: .rs files only — composes with the fuzzy query.
+    let filters = PickerFilters {
+        globs: vec!["*.rs".into()],
+        ..Default::default()
+    };
+    let update = files_query(&mut ws, 12, "ma", filters.clone(), 2).await;
+    let names: Vec<&str> = update
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::File { relative_path, .. } => Some(relative_path.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"src/main.rs"), "items: {names:?}");
+    assert!(
+        !names.contains(&"README.md"),
+        "glob should drop README.md despite the fuzzy match: {names:?}"
+    );
+
+    // Changed-only: the modified + untracked files.
+    let filters = PickerFilters {
+        changed_only: true,
+        ..Default::default()
+    };
+    let update = files_query(&mut ws, 13, "", filters, 3).await;
+    let names: Vec<&str> = update
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::File { relative_path, .. } => Some(relative_path.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["changed.rs", "new.rs"]);
+
+    // Multiple dir scopes union: src/ plus the whole root widens back to the full walk (the
+    // narrower scope doesn't subtract).
+    let filters = PickerFilters {
+        directories: vec![
+            ScopedPath {
+                path_index: 0,
+                relative_path: "src".into(),
+            },
+            ScopedPath {
+                path_index: 0,
+                relative_path: String::new(),
+            },
+        ],
+        ..Default::default()
+    };
+    let update = files_query(&mut ws, 14, "", filters, 4).await;
+    assert_eq!(update.total_matches, 5);
+
+    drop(server);
+}
+
+/// Explorer filters: the listing shows hidden + ignored entries by default (colour-tagged), so
+/// its chips hide them; changed-only keeps changed entries and ancestors of changes.
+#[tokio::test]
+async fn explorer_filters_hide_and_changed_only() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+
+    async fn explorer_view(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        id: u64,
+        filters: Option<PickerFilters>,
+    ) -> PickerUpdateParams {
+        let _ = send_request::<PickerView>(
+            ws,
+            id,
+            &PickerViewParams {
+                filters,
+                kind: PickerKind::Explorer,
+                reset: false,
+                offset: 0,
+                limit: 50,
+                center_on: None,
+                center_on_cursor_grep_hit: None,
+                directory_path: None,
+                buffer_id: None,
+                explorer_roots: false,
+            },
+        )
+        .await;
+        expect_notification::<PickerUpdate>(ws).await
+    }
+
+    fn entry_names(update: &PickerUpdateParams) -> Vec<&str> {
+        update
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                PickerItem::DirEntry { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Default: everything in the root, dotfiles and the ignored log included.
+    let update = explorer_view(&mut ws, 10, None).await;
+    let names = entry_names(&update);
+    assert!(names.contains(&".hidden.rs"), "names: {names:?}");
+    assert!(names.contains(&"debug.log"), "names: {names:?}");
+
+    // Hide hidden: dotfiles drop out (including .gitignore); the ignored log stays.
+    let filters = PickerFilters {
+        hide_hidden: true,
+        ..Default::default()
+    };
+    let update = explorer_view(&mut ws, 11, Some(filters)).await;
+    let names = entry_names(&update);
+    assert!(!names.contains(&".hidden.rs"), "names: {names:?}");
+    assert!(!names.contains(&".gitignore"), "names: {names:?}");
+    assert!(names.contains(&"debug.log"), "names: {names:?}");
+
+    // Hide ignored: the log drops out; dotfiles return (filters were replaced whole).
+    let filters = PickerFilters {
+        hide_ignored: true,
+        ..Default::default()
+    };
+    let update = explorer_view(&mut ws, 12, Some(filters)).await;
+    let names = entry_names(&update);
+    assert!(!names.contains(&"debug.log"), "names: {names:?}");
+    assert!(names.contains(&".hidden.rs"), "names: {names:?}");
+
+    // Changed-only: changed/untracked files plus src/ (clean) is dropped; the ignored log is
+    // not "changed".
+    let filters = PickerFilters {
+        changed_only: true,
+        ..Default::default()
+    };
+    let update = explorer_view(&mut ws, 13, Some(filters)).await;
+    let names = entry_names(&update);
+    assert_eq!(names, vec!["changed.rs", "new.rs"], "names: {names:?}");
+
+    // Filters persist across re-views without an explicit set...
+    let update = explorer_view(&mut ws, 14, None).await;
+    assert_eq!(entry_names(&update), vec!["changed.rs", "new.rs"]);
+
+    // ...and a reset open clears them.
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        15,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Explorer,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert!(entry_names(&update).contains(&"src"), "reset restores the full listing");
+
     drop(server);
 }

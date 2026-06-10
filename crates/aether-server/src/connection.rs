@@ -61,6 +61,11 @@ use uuid::Uuid;
 
 const OUTBOUND_CHANNEL_CAPACITY: usize = 64;
 
+/// Capacity of the per-connection reply channel (responses + pongs). Requests are dispatched
+/// sequentially — at most one response is ever in flight — so this only needs headroom for
+/// interleaved pongs.
+const REPLY_CHANNEL_CAPACITY: usize = 8;
+
 /// Extracted from the WebSocket upgrade request's query string.
 #[derive(Default)]
 struct ConnectQuery {
@@ -146,32 +151,68 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
     let _outbound_tx = outbound_tx;
     let mut ctx = ConnectionCtx { client_id };
 
-    loop {
-        tokio::select! {
-            incoming = reader.next() => {
-                let Some(msg) = incoming else { break };
-                let msg = msg?;
-                match msg {
-                    Message::Text(text) => {
-                        if let Some(reply) = process_text(&text, &state, &mut ctx).await {
-                            writer.send(Message::text(reply)).await?;
+    // The writer is its OWN task, draining notifications and replies independently of request
+    // dispatch. This is load-bearing for deadlock-freedom: handlers run inline on the reader
+    // loop below and may themselves await `outbound.send(...)`. When the writer shared the
+    // reader's `select!`, a full outbound channel (e.g. a grep push flood) plus one incoming
+    // request was a permanent deadlock — the handler parked on `send` waiting for capacity,
+    // and the only drain lived in the other branch of the select that was busy awaiting the
+    // handler. With a dedicated writer the drain never stops, so a handler's push always
+    // completes and channel backpressure only ever slows the *producers* (the search worker),
+    // never request dispatch.
+    let (reply_tx, mut reply_rx) = mpsc::channel::<Message>(REPLY_CHANNEL_CAPACITY);
+    let writer_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                // Prefer replies: a response shouldn't queue behind a burst of pushes.
+                biased;
+                reply = reply_rx.recv() => {
+                    let Some(msg) = reply else { break };
+                    if writer.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                push = outbound_rx.recv() => {
+                    let Some(notif) = push else { break };
+                    let json = match serde_json::to_string(&notif) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to serialize notification");
+                            continue;
                         }
+                    };
+                    if writer.send(Message::text(json)).await.is_err() {
+                        break;
                     }
-                    Message::Binary(_) => {
-                        tracing::warn!("ignoring unexpected binary frame");
-                    }
-                    Message::Close(_) => break,
-                    Message::Ping(p) => writer.send(Message::Pong(p)).await?,
-                    Message::Pong(_) | Message::Frame(_) => {}
                 }
             }
-            push = outbound_rx.recv() => {
-                let Some(notif) = push else { continue };
-                let json = serde_json::to_string(&notif)?;
-                writer.send(Message::text(json)).await?;
+        }
+    });
+
+    loop {
+        let Some(msg) = reader.next().await else { break };
+        let msg = msg?;
+        match msg {
+            Message::Text(text) => {
+                if let Some(reply) = process_text(&text, &state, &mut ctx).await {
+                    if reply_tx.send(Message::text(reply)).await.is_err() {
+                        break; // writer gone — connection is dead
+                    }
+                }
             }
+            Message::Binary(_) => {
+                tracing::warn!("ignoring unexpected binary frame");
+            }
+            Message::Close(_) => break,
+            Message::Ping(p) => {
+                if reply_tx.send(Message::Pong(p)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Pong(_) | Message::Frame(_) => {}
         }
     }
+    writer_task.abort();
 
     {
         let mut s = state.lock().await;

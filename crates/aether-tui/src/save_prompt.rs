@@ -476,11 +476,11 @@ fn split_input(input: &str) -> (&str, &str) {
     }
 }
 
-fn dir_of_input(input: &str) -> &str {
+pub(crate) fn dir_of_input(input: &str) -> &str {
     split_input(input).0
 }
 
-fn partial_of_input(input: &str) -> &str {
+pub(crate) fn partial_of_input(input: &str) -> &str {
     split_input(input).1
 }
 
@@ -491,7 +491,7 @@ fn partial_of_input(input: &str) -> &str {
 ///   "src/"             → ""
 ///   "src/foo"          → "src/"
 ///   "src"              → ""
-fn pop_segment(input: &str) -> String {
+pub(crate) fn pop_segment(input: &str) -> String {
     if input.is_empty() {
         return String::new();
     }
@@ -511,7 +511,7 @@ fn pop_segment(input: &str) -> String {
 }
 
 /// Resolve `dir_part` (project-relative, possibly with trailing `/`) under the chosen root.
-fn join_root_relative(project_paths: &[String], path_index: u32, dir_part: &str) -> String {
+pub(crate) fn join_root_relative(project_paths: &[String], path_index: u32, dir_part: &str) -> String {
     let Some(root) = project_paths.get(path_index as usize) else {
         return String::new();
     };
