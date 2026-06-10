@@ -37,6 +37,13 @@ pub struct BufferOpenParams {
     /// col to the line's end). Used by the grep picker to open + jump in one round trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump_to: Option<LogicalPosition>,
+    /// Transient-buffer intent. `Some(true)`: if this open *creates* the buffer, mark it
+    /// transient — the server closes it automatically once no viewport shows it anymore, unless
+    /// it's been promoted first (an existing buffer is never demoted). `Some(false)`: promote the
+    /// buffer to permanent. `None` (the default): leave the flag as it is. Buffers are also
+    /// promoted by their first edit, a save, or a user-initiated reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,6 +78,10 @@ pub struct BufferOpenResult {
     /// health (servers are keyed by `(language, workspace_root)`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp_server: Option<crate::lsp::LspServerRef>,
+    /// True while the buffer is transient (auto-closes once hidden — see
+    /// [`BufferOpenParams::transient`]). Promotion mid-session is pushed via `buffer/state`.
+    #[serde(default)]
+    pub transient: bool,
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------
@@ -246,4 +257,9 @@ pub struct BufferStateParams {
     /// recreates the file) or by the file being recreated externally.
     #[serde(default)]
     pub externally_deleted: bool,
+    /// True while the buffer is transient (auto-closes once hidden). Flips to false when the
+    /// buffer is promoted — by its first edit, a save, a user-initiated reload, or an explicit
+    /// `buffer/open { transient: false }`.
+    #[serde(default)]
+    pub transient: bool,
 }

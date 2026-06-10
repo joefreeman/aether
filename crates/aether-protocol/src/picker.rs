@@ -141,6 +141,10 @@ pub enum PickerItem {
         /// Indices into `display` (char offsets) covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
+        /// True while the buffer is transient (auto-closes once hidden) — rendered in italics.
+        /// Captured at row-build time, like `status`; an active picker re-pushes on changes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        transient: bool,
     },
     /// One match found by the grep picker. Identity is `(path_index, relative_path, line, col)`.
     /// One row per match (a line with N matches produces N hits) — keeps `match_indices` a flat

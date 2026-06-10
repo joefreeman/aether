@@ -293,6 +293,9 @@ class Editor {
   private savedRevision = 0;
   private externallyModified = false;
   private externallyDeleted = false;
+  /** Buffer auto-closes once hidden (server flag). Shown by italicising the status-bar label;
+   *  promoted to permanent by the first edit, a save, or a reload. */
+  private transient = false;
   private diffView = false;
   // LSP: this buffer's server key, statuses by (language, workspace_root), and diagnostic counts.
   private lspServerRef: LspServerRef | null = null;
@@ -469,7 +472,13 @@ class Editor {
       this.projectName = activated.project.name;
       this.projectPaths = activated.project.paths;
 
-      const lastOrScratch = { buffer_id: activated.last_buffer_id ?? null, create_if_missing: false };
+      // A freshly-spawned placeholder scratch is transient (it auto-closes once a real buffer
+      // replaces it); reattaching to the project's last buffer leaves its flag alone.
+      const lastOrScratch: BufferOpenParams = {
+        buffer_id: activated.last_buffer_id ?? null,
+        create_if_missing: false,
+        ...(activated.last_buffer_id == null ? { transient: true } : {}),
+      };
       let open: BufferOpenResult;
       if (urlFile) {
         try {
@@ -570,6 +579,9 @@ class Editor {
     try {
       await this.client.rpc<ProjectActivateResult>("project/activate", { name: this.projectName });
       const params = this.currentPath ? this.resolvePath(this.currentPath) : null;
+      // A transient buffer was orphaned (and closed) by the disconnect — reopen it as the
+      // preview it was, rather than silently promoting it.
+      if (params && this.transient) params.transient = true;
       let open: BufferOpenResult;
       try {
         open = await this.client.rpc<BufferOpenResult>(
@@ -577,8 +589,12 @@ class Editor {
           params ?? { buffer_id: this.bufferId, create_if_missing: false },
         );
       } catch {
-        // The buffer is gone (server restarted) — fall back to a scratch buffer.
-        open = await this.client.rpc<BufferOpenResult>("buffer/open", { create_if_missing: false });
+        // The buffer is gone (server restarted) — fall back to a scratch buffer. Transient, like
+        // any auto-spawned placeholder.
+        open = await this.client.rpc<BufferOpenResult>("buffer/open", {
+          create_if_missing: false,
+          transient: true,
+        });
       }
       this.adoptOpenedBuffer(open);
       this.recomputeGrid();
@@ -767,7 +783,13 @@ class Editor {
       charBudget(this.statusEl.clientWidth * 0.5, `${barStyle.fontSize} ${barStyle.fontFamily}`) -
         [...proj].length,
     );
-    left.append(`${proj}${truncatePath(this.label, undefined, labelBudget).display}`);
+    // A transient (preview) buffer slants the file label (not the project name) instead of a
+    // marker — mirrors the TUI status bar's italics.
+    left.append(proj);
+    const name = document.createElement("span");
+    if (this.transient) name.className = "status-transient";
+    name.append(truncatePath(this.label, undefined, labelBudget).display);
+    left.append(name);
     // Git cluster next to the file label (tracked files only): `⎇  branch  [base]  +u(s) ~u(s)`,
     // where each per-class count combines the unstaged count with the staged count in parens (each
     // omitted when zero). (Diagnostics live on the right.)
@@ -1150,7 +1172,11 @@ class Editor {
       const a = await this.client.rpc<ProjectActivateResult>("project/create", { name });
       this.projectName = a.project.name;
       this.projectPaths = a.project.paths;
-      await this.switchBuffer({ buffer_id: a.last_buffer_id ?? null, create_if_missing: false });
+      await this.switchBuffer({
+        buffer_id: a.last_buffer_id ?? null,
+        create_if_missing: false,
+        ...(a.last_buffer_id == null ? { transient: true } : {}),
+      });
     });
   }
 
@@ -1172,10 +1198,15 @@ class Editor {
     let jumpTo: LogicalPosition | null = null;
     if (result.kind === "file") {
       params = this.resolvePath(result.path);
+      // Picker-driven file opens are previews: transient until edited or pinned (Space r).
+      if (params) params.transient = true;
     } else if (result.kind === "file_at") {
       params = this.resolvePath(result.path);
       jumpTo = result.position;
-      if (params) params.jump_to = result.position;
+      if (params) {
+        params.jump_to = result.position;
+        params.transient = true;
+      }
     } else if (result.kind === "buffer") {
       params = { buffer_id: result.buffer_id, create_if_missing: false };
     }
@@ -1206,7 +1237,12 @@ class Editor {
     const activated = await this.client.rpc<ProjectActivateResult>("project/activate", { name });
     this.projectName = activated.project.name;
     this.projectPaths = activated.project.paths;
-    await this.switchBuffer({ buffer_id: activated.last_buffer_id ?? null, create_if_missing: false });
+    await this.switchBuffer({
+      buffer_id: activated.last_buffer_id ?? null,
+      create_if_missing: false,
+      // First visit spawns a placeholder scratch — transient, like the bootstrap one.
+      ...(activated.last_buffer_id == null ? { transient: true } : {}),
+    });
   }
 
   /** Map an absolute path to a project-relative (path_index, relative_path) the server accepts. */
@@ -1240,6 +1276,7 @@ class Editor {
     this.blame = null;
     this.lspServerRef = open.lsp_server ?? null;
     this.diagCounts = null;
+    this.transient = open.transient ?? false;
   }
 
   // ---- browser history (the jump list) --------------------------------------------------------
@@ -1745,6 +1782,7 @@ class Editor {
           const params = this.resolvePath(target.path);
           if (params) {
             params.jump_to = target.position;
+            params.transient = true;
             await this.switchBuffer(params, { recordJump: true, reveal: "center" });
             // Prime the buffer's search with the grep query so n / Alt-n continue from here.
             if (target.query) {
@@ -1780,6 +1818,7 @@ class Editor {
           const params = this.resolvePath(r.location.path);
           if (params) {
             params.jump_to = r.location.position;
+            params.transient = true;
             await this.switchBuffer(params, { recordJump: true });
           } else {
             this.setStatus(`definition outside project: ${r.location.path}`, true);
@@ -2084,6 +2123,9 @@ class Editor {
       this.savedRevision = r.revision;
       this.externallyModified = false;
       this.externallyDeleted = false;
+      // Reloading promotes a transient buffer server-side (a keep signal, like save); mirror
+      // the flag locally without waiting for the buffer/state push.
+      this.transient = false;
       this.toast(`reloaded (rev ${r.revision})`, "success");
     };
     try {
@@ -2789,6 +2831,7 @@ class Editor {
         this.savedRevision = p.saved_revision;
         this.externallyModified = p.externally_modified ?? false;
         this.externallyDeleted = p.externally_deleted ?? false;
+        this.transient = p.transient ?? false;
         if (!wasExternal && this.externallyDeleted) {
           this.toast("file removed on disk — save to recreate, or close", "warning");
         } else if (!wasExternal && this.externallyModified) {

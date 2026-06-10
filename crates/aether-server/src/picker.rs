@@ -32,6 +32,8 @@ pub struct BufferCandidate {
     /// Project-relative location (root index + path) when the buffer is a file inside a root;
     /// `None` for scratch buffers / out-of-root files. Sent so the client can build an opener URL.
     pub path: Option<(u32, String)>,
+    /// Buffer is transient (auto-closes once hidden) — the row renders in italics.
+    pub transient: bool,
 }
 
 /// One project-picker candidate. Built fresh per `picker/view` from
@@ -268,6 +270,7 @@ impl PickerCandidates {
                     path_index: c.path.as_ref().map(|(i, _)| *i),
                     relative_path: c.path.as_ref().map(|(_, r)| r.clone()),
                     match_indices,
+                    transient: c.transient,
                 }
             }
             PickerCandidates::Grep(v) => {

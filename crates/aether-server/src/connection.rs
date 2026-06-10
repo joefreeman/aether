@@ -214,10 +214,19 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
     }
     writer_task.abort();
 
-    {
+    let pushes = {
         let mut s = state.lock().await;
         s.clients.remove(&client_id);
+        // Buffers this client was showing: once its viewports are gone, any transient among
+        // them that no other client shows is orphaned and gets closed.
+        let viewed: Vec<aether_protocol::BufferId> = s
+            .viewports
+            .values()
+            .filter(|v| v.client_id == client_id)
+            .map(|v| v.buffer_id)
+            .collect();
         s.drop_viewports_for_client(client_id);
+        let (closed, _stopped) = s.close_orphaned_transients(viewed);
         s.drop_cursors_for_client(client_id);
         s.drop_motion_history_for_client(client_id);
         s.drop_virtual_col_for_client(client_id);
@@ -227,6 +236,15 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_pickers_for_client(client_id);
         s.drop_nav_history_for_client(client_id);
         tracing::debug!(%client_id, "client session removed");
+        // Other clients' buffer pickers should drop the closed transients from their lists.
+        if closed.is_empty() {
+            Vec::new()
+        } else {
+            crate::handlers::refresh_buffer_pickers(&mut s)
+        }
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
     }
     Ok(())
 }

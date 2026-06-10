@@ -462,6 +462,7 @@ fn input_surround_params() {
 #[test]
 fn buffer_open_result_shape() {
     let v = to_value(BufferOpenResult {
+        transient: false,
         buffer_id: 42,
         language: Some("rust".into()),
         line_count: 100,
@@ -494,6 +495,7 @@ fn buffer_open_result_shape() {
 fn buffer_open_result_restored_scroll() {
     use aether_protocol::viewport::ScrollPosition;
     let v = to_value(BufferOpenResult {
+        transient: false,
         buffer_id: 42,
         language: None,
         line_count: 1,
@@ -969,6 +971,7 @@ fn project_activate_result_includes_last_buffer_id_when_set() {
 fn buffer_open_scratch_form() {
     // Both path_index and relative_path null => scratch buffer per §6.1.
     let v = to_value(BufferOpenParams {
+        transient: None,
         buffer_id: None,
         path_index: None,
         relative_path: None,
@@ -1297,6 +1300,7 @@ fn picker_item_buffer_is_tagged() {
         path_index: Some(0),
         relative_path: Some("src/main.rs".into()),
         match_indices: vec![0, 4],
+        transient: true,
     };
     let v = to_value(&item).unwrap();
     assert_eq!(
@@ -1309,10 +1313,12 @@ fn picker_item_buffer_is_tagged() {
             "path_index": 0,
             "relative_path": "src/main.rs",
             "match_indices": [0, 4],
+            "transient": true,
         })
     );
 
-    // Scratch buffer: no path → both fields skipped; clean status → `status` skipped too.
+    // Scratch buffer: no path → both fields skipped; clean status → `status` skipped too;
+    // permanent → `transient` skipped (the common case).
     let scratch = PickerItem::Buffer {
         buffer_id: 9,
         display: "(scratch 1)".into(),
@@ -1320,11 +1326,13 @@ fn picker_item_buffer_is_tagged() {
         path_index: None,
         relative_path: None,
         match_indices: vec![],
+        transient: false,
     };
     let sv = to_value(&scratch).unwrap();
     assert!(sv.get("status").is_none(), "clean buffer omits status");
     assert!(sv.get("path_index").is_none(), "scratch buffer omits path_index");
     assert!(sv.get("relative_path").is_none(), "scratch buffer omits relative_path");
+    assert!(sv.get("transient").is_none(), "permanent buffer omits transient");
 
     // A clean status absent on the wire deserializes back to `Clean` (serde default).
     let back: PickerItem = from_value(json!({
@@ -1667,6 +1675,7 @@ fn picker_view_result_filters_serialized_when_non_default() {
 fn buffer_open_params_buffer_id_skipped_when_none() {
     use aether_protocol::buffer::BufferOpenParams;
     let p = BufferOpenParams {
+        transient: None,
         buffer_id: None,
         path_index: Some(0),
         relative_path: Some("x".into()),
@@ -1683,6 +1692,7 @@ fn buffer_open_params_buffer_id_skipped_when_none() {
 fn buffer_open_params_buffer_id_round_trips() {
     use aether_protocol::buffer::BufferOpenParams;
     let p = BufferOpenParams {
+        transient: None,
         buffer_id: Some(11),
         path_index: None,
         relative_path: None,
@@ -1698,6 +1708,7 @@ fn buffer_open_params_buffer_id_round_trips() {
 fn buffer_open_params_jump_to_skipped_when_none() {
     use aether_protocol::buffer::BufferOpenParams;
     let p = BufferOpenParams {
+        transient: None,
         buffer_id: None,
         path_index: Some(0),
         relative_path: Some("x".into()),
@@ -1713,6 +1724,7 @@ fn buffer_open_params_jump_to_skipped_when_none() {
 fn buffer_open_params_jump_to_round_trips() {
     use aether_protocol::buffer::BufferOpenParams;
     let p = BufferOpenParams {
+        transient: None,
         buffer_id: None,
         path_index: Some(0),
         relative_path: Some("x".into()),
@@ -1745,6 +1757,7 @@ fn buffer_state_params_external_flags_default_false_when_missing() {
 fn buffer_state_params_external_flags_round_trip() {
     use aether_protocol::buffer::BufferStateParams;
     let p = BufferStateParams {
+        transient: false,
         buffer_id: 5,
         saved_revision: 7,
         saved_at_unix_ms: Some(123),
@@ -1757,6 +1770,66 @@ fn buffer_state_params_external_flags_round_trip() {
     let p2: BufferStateParams = from_value(v).unwrap();
     assert!(p2.externally_modified);
     assert!(!p2.externally_deleted);
+}
+
+// ---- transient buffers ---------------------------------------------------------------------
+
+/// `BufferOpenParams.transient` is a three-state intent: omitted = leave as-is, `true` =
+/// transient-if-created, `false` = pin. Pin the skip-when-None shape and the round trip.
+#[test]
+fn buffer_open_params_transient_shape() {
+    use aether_protocol::buffer::BufferOpenParams;
+    let mut p = BufferOpenParams {
+        transient: None,
+        buffer_id: None,
+        path_index: Some(0),
+        relative_path: Some("x".into()),
+        language: None,
+        create_if_missing: false,
+        jump_to: None,
+    };
+    let v = to_value(&p).unwrap();
+    assert!(v.get("transient").is_none(), "transient: None should be skipped");
+
+    p.transient = Some(true);
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["transient"], true);
+    let p2: BufferOpenParams = from_value(v).unwrap();
+    assert_eq!(p2.transient, Some(true));
+
+    // Missing on the wire deserialises as None (older clients).
+    let p3: BufferOpenParams =
+        from_value(json!({"path_index": 0, "relative_path": "x"})).unwrap();
+    assert_eq!(p3.transient, None);
+}
+
+/// `transient` defaults to false when missing in `BufferOpenResult` and `BufferStateParams`,
+/// and round-trips when set.
+#[test]
+fn transient_flag_defaults_false_in_result_and_state() {
+    use aether_protocol::buffer::{BufferOpenResult, BufferStateParams};
+    let r: BufferOpenResult = from_value(json!({
+        "buffer_id": 1,
+        "language": null,
+        "line_count": 1,
+        "byte_count": 0,
+        "revision": 0,
+        "saved_revision": 0,
+        "path": null
+    }))
+    .unwrap();
+    assert!(!r.transient);
+
+    let s: BufferStateParams = from_value(json!({
+        "buffer_id": 5,
+        "saved_revision": 7,
+        "saved_at_unix_ms": null,
+        "transient": true
+    }))
+    .unwrap();
+    assert!(s.transient);
+    let v = to_value(&s).unwrap();
+    assert_eq!(v["transient"], true);
 }
 
 #[test]

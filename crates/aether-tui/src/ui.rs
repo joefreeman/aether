@@ -2376,21 +2376,24 @@ fn picker_item_spans(
 
     // Trailing buffer-state dot — matches the status bar's colour-coded indicator. Goes after the
     // display so it doesn't shift `match_indices` (which index into the display). `None` = clean.
-    let (display_raw, match_indices, dot_color) = match item {
+    let (display_raw, match_indices, dot_color, italic) = match item {
         PickerItem::Buffer {
             display,
             status,
             match_indices,
+            transient,
             ..
         } => (
             display.as_str(),
             match_indices.as_slice(),
             buffer_dirty_dot_color(*status),
+            // Transient buffers slant, like the status-bar label.
+            *transient,
         ),
         PickerItem::Project {
             name,
             match_indices,
-        } => (name.as_str(), match_indices.as_slice(), None),
+        } => (name.as_str(), match_indices.as_slice(), None, false),
         PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
         | PickerItem::DirEntry { .. }
@@ -2398,6 +2401,14 @@ fn picker_item_spans(
         | PickerItem::Diagnostic { .. }
         | PickerItem::LspServer { .. }
         | PickerItem::Reference { .. } => unreachable!("handled above"),
+    };
+    let (base, match_style) = if italic {
+        (
+            base.add_modifier(Modifier::ITALIC),
+            match_style.add_modifier(Modifier::ITALIC),
+        )
+    } else {
+        (base, match_style)
     };
 
     // The dot renders as ` •` (leading space + glyph) — reserve its width so the path truncates
@@ -4009,7 +4020,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // left of the position. When the row is narrow we truncate the right edge of the left
         // segment with `…` so the right segment stays whole and the position never gets
         // painted over.
-        let left_pre = format!("[{}] {}", state.project_name, state.ed().file_label);
+        let project_prefix = format!("[{}] ", state.project_name);
         // Buffer-state dot just after the file label — colour-coded (unsaved / changed / deleted
         // on disk), matching the web client's favicon colours.
         let status_dot = state.buffer_status().map(|kind| {
@@ -4055,7 +4066,9 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         }
 
         Line::from(build_editor_status_spans(
-            &left_pre,
+            &project_prefix,
+            &state.ed().file_label,
+            state.ed().transient,
             status_dot,
             git_spans,
             &state.status,
@@ -4190,7 +4203,9 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
 ///   - if even `left_pre` can't fit, that gets truncated and the status is dropped entirely.
 /// The right segment is never truncated — the cursor position is more useful than the message.
 fn build_editor_status_spans(
-    left_pre: &str,
+    project_prefix: &str,
+    file_label: &str,
+    transient: bool,
     status_dot: Option<Span<'static>>,
     left_badges: Vec<Span<'static>>,
     status: &crate::app::StatusMessage,
@@ -4198,6 +4213,14 @@ fn build_editor_status_spans(
     total_width: usize,
 ) -> Vec<Span<'static>> {
     let base_style = Style::default().bg(NORD1).fg(NORD4);
+    // A transient (preview) buffer slants the file label (root + path — not the project name)
+    // instead of spending row width on an explicit marker. Terminals without italic support
+    // just show it upright.
+    let label_style = if transient {
+        base_style.add_modifier(Modifier::ITALIC)
+    } else {
+        base_style
+    };
     // The right segment (counters / diagnostics / position / LSP glyph) is pre-built by the caller,
     // already including its internal gaps and the glyph's edge padding.
     let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
@@ -4217,15 +4240,24 @@ fn build_editor_status_spans(
         }
     }
     let pre_budget = left_max.saturating_sub(used);
-    if left_pre.width() >= pre_budget {
-        // Even the project/file segment overflows — shrink it (segment elision keeps the
-        // filename end visible; the old right-cut lost exactly that) and drop the rest.
-        let (t, _) = truncate_path_with_indices(left_pre, &[], pre_budget);
-        used += t.width();
-        spans.push(Span::styled(t, base_style));
+    if project_prefix.width() + file_label.width() >= pre_budget {
+        // Even the project/file segment overflows. The file label is the informative part, so
+        // it gets the budget first (segment elision keeps the filename end visible); the
+        // project prefix is shown only if it still fits whole — a partially-cut `[pr…` is
+        // noise. The rest (badges, status) is dropped.
+        let (t, _) = truncate_path_with_indices(file_label, &[], pre_budget);
+        let prefix = if project_prefix.width() + t.width() <= pre_budget {
+            project_prefix.to_string()
+        } else {
+            String::new()
+        };
+        used += prefix.width() + t.width();
+        spans.push(Span::styled(prefix, base_style));
+        spans.push(Span::styled(t, label_style));
     } else {
-        spans.push(Span::styled(left_pre.to_string(), base_style));
-        used += left_pre.width();
+        spans.push(Span::styled(project_prefix.to_string(), base_style));
+        spans.push(Span::styled(file_label.to_string(), label_style));
+        used += project_prefix.width() + file_label.width();
         // Git cluster sits after the file label, set off by a 3-space gap.
         let badge_w: usize = left_badges.iter().map(|s| s.content.width()).sum();
         if badge_w > 0 && used + 3 + badge_w <= left_max {
@@ -5427,11 +5459,29 @@ mod tests {
     #[test]
     fn editor_status_spans_no_status_pads_to_right_edge() {
         let status = crate::app::StatusMessage::default();
-        let spans = build_editor_status_spans("[proj] file.rs", None, Vec::new(), &status, vec![Span::raw("12:5")],30);
+        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![Span::raw("12:5")],30);
         let text = spans_text(&spans);
         assert!(text.starts_with("[proj] file.rs"));
         assert!(text.ends_with("12:5"));
         assert_eq!(spans_total_width(&spans), 30);
+    }
+
+    /// A transient buffer italicises the project/file segment (no explicit marker text); a
+    /// permanent one doesn't.
+    #[test]
+    fn editor_status_spans_italicise_transient_label() {
+        let status = crate::app::StatusMessage::default();
+        let spans = build_editor_status_spans("[proj] ", "file.rs", true, None, Vec::new(), &status, vec![], 30);
+        let label = spans
+            .iter()
+            .find(|s| s.content.contains("file.rs"))
+            .expect("label span present");
+        assert!(label.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(!spans_text(&spans).contains("transient"), "no marker text");
+
+        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![], 30);
+        let label = spans.iter().find(|s| s.content.contains("file.rs")).unwrap();
+        assert!(!label.style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
@@ -5442,7 +5492,7 @@ mod tests {
             Style::default().fg(buffer_status_color(BufferStatusKind::Unsaved)),
         );
         let spans =
-            build_editor_status_spans("[proj] file.rs", Some(dot), Vec::new(), &status, vec![], 30);
+            build_editor_status_spans("[proj] ", "file.rs", false, Some(dot), Vec::new(), &status, vec![], 30);
         // The dot leads the row, before the project name, in the unsaved (frost-blue) colour.
         let text = spans_text(&spans);
         assert!(text.starts_with(&format!("{BUFFER_STATUS_DOT} [proj] file.rs")));
@@ -5457,7 +5507,7 @@ mod tests {
     #[test]
     fn editor_status_spans_renders_status_with_color() {
         let status = crate::app::StatusMessage::success("saved (rev 1)");
-        let spans = build_editor_status_spans("[proj] file.rs", None, Vec::new(), &status, vec![Span::raw("12:5")],60);
+        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![Span::raw("12:5")],60);
         // Status text should appear, sandwiched between the left bit and the padding/right.
         let text = spans_text(&spans);
         assert!(text.contains("[proj] file.rs"));
@@ -5476,7 +5526,7 @@ mod tests {
         // total=30, right="12:5" (4) + gap(1) = 5 reserved; left_max=25. left_pre="[proj] file.rs" (14)
         // + separator(4) = 18 used. Status budget = 25 - 18 = 7. So a long status truncates.
         let status = crate::app::StatusMessage::info("a much longer status message");
-        let spans = build_editor_status_spans("[proj] file.rs", None, Vec::new(), &status, vec![Span::raw("12:5")],30);
+        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![Span::raw("12:5")],30);
         let status_span = spans
             .iter()
             .find(|s| s.style.fg == Some(NORD4) && s.content.contains('…'))
@@ -5489,19 +5539,40 @@ mod tests {
 
     #[test]
     fn editor_status_spans_drops_status_when_left_pre_alone_overflows() {
-        // total=12, right=4, gap=1 → left_max=7. left_pre="[proj] file.rs" (14) > 7, so it
-        // gets truncated and the status is dropped entirely.
+        // total=12, right=4, gap=1 → left_max=7. "[proj] file.rs" (14) > 7: the file label gets
+        // the budget (and fits exactly), the project prefix — which can't fit whole alongside it
+        // — is dropped, and the status is dropped entirely.
         let status = crate::app::StatusMessage::error("save failed: disk full");
-        let spans = build_editor_status_spans("[proj] file.rs", None, Vec::new(), &status, vec![Span::raw("12:5")],12);
+        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![Span::raw("12:5")],12);
         let text = spans_text(&spans);
         // No part of the status text should make it into the rendered line.
         assert!(
             !text.contains("save failed"),
             "status should have been dropped: {text:?}"
         );
-        assert!(text.contains('…'));
+        assert!(text.starts_with("file.rs"), "label survives, prefix dropped: {text:?}");
         assert!(text.ends_with("12:5"));
         assert_eq!(spans_total_width(&spans), 12);
+    }
+
+    /// A long path elides (keeping the filename end) when the label alone overflows the row.
+    #[test]
+    fn editor_status_spans_elides_long_label() {
+        let status = crate::app::StatusMessage::default();
+        let spans = build_editor_status_spans(
+            "[proj] ",
+            "src/deeply/nested/module/file.rs",
+            false,
+            None,
+            Vec::new(),
+            &status,
+            vec![Span::raw("12:5")],
+            25,
+        );
+        let text = spans_text(&spans);
+        assert!(text.contains('…'));
+        assert!(text.contains("file.rs"), "filename end survives elision: {text:?}");
+        assert_eq!(spans_total_width(&spans), 25);
     }
 
     fn dspan(start: u32, end: u32, severity: DiagnosticSeverity) -> DiagnosticSpan {

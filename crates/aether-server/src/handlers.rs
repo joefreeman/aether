@@ -725,6 +725,7 @@ pub async fn buffer_open(
         let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
         let cursor = resolve_open_cursor(&mut s, client_id, buffer_id, clamped_jump);
         let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, buffer_id)).copied());
+        let mut pushes = pin_buffer_if_requested(&mut s, buffer_id, params.transient);
         let result = BufferOpenResult {
             buffer_id,
             language,
@@ -737,9 +738,10 @@ pub async fn buffer_open(
             cursor,
             scroll,
             lsp_server: buffer_lsp_server_ref(&s, buffer_id),
+            transient: s.buffers[&buffer_id].transient,
         };
         s.touch_mru(buffer_id);
-        let pushes = refresh_buffer_pickers(&mut s);
+        pushes.extend(refresh_buffer_pickers(&mut s));
         drop(s);
         for (sender, notif) in pushes {
             let _ = sender.send(notif).await;
@@ -752,7 +754,8 @@ pub async fn buffer_open(
             let mut s = state.lock().await;
             let id = s.allocate_buffer_id();
             let scratch_number = s.next_scratch_number(&active_project_name);
-            let buf = Buffer::scratch(id, params.language.clone(), scratch_number);
+            let mut buf = Buffer::scratch(id, params.language.clone(), scratch_number);
+            buf.transient = params.transient == Some(true);
             let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
             let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump);
             let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, id)).copied());
@@ -768,6 +771,7 @@ pub async fn buffer_open(
                 cursor,
                 scroll,
                 lsp_server: None, // scratch buffers are never language-server-backed
+                transient: buf.transient,
             };
             s.buffers.insert(id, buf);
             s.buffer_projects.insert(id, active_project_name.clone());
@@ -855,6 +859,7 @@ pub async fn buffer_open(
                 None => cursor,
             };
             let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, existing)).copied());
+            let mut pushes = pin_buffer_if_requested(&mut s, existing, params.transient);
             let result = BufferOpenResult {
                 buffer_id: existing,
                 language,
@@ -867,9 +872,10 @@ pub async fn buffer_open(
                 cursor,
                 scroll,
                 lsp_server: buffer_lsp_server_ref(&s, existing),
+                transient: s.buffers[&existing].transient,
             };
             s.touch_mru(existing);
-            let pushes = refresh_buffer_pickers(&mut s);
+            pushes.extend(refresh_buffer_pickers(&mut s));
             drop(s);
             for (sender, notif) in pushes {
                 let _ = sender.send(notif).await;
@@ -880,12 +886,13 @@ pub async fn buffer_open(
 
     let mut s = state.lock().await;
     let id = s.allocate_buffer_id();
-    let buf = if params.create_if_missing && !canonical.exists() {
+    let mut buf = if params.create_if_missing && !canonical.exists() {
         // New file: empty buffer with the target path attached. Save will write to disk.
         Buffer::new_at_path(id, canonical.clone(), params.language.clone())
     } else {
         Buffer::load_from_file(id, canonical.clone()).map_err(RpcError::file_io)?
     };
+    buf.transient = params.transient == Some(true);
     let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
     // First-time open of this buffer: no prior cursor or scroll to surface — but the client could
     // already have one if a previous server-side session allocated state. Look it up anyway for
@@ -958,6 +965,7 @@ pub async fn buffer_open(
         cursor,
         scroll,
         lsp_server: buffer_lsp_server_ref(&s, id),
+        transient: buf.transient,
     };
     s.touch_mru(id);
     let pushes = refresh_buffer_pickers(&mut s);
@@ -1357,7 +1365,8 @@ pub async fn git_apply_hunk(
             s.clear_tree_selection_history_for_buffer(buffer_id);
             s.clear_virtual_col_for_buffer(buffer_id);
 
-            let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+            let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
+            search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
             let new_line_count = s.buffers[&buffer_id].line_count();
             // Also recomputes the cached hunks, so the pushed gutter markers are post-revert.
             refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
@@ -1782,7 +1791,8 @@ pub async fn lsp_format(
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
 
-    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
+    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     notify_lsp_change(&mut s, buffer_id);
@@ -2570,6 +2580,7 @@ pub(crate) fn collect_buffer_state_pushes(
         saved_at_unix_ms: buf.last_modified_unix_ms,
         externally_modified: buf.externally_modified,
         externally_deleted: buf.externally_deleted,
+        transient: buf.transient,
     };
     let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
     let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
@@ -2592,6 +2603,38 @@ pub(crate) fn collect_buffer_state_pushes(
             ))
         })
         .collect()
+}
+
+/// Promote a transient buffer to permanent. Called from every buffer-mutation handler (the
+/// first edit is what makes a previewed buffer worth keeping) and from `buffer/save`. Returns
+/// the `buffer/state` pushes telling viewers the flag flipped; empty when the buffer wasn't
+/// transient (the common case) or doesn't exist.
+fn promote_transient(
+    s: &mut ServerState,
+    buffer_id: BufferId,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    match s.buffers.get_mut(&buffer_id) {
+        Some(buf) if buf.transient => {
+            buf.transient = false;
+            collect_buffer_state_pushes(s, buffer_id)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Apply a `buffer/open { transient }` intent to an *existing* buffer: `Some(false)` pins
+/// (promotes) it; `Some(true)` / `None` leave it alone — an open never demotes a permanent
+/// buffer to transient. Returns the promotion's `buffer/state` pushes (usually empty).
+fn pin_buffer_if_requested(
+    s: &mut ServerState,
+    buffer_id: BufferId,
+    transient: Option<bool>,
+) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+    if transient == Some(false) {
+        promote_transient(s, buffer_id)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Recompute every active search on this buffer after a mutation. Returns the pushes (search
@@ -2817,6 +2860,10 @@ async fn navigate_to(
         language: None,
         create_if_missing: false,
         jump_to: None,
+        // Stepping history through a since-closed file is a revisit, not a keep: reopen it
+        // transient so walking the jump list doesn't re-accumulate buffers. No effect when the
+        // buffer is still open (an open never demotes).
+        transient: Some(true),
     };
     let mut result = buffer_open(state, ctx, open_params).await?;
 
@@ -3016,7 +3063,8 @@ pub async fn buffer_cut(
     s.clear_tree_selection_history_for_buffer(params.buffer_id);
     s.clear_virtual_col_for_buffer(params.buffer_id);
 
-    let search_summary_pushes = refresh_searches_for_buffer(&mut s, params.buffer_id);
+    let mut search_summary_pushes = promote_transient(&mut s, params.buffer_id);
+    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, params.buffer_id));
     let new_line_count = s.buffers[&params.buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, params.buffer_id, new_line_count);
     let buf_ref = &s.buffers[&params.buffer_id];
@@ -3270,6 +3318,12 @@ pub async fn buffer_save(
     // open buffer pickers (the dirty flag just flipped off; the path may have moved on Save-As).
     let (state_pushes, picker_pushes) = {
         let mut s = state.lock().await;
+        // Saving is a keep-this-buffer signal: promote a transient buffer to permanent. (The
+        // first edit normally got there already; this covers a clean-buffer save-as.) The flag
+        // rides the buffer/state push below, so we just flip it.
+        if let Some(buf) = s.buffers.get_mut(&params.buffer_id) {
+            buf.transient = false;
+        }
         let state_pushes = collect_buffer_state_pushes(&s, params.buffer_id);
         let picker_pushes = refresh_buffer_pickers(&mut s);
         (state_pushes, picker_pushes)
@@ -3304,7 +3358,21 @@ pub async fn buffer_reload(
             return Err(RpcError::would_discard_changes(params.buffer_id));
         }
     }
-    let (result, pushes) = reload_buffer_locked(&mut s, params.buffer_id)?;
+    // A user-initiated reload is a keep-this-buffer signal: promote a transient buffer to
+    // permanent, like save. Flipped before the reload so its buffer/state push carries the
+    // cleared flag. (The watcher's silent reload calls `reload_buffer_locked` directly and
+    // deliberately doesn't promote — an external file change shouldn't pin a preview.)
+    let mut promoted = false;
+    if let Some(buf) = s.buffers.get_mut(&params.buffer_id) {
+        promoted = buf.transient;
+        buf.transient = false;
+    }
+    let (result, mut pushes) = reload_buffer_locked(&mut s, params.buffer_id)?;
+    if promoted {
+        // Reloading a *clean* transient buffer flips no dirty state, so the reload's own
+        // picker refresh doesn't fire — re-push open Buffers pickers for the italics change.
+        pushes.extend(refresh_buffer_pickers(&mut s));
+    }
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -3466,6 +3534,39 @@ pub async fn viewport_subscribe(
     s.last_scroll.insert((client_id, buffer_id), params.scroll);
     tracing::debug!(%client_id, viewport_id, buffer_id, first, last_excl, "viewport subscribed");
 
+    // One logical viewport per client: a new subscribe supersedes the client's previous
+    // viewport(s), which the clients historically never unsubscribed. Dropping the stale
+    // entries here keeps "has a viewport" meaning "is showing the buffer" — which is also
+    // what lets a transient buffer detect it just went hidden and close itself.
+    let left_buffers: Vec<BufferId> = {
+        let stale: Vec<aether_protocol::ViewportId> = s
+            .viewports
+            .iter()
+            .filter(|(id, v)| v.client_id == client_id && **id != viewport_id)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut buffers: Vec<BufferId> = Vec::new();
+        for id in stale {
+            if let Some(v) = s.viewports.remove(&id) {
+                if v.buffer_id != buffer_id && !buffers.contains(&v.buffer_id) {
+                    buffers.push(v.buffer_id);
+                }
+            }
+        }
+        buffers
+    };
+    let (closed, stopped_servers) = s.close_orphaned_transients(left_buffers);
+    let mut pushes = Vec::new();
+    if !closed.is_empty() {
+        for &id in &closed {
+            tracing::info!(buffer_id = id, "transient buffer closed (hidden)");
+        }
+        pushes.extend(refresh_buffer_pickers(&mut s));
+    }
+    if !stopped_servers.is_empty() {
+        pushes.extend(refresh_lsp_server_pickers(&mut s));
+    }
+
     // Snapshot the buffer-level status the client can't derive from the window: external-change
     // flags, diagnostic counts, and language-server health. These otherwise only reach a client via
     // change-notifications (`buffer/state`, `lsp/diagnostics_changed`, `lsp/status_changed`), so a
@@ -3479,6 +3580,10 @@ pub async fn viewport_subscribe(
         diagnostics: diagnostic_counts(buffer_diagnostics(&s, buffer_id)),
         lsp_status: s.lsp.status_for_buffer(buffer_id),
     };
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
 
     Ok(ViewportSubscribeResult {
         viewport_id,
@@ -3736,7 +3841,22 @@ pub async fn viewport_unsubscribe(
             "viewport is not owned by this client",
         ));
     }
+    let buffer_id = vp.buffer_id;
     s.viewports.remove(&params.viewport_id);
+    // If that was the last viewport on a transient buffer, the buffer just went hidden — close
+    // it (same rule as the viewport supersession in `viewport_subscribe`).
+    let (closed, stopped_servers) = s.close_orphaned_transients([buffer_id]);
+    let mut pushes = Vec::new();
+    if !closed.is_empty() {
+        pushes.extend(refresh_buffer_pickers(&mut s));
+    }
+    if !stopped_servers.is_empty() {
+        pushes.extend(refresh_lsp_server_pickers(&mut s));
+    }
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
     Ok(())
 }
 
@@ -5813,7 +5933,8 @@ async fn apply_toggle_comment(
     s.clear_virtual_col_for_buffer(buffer_id);
 
     let edit_last_excl = edit_last_incl + 1;
-    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
+    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     let buf_ref = &s.buffers[&buffer_id];
@@ -6270,7 +6391,8 @@ async fn apply_indent_or_dedent(
 
     let edit_first = a;
     let edit_last_excl = b + 1;
-    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
+    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     let buf_ref = &s.buffers[&buffer_id];
@@ -6450,7 +6572,8 @@ pub async fn input_move_lines(
         VerticalDirection::Up => (a - 1, b + 1),
     };
 
-    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
+    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     let buf_ref = &s.buffers[&buffer_id];
@@ -6653,7 +6776,8 @@ pub async fn input_join_lines(
     // Push viewport/lines_changed for affected viewports (we changed multiple lines).
     let (pushes, search_summary_pushes, picker_pushes, new_cursor): (Vec<_>, Vec<_>, Vec<_>, _) = {
         let mut s = state.lock().await;
-        let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+        let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
+        search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
         let new_line_count = s.buffers[&buffer_id].line_count();
         refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
         let buf = &s.buffers[&buffer_id];
@@ -6778,7 +6902,8 @@ async fn apply_undo_or_redo(
 
     // Push the full visible window to every viewport on this buffer — the rope was swapped
     // wholesale, so we can't be surgical about it.
-    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
+    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     // LSP: the rope was swapped wholesale — tell the server so its diagnostics aren't stale.
@@ -7284,7 +7409,8 @@ async fn apply_edit(
 
     // Recompute every active search on this buffer so the embedded `search_matches` in the
     // line-render data we're about to send out reflects the post-edit text.
-    let search_summary_pushes = refresh_searches_for_buffer(&mut s, buffer_id);
+    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
+    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
 
     // Recompute every viewport's pushed range against the new line count, so a mutation that
     // *grew* the buffer (e.g. typing a newline) extends the window to cover the new lines.
@@ -7465,6 +7591,7 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
         display,
         status: buffer_dirty_state(buf),
         path,
+        transient: buf.transient,
     }
 }
 

@@ -166,6 +166,9 @@ export interface BufferOpenParams {
   language?: string | null;
   create_if_missing?: boolean;
   jump_to?: LogicalPosition | null;
+  /** true: open as a transient preview (auto-closes when hidden; only applies when this open
+   *  creates the buffer). false: pin an existing transient buffer. omitted: leave as-is. */
+  transient?: boolean | null;
 }
 export interface LspServerRef {
   language: string;
@@ -184,6 +187,8 @@ export interface BufferOpenResult {
   cursor: CursorState;
   scroll?: ScrollPosition | null;
   lsp_server?: LspServerRef | null;
+  /** True while the buffer is transient (auto-closes once hidden). */
+  transient?: boolean;
 }
 
 // ---- server→client notifications (beyond viewport/picker) ---------------------------------------
@@ -194,6 +199,8 @@ export interface BufferStateParams {
   saved_at_unix_ms?: number | null;
   externally_modified?: boolean;
   externally_deleted?: boolean;
+  /** True while the buffer is transient; flips false on promotion (first edit / save / pin). */
+  transient?: boolean;
 }
 export interface DiagnosticCounts {
   errors: number;
@@ -568,7 +575,7 @@ export type LspStatus =
  *  are code-point offsets into the row's display string, covered by the fuzzy match. */
 export type PickerItem =
   | { kind: "file"; path_index: number; relative_path: string; match_indices?: number[]; git_status?: GitStatus }
-  | { kind: "buffer"; buffer_id: BufferId; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[] }
+  | { kind: "buffer"; buffer_id: BufferId; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean }
   | {
       kind: "grep_hit";
       path_index: number;

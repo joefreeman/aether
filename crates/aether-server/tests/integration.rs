@@ -187,6 +187,7 @@ async fn hello_then_open_file() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("hello.rs".into()),
@@ -211,6 +212,7 @@ async fn hello_then_open_file() {
         &mut ws,
         3,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("hello.rs".into()),
@@ -255,6 +257,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -317,6 +320,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         &mut ws,
         6,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -365,6 +369,7 @@ async fn buffer_open_isolates_scroll_per_client() {
             &mut ws,
             2,
             &BufferOpenParams {
+                transient: None,
                 buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some("a.txt".into()),
@@ -428,6 +433,7 @@ async fn buffer_open_isolates_scroll_per_client() {
         &mut ws_a,
         20,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -441,6 +447,7 @@ async fn buffer_open_isolates_scroll_per_client() {
         &mut ws_b,
         20,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -543,6 +550,7 @@ async fn rejects_path_outside_project() {
         method: BufferOpen::NAME.into(),
         params: Some(
             serde_json::to_value(BufferOpenParams {
+                transient: None,
                 buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some("../aether-outside-test.txt".into()),
@@ -591,6 +599,7 @@ async fn viewport_subscribe_renders_window() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -658,6 +667,7 @@ async fn viewport_subscribe_wraps_long_line() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("long.txt".into()),
@@ -740,6 +750,7 @@ async fn viewport_scroll_returns_new_window() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("many.txt".into()),
@@ -823,6 +834,7 @@ async fn setup_with_buffer(
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("buf.txt".into()),
@@ -1080,6 +1092,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1154,6 +1167,7 @@ async fn match_bracket_motion_jumps_to_pair() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1227,6 +1241,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1288,6 +1303,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1348,6 +1364,7 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1424,6 +1441,7 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1484,6 +1502,7 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1547,6 +1566,7 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1636,6 +1656,7 @@ async fn end_of_unit_works_on_last_function() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1700,6 +1721,7 @@ async fn start_of_unit_extends_back_to_function_start() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1763,6 +1785,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1864,6 +1887,7 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -1938,6 +1962,7 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -2002,6 +2027,7 @@ async fn nav_motion_jumps_between_top_level_rust_items() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -2075,6 +2101,7 @@ async fn nav_motion_prev_walks_backward() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -2135,6 +2162,7 @@ async fn nav_motion_noop_at_end_of_file() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -2199,6 +2227,7 @@ async fn nav_motion_inside_python_class_finds_next_method() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.py".into()),
@@ -2263,6 +2292,7 @@ async fn nav_motion_from_last_method_stays_in_class() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.py".into()),
@@ -2330,6 +2360,7 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.py".into()),
@@ -2391,6 +2422,7 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.html".into()),
@@ -2487,6 +2519,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("notes.md".into()),
@@ -2556,6 +2589,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("greet.txt".into()),
@@ -2670,6 +2704,7 @@ async fn save_preserves_crlf_endings() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("windows.txt".into()),
@@ -2726,6 +2761,7 @@ async fn save_scratch_returns_buffer_has_no_path() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -5386,6 +5422,7 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -5444,6 +5481,7 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -5511,6 +5549,7 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -5566,6 +5605,7 @@ async fn newline_and_indent_engine_python_def() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.py".into()),
@@ -5622,6 +5662,7 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -5676,6 +5717,7 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.go".into()),
@@ -5758,6 +5800,7 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -5816,6 +5859,7 @@ async fn toggle_comment_strips_when_already_commented() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -5875,6 +5919,7 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.py".into()),
@@ -5936,6 +5981,7 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.md".into()),
@@ -5994,6 +6040,7 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
@@ -6053,6 +6100,7 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
@@ -6114,6 +6162,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
@@ -6177,6 +6226,7 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
@@ -6240,6 +6290,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.go".into()),
@@ -6321,6 +6372,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.ts".into()),
@@ -6383,6 +6435,7 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
@@ -6445,6 +6498,7 @@ async fn toggle_comment_round_trip_partial_selection() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
@@ -6518,6 +6572,7 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
@@ -6577,6 +6632,7 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.css".into()),
@@ -6636,6 +6692,7 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.md".into()),
@@ -6685,6 +6742,7 @@ async fn toggle_comment_is_noop_for_json() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.json".into()),
@@ -7684,6 +7742,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("README.md".into()),
@@ -7697,6 +7756,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         &mut ws,
         3,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/lib.rs".into()),
@@ -7710,6 +7770,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         &mut ws,
         4,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
@@ -7783,6 +7844,7 @@ async fn buffers_picker_select_returns_buffer_id() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
@@ -7838,6 +7900,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -7853,6 +7916,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
         &mut ws,
         3,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("README.md".into()),
@@ -7867,6 +7931,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
         &mut ws,
         4,
         &BufferOpenParams {
+            transient: None,
             buffer_id: Some(scratch.buffer_id),
             path_index: None,
             relative_path: None,
@@ -7893,6 +7958,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -7945,6 +8011,7 @@ async fn scratch_number_is_per_project_lowest_unused() {
     // `setup_with_buffer` opens a *file* buffer first, so a later scratch won't have buffer_id 1.
     let (server, mut ws, file_id) = setup_with_buffer("hello\n").await;
     let scratch_params = || BufferOpenParams {
+        transient: None,
         buffer_id: None,
         path_index: None,
         relative_path: None,
@@ -7984,6 +8051,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
@@ -8080,6 +8148,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
@@ -8177,6 +8246,7 @@ async fn buffers_picker_pushes_on_save() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
@@ -8265,6 +8335,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -8278,6 +8349,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         &mut ws,
         3,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -8345,6 +8417,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
         &mut ws_a,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("README.md".into()),
@@ -8358,6 +8431,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
         &mut ws_a,
         3,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/lib.rs".into()),
@@ -8445,6 +8519,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -8505,6 +8580,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
         &mut ws,
         6,
         &BufferOpenParams {
+            transient: None,
             buffer_id: Some(scratch.buffer_id),
             path_index: None,
             relative_path: None,
@@ -8557,6 +8633,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -8603,6 +8680,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
         &mut ws,
         5,
         &BufferOpenParams {
+            transient: None,
             buffer_id: Some(scratch.buffer_id),
             path_index: None,
             relative_path: None,
@@ -8656,6 +8734,7 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("foo/bar.rs".into()),
@@ -8728,6 +8807,7 @@ async fn save_as_creates_missing_parent_directories() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -8796,6 +8876,7 @@ async fn save_as_does_not_create_dirs_outside_project() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -8859,6 +8940,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("existing.txt".into()),
@@ -8873,6 +8955,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
         &mut ws,
         3,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -8930,6 +9013,7 @@ async fn save_as_to_same_path_is_in_place_save() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("doc.txt".into()),
@@ -9013,6 +9097,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -9119,6 +9204,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("file.txt".into()),
@@ -9209,6 +9295,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -9314,6 +9401,7 @@ async fn buffer_close_drops_buffer() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -9327,6 +9415,7 @@ async fn buffer_close_drops_buffer() {
         &mut ws,
         3,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("b.txt".into()),
@@ -9351,6 +9440,7 @@ async fn buffer_close_drops_buffer() {
         &mut ws,
         5,
         &BufferOpenParams {
+            transient: None,
             buffer_id: Some(b.buffer_id),
             path_index: None,
             relative_path: None,
@@ -9394,6 +9484,7 @@ async fn buffer_close_last_buffer_returns_none() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("only.txt".into()),
@@ -9442,6 +9533,7 @@ async fn buffer_close_drops_viewports() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -9674,6 +9766,7 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -9691,6 +9784,7 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
         &mut ws,
         3,
         &BufferOpenParams {
+            transient: None,
             buffer_id: Some(opened.buffer_id),
             path_index: None,
             relative_path: None,
@@ -9734,6 +9828,7 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -10123,6 +10218,7 @@ async fn open_test_buffer(
         ws,
         request_id,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some(relative_path.into()),
@@ -11643,6 +11739,7 @@ async fn setup_watched_buffer(
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("watched.txt".into()),
@@ -11909,6 +12006,7 @@ async fn project_activate_returns_info_and_unlocks_buffer_ops() {
         &mut ws,
         1,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -11939,6 +12037,7 @@ async fn project_activate_returns_info_and_unlocks_buffer_ops() {
         &mut ws,
         3,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: None,
             relative_path: None,
@@ -12003,6 +12102,7 @@ async fn project_activate_same_project_is_idempotent() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("buf.txt".into()),
@@ -12029,6 +12129,7 @@ async fn project_activate_same_project_is_idempotent() {
         &mut ws,
         4,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("buf.txt".into()),
@@ -12556,6 +12657,7 @@ async fn git_blame_line_reports_committed_author() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("tracked.rs".into()),
@@ -12625,6 +12727,7 @@ async fn git_blame_line_is_none_without_repo() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("loose.rs".into()),
@@ -12672,6 +12775,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
@@ -12785,6 +12889,7 @@ async fn git_status_counts_ride_the_window() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
@@ -12887,6 +12992,7 @@ async fn git_status_splits_staged_and_unstaged() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
@@ -12966,6 +13072,7 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
@@ -13042,6 +13149,7 @@ async fn setup_git_apply(
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some(name.into()),
@@ -13512,6 +13620,7 @@ async fn git_gutter_marker_present_without_diff_view() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("g.rs".into()),
@@ -13588,6 +13697,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("nav.rs".into()),
@@ -13726,6 +13836,7 @@ async fn open_and_subscribe(
         &mut ws,
         2,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some(rel_path.into()),
@@ -14101,6 +14212,7 @@ async fn lsp_diagnostics_clear_on_undo() {
         &mut ws,
         10,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
@@ -14173,6 +14285,7 @@ async fn lsp_hover_returns_contents() {
     ]);
     let (server, mut ws) = open_and_subscribe("hover-rust", dir.path(), "main.rs").await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        transient: None,
         buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
         language: None, create_if_missing: false, jump_to: None,
     }).await;
@@ -14212,6 +14325,7 @@ async fn lsp_goto_definition_resolves() {
     ]);
     let (server, mut ws) = open_and_subscribe("def-rust", dir.path(), "main.rs").await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        transient: None,
         buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
         language: None, create_if_missing: false, jump_to: None,
     }).await;
@@ -14255,6 +14369,7 @@ async fn references_picker_lists_all_uses() {
     ]);
     let (server, mut ws) = open_and_subscribe("refs-rust", dir.path(), "main.rs").await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        transient: None,
         buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
         language: None, create_if_missing: false, jump_to: None,
     }).await;
@@ -14339,6 +14454,7 @@ async fn lsp_format_reformats() {
     let main_path = dir.path().join("main.rs");
     let (server, mut ws) = open_and_subscribe("fmt-rust", dir.path(), "main.rs").await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        transient: None,
         buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
         language: None, create_if_missing: false, jump_to: None,
     }).await;
@@ -14390,6 +14506,7 @@ async fn lsp_format_json_reformats() {
     let json_path = dir.path().join("data.json");
     let (server, mut ws) = open_and_subscribe("fmt-json", dir.path(), "data.json").await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        transient: None,
         buffer_id: None, path_index: Some(0), relative_path: Some("data.json".into()),
         language: None, create_if_missing: false, jump_to: None,
     }).await;
@@ -14438,6 +14555,7 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
     ]);
     let (server, mut ws) = open_and_subscribe("diagpick", dir.path(), "main.rs").await;
     let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
+        transient: None,
         buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
         language: None, create_if_missing: false, jump_to: None,
     }).await;
@@ -14702,6 +14820,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
             ws,
             id,
             &BufferOpenParams {
+                transient: None,
                 buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some(file.into()),
@@ -14762,6 +14881,7 @@ async fn nav_open_file(
         ws,
         id,
         &BufferOpenParams {
+            transient: None,
             buffer_id: None,
             path_index: Some(0),
             relative_path: Some(file.into()),
@@ -15825,5 +15945,426 @@ async fn explorer_filters_hide_and_changed_only() {
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     assert!(entry_names(&update).contains(&"src"), "reset restores the full listing");
 
+    drop(server);
+}
+
+// -------- transient buffers -----------------------------------------------------------------
+//
+// A buffer opened with `transient: true` (picker / goto-def navigation, the bootstrap scratch)
+// closes itself once no viewport shows it anymore — switching away is what "hides" it, since
+// `viewport/subscribe` supersedes the client's previous viewport. The first edit, a save, or an
+// explicit `buffer/open { transient: false }` (pin) promotes it to a normal buffer.
+
+async fn setup_transient_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir_path.join("b.txt"), "beta\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    (server, ws)
+}
+
+/// `buffer/open` params for a file in the transient-workspace project.
+fn file_open_params(rel: &str, transient: Option<bool>) -> BufferOpenParams {
+    BufferOpenParams {
+        buffer_id: None,
+        path_index: Some(0),
+        relative_path: Some(rel.into()),
+        language: None,
+        create_if_missing: false,
+        jump_to: None,
+        transient,
+    }
+}
+
+/// `buffer/open` params attaching to an existing buffer by id.
+fn attach_open_params(buffer_id: u64, transient: Option<bool>) -> BufferOpenParams {
+    BufferOpenParams {
+        buffer_id: Some(buffer_id),
+        path_index: None,
+        relative_path: None,
+        language: None,
+        create_if_missing: false,
+        jump_to: None,
+        transient,
+    }
+}
+
+fn transient_sub_params(buffer_id: u64) -> ViewportSubscribeParams {
+    ViewportSubscribeParams {
+        buffer_id,
+        cols: 80,
+        rows: 10,
+        overscan_rows: 0,
+        scroll: ScrollPosition {
+            logical_line: 0,
+            sub_row: 0.0,
+        },
+        wrap: WrapMode::None,
+        continuation_marker_width: 0,
+        tab_width: 4,
+    }
+}
+
+/// The core lifecycle: a transient buffer dies when the client's viewport moves elsewhere.
+#[tokio::test]
+async fn transient_buffer_closes_when_hidden() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", Some(true))).await;
+    assert!(a.transient, "open with transient:true reports the flag");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+
+    // Switch to b: open + subscribe. The subscribe supersedes a's viewport, hiding a → closed.
+    let b: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 4, &file_open_params("b.txt", None)).await;
+    assert!(!b.transient, "open without the flag is permanent");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 5, &transient_sub_params(b.buffer_id)).await;
+
+    let err =
+        send_request_expect_err::<BufferOpen>(&mut ws, 6, &attach_open_params(a.buffer_id, None))
+            .await;
+    assert!(
+        err.contains("unknown buffer_id"),
+        "hidden transient buffer should be closed, got: {err}"
+    );
+    drop(server);
+}
+
+/// A buffer opened without the flag survives being hidden — the pre-transient behavior.
+#[tokio::test]
+async fn permanent_buffer_survives_hiding() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+    let b: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 4, &file_open_params("b.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 5, &transient_sub_params(b.buffer_id)).await;
+    let again: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 6, &attach_open_params(a.buffer_id, None)).await;
+    assert_eq!(again.buffer_id, a.buffer_id);
+    drop(server);
+}
+
+/// The first edit promotes: an edited transient buffer survives being hidden.
+#[tokio::test]
+async fn edit_promotes_transient_buffer() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", Some(true))).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: a.buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+
+    let b: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 5, &file_open_params("b.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 6, &transient_sub_params(b.buffer_id)).await;
+
+    let again: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 7, &attach_open_params(a.buffer_id, None)).await;
+    assert!(!again.transient, "the edit promoted the buffer");
+    drop(server);
+}
+
+/// Explicit pin (`buffer/open { transient: false }`) promotes without an edit.
+#[tokio::test]
+async fn pin_promotes_transient_buffer() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", Some(true))).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+
+    let pinned: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 4, &attach_open_params(a.buffer_id, Some(false)))
+            .await;
+    assert!(!pinned.transient, "pin reports the flag cleared");
+
+    let b: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 5, &file_open_params("b.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 6, &transient_sub_params(b.buffer_id)).await;
+    let again: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 7, &attach_open_params(a.buffer_id, None)).await;
+    assert_eq!(again.buffer_id, a.buffer_id);
+    drop(server);
+}
+
+/// A clean save (save-as flow on an untouched preview) also promotes.
+#[tokio::test]
+async fn save_promotes_transient_buffer() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", Some(true))).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        4,
+        &BufferSaveParams {
+            buffer_id: a.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+
+    let b: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 5, &file_open_params("b.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 6, &transient_sub_params(b.buffer_id)).await;
+    let again: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 7, &attach_open_params(a.buffer_id, None)).await;
+    assert!(!again.transient);
+    drop(server);
+}
+
+/// Opening an already-open (permanent) buffer with `transient: true` never demotes it.
+#[tokio::test]
+async fn transient_open_does_not_demote_existing_buffer() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let first: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", None)).await;
+    let again: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 3, &file_open_params("a.txt", Some(true))).await;
+    assert_eq!(again.buffer_id, first.buffer_id);
+    assert!(!again.transient, "an open never demotes a permanent buffer");
+    drop(server);
+}
+
+/// The bootstrap placeholder: a transient scratch closes once a real file replaces it.
+#[tokio::test]
+async fn transient_scratch_closes_when_replaced_by_file() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            transient: Some(true),
+        },
+    )
+    .await;
+    assert!(scratch.transient);
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(scratch.buffer_id))
+            .await;
+
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 4, &file_open_params("a.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 5, &transient_sub_params(a.buffer_id)).await;
+
+    let err = send_request_expect_err::<BufferOpen>(
+        &mut ws,
+        6,
+        &attach_open_params(scratch.buffer_id, None),
+    )
+    .await;
+    assert!(
+        err.contains("unknown buffer_id"),
+        "hidden transient scratch should be closed, got: {err}"
+    );
+    drop(server);
+}
+
+/// A second client's viewport keeps a transient buffer alive; it closes only once the *last*
+/// viewer leaves.
+#[tokio::test]
+async fn transient_buffer_survives_while_another_client_views_it() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", Some(true))).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+
+    // Client 2 starts viewing the same buffer.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws2,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let a2: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws2, 2, &file_open_params("a.txt", Some(true))).await;
+    assert_eq!(a2.buffer_id, a.buffer_id);
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws2, 3, &transient_sub_params(a.buffer_id)).await;
+
+    // Client 1 switches away — buffer stays (client 2 still shows it).
+    let b: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 4, &file_open_params("b.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 5, &transient_sub_params(b.buffer_id)).await;
+    let still: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 6, &attach_open_params(a.buffer_id, None)).await;
+    assert!(still.transient, "still transient while client 2 views it");
+
+    // Client 2 switches away too — now it's hidden everywhere and closes. (Client 1's attach
+    // above didn't resubscribe a viewport, so its viewport is still on b.)
+    let b2: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws2, 4, &file_open_params("b.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws2, 5, &transient_sub_params(b2.buffer_id)).await;
+    let err =
+        send_request_expect_err::<BufferOpen>(&mut ws, 7, &attach_open_params(a.buffer_id, None))
+            .await;
+    assert!(
+        err.contains("unknown buffer_id"),
+        "expected close once the last viewer left, got: {err}"
+    );
+    drop(server);
+}
+
+/// Nav back into a since-closed transient buffer reopens it by path — transient again, so
+/// walking history doesn't re-accumulate buffers.
+#[tokio::test]
+async fn nav_back_reopens_closed_transient_as_transient() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", Some(true))).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+    // Record the jump origin (as the TUI does before a picker-driven switch), then switch.
+    let _: NavRecordResult = send_request::<NavRecord>(
+        &mut ws,
+        4,
+        &NavRecordParams {
+            buffer_id: a.buffer_id,
+        },
+    )
+    .await;
+    let b: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 5, &file_open_params("b.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 6, &transient_sub_params(b.buffer_id)).await;
+
+    // a is gone; nav/back reopens it by path, transient again.
+    let res: NavStepResult = send_request::<NavBack>(
+        &mut ws,
+        7,
+        &NavStepParams {
+            buffer_id: b.buffer_id,
+        },
+    )
+    .await;
+    let target = res.target.expect("nav/back has an entry");
+    assert_ne!(target.buffer_id, a.buffer_id, "reopened under a fresh id");
+    assert!(target.transient, "nav reopen is a revisit, not a keep");
+    drop(server);
+}
+
+/// A user-initiated reload promotes: it's a keep-this-buffer signal, like save. (The watcher's
+/// silent reload deliberately doesn't.)
+#[tokio::test]
+async fn reload_promotes_transient_buffer() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", Some(true))).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+    let _: BufferReloadResult = send_request::<BufferReload>(
+        &mut ws,
+        4,
+        &BufferReloadParams {
+            buffer_id: a.buffer_id,
+            force: false,
+        },
+    )
+    .await;
+
+    let b: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 5, &file_open_params("b.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 6, &transient_sub_params(b.buffer_id)).await;
+    let again: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 7, &attach_open_params(a.buffer_id, None)).await;
+    assert!(!again.transient, "the reload promoted the buffer");
+    drop(server);
+}
+
+/// The buffers picker carries the transient flag so clients can italicise preview rows.
+#[tokio::test]
+async fn buffers_picker_reports_transient_flag() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", None)).await;
+    let b: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 3, &file_open_params("b.txt", Some(true))).await;
+    // Keep the transient buffer visible so it survives until the picker reads it.
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 4, &transient_sub_params(b.buffer_id)).await;
+
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Buffers,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let flags: Vec<(u64, bool)> = update
+        .items
+        .iter()
+        .map(|i| {
+            let PickerItem::Buffer { buffer_id, transient, .. } = i else {
+                panic!("expected Buffer, got {i:?}")
+            };
+            (*buffer_id, *transient)
+        })
+        .collect();
+    assert!(flags.contains(&(b.buffer_id, true)), "transient buffer flagged: {flags:?}");
+    assert!(flags.contains(&(a.buffer_id, false)), "permanent buffer unflagged: {flags:?}");
     drop(server);
 }

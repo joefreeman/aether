@@ -1782,7 +1782,7 @@ export class Picker {
       // Grep hits are code lines — rendered in the editor's mono font (see .grep-hit).
       if (item.kind === "grep_hit") row.classList.add("grep-hit");
       if (i === localSel) selectedRow = row;
-      const { primary, primaryMatches, meta, prefix, prefixClass, dir, bullet, bulletStatus, bulletClass, bulletIcon, dim, dirtyDot, suffix } = this.describe(item);
+      const { primary, primaryMatches, meta, prefix, prefixClass, dir, bullet, bulletStatus, bulletClass, bulletIcon, dim, dirtyDot, italic, suffix } = this.describe(item);
       if (bullet) {
         // Fixed-width cell (empty when clean/ignored) so entry names stay aligned across rows; the
         // `•` glyph appears only with a colour to show (a git change). LSP rows put the status
@@ -1808,6 +1808,7 @@ export class Picker {
       const mainClass = ["picker-main"];
       if (dim) mainClass.push("picker-dim");
       else if (dir) mainClass.push("picker-dir");
+      if (italic) mainClass.push("picker-italic");
       main.className = mainClass.join(" ");
       main.append(matched(primary, primaryMatches));
       row.append(main);
@@ -2066,7 +2067,13 @@ export class Picker {
       case "buffer":
         // Buffer-state dot on the right (colour-coded), matching the editor status bar and the
         // terminal client's buffer picker. Clean buffers (`status` omitted → "clean") show nothing.
-        return { primary: item.display, primaryMatches: item.match_indices, dirtyDot: item.status };
+        // Transient buffers slant, like the status-bar label.
+        return {
+          primary: item.display,
+          primaryMatches: item.match_indices,
+          dirtyDot: item.status,
+          italic: item.transient,
+        };
       case "grep_hit": {
         // The file is shown in the group header; the row carries the line number + preview.
         // `match_indices` are char offsets into the untrimmed preview, so shift them down by the
@@ -2171,6 +2178,8 @@ interface RowDesc {
   dim?: boolean;
   /** Right-aligned buffer-state dot (buffer rows). `"clean"`/undefined → no dot. */
   dirtyDot?: BufferDirtyState;
+  /** Italicise the primary text — transient buffers, matching the status-bar label. */
+  italic?: boolean;
   /** Dim suffix right after the primary text (multi-root file rows: the root's name). */
   suffix?: string;
 }

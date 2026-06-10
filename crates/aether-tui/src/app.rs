@@ -508,6 +508,10 @@ pub struct EditorState {
     /// status bar shows (language alone is ambiguous when a project runs several same-language
     /// servers at different roots).
     pub lsp_server: Option<LspServerRef>,
+    /// The buffer auto-closes once hidden (server-side flag, from `buffer/open` and `buffer/state`
+    /// pushes). Shown by italicising the status-bar file label; promoted to permanent by the
+    /// first edit, a save, or a reload (`Space r`).
+    pub transient: bool,
 }
 
 /// Client-side cache of the cursor line's blame. `key` records the `(line, revision)` the `info`
@@ -651,6 +655,7 @@ pub async fn bootstrap(
                     language: None,
                     create_if_missing: false,
                     jump_to: None,
+                    transient: None,
                 },
             )
             .await?
@@ -669,6 +674,9 @@ pub async fn bootstrap(
                     language: None,
                     create_if_missing: false,
                     jump_to: None,
+                    // Only the auto-spawned placeholder scratch is transient; reattaching to a
+                    // real last-buffer leaves its flag alone.
+                    transient: if activated.last_buffer_id.is_none() { Some(true) } else { None },
                 },
             )
             .await?
@@ -782,6 +790,9 @@ async fn activate_project_and_rebuild_editor(
         language: None,
         create_if_missing: false,
         jump_to: None,
+        // Only the auto-spawned placeholder scratch is transient; reattaching to a
+        // real last-buffer leaves its flag alone.
+        transient: if activated.last_buffer_id.is_none() { Some(true) } else { None },
     };
     let project_paths = state.project_paths.clone();
     let root_labels = state.root_labels.clone();
@@ -937,6 +948,7 @@ async fn build_editor_state_from_open(
         file_label,
         language: open.language,
         lsp_server: open.lsp_server,
+        transient: open.transient,
     };
     Ok((editor, sub.buffer_status))
 }
@@ -1218,6 +1230,7 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
                 ed.saved_revision = p.saved_revision;
                 ed.externally_modified = p.externally_modified;
                 ed.externally_deleted = p.externally_deleted;
+                ed.transient = p.transient;
                 if p.externally_deleted {
                     state.status = StatusMessage::warning(
                         "file removed on disk — save to recreate, or close buffer",
@@ -3709,6 +3722,7 @@ async fn attach_buffer(
             language: None,
             create_if_missing: false,
             jump_to: None,
+            transient: None,
         })
         .await?;
     subscribe_to_buffer(client, state, open, Reveal::Minimal).await
@@ -3726,6 +3740,7 @@ async fn new_scratch(client: &mut Client, state: &mut AppState) -> Result<()> {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            transient: None,
         })
         .await?;
     // New Scratch is an explicit request for a fresh placeholder — don't discard the one we're on.
@@ -4118,6 +4133,10 @@ async fn open_file_at_path(
             language: None,
             create_if_missing,
             jump_to,
+            // Every caller here is a result-style navigation (picker select, grep `<`/`>`,
+            // goto-definition): open as a transient preview — the buffer auto-closes when
+            // hidden again unless an edit (or `Space r`) pins it.
+            transient: Some(true),
         })
         .await?;
     subscribe_replacing_scratch(client, state, open, reveal).await
@@ -5487,6 +5506,9 @@ async fn reload_buffer_with(client: &mut Client, state: &mut AppState, force: bo
             state.ed_mut().saved_revision = r.revision;
             state.ed_mut().externally_modified = false;
             state.ed_mut().externally_deleted = false;
+            // Reloading promotes a transient buffer server-side (a keep signal, like save);
+            // mirror the flag locally without waiting for the buffer/state push.
+            state.ed_mut().transient = false;
             state.status = StatusMessage::success(format!("reloaded (rev {})", r.revision));
         }
         Err(e) if is_would_discard_changes(&e) => {
@@ -5606,6 +5628,8 @@ async fn create_file_in_explorer_dir(
             language: None,
             create_if_missing: true,
             jump_to: None,
+            // Creating a file is an intentional keep — not a preview.
+            transient: None,
         })
         .await?;
     subscribe_replacing_scratch(client, state, open, Reveal::Minimal).await
@@ -6961,6 +6985,7 @@ mod tests {
     /// The rest is filled with sensible defaults.
     fn stub_editor_state(label: &str) -> EditorState {
         EditorState {
+            transient: false,
             mode: EditorMode::Normal,
             buffer_id: 1,
             viewport_id: 1,

@@ -375,6 +375,35 @@ impl ServerState {
         stopped_server
     }
 
+    /// Close every buffer in `candidates` that is transient and no longer shown by any viewport.
+    /// This is the "hidden ⇒ close" half of transient buffers; callers pass the buffers a client
+    /// just stopped viewing (viewport switch, project switch, disconnect) *after* dropping the
+    /// stale viewports. Dirty buffers are skipped as a guard — the first edit promotes, so a
+    /// dirty transient shouldn't exist. Returns the ids closed and the keys of language servers
+    /// torn down with them (so callers can refresh picker views).
+    pub fn close_orphaned_transients(
+        &mut self,
+        candidates: impl IntoIterator<Item = BufferId>,
+    ) -> (Vec<BufferId>, Vec<crate::lsp::manager::LspServerKey>) {
+        let mut closed = Vec::new();
+        let mut stopped = Vec::new();
+        for id in candidates {
+            let eligible = self
+                .buffers
+                .get(&id)
+                .is_some_and(|b| b.transient && !b.dirty)
+                && !self.viewports.values().any(|v| v.buffer_id == id);
+            if !eligible {
+                continue;
+            }
+            closed.push(id);
+            if let Some(key) = self.close_buffer(id) {
+                stopped.push(key);
+            }
+        }
+        (closed, stopped)
+    }
+
     /// Delete a loaded project's in-memory state: drop the project entry and close every buffer
     /// that belonged to it, tearing down all per-buffer state (same teardown as `buffer/close` /
     /// `project/remove_root`). Returns the closed buffer ids. The caller is responsible for the
@@ -570,8 +599,18 @@ impl ServerState {
             .filter_map(|(id, name)| (name == project_name).then_some(*id))
             .collect();
 
+        let viewed: Vec<BufferId> = self
+            .viewports
+            .values()
+            .filter(|v| v.client_id == client_id && project_buffers.contains(&v.buffer_id))
+            .map(|v| v.buffer_id)
+            .collect();
         self.viewports
             .retain(|_, v| !(v.client_id == client_id && project_buffers.contains(&v.buffer_id)));
+        // A transient buffer the client was previewing doesn't survive leaving the project —
+        // it's hidden now, same as switching buffers. (Permanent buffers stay alive for
+        // re-entry, per the comment below.)
+        let _ = self.close_orphaned_transients(viewed);
         let in_proj =
             |c: &ClientId, b: &BufferId| *c == client_id && project_buffers.contains(b);
         // Viewports + the live search state get torn down (they're transient view-layer
@@ -614,6 +653,12 @@ pub struct Buffer {
     /// Buffer's on-disk file was removed externally. Set by the watcher, cleared by a save
     /// (which recreates the file) or by the file being recreated externally.
     pub externally_deleted: bool,
+    /// Transient buffers auto-close once no viewport shows them anymore (see
+    /// `viewport_subscribe` / `close_orphaned_transients`). Set at creation when the opening
+    /// client asked for it (picker/goto-def navigation, the bootstrap scratch); cleared —
+    /// "promoted" — by the buffer's first edit, a save, or a user-initiated reload. Never set
+    /// again after creation.
+    pub transient: bool,
 
     /// Revision at the most recent successful save. `None` only for a never-saved scratch
     /// buffer in its initial empty state — see `Buffer::scratch`.
@@ -720,6 +765,7 @@ impl Buffer {
             redo_stack: Vec::new(),
             active_group: None,
             externally_modified: false,
+            transient: false,
             externally_deleted: false,
         })
     }
@@ -752,6 +798,7 @@ impl Buffer {
             redo_stack: Vec::new(),
             active_group: None,
             externally_modified: false,
+            transient: false,
             externally_deleted: false,
         }
     }
@@ -781,6 +828,7 @@ impl Buffer {
             redo_stack: Vec::new(),
             active_group: None,
             externally_modified: false,
+            transient: false,
             externally_deleted: false,
         }
     }
