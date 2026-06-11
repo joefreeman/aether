@@ -72,6 +72,20 @@ pub fn line_last_char_byte_idx(buf: &Buffer, line_idx: u32) -> u32 {
     (last_char_byte_start - line_start_byte) as u32
 }
 
+/// Byte offset of the first non-blank (not space/tab) char on the line. The trailing newline
+/// stops the scan, so an all-blank line yields its line-end position and an empty line yields 0.
+fn first_nonblank_col(buf: &Buffer, line_idx: u32) -> u32 {
+    let slice = buf.text.line(line_idx as usize);
+    let mut byte_offset = 0usize;
+    for c in slice.chars() {
+        if c == '\n' || !matches!(c, ' ' | '\t') {
+            break;
+        }
+        byte_offset += c.len_utf8();
+    }
+    byte_offset as u32
+}
+
 pub fn clamp_position(buf: &Buffer, pos: LogicalPosition) -> LogicalPosition {
     let line_count = buf.text.len_lines() as u32;
     let line = pos.line.min(line_count.saturating_sub(1));
@@ -128,18 +142,20 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             line: current.line,
             col: line_last_char_byte_idx(buf, current.line),
         },
-        Motion::LineFirstNonblank => {
-            let slice = buf.text.line(current.line as usize);
-            let mut byte_offset = 0usize;
-            for c in slice.chars() {
-                if c == '\n' || !matches!(c, ' ' | '\t') {
-                    break;
-                }
-                byte_offset += c.len_utf8();
-            }
+        Motion::LineFirstNonblank => LogicalPosition {
+            line: current.line,
+            col: first_nonblank_col(buf, current.line),
+        },
+        Motion::LogicalLineFirstNonblank { direction, count } => {
+            let line_count = buf.text.len_lines() as u32;
+            let new_line = match direction {
+                Direction::Forward => current.line.saturating_add(*count),
+                Direction::Backward => current.line.saturating_sub(*count),
+            };
+            let new_line = new_line.min(line_count.saturating_sub(1));
             LogicalPosition {
-                line: current.line,
-                col: byte_offset as u32,
+                line: new_line,
+                col: first_nonblank_col(buf, new_line),
             }
         }
         Motion::BufferStart => LogicalPosition { line: 0, col: 0 },

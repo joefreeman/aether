@@ -388,6 +388,16 @@ fn motion_is_internally_tagged() {
     let v = to_value(&m).unwrap();
     assert_eq!(v, json!({"kind": "line_start"}));
 
+    let m = Motion::LogicalLineFirstNonblank {
+        direction: Direction::Forward,
+        count: 3,
+    };
+    let v = to_value(&m).unwrap();
+    assert_eq!(
+        v,
+        json!({"kind": "logical_line_first_nonblank", "direction": "forward", "count": 3})
+    );
+
     let m = Motion::Word {
         direction: Direction::Forward,
         count: 2,

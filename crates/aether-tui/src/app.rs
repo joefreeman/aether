@@ -1677,6 +1677,15 @@ async fn run_action(
         Action::MoveLineFirstNonblank => {
             move_motion(client, state, Motion::LineFirstNonblank, extend).await?
         }
+        Action::MoveLogicalLineFirstNonblank(direction) => {
+            move_motion(
+                client,
+                state,
+                Motion::LogicalLineFirstNonblank { direction, count },
+                extend,
+            )
+            .await?
+        }
         Action::GotoLine { last } => {
             let line = if last {
                 state.ed_mut().line_count.saturating_sub(1)

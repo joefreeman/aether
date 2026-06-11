@@ -63,6 +63,13 @@ pub enum Motion {
     LineStart,
     LineEnd,
     LineFirstNonblank,
+    /// Vim's `+`/`-` — move `count` logical lines forward/backward and land on the first
+    /// non-blank char of the target line. Unlike `LogicalLine`, the destination column always
+    /// comes from the target line's indentation, never the current column.
+    LogicalLineFirstNonblank {
+        direction: Direction,
+        count: u32,
+    },
     BufferStart,
     BufferEnd,
     Goto {

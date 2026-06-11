@@ -26,6 +26,7 @@ const TABS: Tab[] = [
           ["w  b  e", "word forward / back / end (Alt = sub-word)"],
           ["0  Home / End  Alt-l", "line start / end"],
           ["Alt-h", "first non-blank"],
+          ["Enter  Backspace", "first non-blank of next / prev line"],
           ["g  Alt-g", "go to line (count) / last line"],
           ["f  t", "find / till char (Alt = backward)"],
           ["m  Alt-m", "matching / inner bracket"],

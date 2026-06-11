@@ -287,6 +287,7 @@ export type Motion =
   | { kind: "line_start" }
   | { kind: "line_end" }
   | { kind: "line_first_nonblank" }
+  | { kind: "logical_line_first_nonblank"; direction: Direction; count: number }
   | { kind: "buffer_start" }
   | { kind: "buffer_end" }
   | { kind: "goto"; position: LogicalPosition }

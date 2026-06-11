@@ -123,6 +123,8 @@ pub enum Action {
     MoveLineStart,
     MoveLineEnd,
     MoveLineFirstNonblank,
+    /// `Enter`/`Backspace` — `count` lines down/up, landing on the first non-blank char.
+    MoveLogicalLineFirstNonblank(Direction),
     /// `g` (line `count`, 1-indexed) / `Alt-g` (last line).
     GotoLine {
         last: bool,
@@ -342,6 +344,7 @@ impl Action {
                 | Action::MoveLineStart
                 | Action::MoveLineEnd
                 | Action::MoveLineFirstNonblank
+                | Action::MoveLogicalLineFirstNonblank(_)
                 | Action::GotoLine { .. }
                 | Action::MatchBracket { .. }
                 | Action::PageMotion { .. }
@@ -515,6 +518,8 @@ static NORMAL: &[Binding] = &[
     bind!(NORMAL_CTX, ch('j'), IgnoreShift(ALT), A::MoveVisualLine(VerticalDirection::Down), "Motion", "Visual row down"),
     bind!(NORMAL_CTX, ch('j'), IgnoreShift(NONE), A::MoveLogicalLine(Direction::Forward), "Motion", "Logical line down"),
     bind!(NORMAL_CTX, ch('0'), IgnoreShift(NONE), A::MoveLineStart, "Motion", "Logical line start"),
+    bind!(NORMAL_CTX, KeyCode::Enter, IgnoreShift(NONE), A::MoveLogicalLineFirstNonblank(Direction::Forward), "Motion", "First non-blank of next line"),
+    bind!(NORMAL_CTX, KeyCode::Backspace, IgnoreShift(NONE), A::MoveLogicalLineFirstNonblank(Direction::Backward), "Motion", "First non-blank of previous line"),
 
     // ---- motions: page / half-page (cursor) ----
     bind!(NORMAL_CTX, ch('d'), IgnoreShift(NONE), A::PageMotion { dir: VerticalDirection::Down, half: false }, "Motion", "Cursor down a page"),

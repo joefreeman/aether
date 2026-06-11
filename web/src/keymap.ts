@@ -22,6 +22,7 @@ export type Action =
   | { t: "moveLineStart" }
   | { t: "moveLineEnd" }
   | { t: "moveLineFirstNonblank" }
+  | { t: "moveLogicalLineFirstNonblank"; dir: Direction }
   | { t: "gotoLine"; last: boolean }
   | { t: "matchBracket"; inner: boolean }
   | { t: "pageMotion"; dir: VerticalDirection; half: boolean }
@@ -170,6 +171,8 @@ const NORMAL: Binding[] = [
   b("j", ignoreShift(false, true), { t: "moveVisualLine", dir: "down" }),
   b("j", ignoreShift(), { t: "moveLogicalLine", dir: "forward" }),
   b("0", ignoreShift(), { t: "moveLineStart" }),
+  b("Enter", ignoreShift(), { t: "moveLogicalLineFirstNonblank", dir: "forward" }),
+  b("Backspace", ignoreShift(), { t: "moveLogicalLineFirstNonblank", dir: "backward" }),
 
   b("d", ignoreShift(false, true), { t: "pageMotion", dir: "down", half: true }),
   b("d", ignoreShift(), { t: "pageMotion", dir: "down", half: false }),

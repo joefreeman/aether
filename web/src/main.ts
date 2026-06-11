@@ -205,6 +205,7 @@ function isRepeatable(a: Action): boolean {
     case "moveLineStart":
     case "moveLineEnd":
     case "moveLineFirstNonblank":
+    case "moveLogicalLineFirstNonblank":
     case "gotoLine":
     case "matchBracket":
     case "pageMotion":
@@ -1537,6 +1538,9 @@ class Editor {
         break;
       case "moveLineFirstNonblank":
         await this.moveMotion({ kind: "line_first_nonblank" }, extend);
+        break;
+      case "moveLogicalLineFirstNonblank":
+        await this.moveMotion({ kind: "logical_line_first_nonblank", direction: action.dir, count }, extend);
         break;
       case "gotoLine": {
         const lineCount = this.window?.line_count ?? 1;

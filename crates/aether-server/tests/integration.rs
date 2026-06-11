@@ -1068,6 +1068,115 @@ async fn line_end_and_buffer_end_motions() {
 }
 
 #[tokio::test]
+async fn logical_line_first_nonblank_motion() {
+    // Lines with varying indentation: spaces, tabs, an empty line, and an unindented tail.
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("alpha\n    beta\n\t\tgamma\n\ndelta").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    let motion = |direction, count| Motion::LogicalLineFirstNonblank { direction, count };
+    async fn step(
+        ws: &mut Ws,
+        id: u64,
+        buffer_id: u64,
+        motion: Motion,
+        extend: bool,
+    ) -> CursorState {
+        send_request::<CursorMove>(
+            ws,
+            id,
+            &CursorMoveParams {
+                buffer_id,
+                motion,
+                extend_selection: extend,
+            },
+        )
+        .await
+    }
+
+    // `Enter` from mid-line lands on the next line's first non-blank, whatever the indent style
+    // — and repeated presses keep making progress.
+    set_cursor(&mut ws, 10, buffer_id, 0, 3).await;
+    let st = step(&mut ws, 11, buffer_id, motion(Direction::Forward, 1), false).await;
+    assert_eq!(st.position, p(1, 4)); // 'b' of "    beta"
+    let st = step(&mut ws, 12, buffer_id, motion(Direction::Forward, 1), false).await;
+    assert_eq!(st.position, p(2, 2)); // 'g' of "\t\tgamma"
+    let st = step(&mut ws, 13, buffer_id, motion(Direction::Forward, 1), false).await;
+    assert_eq!(st.position, p(3, 0)); // empty line
+    let st = step(&mut ws, 14, buffer_id, motion(Direction::Forward, 1), false).await;
+    assert_eq!(st.position, p(4, 0));
+    // At the last line the motion clamps in place.
+    let st = step(&mut ws, 15, buffer_id, motion(Direction::Forward, 1), false).await;
+    assert_eq!(st.position, p(4, 0));
+
+    // `Backspace` mirrors it upward, and clamps at the first line.
+    let st = step(
+        &mut ws,
+        16,
+        buffer_id,
+        motion(Direction::Backward, 1),
+        false,
+    )
+    .await;
+    assert_eq!(st.position, p(3, 0));
+    let st = step(
+        &mut ws,
+        17,
+        buffer_id,
+        motion(Direction::Backward, 1),
+        false,
+    )
+    .await;
+    assert_eq!(st.position, p(2, 2));
+    set_cursor(&mut ws, 18, buffer_id, 0, 3).await;
+    let st = step(
+        &mut ws,
+        19,
+        buffer_id,
+        motion(Direction::Backward, 1),
+        false,
+    )
+    .await;
+    assert_eq!(st.position, p(0, 0));
+
+    // A count skips that many lines (vim's `3+`).
+    set_cursor(&mut ws, 20, buffer_id, 0, 0).await;
+    let st = step(&mut ws, 21, buffer_id, motion(Direction::Forward, 2), false).await;
+    assert_eq!(st.position, p(2, 2));
+
+    // Shift extends: the anchor stays put while the cursor steps to the next line's indent.
+    set_cursor(&mut ws, 22, buffer_id, 1, 4).await;
+    let st = step(&mut ws, 23, buffer_id, motion(Direction::Forward, 1), true).await;
+    assert_eq!(st.anchor, p(1, 4));
+    assert_eq!(st.position, p(2, 2));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn logical_line_first_nonblank_all_blank_line() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("a\n   \nb\n").await;
+
+    // An all-blank line has no non-blank char; the cursor lands at its line end.
+    set_cursor(&mut ws, 10, buffer_id, 0, 0).await;
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        11,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::LogicalLineFirstNonblank {
+                direction: Direction::Forward,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 3 });
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn input_text_inserts_and_pushes_notification() {
     let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
 
