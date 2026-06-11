@@ -2119,10 +2119,21 @@ async fn open_picker_seeded(
     state.picker.total_matches = 0;
     state.picker.total_candidates = view.total_candidates;
     state.picker.ticking = true;
-    // The Buffers picker is MRU-ordered, so item 0 is the buffer you're already in. Default the
-    // highlight to item 1 — the previously-viewed buffer — so `Enter` is a quick flip back.
-    // `apply_update` clamps this to 0 when there's only one buffer.
-    state.picker.selected = if kind == PickerKind::Buffers { 1 } else { 0 };
+    state.picker.selected = 0;
+    // Buffers / Projects: default the highlight to the first item that isn't this client's
+    // active buffer/project, so `Enter` is a quick flip to the previous one. By identity, not
+    // index — the buffers MRU is project-wide, so another client's activity can put *its*
+    // buffer at the top (and push ours below it). Applied by `apply_update` once items land.
+    // The `if` guards lazy access: Projects opens before any editor exists.
+    state.picker.default_skip = match kind {
+        PickerKind::Buffers if state.has_editor() => Some(crate::picker::DefaultSkip::Buffer(
+            state.ed().buffer_id,
+        )),
+        PickerKind::Projects if !state.project_name.is_empty() => Some(
+            crate::picker::DefaultSkip::Project(state.project_name.clone()),
+        ),
+        _ => None,
+    };
     // Prefer the server-resolved centre item (set when `center_on_cursor_grep_hit` resolved)
     // so `apply_update` snaps the highlight to the same row the server framed.
     state.picker.resume_target = view.effective_center_on.clone().or(center_on);
@@ -3462,9 +3473,11 @@ async fn send_picker_query(client: &mut Client, state: &mut AppState) -> Result<
     state.picker.visible_start = 0;
     state.picker.pending_offset = None;
     state.picker.ticking = true;
-    // Query changes invalidate the resume anchor — the user is steering somewhere new.
+    // Query changes invalidate the resume anchor and the skip-the-active-item default — the
+    // user is steering somewhere new.
     state.picker.resume_target = None;
     state.picker.resume_row_offset = None;
+    state.picker.default_skip = None;
     // Recompute the synthetic "create" row immediately so the user gets feedback before the
     // server's response arrives. `apply_update` will reconcile it once the push lands.
     state.picker.recompute_synthetic_create_row();

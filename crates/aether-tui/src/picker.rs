@@ -6,6 +6,7 @@ use crate::scroll::ScrollState;
 use aether_protocol::directory::DirectoryEntry;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{CaseMode, PickerFilters, PickerItem, PickerKind, ScopedPath};
+use aether_protocol::BufferId;
 use std::collections::HashMap;
 
 /// In-flight picker UI state. `open` toggles the overlay; when `false` all the other fields are
@@ -18,6 +19,25 @@ use std::collections::HashMap;
 /// pick the slice the renderer actually draws; `selected` is an index into `items` clamped to
 /// keep the highlight inside the visible slice. We only round-trip when the visible window
 /// approaches the cache edge — see `picker_move_selection` for the refetch trigger.
+/// Identity of the client's active entry in a freshly-opened Buffers / Projects picker — what
+/// the initial highlight should step over. See `PickerState::default_skip`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultSkip {
+    Buffer(BufferId),
+    Project(String),
+}
+
+impl DefaultSkip {
+    /// True when `item` is the active entry this skip names.
+    fn matches(&self, item: &PickerItem) -> bool {
+        match (self, item) {
+            (DefaultSkip::Buffer(id), PickerItem::Buffer { buffer_id, .. }) => buffer_id == id,
+            (DefaultSkip::Project(name), PickerItem::Project { name: n, .. }) => n == name,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PickerState {
     pub open: bool,
@@ -60,6 +80,12 @@ pub struct PickerState {
     /// `visible_start` so the highlight lands at the same row it was at when the picker closed.
     /// Lifecycle mirrors `resume_target`.
     pub resume_row_offset: Option<usize>,
+    /// When set (Buffers / Projects open), the first push with items moves the highlight to the
+    /// first item that *isn't* this client's active buffer/project — the thing you'd flip to.
+    /// An identity check, not "skip row 0": the list is shared MRU (Buffers) or name-ordered
+    /// (Projects), so another client's activity can put any item at the top. Cleared once
+    /// applied, or by a query change (the user is steering somewhere else).
+    pub default_skip: Option<DefaultSkip>,
     /// Per-kind last-selected item and its index offset within the cache, persisted across
     /// hide/show so reopening a picker can resume both the highlight and the scroll position.
     /// Lives outside `kind`-scoped fields above because it survives reset.
@@ -930,6 +956,19 @@ impl PickerState {
                 self.resume_row_offset = None;
             }
         }
+
+        // Fresh-open default highlight: the first item that isn't the client's active
+        // buffer/project. Falls back to 0 when every item is the active one (e.g. a single
+        // open buffer). One-shot — the first push with items decides and clears it.
+        if self.resume_target.is_none() && !self.items.is_empty() {
+            if let Some(skip) = self.default_skip.take() {
+                self.selected = self
+                    .items
+                    .iter()
+                    .position(|item| !skip.matches(item))
+                    .unwrap_or(0);
+            }
+        }
         self.recompute_synthetic_create_row();
         true
     }
@@ -1156,6 +1195,104 @@ mod tests {
         s.kind = Some(kind);
         s.query = TextInput::new(query);
         s
+    }
+
+    fn buffer_item(id: u64) -> PickerItem {
+        PickerItem::Buffer {
+            buffer_id: id,
+            display: format!("buf{id}"),
+            status: Default::default(),
+            path_index: None,
+            relative_path: None,
+            match_indices: Vec::new(),
+            transient: false,
+        }
+    }
+
+    fn project_item(name: &str) -> PickerItem {
+        PickerItem::Project {
+            name: name.into(),
+            match_indices: Vec::new(),
+        }
+    }
+
+    /// Push `items` into `s` the way a server update would (generation/offset 0, not ticking).
+    fn push_items(s: &mut PickerState, kind: PickerKind, items: Vec<PickerItem>) {
+        let n = items.len() as u32;
+        assert!(s.apply_update(kind, 0, 0, items, n, n, false, None));
+    }
+
+    #[test]
+    fn buffers_default_highlight_skips_active_buffer_at_top() {
+        let mut s = empty_state(PickerKind::Buffers, "");
+        s.default_skip = Some(DefaultSkip::Buffer(7));
+        push_items(
+            &mut s,
+            PickerKind::Buffers,
+            vec![buffer_item(7), buffer_item(3), buffer_item(9)],
+        );
+        assert_eq!(s.selected, 1, "active buffer leads the MRU → flip target is row 1");
+        assert!(s.default_skip.is_none(), "one-shot: cleared once applied");
+    }
+
+    #[test]
+    fn buffers_default_highlight_when_another_client_owns_the_top_row() {
+        let mut s = empty_state(PickerKind::Buffers, "");
+        s.default_skip = Some(DefaultSkip::Buffer(7));
+        // Another client touched buffer 3 last, pushing our active buffer (7) off the top.
+        push_items(
+            &mut s,
+            PickerKind::Buffers,
+            vec![buffer_item(3), buffer_item(7), buffer_item(9)],
+        );
+        assert_eq!(s.selected, 0, "row 0 already isn't the active buffer");
+    }
+
+    #[test]
+    fn buffers_default_highlight_with_only_the_active_buffer() {
+        let mut s = empty_state(PickerKind::Buffers, "");
+        s.default_skip = Some(DefaultSkip::Buffer(7));
+        push_items(&mut s, PickerKind::Buffers, vec![buffer_item(7)]);
+        assert_eq!(s.selected, 0, "nothing to flip to → fall back to the top");
+        assert!(s.default_skip.is_none());
+    }
+
+    #[test]
+    fn buffers_default_skip_survives_an_empty_push() {
+        let mut s = empty_state(PickerKind::Buffers, "");
+        s.default_skip = Some(DefaultSkip::Buffer(7));
+        push_items(&mut s, PickerKind::Buffers, vec![]);
+        assert!(
+            s.default_skip.is_some(),
+            "no items yet — keep waiting for a push that has some"
+        );
+        push_items(
+            &mut s,
+            PickerKind::Buffers,
+            vec![buffer_item(7), buffer_item(3)],
+        );
+        assert_eq!(s.selected, 1);
+    }
+
+    #[test]
+    fn projects_default_highlight_skips_active_project() {
+        let mut s = empty_state(PickerKind::Projects, "");
+        s.default_skip = Some(DefaultSkip::Project("beta".into()));
+        push_items(
+            &mut s,
+            PickerKind::Projects,
+            vec![project_item("alpha"), project_item("beta"), project_item("gamma")],
+        );
+        assert_eq!(s.selected, 0, "alpha isn't the active project — no need to skip");
+
+        let mut s = empty_state(PickerKind::Projects, "");
+        s.default_skip = Some(DefaultSkip::Project("alpha".into()));
+        push_items(
+            &mut s,
+            PickerKind::Projects,
+            vec![project_item("alpha"), project_item("beta"), project_item("gamma")],
+        );
+        assert_eq!(s.selected, 1, "step over the active project at the top");
     }
 
     #[test]

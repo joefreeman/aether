@@ -235,8 +235,11 @@ export interface PickerOptions {
   /** Diagnostics / References: the buffer the candidate set is scoped to (diagnostics to list;
    *  cursor to resolve references at). Passed as `buffer_id` on the reset open. */
   scopedBufferId?: number;
-  /** Grep: the active buffer, so the picker opens centered on the cursor's nearest hit. */
+  /** Grep: the active buffer, so the picker opens centered on the cursor's nearest hit.
+   *  Buffers: the active buffer, so the initial highlight lands on the first *other* buffer. */
   activeBufferId?: number;
+  /** Projects: the active project, so the initial highlight lands on the first other project. */
+  activeProjectName?: string;
   /** Surface a transient message (deletion result / errors). */
   onToast?: (message: string, kind?: ToastKind) => void;
   /** Create + open a file at this absolute path (Explorer "+ create file"). */
@@ -413,6 +416,16 @@ export class Picker {
       this.chipValues = adoptFilters(opts.initialFilters);
       this.renderChips();
     }
+    // Buffers / Projects: land the initial highlight on the first item that *isn't* the active
+    // one — the thing you'd flip to. By identity, not "row 1": the buffers MRU is shared across
+    // clients, so another client's activity can put any buffer at the top of the list.
+    if (this.kind === "buffers" && opts.activeBufferId != null) {
+      const active = opts.activeBufferId;
+      this.pendingSelectMatch = (it) => !(it.kind === "buffer" && it.buffer_id === active);
+    } else if (this.kind === "projects" && opts.activeProjectName) {
+      const active = opts.activeProjectName;
+      this.pendingSelectMatch = (it) => !(it.kind === "project" && it.name === active);
+    }
     if (this.kind === "explorer") {
       void this.viewExplorer({ directory_path: opts.explorerInitialDir ?? null, selectName: opts.explorerSelectName });
     } else if (this.kind === "grep") {
@@ -584,6 +597,9 @@ export class Picker {
     this.selected = 0;
     this.requestedOffset = 0;
     this.items = [];
+    // A query change invalidates any pending pre-selection (open-time centering / skip-the-
+    // active-item) — the user is steering somewhere new.
+    this.pendingSelectMatch = null;
     this.listEl.scrollTop = 0; // a new query starts at the top of the (now-empty) result list
     void this.client
       .rpc<null>("picker/query", {
