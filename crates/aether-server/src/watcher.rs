@@ -136,10 +136,11 @@ async fn handle_event(state: &SharedState, event: Event) {
                 index_should_invalidate = true;
             }
 
-            let Some(buf_id) = buffer_for_path(&s, path) else {
-                continue;
-            };
-            handle_buffer_event(&mut s, buf_id, path, category, &mut pushes);
+            // Plural: projects with overlapping roots can each have their own buffer for this
+            // path, and every one of them needs the reload/flag — not just the first found.
+            for buf_id in s.buffers_for_path(path) {
+                handle_buffer_event(&mut s, buf_id, path, category, &mut pushes);
+            }
         }
 
         if index_should_invalidate {
@@ -196,10 +197,6 @@ enum Category {
     Create,
     Modify,
     Remove,
-}
-
-fn buffer_for_path(s: &ServerState, path: &Path) -> Option<BufferId> {
-    s.buffer_for_path_any_project(path)
 }
 
 /// If `path` is a meaningful file inside a `.git` directory — `HEAD`, `index`, `packed-refs`, or

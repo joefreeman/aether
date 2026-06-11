@@ -113,26 +113,40 @@ pub async fn spawn_for_test(
     project_name: impl Into<String>,
     project_paths: Vec<PathBuf>,
 ) -> anyhow::Result<ServerHandle> {
+    spawn_for_test_multi(vec![(project_name.into(), project_paths)]).await
+}
+
+/// Multi-project variant of [`spawn_for_test`]: pre-registers every `(name, paths)` pair on one
+/// server, for tests exercising cross-project behavior (e.g. overlapping roots). The handle's
+/// `project_name` is the first pair's name.
+pub async fn spawn_for_test_multi(
+    projects: Vec<(String, Vec<PathBuf>)>,
+) -> anyhow::Result<ServerHandle> {
     use crate::state::ProjectEntry;
     use crate::workspace_index::WorkspaceIndex;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let project_name = project_name.into();
-    let workspace_index = Arc::new(WorkspaceIndex::new(project_paths.clone()));
+    let project_name = projects
+        .first()
+        .map(|(name, _)| name.clone())
+        .unwrap_or_default();
 
     let state = Arc::new(Mutex::new(ServerState::new()));
     {
         let mut s = state.lock().await;
-        s.projects.insert(
-            project_name.clone(),
-            ProjectEntry {
-                name: project_name.clone(),
-                paths: project_paths.clone(),
-                workspace_index,
-                mru_buffers: std::collections::VecDeque::new(),
-            },
-        );
+        for (name, paths) in &projects {
+            let workspace_index = Arc::new(WorkspaceIndex::new(paths.clone()));
+            s.projects.insert(
+                name.clone(),
+                ProjectEntry {
+                    name: name.clone(),
+                    paths: paths.clone(),
+                    workspace_index,
+                    mru_buffers: std::collections::VecDeque::new(),
+                },
+            );
+        }
     }
 
     // Initialize the watcher synchronously, before spawning the run task, so the test can call
@@ -142,7 +156,9 @@ pub async fn spawn_for_test(
     {
         let s = state.lock().await;
         if let Some(w) = s.watcher.clone() {
-            crate::watcher::watch_project_paths(&w, &project_paths);
+            for (_, paths) in &projects {
+                crate::watcher::watch_project_paths(&w, paths);
+            }
         }
     }
 

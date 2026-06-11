@@ -21,4 +21,4 @@ mod workspace_index;
 mod wrap;
 
 pub use config::{ProjectConfig, SERVER_PORT};
-pub use server::{run, run_with_listener, spawn_for_test, ServerHandle};
+pub use server::{run, run_with_listener, spawn_for_test, spawn_for_test_multi, ServerHandle};

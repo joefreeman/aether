@@ -55,7 +55,7 @@ use aether_protocol::lsp::{
 };
 use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker};
 use aether_protocol::LogicalPosition;
-use aether_server::spawn_for_test;
+use aether_server::{spawn_for_test, spawn_for_test_multi};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
@@ -11900,6 +11900,175 @@ async fn watcher_flags_deleted_file() {
     .await;
     assert!(path.exists(), "save should recreate the deleted file");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+
+    drop(server);
+}
+
+/// Connect a client, activate the named project, open `watched.txt` under root 0, and subscribe
+/// a viewport (so the watcher's `buffer/state` pushes reach it). Returns the socket + buffer id.
+async fn connect_and_open_watched(
+    ws_url: &str,
+    project: &str,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u64,
+) {
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: project.into(),
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("watched.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    (ws, open.buffer_id)
+}
+
+/// Two projects sharing one root, one client on each, the same file open in both — two distinct
+/// buffers for one canonical path. The watcher must fan disk events out to both, not just the
+/// first buffer iteration happens to find.
+async fn setup_overlapping_projects_watched_buffer(
+    initial: &str,
+) -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u64, // buffer id in proj-a
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u64, // buffer id in proj-b
+    std::path::PathBuf,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("watched.txt");
+    std::fs::write(&path, initial).unwrap();
+    // As in `setup_watched_buffer`: keep later writes' mtimes strictly above the loaded one so
+    // the self-save filter can't mistake them for our own.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test_multi(vec![
+        ("proj-a".into(), vec![dir_path.clone()]),
+        ("proj-b".into(), vec![dir_path]),
+    ])
+    .await
+    .unwrap();
+    let (ws_a, buf_a) = connect_and_open_watched(&server.ws_url(), "proj-a").await;
+    let (ws_b, buf_b) = connect_and_open_watched(&server.ws_url(), "proj-b").await;
+    (server, ws_a, buf_a, ws_b, buf_b, path)
+}
+
+#[tokio::test]
+async fn watcher_fans_out_external_write_to_buffers_in_all_projects() {
+    let (server, mut ws_a, buf_a, mut ws_b, buf_b, path) =
+        setup_overlapping_projects_watched_buffer("hello\n").await;
+    assert_ne!(buf_a, buf_b, "each project should hold its own buffer for the path");
+
+    std::fs::write(&path, "hello world\n").unwrap();
+
+    // Both buffers were clean, so both clients should see a silent reload.
+    let push_a = expect_notification_within::<BufferState>(
+        &mut ws_a,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(push_a.buffer_id, buf_a);
+    assert!(!push_a.externally_modified);
+    let push_b = expect_notification_within::<BufferState>(
+        &mut ws_b,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(push_b.buffer_id, buf_b);
+    assert!(!push_b.externally_modified);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn save_in_one_project_reloads_other_projects_buffer() {
+    let (server, mut ws_a, buf_a, mut ws_b, buf_b, path) =
+        setup_overlapping_projects_watched_buffer("hello\n").await;
+
+    // Edit + save in project A. The self-save filter suppresses the event for A's buffer (its
+    // recorded mtime matches the write) but must not suppress it for B's.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws_a,
+        10,
+        &InputTextParams {
+            buffer_id: buf_a,
+            text: "from-a-".into(),
+            select_pasted: false,
+        },
+    )
+    .await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws_a,
+        11,
+        &BufferSaveParams {
+            buffer_id: buf_a,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+
+    // B's buffer was clean → silent reload, announced via buffer/state.
+    let push_b = expect_notification_within::<BufferState>(
+        &mut ws_b,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(push_b.buffer_id, buf_b);
+    assert!(!push_b.externally_modified, "clean buffer should silently reload");
+
+    // Saving B without overwrite proves the reload landed: a stale-but-unflagged buffer would
+    // clobber A's text on disk, and a flagged one would be rejected.
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws_b,
+        12,
+        &BufferSaveParams {
+            buffer_id: buf_b,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "from-a-hello\n");
 
     drop(server);
 }

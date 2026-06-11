@@ -572,14 +572,16 @@ impl ServerState {
         })
     }
 
-    /// Locate an already-open buffer for the given canonical path, in any project. Used by the
-    /// file watcher, which has a path but not a project context — the watcher fires per
-    /// (path, event) pair and the project is recovered from the buffer itself.
-    pub fn buffer_for_path_any_project(&self, canonical: &Path) -> Option<BufferId> {
+    /// Locate every open buffer for the given canonical path, across all projects. Used by the
+    /// file watcher, which has a path but not a project context. Plural because projects with
+    /// overlapping roots can each hold their own buffer for the same file — a disk change must
+    /// reach all of them, not whichever one iteration order yields first.
+    pub fn buffers_for_path(&self, canonical: &Path) -> Vec<BufferId> {
         self.buffers
             .iter()
-            .find(|(_, b)| b.canonical_path.as_deref() == Some(canonical))
+            .filter(|(_, b)| b.canonical_path.as_deref() == Some(canonical))
             .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Tear down all per-`(client, buffer)` state for buffers that belong to `project_name`,
