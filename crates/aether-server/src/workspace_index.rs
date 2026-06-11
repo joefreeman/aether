@@ -116,7 +116,11 @@ fn walk(roots: &[PathBuf]) -> Vec<CachedFile> {
 /// the `+ignored` / `+hidden` filters run this directly for a one-shot relaxed file list.
 /// `.git` directories stay excluded even with `include_hidden` — searching repo internals is
 /// never what those filters mean.
-pub fn walk_with(roots: &[PathBuf], include_ignored: bool, include_hidden: bool) -> Vec<CachedFile> {
+pub fn walk_with(
+    roots: &[PathBuf],
+    include_ignored: bool,
+    include_hidden: bool,
+) -> Vec<CachedFile> {
     let mut out: Vec<CachedFile> = Vec::new();
 
     for (path_index, root) in roots.iter().enumerate() {

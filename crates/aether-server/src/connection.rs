@@ -19,22 +19,22 @@ use aether_protocol::cursor::{
     CursorSwapAnchor, CursorUndo,
 };
 use aether_protocol::directory::{DirectoryCreate, DirectoryList};
-use aether_protocol::git::{
-    GitApplyHunk, GitBlameLine, GitCommitInfo, GitNavigateHunk, GitSetDiffView,
-};
-use aether_protocol::nav::{NavBack, NavForward, NavGoto, NavRecord};
-use aether_protocol::lsp::{
-    LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic, LspRestartServer,
-    LspServerStatusList,
-};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
+};
+use aether_protocol::git::{
+    GitApplyHunk, GitBlameLine, GitCommitInfo, GitNavigateHunk, GitSetDiffView,
 };
 use aether_protocol::input::{
     InputBackspace, InputChangeLine, InputDedent, InputDelete, InputDeleteLine, InputIndent,
     InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine,
     InputSurround, InputText, InputToggleComment, InputUndo, InputUnsurround,
 };
+use aether_protocol::lsp::{
+    LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic, LspRestartServer,
+    LspServerStatusList,
+};
+use aether_protocol::nav::{NavBack, NavForward, NavGoto, NavRecord};
 use aether_protocol::path::PathDelete;
 use aether_protocol::picker::{
     PickerGrepFileJump, PickerGrepNavigate, PickerHide, PickerQuery, PickerSelect, PickerView,
@@ -54,7 +54,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse as HsErr, Request as HsReq, Response as HsResp};
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse as HsErr, Request as HsReq, Response as HsResp,
+};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -110,14 +112,17 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
                 .is_some_and(crate::http::is_loopback_authority);
             let origin_ok = match headers.get("origin") {
                 None => true,
-                Some(o) => o
-                    .to_str()
-                    .is_ok_and(crate::http::is_loopback_authority),
+                Some(o) => o.to_str().is_ok_and(crate::http::is_loopback_authority),
             };
             if host_ok && origin_ok {
                 Ok(resp)
             } else {
-                tracing::warn!(?peer, host_ok, origin_ok, "rejecting connection: non-loopback host/origin");
+                tracing::warn!(
+                    ?peer,
+                    host_ok,
+                    origin_ok,
+                    "rejecting connection: non-loopback host/origin"
+                );
                 let mut err = HsErr::new(Some("forbidden".into()));
                 *err.status_mut() = StatusCode::FORBIDDEN;
                 Err(err)
@@ -190,7 +195,9 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
     });
 
     loop {
-        let Some(msg) = reader.next().await else { break };
+        let Some(msg) = reader.next().await else {
+            break;
+        };
         let msg = msg?;
         match msg {
             Message::Text(text) => {
@@ -389,7 +396,9 @@ async fn dispatch(
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),
         LspGotoDefinition::NAME => run!(LspGotoDefinition, handlers::lsp_goto_definition),
-        LspNavigateDiagnostic::NAME => run!(LspNavigateDiagnostic, handlers::lsp_navigate_diagnostic),
+        LspNavigateDiagnostic::NAME => {
+            run!(LspNavigateDiagnostic, handlers::lsp_navigate_diagnostic)
+        }
         LspFormat::NAME => run!(LspFormat, handlers::lsp_format),
         other => Err(RpcError::method_not_found(other)),
     }

@@ -74,22 +74,26 @@ mod tests {
 
     #[test]
     fn absolute_path_gets_three_slashes() {
-        assert_eq!(path_to_uri(Path::new("/home/joe/x.rs")), "file:///home/joe/x.rs");
+        assert_eq!(
+            path_to_uri(Path::new("/home/joe/x.rs")),
+            "file:///home/joe/x.rs"
+        );
     }
 
     #[test]
     fn spaces_and_specials_are_encoded() {
-        assert_eq!(
-            path_to_uri(Path::new("/a b/c#d")),
-            "file:///a%20b/c%23d"
-        );
+        assert_eq!(path_to_uri(Path::new("/a b/c#d")), "file:///a%20b/c%23d");
     }
 
     #[test]
     fn round_trips() {
         for p in ["/home/joe/main.rs", "/tmp/a b/π/x#1.go", "/x/c++/y.cpp"] {
             let uri = path_to_uri(Path::new(p));
-            assert_eq!(uri_to_path(&uri).unwrap(), PathBuf::from(p), "uri was {uri}");
+            assert_eq!(
+                uri_to_path(&uri).unwrap(),
+                PathBuf::from(p),
+                "uri was {uri}"
+            );
         }
     }
 

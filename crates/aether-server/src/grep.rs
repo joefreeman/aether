@@ -180,8 +180,7 @@ async fn run_search(
                     pickers, matcher, ..
                 } = &mut *s;
                 let picker = pickers.get_mut(&key).expect("checked above");
-                picker.last_completed_search =
-                    Some((picker.query.clone(), picker.filters.clone()));
+                picker.last_completed_search = Some((picker.query.clone(), picker.filters.clone()));
                 let mut update = picker_state::build_update(picker, matcher);
                 if let Some(ref mut u) = update {
                     u.ticking = false;
@@ -260,9 +259,12 @@ impl FileFilter {
                 .iter()
                 .map(|d| (d.path_index, d.relative_path.clone()))
                 .collect(),
-            changed: filters
-                .changed_only
-                .then(|| roots.iter().map(|r| crate::git::repo_status_for_root(r)).collect()),
+            changed: filters.changed_only.then(|| {
+                roots
+                    .iter()
+                    .map(|r| crate::git::repo_status_for_root(r))
+                    .collect()
+            }),
         }
     }
 
@@ -514,7 +516,11 @@ mod tests {
         line.replace_range(500..506, "needle");
         let match_chars: Vec<u32> = (500..506).collect();
         let (p, idx) = windowed_preview(&line, 1000, match_chars);
-        assert_eq!(p.chars().count(), MAX_PREVIEW_CHARS + 1, "window + ellipsis");
+        assert_eq!(
+            p.chars().count(),
+            MAX_PREVIEW_CHARS + 1,
+            "window + ellipsis"
+        );
         assert!(p.starts_with('…'));
         let start = 500 - PREVIEW_LEAD_CHARS;
         let expected: Vec<u32> = (500..506).map(|i| (i - start + 1) as u32).collect();
@@ -543,7 +549,10 @@ mod tests {
             vec![(998 - start + 1) as u32, (999 - start + 1) as u32]
         );
         let max_idx = *idx.iter().max().unwrap() as usize;
-        assert!(max_idx < p.chars().count(), "indices stay inside the window");
+        assert!(
+            max_idx < p.chars().count(),
+            "indices stay inside the window"
+        );
     }
 
     #[test]

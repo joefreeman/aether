@@ -116,8 +116,10 @@ pub fn load_baseline(path: &Path) -> GitBaseline {
     let index_blob = index_blob_bytes(&repo, &rel_path).map(normalize_lf);
     // Staged diff is HEAD → index; absent sides count as empty (a staged add has no HEAD side, a
     // staged whole-file delete has no index side).
-    let staged_hunks =
-        hunks_from_buffers(blob.as_deref().unwrap_or(b""), index_blob.as_deref().unwrap_or(b""));
+    let staged_hunks = hunks_from_buffers(
+        blob.as_deref().unwrap_or(b""),
+        index_blob.as_deref().unwrap_or(b""),
+    );
     GitBaseline {
         repo: Some(GitRepo { workdir, rel_path }),
         blob,
@@ -212,12 +214,16 @@ fn hunks_from_buffers(old: &[u8], new: &[u8]) -> Vec<DiffHunk> {
 
     let mut hunks = Vec::new();
     for h in 0..patch.num_hunks() {
-        let Ok((hunk, _)) = patch.hunk(h) else { continue };
+        let Ok((hunk, _)) = patch.hunk(h) else {
+            continue;
+        };
         let line_count = patch.num_lines_in_hunk(h).unwrap_or(0);
 
         let mut deleted = Vec::new();
         for l in 0..line_count {
-            let Ok(line) = patch.line_in_hunk(h, l) else { continue };
+            let Ok(line) = patch.line_in_hunk(h, l) else {
+                continue;
+            };
             if line.origin() == '-' {
                 deleted.push(line_content(&line));
             }
@@ -864,7 +870,10 @@ mod tests {
         let h = &hunks[0];
         assert_eq!(h.kind, ChangeKind::Deleted);
         assert_eq!(h.new_lines, 0);
-        assert_eq!(h.anchor_line, 1, "deleted block renders above 0-based line 1 (d)");
+        assert_eq!(
+            h.anchor_line, 1,
+            "deleted block renders above 0-based line 1 (d)"
+        );
         assert_eq!(h.deleted, vec!["b".to_string(), "c".to_string()]);
     }
 
@@ -901,9 +910,15 @@ mod tests {
         let old = "a\nb\nc\n";
         let new = "a\nB\nc\nextra\n";
         let got = merged_str(old, new, HunkSelection::WholeHunkAt(1), true).unwrap();
-        assert_eq!(got, "a\nB\nc\n", "modification staged, trailing addition left out");
+        assert_eq!(
+            got, "a\nB\nc\n",
+            "modification staged, trailing addition left out"
+        );
         let got = merged_str(old, new, HunkSelection::WholeHunkAt(3), true).unwrap();
-        assert_eq!(got, "a\nb\nc\nextra\n", "addition staged, modification left out");
+        assert_eq!(
+            got, "a\nb\nc\nextra\n",
+            "addition staged, modification left out"
+        );
     }
 
     #[test]
@@ -924,7 +939,12 @@ mod tests {
 
     #[test]
     fn merge_selection_not_touching_any_hunk_is_none() {
-        let got = merged_str("a\nb\nc\n", "a\nb\nC\n", HunkSelection::Lines { lo: 0, hi: 1 }, true);
+        let got = merged_str(
+            "a\nb\nc\n",
+            "a\nb\nC\n",
+            HunkSelection::Lines { lo: 0, hi: 1 },
+            true,
+        );
         assert!(got.is_none());
     }
 
@@ -998,10 +1018,26 @@ mod tests {
         let new = b"a\nX\nY\nc\ne\n";
         let hunks = hunks_from_buffers(old, new);
         assert_eq!(map_line_to_old(&hunks, 0, false), 0, "before any hunk");
-        assert_eq!(map_line_to_old(&hunks, 1, false), 1, "inside hunk clamps to old start");
-        assert_eq!(map_line_to_old(&hunks, 2, true), 1, "round_up clamps to old end");
-        assert_eq!(map_line_to_old(&hunks, 3, false), 2, "after +1 hunk shifts back");
-        assert_eq!(map_line_to_old(&hunks, 4, false), 4, "after the deletion shifts forward");
+        assert_eq!(
+            map_line_to_old(&hunks, 1, false),
+            1,
+            "inside hunk clamps to old start"
+        );
+        assert_eq!(
+            map_line_to_old(&hunks, 2, true),
+            1,
+            "round_up clamps to old end"
+        );
+        assert_eq!(
+            map_line_to_old(&hunks, 3, false),
+            2,
+            "after +1 hunk shifts back"
+        );
+        assert_eq!(
+            map_line_to_old(&hunks, 4, false),
+            4,
+            "after the deletion shifts forward"
+        );
     }
 
     // ---- map_line_to_new / compose_both (combined staged+unstaged view) -------------------------
@@ -1011,11 +1047,31 @@ mod tests {
         // old: a b c d e ; new: a X Y c e   (b -> X,Y modified; d deleted above e)
         let hunks = hunks_from_buffers(b"a\nb\nc\nd\ne\n", b"a\nX\nY\nc\ne\n");
         assert_eq!(map_line_to_new(&hunks, 0, false), 0, "before any hunk");
-        assert_eq!(map_line_to_new(&hunks, 1, false), 1, "inside clamps to new start");
-        assert_eq!(map_line_to_new(&hunks, 1, true), 2, "round_up clamps to new end");
-        assert_eq!(map_line_to_new(&hunks, 2, false), 3, "after a +1 hunk shifts forward");
-        assert_eq!(map_line_to_new(&hunks, 3, false), 4, "deleted old line clamps to its anchor");
-        assert_eq!(map_line_to_new(&hunks, 4, false), 4, "after the deletion shifts back");
+        assert_eq!(
+            map_line_to_new(&hunks, 1, false),
+            1,
+            "inside clamps to new start"
+        );
+        assert_eq!(
+            map_line_to_new(&hunks, 1, true),
+            2,
+            "round_up clamps to new end"
+        );
+        assert_eq!(
+            map_line_to_new(&hunks, 2, false),
+            3,
+            "after a +1 hunk shifts forward"
+        );
+        assert_eq!(
+            map_line_to_new(&hunks, 3, false),
+            4,
+            "deleted old line clamps to its anchor"
+        );
+        assert_eq!(
+            map_line_to_new(&hunks, 4, false),
+            4,
+            "after the deletion shifts back"
+        );
     }
 
     #[test]
@@ -1026,7 +1082,10 @@ mod tests {
         let both = compose_both(&staged, &unstaged);
         assert_eq!(both.len(), 2);
         assert_eq!((both[0].anchor_line, both[0].stage), (1, DiffStage::Staged));
-        assert_eq!((both[1].anchor_line, both[1].stage), (3, DiffStage::Unstaged));
+        assert_eq!(
+            (both[1].anchor_line, both[1].stage),
+            (3, DiffStage::Unstaged)
+        );
     }
 
     #[test]
@@ -1037,8 +1096,14 @@ mod tests {
         let both = compose_both(&staged, &unstaged);
         assert_eq!(both.len(), 2);
         // Staged-first at the shared anchor, both covering buffer line 1.
-        assert_eq!((both[0].anchor_line, both[0].new_lines, both[0].stage), (1, 1, DiffStage::Staged));
-        assert_eq!((both[1].anchor_line, both[1].new_lines, both[1].stage), (1, 1, DiffStage::Unstaged));
+        assert_eq!(
+            (both[0].anchor_line, both[0].new_lines, both[0].stage),
+            (1, 1, DiffStage::Staged)
+        );
+        assert_eq!(
+            (both[1].anchor_line, both[1].new_lines, both[1].stage),
+            (1, 1, DiffStage::Unstaged)
+        );
     }
 
     #[test]
@@ -1050,7 +1115,10 @@ mod tests {
         let both = compose_both(&staged, &unstaged);
         let staged_del = both.iter().find(|h| h.stage == DiffStage::Staged).unwrap();
         assert_eq!(staged_del.kind, ChangeKind::Deleted);
-        assert_eq!(staged_del.anchor_line, 2, "anchor shifted by the unstaged insert above");
+        assert_eq!(
+            staged_del.anchor_line, 2,
+            "anchor shifted by the unstaged insert above"
+        );
         assert_eq!(staged_del.deleted, vec!["b".to_string()]);
     }
 
@@ -1061,7 +1129,10 @@ mod tests {
         let unstaged: Vec<DiffHunk> = Vec::new();
         let both = compose_both(&staged, &unstaged);
         assert_eq!(both.len(), 1);
-        assert_eq!(both[0].anchor_line, 1, "EOF anchor preserved (past last content line)");
+        assert_eq!(
+            both[0].anchor_line, 1,
+            "EOF anchor preserved (past last content line)"
+        );
         assert_eq!(both[0].stage, DiffStage::Staged);
     }
 
@@ -1077,8 +1148,16 @@ mod tests {
 
         let baseline = load_baseline(&file);
         assert_eq!(baseline.index_blob.as_deref(), Some(&b"one\nTWO\n"[..]));
-        assert_eq!(baseline.blob.as_deref(), Some(&b"one\ntwo\n"[..]), "HEAD untouched");
-        assert_eq!(baseline.staged_hunks.len(), 1, "staged diff now has the change");
+        assert_eq!(
+            baseline.blob.as_deref(),
+            Some(&b"one\ntwo\n"[..]),
+            "HEAD untouched"
+        );
+        assert_eq!(
+            baseline.staged_hunks.len(),
+            1,
+            "staged diff now has the change"
+        );
     }
 
     #[test]
@@ -1089,7 +1168,10 @@ mod tests {
         let file = dir.path().join("new.rs");
         std::fs::write(&file, "hello\n").unwrap();
         let repo = load_baseline(&file).repo.expect("repo resolved");
-        assert!(load_baseline(&file).index_blob.is_none(), "untracked → no entry yet");
+        assert!(
+            load_baseline(&file).index_blob.is_none(),
+            "untracked → no entry yet"
+        );
 
         write_index_blob(&repo, b"hello\n").expect("index write");
 
@@ -1116,7 +1198,9 @@ mod tests {
         let mut index = repo.index().expect("index");
         index.add_path(Path::new(name)).expect("add");
         index.write().expect("index write");
-        let tree = repo.find_tree(index.write_tree().expect("write_tree")).unwrap();
+        let tree = repo
+            .find_tree(index.write_tree().expect("write_tree"))
+            .unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .expect("commit");
@@ -1273,7 +1357,11 @@ mod tests {
         std::fs::write(root.join("debug.log"), "noise\n").unwrap(); // Ignored
 
         let st = dir_statuses(root);
-        assert_eq!(st.get("clean.rs"), None, "unchanged tracked file is uncoloured");
+        assert_eq!(
+            st.get("clean.rs"),
+            None,
+            "unchanged tracked file is uncoloured"
+        );
         assert_eq!(st.get("mod.rs"), Some(&GitStatus::Modified));
         assert_eq!(
             st.get("sub"),
@@ -1313,7 +1401,11 @@ mod tests {
 
         let st = dir_statuses(&root.join("sub"));
         assert_eq!(st.get("deep.rs"), Some(&GitStatus::Modified));
-        assert_eq!(st.get("top.rs"), None, "a sibling outside the listed dir is absent");
+        assert_eq!(
+            st.get("top.rs"),
+            None,
+            "a sibling outside the listed dir is absent"
+        );
     }
 
     #[test]
@@ -1329,10 +1421,7 @@ mod tests {
     fn repo_status_for_root_reports_per_file_status() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        repo_with_files(
-            root,
-            &[("clean.rs", "clean\n"), ("sub/mod.rs", "before\n")],
-        );
+        repo_with_files(root, &[("clean.rs", "clean\n"), ("sub/mod.rs", "before\n")]);
         std::fs::write(root.join("sub/mod.rs"), "after\n").unwrap(); // modified, nested
         std::fs::write(root.join("new.rs"), "new\n").unwrap(); // untracked at root
 
@@ -1349,7 +1438,10 @@ mod tests {
         // path relative to that root — the repo-relative prefix is handled internally.
         let dir = tempfile::tempdir().unwrap();
         let repo_root = dir.path();
-        repo_with_files(repo_root, &[("pkg/mod.rs", "before\n"), ("top.rs", "top\n")]);
+        repo_with_files(
+            repo_root,
+            &[("pkg/mod.rs", "before\n"), ("top.rs", "top\n")],
+        );
         std::fs::write(repo_root.join("pkg/mod.rs"), "after\n").unwrap();
 
         let rs = repo_status_for_root(&repo_root.join("pkg")).expect("subdir is in the repo");

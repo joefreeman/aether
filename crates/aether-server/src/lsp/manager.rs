@@ -121,7 +121,9 @@ impl LspManager {
         version: i64,
         text: &str,
     ) {
-        let Some(h) = self.servers.get_mut(key) else { return };
+        let Some(h) = self.servers.get_mut(key) else {
+            return;
+        };
         if h.open_buffers.contains(&buffer_id) {
             return;
         }
@@ -134,8 +136,12 @@ impl LspManager {
 
     /// Send `didChange` (full document) for a buffer that's open against a ready server.
     pub fn notify_change(&mut self, buffer_id: BufferId, uri: &str, version: i64, text: &str) {
-        let Some(key) = self.doc_server.get(&buffer_id) else { return };
-        let Some(h) = self.servers.get(key) else { return };
+        let Some(key) = self.doc_server.get(&buffer_id) else {
+            return;
+        };
+        let Some(h) = self.servers.get(key) else {
+            return;
+        };
         if !h.open_buffers.contains(&buffer_id) {
             return;
         }
@@ -183,7 +189,11 @@ impl LspManager {
     pub fn status_for_roots(&self, project_roots: &[PathBuf]) -> Vec<LspServerStatus> {
         self.servers
             .values()
-            .filter(|h| project_roots.iter().any(|r| h.workspace_root.starts_with(r)))
+            .filter(|h| {
+                project_roots
+                    .iter()
+                    .any(|r| h.workspace_root.starts_with(r))
+            })
             .map(handle_status)
             .collect()
     }
@@ -270,11 +280,28 @@ pub async fn launch(state: SharedState, key: LspServerKey, spec: LspServerSpec, 
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(server = %key.language, error = %e, "failed to spawn language server");
-            set_status(&state, &key, generation, LspStatus::Crashed { code: None, message: format!("spawn failed: {e}") }).await;
+            set_status(
+                &state,
+                &key,
+                generation,
+                LspStatus::Crashed {
+                    code: None,
+                    message: format!("spawn failed: {e}"),
+                },
+            )
+            .await;
             return;
         }
     };
-    bring_up(&state, key, generation, proc.client, proc.inbound, Some(proc.child)).await;
+    bring_up(
+        &state,
+        key,
+        generation,
+        proc.client,
+        proc.inbound,
+        Some(proc.child),
+    )
+    .await;
 }
 
 /// Perform the handshake, mark the server `Ready`, open every registered buffer, push the status
@@ -296,7 +323,16 @@ async fn bring_up(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(server = %key.language, error = %e, "lsp handshake failed");
-            set_status(state, &key, generation, LspStatus::Crashed { code: None, message: format!("handshake failed: {e}") }).await;
+            set_status(
+                state,
+                &key,
+                generation,
+                LspStatus::Crashed {
+                    code: None,
+                    message: format!("handshake failed: {e}"),
+                },
+            )
+            .await;
             return;
         }
     };
@@ -324,19 +360,31 @@ async fn bring_up(
         }
 
         // didOpen every still-present, file-backed buffer that registered before we were ready.
-        let registered: Vec<BufferId> =
-            s.lsp.servers[&key].registered_buffers.iter().copied().collect();
+        let registered: Vec<BufferId> = s.lsp.servers[&key]
+            .registered_buffers
+            .iter()
+            .copied()
+            .collect();
         for bid in registered {
             if s.lsp.servers[&key].open_buffers.contains(&bid) {
                 continue;
             }
-            let Some(buf) = s.buffers.get(&bid) else { continue };
-            let Some(path) = buf.canonical_path.as_deref() else { continue };
+            let Some(buf) = s.buffers.get(&bid) else {
+                continue;
+            };
+            let Some(path) = buf.canonical_path.as_deref() else {
+                continue;
+            };
             let doc_uri = uri::path_to_uri(path);
             let text = buf.text.to_string();
             let version = buf.revision as i64;
             if lifecycle::did_open(&client, &doc_uri, &key.language, version, &text).is_ok() {
-                s.lsp.servers.get_mut(&key).expect("present").open_buffers.insert(bid);
+                s.lsp
+                    .servers
+                    .get_mut(&key)
+                    .expect("present")
+                    .open_buffers
+                    .insert(bid);
             }
         }
 
@@ -361,8 +409,13 @@ async fn inbound_loop(
 ) {
     while let Some(msg) = inbound.recv().await {
         match msg {
-            LspInbound::Notification { method, params } if method == "textDocument/publishDiagnostics" => {
-                let count = params.get("diagnostics").and_then(|d| d.as_array()).map_or(0, Vec::len);
+            LspInbound::Notification { method, params }
+                if method == "textDocument/publishDiagnostics" =>
+            {
+                let count = params
+                    .get("diagnostics")
+                    .and_then(|d| d.as_array())
+                    .map_or(0, Vec::len);
                 tracing::debug!(server = %key.language, count, "lsp diagnostics");
                 handle_publish_diagnostics(&state, &key, &params).await;
             }
@@ -389,7 +442,16 @@ async fn inbound_loop(
         }
     }
     tracing::warn!(server = %key.language, "language server connection closed");
-    set_status(&state, &key, generation, LspStatus::Crashed { code: None, message: "connection closed".into() }).await;
+    set_status(
+        &state,
+        &key,
+        generation,
+        LspStatus::Crashed {
+            code: None,
+            message: "connection closed".into(),
+        },
+    )
+    .await;
 }
 
 /// Build our reply to a server→client request we don't actively handle yet.
@@ -402,7 +464,10 @@ async fn inbound_loop(
 fn server_request_response(method: &str, params: &Value) -> Value {
     match method {
         "workspace/configuration" => {
-            let n = params.get("items").and_then(Value::as_array).map_or(0, Vec::len);
+            let n = params
+                .get("items")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
             Value::Array(vec![Value::Null; n])
         }
         _ => Value::Null,
@@ -445,14 +510,28 @@ async fn handle_progress(
         Some(other) => other.to_string(), // numeric tokens → their JSON form
         None => return Vec::new(),
     };
-    let Some(value) = params.get("value") else { return Vec::new() };
+    let Some(value) = params.get("value") else {
+        return Vec::new();
+    };
     let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
-    let message = || value.get("message").and_then(Value::as_str).map(str::to_string);
-    let percentage = || value.get("percentage").and_then(Value::as_u64).map(|p| p as u32);
+    let message = || {
+        value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let percentage = || {
+        value
+            .get("percentage")
+            .and_then(Value::as_u64)
+            .map(|p| p as u32)
+    };
     let now = Instant::now();
 
     let mut guard = state.lock().await;
-    let Some(h) = guard.lsp.servers.get_mut(key) else { return Vec::new() };
+    let Some(h) = guard.lsp.servers.get_mut(key) else {
+        return Vec::new();
+    };
     // Update the in-memory map (always — so any later push carries the current value), and note
     // whether this was a `report` (busy unchanged → throttled, picker-only fan-out).
     let report_only = match kind {
@@ -462,11 +541,20 @@ async fn handle_progress(
                 .and_then(Value::as_str)
                 .unwrap_or("working")
                 .to_string();
-            h.progress.insert(token, LspProgress { title, message: message(), percentage: percentage() });
+            h.progress.insert(
+                token,
+                LspProgress {
+                    title,
+                    message: message(),
+                    percentage: percentage(),
+                },
+            );
             false
         }
         "report" => {
-            let Some(entry) = h.progress.get_mut(&token) else { return Vec::new() };
+            let Some(entry) = h.progress.get_mut(&token) else {
+                return Vec::new();
+            };
             if let Some(m) = message() {
                 entry.message = Some(m);
             }
@@ -501,8 +589,12 @@ async fn handle_progress(
 /// Resolve a `publishDiagnostics` payload to a buffer, convert it to buffer coordinates using the
 /// server's negotiated encoding, store it, and re-render the buffer's viewports.
 async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, params: &Value) {
-    let Some(doc_uri) = params.get("uri").and_then(Value::as_str) else { return };
-    let Some(path) = uri::uri_to_path(doc_uri) else { return };
+    let Some(doc_uri) = params.get("uri").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(path) = uri::uri_to_path(doc_uri) else {
+        return;
+    };
     let diags_json = params.get("diagnostics").cloned().unwrap_or(Value::Null);
 
     let pushes = {
@@ -538,13 +630,17 @@ pub async fn restart(state: &SharedState, language: &str, project_roots: &[PathB
             .lsp
             .servers
             .keys()
-            .filter(|k| k.language == language && project_roots.iter().any(|r| k.root.starts_with(r)))
+            .filter(|k| {
+                k.language == language && project_roots.iter().any(|r| k.root.starts_with(r))
+            })
             .cloned()
             .collect()
     };
 
     for key in keys {
-        let Some(spec) = config::server_spec(&key.language) else { continue };
+        let Some(spec) = config::server_spec(&key.language) else {
+            continue;
+        };
         let relaunch = {
             let mut guard = state.lock().await;
             let s = &mut *guard;
@@ -573,7 +669,9 @@ pub async fn restart(state: &SharedState, language: &str, project_roots: &[PathB
 async fn set_status(state: &SharedState, key: &LspServerKey, generation: u64, status: LspStatus) {
     let pushes = {
         let mut guard = state.lock().await;
-        let Some(h) = guard.lsp.servers.get_mut(key) else { return };
+        let Some(h) = guard.lsp.servers.get_mut(key) else {
+            return;
+        };
         if h.generation != generation {
             return; // superseded by a newer instance
         }
@@ -605,7 +703,9 @@ fn collect_status_pushes(
     s: &ServerState,
     key: &LspServerKey,
 ) -> Vec<(mpsc::Sender<Notification>, Notification)> {
-    let Some(handle) = s.lsp.servers.get(key) else { return Vec::new() };
+    let Some(handle) = s.lsp.servers.get(key) else {
+        return Vec::new();
+    };
     let params = serde_json::to_value(handle_status(handle)).expect("infallible");
     s.clients
         .values()
@@ -656,7 +756,12 @@ mod tests {
         let file = src.join("main.rs");
         std::fs::write(&file, "").unwrap();
 
-        let found = discover_root(&file, &["Cargo.toml"], WorkspaceMarker::None, &[root.to_path_buf()]);
+        let found = discover_root(
+            &file,
+            &["Cargo.toml"],
+            WorkspaceMarker::None,
+            &[root.to_path_buf()],
+        );
         assert_eq!(found, root);
     }
 
@@ -671,7 +776,12 @@ mod tests {
         let file = inner.join("lib.rs");
         std::fs::write(&file, "").unwrap();
 
-        let found = discover_root(&file, &["Cargo.toml"], WorkspaceMarker::None, &[root.to_path_buf()]);
+        let found = discover_root(
+            &file,
+            &["Cargo.toml"],
+            WorkspaceMarker::None,
+            &[root.to_path_buf()],
+        );
         assert_eq!(found, inner);
     }
 
@@ -684,7 +794,12 @@ mod tests {
         let file = sub.join("main.rs");
         std::fs::write(&file, "").unwrap();
 
-        let found = discover_root(&file, &["Cargo.toml"], WorkspaceMarker::None, &[root.to_path_buf()]);
+        let found = discover_root(
+            &file,
+            &["Cargo.toml"],
+            WorkspaceMarker::None,
+            &[root.to_path_buf()],
+        );
         assert_eq!(found, root);
     }
 
@@ -695,16 +810,26 @@ mod tests {
         // rust-analyzer for the whole workspace.
         let dir = tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/x\"]\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/x\"]\n",
+        )
+        .unwrap();
         let crate_dir = root.join("crates/x");
         std::fs::create_dir_all(crate_dir.join("src")).unwrap();
         std::fs::write(crate_dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         let file = crate_dir.join("src/main.rs");
         std::fs::write(&file, "").unwrap();
 
-        let ws = WorkspaceMarker::FileContaining { file: "Cargo.toml", needle: "[workspace]" };
+        let ws = WorkspaceMarker::FileContaining {
+            file: "Cargo.toml",
+            needle: "[workspace]",
+        };
         let found = discover_root(&file, &["Cargo.toml"], ws, &[root.to_path_buf()]);
-        assert_eq!(found, root, "should resolve to the workspace root, not the crate");
+        assert_eq!(
+            found, root,
+            "should resolve to the workspace root, not the crate"
+        );
     }
 
     #[test]
@@ -719,7 +844,10 @@ mod tests {
         let file = inner.join("lib.rs");
         std::fs::write(&file, "").unwrap();
 
-        let ws = WorkspaceMarker::FileContaining { file: "Cargo.toml", needle: "[workspace]" };
+        let ws = WorkspaceMarker::FileContaining {
+            file: "Cargo.toml",
+            needle: "[workspace]",
+        };
         let found = discover_root(&file, &["Cargo.toml"], ws, &[root.to_path_buf()]);
         assert_eq!(found, inner);
     }
@@ -748,8 +876,11 @@ mod tests {
     // ---- notify routing -------------------------------------------------------------------------
 
     /// Mock server: replies to `initialize`, forwards every notification it receives to `events`.
-    async fn mock_server<R, W>(reader: R, mut writer: W, events: mpsc::UnboundedSender<(String, Value)>)
-    where
+    async fn mock_server<R, W>(
+        reader: R,
+        mut writer: W,
+        events: mpsc::UnboundedSender<(String, Value)>,
+    ) where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
@@ -836,17 +967,38 @@ mod tests {
         // First report always goes out.
         assert!(report_due(None, t0, interval));
         // Within the window → suppressed; at/after the window → due again.
-        assert!(!report_due(Some(t0), t0 + Duration::from_millis(40), interval));
-        assert!(!report_due(Some(t0), t0 + Duration::from_millis(99), interval));
-        assert!(report_due(Some(t0), t0 + Duration::from_millis(100), interval));
-        assert!(report_due(Some(t0), t0 + Duration::from_millis(250), interval));
+        assert!(!report_due(
+            Some(t0),
+            t0 + Duration::from_millis(40),
+            interval
+        ));
+        assert!(!report_due(
+            Some(t0),
+            t0 + Duration::from_millis(99),
+            interval
+        ));
+        assert!(report_due(
+            Some(t0),
+            t0 + Duration::from_millis(100),
+            interval
+        ));
+        assert!(report_due(
+            Some(t0),
+            t0 + Duration::from_millis(250),
+            interval
+        ));
     }
 
     #[tokio::test]
     async fn progress_begin_report_end_tracks_active_work() {
-        let key = LspServerKey { root: PathBuf::from("/proj"), language: "rust".into() };
+        let key = LspServerKey {
+            root: PathBuf::from("/proj"),
+            language: "rust".into(),
+        };
         let mut st = ServerState::new();
-        st.lsp.servers.insert(key.clone(), clientless_ready_handle(&key));
+        st.lsp
+            .servers
+            .insert(key.clone(), clientless_ready_handle(&key));
         let state = std::sync::Arc::new(tokio::sync::Mutex::new(st));
 
         let progress = |state: &SharedState, key: &LspServerKey, params: Value| {
@@ -858,9 +1010,14 @@ mod tests {
         };
 
         // begin → one active operation, captured title.
-        progress(&state, &key, json!({
-            "token": "idx", "value": { "kind": "begin", "title": "Indexing", "percentage": 0 }
-        })).await;
+        progress(
+            &state,
+            &key,
+            json!({
+                "token": "idx", "value": { "kind": "begin", "title": "Indexing", "percentage": 0 }
+            }),
+        )
+        .await;
         {
             let g = state.lock().await;
             let p = handle_status(&g.lsp.servers[&key]).progress;
@@ -870,9 +1027,14 @@ mod tests {
         }
 
         // A second concurrent token, plus a report that updates the first.
-        progress(&state, &key, json!({
-            "token": "chk", "value": { "kind": "begin", "title": "cargo check" }
-        })).await;
+        progress(
+            &state,
+            &key,
+            json!({
+                "token": "chk", "value": { "kind": "begin", "title": "cargo check" }
+            }),
+        )
+        .await;
         progress(&state, &key, json!({
             "token": "idx", "value": { "kind": "report", "message": "120/430", "percentage": 28 }
         })).await;
@@ -887,7 +1049,12 @@ mod tests {
         }
 
         // end removes just that token; the other stays active (still busy).
-        progress(&state, &key, json!({ "token": "idx", "value": { "kind": "end" } })).await;
+        progress(
+            &state,
+            &key,
+            json!({ "token": "idx", "value": { "kind": "end" } }),
+        )
+        .await;
         {
             let g = state.lock().await;
             let p = handle_status(&g.lsp.servers[&key]).progress;
@@ -896,7 +1063,12 @@ mod tests {
         }
 
         // Final end → idle (no progress, glyph goes back to ●).
-        progress(&state, &key, json!({ "token": "chk", "value": { "kind": "end" } })).await;
+        progress(
+            &state,
+            &key,
+            json!({ "token": "chk", "value": { "kind": "end" } }),
+        )
+        .await;
         {
             let g = state.lock().await;
             assert!(handle_status(&g.lsp.servers[&key]).progress.is_empty());
@@ -905,7 +1077,10 @@ mod tests {
 
     #[tokio::test]
     async fn open_change_close_reach_the_server() {
-        let key = LspServerKey { root: PathBuf::from("/proj"), language: "rust".into() };
+        let key = LspServerKey {
+            root: PathBuf::from("/proj"),
+            language: "rust".into(),
+        };
         let (handle, mut ev) = ready_handle_to_mock(&key);
         let mut mgr = LspManager::default();
         mgr.servers.insert(key.clone(), handle);
@@ -932,14 +1107,19 @@ mod tests {
         // After close the doc is forgotten: a further change is a no-op (no message).
         mgr.notify_change(7, uri, 3, "x");
         assert!(
-            tokio::time::timeout(Duration::from_millis(150), ev.recv()).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(150), ev.recv())
+                .await
+                .is_err(),
             "no message expected after close"
         );
     }
 
     #[tokio::test]
     async fn notify_close_tears_down_idle_server() {
-        let key = LspServerKey { root: PathBuf::from("/proj"), language: "rust".into() };
+        let key = LspServerKey {
+            root: PathBuf::from("/proj"),
+            language: "rust".into(),
+        };
         let (handle, mut ev) = ready_handle_to_mock(&key);
         let mut mgr = LspManager::default();
         mgr.servers.insert(key.clone(), handle);
@@ -958,7 +1138,10 @@ mod tests {
 
     #[tokio::test]
     async fn notify_close_keeps_server_with_other_buffers() {
-        let key = LspServerKey { root: PathBuf::from("/proj"), language: "rust".into() };
+        let key = LspServerKey {
+            root: PathBuf::from("/proj"),
+            language: "rust".into(),
+        };
         let (handle, mut ev) = ready_handle_to_mock(&key);
         let mut mgr = LspManager::default();
         mgr.servers.insert(key.clone(), handle);
@@ -976,7 +1159,10 @@ mod tests {
 
     #[tokio::test]
     async fn change_before_open_is_dropped() {
-        let key = LspServerKey { root: PathBuf::from("/proj"), language: "rust".into() };
+        let key = LspServerKey {
+            root: PathBuf::from("/proj"),
+            language: "rust".into(),
+        };
         let (handle, mut ev) = ready_handle_to_mock(&key);
         let mut mgr = LspManager::default();
         mgr.servers.insert(key.clone(), handle);
@@ -985,7 +1171,9 @@ mod tests {
         // No didOpen yet → didChange must not be sent (the server doesn't know the doc).
         mgr.notify_change(7, "file:///proj/x.rs", 2, "x");
         assert!(
-            tokio::time::timeout(Duration::from_millis(150), ev.recv()).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(150), ev.recv())
+                .await
+                .is_err(),
             "didChange before didOpen should be suppressed"
         );
     }
@@ -993,10 +1181,19 @@ mod tests {
     #[test]
     fn ensure_is_idempotent_and_bumps_generation() {
         let mut mgr = LspManager::default();
-        let a = LspServerKey { root: PathBuf::from("/a"), language: "rust".into() };
-        let b = LspServerKey { root: PathBuf::from("/b"), language: "go".into() };
+        let a = LspServerKey {
+            root: PathBuf::from("/a"),
+            language: "rust".into(),
+        };
+        let b = LspServerKey {
+            root: PathBuf::from("/b"),
+            language: "go".into(),
+        };
         let g0 = mgr.ensure(&a, "rust-analyzer").expect("created");
-        assert!(mgr.ensure(&a, "rust-analyzer").is_none(), "second ensure is a no-op");
+        assert!(
+            mgr.ensure(&a, "rust-analyzer").is_none(),
+            "second ensure is a no-op"
+        );
         let g1 = mgr.ensure(&b, "gopls").expect("created");
         assert_ne!(g0, g1, "distinct handles get distinct generations");
     }
@@ -1004,8 +1201,14 @@ mod tests {
     #[test]
     fn status_snapshot_filters_by_project_root() {
         let mut mgr = LspManager::default();
-        let in_proj = LspServerKey { root: PathBuf::from("/proj/a"), language: "rust".into() };
-        let out_proj = LspServerKey { root: PathBuf::from("/other"), language: "go".into() };
+        let in_proj = LspServerKey {
+            root: PathBuf::from("/proj/a"),
+            language: "rust".into(),
+        };
+        let out_proj = LspServerKey {
+            root: PathBuf::from("/other"),
+            language: "go".into(),
+        };
         mgr.ensure(&in_proj, "rust-analyzer");
         mgr.ensure(&out_proj, "gopls");
 
@@ -1023,8 +1226,14 @@ mod tests {
             server_request_response("workspace/configuration", &params),
             json!([null, null])
         );
-        assert_eq!(server_request_response("workspace/configuration", &json!({})), json!([]));
+        assert_eq!(
+            server_request_response("workspace/configuration", &json!({})),
+            json!([])
+        );
         // Other server requests get a bare null.
-        assert_eq!(server_request_response("workspace/applyEdit", &json!({})), json!(null));
+        assert_eq!(
+            server_request_response("workspace/applyEdit", &json!({})),
+            json!(null)
+        );
     }
 }

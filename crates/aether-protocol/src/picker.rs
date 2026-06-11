@@ -523,7 +523,9 @@ pub enum PickerSelectResult {
         position: LogicalPosition,
     },
     /// A project was selected. The client follows up with `project/activate` to switch.
-    Project { name: String },
+    Project {
+        name: String,
+    },
 }
 
 // ---- picker/hide --------------------------------------------------------------------------------

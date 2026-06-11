@@ -119,7 +119,12 @@ pub fn did_open(
 }
 
 /// Full-document change notification: resend the whole buffer.
-pub fn did_change_full(client: &LspClient, uri: &str, version: i64, text: &str) -> Result<(), LspError> {
+pub fn did_change_full(
+    client: &LspClient,
+    uri: &str,
+    version: i64,
+    text: &str,
+) -> Result<(), LspError> {
     client.notify(
         "textDocument/didChange",
         json!({
@@ -204,7 +209,9 @@ mod tests {
     #[tokio::test]
     async fn handshake_reads_encoding_and_name_and_sends_initialized() {
         let (client, mut ev) = connect_to_server(json!({ "positionEncoding": "utf-8" }));
-        let caps = initialize(&client, Path::new("/home/joe/proj"), None).await.unwrap();
+        let caps = initialize(&client, Path::new("/home/joe/proj"), None)
+            .await
+            .unwrap();
         assert_eq!(caps.name.as_deref(), Some("mock-ls"));
         assert_eq!(caps.position_encoding, PositionEncoding::Utf8);
 
@@ -212,7 +219,10 @@ mod tests {
         let (m1, p1) = recv(&mut ev).await;
         assert_eq!(m1, "request:initialize");
         assert_eq!(p1["rootUri"], "file:///home/joe/proj");
-        assert_eq!(p1["capabilities"]["general"]["positionEncodings"][0], "utf-8");
+        assert_eq!(
+            p1["capabilities"]["general"]["positionEncodings"][0],
+            "utf-8"
+        );
         let (m2, _) = recv(&mut ev).await;
         assert_eq!(m2, "initialized");
     }
@@ -229,20 +239,34 @@ mod tests {
     async fn handshake_reads_formatting_capability() {
         // Advertised → true; absent → false (the default).
         let (client, mut ev) = connect_to_server(json!({ "documentFormattingProvider": true }));
-        assert!(initialize(&client, Path::new("/p"), None).await.unwrap().document_formatting);
+        assert!(
+            initialize(&client, Path::new("/p"), None)
+                .await
+                .unwrap()
+                .document_formatting
+        );
         let _ = recv(&mut ev).await;
 
         let (client2, mut ev2) = connect_to_server(json!({}));
-        assert!(!initialize(&client2, Path::new("/p"), None).await.unwrap().document_formatting);
+        assert!(
+            !initialize(&client2, Path::new("/p"), None)
+                .await
+                .unwrap()
+                .document_formatting
+        );
         let _ = recv(&mut ev2).await;
     }
 
     #[tokio::test]
     async fn handshake_forwards_init_options() {
         let (client, mut ev) = connect_to_server(json!({}));
-        initialize(&client, Path::new("/p"), Some(json!({ "provideFormatter": true })))
-            .await
-            .unwrap();
+        initialize(
+            &client,
+            Path::new("/p"),
+            Some(json!({ "provideFormatter": true })),
+        )
+        .await
+        .unwrap();
         let (m, p) = recv(&mut ev).await;
         assert_eq!(m, "request:initialize");
         assert_eq!(p["initializationOptions"]["provideFormatter"], true);
@@ -266,7 +290,10 @@ mod tests {
         assert_eq!(m, "textDocument/didChange");
         assert_eq!(p["textDocument"]["version"], 2);
         assert_eq!(p["contentChanges"][0]["text"], "fn main() { todo!() }");
-        assert!(p["contentChanges"][0].get("range").is_none(), "full sync sends no range");
+        assert!(
+            p["contentChanges"][0].get("range").is_none(),
+            "full sync sends no range"
+        );
 
         did_close(&client, uri).unwrap();
         let (m, p) = recv(&mut ev).await;

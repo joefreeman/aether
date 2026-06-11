@@ -2,64 +2,63 @@
 //! handshake and `buffer/open`.
 
 use aether_protocol::buffer::{
-    BufferClose, BufferCloseParams, BufferCloseResult, BufferClosed, BufferClosedParams, BufferCopy,
-    BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
+    BufferClose, BufferCloseParams, BufferCloseResult, BufferClosed, BufferClosedParams,
+    BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
     BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferSaveResult,
     BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
     CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
-    CursorUndoParams, CursorUndoResult, Direction, Motion, VerticalDirection, WordBoundary,
+    CursorUndoParams, CursorUndoResult, Direction, Granularity, Motion, VerticalDirection,
+    WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameLine,
-    GitBlameLineParams, GitBlameLineResult, GitCommitInfo,
-    GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams,
-    GitNavigateHunkResult, GitSetDiffView,
-    GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBlameLineParams, GitBlameLineResult, GitCommitInfo, GitCommitInfoParams,
+    GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
+    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
-use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
     InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
     InputUnsurround, InputUnsurroundParams, SurroundTarget, UndoResult,
 };
-use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, PickerFilters, PickerGrepNavigate, PickerGrepNavigateParams,
-    PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
-    PickerQueryParams, PickerSelect,
-    PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
-    PickerViewParams, ScopedPath,
-};
-use aether_protocol::search::{
-    SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
-    SearchSet, SearchSetParams, SearchSetResult,
-};
-use aether_protocol::viewport::{
-    ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
-    ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSetWrap,
-    ViewportScrollToRow, ViewportScrollToRowParams, ViewportSetWrapParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportUnsubscribe,
-    ViewportUnsubscribeParams, ViewportWindowResult, VirtualRowKind, WrapMode,
+use aether_protocol::lsp::{
+    FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
+    LspGotoDefinitionResult, LspHover, LspHoverResult, LspServerStatus, LspStatus,
+    LspStatusChanged,
 };
 use aether_protocol::nav::{
     NavBack, NavForward, NavGoto, NavGotoParams, NavRecord, NavRecordParams, NavRecordResult,
     NavStepParams, NavStepResult,
 };
-use aether_protocol::lsp::{
-    FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
-    LspGotoDefinitionResult, LspHover, LspHoverResult, LspServerStatus, LspStatus, LspStatusChanged,
+use aether_protocol::picker::{
+    BufferDirtyState, CaseMode, PickerFilters, PickerGrepNavigate, PickerGrepNavigateParams,
+    PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
+    PickerQueryParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
+    PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
+};
+use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
+use aether_protocol::search::{
+    SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
+    SearchSet, SearchSetParams, SearchSetResult,
 };
 use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker};
+use aether_protocol::viewport::{
+    ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
+    ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportScrollToRow,
+    ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportUnsubscribe,
+    ViewportUnsubscribeParams, ViewportWindowResult, VirtualRowKind, WrapMode,
+};
 use aether_protocol::LogicalPosition;
 use aether_server::{spawn_for_test, spawn_for_test_multi};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
-
 
 async fn next_text(
     ws: &mut tokio_tungstenite::WebSocketStream<
@@ -295,6 +294,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         &mut ws,
         4,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: cursor_target,
             anchor: cursor_target,
@@ -816,9 +816,7 @@ async fn setup_with_buffer(
     // and the OS will clean up /tmp on reboot.
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -897,6 +895,7 @@ async fn cursor_set_and_extend_selection() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 6 },
             anchor: LogicalPosition { line: 0, col: 6 },
@@ -921,6 +920,116 @@ async fn cursor_set_and_extend_selection() {
     .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 9 });
     assert_eq!(st.anchor, LogicalPosition { line: 0, col: 6 });
+
+    drop(server);
+}
+
+/// Convenience for the granularity tests: one `cursor/set` round-trip.
+async fn set_snapped(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    buffer_id: u64,
+    position: LogicalPosition,
+    anchor: LogicalPosition,
+    granularity: Granularity,
+) -> CursorState {
+    send_request::<CursorSet>(
+        ws,
+        id,
+        &CursorSetParams {
+            granularity,
+            buffer_id,
+            position,
+            anchor,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn cursor_set_word_granularity_snaps_to_word_run() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta_2 gamma\nfoo.bar(baz)\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Double-click mid-word selects the whole word, forward-oriented (anchor at start).
+    let st = set_snapped(&mut ws, 10, buffer_id, p(0, 8), p(0, 8), Granularity::Word).await;
+    assert_eq!(st.anchor, p(0, 6)); // 'b' of "beta_2"
+    assert_eq!(st.position, p(0, 11)); // '2' of "beta_2" (inclusive)
+
+    // Double-click on whitespace selects just the whitespace run (here a single space).
+    let st = set_snapped(&mut ws, 11, buffer_id, p(0, 5), p(0, 5), Granularity::Word).await;
+    assert_eq!((st.anchor, st.position), (p(0, 5), p(0, 5)));
+
+    // Punctuation is its own category: '.' between word chars selects only itself.
+    let st = set_snapped(&mut ws, 12, buffer_id, p(1, 3), p(1, 3), Granularity::Word).await;
+    assert_eq!((st.anchor, st.position), (p(1, 3), p(1, 3)));
+
+    // Word-drag across words: both endpoints snap outward, direction preserved (backward drag
+    // keeps the cursor at the selection's start).
+    let st = set_snapped(&mut ws, 13, buffer_id, p(0, 1), p(0, 8), Granularity::Word).await;
+    assert_eq!(st.position, p(0, 0)); // start of "alpha"
+    assert_eq!(st.anchor, p(0, 11)); // end of "beta_2"
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn cursor_set_word_granularity_at_line_and_buffer_ends() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello\nworld").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Double-click at end-of-line (the newline cell) collapses to the line-end point rather
+    // than dragging in the next line's content.
+    let st = set_snapped(&mut ws, 10, buffer_id, p(0, 5), p(0, 5), Granularity::Word).await;
+    assert_eq!((st.anchor, st.position), (p(0, 5), p(0, 5)));
+
+    // Clicking anywhere in the buffer's first word — including its first char — selects it all.
+    let st = set_snapped(&mut ws, 11, buffer_id, p(0, 0), p(0, 0), Granularity::Word).await;
+    assert_eq!((st.anchor, st.position), (p(0, 0), p(0, 4)));
+    let st = set_snapped(&mut ws, 12, buffer_id, p(0, 2), p(0, 2), Granularity::Word).await;
+    assert_eq!((st.anchor, st.position), (p(0, 0), p(0, 4)));
+
+    // Past the last char of the final line (no trailing newline): clamps to the line-end point,
+    // matching the end-of-line collapse on interior lines.
+    let st = set_snapped(
+        &mut ws,
+        13,
+        buffer_id,
+        p(1, 99),
+        p(1, 99),
+        Granularity::Word,
+    )
+    .await;
+    assert_eq!((st.anchor, st.position), (p(1, 5), p(1, 5)));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn cursor_set_line_granularity_whole_line_normal_form() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("one\ntwo three\n\nfour").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Triple-click selects the whole line in normal form (anchor col 0, cursor at line end).
+    let st = set_snapped(&mut ws, 10, buffer_id, p(1, 4), p(1, 4), Granularity::Line).await;
+    assert_eq!(st.anchor, p(1, 0));
+    assert_eq!(st.position, p(1, 9));
+
+    // An empty line's whole-line form is the point at col 0.
+    let st = set_snapped(&mut ws, 11, buffer_id, p(2, 0), p(2, 0), Granularity::Line).await;
+    assert_eq!((st.anchor, st.position), (p(2, 0), p(2, 0)));
+
+    // Line-drag downward spans whole lines, including the final line without a trailing newline.
+    let st = set_snapped(&mut ws, 12, buffer_id, p(3, 2), p(1, 4), Granularity::Line).await;
+    assert_eq!(st.anchor, p(1, 0));
+    assert_eq!(st.position, p(3, 4));
+
+    // Line-drag upward keeps the cursor at the top edge.
+    let st = set_snapped(&mut ws, 13, buffer_id, p(0, 1), p(1, 4), Granularity::Line).await;
+    assert_eq!(st.position, p(0, 0));
+    assert_eq!(st.anchor, p(1, 9));
 
     drop(server);
 }
@@ -989,6 +1098,7 @@ async fn input_text_inserts_and_pushes_notification() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -1026,6 +1136,7 @@ async fn input_delete_backspace_removes_char_before_cursor() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 5 }, // end of "hello"
             anchor: LogicalPosition { line: 0, col: 5 },
@@ -1183,6 +1294,7 @@ async fn match_bracket_motion_jumps_to_pair() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
             anchor: LogicalPosition { line: 0, col: 9 },
@@ -1256,6 +1368,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
             anchor: LogicalPosition { line: 0, col: 9 },
@@ -1319,6 +1432,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 11 },
             anchor: LogicalPosition { line: 0, col: 11 },
@@ -1380,6 +1494,7 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 11 },
             anchor: LogicalPosition { line: 0, col: 11 },
@@ -1457,6 +1572,7 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
             anchor: LogicalPosition { line: 0, col: 9 },
@@ -1518,6 +1634,7 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
             anchor: LogicalPosition { line: 0, col: 9 },
@@ -1583,6 +1700,7 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -1672,6 +1790,7 @@ async fn end_of_unit_works_on_last_function() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
             anchor: LogicalPosition { line: 1, col: 0 },
@@ -1737,6 +1856,7 @@ async fn start_of_unit_extends_back_to_function_start() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 8 },
             anchor: LogicalPosition { line: 1, col: 8 },
@@ -1800,6 +1920,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -1903,6 +2024,7 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 12 },
             anchor: LogicalPosition { line: 2, col: 12 },
@@ -1977,6 +2099,7 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
             anchor: LogicalPosition { line: 1, col: 0 },
@@ -2044,6 +2167,7 @@ async fn nav_motion_jumps_between_top_level_rust_items() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 8 },
             anchor: LogicalPosition { line: 1, col: 8 },
@@ -2117,6 +2241,7 @@ async fn nav_motion_prev_walks_backward() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 0 },
             anchor: LogicalPosition { line: 2, col: 0 },
@@ -2177,6 +2302,7 @@ async fn nav_motion_noop_at_end_of_file() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -2243,6 +2369,7 @@ async fn nav_motion_inside_python_class_finds_next_method() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 8 },
             anchor: LogicalPosition { line: 2, col: 8 },
@@ -2309,6 +2436,7 @@ async fn nav_motion_from_last_method_stays_in_class() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 4, col: 8 },
             anchor: LogicalPosition { line: 4, col: 8 },
@@ -2375,6 +2503,7 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -2439,6 +2568,7 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 4 },
             anchor: LogicalPosition { line: 2, col: 4 },
@@ -2468,6 +2598,7 @@ async fn nav_motion_with_no_syntax_is_noop() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -2637,6 +2768,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
         &mut ws,
         5,
         &aether_protocol::cursor::CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 5 },
             anchor: LogicalPosition { line: 0, col: 5 },
@@ -2805,6 +2937,7 @@ async fn copy_selection_returns_inclusive_text() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 6 },
             anchor: LogicalPosition { line: 0, col: 6 },
@@ -2844,6 +2977,7 @@ async fn copy_line_returns_full_line_with_newline() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
             anchor: LogicalPosition { line: 1, col: 2 },
@@ -2889,6 +3023,7 @@ async fn cut_selection_deletes_and_returns_text() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 6 },
             anchor: LogicalPosition { line: 0, col: 6 },
@@ -2937,6 +3072,7 @@ async fn input_text_with_select_pasted_makes_selection() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -2987,6 +3123,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
         &mut ws,
         10,
         &aether_protocol::cursor::CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
             anchor: LogicalPosition { line: 0, col: 3 },
@@ -3071,6 +3208,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
         &mut ws,
         10,
         &aether_protocol::cursor::CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
             anchor: LogicalPosition { line: 0, col: 3 },
@@ -3187,6 +3325,7 @@ async fn word_motion_forward_and_back() {
         &mut ws,
         12,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -3315,6 +3454,7 @@ async fn input_text_with_selection_replaces_it() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 6 },
             anchor: LogicalPosition { line: 0, col: 6 },
@@ -3400,6 +3540,7 @@ async fn select_line_forward_picks_current_then_advances_at_end() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
             anchor: LogicalPosition { line: 1, col: 2 },
@@ -3446,6 +3587,7 @@ async fn select_line_forward_at_end_of_line_no_anchor_picks_current_line() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
             anchor: LogicalPosition { line: 1, col: 4 },
@@ -3480,6 +3622,7 @@ async fn select_line_forward_on_empty_line_advances() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
             anchor: LogicalPosition { line: 1, col: 0 },
@@ -3515,6 +3658,7 @@ async fn select_line_forward_extend_on_empty_line_includes_it() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
             anchor: LogicalPosition { line: 1, col: 0 },
@@ -3547,6 +3691,7 @@ async fn select_line_backward_on_empty_line_walks_up() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
             anchor: LogicalPosition { line: 1, col: 0 },
@@ -3581,6 +3726,7 @@ async fn select_line_backward_from_point_picks_line_above_then_walks_up() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 2 },
             anchor: LogicalPosition { line: 2, col: 2 },
@@ -3626,6 +3772,7 @@ async fn select_line_backward_walks_up_via_anchor_on_repeat() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 3, col: 5 },
             anchor: LogicalPosition { line: 3, col: 5 },
@@ -3685,6 +3832,7 @@ async fn select_line_forward_extend_walks_cursor_down() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
             anchor: LogicalPosition { line: 0, col: 2 },
@@ -3742,6 +3890,7 @@ async fn select_line_backward_extend_walks_anchor_up() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 3, col: 2 },
             anchor: LogicalPosition { line: 3, col: 2 },
@@ -3799,6 +3948,7 @@ async fn select_line_after_swap_preserves_backward_orientation() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -3847,6 +3997,7 @@ async fn select_line_backward_from_point_on_first_line_clamps() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
             anchor: LogicalPosition { line: 0, col: 3 },
@@ -3880,6 +4031,7 @@ async fn select_line_backward_on_partial_selection_snaps_to_top_edge() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 3 },
             anchor: LogicalPosition { line: 1, col: 2 },
@@ -3914,6 +4066,7 @@ async fn select_line_backward_extend_from_point_jumps_to_line_above() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 2 },
             anchor: LogicalPosition { line: 2, col: 2 },
@@ -3959,6 +4112,7 @@ async fn select_line_snaps_partial_selection_to_whole_lines() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 3 },
             anchor: LogicalPosition { line: 0, col: 2 },
@@ -3994,6 +4148,7 @@ async fn select_line_snaps_partial_selection_when_cursor_at_line_end() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 5 },
             anchor: LogicalPosition { line: 0, col: 2 },
@@ -4041,6 +4196,7 @@ async fn swap_anchor_swaps_position_and_anchor() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 3 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -4064,6 +4220,7 @@ async fn swap_anchor_with_no_selection_is_noop() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
             anchor: LogicalPosition { line: 0, col: 3 },
@@ -4136,6 +4293,7 @@ async fn motion_undo_restores_previous_cursor() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
             anchor: LogicalPosition { line: 1, col: 2 },
@@ -4146,6 +4304,7 @@ async fn motion_undo_restores_previous_cursor() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 3 },
             anchor: LogicalPosition { line: 2, col: 3 },
@@ -4176,6 +4335,7 @@ async fn motion_undo_then_redo_round_trips() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 3 },
             anchor: LogicalPosition { line: 1, col: 3 },
@@ -4217,6 +4377,7 @@ async fn motion_undo_stack_cleared_by_mutation() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
             anchor: LogicalPosition { line: 1, col: 2 },
@@ -4227,6 +4388,7 @@ async fn motion_undo_stack_cleared_by_mutation() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
             anchor: LogicalPosition { line: 1, col: 4 },
@@ -4261,6 +4423,7 @@ async fn motion_redo_cleared_by_new_motion() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 3 },
             anchor: LogicalPosition { line: 1, col: 3 },
@@ -4274,6 +4437,7 @@ async fn motion_redo_cleared_by_new_motion() {
         &mut ws,
         12,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
             anchor: LogicalPosition { line: 0, col: 2 },
@@ -4300,6 +4464,7 @@ async fn motion_undo_records_select_line_and_swap() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
             anchor: LogicalPosition { line: 1, col: 2 },
@@ -4348,6 +4513,7 @@ async fn word_motion_exclusive_at_buffer_end_does_not_move_past() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 4 },
             anchor: LogicalPosition { line: 0, col: 4 },
@@ -4450,6 +4616,7 @@ async fn visual_line_preserves_visual_column() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 5 },
             anchor: LogicalPosition { line: 0, col: 5 },
@@ -4522,6 +4689,7 @@ async fn visual_line_crosses_logical_line_boundary() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -4578,6 +4746,7 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
             anchor: LogicalPosition { line: 0, col: 3 },
@@ -4632,6 +4801,7 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 5 },
             anchor: LogicalPosition { line: 0, col: 5 },
@@ -4737,6 +4907,7 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -4812,6 +4983,7 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 5 },
             anchor: LogicalPosition { line: 0, col: 5 },
@@ -4883,6 +5055,7 @@ async fn virtual_col_cleared_by_horizontal_motion() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -4967,6 +5140,7 @@ async fn virtual_col_cleared_by_mutation() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -5100,6 +5274,7 @@ async fn move_lines_swaps_with_neighbor_below() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
             anchor: LogicalPosition { line: 0, col: 2 },
@@ -5131,6 +5306,7 @@ async fn move_lines_swaps_with_neighbor_above() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 1 },
             anchor: LogicalPosition { line: 1, col: 1 },
@@ -5161,6 +5337,7 @@ async fn move_lines_moves_whole_selection() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 0 },
             anchor: LogicalPosition { line: 1, col: 0 },
@@ -5210,6 +5387,7 @@ async fn move_lines_at_bottom_is_noop_down() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
             anchor: LogicalPosition { line: 1, col: 0 },
@@ -5241,6 +5419,7 @@ async fn move_lines_preserves_missing_trailing_newline() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
             anchor: LogicalPosition { line: 1, col: 0 },
@@ -5272,6 +5451,7 @@ async fn indent_single_line_adds_two_spaces() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
             anchor: LogicalPosition { line: 0, col: 3 },
@@ -5295,6 +5475,7 @@ async fn dedent_strips_two_spaces() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 4 },
             anchor: LogicalPosition { line: 0, col: 4 },
@@ -5317,6 +5498,7 @@ async fn indent_multi_line_selection() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -5342,6 +5524,7 @@ async fn dedent_line_without_indent_is_noop_for_that_line() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 1 },
             anchor: LogicalPosition { line: 0, col: 4 },
@@ -5381,6 +5564,7 @@ async fn newline_and_indent_copies_leading_whitespace() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 7 },
             anchor: LogicalPosition { line: 0, col: 7 },
@@ -5439,6 +5623,7 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 10 },
             anchor: LogicalPosition { line: 0, col: 10 },
@@ -5497,6 +5682,7 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
             anchor: LogicalPosition { line: 0, col: 9 },
@@ -5566,6 +5752,7 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 1 },
             anchor: LogicalPosition { line: 2, col: 1 },
@@ -5623,6 +5810,7 @@ async fn newline_and_indent_engine_python_def() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 10 },
             anchor: LogicalPosition { line: 0, col: 10 },
@@ -5679,6 +5867,7 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 2, col: 12 },
             anchor: LogicalPosition { line: 2, col: 12 },
@@ -5760,6 +5949,7 @@ async fn newline_and_indent_fallback_copies_previous_line() {
         &mut ws,
         10,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 9 },
             anchor: LogicalPosition { line: 0, col: 9 },
@@ -5816,6 +6006,7 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 4 },
             anchor: LogicalPosition { line: 0, col: 4 },
@@ -5874,6 +6065,7 @@ async fn toggle_comment_strips_when_already_commented() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -5936,6 +6128,7 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -5996,6 +6189,7 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -6056,6 +6250,7 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 12 },
             anchor: LogicalPosition { line: 0, col: 10 },
@@ -6116,6 +6311,7 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 18 },
             anchor: LogicalPosition { line: 0, col: 10 },
@@ -6178,6 +6374,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 2, col: 9 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -6242,6 +6439,7 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 12 },
             anchor: LogicalPosition { line: 0, col: 10 },
@@ -6307,6 +6505,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 10 },
             anchor: LogicalPosition { line: 0, col: 5 },
@@ -6388,6 +6587,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
             anchor: LogicalPosition { line: 0, col: 4 },
@@ -6452,6 +6652,7 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
             anchor: LogicalPosition { line: 0, col: 4 },
@@ -6514,6 +6715,7 @@ async fn toggle_comment_round_trip_partial_selection() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 12 },
             anchor: LogicalPosition { line: 0, col: 10 },
@@ -6588,6 +6790,7 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 13 },
             anchor: LogicalPosition { line: 0, col: 13 },
@@ -6647,6 +6850,7 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: open.buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -6964,16 +7168,37 @@ async fn search_next_cycles_forward_and_wraps() {
         },
     )
     .await;
-    let r1: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    let r1: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(r1.summary.current_index, 2);
     assert_eq!(r1.cursor.anchor, LogicalPosition { line: 0, col: 8 });
-    let r2: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: false }).await;
+    let r2: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        12,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(r2.summary.current_index, 3);
     // Wrap.
-    let r3: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 13, &SearchNavParams { buffer_id, extend: false }).await;
+    let r3: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        13,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(r3.summary.current_index, 1);
 
     drop(server);
@@ -6994,8 +7219,15 @@ async fn search_prev_cycles_backward_with_wrap() {
     )
     .await;
     // From the first match, prev wraps to the last.
-    let r: SearchNavResult =
-        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    let r: SearchNavResult = send_request::<SearchPrev>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(r.summary.current_index, 3);
 
     drop(server);
@@ -7018,8 +7250,15 @@ async fn search_prev_orients_backward() {
     .await;
     // Backward (non-extend) re-selects the previous match oriented by travel direction: the head
     // leads on the start char (cursor before anchor), the anchor trails on the last char.
-    let r: SearchNavResult =
-        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    let r: SearchNavResult = send_request::<SearchPrev>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(r.summary.current_index, 1);
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
@@ -7045,8 +7284,15 @@ async fn search_next_wrap_stays_forward_oriented() {
     // From the last match, forward `next` wraps physically backward to the first match — but the
     // orientation follows logical travel (forward), so it stays forward-oriented: anchor on the
     // start, head on the last char. The wrap doesn't flip orientation.
-    let r: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    let r: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(r.summary.current_index, 1);
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
@@ -7072,8 +7318,15 @@ async fn search_prev_wrap_stays_backward_oriented() {
     // From the first match, backward `prev` wraps physically forward to the last match — orientation
     // still follows logical travel (backward), so it stays backward-oriented: head on the start,
     // anchor on the last char.
-    let r: SearchNavResult =
-        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    let r: SearchNavResult = send_request::<SearchPrev>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(r.summary.current_index, 3);
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 2 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
@@ -7100,14 +7353,28 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
     )
     .await;
     // Alt-n: backward-oriented selection of the first match — anchor (0,2), head (0,0).
-    let back: SearchNavResult =
-        send_request::<SearchPrev>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    let back: SearchNavResult = send_request::<SearchPrev>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(back.cursor.anchor, LogicalPosition { line: 0, col: 2 });
     assert_eq!(back.cursor.position, LogicalPosition { line: 0, col: 0 });
     // Shift-n: extend forward to the second match. Crosses the pivot, re-anchors to the previous
     // head (0,0), so the selection grows to (0,0)..(0,10) — both matches covered, not just the second.
-    let fwd: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: true }).await;
+    let fwd: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        12,
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(fwd.cursor.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(fwd.cursor.position, LogicalPosition { line: 0, col: 10 });
 
@@ -7132,16 +7399,37 @@ async fn search_extend_resets_to_single_match_on_wrap() {
     )
     .await;
     // Start on the second match (0,4). Extend forward twice: spans matches 2..4 (0,4)..(0,22).
-    let _: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: true }).await;
-    let pre: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: true }).await;
+    let _: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
+    )
+    .await;
+    let pre: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        12,
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(pre.cursor.anchor, LogicalPosition { line: 0, col: 4 });
     assert_eq!(pre.cursor.position, LogicalPosition { line: 0, col: 22 });
     // One more extend wraps past the end. Rather than re-anchoring across the wrap (which would
     // engulf (0,0)..(0,22)), it resets to just the first match, forward-oriented.
-    let wrap: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 13, &SearchNavParams { buffer_id, extend: true }).await;
+    let wrap: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        13,
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
+    )
+    .await;
     assert_eq!(wrap.cursor.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(wrap.cursor.position, LogicalPosition { line: 0, col: 2 });
     assert_eq!(wrap.summary.current_index, 1);
@@ -7167,12 +7455,26 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
     )
     .await;
     // On the first match; `next` → second match (forward-oriented, head at (0,10)).
-    let fwd: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: false }).await;
+    let fwd: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(fwd.summary.current_index, 2);
     // Reverse: `prev` steps to the first match, not back onto the second.
-    let back: SearchNavResult =
-        send_request::<SearchPrev>(&mut ws, 12, &SearchNavParams { buffer_id, extend: false }).await;
+    let back: SearchNavResult = send_request::<SearchPrev>(
+        &mut ws,
+        12,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(back.summary.current_index, 1);
 
     drop(server);
@@ -7182,8 +7484,7 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
 async fn search_plain_next_steps_off_multi_match_extend_selection() {
     // Four matches of "foo". Extend across the first two, then a plain (non-extend) `next` must step
     // off the *whole* selection to the third match — not land back inside it on the second.
-    let (server, mut ws, buffer_id) =
-        setup_with_buffer("foo foo bar foo baz foo\n").await;
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo foo bar foo baz foo\n").await;
     let _ = send_request::<SearchSet>(
         &mut ws,
         10,
@@ -7196,11 +7497,25 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
     )
     .await;
     // Extend forward: selection now spans the first two matches (anchor (0,0), head (0,6)).
-    let _: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 11, &SearchNavParams { buffer_id, extend: true }).await;
+    let _: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
+    )
+    .await;
     // Plain next: steps off the whole selection to the third match at (0,12), not the second (0,4).
-    let r: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: false }).await;
+    let r: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        12,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(r.summary.current_index, 3);
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 12 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 14 });
@@ -7228,7 +7543,10 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
     let r1: SearchNavResult = send_request::<SearchNext>(
         &mut ws,
         11,
-        &SearchNavParams { buffer_id, extend: true },
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
     )
     .await;
     assert_eq!(r1.cursor.anchor, LogicalPosition { line: 0, col: 0 });
@@ -7241,7 +7559,10 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
     let r2: SearchNavResult = send_request::<SearchNext>(
         &mut ws,
         12,
-        &SearchNavParams { buffer_id, extend: true },
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
     )
     .await;
     assert_eq!(r2.cursor.anchor, LogicalPosition { line: 0, col: 0 });
@@ -7272,7 +7593,10 @@ async fn search_prev_extend_keeps_anchor_and_grows_backward() {
     let r: SearchNavResult = send_request::<SearchPrev>(
         &mut ws,
         11,
-        &SearchNavParams { buffer_id, extend: true },
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
     )
     .await;
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 2 });
@@ -7303,7 +7627,10 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
     let back: SearchNavResult = send_request::<SearchPrev>(
         &mut ws,
         11,
-        &SearchNavParams { buffer_id, extend: true },
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
     )
     .await;
     assert_eq!(back.cursor.anchor, LogicalPosition { line: 0, col: 10 });
@@ -7314,7 +7641,10 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
     let fwd: SearchNavResult = send_request::<SearchNext>(
         &mut ws,
         12,
-        &SearchNavParams { buffer_id, extend: true },
+        &SearchNavParams {
+            buffer_id,
+            extend: true,
+        },
     )
     .await;
     assert_eq!(fwd.cursor.anchor, LogicalPosition { line: 0, col: 0 });
@@ -7339,8 +7669,15 @@ async fn search_clear_removes_active_search() {
     .await;
     let _: () = send_request::<SearchClear>(&mut ws, 11, &SearchClearParams { buffer_id }).await;
     // After clear, n/prev should report no matches.
-    let r: SearchNavResult =
-        send_request::<SearchNext>(&mut ws, 12, &SearchNavParams { buffer_id, extend: false }).await;
+    let r: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        12,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+        },
+    )
+    .await;
     assert_eq!(r.summary.total, 0);
 
     drop(server);
@@ -7363,9 +7700,7 @@ async fn setup_picker_workspace() -> (
     std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -7627,10 +7962,9 @@ async fn picker_resume_centers_on_remembered_item() {
     assert_eq!(resume.effective_offset, 0);
 
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    assert!(update
-        .items
-        .iter()
-        .any(|i| matches!(i, PickerItem::File { relative_path, .. } if relative_path == "src/lib.rs")));
+    assert!(update.items.iter().any(
+        |i| matches!(i, PickerItem::File { relative_path, .. } if relative_path == "src/lib.rs")
+    ));
 
     drop(server);
 }
@@ -7716,9 +8050,7 @@ async fn setup_buffer_picker_workspace() -> (
     std::fs::write(dir_path.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
     std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -7817,7 +8149,12 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         .items
         .iter()
         .map(|i| {
-            let PickerItem::Buffer { path_index, relative_path, .. } = i else {
+            let PickerItem::Buffer {
+                path_index,
+                relative_path,
+                ..
+            } = i
+            else {
                 panic!("expected Buffer, got {i:?}")
             };
             (*path_index, relative_path.as_deref())
@@ -8033,9 +8370,14 @@ async fn scratch_number_is_per_project_lowest_unused() {
     assert_eq!(s2.scratch_number, Some(2));
 
     // Close #1; the next scratch reuses its freed number rather than taking #3.
-    let _: BufferCloseResult =
-        send_request::<BufferClose>(&mut ws, 102, &BufferCloseParams { buffer_id: s1.buffer_id })
-            .await;
+    let _: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        102,
+        &BufferCloseParams {
+            buffer_id: s1.buffer_id,
+        },
+    )
+    .await;
     let s3: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 103, &scratch_params()).await;
     assert_eq!(s3.scratch_number, Some(1), "freed #1 is reused, not #3");
 
@@ -8611,12 +8953,9 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
     let b_path = dir_b.path().to_path_buf();
     std::mem::forget(dir_a);
     std::mem::forget(dir_b);
-    let server = spawn_for_test(
-        "test-proj",
-        vec![a_path.clone(), b_path.clone()],
-    )
-    .await
-    .unwrap();
+    let server = spawn_for_test("test-proj", vec![a_path.clone(), b_path.clone()])
+        .await
+        .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -8745,7 +9084,9 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
     )
     .await;
     assert!(
-        open.path.as_deref().is_some_and(|p| p.ends_with("foo/bar.rs")),
+        open.path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("foo/bar.rs")),
         "buffer should be bound to the not-yet-existing multi-segment path; got {:?}",
         open.path
     );
@@ -8775,7 +9116,10 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
         },
     )
     .await;
-    assert!(dir_path.join("foo").is_dir(), "save should mkdir-p the parent");
+    assert!(
+        dir_path.join("foo").is_dir(),
+        "save should mkdir-p the parent"
+    );
     let written = std::fs::read_to_string(dir_path.join("foo/bar.rs")).unwrap();
     assert_eq!(written, "hello\n");
     drop(server);
@@ -8840,8 +9184,14 @@ async fn save_as_creates_missing_parent_directories() {
     )
     .await;
     // The intermediate dirs and the file should all exist on disk.
-    assert!(dir_path.join("a").is_dir(), "intermediate dir `a` was not created");
-    assert!(dir_path.join("a/b").is_dir(), "intermediate dir `a/b` was not created");
+    assert!(
+        dir_path.join("a").is_dir(),
+        "intermediate dir `a` was not created"
+    );
+    assert!(
+        dir_path.join("a/b").is_dir(),
+        "intermediate dir `a/b` was not created"
+    );
     let written = std::fs::read_to_string(dir_path.join("a/b/c.txt")).expect("file written");
     assert_eq!(written, "deep\n");
     drop(server);
@@ -8902,11 +9252,7 @@ async fn save_as_does_not_create_dirs_outside_project() {
         "unexpected error: {err}"
     );
     assert!(
-        !project_canonical
-            .parent()
-            .unwrap()
-            .join("escape")
-            .exists(),
+        !project_canonical.parent().unwrap().join("escape").exists(),
         "must not have created an `escape` dir alongside the project"
     );
     drop(server);
@@ -8920,9 +9266,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("existing.txt"), "old content\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -9383,9 +9727,7 @@ async fn buffer_close_drops_buffer() {
     std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
     std::fs::write(dir_path.join("b.txt"), "beta\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -9466,9 +9808,7 @@ async fn buffer_close_last_buffer_returns_none() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("only.txt"), "x\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -9515,9 +9855,7 @@ async fn buffer_close_drops_viewports() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -9618,6 +9956,7 @@ async fn input_delete_line_removes_line_with_newline() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
             anchor: LogicalPosition { line: 1, col: 2 },
@@ -9663,6 +10002,7 @@ async fn input_change_line_blanks_content_keeps_newline() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 2 },
             anchor: LogicalPosition { line: 1, col: 2 },
@@ -9709,6 +10049,7 @@ async fn input_replace_line_swaps_content() {
         &mut ws,
         3,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 0 },
             anchor: LogicalPosition { line: 1, col: 0 },
@@ -9747,9 +10088,7 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
     std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -9808,9 +10147,7 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
     std::fs::write(&path, "ab\ncd\n").unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -9867,9 +10204,7 @@ async fn setup_grep_workspace() -> (
     std::fs::write(dir_path.join("README.md"), "no match here\n").unwrap();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -10285,6 +10620,7 @@ async fn set_point_cursor(
         ws,
         request_id,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position,
             anchor: position,
@@ -10425,15 +10761,14 @@ async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
         &mut ws,
         21,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 9 },
             anchor: LogicalPosition { line: 1, col: 4 },
         },
     )
     .await;
-    let gp = st
-        .grep_position
-        .expect("selection covers the hit exactly");
+    let gp = st.grep_position.expect("selection covers the hit exactly");
     assert_eq!(gp.current, 2);
     assert_eq!(gp.total, 3);
 
@@ -10442,6 +10777,7 @@ async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
         &mut ws,
         22,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
             anchor: LogicalPosition { line: 1, col: 9 },
@@ -10456,6 +10792,7 @@ async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
         &mut ws,
         23,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 4 },
             anchor: LogicalPosition { line: 1, col: 4 },
@@ -10469,6 +10806,7 @@ async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
         &mut ws,
         24,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 10 },
             anchor: LogicalPosition { line: 1, col: 4 },
@@ -10542,7 +10880,12 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
         .effective_center_on
         .expect("server should echo back the wrapped-to-first hit");
     match resolved {
-        PickerItem::GrepHit { relative_path, line, col, .. } => {
+        PickerItem::GrepHit {
+            relative_path,
+            line,
+            col,
+            ..
+        } => {
             assert_eq!(relative_path, "src/lib.rs");
             assert_eq!(line, 0);
             assert_eq!(col, 3);
@@ -10596,6 +10939,7 @@ async fn cursor_grep_position_is_none_without_cached_grep() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
             anchor: LogicalPosition { line: 0, col: 3 },
@@ -10623,6 +10967,7 @@ async fn grep_navigate_backward_skips_currently_selected_match() {
         &mut ws,
         21,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 9 },
             anchor: LogicalPosition { line: 1, col: 4 },
@@ -10683,9 +11028,7 @@ async fn setup_explorer_workspace() -> (
     std::fs::write(root.join("README.md"), "hi\n").unwrap();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![root])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -11366,7 +11709,9 @@ async fn directory_list_rejects_missing_path() {
 /// canonical absolute path. mkdir-p semantics so multi-level paths in one call work too.
 #[tokio::test]
 async fn directory_create_makes_dir_and_returns_canonical_path() {
-    use aether_protocol::directory::{DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult};
+    use aether_protocol::directory::{
+        DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult,
+    };
     let (server, mut ws, root) = setup_explorer_workspace().await;
     let target = root.join("brand-new");
     let result: DirectoryCreateResult = send_request::<DirectoryCreate>(
@@ -11378,7 +11723,10 @@ async fn directory_create_makes_dir_and_returns_canonical_path() {
     )
     .await;
     assert_eq!(result.path, target.to_str().unwrap());
-    assert!(target.is_dir(), "directory should exist on disk after the call");
+    assert!(
+        target.is_dir(),
+        "directory should exist on disk after the call"
+    );
     drop(server);
 }
 
@@ -11514,7 +11862,8 @@ async fn setup_explorer_git_workspace() -> (
     index.write().unwrap();
     let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
     let sig = git2::Signature::now("Test", "t@e.com").unwrap();
-    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
     drop(tree);
     drop(index);
     drop(repo);
@@ -11572,17 +11921,27 @@ async fn picker_explorer_tags_entries_with_git_status() {
             .items
             .iter()
             .find_map(|it| match it {
-                PickerItem::DirEntry { name, git_status, .. } if name == target => Some(*git_status),
+                PickerItem::DirEntry {
+                    name, git_status, ..
+                } if name == target => Some(*git_status),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("entry {target:?} not in listing"))
     };
 
-    assert_eq!(status_of("sub"), Some(GitStatus::Modified), "folder aggregates its descendant's change");
+    assert_eq!(
+        status_of("sub"),
+        Some(GitStatus::Modified),
+        "folder aggregates its descendant's change"
+    );
     assert_eq!(status_of("mod.rs"), Some(GitStatus::Modified));
     assert_eq!(status_of("new.rs"), Some(GitStatus::Untracked));
     assert_eq!(status_of("debug.log"), Some(GitStatus::Ignored));
-    assert_eq!(status_of("clean.rs"), None, "an unchanged tracked file is untagged");
+    assert_eq!(
+        status_of("clean.rs"),
+        None,
+        "an unchanged tracked file is untagged"
+    );
 
     drop(server);
 }
@@ -11617,18 +11976,28 @@ async fn picker_files_tags_entries_with_git_status() {
             .items
             .iter()
             .find_map(|it| match it {
-                PickerItem::File { relative_path, git_status, .. } if relative_path == target => {
-                    Some(*git_status)
-                }
+                PickerItem::File {
+                    relative_path,
+                    git_status,
+                    ..
+                } if relative_path == target => Some(*git_status),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("file {target:?} not in listing: {:?}", update.items))
     };
 
     assert_eq!(status_of("mod.rs"), Some(GitStatus::Modified));
-    assert_eq!(status_of("sub/deep.rs"), Some(GitStatus::Modified), "nested change tagged");
+    assert_eq!(
+        status_of("sub/deep.rs"),
+        Some(GitStatus::Modified),
+        "nested change tagged"
+    );
     assert_eq!(status_of("new.rs"), Some(GitStatus::Untracked));
-    assert_eq!(status_of("clean.rs"), None, "an unchanged tracked file is untagged");
+    assert_eq!(
+        status_of("clean.rs"),
+        None,
+        "an unchanged tracked file is untagged"
+    );
     assert!(
         !update
             .items
@@ -11708,8 +12077,8 @@ async fn setup_watched_buffer(
 ) -> (
     aether_server::ServerHandle,
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    u64,                  // buffer_id
-    std::path::PathBuf,   // file path
+    u64,                // buffer_id
+    std::path::PathBuf, // file path
 ) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("watched.txt");
@@ -11721,9 +12090,7 @@ async fn setup_watched_buffer(
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path])
-        .await
-        .unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -11777,11 +12144,8 @@ async fn watcher_reloads_clean_buffer_on_external_write() {
     // External edit. Buffer was clean, so the server should silently reload + push state.
     std::fs::write(&path, "hello world\n").unwrap();
 
-    let state_push = expect_notification_within::<BufferState>(
-        &mut ws,
-        std::time::Duration::from_secs(5),
-    )
-    .await;
+    let state_push =
+        expect_notification_within::<BufferState>(&mut ws, std::time::Duration::from_secs(5)).await;
     assert_eq!(state_push.buffer_id, buffer_id);
     assert!(
         !state_push.externally_modified,
@@ -11813,13 +12177,13 @@ async fn watcher_flags_dirty_buffer_on_external_write() {
     // External write while dirty: server should flag externally_modified, not silently reload.
     std::fs::write(&path, "external content\n").unwrap();
 
-    let state_push = expect_notification_within::<BufferState>(
-        &mut ws,
-        std::time::Duration::from_secs(5),
-    )
-    .await;
+    let state_push =
+        expect_notification_within::<BufferState>(&mut ws, std::time::Duration::from_secs(5)).await;
     assert_eq!(state_push.buffer_id, buffer_id);
-    assert!(state_push.externally_modified, "expected externally_modified=true");
+    assert!(
+        state_push.externally_modified,
+        "expected externally_modified=true"
+    );
     assert!(!state_push.externally_deleted);
 
     // Save without overwrite should be rejected.
@@ -11994,23 +12358,22 @@ async fn setup_overlapping_projects_watched_buffer(
 async fn watcher_fans_out_external_write_to_buffers_in_all_projects() {
     let (server, mut ws_a, buf_a, mut ws_b, buf_b, path) =
         setup_overlapping_projects_watched_buffer("hello\n").await;
-    assert_ne!(buf_a, buf_b, "each project should hold its own buffer for the path");
+    assert_ne!(
+        buf_a, buf_b,
+        "each project should hold its own buffer for the path"
+    );
 
     std::fs::write(&path, "hello world\n").unwrap();
 
     // Both buffers were clean, so both clients should see a silent reload.
-    let push_a = expect_notification_within::<BufferState>(
-        &mut ws_a,
-        std::time::Duration::from_secs(5),
-    )
-    .await;
+    let push_a =
+        expect_notification_within::<BufferState>(&mut ws_a, std::time::Duration::from_secs(5))
+            .await;
     assert_eq!(push_a.buffer_id, buf_a);
     assert!(!push_a.externally_modified);
-    let push_b = expect_notification_within::<BufferState>(
-        &mut ws_b,
-        std::time::Duration::from_secs(5),
-    )
-    .await;
+    let push_b =
+        expect_notification_within::<BufferState>(&mut ws_b, std::time::Duration::from_secs(5))
+            .await;
     assert_eq!(push_b.buffer_id, buf_b);
     assert!(!push_b.externally_modified);
 
@@ -12047,13 +12410,14 @@ async fn save_in_one_project_reloads_other_projects_buffer() {
     .await;
 
     // B's buffer was clean → silent reload, announced via buffer/state.
-    let push_b = expect_notification_within::<BufferState>(
-        &mut ws_b,
-        std::time::Duration::from_secs(5),
-    )
-    .await;
+    let push_b =
+        expect_notification_within::<BufferState>(&mut ws_b, std::time::Duration::from_secs(5))
+            .await;
     assert_eq!(push_b.buffer_id, buf_b);
-    assert!(!push_b.externally_modified, "clean buffer should silently reload");
+    assert!(
+        !push_b.externally_modified,
+        "clean buffer should silently reload"
+    );
 
     // Saving B without overwrite proves the reload landed: a stale-but-unflagged buffer would
     // clobber A's text on disk, and a flagged one would be rejected.
@@ -12354,6 +12718,7 @@ async fn surround_wraps_selection_and_selects_inner() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -12397,6 +12762,7 @@ async fn surround_aliases_and_quotes() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -12432,6 +12798,7 @@ async fn surround_unknown_delimiter_is_noop() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 1 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -12464,6 +12831,7 @@ async fn unsurround_strips_hugging_pair() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 3 },
             anchor: LogicalPosition { line: 0, col: 2 },
@@ -12471,8 +12839,15 @@ async fn unsurround_strips_hugging_pair() {
     )
     .await;
 
-    let result: EditResult =
-        send_request::<InputUnsurround>(&mut ws, 12, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    let result: EditResult = send_request::<InputUnsurround>(
+        &mut ws,
+        12,
+        &InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
     assert_eq!(result.revision, 1);
     // Inner text "bc" stays selected, now at cols 1..=2.
     assert_eq!(result.cursor.anchor, LogicalPosition { line: 0, col: 1 });
@@ -12498,6 +12873,7 @@ async fn unsurround_noop_when_no_pair_hugs_selection() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -12505,8 +12881,15 @@ async fn unsurround_noop_when_no_pair_hugs_selection() {
     )
     .await;
 
-    let result: EditResult =
-        send_request::<InputUnsurround>(&mut ws, 12, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    let result: EditResult = send_request::<InputUnsurround>(
+        &mut ws,
+        12,
+        &InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
     // No edit: revision unchanged, selection preserved.
     assert_eq!(result.revision, 0);
     assert_eq!(result.cursor.anchor, LogicalPosition { line: 0, col: 1 });
@@ -12524,6 +12907,7 @@ async fn surround_then_unsurround_roundtrips() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
             anchor: LogicalPosition { line: 0, col: 1 },
@@ -12548,7 +12932,15 @@ async fn surround_then_unsurround_roundtrips() {
     );
 
     // Surround left the inner "bc" selected, so unsurround strips the brackets we just added.
-    send_request::<InputUnsurround>(&mut ws, 13, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    send_request::<InputUnsurround>(
+        &mut ws,
+        13,
+        &InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
@@ -12569,6 +12961,7 @@ async fn unsurround_peels_nested_layers_per_press() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
             anchor: LogicalPosition { line: 0, col: 2 },
@@ -12577,8 +12970,15 @@ async fn unsurround_peels_nested_layers_per_press() {
     .await;
 
     // First press strips one layer: "((x))" → "(x)".
-    let r1: EditResult =
-        send_request::<InputUnsurround>(&mut ws, 12, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    let r1: EditResult = send_request::<InputUnsurround>(
+        &mut ws,
+        12,
+        &InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
     assert_eq!(r1.revision, 1);
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
@@ -12588,8 +12988,15 @@ async fn unsurround_peels_nested_layers_per_press() {
     );
 
     // Selection now sits on "x" again — a second press peels the next layer: "(x)" → "x".
-    let r2: EditResult =
-        send_request::<InputUnsurround>(&mut ws, 13, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    let r2: EditResult = send_request::<InputUnsurround>(
+        &mut ws,
+        13,
+        &InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
     assert_eq!(r2.revision, 2);
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
@@ -12599,8 +13006,15 @@ async fn unsurround_peels_nested_layers_per_press() {
     );
 
     // Nothing left to strip: third press is a no-op (revision unchanged).
-    let r3: EditResult =
-        send_request::<InputUnsurround>(&mut ws, 14, &InputUnsurroundParams { buffer_id, target: SurroundTarget::Selection }).await;
+    let r3: EditResult = send_request::<InputUnsurround>(
+        &mut ws,
+        14,
+        &InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
     assert_eq!(r3.revision, 2);
 
     drop(server);
@@ -12648,6 +13062,7 @@ async fn surround_line_targets_cursor_line() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 1, col: 1 },
             anchor: LogicalPosition { line: 1, col: 1 },
@@ -12698,6 +13113,7 @@ async fn unsurround_line_strips_wrapping_pair() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 2 },
             anchor: LogicalPosition { line: 0, col: 2 },
@@ -12861,11 +13277,13 @@ async fn git_blame_line_reports_committed_author() {
         },
     )
     .await;
-    let info = info_res.info.expect("blame hash should resolve to a commit");
+    let info = info_res
+        .info
+        .expect("blame hash should resolve to a commit");
     assert_eq!(info.author, "Test");
     assert_eq!(info.message, "init commit");
     assert!(info.commit.starts_with(&blame.commit)); // full hash extends the abbreviated one
-    // Date is pre-formatted "YYYY-MM-DD HH:MM:SS ±HHMM" (25 chars) in the commit's own timezone.
+                                                     // Date is pre-formatted "YYYY-MM-DD HH:MM:SS ±HHMM" (25 chars) in the commit's own timezone.
     assert_eq!(info.date.len(), 25, "unexpected date format: {}", info.date);
     assert!(info.date.starts_with("20"));
     assert!(info.date[20..].starts_with(['+', '-']));
@@ -13002,7 +13420,11 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
         .iter()
         .find(|l| l.logical_line == 0)
         .expect("line 0 in window");
-    assert_eq!(line0.virtual_rows_above.len(), 1, "one deleted baseline row");
+    assert_eq!(
+        line0.virtual_rows_above.len(),
+        1,
+        "one deleted baseline row"
+    );
     assert_eq!(line0.virtual_rows_above[0].text, "alpha");
     assert_eq!(line0.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
     assert_eq!(line0.visual_rows[0].segments[0].text, "Xalpha");
@@ -13087,7 +13509,10 @@ async fn git_status_counts_ride_the_window() {
     )
     .await;
     // The freshly opened buffer matches HEAD → no changes in either half of the status counts.
-    let gs = sub.window.git_status.expect("tracked file carries git status");
+    let gs = sub
+        .window
+        .git_status
+        .expect("tracked file carries git status");
     assert!(
         gs.staged.is_empty() && gs.unstaged.is_empty(),
         "clean buffer reports no changes, got {gs:?}"
@@ -13337,9 +13762,13 @@ async fn select_lines(ws: &mut Ws, id: u64, buffer_id: u64, anchor_line: u32, li
         ws,
         id,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line, col: 0 },
-            anchor: LogicalPosition { line: anchor_line, col: 0 },
+            anchor: LogicalPosition {
+                line: anchor_line,
+                col: 0,
+            },
         },
     )
     .await;
@@ -13376,12 +13805,18 @@ async fn apply_hunk_toggle_round_trips_a_modification() {
     set_cursor(&mut ws, 3, buffer_id, 1, 2).await;
     let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
-    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "alpha\nBETA\ngamma\n");
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "alpha\nBETA\ngamma\n"
+    );
 
     // The region now holds nothing unstaged, so a second toggle pulls it back out.
     let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Toggle).await;
     assert_eq!(r.status, ApplyHunkStatus::Unstaged);
-    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "alpha\nbeta\ngamma\n");
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "alpha\nbeta\ngamma\n"
+    );
 
     drop(server);
 }
@@ -13396,7 +13831,11 @@ async fn apply_hunk_stage_requires_clean_buffer() {
     let _: EditResult = send_request::<InputText>(
         &mut ws,
         3,
-        &InputTextParams { buffer_id, text: "X".into(), select_pasted: false },
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+        },
     )
     .await;
     let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
@@ -13437,7 +13876,11 @@ async fn apply_hunk_stages_deletion_via_its_anchor_line() {
 
     set_cursor(&mut ws, 3, buffer_id, 0, 0).await;
     let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
-    assert_eq!(r.status, ApplyHunkStatus::NoChange, "line above does not own the deletion");
+    assert_eq!(
+        r.status,
+        ApplyHunkStatus::NoChange,
+        "line above does not own the deletion"
+    );
 
     set_cursor(&mut ws, 5, buffer_id, 1, 0).await;
     let r = apply_hunk(&mut ws, 6, buffer_id, HunkAction::Toggle).await;
@@ -13472,7 +13915,10 @@ async fn apply_hunk_stages_untracked_file() {
     std::fs::write(dir.path().join("new.rs"), "hello\nworld\n").unwrap();
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "untracked-proj", "new.rs").await;
 
-    assert!(index_text(dir.path(), "new.rs").is_none(), "no index entry before staging");
+    assert!(
+        index_text(dir.path(), "new.rs").is_none(),
+        "no index entry before staging"
+    );
     set_cursor(&mut ws, 3, buffer_id, 0, 0).await;
     let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
@@ -13493,12 +13939,18 @@ async fn apply_hunk_unstages_region_back_to_head() {
     set_cursor(&mut ws, 3, buffer_id, 1, 0).await;
     let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
     assert_eq!(r.status, ApplyHunkStatus::Unstaged);
-    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "alpha\nbeta\ngamma\n");
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "alpha\nbeta\ngamma\n"
+    );
 
     // Unstaging re-opened the buffer-vs-index difference, so the next toggle stages it again.
     let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Toggle).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
-    assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "alpha\nBETA\ngamma\n");
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "alpha\nBETA\ngamma\n"
+    );
 
     drop(server);
 }
@@ -13537,12 +13989,18 @@ async fn apply_hunk_reverts_modification_and_is_undoable() {
     set_cursor(&mut ws, 3, buffer_id, 1, 2).await;
     let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Revert).await;
     assert_eq!(r.status, ApplyHunkStatus::Reverted);
-    assert_eq!(buffer_text(&mut ws, 5, buffer_id).await, "alpha\nbeta\ngamma\n");
+    assert_eq!(
+        buffer_text(&mut ws, 5, buffer_id).await,
+        "alpha\nbeta\ngamma\n"
+    );
 
     // The revert is an ordinary edit: one undo step brings the change back.
     let _: UndoResult =
         send_request::<InputUndo>(&mut ws, 7, &BufferOnlyParams { buffer_id }).await;
-    assert_eq!(buffer_text(&mut ws, 8, buffer_id).await, "alpha\nBETA\ngamma\n");
+    assert_eq!(
+        buffer_text(&mut ws, 8, buffer_id).await,
+        "alpha\nBETA\ngamma\n"
+    );
 
     drop(server);
 }
@@ -13579,13 +14037,19 @@ async fn apply_hunk_revert_peels_unstaged_before_staged() {
     set_cursor(&mut ws, 3, buffer_id, 3, 0).await;
     let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Revert).await;
     assert_eq!(r.status, ApplyHunkStatus::Reverted);
-    assert_eq!(buffer_text(&mut ws, 5, buffer_id).await, "alpha\nBETA\ngamma\n");
+    assert_eq!(
+        buffer_text(&mut ws, 5, buffer_id).await,
+        "alpha\nBETA\ngamma\n"
+    );
 
     // BETA is now staged-only (buffer == index ≠ HEAD): the next revert peels to HEAD.
     set_cursor(&mut ws, 7, buffer_id, 1, 0).await;
     let r = apply_hunk(&mut ws, 8, buffer_id, HunkAction::Revert).await;
     assert_eq!(r.status, ApplyHunkStatus::Reverted);
-    assert_eq!(buffer_text(&mut ws, 9, buffer_id).await, "alpha\nbeta\ngamma\n");
+    assert_eq!(
+        buffer_text(&mut ws, 9, buffer_id).await,
+        "alpha\nbeta\ngamma\n"
+    );
     assert_eq!(
         index_text(dir.path(), "edit.rs").unwrap(),
         "alpha\nBETA\ngamma\n",
@@ -13606,7 +14070,11 @@ async fn apply_hunk_revert_works_on_dirty_buffer() {
     let _: EditResult = send_request::<InputText>(
         &mut ws,
         4,
-        &InputTextParams { buffer_id, text: "X".into(), select_pasted: false },
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+        },
     )
     .await;
     set_cursor(&mut ws, 5, buffer_id, 1, 0).await;
@@ -13645,7 +14113,10 @@ async fn apply_hunk_stage_refreshes_status_counts() {
             cols: 80,
             rows: 24,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -13657,9 +14128,14 @@ async fn apply_hunk_stage_refreshes_status_counts() {
     let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Toggle).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
 
-    let notif: ViewportLinesChangedParams = expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
     let gs = notif.git_status.expect("git status rides the refresh");
-    assert_eq!((gs.staged.modified, gs.unstaged.modified), (1, 0), "change moved to staged");
+    assert_eq!(
+        (gs.staged.modified, gs.unstaged.modified),
+        (1, 0),
+        "change moved to staged"
+    );
     // The combined view (default base) re-tags the hunk in place: same marker, now Staged — this
     // is the "stage a hunk and its colour flips" interaction.
     let line1 = notif
@@ -13668,7 +14144,10 @@ async fn apply_hunk_stage_refreshes_status_counts() {
         .find(|l| l.logical_line == 1)
         .expect("changed line in the refreshed window");
     assert_eq!(line1.diff_marker, Some(DiffMarker::Modified));
-    assert_eq!(line1.diff_stage, aether_protocol::viewport::DiffStage::Staged);
+    assert_eq!(
+        line1.diff_stage,
+        aether_protocol::viewport::DiffStage::Staged
+    );
 
     drop(server);
 }
@@ -13693,7 +14172,10 @@ async fn remodified_staged_line_reads_as_unstaged() {
             cols: 80,
             rows: 24,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -13701,11 +14183,21 @@ async fn remodified_staged_line_reads_as_unstaged() {
     )
     .await;
     use aether_protocol::viewport::DiffStage;
-    let line1 = sub.window.lines.iter().find(|l| l.logical_line == 1).unwrap();
+    let line1 = sub
+        .window
+        .lines
+        .iter()
+        .find(|l| l.logical_line == 1)
+        .unwrap();
     assert_eq!(line1.diff_marker, Some(DiffMarker::Modified));
     assert_eq!(line1.diff_stage, DiffStage::Unstaged);
     // Neighbours stay unmarked.
-    let line0 = sub.window.lines.iter().find(|l| l.logical_line == 0).unwrap();
+    let line0 = sub
+        .window
+        .lines
+        .iter()
+        .find(|l| l.logical_line == 0)
+        .unwrap();
     assert_eq!(line0.diff_marker, None);
 
     drop(server);
@@ -13732,7 +14224,10 @@ async fn shared_anchor_phantom_rows_show_only_the_unstaged_layer() {
             cols: 80,
             rows: 24,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -13749,7 +14244,12 @@ async fn shared_anchor_phantom_rows_show_only_the_unstaged_layer() {
     )
     .await;
     use aether_protocol::viewport::DiffStage;
-    let line0 = on.window.lines.iter().find(|l| l.logical_line == 0).unwrap();
+    let line0 = on
+        .window
+        .lines
+        .iter()
+        .find(|l| l.logical_line == 0)
+        .unwrap();
     let rows: Vec<(&str, DiffStage)> = line0
         .virtual_rows_above
         .iter()
@@ -13893,6 +14393,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
         &mut ws,
         4,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 3, col: 0 },
             anchor: LogicalPosition { line: 3, col: 0 },
@@ -13966,9 +14467,8 @@ async fn git_navigate_hunk_jumps_between_changes() {
 //     mise exec -- cargo test -p aether-server --test integration -- --ignored --test-threads=1 lsp_
 // Each test names the server it needs; install it however you like as long as it's on PATH.
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Fail fast (rather than time out) if a server binary isn't on PATH.
 fn require_server_on_path(cmd: &str) {
@@ -13998,7 +14498,9 @@ async fn open_and_subscribe(
     let _act: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams { name: project.into() },
+        &ProjectActivateParams {
+            name: project.into(),
+        },
     )
     .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
@@ -14023,7 +14525,10 @@ async fn open_and_subscribe(
             cols: 100,
             rows: 40,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -14046,7 +14551,8 @@ async fn run_lsp_diagnostics(
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         loop {
             let text = next_text(&mut ws).await;
-            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text) {
+            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text)
+            {
                 if n.method == ViewportLinesChanged::NAME {
                     let p: ViewportLinesChangedParams =
                         serde_json::from_value(n.params).expect("typed params");
@@ -14083,7 +14589,8 @@ async fn run_lsp_until_ready(
     let ready = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         loop {
             let text = next_text(&mut ws).await;
-            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text) {
+            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text)
+            {
                 if n.method == LspStatusChanged::NAME {
                     let s: LspServerStatus = serde_json::from_value(n.params).expect("typed");
                     if s.language == language && matches!(s.status, LspStatus::Ready) {
@@ -14095,7 +14602,8 @@ async fn run_lsp_until_ready(
     })
     .await;
     drop(server);
-    ready.unwrap_or_else(|_| panic!("{language} server did not reach Ready within {timeout_secs}s"));
+    ready
+        .unwrap_or_else(|_| panic!("{language} server did not reach Ready within {timeout_secs}s"));
 }
 
 /// Write `files` into a fresh temp dir, then [`run_lsp_diagnostics`].
@@ -14157,7 +14665,9 @@ async fn lsp_diag_rust_analyzer() {
     )
     .await;
     dump_diags("rust-analyzer", &diags);
-    assert!(diags.iter().any(|(s, _)| matches!(s, DiagnosticSeverity::Error)));
+    assert!(diags
+        .iter()
+        .any(|(s, _)| matches!(s, DiagnosticSeverity::Error)));
 }
 
 #[tokio::test]
@@ -14183,21 +14693,27 @@ async fn lsp_diag_gopls() {
         "diag-go",
         &[
             ("go.mod", "module example\n\ngo 1.21\n"),
-            ("main.go", "package main\n\nfunc main() {\n\tvar _ int = \"not an int\"\n}\n"),
+            (
+                "main.go",
+                "package main\n\nfunc main() {\n\tvar _ int = \"not an int\"\n}\n",
+            ),
         ],
         "main.go",
         120,
     )
     .await;
     dump_diags("gopls", &diags);
-    assert!(diags.iter().any(|(s, _)| matches!(s, DiagnosticSeverity::Error)));
+    assert!(diags
+        .iter()
+        .any(|(s, _)| matches!(s, DiagnosticSeverity::Error)));
 }
 
 #[tokio::test]
 #[ignore = "needs taplo"]
 async fn lsp_diag_taplo() {
     require_server_on_path("taplo");
-    let diags = first_lsp_diagnostics("diag-toml", &[("bad.toml", "key = \n")], "bad.toml", 30).await;
+    let diags =
+        first_lsp_diagnostics("diag-toml", &[("bad.toml", "key = \n")], "bad.toml", 30).await;
     dump_diags("taplo", &diags);
     assert!(!diags.is_empty());
 }
@@ -14206,7 +14722,8 @@ async fn lsp_diag_taplo() {
 #[ignore = "needs vscode-json-language-server"]
 async fn lsp_diag_json() {
     require_server_on_path("vscode-json-language-server");
-    let diags = first_lsp_diagnostics("diag-json", &[("bad.json", "{ \"a\": }\n")], "bad.json", 30).await;
+    let diags =
+        first_lsp_diagnostics("diag-json", &[("bad.json", "{ \"a\": }\n")], "bad.json", 30).await;
     dump_diags("json", &diags);
     assert!(!diags.is_empty());
 }
@@ -14215,7 +14732,8 @@ async fn lsp_diag_json() {
 #[ignore = "needs yaml-language-server"]
 async fn lsp_diag_yaml() {
     require_server_on_path("yaml-language-server");
-    let diags = first_lsp_diagnostics("diag-yaml", &[("bad.yaml", "foo: [1, 2\n")], "bad.yaml", 30).await;
+    let diags =
+        first_lsp_diagnostics("diag-yaml", &[("bad.yaml", "foo: [1, 2\n")], "bad.yaml", 30).await;
     dump_diags("yaml", &diags);
     assert!(!diags.is_empty());
 }
@@ -14224,7 +14742,8 @@ async fn lsp_diag_yaml() {
 #[ignore = "needs vscode-css-language-server"]
 async fn lsp_diag_css() {
     require_server_on_path("vscode-css-language-server");
-    let diags = first_lsp_diagnostics("diag-css", &[("bad.css", "a { color: }\n")], "bad.css", 30).await;
+    let diags =
+        first_lsp_diagnostics("diag-css", &[("bad.css", "a { color: }\n")], "bad.css", 30).await;
     dump_diags("css", &diags);
     assert!(!diags.is_empty());
 }
@@ -14270,7 +14789,8 @@ async fn lsp_diag_typescript() {
 /// Locate an installed `typescript` package dir (holding `lib/tsserver.js`), installer-agnostically:
 /// the `AETHER_TEST_TYPESCRIPT_DIR` override first, then node's own module resolution.
 fn find_typescript_lib() -> Option<std::path::PathBuf> {
-    let has_tsserver = |dir: std::path::PathBuf| dir.join("lib/tsserver.js").exists().then_some(dir);
+    let has_tsserver =
+        |dir: std::path::PathBuf| dir.join("lib/tsserver.js").exists().then_some(dir);
     if let Some(dir) = std::env::var_os("AETHER_TEST_TYPESCRIPT_DIR") {
         if let Some(found) = has_tsserver(std::path::PathBuf::from(dir)) {
             return Some(found);
@@ -14298,14 +14818,28 @@ fn find_typescript_lib() -> Option<std::path::PathBuf> {
 #[ignore = "needs vscode-html-language-server"]
 async fn lsp_ready_html() {
     require_server_on_path("vscode-html-language-server");
-    first_lsp_ready("ready-html", &[("index.html", "<html><body></body></html>\n")], "index.html", "html", 30).await;
+    first_lsp_ready(
+        "ready-html",
+        &[("index.html", "<html><body></body></html>\n")],
+        "index.html",
+        "html",
+        30,
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "needs marksman"]
 async fn lsp_ready_markdown() {
     require_server_on_path("marksman");
-    first_lsp_ready("ready-md", &[("README.md", "# Title\n\nsome text\n")], "README.md", "markdown", 30).await;
+    first_lsp_ready(
+        "ready-md",
+        &[("README.md", "# Title\n\nsome text\n")],
+        "README.md",
+        "markdown",
+        30,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -14333,7 +14867,10 @@ async fn lsp_ready_erlang() {
         "ready-erl",
         &[
             ("rebar.config", "{erl_opts, [debug_info]}.\n"),
-            ("src/p.erl", "-module(p).\n-export([hello/0]).\nhello() -> world.\n"),
+            (
+                "src/p.erl",
+                "-module(p).\n-export([hello/0]).\nhello() -> world.\n",
+            ),
         ],
         "src/p.erl",
         "erlang",
@@ -14349,11 +14886,15 @@ async fn wait_for_diag_state(ws: &mut Ws, want: bool, timeout_secs: u64) -> bool
     tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         loop {
             let text = next_text(ws).await;
-            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text) {
+            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text)
+            {
                 if n.method == ViewportLinesChanged::NAME {
                     let p: ViewportLinesChangedParams =
                         serde_json::from_value(n.params).expect("typed");
-                    let has = p.replacement_lines.iter().any(|l| !l.diagnostics.is_empty());
+                    let has = p
+                        .replacement_lines
+                        .iter()
+                        .any(|l| !l.diagnostics.is_empty());
                     if has == want {
                         return;
                     }
@@ -14398,6 +14939,7 @@ async fn lsp_diagnostics_clear_on_undo() {
         &mut ws,
         11,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line: 0, col: 0 },
             anchor: LogicalPosition { line: 0, col: 0 },
@@ -14420,11 +14962,15 @@ async fn lsp_diagnostics_clear_on_undo() {
     );
 
     // Undo — the fix must send didChange so the server re-analyzes the reverted text and clears it.
-    let undo: UndoResult = send_request::<InputUndo>(&mut ws, 13, &BufferOnlyParams { buffer_id }).await;
+    let undo: UndoResult =
+        send_request::<InputUndo>(&mut ws, 13, &BufferOnlyParams { buffer_id }).await;
     assert!(undo.applied);
     let cleared = wait_for_diag_state(&mut ws, false, 90).await;
     drop(server);
-    assert!(cleared, "diagnostics did not clear after undo (didChange not sent on undo?)");
+    assert!(
+        cleared,
+        "diagnostics did not clear after undo (didChange not sent on undo?)"
+    );
 }
 
 /// Place the cursor at `(line, col)` in `buffer_id`.
@@ -14433,6 +14979,7 @@ async fn set_cursor(ws: &mut Ws, id: u64, buffer_id: u64, line: u32, col: u32) {
         ws,
         id,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: LogicalPosition { line, col },
             anchor: LogicalPosition { line, col },
@@ -14453,11 +15000,20 @@ async fn lsp_hover_returns_contents() {
         ("main.rs", "fn main() {\n    let _x: i32 = 1;\n}\n"),
     ]);
     let (server, mut ws) = open_and_subscribe("hover-rust", dir.path(), "main.rs").await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
-        transient: None,
-        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
     set_cursor(&mut ws, 11, buffer_id, 0, 3).await; // on `main`
 
@@ -14479,7 +15035,10 @@ async fn lsp_hover_returns_contents() {
     drop(server);
     let contents = contents.expect("hover did not return contents within 90s");
     eprintln!("hover contents:\n{contents}");
-    assert!(contents.contains("fn main"), "expected the fn signature, got: {contents}");
+    assert!(
+        contents.contains("fn main"),
+        "expected the fn signature, got: {contents}"
+    );
 }
 
 /// Phase 3: goto-definition at a call site resolves to the definition's location.
@@ -14493,11 +15052,20 @@ async fn lsp_goto_definition_resolves() {
         ("main.rs", "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n"),
     ]);
     let (server, mut ws) = open_and_subscribe("def-rust", dir.path(), "main.rs").await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
-        transient: None,
-        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
     set_cursor(&mut ws, 11, buffer_id, 4, 14).await; // inside the `helper()` call
 
@@ -14505,7 +15073,8 @@ async fn lsp_goto_definition_resolves() {
     let loc = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let r: LspGotoDefinitionResult =
-                send_request::<LspGotoDefinition>(&mut ws, id, &LspBufferParams { buffer_id }).await;
+                send_request::<LspGotoDefinition>(&mut ws, id, &LspBufferParams { buffer_id })
+                    .await;
             id += 1;
             if let Some(loc) = r.location {
                 return loc;
@@ -14517,7 +15086,11 @@ async fn lsp_goto_definition_resolves() {
     drop(server);
     let loc = loc.expect("goto-definition did not resolve within 90s");
     eprintln!("definition at {}:{}", loc.path, loc.position.line);
-    assert!(loc.path.ends_with("main.rs"), "unexpected path: {}", loc.path);
+    assert!(
+        loc.path.ends_with("main.rs"),
+        "unexpected path: {}",
+        loc.path
+    );
     assert_eq!(loc.position.line, 0, "helper is defined on line 0");
 }
 
@@ -14537,11 +15110,20 @@ async fn references_picker_lists_all_uses() {
         ("main.rs", "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n"),
     ]);
     let (server, mut ws) = open_and_subscribe("refs-rust", dir.path(), "main.rs").await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
-        transient: None,
-        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
     set_cursor(&mut ws, 11, buffer_id, 0, 3).await; // on the `helper` declaration
 
@@ -14550,20 +15132,28 @@ async fn references_picker_lists_all_uses() {
         loop {
             // Each open mints a fresh resolve; the initial push is empty + ticking, then the
             // spawned task pushes the resolved set with ticking: false.
-            let view = send_request::<PickerView>(&mut ws, id, &PickerViewParams {
-                filters: None,
-                kind: PickerKind::References,
-                reset: true,
-                offset: 0,
-                limit: 30,
-                center_on: None,
-                center_on_cursor_grep_hit: None,
-                directory_path: None,
-                buffer_id: Some(buffer_id),
-                explorer_roots: false,
-            }).await;
+            let view = send_request::<PickerView>(
+                &mut ws,
+                id,
+                &PickerViewParams {
+                    filters: None,
+                    kind: PickerKind::References,
+                    reset: true,
+                    offset: 0,
+                    limit: 30,
+                    center_on: None,
+                    center_on_cursor_grep_hit: None,
+                    directory_path: None,
+                    buffer_id: Some(buffer_id),
+                    explorer_roots: false,
+                },
+            )
+            .await;
             id += 1;
-            assert_eq!(view.total_candidates, 0, "references opens empty, then streams in");
+            assert_eq!(
+                view.total_candidates, 0,
+                "references opens empty, then streams in"
+            );
             // Drain until the resolve completes (ticking: false). The first push is the empty
             // ticking placeholder.
             let done = loop {
@@ -14592,7 +15182,14 @@ async fn references_picker_lists_all_uses() {
         .items
         .iter()
         .map(|i| {
-            let PickerItem::Reference { path, display_path, line, preview, .. } = i else {
+            let PickerItem::Reference {
+                path,
+                display_path,
+                line,
+                preview,
+                ..
+            } = i
+            else {
                 panic!("expected Reference item, got {i:?}")
             };
             assert!(path.ends_with("main.rs"), "unexpected path: {path}");
@@ -14622,11 +15219,20 @@ async fn lsp_format_reformats() {
     ]);
     let main_path = dir.path().join("main.rs");
     let (server, mut ws) = open_and_subscribe("fmt-rust", dir.path(), "main.rs").await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
-        transient: None,
-        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
 
     // Poll until rust-analyzer is ready enough to return formatting edits.
@@ -14646,7 +15252,12 @@ async fn lsp_format_reformats() {
     .expect("format did not apply within 90s");
 
     // Save and verify the on-disk content is canonically formatted.
-    let save_params = BufferSaveParams { buffer_id, path_index: None, relative_path: None, overwrite: true };
+    let save_params = BufferSaveParams {
+        buffer_id,
+        path_index: None,
+        relative_path: None,
+        overwrite: true,
+    };
     let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, id, &save_params).await;
     id += 1;
     let once = std::fs::read_to_string(&main_path).unwrap();
@@ -14659,7 +15270,10 @@ async fn lsp_format_reformats() {
     let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, id, &save_params).await;
     let twice = std::fs::read_to_string(&main_path).unwrap();
     drop(server);
-    assert_eq!(twice, FORMATTED, "second format changed already-canonical text");
+    assert_eq!(
+        twice, FORMATTED,
+        "second format changed already-canonical text"
+    );
 }
 
 /// Regression: the vscode JSON server gates its formatter behind `initializationOptions:
@@ -14674,11 +15288,20 @@ async fn lsp_format_json_reformats() {
     let dir = lay_out(&[("data.json", "{\"a\":1,\"b\":[1,2,3]}\n")]);
     let json_path = dir.path().join("data.json");
     let (server, mut ws) = open_and_subscribe("fmt-json", dir.path(), "data.json").await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
-        transient: None,
-        buffer_id: None, path_index: Some(0), relative_path: Some("data.json".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("data.json".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
 
     let mut id = 100;
@@ -14697,15 +15320,30 @@ async fn lsp_format_json_reformats() {
     })
     .await
     .expect("format did not resolve within 60s");
-    assert_eq!(status, FormatStatus::Applied, "json server should advertise a formatter");
+    assert_eq!(
+        status,
+        FormatStatus::Applied,
+        "json server should advertise a formatter"
+    );
 
-    let save_params = BufferSaveParams { buffer_id, path_index: None, relative_path: None, overwrite: true };
+    let save_params = BufferSaveParams {
+        buffer_id,
+        path_index: None,
+        relative_path: None,
+        overwrite: true,
+    };
     let _: BufferSaveResult = send_request::<BufferSave>(&mut ws, id, &save_params).await;
     let formatted = std::fs::read_to_string(&json_path).unwrap();
     drop(server);
     // The compact input gets expanded across lines with indentation.
-    assert!(formatted.contains('\n'), "expected multi-line JSON, got: {formatted:?}");
-    assert_ne!(formatted, "{\"a\":1,\"b\":[1,2,3]}\n", "json was not reformatted");
+    assert!(
+        formatted.contains('\n'),
+        "expected multi-line JSON, got: {formatted:?}"
+    );
+    assert_ne!(
+        formatted, "{\"a\":1,\"b\":[1,2,3]}\n",
+        "json was not reformatted"
+    );
 }
 
 /// Phase: the buffer-scoped diagnostics picker lists the buffer's diagnostics and selecting one
@@ -14723,27 +15361,44 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
         ("main.rs", "fn main() {\n    let _x: i32 = \"not an int\";\n}\n"),
     ]);
     let (server, mut ws) = open_and_subscribe("diagpick", dir.path(), "main.rs").await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 10, &BufferOpenParams {
-        transient: None,
-        buffer_id: None, path_index: Some(0), relative_path: Some("main.rs".into()),
-        language: None, create_if_missing: false, jump_to: None,
-    }).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
     let buffer_id = open.buffer_id;
-    assert!(wait_for_diag_state(&mut ws, true, 90).await, "diagnostics should arrive");
+    assert!(
+        wait_for_diag_state(&mut ws, true, 90).await,
+        "diagnostics should arrive"
+    );
 
     // Open the diagnostics picker for this buffer.
-    let _view = send_request::<PickerView>(&mut ws, 20, &PickerViewParams {
-        filters: None,
-        kind: PickerKind::Diagnostics,
-        reset: true,
-        offset: 0,
-        limit: 50,
-        center_on: None,
-        center_on_cursor_grep_hit: None,
-        directory_path: None,
-        buffer_id: Some(buffer_id),
-        explorer_roots: false,
-    }).await;
+    let _view = send_request::<PickerView>(
+        &mut ws,
+        20,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Diagnostics,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: Some(buffer_id),
+            explorer_roots: false,
+        },
+    )
+    .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.kind, PickerKind::Diagnostics);
 
@@ -14752,15 +15407,23 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
         _ => None,
     });
     let diag_item = diag_item.expect("picker lists at least one diagnostic");
-    if let PickerItem::Diagnostic { severity, message, .. } = &diag_item {
+    if let PickerItem::Diagnostic {
+        severity, message, ..
+    } = &diag_item
+    {
         eprintln!("diagnostic picker item: [{severity:?}] {message}");
     }
 
     // Selecting it resolves to the buffer's file at the diagnostic position.
-    let result: PickerSelectResult = send_request::<PickerSelect>(&mut ws, 21, &PickerSelectParams {
-        kind: PickerKind::Diagnostics,
-        item: diag_item,
-    }).await;
+    let result: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        21,
+        &PickerSelectParams {
+            kind: PickerKind::Diagnostics,
+            item: diag_item,
+        },
+    )
+    .await;
     drop(server);
     match result {
         PickerSelectResult::FileAt { path, .. } => assert!(path.ends_with("main.rs"), "got {path}"),
@@ -14799,7 +15462,10 @@ async fn serves_web_client_over_http() {
     );
     assert!(body.contains("text/html"), "should be served as HTML");
     // No token is served anymore: auth is by loopback Host/Origin, not an injected secret.
-    assert!(!body.contains("AETHER_TOKEN"), "no token should appear in the page");
+    assert!(
+        !body.contains("AETHER_TOKEN"),
+        "no token should appear in the page"
+    );
 
     // The fixed shell always links the bundle's JS at a stable path; fetch it to exercise the asset
     // route + mime (requires web/dist to have been built, which CI/dev does before running tests).
@@ -14875,7 +15541,10 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
             cols: 80,
             rows: 10,
             overscan_rows: 10,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -14921,7 +15590,10 @@ async fn viewport_total_visual_rows_counts_wrapped_rows() {
             cols: 10,
             rows: 5,
             overscan_rows: 5,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -14969,7 +15641,10 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
                 cols: 80,
                 rows: 10,
                 overscan_rows: 0,
-                scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+                scroll: ScrollPosition {
+                    logical_line: 0,
+                    sub_row: 0.0,
+                },
                 wrap: WrapMode::Soft,
                 continuation_marker_width: 0,
                 tab_width: 4,
@@ -15001,20 +15676,29 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
         .await
     }
 
-    let activate = ProjectActivateParams { name: "test-proj".into() };
+    let activate = ProjectActivateParams {
+        name: "test-proj".into(),
+    };
 
     // Client A: open a.txt (the shared buffer) and b.txt (so a next buffer exists after the close).
-    let (mut ws_a, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _: ProjectActivateResult = send_request::<ProjectActivate>(&mut ws_a, 1, &activate).await;
     let buf_a = open(&mut ws_a, 2, "a.txt").await.buffer_id;
     subscribe(&mut ws_a, 3, buf_a).await;
     let buf_b = open(&mut ws_a, 4, "b.txt").await.buffer_id;
 
     // Client B: open and view the same shared buffer.
-    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _: ProjectActivateResult = send_request::<ProjectActivate>(&mut ws_b, 1, &activate).await;
     let buf_a_b = open(&mut ws_b, 2, "a.txt").await.buffer_id;
-    assert_eq!(buf_a_b, buf_a, "same file dedups to one buffer across clients");
+    assert_eq!(
+        buf_a_b, buf_a,
+        "same file dedups to one buffer across clients"
+    );
     subscribe(&mut ws_b, 3, buf_a).await;
 
     // Client A closes the shared buffer. It gets its next buffer in the RPC result...
@@ -15043,8 +15727,12 @@ async fn nav_open_file(
     prev_vp: Option<u64>,
 ) -> (u64, u64) {
     if let Some(vp) = prev_vp {
-        send_request::<ViewportUnsubscribe>(ws, id + 2, &ViewportUnsubscribeParams { viewport_id: vp })
-            .await;
+        send_request::<ViewportUnsubscribe>(
+            ws,
+            id + 2,
+            &ViewportUnsubscribeParams { viewport_id: vp },
+        )
+        .await;
     }
     let open: BufferOpenResult = send_request::<BufferOpen>(
         ws,
@@ -15068,7 +15756,10 @@ async fn nav_open_file(
             cols: 80,
             rows: 10,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -15087,9 +15778,17 @@ async fn nav_back_and_forward_across_files() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ProjectActivateResult =
-        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: "test-proj".into() }).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
 
     // In a.txt, make a selection on line 1 (anchor before cursor) so we can prove it's restored.
     let (buf_a, vp_a) = nav_open_file(&mut ws, 10, "a.txt", None).await;
@@ -15097,6 +15796,7 @@ async fn nav_back_and_forward_across_files() {
         &mut ws,
         20,
         &CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: buf_a,
             position: LogicalPosition { line: 1, col: 4 },
             anchor: LogicalPosition { line: 1, col: 1 },
@@ -15122,7 +15822,10 @@ async fn nav_back_and_forward_across_files() {
     let (_a_again, vp_a2) = nav_open_file(&mut ws, 60, "a.txt", Some(vp_b)).await;
     let fwd: NavStepResult =
         send_request::<NavForward>(&mut ws, 70, &NavStepParams { buffer_id: buf_a }).await;
-    assert_eq!(fwd.target.expect("forward should move to b.txt").buffer_id, buf_b);
+    assert_eq!(
+        fwd.target.expect("forward should move to b.txt").buffer_id,
+        buf_b
+    );
 
     // Re-point to b, then back again (from b) lands on a once more (stack intact).
     let (_b_again, _vp_b2) = nav_open_file(&mut ws, 90, "b.txt", Some(vp_a2)).await;
@@ -15141,9 +15844,17 @@ async fn nav_back_empty_is_noop() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ProjectActivateResult =
-        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: "test-proj".into() }).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
     let (buf_a, _) = nav_open_file(&mut ws, 10, "a.txt", None).await;
 
     let back: NavStepResult =
@@ -15161,9 +15872,17 @@ async fn nav_goto_reopens_by_path() {
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
         .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
-    let _: ProjectActivateResult =
-        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: "test-proj".into() }).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
     let (buf_a, _) = nav_open_file(&mut ws, 10, "a.txt", None).await;
     // Close it so the stale buffer_id forces the path fallback.
     send_request::<BufferClose>(&mut ws, 20, &BufferCloseParams { buffer_id: buf_a }).await;
@@ -15185,7 +15904,10 @@ async fn nav_goto_reopens_by_path() {
     )
     .await;
     let target = res.target.expect("goto should open the file");
-    assert_eq!(target.path.as_deref().map(|p| p.ends_with("a.txt")), Some(true));
+    assert_eq!(
+        target.path.as_deref().map(|p| p.ends_with("a.txt")),
+        Some(true)
+    );
     assert_eq!(target.cursor.position, LogicalPosition { line: 2, col: 1 });
     drop(server);
 }
@@ -15240,7 +15962,8 @@ async fn setup_grep_filter_workspace() -> (
     index.write().unwrap();
     let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
     let sig = git2::Signature::now("Test", "t@e.com").unwrap();
-    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
     drop(tree);
     drop(index);
     drop(repo);
@@ -15334,7 +16057,12 @@ async fn grep_filter_baseline_smart_case() {
     let (server, mut ws) = setup_grep_filter_workspace().await;
     // All-lowercase query under smart case is case-insensitive: "Needle" in README counts.
     let update = grep_with_filters(&mut ws, 10, "needle", PickerFilters::default(), 1).await;
-    assert_eq!(update.total_matches, 7, "files: {:?}", grep_hit_files(&update));
+    assert_eq!(
+        update.total_matches,
+        7,
+        "files: {:?}",
+        grep_hit_files(&update)
+    );
     // An uppercase letter flips smart case to sensitive: only README's "Needle" matches.
     let update = grep_with_filters(&mut ws, 11, "Needle", PickerFilters::default(), 2).await;
     assert_eq!(update.total_matches, 1);
@@ -15400,7 +16128,12 @@ async fn grep_filter_globs() {
         ..Default::default()
     };
     let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
-    assert_eq!(update.total_matches, 5, "files: {:?}", grep_hit_files(&update));
+    assert_eq!(
+        update.total_matches,
+        5,
+        "files: {:?}",
+        grep_hit_files(&update)
+    );
     assert!(!grep_hit_files(&update).contains(&"README.md".to_string()));
     // Exclude glob: everything except .md files.
     let filters = PickerFilters {
@@ -15664,8 +16397,14 @@ async fn grep_filter_include_ignored_and_hidden() {
     };
     let update = grep_with_filters(&mut ws, 11, "needle", filters, 2).await;
     let files = grep_hit_files(&update);
-    assert!(files.contains(&".hidden.rs".to_string()), "files: {files:?}");
-    assert!(!files.contains(&"debug.log".to_string()), "files: {files:?}");
+    assert!(
+        files.contains(&".hidden.rs".to_string()),
+        "files: {files:?}"
+    );
+    assert!(
+        !files.contains(&"debug.log".to_string()),
+        "files: {files:?}"
+    );
     assert_eq!(update.total_matches, 8);
     drop(server);
 }
@@ -15811,7 +16550,9 @@ async fn grep_filter_root_scope() {
     std::fs::write(root_b.join("b.txt"), "needle in b\n").unwrap();
     std::mem::forget(dir_a);
     std::mem::forget(dir_b);
-    let server = spawn_for_test("test-proj", vec![root_a, root_b]).await.unwrap();
+    let server = spawn_for_test("test-proj", vec![root_a, root_b])
+        .await
+        .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -15878,7 +16619,10 @@ async fn grep_filter_root_scope() {
         ..Default::default()
     };
     let update = grep_with_filters(&mut ws, 11, "needle", filters, 2).await;
-    assert_eq!(update.total_matches, 2, "both roots' hits under a cross-root union");
+    assert_eq!(
+        update.total_matches, 2,
+        "both roots' hits under a cross-root union"
+    );
     drop(server);
 }
 
@@ -16112,7 +16856,10 @@ async fn explorer_filters_hide_and_changed_only() {
     )
     .await;
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
-    assert!(entry_names(&update).contains(&"src"), "reset restores the full listing");
+    assert!(
+        entry_names(&update).contains(&"src"),
+        "reset restores the full listing"
+    );
 
     drop(server);
 }
@@ -16275,8 +17022,7 @@ async fn pin_promotes_transient_buffer() {
         send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
 
     let pinned: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, 4, &attach_open_params(a.buffer_id, Some(false)))
-            .await;
+        send_request::<BufferOpen>(&mut ws, 4, &attach_open_params(a.buffer_id, Some(false))).await;
     assert!(!pinned.transient, "pin reports the flag cleared");
 
     let b: BufferOpenResult =
@@ -16527,13 +17273,24 @@ async fn buffers_picker_reports_transient_flag() {
         .items
         .iter()
         .map(|i| {
-            let PickerItem::Buffer { buffer_id, transient, .. } = i else {
+            let PickerItem::Buffer {
+                buffer_id,
+                transient,
+                ..
+            } = i
+            else {
                 panic!("expected Buffer, got {i:?}")
             };
             (*buffer_id, *transient)
         })
         .collect();
-    assert!(flags.contains(&(b.buffer_id, true)), "transient buffer flagged: {flags:?}");
-    assert!(flags.contains(&(a.buffer_id, false)), "permanent buffer unflagged: {flags:?}");
+    assert!(
+        flags.contains(&(b.buffer_id, true)),
+        "transient buffer flagged: {flags:?}"
+    );
+    assert!(
+        flags.contains(&(a.buffer_id, false)),
+        "permanent buffer unflagged: {flags:?}"
+    );
     drop(server);
 }

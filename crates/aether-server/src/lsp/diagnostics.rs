@@ -23,7 +23,11 @@ pub struct BufferDiagnostic {
 /// Convert an LSP `diagnostics` array (from `publishDiagnostics`) into buffer-relative diagnostics,
 /// mapping each `character` from `encoding` to a byte column against `text`. Diagnostics whose line
 /// is past the end of the buffer are dropped.
-pub fn from_lsp(diagnostics: &Value, text: &Rope, encoding: PositionEncoding) -> Vec<BufferDiagnostic> {
+pub fn from_lsp(
+    diagnostics: &Value,
+    text: &Rope,
+    encoding: PositionEncoding,
+) -> Vec<BufferDiagnostic> {
     let Some(arr) = diagnostics.as_array() else {
         return Vec::new();
     };
@@ -65,7 +69,11 @@ fn convert_one(d: &Value, text: &Rope, encoding: PositionEncoding) -> Option<Buf
     })
 }
 
-fn lsp_pos_to_buffer(pos: &Value, text: &Rope, encoding: PositionEncoding) -> Option<LogicalPosition> {
+fn lsp_pos_to_buffer(
+    pos: &Value,
+    text: &Rope,
+    encoding: PositionEncoding,
+) -> Option<LogicalPosition> {
     let line = pos.get("line")?.as_u64()? as u32;
     let character = pos.get("character")?.as_u64()? as u32;
     if line as usize >= text.len_lines() {

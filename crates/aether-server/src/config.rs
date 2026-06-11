@@ -65,9 +65,7 @@ pub fn list_project_names() -> anyhow::Result<Vec<String>> {
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(e).with_context(|| format!("reading projects dir {}", dir.display()))
-        }
+        Err(e) => return Err(e).with_context(|| format!("reading projects dir {}", dir.display())),
     };
     let mut names: Vec<String> = entries
         .flatten()
@@ -181,7 +179,11 @@ pub fn rename_project_config(old: &str, new: &str) -> anyhow::Result<()> {
             .with_context(|| format!("creating projects dir {}", parent.display()))?;
     }
     std::fs::rename(&from, &to).with_context(|| {
-        format!("renaming project config {} -> {}", from.display(), to.display())
+        format!(
+            "renaming project config {} -> {}",
+            from.display(),
+            to.display()
+        )
     })?;
     Ok(())
 }

@@ -340,6 +340,9 @@ class Editor {
   // Mouse drag-select.
   private dragging = false;
   private dragAnchor: LogicalPosition | null = null;
+  /** Snapping unit of the drag gesture, from the click count: single → char, double → word,
+   *  triple+ → line. The server expands the selection to this granularity on every update. */
+  private dragGranularity: "char" | "word" | "line" = "char";
   /** Serializes async key handling so rapid keystrokes don't race on shared cursor/window state. */
   private queue: Promise<void> = Promise.resolve();
 
@@ -2324,6 +2327,8 @@ class Editor {
     this.dismissHover();
     this.clipboardCapture.focus();
     this.dragging = true;
+    // The browser counts clicks for us (`detail`): double selects a word, triple a line.
+    this.dragGranularity = e.detail <= 1 ? "char" : e.detail === 2 ? "word" : "line";
     this.dragAnchor = pos;
     this.setSelection(pos, pos);
   }
@@ -2334,14 +2339,17 @@ class Editor {
     if (pos) this.setSelection(pos, this.dragAnchor);
   }
 
-  /** Set the cursor/selection and repaint locally (no window refetch — a click stays in view). */
+  /** Set the cursor/selection and repaint locally (no window refetch — a click stays in view).
+   *  The active gesture's granularity rides along so the server snaps word/line selections. */
   private setSelection(position: LogicalPosition, anchor: LogicalPosition): void {
+    const granularity = this.dragGranularity;
     this.queue = this.queue
       .then(async () => {
         this.cursor = await this.client.rpc<CursorState>("cursor/set", {
           buffer_id: this.bufferId,
           position,
           anchor,
+          ...(granularity !== "char" ? { granularity } : {}),
         });
         this.render();
       })

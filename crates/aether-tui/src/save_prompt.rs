@@ -527,7 +527,11 @@ pub(crate) fn pop_segment(input: &str) -> String {
 }
 
 /// Resolve `dir_part` (project-relative, possibly with trailing `/`) under the chosen root.
-pub(crate) fn join_root_relative(project_paths: &[String], path_index: u32, dir_part: &str) -> String {
+pub(crate) fn join_root_relative(
+    project_paths: &[String],
+    path_index: u32,
+    dir_part: &str,
+) -> String {
     let Some(root) = project_paths.get(path_index as usize) else {
         return String::new();
     };

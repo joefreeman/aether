@@ -78,8 +78,8 @@ const NORD15: Color = Color::Rgb(180, 142, 173); // Aurora purple — numbers, c
 const GIT_DELETED_BG: Color = Color::Rgb(59, 34, 38); // dark muted red
 const GIT_ADDED_BG: Color = Color::Rgb(45, 58, 45); // dark muted green
 const GIT_MODIFIED_BG: Color = Color::Rgb(58, 54, 40); // dark muted olive
-// Staged variants keep each kind's hue but dimmed/desaturated — hue says *what* changed,
-// brightness says whether it still needs staging (bright = unstaged, muted = in the index).
+                                                       // Staged variants keep each kind's hue but dimmed/desaturated — hue says *what* changed,
+                                                       // brightness says whether it still needs staging (bright = unstaged, muted = in the index).
 const GIT_STAGED_ADDED: Color = Color::Rgb(110, 128, 96); // dimmed NORD14
 const GIT_STAGED_MODIFIED: Color = Color::Rgb(158, 138, 98); // dimmed NORD13
 const GIT_STAGED_DELETED: Color = Color::Rgb(132, 76, 83); // dimmed NORD11
@@ -1490,11 +1490,8 @@ fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
 /// separator is dropped too, since it would double up against the bottom border.
 fn collapsed_picker_box_rect(area: Rect, content_rows: u32, editor_open: bool) -> Rect {
     let full = picker_box_rect(area);
-    let chrome: u32 =
-        (if content_rows == 0 { 3 } else { 4 }) + editor_open as u32;
-    let height = content_rows
-        .saturating_add(chrome)
-        .min(full.height as u32) as u16;
+    let chrome: u32 = (if content_rows == 0 { 3 } else { 4 }) + editor_open as u32;
+    let height = content_rows.saturating_add(chrome).min(full.height as u32) as u16;
     Rect { height, ..full }
 }
 
@@ -1694,19 +1691,35 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
             text.push_str(&format!("  {msg}"));
         }
         // The label appears once; further operations keep the value column.
-        push_lsp_detail_row(&mut lines, if i == 0 { "Working" } else { "" }, &text, NORD13, w);
+        push_lsp_detail_row(
+            &mut lines,
+            if i == 0 { "Working" } else { "" },
+            &text,
+            NORD13,
+            w,
+        );
     }
     let total = lines.len() as u16;
     let body_h = area.height;
     detail.scroll.record(total, body_h);
     let offset = detail.scroll.offset();
-    let text_area = Rect { width: text_w, ..area };
+    let text_area = Rect {
+        width: text_w,
+        ..area
+    };
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)).scroll((offset, 0)),
+        Paragraph::new(lines)
+            .style(Style::default().bg(NORD0).fg(NORD4))
+            .scroll((offset, 0)),
         text_area,
     );
     if total > body_h {
-        let bar = Rect { x: area.x + area.width - 1, y: area.y, width: 1, height: area.height };
+        let bar = Rect {
+            x: area.x + area.width - 1,
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
         draw_vertical_scrollbar(f, bar, offset, total, body_h);
     }
 }
@@ -1873,7 +1886,12 @@ fn chip_editor_spans(state: &AppState) -> (Vec<Span<'static>>, u16) {
                 } else if invalid {
                     // An unfocused-but-unmatched root shows the raw red filter — not the
                     // fallback label, which would advertise a commit target the gate refuses.
-                    push(&mut spans, &mut w, ed.root_filter.text.clone(), invalid_style);
+                    push(
+                        &mut spans,
+                        &mut w,
+                        ed.root_filter.text.clone(),
+                        invalid_style,
+                    );
                 } else {
                     let chosen = ed.chosen_root(&labels) as usize;
                     let label = labels.get(chosen).cloned().unwrap_or_default();
@@ -1885,7 +1903,11 @@ fn chip_editor_spans(state: &AppState) -> (Vec<Span<'static>>, u16) {
                     push(&mut spans, &mut w, ": ".into(), label_style);
                 }
             }
-            let path_style = if ed.path_invalid() { invalid_style } else { text_style };
+            let path_style = if ed.path_invalid() {
+                invalid_style
+            } else {
+                text_style
+            };
             if ed.field == ChipEditorField::Path || !multi_root {
                 cursor = w + ed.input.width_to_cursor();
                 push(&mut spans, &mut w, ed.input.text.clone(), path_style);
@@ -2274,7 +2296,14 @@ fn picker_item_spans(
         git_status,
     } = item
     {
-        return dir_entry_spans(name, *is_dir, *git_status, match_indices, highlighted, max_width);
+        return dir_entry_spans(
+            name,
+            *is_dir,
+            *git_status,
+            match_indices,
+            highlighted,
+            max_width,
+        );
     }
     // File rows get a leading dim `{label}: ` prefix; everything else falls through with the
     // legacy single-string display.
@@ -2459,9 +2488,9 @@ fn picker_item_spans(
 fn buffer_dirty_dot_color(status: BufferDirtyState) -> Option<Color> {
     match status {
         BufferDirtyState::Clean => None,
-        BufferDirtyState::Unsaved => Some(NORD9),             // frost blue — unsaved edits
+        BufferDirtyState::Unsaved => Some(NORD9), // frost blue — unsaved edits
         BufferDirtyState::ExternallyModified => Some(NORD12), // aurora orange — changed on disk
-        BufferDirtyState::ExternallyDeleted => Some(NORD11),  // aurora red — gone on disk
+        BufferDirtyState::ExternallyDeleted => Some(NORD11), // aurora red — gone on disk
     }
 }
 
@@ -2653,7 +2682,10 @@ fn grep_hit_spans(
         (cut, true)
     };
     let kept_char_count = shown.chars().count() as u32;
-    let kept_indices: Vec<u32> = shifted.into_iter().filter(|&i| i < kept_char_count).collect();
+    let kept_indices: Vec<u32> = shifted
+        .into_iter()
+        .filter(|&i| i < kept_char_count)
+        .collect();
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     push_styled_with_match_indices(&mut spans, &shown, &kept_indices, base, match_style);
@@ -2663,7 +2695,10 @@ fn grep_hit_spans(
     // Pad out to the right edge (≥ the gap by construction), so the numbers' last digits align
     // down the file group. The pad carries the row background, like the text.
     let used = shown.width() + usize::from(ellipsis) + line_str.width();
-    spans.push(Span::styled(" ".repeat(max_width.saturating_sub(used)), base));
+    spans.push(Span::styled(
+        " ".repeat(max_width.saturating_sub(used)),
+        base,
+    ));
     spans.push(Span::styled(line_str, dim_style));
     spans
 }
@@ -2702,7 +2737,11 @@ fn diagnostic_item_spans(
         })
         .collect();
     let kept = truncated.chars().count() as u32;
-    let kept_indices: Vec<u32> = match_indices.iter().copied().filter(|&i| i < kept).collect();
+    let kept_indices: Vec<u32> = match_indices
+        .iter()
+        .copied()
+        .filter(|&i| i < kept)
+        .collect();
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     if kept_indices.is_empty() {
@@ -2846,7 +2885,11 @@ fn lsp_server_item_spans(
     let bg = if highlighted { NORD2 } else { NORD0 };
     // A ready server with active `$/progress` work shows the busy colour (same as the status bar).
     let busy = matches!(status, LspStatus::Ready) && !progress.is_empty();
-    let dot_color = if busy { NORD13 } else { lsp_status_color(status) };
+    let dot_color = if busy {
+        NORD13
+    } else {
+        lsp_status_color(status)
+    };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
     // Dim tail: `language · root`, the root only when the server isn't at the project root
@@ -2878,7 +2921,11 @@ fn lsp_server_item_spans(
         })
         .collect();
     let kept = truncated.chars().count() as u32;
-    let kept_indices: Vec<u32> = match_indices.iter().copied().filter(|&i| i < kept).collect();
+    let kept_indices: Vec<u32> = match_indices
+        .iter()
+        .copied()
+        .filter(|&i| i < kept)
+        .collect();
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
@@ -2926,7 +2973,9 @@ fn lsp_server_item_spans(
 /// (alphabetically first) operation's title, its percentage when known, and `+N` when more are
 /// running. Empty when the server is idle.
 fn lsp_progress_hint(progress: &[LspProgress]) -> String {
-    let Some(first) = progress.first() else { return String::new() };
+    let Some(first) = progress.first() else {
+        return String::new();
+    };
     let mut s = format!("  {}", first.title);
     if let Some(pct) = first.percentage {
         s.push_str(&format!(" {pct}%"));
@@ -3248,7 +3297,10 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                         spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
                     }
                     let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
-                    append_eol_blame(&mut spans, show_blame.then(|| blame_text.as_deref()).flatten());
+                    append_eol_blame(
+                        &mut spans,
+                        show_blame.then(|| blame_text.as_deref()).flatten(),
+                    );
                     apply_line_tint(&mut spans, line_tint, viewport_cols);
                     lines.push(prepend_gutter(gutter_mark, render.diff_stage, spans));
                     continue;
@@ -3335,7 +3387,10 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
             }
             let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
-            append_eol_blame(&mut spans, show_blame.then(|| blame_text.as_deref()).flatten());
+            append_eol_blame(
+                &mut spans,
+                show_blame.then(|| blame_text.as_deref()).flatten(),
+            );
             apply_line_tint(&mut spans, line_tint, viewport_cols);
             lines.push(prepend_gutter(gutter_mark, render.diff_stage, spans));
         }
@@ -3363,7 +3418,9 @@ fn deleted_virtual_row_spans(text: &str, width: u16, stage: DiffStage) -> Vec<Sp
     let used = shown.chars().count();
     shown.push_str(&" ".repeat((width as usize).saturating_sub(used)));
     let style = if stage == DiffStage::Staged {
-        Style::default().fg(GIT_STAGED_DELETED).bg(GIT_STAGED_DELETED_BG)
+        Style::default()
+            .fg(GIT_STAGED_DELETED)
+            .bg(GIT_STAGED_DELETED_BG)
     } else {
         Style::default().fg(NORD11).bg(GIT_DELETED_BG)
     };
@@ -3391,9 +3448,7 @@ fn stage_color(stage: DiffStage, bright: Color, dim: Color) -> Color {
 fn git_gutter_cell(mark: Option<DiffMarker>, stage: DiffStage) -> Span<'static> {
     match mark {
         Some(DiffMarker::Added) => gutter_bar(stage_color(stage, NORD14, GIT_STAGED_ADDED)),
-        Some(DiffMarker::Modified) => {
-            gutter_bar(stage_color(stage, NORD13, GIT_STAGED_MODIFIED))
-        }
+        Some(DiffMarker::Modified) => gutter_bar(stage_color(stage, NORD13, GIT_STAGED_MODIFIED)),
         Some(DiffMarker::Deleted) => {
             // "removed above" top marker
             Span::styled(
@@ -4296,7 +4351,7 @@ fn buffer_status_color(kind: BufferStatusKind) -> Color {
     match kind {
         BufferStatusKind::ExternallyDeleted => NORD11, // aurora red — gone on disk
         BufferStatusKind::ExternallyModified => NORD12, // aurora orange — changed on disk
-        BufferStatusKind::Unsaved => NORD9,             // frost blue — unsaved edits
+        BufferStatusKind::Unsaved => NORD9,            // frost blue — unsaved edits
     }
 }
 
@@ -4326,7 +4381,12 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
     // Combined per-class counts: unstaged then `(staged)`.
     for (sigil, color, unstaged, staged) in [
         ('+', NORD14, status.unstaged.added, status.staged.added),
-        ('~', NORD13, status.unstaged.modified, status.staged.modified),
+        (
+            '~',
+            NORD13,
+            status.unstaged.modified,
+            status.staged.modified,
+        ),
         ('-', NORD11, status.unstaged.deleted, status.staged.deleted),
     ] {
         if unstaged == 0 && staged == 0 {
@@ -5135,9 +5195,16 @@ mod tests {
         let lines = hover_display_lines(&blocks, 80);
         assert_eq!(
             lines[0],
-            ("Error: bad thing".to_string(), Some(DiagnosticSeverity::Error))
+            (
+                "Error: bad thing".to_string(),
+                Some(DiagnosticSeverity::Error)
+            )
         );
-        assert_eq!(lines[1], (String::new(), None), "blank separator between blocks");
+        assert_eq!(
+            lines[1],
+            (String::new(), None),
+            "blank separator between blocks"
+        );
         assert_eq!(
             lines[2],
             ("Hint: maybe".to_string(), Some(DiagnosticSeverity::Hint))
@@ -5147,7 +5214,10 @@ mod tests {
             text: "fn x()".into(),
             severity: None,
         }];
-        assert_eq!(hover_display_lines(&plain, 80)[0], ("fn x()".to_string(), None));
+        assert_eq!(
+            hover_display_lines(&plain, 80)[0],
+            ("fn x()".to_string(), None)
+        );
     }
 
     #[test]
@@ -5161,7 +5231,10 @@ mod tests {
         assert_eq!(hover_border_color(&[blk(None)]), NORD8);
         // Worst severity wins.
         assert_eq!(
-            hover_border_color(&[blk(Some(DiagnosticSeverity::Hint)), blk(Some(DiagnosticSeverity::Error))]),
+            hover_border_color(&[
+                blk(Some(DiagnosticSeverity::Hint)),
+                blk(Some(DiagnosticSeverity::Error))
+            ]),
             diag_color(DiagnosticSeverity::Error)
         );
         assert_eq!(
@@ -5264,7 +5337,7 @@ mod tests {
         assert!(text.starts_with("• rust-analyzer"));
         assert!(text.ends_with("rust · backend"));
         assert_eq!(spans[0].style.fg, Some(NORD14)); // ready → green dot
-        // At the project root the tail is just the language — no separator.
+                                                     // At the project root the tail is just the language — no separator.
         let single = lsp_server_item_spans(
             "rust-analyzer",
             "rust",
@@ -5283,7 +5356,12 @@ mod tests {
 
     #[test]
     fn collapsed_picker_box_shrinks_to_content_keeping_top() {
-        let area = Rect { x: 0, y: 0, width: 200, height: 60 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 60,
+        };
         let full = picker_box_rect(area);
         let collapsed = collapsed_picker_box_rect(area, 3, false);
         assert_eq!(collapsed.height, 7); // 3 content rows + borders + input + separator
@@ -5303,14 +5381,23 @@ mod tests {
         );
         // Over budget: whole middle segments collapse to one `…`, filename always survives,
         // and the candidate keeping the most segments wins.
-        assert_eq!(truncate_path_with_indices(p, &[], 30).0, "crates/…/src/handlers.rs");
+        assert_eq!(
+            truncate_path_with_indices(p, &[], 30).0,
+            "crates/…/src/handlers.rs"
+        );
         // Tighter: the tail is preferred over leading dirs.
-        assert_eq!(truncate_path_with_indices(p, &[], 20).0, "…/src/handlers.rs");
+        assert_eq!(
+            truncate_path_with_indices(p, &[], 20).0,
+            "…/src/handlers.rs"
+        );
         assert_eq!(truncate_path_with_indices(p, &[], 16).0, "…/handlers.rs");
         // Tighter than `…/{filename}`: char-level floor keeps the filename's tail.
         assert_eq!(truncate_path_with_indices(p, &[], 8).0, "…lers.rs");
         // Non-paths skip straight to the floor.
-        assert_eq!(truncate_path_with_indices("a long project name", &[], 8).0, "…ct name");
+        assert_eq!(
+            truncate_path_with_indices("a long project name", &[], 8).0,
+            "…ct name"
+        );
     }
 
     #[test]
@@ -5339,10 +5426,20 @@ mod tests {
     #[test]
     fn picker_box_width_caps_on_wide_terminals() {
         // Comfortable terminal: percentage scaling, under the cap.
-        let medium = Rect { x: 0, y: 0, width: 100, height: 40 };
+        let medium = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
         assert!(picker_box_rect(medium).width < PICKER_WIDTH_CAP);
         // Ultrawide: 80% would be 240 cols — the cap wins, and the box stays centred.
-        let wide = Rect { x: 0, y: 0, width: 300, height: 60 };
+        let wide = Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 60,
+        };
         let r = picker_box_rect(wide);
         assert_eq!(r.width, PICKER_WIDTH_CAP);
         assert_eq!(r.x, (300 - PICKER_WIDTH_CAP) / 2);
@@ -5350,19 +5447,37 @@ mod tests {
 
     #[test]
     fn collapsed_picker_box_caps_at_full_size() {
-        let area = Rect { x: 0, y: 0, width: 200, height: 60 };
-        assert_eq!(collapsed_picker_box_rect(area, 10_000, false), picker_box_rect(area));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 60,
+        };
+        assert_eq!(
+            collapsed_picker_box_rect(area, 10_000, false),
+            picker_box_rect(area)
+        );
     }
 
     #[test]
     fn collapsed_picker_box_drops_separator_row_when_empty() {
-        let area = Rect { x: 0, y: 0, width: 200, height: 60 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 60,
+        };
         assert_eq!(collapsed_picker_box_rect(area, 0, false).height, 3); // borders + input only
     }
 
     #[test]
     fn collapsed_picker_box_grows_for_open_chip_editor() {
-        let area = Rect { x: 0, y: 0, width: 200, height: 60 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 60,
+        };
         // The chip editor line adds one chrome row below the input.
         assert_eq!(collapsed_picker_box_rect(area, 3, true).height, 8);
     }
@@ -5459,7 +5574,16 @@ mod tests {
     #[test]
     fn editor_status_spans_no_status_pads_to_right_edge() {
         let status = crate::app::StatusMessage::default();
-        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![Span::raw("12:5")],30);
+        let spans = build_editor_status_spans(
+            "[proj] ",
+            "file.rs",
+            false,
+            None,
+            Vec::new(),
+            &status,
+            vec![Span::raw("12:5")],
+            30,
+        );
         let text = spans_text(&spans);
         assert!(text.starts_with("[proj] file.rs"));
         assert!(text.ends_with("12:5"));
@@ -5471,7 +5595,16 @@ mod tests {
     #[test]
     fn editor_status_spans_italicise_transient_label() {
         let status = crate::app::StatusMessage::default();
-        let spans = build_editor_status_spans("[proj] ", "file.rs", true, None, Vec::new(), &status, vec![], 30);
+        let spans = build_editor_status_spans(
+            "[proj] ",
+            "file.rs",
+            true,
+            None,
+            Vec::new(),
+            &status,
+            vec![],
+            30,
+        );
         let label = spans
             .iter()
             .find(|s| s.content.contains("file.rs"))
@@ -5479,8 +5612,20 @@ mod tests {
         assert!(label.style.add_modifier.contains(Modifier::ITALIC));
         assert!(!spans_text(&spans).contains("transient"), "no marker text");
 
-        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![], 30);
-        let label = spans.iter().find(|s| s.content.contains("file.rs")).unwrap();
+        let spans = build_editor_status_spans(
+            "[proj] ",
+            "file.rs",
+            false,
+            None,
+            Vec::new(),
+            &status,
+            vec![],
+            30,
+        );
+        let label = spans
+            .iter()
+            .find(|s| s.content.contains("file.rs"))
+            .unwrap();
         assert!(!label.style.add_modifier.contains(Modifier::ITALIC));
     }
 
@@ -5491,8 +5636,16 @@ mod tests {
             BUFFER_STATUS_DOT.to_string(),
             Style::default().fg(buffer_status_color(BufferStatusKind::Unsaved)),
         );
-        let spans =
-            build_editor_status_spans("[proj] ", "file.rs", false, Some(dot), Vec::new(), &status, vec![], 30);
+        let spans = build_editor_status_spans(
+            "[proj] ",
+            "file.rs",
+            false,
+            Some(dot),
+            Vec::new(),
+            &status,
+            vec![],
+            30,
+        );
         // The dot leads the row, before the project name, in the unsaved (frost-blue) colour.
         let text = spans_text(&spans);
         assert!(text.starts_with(&format!("{BUFFER_STATUS_DOT} [proj] file.rs")));
@@ -5507,7 +5660,16 @@ mod tests {
     #[test]
     fn editor_status_spans_renders_status_with_color() {
         let status = crate::app::StatusMessage::success("saved (rev 1)");
-        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![Span::raw("12:5")],60);
+        let spans = build_editor_status_spans(
+            "[proj] ",
+            "file.rs",
+            false,
+            None,
+            Vec::new(),
+            &status,
+            vec![Span::raw("12:5")],
+            60,
+        );
         // Status text should appear, sandwiched between the left bit and the padding/right.
         let text = spans_text(&spans);
         assert!(text.contains("[proj] file.rs"));
@@ -5526,7 +5688,16 @@ mod tests {
         // total=30, right="12:5" (4) + gap(1) = 5 reserved; left_max=25. left_pre="[proj] file.rs" (14)
         // + separator(4) = 18 used. Status budget = 25 - 18 = 7. So a long status truncates.
         let status = crate::app::StatusMessage::info("a much longer status message");
-        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![Span::raw("12:5")],30);
+        let spans = build_editor_status_spans(
+            "[proj] ",
+            "file.rs",
+            false,
+            None,
+            Vec::new(),
+            &status,
+            vec![Span::raw("12:5")],
+            30,
+        );
         let status_span = spans
             .iter()
             .find(|s| s.style.fg == Some(NORD4) && s.content.contains('…'))
@@ -5543,14 +5714,26 @@ mod tests {
         // the budget (and fits exactly), the project prefix — which can't fit whole alongside it
         // — is dropped, and the status is dropped entirely.
         let status = crate::app::StatusMessage::error("save failed: disk full");
-        let spans = build_editor_status_spans("[proj] ", "file.rs", false, None, Vec::new(), &status, vec![Span::raw("12:5")],12);
+        let spans = build_editor_status_spans(
+            "[proj] ",
+            "file.rs",
+            false,
+            None,
+            Vec::new(),
+            &status,
+            vec![Span::raw("12:5")],
+            12,
+        );
         let text = spans_text(&spans);
         // No part of the status text should make it into the rendered line.
         assert!(
             !text.contains("save failed"),
             "status should have been dropped: {text:?}"
         );
-        assert!(text.starts_with("file.rs"), "label survives, prefix dropped: {text:?}");
+        assert!(
+            text.starts_with("file.rs"),
+            "label survives, prefix dropped: {text:?}"
+        );
         assert!(text.ends_with("12:5"));
         assert_eq!(spans_total_width(&spans), 12);
     }
@@ -5571,7 +5754,10 @@ mod tests {
         );
         let text = spans_text(&spans);
         assert!(text.contains('…'));
-        assert!(text.contains("file.rs"), "filename end survives elision: {text:?}");
+        assert!(
+            text.contains("file.rs"),
+            "filename end survives elision: {text:?}"
+        );
         assert_eq!(spans_total_width(&spans), 25);
     }
 
@@ -5668,7 +5854,10 @@ mod tests {
         };
         assert_eq!(lsp_progress_hint(&[]), "");
         assert_eq!(lsp_progress_hint(&[mk("Indexing", None)]), "  Indexing");
-        assert_eq!(lsp_progress_hint(&[mk("cargo check", Some(28))]), "  cargo check 28%");
+        assert_eq!(
+            lsp_progress_hint(&[mk("cargo check", Some(28))]),
+            "  cargo check 28%"
+        );
         // Several concurrent operations → first (with %) plus a "+N" overflow marker.
         assert_eq!(
             lsp_progress_hint(&[mk("cargo check", Some(28)), mk("Indexing", None)]),
@@ -5681,12 +5870,18 @@ mod tests {
         use aether_protocol::viewport::DiffStage::{Staged, Unstaged};
         // An added/modified cursor line gets the green/olive variant, not the plain cursorline —
         // and crucially not the diff tint itself, so it reads as "cursor here AND changed".
-        assert_eq!(cursor_line_bg(Some(DiffMarker::Added), Unstaged), CURSOR_LINE_ADDED_BG);
+        assert_eq!(
+            cursor_line_bg(Some(DiffMarker::Added), Unstaged),
+            CURSOR_LINE_ADDED_BG
+        );
         assert_eq!(
             cursor_line_bg(Some(DiffMarker::Modified), Unstaged),
             CURSOR_LINE_MODIFIED_BG
         );
-        assert_ne!(cursor_line_bg(Some(DiffMarker::Added), Unstaged), GIT_ADDED_BG);
+        assert_ne!(
+            cursor_line_bg(Some(DiffMarker::Added), Unstaged),
+            GIT_ADDED_BG
+        );
         // A staged line keeps its dimmer identity under the cursor instead of flaring back up to
         // the unstaged brightness.
         assert_eq!(
@@ -5698,7 +5893,10 @@ mod tests {
             CURSOR_LINE_STAGED_MODIFIED_BG
         );
         // Deleted (no real-line tint) and unchanged lines fall back to the plain cursorline.
-        assert_eq!(cursor_line_bg(Some(DiffMarker::Deleted), Unstaged), CURSOR_LINE_BG);
+        assert_eq!(
+            cursor_line_bg(Some(DiffMarker::Deleted), Unstaged),
+            CURSOR_LINE_BG
+        );
         assert_eq!(cursor_line_bg(None, Unstaged), CURSOR_LINE_BG);
     }
 }

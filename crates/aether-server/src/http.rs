@@ -57,7 +57,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
 /// everything else is served as HTTP. Bytes peeked here remain queued for the chosen handler.
 pub async fn route(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
     let mut head = [0u8; 1024];
-    let n = stream.peek(&mut head).await.context("peeking request head")?;
+    let n = stream
+        .peek(&mut head)
+        .await
+        .context("peeking request head")?;
     if is_websocket_upgrade(&head[..n]) {
         crate::connection::handle(stream, state).await
     } else {
@@ -153,11 +156,17 @@ fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
 fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
     let (bytes, content_type): (&'static [u8], &'static str) = match rel {
         "assets/index.js" => (
-            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/dist/assets/index.js")),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/index.js"
+            )),
             "text/javascript; charset=utf-8",
         ),
         "assets/index.css" => (
-            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/dist/assets/index.css")),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/index.css"
+            )),
             "text/css; charset=utf-8",
         ),
         _ => return None,

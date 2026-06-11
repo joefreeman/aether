@@ -168,9 +168,13 @@ pub enum ChipValue {
     /// Gitignored-file visibility. `hide` records the per-kind direction at creation time
     /// (the Explorer hides, Grep includes — see docs §1.2), so the wire conversion needs no
     /// kind context.
-    Ignored { hide: bool },
+    Ignored {
+        hide: bool,
+    },
     /// Hidden-file visibility; same `hide` convention as `Ignored`.
-    Hidden { hide: bool },
+    Hidden {
+        hide: bool,
+    },
     Changed,
 }
 
@@ -195,8 +199,7 @@ pub fn normalize_glob(text: &str) -> Option<String> {
     if body.is_empty() || body == "*" || body == "**" {
         return None;
     }
-    let extension_shorthand =
-        body.starts_with('.') && !body.contains(['*', '?', '[', '/']);
+    let extension_shorthand = body.starts_with('.') && !body.contains(['*', '?', '[', '/']);
     Some(if extension_shorthand {
         format!("{neg}*{body}")
     } else {
@@ -464,7 +467,10 @@ impl ChipEditor {
             return self.input.text.clone();
         }
         let matches = crate::save_prompt::matching_indices(&self.listing, leaf);
-        match matches.get(self.suggestion_idx).and_then(|&i| self.listing.get(i)) {
+        match matches
+            .get(self.suggestion_idx)
+            .and_then(|&i| self.listing.get(i))
+        {
             Some(entry) => format!("{dir}{}", entry.name),
             None => self.input.text.clone(),
         }
@@ -514,7 +520,11 @@ impl ChipEditor {
             return;
         }
         let sel = self.suggestion_idx.min(n - 1);
-        self.suggestion_idx = if down { (sel + 1).min(n - 1) } else { sel.saturating_sub(1) };
+        self.suggestion_idx = if down {
+            (sel + 1).min(n - 1)
+        } else {
+            sel.saturating_sub(1)
+        };
     }
 
     /// Tab / Alt-l in the path field: absorb the ghost into the input. The suffix always ends
@@ -804,7 +814,12 @@ impl PickerState {
         let value = ChipValue::Glob(g);
         match edit {
             Some(i) => {
-                if self.chips.iter().enumerate().any(|(j, v)| j != i && *v == value) {
+                if self
+                    .chips
+                    .iter()
+                    .enumerate()
+                    .any(|(j, v)| j != i && *v == value)
+                {
                     self.chips.remove(i);
                 } else {
                     self.chips[i] = value;
@@ -840,7 +855,12 @@ impl PickerState {
         let value = ChipValue::Dir(d);
         match edit {
             Some(i) => {
-                if self.chips.iter().enumerate().any(|(j, v)| j != i && *v == value) {
+                if self
+                    .chips
+                    .iter()
+                    .enumerate()
+                    .any(|(j, v)| j != i && *v == value)
+                {
                     self.chips.remove(i);
                 } else {
                     self.chips[i] = value;
@@ -870,8 +890,12 @@ impl PickerState {
             ChipId::Case => self.chips.retain(|v| !matches!(v, ChipValue::Case(_))),
             ChipId::Word => self.chips.retain(|v| *v != ChipValue::Word),
             ChipId::Lit => self.chips.retain(|v| *v != ChipValue::Lit),
-            ChipId::Ignored => self.chips.retain(|v| !matches!(v, ChipValue::Ignored { .. })),
-            ChipId::Hidden => self.chips.retain(|v| !matches!(v, ChipValue::Hidden { .. })),
+            ChipId::Ignored => self
+                .chips
+                .retain(|v| !matches!(v, ChipValue::Ignored { .. })),
+            ChipId::Hidden => self
+                .chips
+                .retain(|v| !matches!(v, ChipValue::Hidden { .. })),
             ChipId::Changed => self.chips.retain(|v| *v != ChipValue::Changed),
         }
     }
@@ -1231,7 +1255,10 @@ mod tests {
             PickerKind::Buffers,
             vec![buffer_item(7), buffer_item(3), buffer_item(9)],
         );
-        assert_eq!(s.selected, 1, "active buffer leads the MRU → flip target is row 1");
+        assert_eq!(
+            s.selected, 1,
+            "active buffer leads the MRU → flip target is row 1"
+        );
         assert!(s.default_skip.is_none(), "one-shot: cleared once applied");
     }
 
@@ -1281,16 +1308,27 @@ mod tests {
         push_items(
             &mut s,
             PickerKind::Projects,
-            vec![project_item("alpha"), project_item("beta"), project_item("gamma")],
+            vec![
+                project_item("alpha"),
+                project_item("beta"),
+                project_item("gamma"),
+            ],
         );
-        assert_eq!(s.selected, 0, "alpha isn't the active project — no need to skip");
+        assert_eq!(
+            s.selected, 0,
+            "alpha isn't the active project — no need to skip"
+        );
 
         let mut s = empty_state(PickerKind::Projects, "");
         s.default_skip = Some(DefaultSkip::Project("alpha".into()));
         push_items(
             &mut s,
             PickerKind::Projects,
-            vec![project_item("alpha"), project_item("beta"), project_item("gamma")],
+            vec![
+                project_item("alpha"),
+                project_item("beta"),
+                project_item("gamma"),
+            ],
         );
         assert_eq!(s.selected, 1, "step over the active project at the top");
     }
@@ -1648,8 +1686,10 @@ mod tests {
 
     #[test]
     fn root_candidates_filter_by_smartcase_prefix() {
-        let labels: Vec<String> =
-            ["beta", "beta-api", "Backend", "core"].iter().map(|s| s.to_string()).collect();
+        let labels: Vec<String> = ["beta", "beta-api", "Backend", "core"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         // Empty filter: every root, in order.
         assert_eq!(root_candidates(&labels, ""), vec![0, 1, 2, 3]);
         // Lowercase filter is case-insensitive (smartcase): matches Backend too.
@@ -1662,8 +1702,10 @@ mod tests {
 
     #[test]
     fn chip_editor_chosen_root_follows_filter_and_falls_back() {
-        let labels: Vec<String> =
-            ["alpha", "beta", "gamma"].iter().map(|s| s.to_string()).collect();
+        let labels: Vec<String> = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let mut ed = ChipEditor::dir(String::new(), ChipEditorField::Root, 1, None);
         // Empty filter: candidates are all roots; selection picks by position.
         ed.root_selected = 2;
@@ -1700,8 +1742,10 @@ mod tests {
 
     #[test]
     fn chip_editor_root_ghost_is_match_suffix() {
-        let labels: Vec<String> =
-            ["alpha", "beta", "beta-api"].iter().map(|s| s.to_string()).collect();
+        let labels: Vec<String> = ["alpha", "beta", "beta-api"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let mut ed = ChipEditor::dir(String::new(), ChipEditorField::Root, 0, None);
         ed.root_filter = TextInput::new("be");
         ed.root_selected = 0;
@@ -1751,7 +1795,10 @@ mod tests {
     fn dir_editor_path_ghost_suggests_directories_only() {
         let paths = vec!["/proj".to_string()];
         let mut ed = ChipEditor::dir(String::new(), ChipEditorField::Path, 0, None);
-        assert!(ed.sync_dir_listing(&paths), "fresh editor owes a listing fetch");
+        assert!(
+            ed.sync_dir_listing(&paths),
+            "fresh editor owes a listing fetch"
+        );
         assert_eq!(ed.listing_dir_abs, "/proj");
         ed.set_dir_listing(vec![
             listing_entry("README.md", false),
@@ -1761,7 +1808,10 @@ mod tests {
         // Files are dropped at ingest; the ghost completes the first directory.
         assert_eq!(ed.path_ghost().as_deref(), Some("src/"));
         ed.input = TextInput::new("t");
-        assert!(!ed.path_edited(&paths), "leaf edit doesn't move the dir portion");
+        assert!(
+            !ed.path_edited(&paths),
+            "leaf edit doesn't move the dir portion"
+        );
         assert_eq!(ed.path_ghost().as_deref(), Some("ests/"));
         // No match → no ghost.
         ed.input = TextInput::new("zzz");
@@ -1800,7 +1850,10 @@ mod tests {
         );
         assert_eq!(ed.input.text, "src/");
         assert_eq!(ed.listing_dir_abs, "/proj/src");
-        assert!(ed.listing.is_empty(), "stale listing cleared until the fetch lands");
+        assert!(
+            ed.listing.is_empty(),
+            "stale listing cleared until the fetch lands"
+        );
         // Without a ghost (empty listing) accepting is a no-op.
         assert!(!ed.accept_path_suggestion(&paths));
         assert_eq!(ed.input.text, "src/");
@@ -1819,7 +1872,11 @@ mod tests {
         ed.cycle_path_suggestion(true);
         assert_eq!(ed.path_ghost().as_deref(), Some("c/"));
         ed.cycle_path_suggestion(true);
-        assert_eq!(ed.path_ghost().as_deref(), Some("c/"), "no wrap at the bottom");
+        assert_eq!(
+            ed.path_ghost().as_deref(),
+            Some("c/"),
+            "no wrap at the bottom"
+        );
         ed.cycle_path_suggestion(false);
         assert_eq!(ed.path_ghost().as_deref(), Some("b/"));
     }
@@ -1830,9 +1887,15 @@ mod tests {
         let mut ed = ChipEditor::dir("src/app/picker".into(), ChipEditorField::Path, 0, None);
         ed.sync_dir_listing(&paths);
         assert_eq!(ed.listing_dir_abs, "/proj/src/app");
-        assert!(!ed.pop_path_segment(&paths), "dropping the leaf keeps the dir portion");
+        assert!(
+            !ed.pop_path_segment(&paths),
+            "dropping the leaf keeps the dir portion"
+        );
         assert_eq!(ed.input.text, "src/app/");
-        assert!(ed.pop_path_segment(&paths), "dropping a dir segment moves it");
+        assert!(
+            ed.pop_path_segment(&paths),
+            "dropping a dir segment moves it"
+        );
         assert_eq!(ed.input.text, "src/");
         assert_eq!(ed.listing_dir_abs, "/proj/src");
         ed.pop_path_segment(&paths);
@@ -1842,13 +1905,15 @@ mod tests {
 
     #[test]
     fn dir_editor_root_complete_only_on_full_label() {
-        let labels: Vec<String> =
-            ["beta", "beta-api"].iter().map(|s| s.to_string()).collect();
+        let labels: Vec<String> = ["beta", "beta-api"].iter().map(|s| s.to_string()).collect();
         let mut ed = ChipEditor::dir(String::new(), ChipEditorField::Root, 0, None);
         ed.root_filter = TextInput::new("be");
         assert!(!ed.root_complete(&labels));
         ed.root_filter = TextInput::new("beta");
-        assert!(ed.root_complete(&labels), "exact label, even though beta-api also matches");
+        assert!(
+            ed.root_complete(&labels),
+            "exact label, even though beta-api also matches"
+        );
         ed.root_filter = TextInput::new("zzz");
         assert!(!ed.root_complete(&labels), "no match is never complete");
     }
@@ -1932,7 +1997,10 @@ mod tests {
         let paths = vec!["/proj".to_string()];
         let mut ed = ChipEditor::dir("src/ap".into(), ChipEditorField::Path, 0, None);
         ed.sync_dir_listing(&paths);
-        ed.set_dir_listing(vec![listing_entry("app", true), listing_entry("apple", true)]);
+        ed.set_dir_listing(vec![
+            listing_entry("app", true),
+            listing_entry("apple", true),
+        ]);
         // The partial leaf commits as the highlighted completion — exactly what the ghost
         // shows.
         assert!(ed.path_valid());
@@ -1956,8 +2024,7 @@ mod tests {
 
     #[test]
     fn dir_editor_root_invalid_only_when_nothing_matches() {
-        let labels: Vec<String> =
-            ["alpha", "beta"].iter().map(|s| s.to_string()).collect();
+        let labels: Vec<String> = ["alpha", "beta"].iter().map(|s| s.to_string()).collect();
         let mut ed = ChipEditor::dir(String::new(), ChipEditorField::Root, 0, None);
         // Empty filter matches every root — a fresh Alt-d → Enter still commits.
         assert!(!ed.root_invalid(&labels));
@@ -1997,7 +2064,10 @@ mod tests {
         let mut ed = ChipEditor::dir(String::new(), ChipEditorField::Root, 0, None);
         ed.root_filter = TextInput::new("b");
         ed.root_selected = 0;
-        assert!(ed.commit_root_field(&labels, &paths), "root chosen — listing fetch due");
+        assert!(
+            ed.commit_root_field(&labels, &paths),
+            "root chosen — listing fetch due"
+        );
         assert_eq!(ed.field, ChipEditorField::Path);
         assert_eq!(ed.root_filter.text, "beta");
         assert_eq!(ed.chosen_root(&labels), 1);

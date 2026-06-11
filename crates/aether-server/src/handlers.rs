@@ -11,12 +11,10 @@ use crate::state::{
 };
 use crate::surround;
 use crate::wrap;
-use std::borrow::Cow;
 use aether_protocol::buffer::{
     BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopyParams, BufferCopyResult,
-    BufferCutResult, BufferOpenParams,
-    BufferOpenResult, BufferReloadParams, BufferReloadResult, BufferSaveParams, BufferSaveResult,
-    BufferState, BufferStateParams, CopyScope,
+    BufferCutResult, BufferOpenParams, BufferOpenResult, BufferReloadParams, BufferReloadResult,
+    BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState,
@@ -29,28 +27,14 @@ use aether_protocol::directory::{
 };
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
-use aether_protocol::nav::{
-    NavGotoParams, NavRecordParams, NavRecordResult, NavStepParams, NavStepResult,
+use aether_protocol::git::{
+    ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBlameLineParams,
+    GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitCommitInfoParams, GitCommitInfoResult,
+    GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputMoveLinesParams, InputSurroundParams, InputTextParams,
     InputUnsurroundParams, SurroundTarget, UndoResult,
-};
-use aether_protocol::picker::{
-    BufferDirtyState, PickerGrepFileJumpParams, PickerGrepNavigateParams, PickerGrepNavigateTarget,
-    PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerSelectParams,
-    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams, PickerViewResult,
-};
-use aether_protocol::project::{
-    ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
-    ProjectDeleteParams, ProjectInfo, ProjectListParams, ProjectListResult, ProjectRemoveRootParams,
-    ProjectRemoveRootResult, ProjectRenameParams, ProjectSummary,
-};
-use aether_protocol::git::{
-    ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBlameLineParams,
-    GitBlameLineResult, GitChangeCounts, GitCommitInfoParams, GitCommitInfoResult,
-    GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams,
-    GitBufferStatus, HunkAction, HunkDirection,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -58,20 +42,33 @@ use aether_protocol::lsp::{
     LspLocation, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServerParams,
     LspServerStatusParams, LspServerStatusResult, LspStatus,
 };
+use aether_protocol::nav::{
+    NavGotoParams, NavRecordParams, NavRecordResult, NavStepParams, NavStepResult,
+};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
+use aether_protocol::picker::{
+    BufferDirtyState, PickerGrepFileJumpParams, PickerGrepNavigateParams, PickerGrepNavigateTarget,
+    PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerSelectParams,
+    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams, PickerViewResult,
+};
+use aether_protocol::project::{
+    ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
+    ProjectDeleteParams, ProjectInfo, ProjectListParams, ProjectListResult,
+    ProjectRemoveRootParams, ProjectRemoveRootResult, ProjectRenameParams, ProjectSummary,
+};
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
     SearchSetResult, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSpan, DiffMarker, DiffStage, LogicalLineRange,
-    LogicalLineRender, ViewportLinesChanged,
-    ViewportLinesChangedParams, ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportUnsubscribeParams,
-    ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
+    LogicalLineRender, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResizeParams,
+    ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams, ViewportSubscribeResult,
+    ViewportUnsubscribeParams, ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
 };
 use aether_protocol::LogicalPosition;
 use aether_protocol::{BufferId, ClientId, Revision};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -316,13 +313,18 @@ pub async fn project_add_root(
     project.paths.push(canonical.clone());
     // Rebuild workspace_index with the new path list. The old Arc remains alive only for any
     // in-flight reader; subsequent picker opens see the fresh one.
-    project.workspace_index =
-        Arc::new(crate::workspace_index::WorkspaceIndex::new(project.paths.clone()));
+    project.workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
+        project.paths.clone(),
+    ));
     let updated = crate::config::ProjectConfig {
         name: project.name.clone(),
         paths: project.paths.clone(),
     };
-    let entry_paths: Vec<String> = project.paths.iter().map(|p| p.display().to_string()).collect();
+    let entry_paths: Vec<String> = project
+        .paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
     let watcher = s.watcher.clone();
     drop(s);
 
@@ -427,13 +429,18 @@ pub async fn project_remove_root(
         .get_mut(&params.project)
         .expect("project still loaded — we held it above");
     project.paths.retain(|p| *p != canonical);
-    project.workspace_index =
-        Arc::new(crate::workspace_index::WorkspaceIndex::new(project.paths.clone()));
+    project.workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
+        project.paths.clone(),
+    ));
     let updated = crate::config::ProjectConfig {
         name: project.name.clone(),
         paths: project.paths.clone(),
     };
-    let entry_paths: Vec<String> = project.paths.iter().map(|p| p.display().to_string()).collect();
+    let entry_paths: Vec<String> = project
+        .paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
 
     // Next buffer for the requesting client: top of project MRU, else any remaining buffer in
     // the project. Mirrors buffer/close.
@@ -492,7 +499,11 @@ pub async fn project_rename(
             // No-op rename — return current info without touching disk or state.
             return Ok(ProjectInfo {
                 name: old_name,
-                paths: entry.paths.iter().map(|p| p.display().to_string()).collect(),
+                paths: entry
+                    .paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect(),
             });
         }
     }
@@ -556,7 +567,10 @@ pub async fn project_delete(
     if !dirty.is_empty() {
         let mut err = RpcError::new(
             ErrorCode::DIRTY_BUFFERS_PREVENT_DELETE,
-            format!("{} buffer(s) in project {name} have unsaved changes", dirty.len()),
+            format!(
+                "{} buffer(s) in project {name} have unsaved changes",
+                dirty.len()
+            ),
         );
         err.data = Some(serde_json::json!({ "dirty_buffer_ids": dirty }));
         return Err(err);
@@ -631,7 +645,11 @@ pub async fn path_delete(
 
     // Close the buffers whose backing file just went to the trash, and refresh.
     let mut s = state.lock().await;
-    let Some(project_name) = s.clients.get(&client_id).and_then(|c| c.active_project.clone()) else {
+    let Some(project_name) = s
+        .clients
+        .get(&client_id)
+        .and_then(|c| c.active_project.clone())
+    else {
         // Client deactivated mid-call — the trash already happened; nothing left to tear down.
         return Ok(PathDeleteResult {
             closed_buffer_ids: Vec::new(),
@@ -836,10 +854,7 @@ pub async fn buffer_open(
 
     {
         let mut s = state.lock().await;
-        if !s
-            .active_project_or_err(ctx.client_id)?
-            .contains(&canonical)
-        {
+        if !s.active_project_or_err(ctx.client_id)?.contains(&canonical) {
             return Err(RpcError::invalid_path(format!(
                 "{} is outside the project's access boundary",
                 canonical.display()
@@ -971,7 +986,12 @@ pub async fn buffer_open(
     let pushes = refresh_buffer_pickers(&mut s);
     drop(s);
     if let Some((key, spec, generation)) = lsp_launch {
-        tokio::spawn(crate::lsp::manager::launch(state.clone(), key, spec, generation));
+        tokio::spawn(crate::lsp::manager::launch(
+            state.clone(),
+            key,
+            spec,
+            generation,
+        ));
     }
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -1009,7 +1029,11 @@ pub async fn git_blame_line(
         // Blame via the cached repo (no rediscovery). `None` repo (untracked / no repo) → empty.
         // The `buf`/`git_baseline` borrows end at the `compute_blame` call; `lines` is owned, so
         // the `git_blame` mutation below is free of them.
-        let lines = match s.git_baseline.get(&params.buffer_id).and_then(|b| b.repo.as_ref()) {
+        let lines = match s
+            .git_baseline
+            .get(&params.buffer_id)
+            .and_then(|b| b.repo.as_ref())
+        {
             Some(repo) => crate::git::compute_blame(repo, &buf.text).unwrap_or_default(),
             None => Vec::new(),
         };
@@ -1137,15 +1161,22 @@ pub async fn git_navigate_hunk(
         let head = crate::git::diff_hunks(baseline.and_then(|b| b.blob.as_deref()), &buf.text);
         let unstaged =
             crate::git::diff_hunks(baseline.and_then(|b| b.index_blob.as_deref()), &buf.text);
-        let mut anchors: Vec<u32> =
-            head.iter().chain(unstaged.iter()).map(|h| h.anchor_line).collect();
+        let mut anchors: Vec<u32> = head
+            .iter()
+            .chain(unstaged.iter())
+            .map(|h| h.anchor_line)
+            .collect();
         anchors.sort_unstable();
         anchors.dedup();
         anchors
     };
     let target = match params.direction {
         HunkDirection::Next => anchors.iter().find(|&&a| a > params.from_line).copied(),
-        HunkDirection::Prev => anchors.iter().rev().find(|&&a| a < params.from_line).copied(),
+        HunkDirection::Prev => anchors
+            .iter()
+            .rev()
+            .find(|&&a| a < params.from_line)
+            .copied(),
     };
 
     let Some(target_line) = target else {
@@ -1157,10 +1188,13 @@ pub async fn git_navigate_hunk(
     };
 
     let buf = &s.buffers[&params.buffer_id];
-    let position = motion::clamp_position(buf, LogicalPosition {
-        line: target_line,
-        col: 0,
-    });
+    let position = motion::clamp_position(
+        buf,
+        LogicalPosition {
+            line: target_line,
+            col: 0,
+        },
+    );
     let result = CursorState {
         position,
         anchor: position,
@@ -1493,10 +1527,13 @@ fn buffer_lsp_server_ref(
     s: &ServerState,
     buffer_id: BufferId,
 ) -> Option<aether_protocol::lsp::LspServerRef> {
-    s.lsp.doc_server.get(&buffer_id).map(|key| aether_protocol::lsp::LspServerRef {
-        language: key.language.clone(),
-        workspace_root: key.root.display().to_string(),
-    })
+    s.lsp
+        .doc_server
+        .get(&buffer_id)
+        .map(|key| aether_protocol::lsp::LspServerRef {
+            language: key.language.clone(),
+            workspace_root: key.root.display().to_string(),
+        })
 }
 
 /// A buffer line's text without its trailing newline; empty if `line` is past the end.
@@ -1556,7 +1593,11 @@ pub async fn lsp_goto_definition(
         "textDocument": { "uri": req.uri },
         "position": { "line": req.line, "character": req.character },
     });
-    let location = match req.client.request("textDocument/definition", params_json).await {
+    let location = match req
+        .client
+        .request("textDocument/definition", params_json)
+        .await
+    {
         Ok(v) => parse_definition(&v, req.encoding),
         Err(e) => {
             tracing::debug!(error = %e, "lsp definition request failed");
@@ -1662,10 +1703,18 @@ enum FormatResolve {
 }
 
 fn lsp_format_resolve(s: &ServerState, buffer_id: BufferId) -> FormatResolve {
-    let Some(buf) = s.buffers.get(&buffer_id) else { return FormatResolve::Unsupported };
-    let Some(path) = buf.canonical_path.as_deref() else { return FormatResolve::Unsupported };
-    let Some(key) = s.lsp.doc_server.get(&buffer_id) else { return FormatResolve::Unsupported };
-    let Some(handle) = s.lsp.servers.get(key) else { return FormatResolve::Unsupported };
+    let Some(buf) = s.buffers.get(&buffer_id) else {
+        return FormatResolve::Unsupported;
+    };
+    let Some(path) = buf.canonical_path.as_deref() else {
+        return FormatResolve::Unsupported;
+    };
+    let Some(key) = s.lsp.doc_server.get(&buffer_id) else {
+        return FormatResolve::Unsupported;
+    };
+    let Some(handle) = s.lsp.servers.get(key) else {
+        return FormatResolve::Unsupported;
+    };
     match handle.status {
         LspStatus::Ready => {}
         LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => {
@@ -1676,7 +1725,9 @@ fn lsp_format_resolve(s: &ServerState, buffer_id: BufferId) -> FormatResolve {
     if !handle.document_formatting {
         return FormatResolve::Unsupported;
     }
-    let Some(client) = handle.client.clone() else { return FormatResolve::Unsupported };
+    let Some(client) = handle.client.clone() else {
+        return FormatResolve::Unsupported;
+    };
     let (tab_size, insert_spaces) = match buf.indent_style {
         crate::indent::IndentStyle::Tab => (4, false),
         crate::indent::IndentStyle::Spaces(n) => (n as u32, true),
@@ -1740,7 +1791,11 @@ pub async fn lsp_format(
         "textDocument": { "uri": req.uri },
         "options": { "tabSize": req.tab_size, "insertSpaces": req.insert_spaces },
     });
-    let edits = match req.client.request("textDocument/formatting", params_json).await {
+    let edits = match req
+        .client
+        .request("textDocument/formatting", params_json)
+        .await
+    {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(error = %e, "lsp format request failed");
@@ -1809,7 +1864,15 @@ pub async fn lsp_format(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(
+                buf_ref,
+                vp,
+                revision,
+                search,
+                buffer_both_hunks(&s, buffer_id),
+                buffer_diagnostics(&s, buffer_id),
+                buffer_git_status(&s, buffer_id),
+            ),
         ));
     }
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
@@ -2221,7 +2284,14 @@ pub async fn search_next(
     ctx: &mut ConnectionCtx,
     params: SearchNavParams,
 ) -> Result<SearchNavResult, RpcError> {
-    search_navigate(state, ctx, params.buffer_id, Direction::Forward, params.extend).await
+    search_navigate(
+        state,
+        ctx,
+        params.buffer_id,
+        Direction::Forward,
+        params.extend,
+    )
+    .await
 }
 
 pub async fn search_prev(
@@ -2229,7 +2299,14 @@ pub async fn search_prev(
     ctx: &mut ConnectionCtx,
     params: SearchNavParams,
 ) -> Result<SearchNavResult, RpcError> {
-    search_navigate(state, ctx, params.buffer_id, Direction::Backward, params.extend).await
+    search_navigate(
+        state,
+        ctx,
+        params.buffer_id,
+        Direction::Backward,
+        params.extend,
+    )
+    .await
 }
 
 async fn search_navigate(
@@ -2813,7 +2890,11 @@ fn buffer_path_ref(
     client_id: ClientId,
     buffer_id: BufferId,
 ) -> (Option<u32>, Option<String>) {
-    let Some(canonical) = s.buffers.get(&buffer_id).and_then(|b| b.canonical_path.clone()) else {
+    let Some(canonical) = s
+        .buffers
+        .get(&buffer_id)
+        .and_then(|b| b.canonical_path.clone())
+    else {
         return (None, None);
     };
     let Some(project) = s.active_project(client_id) else {
@@ -2837,9 +2918,18 @@ fn nav_entry_for(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> O
     if !s.buffers.contains_key(&buffer_id) {
         return None;
     }
-    let cursor = s.cursors.get(&(client_id, buffer_id)).copied().unwrap_or_default();
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
     let (path_index, relative_path) = buffer_path_ref(s, client_id, buffer_id);
-    Some(NavEntry { buffer_id, path_index, relative_path, cursor })
+    Some(NavEntry {
+        buffer_id,
+        path_index,
+        relative_path,
+        cursor,
+    })
 }
 
 /// Open `entry`'s buffer (reopening a closed file by path, else attaching by id) and restore its
@@ -2878,7 +2968,8 @@ async fn navigate_to(
         None => entry.cursor,
     };
     // Direct insert, *not* via record_motion — a jump-back must not feed `z` (see docs/nav design).
-    s.cursors.insert((ctx.client_id, result.buffer_id), restored);
+    s.cursors
+        .insert((ctx.client_id, result.buffer_id), restored);
     result.cursor = restored;
     Ok(result)
 }
@@ -2915,7 +3006,11 @@ async fn nav_step(
         let mut chosen = None;
         loop {
             let popped = s.nav_history.get_mut(&client_id).and_then(|h| {
-                if forward { h.forward.pop() } else { h.back.pop() }
+                if forward {
+                    h.forward.pop()
+                } else {
+                    h.back.pop()
+                }
             });
             let Some(entry) = popped else { break };
             // A file entry can always be reopened; a scratch entry only if it's still open.
@@ -2930,7 +3025,11 @@ async fn nav_step(
         if chosen.is_some() {
             if let Some(cur) = current {
                 let hist = s.nav_history.entry(client_id).or_default();
-                let other = if forward { &mut hist.back } else { &mut hist.forward };
+                let other = if forward {
+                    &mut hist.back
+                } else {
+                    &mut hist.forward
+                };
                 other.push(cur);
                 if other.len() > crate::state::NAV_HISTORY_CAP {
                     other.remove(0);
@@ -3090,7 +3189,15 @@ pub async fn buffer_cut(
         let search = s.searches.get(&(vp.client_id, params.buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, params.buffer_id), buffer_diagnostics(&s, params.buffer_id), buffer_git_status(&s, params.buffer_id)),
+            build_lines_changed_notif(
+                buf_ref,
+                vp,
+                revision,
+                search,
+                buffer_both_hunks(&s, params.buffer_id),
+                buffer_diagnostics(&s, params.buffer_id),
+                buffer_git_status(&s, params.buffer_id),
+            ),
         ));
     }
 
@@ -3448,7 +3555,15 @@ pub(crate) fn reload_buffer_locked(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(
+                buf_ref,
+                vp,
+                revision,
+                search,
+                buffer_both_hunks(&s, buffer_id),
+                buffer_diagnostics(&s, buffer_id),
+                buffer_git_status(&s, buffer_id),
+            ),
         ));
     }
 
@@ -3693,7 +3808,17 @@ pub async fn viewport_scroll_to_row(
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
     let window = render_window(
-        buf, first, last_excl, cols, wrap, marker_width, tab_width, rows, search, diff_view, hunks,
+        buf,
+        first,
+        last_excl,
+        cols,
+        wrap,
+        marker_width,
+        tab_width,
+        rows,
+        search,
+        diff_view,
+        hunks,
         diagnostics,
         buffer_git_status(&s, buffer_id),
     );
@@ -3993,9 +4118,9 @@ fn diff_markers_by_line(
     let last_line = line_count.saturating_sub(1);
     let mut map: HashMap<u32, (DiffMarker, DiffStage)> = HashMap::new();
     let put = |map: &mut HashMap<u32, (DiffMarker, DiffStage)>,
-                   line: u32,
-                   marker: DiffMarker,
-                   stage: DiffStage| {
+               line: u32,
+               marker: DiffMarker,
+               stage: DiffStage| {
         map.entry(line)
             .and_modify(|(k, s)| {
                 // A staged hunk never overrides an unstaged marker (the top layer wins)...
@@ -4024,7 +4149,12 @@ fn diff_markers_by_line(
                 }
             }
             ChangeKind::Deleted => {
-                put(&mut map, h.anchor_line.min(last_line), DiffMarker::Deleted, h.stage);
+                put(
+                    &mut map,
+                    h.anchor_line.min(last_line),
+                    DiffMarker::Deleted,
+                    h.stage,
+                );
             }
         }
     }
@@ -4097,7 +4227,11 @@ fn notify_lsp_change(s: &mut ServerState, buffer_id: BufferId) {
     let Some(buf) = s.buffers.get(&buffer_id) else {
         return;
     };
-    let Some(uri) = buf.canonical_path.as_deref().map(crate::lsp::uri::path_to_uri) else {
+    let Some(uri) = buf
+        .canonical_path
+        .as_deref()
+        .map(crate::lsp::uri::path_to_uri)
+    else {
         return;
     };
     let revision = buf.revision as i64;
@@ -4163,7 +4297,11 @@ async fn build_reference_candidates(
         "position": { "line": req.line, "character": req.character },
         "context": { "includeDeclaration": true },
     });
-    let locations = match req.client.request("textDocument/references", params_json).await {
+    let locations = match req
+        .client
+        .request("textDocument/references", params_json)
+        .await
+    {
         Ok(v) => parse_references(&v, req.encoding),
         Err(e) => {
             tracing::debug!(error = %e, "lsp references request failed");
@@ -4184,11 +4322,11 @@ async fn build_reference_candidates(
                 std::path::Path::new(&loc.path),
                 &roots,
             )?;
-            let lines = file_lines
-                .entry(loc.path.clone())
-                .or_insert_with(|| std::fs::read_to_string(&loc.path).ok().map(|c| {
-                    c.lines().map(str::to_string).collect()
-                }));
+            let lines = file_lines.entry(loc.path.clone()).or_insert_with(|| {
+                std::fs::read_to_string(&loc.path)
+                    .ok()
+                    .map(|c| c.lines().map(str::to_string).collect())
+            });
             let preview = lines
                 .as_ref()
                 .and_then(|ls| ls.get(loc.position.line as usize))
@@ -4291,7 +4429,11 @@ fn build_lsp_server_candidates(
             progress: st.progress,
         })
         .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.language.cmp(&b.language)));
+    out.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.language.cmp(&b.language))
+    });
     out
 }
 
@@ -4396,8 +4538,16 @@ fn diagnostic_spans_on_line(
         if line_idx < d.start.line || line_idx > d.end.line {
             continue;
         }
-        let s = if line_idx == d.start.line { d.start.col } else { 0 };
-        let e = if line_idx == d.end.line { d.end.col } else { line_len };
+        let s = if line_idx == d.start.line {
+            d.start.col
+        } else {
+            0
+        };
+        let e = if line_idx == d.end.line {
+            d.end.col
+        } else {
+            line_len
+        };
         let s = s.min(line_len);
         let e = e.min(line_len).max(s);
         out.push(DiagnosticSpan {
@@ -4496,7 +4646,9 @@ fn compute_visual_extent(
             first_vr = total;
         }
         let virtual_n = deleted_rows.get(&i).map_or(0, |v| v.len() as u32);
-        total = total.saturating_add(line_visual_rows(buf, i, no_wrap, cols, marker_width, tab_width) + virtual_n);
+        total = total.saturating_add(
+            line_visual_rows(buf, i, no_wrap, cols, marker_width, tab_width) + virtual_n,
+        );
     }
     if first >= line_count {
         first_vr = total;
@@ -4626,8 +4778,15 @@ fn render_window(
         render.diagnostics = diagnostic_spans_on_line(diagnostics, i, text.len() as u32);
         lines.push(render);
     }
-    let (first_visual_row, total_visual_rows) =
-        compute_visual_extent(buf, cols, wrap, marker_width, tab_width, &deleted_rows, first);
+    let (first_visual_row, total_visual_rows) = compute_visual_extent(
+        buf,
+        cols,
+        wrap,
+        marker_width,
+        tab_width,
+        &deleted_rows,
+        first,
+    );
     let max_line_width = if matches!(wrap, aether_protocol::viewport::WrapMode::None) {
         compute_max_line_width(buf, tab_width)
     } else {
@@ -4982,6 +5141,7 @@ pub async fn cursor_set(
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     let position = motion::clamp_position(buf, params.position);
     let anchor = motion::clamp_position(buf, params.anchor);
+    let (position, anchor) = motion::snap_selection(buf, position, anchor, params.granularity);
     let result = CursorState {
         position,
         anchor,
@@ -5387,7 +5547,13 @@ pub async fn input_unsurround(
             return Ok(EditResult { revision, cursor });
         }
     }
-    apply_edit(state, client_id, params.buffer_id, EditKind::Unsurround { line }).await
+    apply_edit(
+        state,
+        client_id,
+        params.buffer_id,
+        EditKind::Unsurround { line },
+    )
+    .await
 }
 
 pub async fn input_undo(
@@ -5959,7 +6125,15 @@ async fn apply_toggle_comment(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(
+                buf_ref,
+                vp,
+                revision,
+                search,
+                buffer_both_hunks(&s, buffer_id),
+                buffer_diagnostics(&s, buffer_id),
+                buffer_git_status(&s, buffer_id),
+            ),
         ));
     }
 
@@ -6417,7 +6591,15 @@ async fn apply_indent_or_dedent(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(
+                buf_ref,
+                vp,
+                revision,
+                search,
+                buffer_both_hunks(&s, buffer_id),
+                buffer_diagnostics(&s, buffer_id),
+                buffer_git_status(&s, buffer_id),
+            ),
         ));
     }
 
@@ -6598,7 +6780,15 @@ pub async fn input_move_lines(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(
+                buf_ref,
+                vp,
+                revision,
+                search,
+                buffer_both_hunks(&s, buffer_id),
+                buffer_diagnostics(&s, buffer_id),
+                buffer_git_status(&s, buffer_id),
+            ),
         ));
     }
 
@@ -6790,7 +6980,18 @@ pub async fn input_join_lines(
                 continue;
             };
             let search = s.searches.get(&(vp.client_id, buffer_id));
-            pushes.push((sender, build_lines_changed_notif(buf, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id))));
+            pushes.push((
+                sender,
+                build_lines_changed_notif(
+                    buf,
+                    vp,
+                    revision,
+                    search,
+                    buffer_both_hunks(&s, buffer_id),
+                    buffer_diagnostics(&s, buffer_id),
+                    buffer_git_status(&s, buffer_id),
+                ),
+            ));
         }
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
         let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
@@ -6920,7 +7121,15 @@ async fn apply_undo_or_redo(
         let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id)),
+            build_lines_changed_notif(
+                buf_ref,
+                vp,
+                revision,
+                search,
+                buffer_both_hunks(&s, buffer_id),
+                buffer_diagnostics(&s, buffer_id),
+                buffer_git_status(&s, buffer_id),
+            ),
         ));
     }
 
@@ -7000,11 +7209,9 @@ fn with_grep_position(
     let Some(project) = s.active_project(client_id) else {
         return cursor;
     };
-    let Some((current_idx, current_rel)) = buf
-        .canonical_path
-        .as_deref()
-        .and_then(|p| crate::workspace_index::project_relative_parts(std::path::Path::new(p), &project.paths))
-    else {
+    let Some((current_idx, current_rel)) = buf.canonical_path.as_deref().and_then(|p| {
+        crate::workspace_index::project_relative_parts(std::path::Path::new(p), &project.paths)
+    }) else {
         return cursor;
     };
     // Compare in char-index space so multi-byte content stays on char boundaries (mirrors
@@ -7302,7 +7509,8 @@ async fn apply_edit(
                 .slice(range.start_char..range.end_char)
                 .chars()
                 .collect();
-            let mut wrapped = String::with_capacity(inner.len() + open.len_utf8() + close.len_utf8());
+            let mut wrapped =
+                String::with_capacity(inner.len() + open.len_utf8() + close.len_utf8());
             wrapped.push(*open);
             wrapped.push_str(&inner);
             wrapped.push(*close);
@@ -7372,7 +7580,9 @@ async fn apply_edit(
     // A `Select` span only holds if it leaves a non-empty range (lead + trail < inserted count);
     // otherwise it degrades to a point just past the insert.
     let selection = match post_edit {
-        PostEdit::Select { lead, trail } if lead + trail < inserted_char_count => Some((lead, trail)),
+        PostEdit::Select { lead, trail } if lead + trail < inserted_char_count => {
+            Some((lead, trail))
+        }
         _ => None,
     };
     let new_cursor_state = if let Some((lead, trail)) = selection {
@@ -7440,7 +7650,15 @@ async fn apply_edit(
             continue;
         };
         let search = s.searches.get(&(vp.client_id, buffer_id));
-        let notif = build_lines_changed_notif(buf_ref, vp, revision, search, buffer_both_hunks(&s, buffer_id), buffer_diagnostics(&s, buffer_id), buffer_git_status(&s, buffer_id));
+        let notif = build_lines_changed_notif(
+            buf_ref,
+            vp,
+            revision,
+            search,
+            buffer_both_hunks(&s, buffer_id),
+            buffer_diagnostics(&s, buffer_id),
+            buffer_git_status(&s, buffer_id),
+        );
         pushes.push((sender, notif));
     }
 
@@ -7544,7 +7762,8 @@ fn build_buffer_candidates(
     };
     let project_name = project.name.clone();
     let roots = project.paths.clone();
-    let belongs = |id: &BufferId| s.buffer_projects.get(id).map(|s| s.as_str()) == Some(&project_name);
+    let belongs =
+        |id: &BufferId| s.buffer_projects.get(id).map(|s| s.as_str()) == Some(&project_name);
 
     let mut out: Vec<picker_state::BufferCandidate> = Vec::with_capacity(s.buffers.len());
     let mut seen: std::collections::HashSet<BufferId> = std::collections::HashSet::new();
@@ -7578,7 +7797,10 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
     let display = match buf.canonical_path.as_deref() {
         Some(p) => crate::workspace_index::project_relative_display(p, roots)
             .unwrap_or_else(|| p.display().to_string()),
-        None => format!("(scratch {})", buf.scratch_number.map(u64::from).unwrap_or(buf.id)),
+        None => format!(
+            "(scratch {})",
+            buf.scratch_number.map(u64::from).unwrap_or(buf.id)
+        ),
     };
     // The (root index, relative path) the client needs for an opener URL — `None` for scratch
     // buffers and files outside every root (display still falls back to the absolute path above).
@@ -7953,7 +8175,11 @@ pub(crate) fn refresh_explorers_for_dirs(
     }
     // Snapshot which (client, picker_path, filters) triples need refresh before we mutate —
     // the rebuilt listing must honour the picker's active filter chips.
-    let to_refresh: Vec<(ClientId, std::path::PathBuf, aether_protocol::picker::PickerFilters)> = s
+    let to_refresh: Vec<(
+        ClientId,
+        std::path::PathBuf,
+        aether_protocol::picker::PickerFilters,
+    )> = s
         .pickers
         .iter()
         .filter_map(|((cid, kind), picker)| {
@@ -8104,7 +8330,9 @@ pub async fn picker_view(
         PickerKind::Grep => picker_state::PickerCandidates::Grep(Vec::new()),
         PickerKind::Explorer => {
             if params.explorer_roots {
-                picker_state::PickerCandidates::ExplorerRoots(build_explorer_roots(state, client_id).await?)
+                picker_state::PickerCandidates::ExplorerRoots(
+                    build_explorer_roots(state, client_id).await?,
+                )
             } else {
                 // The listing is built *before* the picker state is (re)hydrated, but it must
                 // honour the filters that will be in effect: the caller's replacement set if
@@ -8148,7 +8376,9 @@ pub async fn picker_view(
             // Fresh open: build from the buffer's current diagnostics.
             Some(buffer_id) => {
                 let s = state.lock().await;
-                picker_state::PickerCandidates::Diagnostics(build_diagnostic_candidates(&s, buffer_id))
+                picker_state::PickerCandidates::Diagnostics(build_diagnostic_candidates(
+                    &s, buffer_id,
+                ))
             }
             // Resume / scroll re-view: an empty placeholder; `preserve_existing` keeps the snapshot.
             None => picker_state::PickerCandidates::Diagnostics(Vec::new()),
@@ -8281,31 +8511,27 @@ pub async fn picker_view(
     // client-passed item). Lets `Space g` land on the user's spot in the result list even when
     // the cursor isn't sitting on a hit exactly. The resolution is echoed back via
     // `effective_center_on` so the client knows what to highlight.
-    let cursor_resolved_item: Option<PickerItem> = match (
-        cursor_centering_info.as_ref(),
-        &picker.candidates,
-    ) {
-        (Some((leading_edge, current_key)), picker_state::PickerCandidates::Grep(hits))
-            if !hits.is_empty() =>
-        {
-            find_nearest_grep_hit(
-                hits,
-                current_key.as_ref().map(|(i, r)| (*i, r.as_str())),
-                *leading_edge,
-            )
-            .map(|c| {
-                PickerItem::GrepHit {
+    let cursor_resolved_item: Option<PickerItem> =
+        match (cursor_centering_info.as_ref(), &picker.candidates) {
+            (Some((leading_edge, current_key)), picker_state::PickerCandidates::Grep(hits))
+                if !hits.is_empty() =>
+            {
+                find_nearest_grep_hit(
+                    hits,
+                    current_key.as_ref().map(|(i, r)| (*i, r.as_str())),
+                    *leading_edge,
+                )
+                .map(|c| PickerItem::GrepHit {
                     path_index: c.path_index,
                     relative_path: c.relative_path.clone(),
                     line: c.line,
                     col: c.col,
                     preview: c.preview.clone(),
                     match_indices: c.match_indices.clone(),
-                }
-            })
-        }
-        _ => None,
-    };
+                })
+            }
+            _ => None,
+        };
 
     // Resolve the window. `center_on` wins over `offset` and picks a frame containing the item;
     // we centre it (roughly) so a small navigation away keeps it on screen. Falls through to
@@ -8433,7 +8659,8 @@ pub async fn picker_query(
     // Mark the initial push as ticking when we're about to spawn the search. Without this the
     // client would briefly see "0 hits, search finished" between sending the query and the
     // coordinator's first batch landing.
-    if will_spawn_grep_search || (matches!(params.kind, PickerKind::References) && references_loading)
+    if will_spawn_grep_search
+        || (matches!(params.kind, PickerKind::References) && references_loading)
     {
         if let Some(ref mut u) = update {
             u.ticking = true;
@@ -8665,13 +8892,13 @@ fn find_next_grep_hit<'a>(
     let Some((cur_idx, cur_rel)) = current else {
         return hits.first();
     };
-    hits.iter().find(|h| {
-        match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
+    hits.iter().find(
+        |h| match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
             Ordering::Greater => true,
             Ordering::Equal => (h.line, h.col) > (cursor.line, cursor.col),
             Ordering::Less => false,
-        }
-    })
+        },
+    )
 }
 
 fn find_prev_grep_hit<'a>(
@@ -8707,11 +8934,13 @@ fn find_nearest_grep_hit<'a>(
         return hits.first();
     };
     hits.iter()
-        .find(|h| match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
-            Ordering::Greater => true,
-            Ordering::Equal => (h.line, h.col) >= (cursor.line, cursor.col),
-            Ordering::Less => false,
-        })
+        .find(
+            |h| match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
+                Ordering::Greater => true,
+                Ordering::Equal => (h.line, h.col) >= (cursor.line, cursor.col),
+                Ordering::Less => false,
+            },
+        )
         .or_else(|| hits.first())
 }
 
@@ -8817,12 +9046,24 @@ mod diff_anchor_tests {
         staged.stage = DiffStage::Staged;
         let unstaged = hunk(ChangeKind::Modified, 3, 1, &["b'"]); // line 3 only
         let map = diff_markers_by_line(&[staged.clone(), unstaged.clone()], 100);
-        assert_eq!(map.get(&2), Some(&(DiffMarker::Modified, DiffStage::Staged)));
-        assert_eq!(map.get(&3), Some(&(DiffMarker::Modified, DiffStage::Unstaged)));
-        assert_eq!(map.get(&4), Some(&(DiffMarker::Modified, DiffStage::Staged)));
+        assert_eq!(
+            map.get(&2),
+            Some(&(DiffMarker::Modified, DiffStage::Staged))
+        );
+        assert_eq!(
+            map.get(&3),
+            Some(&(DiffMarker::Modified, DiffStage::Unstaged))
+        );
+        assert_eq!(
+            map.get(&4),
+            Some(&(DiffMarker::Modified, DiffStage::Staged))
+        );
         // Order-independent: a staged hunk processed after the unstaged one changes nothing.
         let reversed = diff_markers_by_line(&[unstaged, staged], 100);
-        assert_eq!(reversed.get(&3), Some(&(DiffMarker::Modified, DiffStage::Unstaged)));
+        assert_eq!(
+            reversed.get(&3),
+            Some(&(DiffMarker::Modified, DiffStage::Unstaged))
+        );
     }
 
     #[test]
@@ -8838,10 +9079,20 @@ mod diff_anchor_tests {
         staged_elsewhere.stage = DiffStage::Staged;
         let map = deleted_rows_by_anchor(&[staged, unstaged, staged_elsewhere], 10);
         let rows = &map[&1];
-        assert_eq!(rows.len(), 1, "staged layer suppressed at the shared anchor");
-        assert_eq!((rows[0].text.as_str(), rows[0].stage), ("index text", DiffStage::Unstaged));
+        assert_eq!(
+            rows.len(),
+            1,
+            "staged layer suppressed at the shared anchor"
+        );
+        assert_eq!(
+            (rows[0].text.as_str(), rows[0].stage),
+            ("index text", DiffStage::Unstaged)
+        );
         let solo = &map[&5];
-        assert_eq!((solo[0].text.as_str(), solo[0].stage), ("solo head text", DiffStage::Staged));
+        assert_eq!(
+            (solo[0].text.as_str(), solo[0].stage),
+            ("solo head text", DiffStage::Staged)
+        );
     }
 
     #[test]
@@ -8850,10 +9101,10 @@ mod diff_anchor_tests {
         // (`deleted.len()`). A Modified hunk's replaced old lines ride its `modified` count and are
         // *not* also tallied as deletions.
         let hunks = vec![
-            hunk(ChangeKind::Added, 5, 3, &[]),                  // +3
-            hunk(ChangeKind::Modified, 2, 1, &["a", "b"]),       // ~1 (2 old lines → 1 new)
-            hunk(ChangeKind::Modified, 10, 2, &["c"]),           // ~2
-            hunk(ChangeKind::Deleted, 9, 0, &["x", "y", "z"]),   // -3
+            hunk(ChangeKind::Added, 5, 3, &[]),                // +3
+            hunk(ChangeKind::Modified, 2, 1, &["a", "b"]),     // ~1 (2 old lines → 1 new)
+            hunk(ChangeKind::Modified, 10, 2, &["c"]),         // ~2
+            hunk(ChangeKind::Deleted, 9, 0, &["x", "y", "z"]), // -3
         ];
         let c = git_change_counts(&hunks);
         assert_eq!((c.added, c.modified, c.deleted), (3, 3, 3));
@@ -8905,7 +9156,10 @@ mod subscribe_snapshot_tests {
             cols: 80,
             rows: 24,
             overscan_rows: 0,
-            scroll: ScrollPosition { logical_line: 0, sub_row: 0.0 },
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -9020,8 +9274,8 @@ mod grep_boundary_tests {
 #[cfg(test)]
 mod diagnostic_span_tests {
     use super::{diagnostic_counts, diagnostic_spans_on_line, navigate_diagnostic_target};
-    use aether_protocol::lsp::DiagnosticDirection;
     use crate::lsp::diagnostics::BufferDiagnostic;
+    use aether_protocol::lsp::DiagnosticDirection;
     use aether_protocol::viewport::DiagnosticSeverity;
     use aether_protocol::LogicalPosition;
 
@@ -9096,11 +9350,23 @@ mod diagnostic_span_tests {
         // Diagnostics on lines 2 (col 4), 5, 9 — deliberately out of order to exercise the sort.
         let diags = [diag(5, 0, 5, 1), diag(2, 4, 2, 6), diag(9, 0, 9, 3)];
         // From line 3: next is line 5, prev is line 2 (at its column).
-        assert_eq!(navigate_diagnostic_target(&diags, 3, Next), Some(LogicalPosition { line: 5, col: 0 }));
-        assert_eq!(navigate_diagnostic_target(&diags, 3, Prev), Some(LogicalPosition { line: 2, col: 4 }));
+        assert_eq!(
+            navigate_diagnostic_target(&diags, 3, Next),
+            Some(LogicalPosition { line: 5, col: 0 })
+        );
+        assert_eq!(
+            navigate_diagnostic_target(&diags, 3, Prev),
+            Some(LogicalPosition { line: 2, col: 4 })
+        );
         // Strictly beyond the cursor line: standing on a diagnostic line skips it.
-        assert_eq!(navigate_diagnostic_target(&diags, 5, Next), Some(LogicalPosition { line: 9, col: 0 }));
-        assert_eq!(navigate_diagnostic_target(&diags, 5, Prev), Some(LogicalPosition { line: 2, col: 4 }));
+        assert_eq!(
+            navigate_diagnostic_target(&diags, 5, Next),
+            Some(LogicalPosition { line: 9, col: 0 })
+        );
+        assert_eq!(
+            navigate_diagnostic_target(&diags, 5, Prev),
+            Some(LogicalPosition { line: 2, col: 4 })
+        );
     }
 
     #[test]
@@ -9122,7 +9388,8 @@ mod lsp_parse_tests {
     #[test]
     fn hover_markup_content_string_and_array() {
         assert_eq!(
-            parse_hover_contents(&json!({"contents": {"kind": "markdown", "value": "fn foo()"}})).as_deref(),
+            parse_hover_contents(&json!({"contents": {"kind": "markdown", "value": "fn foo()"}}))
+                .as_deref(),
             Some("fn foo()")
         );
         assert_eq!(
@@ -9130,7 +9397,8 @@ mod lsp_parse_tests {
             Some("plain")
         );
         assert_eq!(
-            parse_hover_contents(&json!({"contents": [{"language": "rust", "value": "a"}, "b"]})).as_deref(),
+            parse_hover_contents(&json!({"contents": [{"language": "rust", "value": "a"}, "b"]}))
+                .as_deref(),
             Some("a\n\nb")
         );
     }
@@ -9151,7 +9419,13 @@ mod lsp_parse_tests {
         assert_eq!(loc.position, LogicalPosition { line: 3, col: 5 });
         // Array → first.
         let v = json!([{"uri": "file:///p/a.rs", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}}]);
-        assert_eq!(parse_definition(&v, PositionEncoding::Utf8).unwrap().position.line, 1);
+        assert_eq!(
+            parse_definition(&v, PositionEncoding::Utf8)
+                .unwrap()
+                .position
+                .line,
+            1
+        );
         // LocationLink → targetSelectionRange preferred over targetRange.
         let v = json!([{
             "targetUri": "file:///p/b.rs",
@@ -9189,7 +9463,9 @@ mod lsp_parse_tests {
         // `textDocument/references` returns `Location[] | null`; both null and a stray object
         // yield no references rather than erroring.
         assert!(parse_references(&json!(null), PositionEncoding::Utf8).is_empty());
-        assert!(parse_references(&json!({"uri": "file:///p/a.rs"}), PositionEncoding::Utf8).is_empty());
+        assert!(
+            parse_references(&json!({"uri": "file:///p/a.rs"}), PositionEncoding::Utf8).is_empty()
+        );
         // Unparseable entries are skipped, not fatal.
         let v = json!([
             {"uri": "file:///p/a.rs", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}},

@@ -13,7 +13,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 
 /// Read one framed message, returning its raw JSON bytes. `Ok(None)` is a clean EOF (the peer
 /// closed the stream between messages).
-pub async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+pub async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut content_length: Option<usize> = None;
     let mut saw_header = false;
     loop {
@@ -37,15 +39,18 @@ pub async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Res
         }
         // Any other header (Content-Type, ...) is ignored.
     }
-    let len =
-        content_length.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing Content-Length"))?;
+    let len = content_length
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing Content-Length"))?;
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
     Ok(Some(body))
 }
 
 /// Write one framed message around the given JSON `body`.
-pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> std::io::Result<()> {
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    body: &[u8],
+) -> std::io::Result<()> {
     let header = format!("Content-Length: {}\r\n\r\n", body.len());
     writer.write_all(header.as_bytes()).await?;
     writer.write_all(body).await?;
@@ -63,7 +68,9 @@ mod tests {
         let (a, b) = tokio::io::duplex(8192);
         let (ar, _aw) = tokio::io::split(a);
         let (_br, mut bw) = tokio::io::split(b);
-        write_frame(&mut bw, br#"{"jsonrpc":"2.0","id":1}"#).await.unwrap();
+        write_frame(&mut bw, br#"{"jsonrpc":"2.0","id":1}"#)
+            .await
+            .unwrap();
         let mut reader = BufReader::new(ar);
         let got = read_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(got, br#"{"jsonrpc":"2.0","id":1}"#);

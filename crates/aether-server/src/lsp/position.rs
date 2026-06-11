@@ -188,6 +188,9 @@ mod tests {
             assert_eq!(PositionEncoding::from_lsp(s), enc);
             assert_eq!(enc.as_lsp(), s);
         }
-        assert_eq!(PositionEncoding::from_lsp("banana"), PositionEncoding::Utf16);
+        assert_eq!(
+            PositionEncoding::from_lsp("banana"),
+            PositionEncoding::Utf16
+        );
     }
 }

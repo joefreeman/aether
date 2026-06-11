@@ -63,10 +63,7 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
 /// gets a recursive watch. Errors are logged, not propagated — losing the watcher on one root
 /// shouldn't fail the whole activation; the project just won't receive external-change
 /// notifications for that root.
-pub fn watch_project_paths(
-    watcher: &Arc<Mutex<RecommendedWatcher>>,
-    paths: &[PathBuf],
-) {
+pub fn watch_project_paths(watcher: &Arc<Mutex<RecommendedWatcher>>, paths: &[PathBuf]) {
     let mut watcher = match watcher.lock() {
         Ok(g) => g,
         Err(p) => {
@@ -84,10 +81,7 @@ pub fn watch_project_paths(
 /// Stop watching the given paths. Used by `project/remove_root`. Errors are logged but
 /// otherwise ignored — if the watcher had already lost the path (e.g. the directory was deleted
 /// out from under us), there's nothing for the caller to recover from.
-pub fn unwatch_project_paths(
-    watcher: &Arc<Mutex<RecommendedWatcher>>,
-    paths: &[PathBuf],
-) {
+pub fn unwatch_project_paths(watcher: &Arc<Mutex<RecommendedWatcher>>, paths: &[PathBuf]) {
     let mut watcher = match watcher.lock() {
         Ok(g) => g,
         Err(p) => {
@@ -291,7 +285,13 @@ mod tests {
 
     #[test]
     fn detects_meaningful_git_files() {
-        for inner in ["HEAD", "index", "packed-refs", "refs/heads/main", "refs/tags/v1"] {
+        for inner in [
+            "HEAD",
+            "index",
+            "packed-refs",
+            "refs/heads/main",
+            "refs/tags/v1",
+        ] {
             let p = PathBuf::from(format!("/home/u/proj/.git/{inner}"));
             assert_eq!(
                 git_change_workdir(&p),
@@ -304,13 +304,17 @@ mod tests {
     #[test]
     fn ignores_noise_and_non_git_paths() {
         for p in [
-            "/home/u/proj/.git/index.lock",   // lock temp file
-            "/home/u/proj/.git/logs/HEAD",    // reflog
+            "/home/u/proj/.git/index.lock",    // lock temp file
+            "/home/u/proj/.git/logs/HEAD",     // reflog
             "/home/u/proj/.git/objects/ab/cd", // object write
             "/home/u/proj/.git/COMMIT_EDITMSG",
-            "/home/u/proj/src/main.rs",       // ordinary source file
+            "/home/u/proj/src/main.rs", // ordinary source file
         ] {
-            assert_eq!(git_change_workdir(Path::new(p)), None, "{p} should be ignored");
+            assert_eq!(
+                git_change_workdir(Path::new(p)),
+                None,
+                "{p} should be ignored"
+            );
         }
     }
 }

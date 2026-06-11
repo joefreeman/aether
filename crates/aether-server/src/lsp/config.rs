@@ -17,7 +17,10 @@ pub enum WorkspaceMarker {
     File(&'static str),
     /// An ancestor whose `file` contains `needle` (on some line) is a workspace root (outermost
     /// wins), e.g. a `Cargo.toml` with a `[workspace]` table.
-    FileContaining { file: &'static str, needle: &'static str },
+    FileContaining {
+        file: &'static str,
+        needle: &'static str,
+    },
 }
 
 /// The workspace-root rule for `language`. Most languages have none (nearest-marker is right);
@@ -26,7 +29,10 @@ pub enum WorkspaceMarker {
 /// servers.
 pub fn workspace_marker(language: &str) -> WorkspaceMarker {
     match language {
-        "rust" => WorkspaceMarker::FileContaining { file: "Cargo.toml", needle: "[workspace]" },
+        "rust" => WorkspaceMarker::FileContaining {
+            file: "Cargo.toml",
+            needle: "[workspace]",
+        },
         "go" => WorkspaceMarker::File("go.work"),
         _ => WorkspaceMarker::None,
     }
@@ -70,7 +76,12 @@ pub fn server_spec(language: &str) -> Option<LspServerSpec> {
         "python" => LspServerSpec {
             command: "pyright-langserver",
             args: &["--stdio"],
-            root_markers: &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"],
+            root_markers: &[
+                "pyproject.toml",
+                "setup.py",
+                "setup.cfg",
+                "requirements.txt",
+            ],
             init_options: None,
         },
         "go" => LspServerSpec {
@@ -151,17 +162,30 @@ mod tests {
         assert_eq!(server_spec("toml").unwrap().command, "taplo");
         assert_eq!(server_spec("toml").unwrap().args, &["lsp", "stdio"]);
         // The gap languages added for broad coverage.
-        assert_eq!(server_spec("json").unwrap().command, "vscode-json-language-server");
+        assert_eq!(
+            server_spec("json").unwrap().command,
+            "vscode-json-language-server"
+        );
         // The vscode servers opt into their formatter; others send no init options.
         for lang in ["json", "css", "html"] {
             assert!(
-                server_spec(lang).unwrap().init_options.unwrap().contains("provideFormatter"),
+                server_spec(lang)
+                    .unwrap()
+                    .init_options
+                    .unwrap()
+                    .contains("provideFormatter"),
                 "{lang} should opt into its formatter",
             );
         }
         assert!(server_spec("rust").unwrap().init_options.is_none());
-        assert_eq!(server_spec("html").unwrap().command, "vscode-html-language-server");
-        assert_eq!(server_spec("css").unwrap().command, "vscode-css-language-server");
+        assert_eq!(
+            server_spec("html").unwrap().command,
+            "vscode-html-language-server"
+        );
+        assert_eq!(
+            server_spec("css").unwrap().command,
+            "vscode-css-language-server"
+        );
         assert_eq!(server_spec("yaml").unwrap().command, "yaml-language-server");
         assert_eq!(server_spec("bash").unwrap().command, "bash-language-server");
         assert_eq!(server_spec("markdown").unwrap().command, "marksman");
@@ -170,7 +194,10 @@ mod tests {
         // Workspace-aware languages resolve to the workspace root, not per crate/module.
         assert_eq!(
             workspace_marker("rust"),
-            WorkspaceMarker::FileContaining { file: "Cargo.toml", needle: "[workspace]" }
+            WorkspaceMarker::FileContaining {
+                file: "Cargo.toml",
+                needle: "[workspace]"
+            }
         );
         assert_eq!(workspace_marker("go"), WorkspaceMarker::File("go.work"));
         assert_eq!(workspace_marker("python"), WorkspaceMarker::None);

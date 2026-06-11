@@ -281,7 +281,11 @@ impl ServerState {
     pub fn rename_project(&mut self, old: &str, new: &str) -> Option<Vec<String>> {
         let mut entry = self.projects.remove(old)?;
         entry.name = new.to_string();
-        let paths: Vec<String> = entry.paths.iter().map(|p| p.display().to_string()).collect();
+        let paths: Vec<String> = entry
+            .paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         self.projects.insert(new.to_string(), entry);
         for project in self.buffer_projects.values_mut() {
             if project == old {
@@ -325,7 +329,9 @@ impl ServerState {
             .filter_map(|(id, _)| self.buffers.get(id))
             .filter_map(|b| b.scratch_number)
             .collect();
-        (1..).find(|n| !used.contains(n)).expect("u32 range is non-empty")
+        (1..)
+            .find(|n| !used.contains(n))
+            .expect("u32 range is non-empty")
     }
 
     /// Buffer ids in `project` whose backing file is at or under `canonical` — an exact match for
@@ -588,11 +594,7 @@ impl ServerState {
     /// limited to one client. Used when the client switches its active project: the buffers
     /// themselves stay alive (other clients may have them open), but this client's viewports,
     /// cursors, history, searches, scroll, and pickers/mru are reset.
-    pub fn teardown_client_state_for_project(
-        &mut self,
-        client_id: ClientId,
-        project_name: &str,
-    ) {
+    pub fn teardown_client_state_for_project(&mut self, client_id: ClientId, project_name: &str) {
         // Snapshot the buffer ids belonging to the project; we'll filter all the per-(client,
         // buffer) maps against this set. Avoids borrowing `buffers` while mutating the maps.
         let project_buffers: std::collections::HashSet<BufferId> = self
@@ -613,8 +615,7 @@ impl ServerState {
         // it's hidden now, same as switching buffers. (Permanent buffers stay alive for
         // re-entry, per the comment below.)
         let _ = self.close_orphaned_transients(viewed);
-        let in_proj =
-            |c: &ClientId, b: &BufferId| *c == client_id && project_buffers.contains(b);
+        let in_proj = |c: &ClientId, b: &BufferId| *c == client_id && project_buffers.contains(b);
         // Viewports + the live search state get torn down (they're transient view-layer
         // bookkeeping). Cursors / motion history / tree-selection / virtual-col / scroll are
         // *preserved* — they're the user's place-in-the-buffer memory, and re-attaching to a
@@ -1249,8 +1250,10 @@ mod project_state_tests {
     #[test]
     fn rename_project_rekeys_buffers_and_clients() {
         let mut s = ServerState::new();
-        s.projects
-            .insert("old".to_string(), project_entry("old", vec![PathBuf::from("/tmp/x")]));
+        s.projects.insert(
+            "old".to_string(),
+            project_entry("old", vec![PathBuf::from("/tmp/x")]),
+        );
         s.projects
             .insert("other".to_string(), project_entry("other", vec![]));
 
@@ -1315,8 +1318,10 @@ mod project_state_tests {
     #[test]
     fn delete_project_closes_only_its_buffers() {
         let mut s = ServerState::new();
-        s.projects
-            .insert("doomed".to_string(), project_entry("doomed", vec![PathBuf::from("/tmp/d")]));
+        s.projects.insert(
+            "doomed".to_string(),
+            project_entry("doomed", vec![PathBuf::from("/tmp/d")]),
+        );
         s.projects
             .insert("keep".to_string(), project_entry("keep", vec![]));
 
@@ -1344,7 +1349,10 @@ mod project_state_tests {
         assert!(!s.buffer_projects.contains_key(&buf_a));
         assert!(!s.buffer_projects.contains_key(&buf_b));
         assert!(!s.cursors.contains_key(&(client, buf_a)));
-        assert_eq!(s.buffer_projects.get(&survivor).map(String::as_str), Some("keep"));
+        assert_eq!(
+            s.buffer_projects.get(&survivor).map(String::as_str),
+            Some("keep")
+        );
         assert!(s.cursors.contains_key(&(client, survivor)));
     }
 
@@ -1354,8 +1362,10 @@ mod project_state_tests {
     #[test]
     fn buffers_under_path_matches_file_and_dir_prefix() {
         let mut s = ServerState::new();
-        s.projects
-            .insert("proj".to_string(), project_entry("proj", vec![PathBuf::from("/ws")]));
+        s.projects.insert(
+            "proj".to_string(),
+            project_entry("proj", vec![PathBuf::from("/ws")]),
+        );
 
         let add = |s: &mut ServerState, path: &str| -> BufferId {
             let id = s.allocate_buffer_id();
@@ -1373,7 +1383,10 @@ mod project_state_tests {
         under.sort();
         let mut expected = vec![a, b];
         expected.sort();
-        assert_eq!(under, expected, "directory prefix should match a.rs and sub/b.rs only");
+        assert_eq!(
+            under, expected,
+            "directory prefix should match a.rs and sub/b.rs only"
+        );
 
         assert_eq!(
             s.buffers_under_path("proj", Path::new("/ws/src/a.rs")),
@@ -1381,7 +1394,8 @@ mod project_state_tests {
             "exact file path matches just that buffer"
         );
         assert!(
-            s.buffers_under_path("other-proj", Path::new("/ws/src")).is_empty(),
+            s.buffers_under_path("other-proj", Path::new("/ws/src"))
+                .is_empty(),
             "scoped to the named project"
         );
     }
@@ -1403,8 +1417,10 @@ mod project_state_tests {
         add_scratch(&mut s, 2);
         // A file buffer (no scratch number) doesn't occupy a slot.
         let file = s.allocate_buffer_id();
-        s.buffers
-            .insert(file, Buffer::new_at_path(file, PathBuf::from("/p/a.rs"), None));
+        s.buffers.insert(
+            file,
+            Buffer::new_at_path(file, PathBuf::from("/p/a.rs"), None),
+        );
         s.buffer_projects.insert(file, "proj".to_string());
         assert_eq!(s.next_scratch_number("proj"), 3, "1 and 2 used → 3");
 

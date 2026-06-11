@@ -4,7 +4,8 @@
 
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::{
-    CursorMove, CursorMoveParams, CursorState, Direction, Motion, WordBoundary,
+    CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Granularity,
+    Motion, WordBoundary,
 };
 use aether_protocol::directory::{
     DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryList,
@@ -15,29 +16,29 @@ use aether_protocol::envelope::{
     RpcMethod,
 };
 use aether_protocol::git::{
-    ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams,
-    GitApplyHunkResult, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitChangeCounts,
-    GitCommitInfo, GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams,
-    HunkAction, HunkDirection, GitSetDiffView, GitSetDiffViewParams,
+    ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
+    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitChangeCounts, GitCommitInfo,
+    GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams,
+    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
+use aether_protocol::input::{InputSurround, InputSurroundParams, InputText, InputTextParams};
+use aether_protocol::lsp::{
+    DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
+    LspDiagnosticsChangedParams, LspFormat, LspFormatResult, LspGotoDefinition,
+    LspGotoDefinitionResult, LspHover, LspHoverResult, LspLocation, LspNavigateDiagnostic,
+    LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServer, LspServerStatus,
+    LspServerStatusList, LspStatus, LspStatusChanged,
+};
+use aether_protocol::project::{
+    ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
+};
+use aether_protocol::search::{SearchSet, SearchSetParams};
+use aether_protocol::viewport::LogicalLineRange;
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
     LogicalLineRender, VirtualRow, VirtualRowKind, Window,
 };
-use aether_protocol::input::{InputSurround, InputSurroundParams, InputText, InputTextParams};
-use aether_protocol::search::{SearchSet, SearchSetParams};
-use aether_protocol::project::{
-    ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
-};
-use aether_protocol::lsp::{
-    DiagnosticCounts, DiagnosticDirection, LspBufferParams, LspDiagnosticsChanged,
-    LspDiagnosticsChangedParams, LspGotoDefinition, LspGotoDefinitionResult, LspHover,
-    FormatStatus, LspFormat, LspFormatResult, LspHoverResult, LspLocation, LspNavigateDiagnostic,
-    LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServer, LspServerStatus,
-    LspServerStatusList, LspStatus, LspStatusChanged,
-};
 use aether_protocol::viewport::{ViewportLinesChanged, ViewportLinesChangedParams};
-use aether_protocol::viewport::LogicalLineRange;
 use aether_protocol::LogicalPosition;
 use serde_json::{from_str, from_value, json, to_value};
 
@@ -53,7 +54,12 @@ fn request_roundtrip() {
         jsonrpc: JsonRpc,
         id: 7,
         method: ProjectActivate::NAME.into(),
-        params: Some(to_value(ProjectActivateParams { name: "aether".into() }).unwrap()),
+        params: Some(
+            to_value(ProjectActivateParams {
+                name: "aether".into(),
+            })
+            .unwrap(),
+        ),
     };
     let s = serde_json::to_string(&req).unwrap();
     let v: serde_json::Value = from_str(&s).unwrap();
@@ -186,7 +192,10 @@ fn git_set_diff_view_params_shape() {
         viewport_id: 9,
         enabled: true,
     };
-    assert_eq!(to_value(&p).unwrap(), json!({"viewport_id": 9, "enabled": true}));
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({"viewport_id": 9, "enabled": true})
+    );
     assert_eq!(GitSetDiffView::NAME, "git/set_diff_view");
 }
 
@@ -203,10 +212,22 @@ fn logical_line_render_virtual_rows_shape() {
         diagnostics: vec![],
     };
     let v = to_value(&bare).unwrap();
-    assert!(v.get("virtual_rows_above").is_none(), "empty omitted from wire");
-    assert!(v.get("diff_marker").is_none(), "None marker omitted from wire");
-    assert!(v.get("diff_stage").is_none(), "unstaged stage omitted from wire");
-    assert!(v.get("diagnostics").is_none(), "empty diagnostics omitted from wire");
+    assert!(
+        v.get("virtual_rows_above").is_none(),
+        "empty omitted from wire"
+    );
+    assert!(
+        v.get("diff_marker").is_none(),
+        "None marker omitted from wire"
+    );
+    assert!(
+        v.get("diff_stage").is_none(),
+        "unstaged stage omitted from wire"
+    );
+    assert!(
+        v.get("diagnostics").is_none(),
+        "empty diagnostics omitted from wire"
+    );
 
     let with_del = LogicalLineRender {
         logical_line: 4,
@@ -261,7 +282,12 @@ fn buffer_status_snapshot_shape() {
     let full = BufferStatusSnapshot {
         externally_modified: true,
         externally_deleted: false,
-        diagnostics: DiagnosticCounts { errors: 2, warnings: 1, infos: 0, hints: 0 },
+        diagnostics: DiagnosticCounts {
+            errors: 2,
+            warnings: 1,
+            infos: 0,
+            hints: 0,
+        },
         lsp_status: Some(LspServerStatus {
             name: "rust-analyzer".into(),
             language: "rust".into(),
@@ -290,7 +316,10 @@ fn git_change_counts_shape() {
     // the wire there — pinned in `git_buffer_status_shape` below.
     let counts = GitChangeCounts::default();
     assert!(counts.is_empty());
-    assert_eq!(to_value(counts).unwrap(), json!({"added": 0, "modified": 0, "deleted": 0}));
+    assert_eq!(
+        to_value(counts).unwrap(),
+        json!({"added": 0, "modified": 0, "deleted": 0})
+    );
 }
 
 #[test]
@@ -302,13 +331,27 @@ fn git_buffer_status_shape() {
     // Branch + a staged modification + an unstaged addition; empty count side is omitted.
     let s = GitBufferStatus {
         branch: Some("main".into()),
-        staged: GitChangeCounts { added: 0, modified: 1, deleted: 0 },
-        unstaged: GitChangeCounts { added: 2, modified: 0, deleted: 0 },
+        staged: GitChangeCounts {
+            added: 0,
+            modified: 1,
+            deleted: 0,
+        },
+        unstaged: GitChangeCounts {
+            added: 2,
+            modified: 0,
+            deleted: 0,
+        },
     };
     let v = to_value(&s).unwrap();
     assert_eq!(v["branch"], "main");
-    assert_eq!(v["staged"], json!({"added": 0, "modified": 1, "deleted": 0}));
-    assert_eq!(v["unstaged"], json!({"added": 2, "modified": 0, "deleted": 0}));
+    assert_eq!(
+        v["staged"],
+        json!({"added": 0, "modified": 1, "deleted": 0})
+    );
+    assert_eq!(
+        v["unstaged"],
+        json!({"added": 2, "modified": 0, "deleted": 0})
+    );
     let back: GitBufferStatus = from_value(v).unwrap();
     assert_eq!(back.branch.as_deref(), Some("main"));
     assert_eq!((back.staged.modified, back.unstaged.added), (1, 2));
@@ -322,7 +365,10 @@ fn git_navigate_hunk_shapes() {
         direction: HunkDirection::Next,
     };
     let v = to_value(&p).unwrap();
-    assert_eq!(v, json!({"buffer_id": 2, "from_line": 10, "direction": "next"}));
+    assert_eq!(
+        v,
+        json!({"buffer_id": 2, "from_line": 10, "direction": "next"})
+    );
     assert_eq!(GitNavigateHunk::NAME, "git/navigate_hunk");
 }
 
@@ -383,6 +429,56 @@ fn cursor_move_params_use_motion() {
             "extend_selection": true,
         })
     );
+}
+
+#[test]
+fn cursor_set_params_granularity() {
+    use aether_protocol::envelope::RpcMethod;
+    assert_eq!(CursorSet::NAME, "cursor/set");
+
+    // Char granularity (the default) is omitted on the wire.
+    let v = to_value(CursorSetParams {
+        buffer_id: 7,
+        position: LogicalPosition { line: 1, col: 4 },
+        anchor: LogicalPosition { line: 1, col: 4 },
+        granularity: Granularity::Char,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "buffer_id": 7,
+            "position": {"line": 1, "col": 4},
+            "anchor": {"line": 1, "col": 4},
+        })
+    );
+
+    // Word/Line serialise as snake_case strings.
+    let v = to_value(CursorSetParams {
+        buffer_id: 7,
+        position: LogicalPosition { line: 1, col: 4 },
+        anchor: LogicalPosition { line: 0, col: 2 },
+        granularity: Granularity::Word,
+    })
+    .unwrap();
+    assert_eq!(v["granularity"], "word");
+
+    // Omitted on the wire defaults to Char (back-compat with older clients).
+    let p: CursorSetParams = from_value(json!({
+        "buffer_id": 7,
+        "position": {"line": 0, "col": 0},
+        "anchor": {"line": 0, "col": 0},
+    }))
+    .unwrap();
+    assert_eq!(p.granularity, Granularity::Char);
+    let p: CursorSetParams = from_value(json!({
+        "buffer_id": 7,
+        "position": {"line": 0, "col": 0},
+        "anchor": {"line": 0, "col": 0},
+        "granularity": "line",
+    }))
+    .unwrap();
+    assert_eq!(p.granularity, Granularity::Line);
 }
 
 #[test]
@@ -517,7 +613,10 @@ fn buffer_open_result_restored_scroll() {
     // `scratch_number: None` skips serialisation, like a file buffer.
     assert!(v.get("scratch_number").is_none());
     // `lsp_server: None` is skipped too.
-    assert!(v.get("lsp_server").is_none(), "lsp_server: None should be skipped");
+    assert!(
+        v.get("lsp_server").is_none(),
+        "lsp_server: None should be skipped"
+    );
 }
 
 #[test]
@@ -637,13 +736,22 @@ fn lsp_diagnostics_changed_shape() {
     assert_eq!(LspDiagnosticsChanged::NAME, "lsp/diagnostics_changed");
     let p = LspDiagnosticsChangedParams {
         buffer_id: 5,
-        counts: DiagnosticCounts { errors: 2, warnings: 1, infos: 0, hints: 3 },
+        counts: DiagnosticCounts {
+            errors: 2,
+            warnings: 1,
+            infos: 0,
+            hints: 3,
+        },
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["buffer_id"], 5);
     assert_eq!(v["counts"]["errors"], 2);
     assert_eq!(v["counts"]["hints"], 3);
-    assert!(!DiagnosticCounts { errors: 1, ..Default::default() }.is_empty());
+    assert!(!DiagnosticCounts {
+        errors: 1,
+        ..Default::default()
+    }
+    .is_empty());
     assert!(DiagnosticCounts::default().is_empty());
 }
 
@@ -655,7 +763,10 @@ fn lsp_hover_and_goto_shapes() {
     let v = to_value(LspBufferParams { buffer_id: 3 }).unwrap();
     assert_eq!(v, json!({"buffer_id": 3}));
     // Hover: optional contents.
-    let v = to_value(LspHoverResult { contents: Some("fn x()".into()) }).unwrap();
+    let v = to_value(LspHoverResult {
+        contents: Some("fn x()".into()),
+    })
+    .unwrap();
     assert_eq!(v["contents"], "fn x()");
     // Goto: optional location with absolute path + byte-col position.
     let r = LspGotoDefinitionResult {
@@ -675,14 +786,20 @@ fn lsp_hover_and_goto_shapes() {
 fn lsp_format_shape() {
     assert_eq!(LspFormat::NAME, "lsp/format");
     // Params are the shared cursor-relative buffer params.
-    assert_eq!(to_value(LspBufferParams { buffer_id: 4 }).unwrap(), json!({"buffer_id": 4}));
+    assert_eq!(
+        to_value(LspBufferParams { buffer_id: 4 }).unwrap(),
+        json!({"buffer_id": 4})
+    );
     let r = LspFormatResult {
         cursor: CursorState::default(),
         status: FormatStatus::Applied,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["status"], "applied");
-    assert_eq!(to_value(FormatStatus::Unsupported).unwrap(), json!("unsupported"));
+    assert_eq!(
+        to_value(FormatStatus::Unsupported).unwrap(),
+        json!("unsupported")
+    );
     let back: LspFormatResult = from_value(v).unwrap();
     assert_eq!(back.status, FormatStatus::Applied);
 }
@@ -696,11 +813,11 @@ fn lsp_navigate_diagnostic_shape() {
         direction: DiagnosticDirection::Next,
     };
     let v = to_value(&p).unwrap();
-    assert_eq!(v, json!({"buffer_id": 7, "from_line": 3, "direction": "next"}));
     assert_eq!(
-        to_value(DiagnosticDirection::Prev).unwrap(),
-        json!("prev")
+        v,
+        json!({"buffer_id": 7, "from_line": 3, "direction": "next"})
     );
+    assert_eq!(to_value(DiagnosticDirection::Prev).unwrap(), json!("prev"));
     let r = LspNavigateDiagnosticResult {
         cursor: CursorState::default(),
         moved: true,
@@ -714,7 +831,10 @@ fn lsp_navigate_diagnostic_shape() {
 #[test]
 fn lsp_status_is_internally_tagged() {
     // Unit variant: just the tag.
-    assert_eq!(to_value(LspStatus::Ready).unwrap(), json!({"state": "ready"}));
+    assert_eq!(
+        to_value(LspStatus::Ready).unwrap(),
+        json!({"state": "ready"})
+    );
     // Struct variant: tag alongside its fields, flat.
     assert_eq!(
         to_value(LspStatus::Crashed {
@@ -1109,7 +1229,7 @@ fn picker_item_file_carries_git_status() {
 
 #[test]
 fn picker_item_diagnostic_is_tagged() {
-    use aether_protocol::picker::{PickerKind, PickerItem};
+    use aether_protocol::picker::{PickerItem, PickerKind};
     assert_eq!(
         to_value(PickerKind::Diagnostics).unwrap(),
         json!("diagnostics")
@@ -1139,13 +1259,23 @@ fn picker_item_diagnostic_is_tagged() {
         "kind": "diagnostic", "line": 3, "col": 0, "severity": "warning", "message": "unused"
     }))
     .unwrap();
-    assert!(matches!(bare, PickerItem::Diagnostic { end_line: 0, end_col: 0, .. }));
+    assert!(matches!(
+        bare,
+        PickerItem::Diagnostic {
+            end_line: 0,
+            end_col: 0,
+            ..
+        }
+    ));
 }
 
 #[test]
 fn picker_item_reference_is_tagged() {
     use aether_protocol::picker::{PickerItem, PickerKind};
-    assert_eq!(to_value(PickerKind::References).unwrap(), json!("references"));
+    assert_eq!(
+        to_value(PickerKind::References).unwrap(),
+        json!("references")
+    );
     let item = PickerItem::Reference {
         path: "/home/u/proj/src/lib.rs".into(),
         display_path: "src/lib.rs".into(),
@@ -1170,13 +1300,18 @@ fn picker_item_reference_is_tagged() {
         "kind": "reference", "path": "/a", "display_path": "a", "line": 0, "col": 0, "preview": ""
     }))
     .unwrap();
-    assert!(matches!(bare, PickerItem::Reference { ref match_indices, .. } if match_indices.is_empty()));
+    assert!(
+        matches!(bare, PickerItem::Reference { ref match_indices, .. } if match_indices.is_empty())
+    );
 }
 
 #[test]
 fn picker_item_lsp_server_is_tagged() {
     use aether_protocol::picker::{PickerItem, PickerKind};
-    assert_eq!(to_value(PickerKind::LspServers).unwrap(), json!("lsp_servers"));
+    assert_eq!(
+        to_value(PickerKind::LspServers).unwrap(),
+        json!("lsp_servers")
+    );
     let item = PickerItem::LspServer {
         name: "rust-analyzer".into(),
         language: "rust".into(),
@@ -1330,9 +1465,18 @@ fn picker_item_buffer_is_tagged() {
     };
     let sv = to_value(&scratch).unwrap();
     assert!(sv.get("status").is_none(), "clean buffer omits status");
-    assert!(sv.get("path_index").is_none(), "scratch buffer omits path_index");
-    assert!(sv.get("relative_path").is_none(), "scratch buffer omits relative_path");
-    assert!(sv.get("transient").is_none(), "permanent buffer omits transient");
+    assert!(
+        sv.get("path_index").is_none(),
+        "scratch buffer omits path_index"
+    );
+    assert!(
+        sv.get("relative_path").is_none(),
+        "scratch buffer omits relative_path"
+    );
+    assert!(
+        sv.get("transient").is_none(),
+        "permanent buffer omits transient"
+    );
 
     // A clean status absent on the wire deserializes back to `Clean` (serde default).
     let back: PickerItem = from_value(json!({
@@ -1789,7 +1933,10 @@ fn buffer_open_params_transient_shape() {
         jump_to: None,
     };
     let v = to_value(&p).unwrap();
-    assert!(v.get("transient").is_none(), "transient: None should be skipped");
+    assert!(
+        v.get("transient").is_none(),
+        "transient: None should be skipped"
+    );
 
     p.transient = Some(true);
     let v = to_value(&p).unwrap();
@@ -1798,8 +1945,7 @@ fn buffer_open_params_transient_shape() {
     assert_eq!(p2.transient, Some(true));
 
     // Missing on the wire deserialises as None (older clients).
-    let p3: BufferOpenParams =
-        from_value(json!({"path_index": 0, "relative_path": "x"})).unwrap();
+    let p3: BufferOpenParams = from_value(json!({"path_index": 0, "relative_path": "x"})).unwrap();
     assert_eq!(p3.transient, None);
 }
 

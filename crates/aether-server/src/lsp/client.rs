@@ -128,7 +128,7 @@ where
                         tracing::warn!("lsp: dropping unparseable message from server");
                     }
                 }
-                Ok(None) => break,                  // clean EOF
+                Ok(None) => break, // clean EOF
                 Err(e) => {
                     tracing::debug!(error = %e, "lsp: read error, closing connection");
                     break;
@@ -210,7 +210,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn within<T>(fut: impl std::future::Future<Output = T>) -> impl std::future::Future<Output = T> {
+    fn within<T>(
+        fut: impl std::future::Future<Output = T>,
+    ) -> impl std::future::Future<Output = T> {
         async move {
             tokio::time::timeout(Duration::from_secs(2), fut)
                 .await
@@ -220,8 +222,11 @@ mod tests {
 
     /// A trivial mock server: replies to every request by echoing the method name back in the
     /// result, and forwards received notifications to `notif_tx`.
-    async fn echo_server<R, W>(reader: R, mut writer: W, notif_tx: mpsc::UnboundedSender<(String, Value)>)
-    where
+    async fn echo_server<R, W>(
+        reader: R,
+        mut writer: W,
+        notif_tx: mpsc::UnboundedSender<(String, Value)>,
+    ) where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
@@ -270,8 +275,12 @@ mod tests {
     #[tokio::test]
     async fn notifications_reach_the_server_in_order() {
         let (client, mut notif_rx) = client_with_echo_server();
-        client.notify("textDocument/didOpen", json!({"n": 1})).unwrap();
-        client.notify("textDocument/didChange", json!({"n": 2})).unwrap();
+        client
+            .notify("textDocument/didOpen", json!({"n": 1}))
+            .unwrap();
+        client
+            .notify("textDocument/didChange", json!({"n": 2}))
+            .unwrap();
         let first = within(notif_rx.recv()).await.unwrap();
         let second = within(notif_rx.recv()).await.unwrap();
         assert_eq!(first.0, "textDocument/didOpen");
@@ -316,7 +325,8 @@ mod tests {
         let (sr, mut sw) = tokio::io::split(server_io);
         // Server asks the client to apply an edit, then reads the client's response.
         let server = tokio::spawn(async move {
-            let req = json!({"jsonrpc": "2.0", "id": 99, "method": "workspace/applyEdit", "params": {}});
+            let req =
+                json!({"jsonrpc": "2.0", "id": 99, "method": "workspace/applyEdit", "params": {}});
             transport::write_frame(&mut sw, &serde_json::to_vec(&req).unwrap())
                 .await
                 .unwrap();
@@ -356,7 +366,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
         let (client, _inbound) = connect(cr, cw);
-        let err = within(client.request("bogus", json!({}))).await.unwrap_err();
+        let err = within(client.request("bogus", json!({})))
+            .await
+            .unwrap_err();
         match err {
             LspError::Rpc { code, message } => {
                 assert_eq!(code, -32601);

@@ -185,12 +185,37 @@ impl RpcMethod for CursorSet {
     type Result = CursorState;
 }
 
+/// Snapping unit for `cursor/set` — how far the server expands the given endpoints outward.
+/// Drives mouse multi-click selection: single click → `Char`, double → `Word`, triple → `Line`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Granularity {
+    /// Use the endpoints exactly as given (clamped to the buffer).
+    #[default]
+    Char,
+    /// Expand each endpoint to the boundary of the same-category char run it sits in (word
+    /// chars, symbols, or intra-line whitespace; a newline is its own unit).
+    Word,
+    /// Expand to the whole-line normal form: `anchor.col == 0`, `cursor.col == line_end`.
+    Line,
+}
+
+impl Granularity {
+    pub fn is_char(&self) -> bool {
+        *self == Granularity::Char
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CursorSetParams {
     pub buffer_id: BufferId,
     pub position: LogicalPosition,
     /// Other end of the selection. Pass `anchor == position` to collapse to a point.
     pub anchor: LogicalPosition,
+    /// Snap both endpoints outward to this unit. The selection direction (which end the cursor
+    /// occupies) is preserved.
+    #[serde(default, skip_serializing_if = "Granularity::is_char")]
+    pub granularity: Granularity,
 }
 
 // ---- cursor/select_line -------------------------------------------------------------------------

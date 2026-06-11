@@ -8,26 +8,22 @@ use crate::text_input::PromptKeyOutcome;
 use crate::ui;
 use aether_protocol::buffer::{
     BufferClose, BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopy, BufferCopyParams,
-    BufferCopyResult, BufferCut,
-    BufferCutResult, BufferOpen, BufferOpenParams, BufferOpenResult, BufferReload,
-    BufferReloadParams, BufferSave, BufferSaveParams, BufferState, BufferStateParams, CopyScope,
+    BufferCopyResult, BufferCut, BufferCutResult, BufferOpen, BufferOpenParams, BufferOpenResult,
+    BufferReload, BufferReloadParams, BufferSave, BufferSaveParams, BufferState, BufferStateParams,
+    CopyScope,
 };
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams, CursorRedo,
     CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
     CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
-    Direction, Motion, VerticalDirection,
+    Direction, Granularity, Motion, VerticalDirection,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams,
-    GitBlameLine, GitBlameLineParams, GitBufferStatus,
-    GitCommitInfo, GitCommitInfoParams, GitNavigateHunk, GitNavigateHunkParams,
-    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
-};
-use aether_protocol::nav::{
-    NavBack, NavForward, NavRecord, NavRecordParams, NavStepParams, NavStepResult,
+    ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams, GitBlameLine,
+    GitBlameLineParams, GitBufferStatus, GitCommitInfo, GitCommitInfoParams, GitNavigateHunk,
+    GitNavigateHunkParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
@@ -40,11 +36,13 @@ use aether_protocol::lsp::{
     LspDiagnosticsChangedParams, LspFormat, LspNavigateDiagnostic, LspNavigateDiagnosticParams,
     LspRestartServer, LspRestartServerParams, LspServerRef, LspServerStatus, LspStatusChanged,
 };
+use aether_protocol::nav::{
+    NavBack, NavForward, NavRecord, NavRecordParams, NavStepParams, NavStepResult,
+};
 use aether_protocol::picker::{
     PickerFilters, PickerGrepNavigate, PickerGrepNavigateParams, PickerHide, PickerHideParams,
     PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
-    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
-    ScopedPath,
+    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
 };
 use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
 use aether_protocol::search::{
@@ -53,10 +51,9 @@ use aether_protocol::search::{
 };
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSeverity, LogicalLineRender, ScrollPosition,
-    ViewportLinesChanged, ViewportLinesChangedParams,
-    ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportSetWrap,
-    ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
-    WrapMode,
+    ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize, ViewportResizeParams,
+    ViewportScroll, ViewportScrollParams, ViewportSetWrap, ViewportSetWrapParams,
+    ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult, WrapMode,
 };
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 use anyhow::{Context, Result};
@@ -70,6 +67,7 @@ use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{stdout, Stdout};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Editor's modal-edit state — toggled by the user's keybindings (`i` enters Insert, `Esc`
@@ -467,8 +465,18 @@ pub struct EditorState {
     /// to a coalesced `viewport/scroll` RPC at draw time.
     pub pending_scroll_lines: i64,
     /// Anchor position set by a left-mouse-button down. Subsequent drags use it as the
-    /// selection anchor; cleared on mouse-up.
+    /// selection anchor; cleared on mouse-up. This is the *raw clicked* position, not the
+    /// server's snapped cursor, so word/line drags keep re-snapping from the original cell.
     pub drag_anchor: Option<LogicalPosition>,
+    /// Snapping granularity of the drag gesture in progress — set on mouse-down from the click
+    /// streak (single/double/triple → char/word/line) and applied to every drag update.
+    pub drag_granularity: Granularity,
+    /// `(when, row, col)` of the most recent left-button press. The terminal reports plain
+    /// presses only, so multi-clicks are synthesized: a press on the same cell within
+    /// [`MULTI_CLICK_WINDOW`] extends `click_streak`, anything else resets it to 1.
+    pub last_click: Option<(Instant, u16, u16)>,
+    /// Length of the current same-cell click chain (1 = single, 2 = double, 3+ = triple).
+    pub click_streak: u32,
     pub revision: u64,
     /// Revision at the most recent successful save. `dirty` is derived as
     /// `revision != saved_revision`.
@@ -524,7 +532,6 @@ pub struct BlameState {
 }
 
 pub use crate::save_prompt::SavePromptState;
-
 
 /// Dot used as the buffer-state indicator (status bar + terminal title). The heavier `●` (same
 /// glyph as the LSP status indicator), which reads more clearly than the lighter bullet.
@@ -676,7 +683,11 @@ pub async fn bootstrap(
                     jump_to: None,
                     // Only the auto-spawned placeholder scratch is transient; reattaching to a
                     // real last-buffer leaves its flag alone.
-                    transient: if activated.last_buffer_id.is_none() { Some(true) } else { None },
+                    transient: if activated.last_buffer_id.is_none() {
+                        Some(true)
+                    } else {
+                        None
+                    },
                 },
             )
             .await?
@@ -792,7 +803,11 @@ async fn activate_project_and_rebuild_editor(
         jump_to: None,
         // Only the auto-spawned placeholder scratch is transient; reattaching to a
         // real last-buffer leaves its flag alone.
-        transient: if activated.last_buffer_id.is_none() { Some(true) } else { None },
+        transient: if activated.last_buffer_id.is_none() {
+            Some(true)
+        } else {
+            None
+        },
     };
     let project_paths = state.project_paths.clone();
     let root_labels = state.root_labels.clone();
@@ -847,8 +862,14 @@ async fn open_buffer_and_subscribe(
 /// subscribe snapshot, so a buffer's status-bar state is correct the instant it's shown — not only
 /// after the next change-notification. External-change flags live on the editor itself and are set
 /// in `build_editor_state_from_open`. Idempotent: re-subscribing overwrites with the fresh values.
-fn seed_buffer_status_maps(state: &mut AppState, buffer_id: BufferId, status: &BufferStatusSnapshot) {
-    state.diagnostic_counts.insert(buffer_id, status.diagnostics);
+fn seed_buffer_status_maps(
+    state: &mut AppState,
+    buffer_id: BufferId,
+    status: &BufferStatusSnapshot,
+) {
+    state
+        .diagnostic_counts
+        .insert(buffer_id, status.diagnostics);
     if let Some(s) = status.lsp_status.clone() {
         state
             .lsp_status
@@ -932,6 +953,9 @@ async fn build_editor_state_from_open(
         scroll_col: 0,
         pending_scroll_lines: 0,
         drag_anchor: None,
+        drag_granularity: Granularity::Char,
+        last_click: None,
+        click_streak: 0,
         revision: open.revision,
         saved_revision: open.saved_revision,
         // External-change flags come from the subscribe snapshot (the server's current view), so a
@@ -1191,7 +1215,9 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
     if n.method == LspStatusChanged::NAME {
         match serde_json::from_value::<LspServerStatus>(n.params) {
             Ok(s) => {
-                state.lsp_status.insert((s.language.clone(), s.workspace_root.clone()), s);
+                state
+                    .lsp_status
+                    .insert((s.language.clone(), s.workspace_root.clone()), s);
             }
             Err(e) => state.status = StatusMessage::error(format!("bad lsp/status_changed: {e}")),
         }
@@ -1202,7 +1228,9 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
             Ok(p) => {
                 state.diagnostic_counts.insert(p.buffer_id, p.counts);
             }
-            Err(e) => state.status = StatusMessage::error(format!("bad lsp/diagnostics_changed: {e}")),
+            Err(e) => {
+                state.status = StatusMessage::error(format!("bad lsp/diagnostics_changed: {e}"))
+            }
         }
         return;
     }
@@ -1481,6 +1509,10 @@ async fn handle_event(client: &mut Client, state: &mut AppState, ev: Event) -> R
     Ok(())
 }
 
+/// How long after a left press a follow-up press on the same cell still counts as part of the
+/// same multi-click chain (double → word, triple → line).
+const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
 async fn handle_mouse_event(
     client: &mut Client,
     state: &mut AppState,
@@ -1495,15 +1527,38 @@ async fn handle_mouse_event(
                 return Ok(());
             }
             if let Some(pos) = ui::screen_to_logical(state, m.row, m.column) {
+                // The terminal reports plain presses only (no click counts), so synthesize
+                // double/triple clicks from a same-cell press chain within the window.
+                let now = Instant::now();
+                let ed = state.ed_mut();
+                let streak = match ed.last_click {
+                    Some((at, row, col))
+                        if (row, col) == (m.row, m.column)
+                            && now.duration_since(at) <= MULTI_CLICK_WINDOW =>
+                    {
+                        ed.click_streak + 1
+                    }
+                    _ => 1,
+                };
+                ed.last_click = Some((now, m.row, m.column));
+                ed.click_streak = streak;
+                let granularity = match streak {
+                    1 => Granularity::Char,
+                    2 => Granularity::Word,
+                    _ => Granularity::Line,
+                };
+                ed.drag_granularity = granularity;
+                let buffer_id = ed.buffer_id;
                 let new = client
                     .rpc::<CursorSet>(CursorSetParams {
-                        buffer_id: state.ed_mut().buffer_id,
+                        buffer_id,
                         position: pos,
                         anchor: pos,
+                        granularity,
                     })
                     .await?;
                 state.ed_mut().cursor = new;
-                state.ed_mut().drag_anchor = Some(new.position);
+                state.ed_mut().drag_anchor = Some(pos);
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -1513,7 +1568,8 @@ async fn handle_mouse_event(
                         .rpc::<CursorSet>(CursorSetParams {
                             buffer_id: state.ed_mut().buffer_id,
                             position: pos,
-                            anchor: anchor,
+                            anchor,
+                            granularity: state.ed_mut().drag_granularity,
                         })
                         .await?;
                     state.ed_mut().cursor = new;
@@ -1853,8 +1909,12 @@ async fn run_action(
         Action::GotoDefinition => lsp_goto_definition(client, state).await?,
         Action::ShowCommitInfo => show_commit_info(client, state).await?,
         Action::ShowDiagnostic => show_diagnostic(state),
-        Action::NextDiagnostic => navigate_diagnostic(client, state, DiagnosticDirection::Next).await?,
-        Action::PrevDiagnostic => navigate_diagnostic(client, state, DiagnosticDirection::Prev).await?,
+        Action::NextDiagnostic => {
+            navigate_diagnostic(client, state, DiagnosticDirection::Next).await?
+        }
+        Action::PrevDiagnostic => {
+            navigate_diagnostic(client, state, DiagnosticDirection::Prev).await?
+        }
         Action::Format => lsp_format(client, state).await?,
     }
     // Remember the action for `r`/`Shift-r` to replay. Recorded *after* a successful run (an RPC
@@ -2126,9 +2186,9 @@ async fn open_picker_seeded(
     // buffer at the top (and push ours below it). Applied by `apply_update` once items land.
     // The `if` guards lazy access: Projects opens before any editor exists.
     state.picker.default_skip = match kind {
-        PickerKind::Buffers if state.has_editor() => Some(crate::picker::DefaultSkip::Buffer(
-            state.ed().buffer_id,
-        )),
+        PickerKind::Buffers if state.has_editor() => {
+            Some(crate::picker::DefaultSkip::Buffer(state.ed().buffer_id))
+        }
         PickerKind::Projects if !state.project_name.is_empty() => Some(
             crate::picker::DefaultSkip::Project(state.project_name.clone()),
         ),
@@ -2457,8 +2517,7 @@ async fn handle_picker_key(client: &mut Client, state: &mut AppState, k: KeyEven
                 (KeyCode::Backspace, _) | (KeyCode::Delete, _) => {
                     state.picker.remove_chip(chips[sel].id);
                     let remaining = chips.len() - 1;
-                    state.picker.chip_selected =
-                        (remaining > 0).then(|| sel.min(remaining - 1));
+                    state.picker.chip_selected = (remaining > 0).then(|| sel.min(remaining - 1));
                     apply_picker_filter_change(client, state).await?;
                 }
                 (KeyCode::Enter, _) => edit_selected_chip(client, state, chips[sel].id).await?,
@@ -2772,7 +2831,10 @@ async fn refresh_chip_editor_listing(client: &mut Client, state: &mut AppState) 
     else {
         return Ok(());
     };
-    match client.rpc::<DirectoryList>(DirectoryListParams { path }).await {
+    match client
+        .rpc::<DirectoryList>(DirectoryListParams { path })
+        .await
+    {
         Ok(r) => {
             if let Some(ed) = state.picker.chip_editor.as_mut() {
                 ed.set_dir_listing(r.entries);
@@ -2797,7 +2859,11 @@ async fn refresh_chip_editor_listing(client: &mut Client, state: &mut AppState) 
 /// Alt-Backspace deletes the rightmost path segment (then, at an empty path, clears the root
 /// selection), and plain Backspace at an empty path steps back into the root. Everything else
 /// edits the focused field via the shared prompt keymap (Enter commits, Esc cancels).
-async fn handle_chip_editor_key(client: &mut Client, state: &mut AppState, k: KeyEvent) -> Result<()> {
+async fn handle_chip_editor_key(
+    client: &mut Client,
+    state: &mut AppState,
+    k: KeyEvent,
+) -> Result<()> {
     use crate::picker::{root_candidates, ChipEditorField};
     let (is_dir, field) = {
         let ed = state.picker.chip_editor.as_ref().expect("caller checked");
@@ -2893,7 +2959,11 @@ async fn handle_chip_editor_key(client: &mut Client, state: &mut AppState, k: Ke
                 let n = root_candidates(&labels, &ed.root_filter.text).len();
                 if n > 0 {
                     let sel = ed.root_selected.min(n - 1);
-                    ed.root_selected = if down { (sel + 1) % n } else { (sel + n - 1) % n };
+                    ed.root_selected = if down {
+                        (sel + 1) % n
+                    } else {
+                        (sel + n - 1) % n
+                    };
                     // The chosen root moved — any path text now resolves under it, so the
                     // suggestion listing (and the validity it vouches for) must follow.
                     refresh = ed.sync_dir_listing(&project_paths);
@@ -2988,7 +3058,11 @@ async fn commit_chip_editor(client: &mut Client, state: &mut AppState) -> Result
                 None
             } else {
                 let labels = crate::labels::root_labels(&state.project_paths);
-                let path_index = if multi_root { ed.chosen_root(&labels) } else { 0 };
+                let path_index = if multi_root {
+                    ed.chosen_root(&labels)
+                } else {
+                    0
+                };
                 Some(ScopedPath {
                     path_index,
                     relative_path: text,
@@ -3499,9 +3573,7 @@ async fn send_picker_query(client: &mut Client, state: &mut AppState) -> Result<
 /// take no filters, and for the Explorer's Roots mode (nothing to filter there).
 async fn apply_picker_filter_change(client: &mut Client, state: &mut AppState) -> Result<()> {
     match state.picker.kind {
-        Some(PickerKind::Grep) | Some(PickerKind::Files) => {
-            send_picker_query(client, state).await
-        }
+        Some(PickerKind::Grep) | Some(PickerKind::Files) => send_picker_query(client, state).await,
         Some(PickerKind::Explorer) => {
             if state.picker.explorer_dir.is_none() {
                 return Ok(()); // Roots mode — filters don't apply to the roots listing.
@@ -3678,7 +3750,11 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
 /// cross-file navigation. Best-effort — a failure shouldn't abort the navigation itself.
 async fn record_nav(client: &mut Client, state: &AppState) {
     if let Some(ed) = state.editor.as_ref() {
-        let _ = client.rpc::<NavRecord>(NavRecordParams { buffer_id: ed.buffer_id }).await;
+        let _ = client
+            .rpc::<NavRecord>(NavRecordParams {
+                buffer_id: ed.buffer_id,
+            })
+            .await;
     }
 }
 
@@ -3690,7 +3766,9 @@ async fn nav_step(client: &mut Client, state: &mut AppState, forward: bool) -> R
         return Ok(());
     };
     let res: NavStepResult = if forward {
-        client.rpc::<NavForward>(NavStepParams { buffer_id }).await?
+        client
+            .rpc::<NavForward>(NavStepParams { buffer_id })
+            .await?
     } else {
         client.rpc::<NavBack>(NavStepParams { buffer_id }).await?
     };
@@ -3959,8 +4037,14 @@ pub(crate) fn strip_longest_root(abs: &str, project_paths: &[String]) -> Option<
 /// Drill into the highlighted LSP server's status/error detail (`Enter` in the LSP-servers picker).
 /// A snapshot from the row, which already carries the server's `status` (incl. any crash message).
 fn open_lsp_detail(state: &mut AppState) {
-    if let Some(PickerItem::LspServer { name, language, workspace_root, status, progress, .. }) =
-        state.picker.highlighted()
+    if let Some(PickerItem::LspServer {
+        name,
+        language,
+        workspace_root,
+        status,
+        progress,
+        ..
+    }) = state.picker.highlighted()
     {
         state.picker.lsp_detail = Some(crate::picker::LspServerDetail {
             name: name.clone(),
@@ -3988,9 +4072,13 @@ fn refresh_lsp_detail_from_items(state: &mut AppState) {
         return;
     };
     let fresh = state.picker.items.iter().find_map(|it| match it {
-        PickerItem::LspServer { language, workspace_root, status, progress, .. }
-            if *language == lang && *workspace_root == root =>
-        {
+        PickerItem::LspServer {
+            language,
+            workspace_root,
+            status,
+            progress,
+            ..
+        } if *language == lang && *workspace_root == root => {
             Some((status.clone(), progress.clone()))
         }
         _ => None,
@@ -4232,8 +4320,15 @@ async fn lsp_goto_definition(client: &mut Client, state: &mut AppState) -> Resul
     {
         Ok(r) => match r.location {
             Some(loc) => {
-                if let Err(e) =
-                    open_file_at_path(client, state, loc.path.clone(), false, Some(loc.position), Reveal::Minimal).await
+                if let Err(e) = open_file_at_path(
+                    client,
+                    state,
+                    loc.path.clone(),
+                    false,
+                    Some(loc.position),
+                    Reveal::Minimal,
+                )
+                .await
                 {
                     state.status =
                         StatusMessage::warning(format!("definition at {}: {e}", loc.path));
@@ -4255,29 +4350,29 @@ fn show_diagnostic(state: &mut AppState) {
     };
     let cursor = ed.cursor.position;
     let local = (cursor.line as i64) - (ed.window_first_logical_line as i64);
-    let diags: Vec<(DiagnosticSeverity, String)> = if local >= 0 && (local as usize) < ed.lines.len()
-    {
-        let line = &ed.lines[local as usize];
-        // A span covers the column when `start <= col < end`, widening a zero-width point
-        // (`start == end`, common for rust-analyzer "expected …" errors) to one cell so the cursor
-        // can still land "on" it. Matches the web client.
-        let under: Vec<(DiagnosticSeverity, String)> = line
-            .diagnostics
-            .iter()
-            .filter(|d| cursor.col >= d.start && cursor.col < d.end.max(d.start + 1))
-            .map(|d| (d.severity, d.message.clone()))
-            .collect();
-        if under.is_empty() {
-            line.diagnostics
+    let diags: Vec<(DiagnosticSeverity, String)> =
+        if local >= 0 && (local as usize) < ed.lines.len() {
+            let line = &ed.lines[local as usize];
+            // A span covers the column when `start <= col < end`, widening a zero-width point
+            // (`start == end`, common for rust-analyzer "expected …" errors) to one cell so the cursor
+            // can still land "on" it. Matches the web client.
+            let under: Vec<(DiagnosticSeverity, String)> = line
+                .diagnostics
                 .iter()
+                .filter(|d| cursor.col >= d.start && cursor.col < d.end.max(d.start + 1))
                 .map(|d| (d.severity, d.message.clone()))
-                .collect()
+                .collect();
+            if under.is_empty() {
+                line.diagnostics
+                    .iter()
+                    .map(|d| (d.severity, d.message.clone()))
+                    .collect()
+            } else {
+                under
+            }
         } else {
-            under
-        }
-    } else {
-        Vec::new()
-    };
+            Vec::new()
+        };
     if diags.is_empty() {
         state.status = StatusMessage::info("No diagnostics on this line");
         return;
@@ -4452,6 +4547,7 @@ async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
     // Restore cursor + selection.
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: state.ed_mut().buffer_id,
             position: snap.cursor.position,
             anchor: snap.cursor.anchor,
@@ -4487,6 +4583,7 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
             {
                 let new = client
                     .rpc::<CursorSet>(CursorSetParams {
+                        granularity: Granularity::Char,
                         buffer_id: state.ed_mut().buffer_id,
                         position: snap_cursor.position,
                         anchor: snap_cursor.anchor,
@@ -4547,6 +4644,7 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
             {
                 let new = client
                     .rpc::<CursorSet>(CursorSetParams {
+                        granularity: Granularity::Char,
                         buffer_id: state.ed_mut().buffer_id,
                         position: snap_cursor.position,
                         anchor: snap_cursor.anchor,
@@ -4920,6 +5018,7 @@ async fn clear_selection(client: &mut Client, state: &mut AppState) -> Result<()
     let pos = state.ed_mut().cursor.position;
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: state.ed_mut().buffer_id,
             position: pos,
             anchor: pos,
@@ -4949,6 +5048,7 @@ async fn enter_insert_at(
             let max = max_pos(pos, cursor.anchor);
             let _ = client
                 .rpc::<CursorSet>(CursorSetParams {
+                    granularity: Granularity::Char,
                     buffer_id,
                     position: max,
                     anchor: max,
@@ -4976,6 +5076,7 @@ async fn enter_insert_at(
             let start = LogicalPosition { line, col: 0 };
             let _ = client
                 .rpc::<CursorSet>(CursorSetParams {
+                    granularity: Granularity::Char,
                     buffer_id,
                     position: start,
                     anchor: start,
@@ -5002,6 +5103,7 @@ async fn enter_insert_at(
     };
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id,
             position: target,
             anchor: target,
@@ -5249,6 +5351,7 @@ async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()
     };
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: state.ed_mut().buffer_id,
             position: target,
             anchor: target,
@@ -5268,6 +5371,7 @@ async fn open_line_above(client: &mut Client, state: &mut AppState) -> Result<()
     let target = LogicalPosition { line, col: 0 };
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: state.ed_mut().buffer_id,
             position: target,
             anchor: target,
@@ -5364,6 +5468,7 @@ async fn paste_before(client: &mut Client, state: &mut AppState, count: u32) -> 
     let start = min_pos(state.ed_mut().cursor.position, state.ed_mut().cursor.anchor);
     let new = client
         .rpc::<CursorSet>(CursorSetParams {
+            granularity: Granularity::Char,
             buffer_id: state.ed_mut().buffer_id,
             position: start,
             anchor: start,
@@ -6147,7 +6252,10 @@ async fn handle_save_prompt_key(
         (KeyCode::Char(':'), m)
             if !m.contains(KeyModifiers::CONTROL)
                 && !m.contains(KeyModifiers::ALT)
-                && matches!(prompt.mode, crate::save_prompt::PromptMode::SelectingRoot(_)) =>
+                && matches!(
+                    prompt.mode,
+                    crate::save_prompt::PromptMode::SelectingRoot(_)
+                ) =>
         {
             if prompt.ghost_suffix(&project_paths).as_deref() == Some("") {
                 prompt.tab(&project_paths)
@@ -6503,9 +6611,7 @@ async fn apply_hunk(client: &mut Client, state: &mut AppState, action: HunkActio
         ApplyHunkStatus::DirtyBuffer => {
             StatusMessage::warning("unsaved changes — save first".to_string())
         }
-        ApplyHunkStatus::Unavailable => {
-            StatusMessage::info("not in a git repository".to_string())
-        }
+        ApplyHunkStatus::Unavailable => StatusMessage::info("not in a git repository".to_string()),
     };
     Ok(())
 }
@@ -6920,7 +7026,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-        pending_external_close: None,
+            pending_external_close: None,
         };
         assert_eq!(terminal_title(&state), "Aether");
     }
@@ -6947,7 +7053,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-        pending_external_close: None,
+            pending_external_close: None,
         };
         assert_eq!(terminal_title(&state), "[demo]");
         // Once a buffer exists, the title grows to include the file label.
@@ -6977,7 +7083,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-        pending_external_close: None,
+            pending_external_close: None,
         };
         // Clean buffer → no dot.
         assert_eq!(terminal_title(&state), "[demo] src/main.rs");
@@ -7015,6 +7121,9 @@ mod tests {
             scroll_col: 0,
             pending_scroll_lines: 0,
             drag_anchor: None,
+            drag_granularity: Granularity::Char,
+            last_click: None,
+            click_streak: 0,
             revision: 0,
             saved_revision: 0,
             externally_modified: false,

@@ -10,8 +10,7 @@
 use crate::workspace_index::CachedFile;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{
-    BufferDirtyState, PickerFilters, PickerItem, PickerKind, PickerSelectResult,
-    PickerUpdateParams,
+    BufferDirtyState, PickerFilters, PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams,
 };
 use aether_protocol::viewport::DiagnosticSeverity;
 use aether_protocol::{BufferId, LogicalPosition};
@@ -601,11 +600,7 @@ impl FilesFilter {
         }
     }
 
-    fn passes(
-        &self,
-        file: &CachedFile,
-        status: Option<aether_protocol::git::GitStatus>,
-    ) -> bool {
+    fn passes(&self, file: &CachedFile, status: Option<aether_protocol::git::GitStatus>) -> bool {
         if self.reject_all {
             return false;
         }
@@ -843,7 +838,10 @@ impl PickerState {
                 }
             }
         }
-        Some((offset + headers_at_or_before, self.ranked.len() as u32 + total_files))
+        Some((
+            offset + headers_at_or_before,
+            self.ranked.len() as u32 + total_files,
+        ))
     }
 }
 

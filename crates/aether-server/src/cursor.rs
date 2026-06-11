@@ -6,7 +6,7 @@
 
 use crate::state::Buffer;
 use crate::wrap::{self, RowInfo};
-use aether_protocol::cursor::{Direction, Motion, VerticalDirection, WordBoundary};
+use aether_protocol::cursor::{Direction, Granularity, Motion, VerticalDirection, WordBoundary};
 use aether_protocol::viewport::WrapMode;
 use aether_protocol::LogicalPosition;
 use unicode_width::UnicodeWidthChar;
@@ -877,4 +877,67 @@ fn word_backward_end(
         }
     }
     i
+}
+
+/// Inclusive (start, end) of the same-category char run containing `pos` — the "word" a
+/// double-click selects. Runs follow `WordBoundary::Word` categories (word chars / symbols /
+/// whitespace), except a newline never joins a run: clicking at end-of-line selects just the
+/// line-end position rather than a whitespace run spilling into the next line's indentation.
+pub fn word_run(buf: &Buffer, pos: LogicalPosition) -> (LogicalPosition, LogicalPosition) {
+    let rope = &buf.text;
+    let total = rope.len_chars();
+    let i = pos_to_char(buf, pos);
+    if i >= total {
+        let p = char_to_pos(buf, i);
+        return (p, p);
+    }
+    let c = rope.char(i);
+    if c == '\n' {
+        let p = char_to_pos(buf, i);
+        return (p, p);
+    }
+    let cat = char_cat(c, WordBoundary::Word);
+    let joins = |c: char| c != '\n' && char_cat(c, WordBoundary::Word) == cat;
+    let mut start = i;
+    while start > 0 && joins(rope.char(start - 1)) {
+        start -= 1;
+    }
+    let mut end = i;
+    while end + 1 < total && joins(rope.char(end + 1)) {
+        end += 1;
+    }
+    (char_to_pos(buf, start), char_to_pos(buf, end))
+}
+
+/// Expand a `(position, anchor)` pair outward to `granularity` boundaries, preserving which end
+/// the cursor occupies. `Word` snaps each endpoint to its containing char run (see [`word_run`]);
+/// `Line` produces the whole-line normal form (`col 0` … `line_end`) over the spanned lines. For
+/// a point selection the result is forward-oriented. Inputs must already be clamped.
+pub fn snap_selection(
+    buf: &Buffer,
+    position: LogicalPosition,
+    anchor: LogicalPosition,
+    granularity: Granularity,
+) -> (LogicalPosition, LogicalPosition) {
+    let backward = (position.line, position.col) < (anchor.line, anchor.col);
+    let (lo, hi) = ordered(position, anchor);
+    let (lo, hi) = match granularity {
+        Granularity::Char => (lo, hi),
+        Granularity::Word => (word_run(buf, lo).0, word_run(buf, hi).1),
+        Granularity::Line => (
+            LogicalPosition {
+                line: lo.line,
+                col: 0,
+            },
+            LogicalPosition {
+                line: hi.line,
+                col: line_byte_len_excl_newline(buf, hi.line),
+            },
+        ),
+    };
+    if backward {
+        (lo, hi)
+    } else {
+        (hi, lo)
+    }
 }
