@@ -105,6 +105,7 @@ pub struct BufferSaveParams {
     /// - `EXTERNALLY_MODIFIED`: the buffer's own file changed on disk since it was last loaded
     ///   or saved.
     /// - `EXTERNALLY_DELETED`: the buffer's own file was removed on disk.
+    ///
     /// In each case, the client uses a two-step "ask, then confirm" handshake: attempt with
     /// `false`, present the appropriate prompt for the specific error code, retry with `true`.
     #[serde(default)]

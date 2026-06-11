@@ -852,8 +852,10 @@ async fn open_buffer_and_subscribe(
         project_paths,
         root_labels,
         open,
-        WrapMode::Soft,
-        false, // bootstrap: inline diff starts off
+        ViewSettings {
+            wrap: WrapMode::Soft,
+            diff_view: false,
+        },
     )
     .await
 }
@@ -877,10 +879,20 @@ fn seed_buffer_status_maps(
     }
 }
 
+/// The per-editor view toggles that stay sticky across buffer switches: the wrap mode and the
+/// inline-diff view. Bootstrap passes the defaults; runtime switches carry the prior editor's
+/// values so the user's toggles survive the switch.
+#[derive(Clone, Copy)]
+struct ViewSettings {
+    wrap: WrapMode,
+    diff_view: bool,
+}
+
 /// Subscribe a fresh viewport for `open.buffer_id` and build the `EditorState` describing it.
 /// Shared by bootstrap and by `subscribe_to_buffer`; pure construction with no side effects
-/// on the broader `AppState`. The caller picks `wrap` (bootstrap defaults to Soft; runtime
-/// buffer switches inherit the prior editor's setting so the user's wrap toggle is sticky).
+/// on the broader `AppState`. The caller picks `view` (bootstrap defaults to Soft wrap with the
+/// diff view off; runtime buffer switches inherit the prior editor's settings so the user's
+/// toggles are sticky).
 async fn build_editor_state_from_open(
     client: &mut Client,
     viewport_cols: u32,
@@ -888,8 +900,7 @@ async fn build_editor_state_from_open(
     project_paths: &[String],
     root_labels: &[String],
     open: BufferOpenResult,
-    wrap: WrapMode,
-    diff_view: bool,
+    view: ViewSettings,
 ) -> Result<(EditorState, BufferStatusSnapshot)> {
     // Initial scroll: prefer a restored value (a buffer we'd seen before), otherwise centre
     // the viewport on the cursor. For a default cursor at (0,0) that's still line 0; for a
@@ -910,7 +921,7 @@ async fn build_editor_state_from_open(
             rows: viewport_rows,
             overscan_rows: viewport_rows,
             scroll: initial_scroll,
-            wrap,
+            wrap: view.wrap,
             continuation_marker_width: ui::CONTINUATION_MARKER_WIDTH,
             tab_width: ui::TAB_WIDTH,
         })
@@ -920,7 +931,7 @@ async fn build_editor_state_from_open(
     // window. Mirrors how `wrap` is carried across switches.
     let viewport_id = sub.viewport_id;
     let mut window = sub.window;
-    if diff_view {
+    if view.diff_view {
         let r = client
             .rpc::<GitSetDiffView>(GitSetDiffViewParams {
                 viewport_id,
@@ -948,8 +959,8 @@ async fn build_editor_state_from_open(
         line_count: window.line_count,
         git_status: window.git_status,
         max_scroll_logical_line: window.max_scroll_logical_line,
-        wrap,
-        diff_view,
+        wrap: view.wrap,
+        diff_view: view.diff_view,
         scroll_col: 0,
         pending_scroll_lines: 0,
         drag_anchor: None,
@@ -1298,16 +1309,7 @@ fn apply_notification(state: &mut AppState, n: aether_protocol::envelope::Notifi
     } else if n.method == PickerUpdate::NAME {
         match serde_json::from_value::<PickerUpdateParams>(n.params) {
             Ok(p) => {
-                let applied = state.picker.apply_update(
-                    p.kind,
-                    p.generation,
-                    p.offset,
-                    p.items,
-                    p.total_matches,
-                    p.total_candidates,
-                    p.ticking,
-                    p.grep_total_display_rows,
-                );
+                let applied = state.picker.apply_update(p);
                 // `apply_update` may snap `selected` (resume re-anchor, or `pending_offset`
                 // reconciliation) without touching `visible_start`. Slide the window now so the
                 // highlight is on-screen on first draw, not only after the user presses arrow keys.
@@ -3961,8 +3963,10 @@ async fn subscribe_to_buffer(
 ) -> Result<()> {
     // Inherit wrap and the inline-diff toggle from the current editor so switching buffers keeps
     // both of the user's view settings sticky for the session.
-    let wrap = state.ed_mut().wrap;
-    let diff_view = state.ed_mut().diff_view;
+    let view = ViewSettings {
+        wrap: state.ed_mut().wrap,
+        diff_view: state.ed_mut().diff_view,
+    };
     // Snapshot labels before passing into the builder so we can hand the builder pure slices —
     // it doesn't need (and shouldn't borrow) the full AppState.
     let project_paths = state.project_paths.clone();
@@ -3974,8 +3978,7 @@ async fn subscribe_to_buffer(
         &project_paths,
         &root_labels,
         open,
-        wrap,
-        diff_view,
+        view,
     )
     .await?;
     let buffer_id = editor.buffer_id;

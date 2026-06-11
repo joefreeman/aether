@@ -243,9 +243,8 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
                 }
             } else if cursor_byte == open {
                 close
-            } else if cursor_byte == close {
-                open
             } else {
+                // On the closer *or* between the pair — both land on the opener.
                 open
             };
             char_to_pos(buf, buf.text.byte_to_char(target_byte))
@@ -327,17 +326,6 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
     }
 }
 
-/// Walk up the tree from the cursor looking for the closest navigation-kind node past (or
-/// before) `cursor_byte`, at the cursor's *own* depth — the motion never crosses scope
-/// boundaries. The walk-up has two steps:
-///
-/// 1. **Skip nav-kind ancestors anchored at the cursor** — i.e. if the cursor sits at the
-///    exact start of a nav-kind, that nav-kind is the cursor's *self*, not its container; we
-///    keep walking so navigation happens among its siblings.
-/// 2. **Stop at the first ancestor with any nav-kind children.** That ancestor *is* the
-///    cursor's level; pick the next/prev qualifying child or no-op. We never walk past this
-///    level even when there's no hit, so a cursor on the last method of a class can't fall
-///    out of the class into top-level items.
 /// Smallest navigation-kind ancestor of the cursor — the unit the cursor is "inside" or "on".
 /// Walks up from the cursor's deepest descendant, returning the first ancestor whose kind is
 /// in `nav_kinds`. `None` when the cursor isn't inside any navigation unit (e.g. on a blank
@@ -360,6 +348,17 @@ fn enclosing_navigation_unit<'tree>(
     }
 }
 
+/// Walk up the tree from the cursor looking for the closest navigation-kind node past (or
+/// before) `cursor_byte`, at the cursor's *own* depth — the motion never crosses scope
+/// boundaries. The walk-up has two steps:
+///
+/// 1. **Skip nav-kind ancestors anchored at the cursor** — i.e. if the cursor sits at the
+///    exact start of a nav-kind, that nav-kind is the cursor's *self*, not its container; we
+///    keep walking so navigation happens among its siblings.
+/// 2. **Stop at the first ancestor with any nav-kind children.** That ancestor *is* the
+///    cursor's level; pick the next/prev qualifying child or no-op. We never walk past this
+///    level even when there's no hit, so a cursor on the last method of a class can't fall
+///    out of the class into top-level items.
 fn find_navigation_target<'tree>(
     tree: &'tree tree_sitter::Tree,
     cursor_byte: usize,
@@ -417,10 +416,10 @@ fn find_char(
         Direction::Forward => {
             // Start one char past the cursor so `f x` from an existing 'x' lands on the *next*.
             let start = (cur_idx + 1).min(total);
-            let mut iter = text.chars_at(start);
+            let iter = text.chars_at(start);
             let mut at = start;
             let mut found = 0usize;
-            while let Some(c) = iter.next() {
+            for c in iter {
                 if c == ch {
                     found += 1;
                     if found == count {
@@ -459,15 +458,18 @@ fn find_char(
 /// don't drift across rows with different prefix widths (continuation marker + indent).
 pub fn resolve_visual_line(
     buf: &Buffer,
-    wrap: WrapMode,
-    cols: u32,
-    marker_width: u32,
-    tab_width: u32,
+    geom: wrap::WrapGeometry,
     current: LogicalPosition,
     virtual_col_in: Option<u32>,
     direction: VerticalDirection,
     count: u32,
 ) -> (LogicalPosition, u32) {
+    let wrap::WrapGeometry {
+        wrap,
+        cols,
+        marker_width,
+        tab_width,
+    } = geom;
     if matches!(wrap, WrapMode::None) || cols == 0 {
         // No-wrap fast path: treat the entire logical line as one row. The virtual column is in
         // display cells (same currency as the wrap path), so multi-byte chars like `—` round-
@@ -573,13 +575,10 @@ pub fn resolve_visual_line(
 /// Resolve VisualLineStart: cursor to the first byte of its current visual row.
 pub fn resolve_visual_line_start(
     buf: &Buffer,
-    wrap: WrapMode,
-    cols: u32,
-    marker_width: u32,
-    tab_width: u32,
+    geom: wrap::WrapGeometry,
     current: LogicalPosition,
 ) -> LogicalPosition {
-    let rows = wrap_rows_for_cursor(buf, wrap, cols, marker_width, tab_width, current);
+    let rows = wrap_rows_for_cursor(buf, geom, current);
     let row_idx = find_row_for_col(&rows, current.col as usize);
     LogicalPosition {
         line: current.line,
@@ -590,13 +589,10 @@ pub fn resolve_visual_line_start(
 /// Resolve VisualLineEnd: cursor to the last byte of its current visual row.
 pub fn resolve_visual_line_end(
     buf: &Buffer,
-    wrap: WrapMode,
-    cols: u32,
-    marker_width: u32,
-    tab_width: u32,
+    geom: wrap::WrapGeometry,
     current: LogicalPosition,
 ) -> LogicalPosition {
-    let rows = wrap_rows_for_cursor(buf, wrap, cols, marker_width, tab_width, current);
+    let rows = wrap_rows_for_cursor(buf, geom, current);
     let row_idx = find_row_for_col(&rows, current.col as usize);
     let row = &rows[row_idx];
     let end_byte = row.byte_offset + row.text.len();
@@ -608,12 +604,15 @@ pub fn resolve_visual_line_end(
 
 fn wrap_rows_for_cursor(
     buf: &Buffer,
-    wrap: WrapMode,
-    cols: u32,
-    marker_width: u32,
-    tab_width: u32,
+    geom: wrap::WrapGeometry,
     current: LogicalPosition,
 ) -> Vec<RowInfo> {
+    let wrap::WrapGeometry {
+        wrap,
+        cols,
+        marker_width,
+        tab_width,
+    } = geom;
     let line_count = buf.text.len_lines() as u32;
     let line_idx = current.line.min(line_count.saturating_sub(1));
     if matches!(wrap, WrapMode::None) || cols == 0 {

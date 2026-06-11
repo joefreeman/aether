@@ -73,6 +73,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Notifications collected while holding the state lock, paired with their target senders —
+/// emitted by the caller after the lock drops so a slow client can't stall the lock.
+pub(crate) type PendingPushes = Vec<(mpsc::Sender<Notification>, Notification)>;
+
 /// Per-connection context handed to handlers. Mutable bits live here; the durable state is in
 /// [`SharedState`].
 pub struct ConnectionCtx {
@@ -1024,7 +1028,7 @@ pub async fn git_blame_line(
     let stale = s
         .git_blame
         .get(&params.buffer_id)
-        .map_or(true, |c| c.revision != revision);
+        .is_none_or(|c| c.revision != revision);
     if stale {
         // Blame via the cached repo (no rediscovery). `None` repo (untracked / no repo) → empty.
         // The `buf`/`git_baseline` borrows end at the `compute_blame` call; `lines` is owned, so
@@ -1111,16 +1115,20 @@ pub async fn git_set_diff_view(
         buf,
         first,
         last_excl,
-        cols,
-        wrap,
-        marker_width,
-        tab_width,
+        wrap::WrapGeometry {
+            wrap,
+            cols,
+            marker_width,
+            tab_width,
+        },
         rows,
-        search,
-        params.enabled,
-        hunks,
-        diagnostics,
-        buffer_git_status(&s, buffer_id),
+        WindowDecorations {
+            search,
+            diff_view: params.enabled,
+            hunks,
+            diagnostics,
+            git_status: buffer_git_status(&s, buffer_id),
+        },
     );
 
     let vp = s
@@ -1407,7 +1415,7 @@ pub async fn git_apply_hunk(
             notify_lsp_change(&mut s, buffer_id);
 
             let buf_ref = &s.buffers[&buffer_id];
-            let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+            let mut pushes: PendingPushes = Vec::new();
             for vp in s.viewports.values() {
                 if vp.buffer_id != buffer_id {
                     continue;
@@ -1853,7 +1861,7 @@ pub async fn lsp_format(
     notify_lsp_change(&mut s, buffer_id);
 
     let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
         if vp.buffer_id != buffer_id {
             continue;
@@ -2059,10 +2067,7 @@ fn target_byte_col(
 /// pushes for every viewport on the buffer so the gutter / inline diff refresh live. Called by
 /// the file watcher when something under the repo's `.git` changes. Returns the pushes to send
 /// after the state lock is released. No-op (empty) for a scratch buffer or a missing buffer.
-pub(crate) fn refresh_git_for_buffer(
-    s: &mut ServerState,
-    buffer_id: BufferId,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -> PendingPushes {
     let Some(buf) = s.buffers.get(&buffer_id) else {
         return Vec::new();
     };
@@ -2533,7 +2538,7 @@ fn collect_viewport_refresh(
     s: &ServerState,
     client_id: ClientId,
     buffer_id: BufferId,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+) -> PendingPushes {
     let mut pushes = Vec::new();
     let buf = match s.buffers.get(&buffer_id) {
         Some(b) => b,
@@ -2559,16 +2564,15 @@ fn collect_viewport_refresh(
             buf,
             new_first,
             new_last_excl,
-            vp.cols,
-            vp.wrap,
-            vp.continuation_marker_width,
-            vp.tab_width,
+            vp.wrap_geometry(),
             vp.rows,
-            search_entry,
-            vp.diff_view,
-            buffer_both_hunks(s, buffer_id),
-            diagnostics,
-            buffer_git_status(s, buffer_id),
+            WindowDecorations {
+                search: search_entry,
+                diff_view: vp.diff_view,
+                hunks: buffer_both_hunks(s, buffer_id),
+                diagnostics,
+                git_status: buffer_git_status(s, buffer_id),
+            },
         );
         let params = ViewportLinesChangedParams {
             viewport_id: vp.id,
@@ -2644,10 +2648,7 @@ fn collect_cursor_search_update(
 /// (which clients already learn from `viewport/lines_changed`) and the client derives `dirty`
 /// as `revision != saved_revision`, so this notification is only needed when `saved_revision`
 /// changes or when the external-change flags flip.
-pub(crate) fn collect_buffer_state_pushes(
-    s: &ServerState,
-    buffer_id: BufferId,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) -> PendingPushes {
     let Some(buf) = s.buffers.get(&buffer_id) else {
         return Vec::new();
     };
@@ -2686,10 +2687,7 @@ pub(crate) fn collect_buffer_state_pushes(
 /// first edit is what makes a previewed buffer worth keeping) and from `buffer/save`. Returns
 /// the `buffer/state` pushes telling viewers the flag flipped; empty when the buffer wasn't
 /// transient (the common case) or doesn't exist.
-fn promote_transient(
-    s: &mut ServerState,
-    buffer_id: BufferId,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+fn promote_transient(s: &mut ServerState, buffer_id: BufferId) -> PendingPushes {
     match s.buffers.get_mut(&buffer_id) {
         Some(buf) if buf.transient => {
             buf.transient = false;
@@ -2706,7 +2704,7 @@ fn pin_buffer_if_requested(
     s: &mut ServerState,
     buffer_id: BufferId,
     transient: Option<bool>,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+) -> PendingPushes {
     if transient == Some(false) {
         promote_transient(s, buffer_id)
     } else {
@@ -2718,10 +2716,7 @@ fn pin_buffer_if_requested(
 /// summary notifications) to be sent after dropping the lock. The line-level highlight refresh
 /// happens via the existing `viewport/lines_changed` flow (since `render_window` reads the
 /// freshly-recomputed entries).
-fn refresh_searches_for_buffer(
-    s: &mut ServerState,
-    buffer_id: BufferId,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+fn refresh_searches_for_buffer(s: &mut ServerState, buffer_id: BufferId) -> PendingPushes {
     let mut pushes = Vec::new();
     if !s.buffers.contains_key(&buffer_id) {
         return pushes;
@@ -2811,10 +2806,7 @@ fn clients_viewing_buffers(
 /// Build the `buffer/closed` pushes for the clients captured by [`clients_viewing_buffers`],
 /// telling each which buffer to switch to. Call AFTER teardown so each next-buffer reflects the
 /// settled MRU. Clients that have since disconnected are skipped.
-fn buffer_closed_pushes(
-    s: &ServerState,
-    affected: &[(ClientId, BufferId)],
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+fn buffer_closed_pushes(s: &ServerState, affected: &[(ClientId, BufferId)]) -> PendingPushes {
     affected
         .iter()
         .filter_map(|&(client_id, buffer_id)| {
@@ -3168,7 +3160,7 @@ pub async fn buffer_cut(
     refresh_viewport_ranges_for_buffer(&mut s, params.buffer_id, new_line_count);
     let buf_ref = &s.buffers[&params.buffer_id];
 
-    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
         if vp.buffer_id != params.buffer_id {
             continue;
@@ -3493,13 +3485,7 @@ pub async fn buffer_reload(
 pub(crate) fn reload_buffer_locked(
     s: &mut ServerState,
     buffer_id: BufferId,
-) -> Result<
-    (
-        BufferReloadResult,
-        Vec<(mpsc::Sender<Notification>, Notification)>,
-    ),
-    RpcError,
-> {
+) -> Result<(BufferReloadResult, PendingPushes), RpcError> {
     let was_dirty = s.buffers.get(&buffer_id).map(|b| b.dirty).unwrap_or(false);
 
     let saved_at_unix_ms = {
@@ -3544,7 +3530,7 @@ pub(crate) fn reload_buffer_locked(
 
     let revision = s.buffers[&buffer_id].revision;
     let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
         if vp.buffer_id != buffer_id {
             continue;
@@ -3560,9 +3546,9 @@ pub(crate) fn reload_buffer_locked(
                 vp,
                 revision,
                 search,
-                buffer_both_hunks(&s, buffer_id),
-                buffer_diagnostics(&s, buffer_id),
-                buffer_git_status(&s, buffer_id),
+                buffer_both_hunks(s, buffer_id),
+                buffer_diagnostics(s, buffer_id),
+                buffer_git_status(s, buffer_id),
             ),
         ));
     }
@@ -3616,16 +3602,20 @@ pub async fn viewport_subscribe(
         buf,
         first,
         last_excl,
-        params.cols,
-        params.wrap,
-        params.continuation_marker_width,
-        params.tab_width,
+        wrap::WrapGeometry {
+            wrap: params.wrap,
+            cols: params.cols,
+            marker_width: params.continuation_marker_width,
+            tab_width: params.tab_width,
+        },
         params.rows,
-        search,
-        false,
-        hunks,
-        diagnostics,
-        buffer_git_status(&s, buffer_id),
+        WindowDecorations {
+            search,
+            diff_view: false,
+            hunks,
+            diagnostics,
+            git_status: buffer_git_status(&s, buffer_id),
+        },
     );
 
     let viewport_id = s.allocate_viewport_id();
@@ -3743,16 +3733,20 @@ pub async fn viewport_resize(
         buf,
         first,
         last_excl,
-        cols,
-        wrap,
-        marker_width,
-        tab_width,
+        wrap::WrapGeometry {
+            wrap,
+            cols,
+            marker_width,
+            tab_width,
+        },
         rows,
-        search,
-        diff_view,
-        hunks,
-        diagnostics,
-        buffer_git_status(&s, buffer_id),
+        WindowDecorations {
+            search,
+            diff_view,
+            hunks,
+            diagnostics,
+            git_status: buffer_git_status(&s, buffer_id),
+        },
     );
 
     let vp = s
@@ -3811,16 +3805,20 @@ pub async fn viewport_scroll_to_row(
         buf,
         first,
         last_excl,
-        cols,
-        wrap,
-        marker_width,
-        tab_width,
+        wrap::WrapGeometry {
+            wrap,
+            cols,
+            marker_width,
+            tab_width,
+        },
         rows,
-        search,
-        diff_view,
-        hunks,
-        diagnostics,
-        buffer_git_status(&s, buffer_id),
+        WindowDecorations {
+            search,
+            diff_view,
+            hunks,
+            diagnostics,
+            git_status: buffer_git_status(&s, buffer_id),
+        },
     );
     let vp = s
         .viewports
@@ -3868,16 +3866,20 @@ pub async fn viewport_set_wrap(
         buf,
         first,
         last_excl,
-        cols,
-        wrap,
-        marker_width,
-        tab_width,
+        wrap::WrapGeometry {
+            wrap,
+            cols,
+            marker_width,
+            tab_width,
+        },
         rows,
-        search,
-        diff_view,
-        hunks,
-        diagnostics,
-        buffer_git_status(&s, buffer_id),
+        WindowDecorations {
+            search,
+            diff_view,
+            hunks,
+            diagnostics,
+            git_status: buffer_git_status(&s, buffer_id),
+        },
     );
 
     let vp = s
@@ -3925,16 +3927,20 @@ pub async fn viewport_scroll(
         buf,
         first,
         last_excl,
-        cols,
-        wrap,
-        marker_width,
-        tab_width,
+        wrap::WrapGeometry {
+            wrap,
+            cols,
+            marker_width,
+            tab_width,
+        },
         rows,
-        search,
-        diff_view,
-        hunks,
-        diagnostics,
-        buffer_git_status(&s, buffer_id),
+        WindowDecorations {
+            search,
+            diff_view,
+            hunks,
+            diagnostics,
+            git_status: buffer_git_status(&s, buffer_id),
+        },
     );
 
     let vp = s
@@ -3987,11 +3993,11 @@ pub async fn viewport_unsubscribe(
 
 // ---- helpers -----------------------------------------------------------------------------------
 
-fn require_viewport_mut<'a>(
-    state: &'a mut ServerState,
+fn require_viewport_mut(
+    state: &mut ServerState,
     viewport_id: aether_protocol::ViewportId,
     client_id: ClientId,
-) -> Result<&'a mut Viewport, RpcError> {
+) -> Result<&mut Viewport, RpcError> {
     let vp = state.viewports.get_mut(&viewport_id).ok_or_else(|| {
         RpcError::new(
             ErrorCode::VIEWPORT_NOT_FOUND,
@@ -4459,7 +4465,7 @@ pub fn set_diagnostics_and_refresh(
     s: &mut ServerState,
     buffer_id: BufferId,
     diagnostics: Vec<crate::lsp::diagnostics::BufferDiagnostic>,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+) -> PendingPushes {
     s.diagnostics.insert(buffer_id, diagnostics);
     if !s.buffers.contains_key(&buffer_id) {
         return Vec::new();
@@ -4704,22 +4710,38 @@ fn logical_line_at_visual_row(
     line_count - 1
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Everything that decorates a rendered window beyond the text itself: search highlights, the
+/// inline-diff state, diagnostics squiggles, and the buffer's git status. Bundled because every
+/// `render_window` caller assembles the same set from `ServerState`.
+struct WindowDecorations<'a> {
+    search: Option<&'a SearchEntry>,
+    diff_view: bool,
+    hunks: &'a [crate::git::DiffHunk],
+    diagnostics: &'a [crate::lsp::diagnostics::BufferDiagnostic],
+    git_status: Option<GitBufferStatus>,
+}
+
 fn render_window(
     buf: &Buffer,
     first: u32,
     last_excl: u32,
-    cols: u32,
-    wrap: aether_protocol::viewport::WrapMode,
-    marker_width: u32,
-    tab_width: u32,
+    geom: wrap::WrapGeometry,
     viewport_rows: u32,
-    search: Option<&SearchEntry>,
-    diff_view: bool,
-    hunks: &[crate::git::DiffHunk],
-    diagnostics: &[crate::lsp::diagnostics::BufferDiagnostic],
-    git_status: Option<GitBufferStatus>,
+    deco: WindowDecorations<'_>,
 ) -> Window {
+    let WindowDecorations {
+        search,
+        diff_view,
+        hunks,
+        diagnostics,
+        git_status,
+    } = deco;
+    let wrap::WrapGeometry {
+        wrap,
+        cols,
+        marker_width,
+        tab_width,
+    } = geom;
     let mut lines: Vec<LogicalLineRender> = Vec::with_capacity((last_excl - first) as usize);
 
     // Per-line change markers drive the always-on gutter, so they're computed whenever hunks are
@@ -4872,10 +4894,7 @@ pub async fn cursor_move(
             })?;
             let (pos, target_vcol) = motion::resolve_visual_line(
                 buf,
-                vp.wrap,
-                vp.cols,
-                vp.continuation_marker_width,
-                vp.tab_width,
+                vp.wrap_geometry(),
                 current.position,
                 virtual_col_in,
                 *direction,
@@ -4891,14 +4910,7 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_start(
-                buf,
-                vp.wrap,
-                vp.cols,
-                vp.continuation_marker_width,
-                vp.tab_width,
-                current.position,
-            )
+            motion::resolve_visual_line_start(buf, vp.wrap_geometry(), current.position)
         }
         Motion::VisualLineEnd { viewport_id } => {
             let vp = s.viewports.get(viewport_id).ok_or_else(|| {
@@ -4907,14 +4919,7 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_end(
-                buf,
-                vp.wrap,
-                vp.cols,
-                vp.continuation_marker_width,
-                vp.tab_width,
-                current.position,
-            )
+            motion::resolve_visual_line_end(buf, vp.wrap_geometry(), current.position)
         }
         Motion::LogicalLine {
             direction,
@@ -5673,7 +5678,7 @@ fn compute_smart_indent(buf: &Buffer, cursor_pos: LogicalPosition) -> String {
     let line_text: String = line_slice.chunks().collect();
     let line_content = line_text.strip_suffix('\n').unwrap_or(&line_text);
     let prefix = &line_content[..col];
-    let trimmed = prefix.trim_end_matches(|c: char| c == ' ' || c == '\t');
+    let trimmed = prefix.trim_end_matches([' ', '\t']);
     let mut opener_bonus = match trimmed.as_bytes().last() {
         Some(b'{') | Some(b'(') | Some(b'[') => 1,
         _ => 0,
@@ -5846,13 +5851,12 @@ async fn apply_toggle_comment(
                 open,
                 close,
             }
-        } else if is_partial && block_tok.is_some() {
+        } else if let (true, Some((open, close))) = (is_partial, block_tok) {
             let (start_pos, end_pos) = ordered_selection_or_cursor_line(&cursor);
             let sc = motion::pos_to_char(buf, start_pos);
             let ec = motion::pos_to_char(buf, end_pos)
                 .saturating_add(1)
                 .min(buf.text.len_chars());
-            let (open, close) = block_tok.unwrap();
             Plan::BlockWrap {
                 start_char: sc,
                 end_char_excl: ec,
@@ -6104,7 +6108,7 @@ async fn apply_toggle_comment(
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
         if vp.buffer_id != buffer_id {
             continue;
@@ -6570,7 +6574,7 @@ async fn apply_indent_or_dedent(
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
         if vp.buffer_id != buffer_id {
             continue;
@@ -6759,7 +6763,7 @@ pub async fn input_move_lines(
     let new_line_count = s.buffers[&buffer_id].line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
         if vp.buffer_id != buffer_id {
             continue;
@@ -7084,9 +7088,9 @@ async fn apply_undo_or_redo(
         .filter_map(|(c, b)| if *b == buffer_id { Some(*c) } else { None })
         .collect();
     for cid in existing_cursor_ids {
-        if !new_cursors.contains_key(&cid) {
+        if let std::collections::hash_map::Entry::Vacant(e) = new_cursors.entry(cid) {
             if let Some(cursor) = s.cursors.get(&(cid, buffer_id)).copied() {
-                new_cursors.insert(cid, clamp_cursor(buf, cursor));
+                e.insert(clamp_cursor(buf, cursor));
             }
         }
     }
@@ -7110,7 +7114,7 @@ async fn apply_undo_or_redo(
     // LSP: the rope was swapped wholesale — tell the server so its diagnostics aren't stale.
     notify_lsp_change(&mut s, buffer_id);
     let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
         if vp.buffer_id != buffer_id {
             continue;
@@ -7631,7 +7635,7 @@ async fn apply_edit(
     let edit_first = old_first_line;
     let edit_last_excl = old_last_line.saturating_add(1);
     let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
         if vp.buffer_id != buffer_id {
             continue;
@@ -7713,16 +7717,15 @@ fn build_lines_changed_notif(
         buffer,
         new_first,
         new_last_excl,
-        vp.cols,
-        vp.wrap,
-        vp.continuation_marker_width,
-        vp.tab_width,
+        vp.wrap_geometry(),
         vp.rows,
-        search,
-        vp.diff_view,
-        hunks,
-        diagnostics,
-        git_status,
+        WindowDecorations {
+            search,
+            diff_view: vp.diff_view,
+            hunks,
+            diagnostics,
+            git_status,
+        },
     );
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
@@ -7835,9 +7838,7 @@ fn buffer_dirty_state(buf: &Buffer) -> BufferDirtyState {
 /// Rebuild candidates for every subscribed `Buffers` picker, re-rank under the existing query,
 /// and collect the resulting `picker/update` pushes. Caller sends them after dropping the lock.
 /// Cheap when no picker is open: a HashMap scan over `pickers` and an early return.
-pub(crate) fn refresh_buffer_pickers(
-    s: &mut ServerState,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+pub(crate) fn refresh_buffer_pickers(s: &mut ServerState) -> PendingPushes {
     // Collect client_ids with a *subscribed* Buffers picker. Skip the rest — they may still
     // have persisted state from a prior session, but they're not waiting for pushes.
     let client_ids: Vec<ClientId> = s
@@ -7881,9 +7882,7 @@ pub(crate) fn refresh_buffer_pickers(
 /// Rebuild and re-push every subscribed `LspServers` picker. Called whenever a server's status
 /// changes (from `crate::lsp::manager`) so the open dialog's health glyphs update live — e.g.
 /// `◐ → ●` as a restart completes. Mirrors [`refresh_buffer_pickers`].
-pub fn refresh_lsp_server_pickers(
-    s: &mut ServerState,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+pub fn refresh_lsp_server_pickers(s: &mut ServerState) -> PendingPushes {
     let client_ids: Vec<ClientId> = s
         .pickers
         .iter()
@@ -7937,11 +7936,7 @@ pub(crate) fn picker_update_notif(params: PickerUpdateParams) -> Notification {
 /// refresh pushes. Caller captures `was_dirty` before the mutation; this reads the post-
 /// mutation value and decides. No-op (no allocation, no rerank) when dirty didn't change —
 /// the typical hot path during a typing burst.
-fn maybe_refresh_dirty(
-    s: &mut ServerState,
-    buffer_id: BufferId,
-    was_dirty: bool,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+fn maybe_refresh_dirty(s: &mut ServerState, buffer_id: BufferId, was_dirty: bool) -> PendingPushes {
     let now_dirty = s.buffers.get(&buffer_id).map(|b| b.dirty).unwrap_or(false);
     if now_dirty == was_dirty {
         Vec::new()
@@ -8169,7 +8164,7 @@ pub async fn directory_create(
 pub(crate) fn refresh_explorers_for_dirs(
     s: &mut ServerState,
     affected_dirs: &std::collections::HashSet<std::path::PathBuf>,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+) -> PendingPushes {
     if affected_dirs.is_empty() {
         return Vec::new();
     }
@@ -8440,41 +8435,45 @@ pub async fn picker_view(
     if params.reset {
         pickers.remove(&key);
     }
-    if !pickers.contains_key(&key) {
-        pickers.insert(key, picker_state::PickerState::new(candidates));
-    } else {
-        let p = pickers.get_mut(&key).expect("just checked");
-        // Files: the workspace index returns the same `Arc` until a refresh — skip the
-        // rerank in that case. Buffers: the candidate set is fresh each call, always re-bind.
-        // Grep: the persisted candidates *are* the prior search results — keep them on resume
-        // (the caller passed an empty placeholder). Discard them only on `reset`, which was
-        // handled by the `pickers.remove(&key)` call above. Explorer: fresh listing every call
-        // (directory contents may have changed), so always re-bind and rerank.
-        let preserve_existing = match (&p.candidates, &candidates) {
-            (
-                picker_state::PickerCandidates::Files { files: a, .. },
-                picker_state::PickerCandidates::Files { files: b, .. },
-            ) => Arc::ptr_eq(a, b),
-            (picker_state::PickerCandidates::Grep(_), picker_state::PickerCandidates::Grep(_)) => {
-                true
+    match pickers.entry(key) {
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(picker_state::PickerState::new(candidates));
+        }
+        std::collections::hash_map::Entry::Occupied(mut o) => {
+            let p = o.get_mut();
+            // Files: the workspace index returns the same `Arc` until a refresh — skip the
+            // rerank in that case. Buffers: the candidate set is fresh each call, always re-bind.
+            // Grep: the persisted candidates *are* the prior search results — keep them on resume
+            // (the caller passed an empty placeholder). Discard them only on `reset`, which was
+            // handled by the `pickers.remove(&key)` call above. Explorer: fresh listing every call
+            // (directory contents may have changed), so always re-bind and rerank.
+            let preserve_existing = match (&p.candidates, &candidates) {
+                (
+                    picker_state::PickerCandidates::Files { files: a, .. },
+                    picker_state::PickerCandidates::Files { files: b, .. },
+                ) => Arc::ptr_eq(a, b),
+                (
+                    picker_state::PickerCandidates::Grep(_),
+                    picker_state::PickerCandidates::Grep(_),
+                ) => true,
+                // Diagnostics: keep the snapshot taken on open across scroll/resume re-views (the
+                // re-view sends an empty placeholder), like Grep.
+                (
+                    picker_state::PickerCandidates::Diagnostics(_),
+                    picker_state::PickerCandidates::Diagnostics(_),
+                ) => true,
+                // References: keep the one-shot LSP snapshot across scroll/resume re-views (the
+                // re-view sends an empty placeholder), like Diagnostics and Grep.
+                (
+                    picker_state::PickerCandidates::References(_),
+                    picker_state::PickerCandidates::References(_),
+                ) => true,
+                _ => false,
+            };
+            if !preserve_existing {
+                p.candidates = candidates;
+                p.rerank(matcher);
             }
-            // Diagnostics: keep the snapshot taken on open across scroll/resume re-views (the
-            // re-view sends an empty placeholder), like Grep.
-            (
-                picker_state::PickerCandidates::Diagnostics(_),
-                picker_state::PickerCandidates::Diagnostics(_),
-            ) => true,
-            // References: keep the one-shot LSP snapshot across scroll/resume re-views (the
-            // re-view sends an empty placeholder), like Diagnostics and Grep.
-            (
-                picker_state::PickerCandidates::References(_),
-                picker_state::PickerCandidates::References(_),
-            ) => true,
-            _ => false,
-        };
-        if !preserve_existing {
-            p.candidates = candidates;
-            p.rerank(matcher);
         }
     }
     let picker = pickers.get_mut(&key).expect("populated above");
@@ -8994,7 +8993,7 @@ mod diff_anchor_tests {
         assert_eq!(map[&1][0].kind, VirtualRowKind::Deleted);
         assert_eq!(map.get(&4).map(Vec::len), Some(2));
         assert_eq!(map[&4][1].text, "gone two");
-        assert!(map.get(&7).is_none(), "pure additions have no deleted rows");
+        assert!(!map.contains_key(&7), "pure additions have no deleted rows");
     }
 
     #[test]
@@ -9003,7 +9002,7 @@ mod diff_anchor_tests {
         // final line index so it still renders (above the trailing empty line of the buffer).
         let hunks = vec![hunk(ChangeKind::Deleted, 9, 0, &["tail"])];
         let map = deleted_rows_by_anchor(&hunks, 5); // line_count = 5 → last index 4
-        assert!(map.get(&9).is_none());
+        assert!(!map.contains_key(&9));
         assert_eq!(map.get(&4).map(Vec::len), Some(1));
         assert_eq!(map[&4][0].text, "tail");
     }

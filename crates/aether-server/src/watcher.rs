@@ -15,12 +15,12 @@
 //! Roots are watched lazily: `project/activate` calls [`watch_project_paths`] for each new
 //! project's roots, so cold projects don't waste an inotify slot.
 
+use crate::handlers::PendingPushes;
 use crate::handlers::{
     collect_buffer_state_pushes, explorer_dirs_in_workdirs, refresh_explorers_for_dirs,
     refresh_git_for_buffer, reload_buffer_locked,
 };
 use crate::state::{ServerState, SharedState};
-use aether_protocol::envelope::Notification;
 use aether_protocol::BufferId;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
@@ -115,7 +115,7 @@ async fn handle_event(state: &SharedState, event: Event) {
         .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
         .collect();
 
-    let mut pushes: Vec<(mpsc::Sender<Notification>, Notification)> = Vec::new();
+    let mut pushes: PendingPushes = Vec::new();
     let mut affected_dirs: HashSet<PathBuf> = HashSet::new();
     let mut index_should_invalidate = false;
 
@@ -220,7 +220,7 @@ fn handle_buffer_event(
     buf_id: BufferId,
     path: &Path,
     category: Category,
-    pushes: &mut Vec<(mpsc::Sender<Notification>, Notification)>,
+    pushes: &mut PendingPushes,
 ) {
     match category {
         Category::Remove => {

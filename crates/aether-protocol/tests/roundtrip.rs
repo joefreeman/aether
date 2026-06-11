@@ -33,12 +33,11 @@ use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
 };
 use aether_protocol::search::{SearchSet, SearchSetParams};
-use aether_protocol::viewport::LogicalLineRange;
+use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
-    LogicalLineRender, VirtualRow, VirtualRowKind, Window,
+    LogicalLineRender, VirtualRow, VirtualRowKind,
 };
-use aether_protocol::viewport::{ViewportLinesChanged, ViewportLinesChangedParams};
 use aether_protocol::LogicalPosition;
 use serde_json::{from_str, from_value, json, to_value};
 
@@ -1743,7 +1742,7 @@ fn picker_view_result_directory_fields_serialized() {
 
 #[test]
 fn picker_filters_default_is_empty_object_and_absent_field_deserializes() {
-    use aether_protocol::picker::{PickerFilters, PickerKind, PickerQueryParams};
+    use aether_protocol::picker::{PickerFilters, PickerQueryParams};
     // All-default filters serialize to an empty object (every field is skipped)...
     assert_eq!(to_value(PickerFilters::default()).unwrap(), json!({}));
     // ...and an absent `filters` field on params deserializes to the default set, so the old

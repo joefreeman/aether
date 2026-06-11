@@ -213,6 +213,12 @@ impl ProjectEntry {
     }
 }
 
+impl Default for ServerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServerState {
     pub fn new() -> Self {
         Self {
@@ -1214,6 +1220,18 @@ pub struct Viewport {
     /// buffer's Git hunks and the buffer's hunks are recomputed on every edit. Per-viewport so
     /// two views of the same buffer can differ. Toggled by `git/set_diff_view`.
     pub diff_view: bool,
+}
+
+impl Viewport {
+    /// This viewport's wrap-layout inputs, bundled for the motion/render paths.
+    pub fn wrap_geometry(&self) -> crate::wrap::WrapGeometry {
+        crate::wrap::WrapGeometry {
+            wrap: self.wrap,
+            cols: self.cols,
+            marker_width: self.continuation_marker_width,
+            tab_width: self.tab_width,
+        }
+    }
 }
 
 #[cfg(test)]

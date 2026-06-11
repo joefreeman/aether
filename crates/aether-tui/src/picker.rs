@@ -5,7 +5,9 @@
 use crate::scroll::ScrollState;
 use aether_protocol::directory::DirectoryEntry;
 use aether_protocol::lsp::{LspProgress, LspStatus};
-use aether_protocol::picker::{CaseMode, PickerFilters, PickerItem, PickerKind, ScopedPath};
+use aether_protocol::picker::{
+    CaseMode, PickerFilters, PickerItem, PickerKind, PickerUpdateParams, ScopedPath,
+};
 use aether_protocol::BufferId;
 use std::collections::HashMap;
 
@@ -905,43 +907,33 @@ impl PickerState {
     /// either the currently-applied offset OR the pending offset (the result of an in-flight
     /// refetch); in the latter case it shifts `visible_start` and `selected` so the user's
     /// position in the result set is preserved across the cache swap.
-    pub fn apply_update(
-        &mut self,
-        kind: PickerKind,
-        generation: u64,
-        offset: u32,
-        items: Vec<PickerItem>,
-        total_matches: u32,
-        total_candidates: u32,
-        ticking: bool,
-        total_display_rows: Option<u32>,
-    ) -> bool {
-        if Some(kind) != self.kind {
+    pub fn apply_update(&mut self, p: PickerUpdateParams) -> bool {
+        if Some(p.kind) != self.kind {
             return false;
         }
-        if generation != self.generation {
+        if p.generation != self.generation {
             return false;
         }
-        let shift: i64 = if offset == self.offset {
+        let shift: i64 = if p.offset == self.offset {
             0
-        } else if Some(offset) == self.pending_offset {
-            let s = offset as i64 - self.offset as i64;
-            self.offset = offset;
+        } else if Some(p.offset) == self.pending_offset {
+            let s = p.offset as i64 - self.offset as i64;
+            self.offset = p.offset;
             self.pending_offset = None;
             s
         } else {
             return false;
         };
-        self.items = items;
+        self.items = p.items;
         // The server's push never contains our client-side synthetic row, so any cached
         // `synthetic_create_idx` is stale relative to the new `items` Vec. Drop it before the
         // recompute below decides whether to re-add — otherwise the strip-by-index logic could
         // remove a real entry at the same position.
         self.synthetic_create_idx = None;
-        self.total_matches = total_matches;
-        self.total_candidates = total_candidates;
-        self.ticking = ticking;
-        self.total_display_rows = total_display_rows;
+        self.total_matches = p.total_matches;
+        self.total_candidates = p.total_candidates;
+        self.ticking = p.ticking;
+        self.total_display_rows = p.grep_total_display_rows;
 
         if shift != 0 {
             // Cache moved by `shift` in absolute coordinates → existing indices into the old
@@ -1214,11 +1206,12 @@ mod tests {
     }
 
     fn empty_state(kind: PickerKind, query: &str) -> PickerState {
-        let mut s = PickerState::default();
-        s.open = true;
-        s.kind = Some(kind);
-        s.query = TextInput::new(query);
-        s
+        PickerState {
+            open: true,
+            kind: Some(kind),
+            query: TextInput::new(query),
+            ..PickerState::default()
+        }
     }
 
     fn buffer_item(id: u64) -> PickerItem {
@@ -1243,7 +1236,17 @@ mod tests {
     /// Push `items` into `s` the way a server update would (generation/offset 0, not ticking).
     fn push_items(s: &mut PickerState, kind: PickerKind, items: Vec<PickerItem>) {
         let n = items.len() as u32;
-        assert!(s.apply_update(kind, 0, 0, items, n, n, false, None));
+        assert!(s.apply_update(PickerUpdateParams {
+            kind,
+            generation: 0,
+            offset: 0,
+            items,
+            total_matches: n,
+            total_candidates: n,
+            ticking: false,
+            grep_display_offset: None,
+            grep_total_display_rows: None,
+        }));
     }
 
     #[test]
@@ -1508,20 +1511,21 @@ mod tests {
         // entries. `apply_update` must clear synthetic_create_idx so the recompute treats the
         // items as synthetic-free.
         s.generation = 7;
-        let ok = s.apply_update(
-            PickerKind::Explorer,
-            7,
-            0,
-            vec![
+        let ok = s.apply_update(PickerUpdateParams {
+            kind: PickerKind::Explorer,
+            generation: 7,
+            offset: 0,
+            items: vec![
                 dir_entry("a.rs", false),
                 dir_entry("b.rs", false),
                 dir_entry("c.rs", false),
             ],
-            3,
-            3,
-            false,
-            None,
-        );
+            total_matches: 3,
+            total_candidates: 3,
+            ticking: false,
+            grep_display_offset: None,
+            grep_total_display_rows: None,
+        });
         assert!(ok);
         // Items should be [a.rs, b.rs, c.rs, "Create file …"] — the synthetic re-added
         // without having removed `b.rs` (which would happen if the stale idx=1 was used).

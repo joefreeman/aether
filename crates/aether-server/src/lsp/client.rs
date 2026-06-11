@@ -210,14 +210,10 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn within<T>(
-        fut: impl std::future::Future<Output = T>,
-    ) -> impl std::future::Future<Output = T> {
-        async move {
-            tokio::time::timeout(Duration::from_secs(2), fut)
-                .await
-                .expect("timed out")
-        }
+    async fn within<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("timed out")
     }
 
     /// A trivial mock server: replies to every request by echoing the method name back in the

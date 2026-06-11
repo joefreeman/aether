@@ -127,7 +127,7 @@ mod tests {
     fn nested_brackets_pick_the_innermost_enclosing_pair() {
         let src = "fn foo() { if true { bar(); } }";
         let tree = parse_rust(src);
-        let inner_open = src.find("{ bar").unwrap() + 0; // the inner `{`
+        let inner_open = src.find("{ bar").unwrap(); // the inner `{`
         let inner_close = src.find("} }").unwrap(); // the inner `}`
         let inside_inner = src.find("bar").unwrap();
         assert_eq!(

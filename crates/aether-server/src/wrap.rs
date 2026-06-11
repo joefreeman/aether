@@ -7,6 +7,18 @@
 use aether_protocol::viewport::{Highlight, LogicalLineRender, Segment, VisualRow, WrapMode};
 use unicode_width::UnicodeWidthChar;
 
+/// Per-viewport wrap-layout inputs — everything beyond the text itself that determines how a
+/// logical line splits into visual rows. Bundled (see `Viewport::wrap_geometry`) because the
+/// fields travel together into every layout-aware path and three of them are `u32`, so a
+/// positional mixup would compile silently.
+#[derive(Debug, Clone, Copy)]
+pub struct WrapGeometry {
+    pub wrap: WrapMode,
+    pub cols: u32,
+    pub marker_width: u32,
+    pub tab_width: u32,
+}
+
 /// Visual cols a single char contributes when rendered at `current_col`. Tabs advance to the
 /// next multiple of `tab_width` (so `\t` at col 5 with tab_width=4 takes 3 cols, landing the
 /// cursor at col 8); everything else falls through to `UnicodeWidthChar`. Shared between wrap

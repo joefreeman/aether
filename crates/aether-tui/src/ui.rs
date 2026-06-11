@@ -459,7 +459,7 @@ fn draw_vertical_scrollbar(f: &mut Frame, area: Rect, offset: u16, total: u16, v
     let total = u64::from(total.max(1));
     let window = u64::from(visible.min(total as u16).max(1));
     let th = u64::from(track_h);
-    let thumb_h = ((window * th + total - 1) / total).max(1).min(th) as u16;
+    let thumb_h = (window * th).div_ceil(total).max(1).min(th) as u16;
     let max_thumb_y = track_h.saturating_sub(thumb_h);
     let thumb_y = ((u64::from(offset) * th) / total) as u16;
     let thumb_y = thumb_y.min(max_thumb_y);
@@ -524,10 +524,12 @@ fn tab_contexts(tab: HelpTab) -> &'static [keymap::KeyContext] {
 /// fit the Alt column, the Alt variant stacks on its own indented line instead.
 fn help_lines(tab: HelpTab, width: usize) -> Vec<Line<'static>> {
     let heading = Style::default().fg(NORD8).add_modifier(Modifier::BOLD);
-    let key_style = Style::default().fg(NORD9);
-    let desc_style = Style::default().fg(NORD4);
-    // The `/` that joins a merged direction pair (e.g. `h / l`) renders dimmer, as a separator.
-    let sep_style = Style::default().fg(NORD3);
+    let styles = HelpStyles {
+        key: Style::default().fg(NORD9),
+        desc: Style::default().fg(NORD4),
+        // The `/` that joins a merged direction pair (e.g. `h / l`) renders dimmer, as a separator.
+        sep: Style::default().fg(NORD3),
+    };
     let w = width.max(24);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -666,50 +668,33 @@ fn help_lines(tab: HelpTab, width: usize) -> Vec<Line<'static>> {
                 let alt_desc_w = col_w - akw - 1;
                 let chunks = wrap_words(&a.desc, alt_desc_w);
                 // Only the key column dims its `/` separator; descriptions keep theirs in the
-                // normal text colour (pass `desc_style` as the separator style).
-                let mut spans = padded_spans(bkey, kw, key_style, sep_style);
+                // normal text colour (pass the description style as the separator style).
+                let mut spans = padded_spans(bkey, kw, styles.key, styles.sep);
                 spans.push(Span::raw("  "));
                 spans.extend(padded_spans(
                     &r.base.desc,
                     base_field,
-                    desc_style,
-                    desc_style,
+                    styles.desc,
+                    styles.desc,
                 ));
                 spans.push(Span::raw(" ".repeat(GAP)));
-                spans.extend(padded_spans(&a.key, akw, key_style, sep_style));
+                spans.extend(padded_spans(&a.key, akw, styles.key, styles.sep));
                 spans.push(Span::raw(" "));
-                spans.extend(sep_spans(&chunks[0], desc_style, desc_style));
+                spans.extend(sep_spans(&chunks[0], styles.desc, styles.desc));
                 lines.push(Line::from(spans));
                 let alt_desc_col = col_w + GAP + akw + 1;
                 for c in &chunks[1..] {
                     let mut l = vec![Span::raw(" ".repeat(alt_desc_col))];
-                    l.extend(sep_spans(c, desc_style, desc_style));
+                    l.extend(sep_spans(c, styles.desc, styles.desc));
                     lines.push(Line::from(l));
                 }
             } else {
                 // Base on its own wrapped line(s); a stacked Alt (too narrow to align) indents
                 // under the base description.
-                push_wrapped(
-                    &mut lines,
-                    bkey,
-                    kw,
-                    &r.base.desc,
-                    w,
-                    key_style,
-                    desc_style,
-                    sep_style,
-                );
+                push_wrapped(&mut lines, bkey, kw, &r.base.desc, w, styles);
                 if let Some(a) = &r.alt {
                     let mut indented = vec![Span::raw(" ".repeat(kw + 2))];
-                    let inner = wrapped_spans(
-                        &a.key,
-                        a.key.width(),
-                        &a.desc,
-                        w - (kw + 2),
-                        key_style,
-                        desc_style,
-                        sep_style,
-                    );
+                    let inner = wrapped_spans(&a.key, a.key.width(), &a.desc, w - (kw + 2), styles);
                     // Splice the first inner line after the indent; push the rest with indent.
                     let mut iter = inner.into_iter();
                     if let Some(first) = iter.next() {
@@ -728,6 +713,15 @@ fn help_lines(tab: HelpTab, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// The three text styles a help row is built from: the key column, the description, and the
+/// dimmed separator (`/` between a merged direction pair, alias commas).
+#[derive(Clone, Copy)]
+struct HelpStyles {
+    key: Style,
+    desc: Style,
+    sep: Style,
+}
+
 /// Push a `<key>  <description>` block to `lines`, word-wrapping the description to `width` with a
 /// hanging indent aligned under the description column.
 fn push_wrapped(
@@ -736,20 +730,18 @@ fn push_wrapped(
     key_w: usize,
     desc: &str,
     width: usize,
-    key_style: Style,
-    desc_style: Style,
-    sep_style: Style,
+    styles: HelpStyles,
 ) {
     let desc_col = key_w + 2;
     let chunks = wrap_words(desc, width.saturating_sub(desc_col));
     // Key column dims its `/`; the description keeps its `/` in the normal text colour.
-    let mut first = padded_spans(key, key_w, key_style, sep_style);
+    let mut first = padded_spans(key, key_w, styles.key, styles.sep);
     first.push(Span::raw("  "));
-    first.extend(sep_spans(&chunks[0], desc_style, desc_style));
+    first.extend(sep_spans(&chunks[0], styles.desc, styles.desc));
     lines.push(Line::from(first));
     for c in &chunks[1..] {
         let mut l = vec![Span::raw(" ".repeat(desc_col))];
-        l.extend(sep_spans(c, desc_style, desc_style));
+        l.extend(sep_spans(c, styles.desc, styles.desc));
         lines.push(Line::from(l));
     }
 }
@@ -761,21 +753,19 @@ fn wrapped_spans(
     key_w: usize,
     desc: &str,
     width: usize,
-    key_style: Style,
-    desc_style: Style,
-    sep_style: Style,
+    styles: HelpStyles,
 ) -> Vec<Vec<Span<'static>>> {
     let desc_col = key_w + 1;
     let chunks = wrap_words(desc, width.saturating_sub(desc_col));
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     // Key column dims its `/`; the description keeps its `/` in the normal text colour.
-    let mut first = padded_spans(key, key_w, key_style, sep_style);
+    let mut first = padded_spans(key, key_w, styles.key, styles.sep);
     first.push(Span::raw(" "));
-    first.extend(sep_spans(&chunks[0], desc_style, desc_style));
+    first.extend(sep_spans(&chunks[0], styles.desc, styles.desc));
     out.push(first);
     for c in &chunks[1..] {
         let mut l = vec![Span::raw(" ".repeat(desc_col))];
-        l.extend(sep_spans(c, desc_style, desc_style));
+        l.extend(sep_spans(c, styles.desc, styles.desc));
         out.push(l);
     }
     out
@@ -1822,7 +1812,7 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     }
     spans.push(Span::styled(left_text, left_style));
     let used = prefix_w + chips_w + left_w;
-    if !counts.is_empty() && used + counts_w + 1 <= total_width {
+    if !counts.is_empty() && used + counts_w < total_width {
         let pad = total_width.saturating_sub(used + counts_w);
         spans.push(Span::styled(" ".repeat(pad), base_style));
         spans.push(Span::styled(counts, base_style));
@@ -2258,7 +2248,7 @@ fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
         return;
     }
     // Thumb spans `window / total` of the track, at least 1 cell. Position is `offset / total`.
-    let thumb_h = ((window * track_h + total - 1) / total).max(1).min(track_h) as u16;
+    let thumb_h = (window * track_h).div_ceil(total).max(1).min(track_h) as u16;
     let max_thumb_y = (track_h as u16).saturating_sub(thumb_h);
     let thumb_y = ((offset * track_h) / total) as u16;
     let thumb_y = thumb_y.min(max_thumb_y);
@@ -2349,10 +2339,12 @@ fn picker_item_spans(
     } = item
     {
         return diagnostic_item_spans(
-            *line,
-            *col,
-            *end_line,
-            *end_col,
+            DiagRange {
+                line: *line,
+                col: *col,
+                end_line: *end_line,
+                end_col: *end_col,
+            },
             *severity,
             message,
             match_indices,
@@ -2371,11 +2363,13 @@ fn picker_item_spans(
     } = item
     {
         return lsp_server_item_spans(
-            name,
-            language,
-            root_label,
-            status,
-            progress,
+            LspServerRow {
+                name,
+                language,
+                root_label,
+                status,
+                progress,
+            },
             match_indices,
             highlighted,
             max_width,
@@ -2703,13 +2697,20 @@ fn grep_hit_spans(
     spans
 }
 
-/// Diagnostics-picker row: `• {line} {message}`, the dot colored by severity (matching the gutter)
-/// and the line number dim; fuzzy matches in the message are highlighted.
-fn diagnostic_item_spans(
+/// A diagnostic's start/end buffer position (0-based), as carried flattened on
+/// [`PickerItem::Diagnostic`]; rendered via [`diag_range_label`].
+#[derive(Clone, Copy)]
+struct DiagRange {
     line: u32,
     col: u32,
     end_line: u32,
     end_col: u32,
+}
+
+/// Diagnostics-picker row: `• {line} {message}`, the dot colored by severity (matching the gutter)
+/// and the line number dim; fuzzy matches in the message are highlighted.
+fn diagnostic_item_spans(
+    range: DiagRange,
     severity: DiagnosticSeverity,
     message: &str,
     match_indices: &[u32],
@@ -2721,7 +2722,7 @@ fn diagnostic_item_spans(
     // the bright accent so they remain visible. The range trails in gray parentheses.
     let base = Style::default().fg(diag_color(severity)).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
-    let line_suffix = format!(" ({})", diag_range_label(line, col, end_line, end_col));
+    let line_suffix = format!(" ({})", diag_range_label(range));
     let msg_budget = max_width.saturating_sub(line_suffix.width());
 
     let truncated: String = message
@@ -2780,13 +2781,19 @@ fn diagnostic_item_spans(
 
 /// A diagnostic's range as a compact `line:col` label (1-based), collapsing to `line:col-endcol`
 /// when start and end share a line and to a single `line:col` for a zero-width point.
-fn diag_range_label(line: u32, col: u32, end_line: u32, end_col: u32) -> String {
-    if line == end_line && col == end_col {
-        format!("{}:{}", line + 1, col + 1)
-    } else if line == end_line {
-        format!("{}:{}-{}", line + 1, col + 1, end_col + 1)
+fn diag_range_label(r: DiagRange) -> String {
+    if r.line == r.end_line && r.col == r.end_col {
+        format!("{}:{}", r.line + 1, r.col + 1)
+    } else if r.line == r.end_line {
+        format!("{}:{}-{}", r.line + 1, r.col + 1, r.end_col + 1)
     } else {
-        format!("{}:{}-{}:{}", line + 1, col + 1, end_line + 1, end_col + 1)
+        format!(
+            "{}:{}-{}:{}",
+            r.line + 1,
+            r.col + 1,
+            r.end_line + 1,
+            r.end_col + 1
+        )
     }
 }
 
@@ -2868,20 +2875,32 @@ fn reference_item_spans(
     spans
 }
 
+/// The identity-and-state fields of one LSP server, borrowed from [`PickerItem::LspServer`].
+struct LspServerRow<'a> {
+    name: &'a str,
+    language: &'a str,
+    root_label: &'a str,
+    status: &'a LspStatus,
+    progress: &'a [LspProgress],
+}
+
 /// One LSP-servers picker row: a status dot (the same medium `•` cell the file pickers use for
 /// git status, coloured like the status-bar indicator), the server name with fuzzy-match
 /// highlights, and a dim `language · root` tail. The dot re-renders live as
 /// `lsp/status_changed` re-pushes the picker.
 fn lsp_server_item_spans(
-    name: &str,
-    language: &str,
-    root_label: &str,
-    status: &LspStatus,
-    progress: &[LspProgress],
+    server: LspServerRow<'_>,
     match_indices: &[u32],
     highlighted: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
+    let LspServerRow {
+        name,
+        language,
+        root_label,
+        status,
+        progress,
+    } = server;
     let bg = if highlighted { NORD2 } else { NORD0 };
     // A ready server with active `$/progress` work shows the busy colour (same as the status bar).
     let busy = matches!(status, LspStatus::Ready) && !progress.is_empty();
@@ -3299,7 +3318,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
                     append_eol_blame(
                         &mut spans,
-                        show_blame.then(|| blame_text.as_deref()).flatten(),
+                        show_blame.then_some(blame_text.as_deref()).flatten(),
                     );
                     apply_line_tint(&mut spans, line_tint, viewport_cols);
                     lines.push(prepend_gutter(gutter_mark, render.diff_stage, spans));
@@ -3389,7 +3408,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
             append_eol_blame(
                 &mut spans,
-                show_blame.then(|| blame_text.as_deref()).flatten(),
+                show_blame.then_some(blame_text.as_deref()).flatten(),
             );
             apply_line_tint(&mut spans, line_tint, viewport_cols);
             lines.push(prepend_gutter(gutter_mark, render.diff_stage, spans));
@@ -3823,8 +3842,8 @@ fn build_spans(
     for h in highlights {
         let s = (h.start as usize).min(trunc_len);
         let e = (h.end as usize).min(trunc_len);
-        for i in s..e {
-            byte_kind[i] = Some(h.kind.as_str());
+        for kind in &mut byte_kind[s..e] {
+            *kind = Some(h.kind.as_str());
         }
     }
 
@@ -3832,8 +3851,8 @@ fn build_spans(
     for (s, e) in matches {
         let s = (*s as usize).min(trunc_len);
         let e = (*e as usize).min(trunc_len);
-        for i in s..e {
-            byte_in_match[i] = true;
+        for in_match in &mut byte_in_match[s..e] {
+            *in_match = true;
         }
     }
 
@@ -3852,7 +3871,7 @@ fn build_spans(
         let s = (*s as usize).min(trunc_len);
         let e = (*e as usize).min(trunc_len);
         for slot in byte_diag.iter_mut().take(e).skip(s) {
-            if slot.map_or(true, |cur| severity_rank(*sev) > severity_rank(cur)) {
+            if slot.is_none_or(|cur| severity_rank(*sev) > severity_rank(cur)) {
                 *slot = Some(*sev);
             }
         }
@@ -4121,9 +4140,11 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         }
 
         Line::from(build_editor_status_spans(
-            &project_prefix,
-            &state.ed().file_label,
-            state.ed().transient,
+            StatusLabel {
+                project_prefix: &project_prefix,
+                file_label: &state.ed().file_label,
+                transient: state.ed().transient,
+            },
             status_dot,
             git_spans,
             &state.status,
@@ -4227,7 +4248,7 @@ fn draw_save_prompt_spans(
         let counter = format!("[{pos}/{total}]");
         let counter_w = counter.width();
         let used = " save as: ".width() + label_w + prompt.input.text.width() + ghost_w;
-        if used + counter_w + 1 <= total_width {
+        if used + counter_w < total_width {
             let pad = total_width.saturating_sub(used + counter_w);
             spans.push(Span::styled(" ".repeat(pad), base_style));
             spans.push(Span::styled(counter, base_style));
@@ -4250,23 +4271,35 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
     Style::default().bg(NORD1).fg(fg)
 }
 
+/// The status row's leading label: an optional `[project] ` prefix, the file label, and whether
+/// the buffer is transient (which italicises the label).
+struct StatusLabel<'a> {
+    project_prefix: &'a str,
+    file_label: &'a str,
+    transient: bool,
+}
+
 /// Build the spans for the default editor status row: an optional leading buffer-state dot, then
 /// `left_pre` (project/file) in the base style, an optional colored status message after a `    `
 /// separator, then padding pushing the right segment flush to the row edge. When the row is too
 /// narrow:
-///   - the status text truncates first (`…`), preserving the dot and project/file;
-///   - if even `left_pre` can't fit, that gets truncated and the status is dropped entirely.
+/// - the status text truncates first (`…`), preserving the dot and project/file;
+/// - if even `left_pre` can't fit, that gets truncated and the status is dropped entirely.
+///
 /// The right segment is never truncated — the cursor position is more useful than the message.
 fn build_editor_status_spans(
-    project_prefix: &str,
-    file_label: &str,
-    transient: bool,
+    label: StatusLabel<'_>,
     status_dot: Option<Span<'static>>,
     left_badges: Vec<Span<'static>>,
     status: &crate::app::StatusMessage,
     right_spans: Vec<Span<'static>>,
     total_width: usize,
 ) -> Vec<Span<'static>> {
+    let StatusLabel {
+        project_prefix,
+        file_label,
+        transient,
+    } = label;
     let base_style = Style::default().bg(NORD1).fg(NORD4);
     // A transient (preview) buffer slants the file label (root + path — not the project name)
     // instead of spending row width on an explicit marker. Terminals without italic support
@@ -4288,7 +4321,7 @@ fn build_editor_status_spans(
     // the web favicon. Reserve its width (glyph + a trailing space) before laying out the rest.
     if let Some(dot) = status_dot {
         let dot_w = dot.content.width();
-        if dot_w + 1 <= left_max {
+        if dot_w < left_max {
             spans.push(dot);
             spans.push(Span::styled(" ".to_string(), base_style));
             used += dot_w + 1;
@@ -4696,7 +4729,7 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
     else {
         return; // cursor off-screen
     };
-    let row = buffer_area.y + visual_row as u16;
+    let row = buffer_area.y + visual_row;
     // `visual_col` is content-relative; shift past the gutter to the real screen column.
     let col = buffer_area
         .x
@@ -4864,10 +4897,7 @@ pub fn screen_to_logical(
             });
         }
         rows_remaining -= visual_rows_in_line;
-        logical_line = match logical_line.checked_add(1) {
-            Some(n) => n,
-            None => return None,
-        };
+        logical_line = logical_line.checked_add(1)?;
     }
 }
 
@@ -5324,11 +5354,13 @@ mod tests {
     #[test]
     fn lsp_row_status_dot_and_bulleted_tail() {
         let spans = lsp_server_item_spans(
-            "rust-analyzer",
-            "rust",
-            "backend",
-            &LspStatus::Ready,
-            &[],
+            LspServerRow {
+                name: "rust-analyzer",
+                language: "rust",
+                root_label: "backend",
+                status: &LspStatus::Ready,
+                progress: &[],
+            },
             &[],
             false,
             60,
@@ -5339,11 +5371,13 @@ mod tests {
         assert_eq!(spans[0].style.fg, Some(NORD14)); // ready → green dot
                                                      // At the project root the tail is just the language — no separator.
         let single = lsp_server_item_spans(
-            "rust-analyzer",
-            "rust",
-            "",
-            &LspStatus::Stopped,
-            &[],
+            LspServerRow {
+                name: "rust-analyzer",
+                language: "rust",
+                root_label: "",
+                status: &LspStatus::Stopped,
+                progress: &[],
+            },
             &[],
             false,
             60,
@@ -5485,9 +5519,11 @@ mod tests {
     #[test]
     fn picker_content_rows_counts_kind_specifics() {
         use aether_protocol::picker::PickerKind;
-        let mut p = crate::picker::PickerState::default();
-        p.kind = Some(PickerKind::Files);
-        p.total_matches = 5;
+        let mut p = crate::picker::PickerState {
+            kind: Some(PickerKind::Files),
+            total_matches: 5,
+            ..Default::default()
+        };
         assert_eq!(picker_content_rows(&p), 5);
         // The synthetic "Create …" row is client-side, on top of total_matches.
         p.synthetic_create_idx = Some(5);
@@ -5575,9 +5611,11 @@ mod tests {
     fn editor_status_spans_no_status_pads_to_right_edge() {
         let status = crate::app::StatusMessage::default();
         let spans = build_editor_status_spans(
-            "[proj] ",
-            "file.rs",
-            false,
+            StatusLabel {
+                project_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: false,
+            },
             None,
             Vec::new(),
             &status,
@@ -5596,9 +5634,11 @@ mod tests {
     fn editor_status_spans_italicise_transient_label() {
         let status = crate::app::StatusMessage::default();
         let spans = build_editor_status_spans(
-            "[proj] ",
-            "file.rs",
-            true,
+            StatusLabel {
+                project_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: true,
+            },
             None,
             Vec::new(),
             &status,
@@ -5613,9 +5653,11 @@ mod tests {
         assert!(!spans_text(&spans).contains("transient"), "no marker text");
 
         let spans = build_editor_status_spans(
-            "[proj] ",
-            "file.rs",
-            false,
+            StatusLabel {
+                project_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: false,
+            },
             None,
             Vec::new(),
             &status,
@@ -5637,9 +5679,11 @@ mod tests {
             Style::default().fg(buffer_status_color(BufferStatusKind::Unsaved)),
         );
         let spans = build_editor_status_spans(
-            "[proj] ",
-            "file.rs",
-            false,
+            StatusLabel {
+                project_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: false,
+            },
             Some(dot),
             Vec::new(),
             &status,
@@ -5661,9 +5705,11 @@ mod tests {
     fn editor_status_spans_renders_status_with_color() {
         let status = crate::app::StatusMessage::success("saved (rev 1)");
         let spans = build_editor_status_spans(
-            "[proj] ",
-            "file.rs",
-            false,
+            StatusLabel {
+                project_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: false,
+            },
             None,
             Vec::new(),
             &status,
@@ -5689,9 +5735,11 @@ mod tests {
         // + separator(4) = 18 used. Status budget = 25 - 18 = 7. So a long status truncates.
         let status = crate::app::StatusMessage::info("a much longer status message");
         let spans = build_editor_status_spans(
-            "[proj] ",
-            "file.rs",
-            false,
+            StatusLabel {
+                project_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: false,
+            },
             None,
             Vec::new(),
             &status,
@@ -5715,9 +5763,11 @@ mod tests {
         // — is dropped, and the status is dropped entirely.
         let status = crate::app::StatusMessage::error("save failed: disk full");
         let spans = build_editor_status_spans(
-            "[proj] ",
-            "file.rs",
-            false,
+            StatusLabel {
+                project_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: false,
+            },
             None,
             Vec::new(),
             &status,
@@ -5743,9 +5793,11 @@ mod tests {
     fn editor_status_spans_elides_long_label() {
         let status = crate::app::StatusMessage::default();
         let spans = build_editor_status_spans(
-            "[proj] ",
-            "src/deeply/nested/module/file.rs",
-            false,
+            StatusLabel {
+                project_prefix: "[proj] ",
+                file_label: "src/deeply/nested/module/file.rs",
+                transient: false,
+            },
             None,
             Vec::new(),
             &status,
