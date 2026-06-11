@@ -91,6 +91,8 @@ export type Action =
   | { t: "replaceLineClipboard" }
   // leader / app
   | { t: "openPicker"; kind: PickerKind }
+  | { t: "openPickerInBufferDir"; kind: PickerKind }
+  | { t: "openExplorerAtRoot" }
   | { t: "toggleWrap" }
   | { t: "save" }
   | { t: "saveAs" }
@@ -271,9 +273,12 @@ const GLOBAL: Binding[] = [
 
 const LEADER: Binding[] = [
   b("f", exact(), { t: "openPicker", kind: "files" }),
+  b("f", exact(false, true), { t: "openPickerInBufferDir", kind: "files" }),
   b("b", exact(), { t: "openPicker", kind: "buffers" }),
   b("g", exact(), { t: "openPicker", kind: "grep" }),
+  b("g", exact(false, true), { t: "openPickerInBufferDir", kind: "grep" }),
   b("e", exact(), { t: "openPicker", kind: "explorer" }),
+  b("e", exact(false, true), { t: "openExplorerAtRoot" }),
   b("p", exact(), { t: "openPicker", kind: "projects" }),
   b("t", exact(), { t: "openPicker", kind: "diagnostics" }),
   b("l", exact(), { t: "openPicker", kind: "lsp_servers" }),

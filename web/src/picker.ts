@@ -80,6 +80,28 @@ function sameScope(a: ScopedPath, b: ScopedPath): boolean {
   return a.path_index === b.path_index && a.relative_path === b.relative_path;
 }
 
+/** Map an absolute directory to a `ScopedPath` — the longest project root that contains it,
+ *  with the root itself mapping to an empty relative path (a whole-root scope). Null when the
+ *  dir sits outside every root. Shared by the explorer's Grep/Files switch and the host's
+ *  `Space Alt-f/g` buffer-directory scoping. */
+export function scopeForDir(dir: string, projectPaths: string[]): ScopedPath | null {
+  let best: ScopedPath | null = null;
+  let bestLen = -1;
+  projectPaths.forEach((root, i) => {
+    const prefix = root.endsWith("/") ? root : `${root}/`;
+    if (dir === root) {
+      if (root.length > bestLen) {
+        bestLen = root.length;
+        best = { path_index: i, relative_path: "" };
+      }
+    } else if (dir.startsWith(prefix) && root.length > bestLen) {
+      bestLen = root.length;
+      best = { path_index: i, relative_path: dir.slice(prefix.length) };
+    }
+  });
+  return best;
+}
+
 /** True when two values are the same chip — for the repeatable kinds that means equal values
  *  (dirs and globs dedupe at commit time), for flags just the kind (`case` mid-cycle and an
  *  ignored/hidden direction change are the same chip). */
@@ -893,27 +915,10 @@ export class Picker {
     this.onSwitch(kind, seeded);
   }
 
-  /** The browsed directory as a `ScopedPath` — longest project root that contains it, with
-   *  the root itself mapping to an empty relative path (a whole-root scope). Null in Roots
-   *  mode or when the dir sits outside every root. */
+  /** The browsed directory as a `ScopedPath` (see `scopeForDir`). Null in Roots mode or when
+   *  the dir sits outside every root. */
   private explorerScope(): ScopedPath | null {
-    const dir = this.explorerDir;
-    if (!dir) return null;
-    let best: ScopedPath | null = null;
-    let bestLen = -1;
-    this.projectPaths.forEach((root, i) => {
-      const prefix = root.endsWith("/") ? root : `${root}/`;
-      if (dir === root) {
-        if (root.length > bestLen) {
-          bestLen = root.length;
-          best = { path_index: i, relative_path: "" };
-        }
-      } else if (dir.startsWith(prefix) && root.length > bestLen) {
-        bestLen = root.length;
-        best = { path_index: i, relative_path: dir.slice(prefix.length) };
-      }
-    });
-    return best;
+    return this.explorerDir ? scopeForDir(this.explorerDir, this.projectPaths) : null;
   }
 
   /** Rebuild the chip row DOM. Cheap (a handful of spans), so it runs wholesale on any filter

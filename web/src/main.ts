@@ -7,7 +7,7 @@ import { RpcClient, RpcError } from "./client";
 import type { ConnState } from "./client";
 import { renderMarkdown } from "./markdown";
 import { renderBuffer } from "./render";
-import { Picker, bufferStatusDot } from "./picker";
+import { Picker, bufferStatusDot, scopeForDir } from "./picker";
 import { rootLabels } from "./labels";
 import { decodeRow } from "./text";
 import { readClipboard, writeClipboard } from "./clipboard";
@@ -1033,6 +1033,14 @@ class Editor {
         this.openPicker(a.kind);
         return { handled: true };
       }
+      if (a.t === "openPickerInBufferDir") {
+        this.openPickerInBufferDir(a.kind);
+        return { handled: true };
+      }
+      if (a.t === "openExplorerAtRoot") {
+        this.openPicker("explorer", undefined, this.bufferRootDir() ?? undefined);
+        return { handled: true };
+      }
       return { handled: true, run: () => this.runAction(a, 1, false) };
     }
 
@@ -1104,14 +1112,14 @@ class Editor {
 
   // ---- pickers --------------------------------------------------------------------------------
 
-  private openPicker(kind: PickerKind, initialFilters?: PickerFilters): void {
+  private openPicker(kind: PickerKind, initialFilters?: PickerFilters, explorerDir?: string): void {
     this.picker = new Picker({
       client: this.client,
       kind,
       onConfirm: (item) => this.onPickerConfirm(item),
       onClose: () => this.closePicker(),
       fileUrl: (item, explorerDir) => this.pickerItemUrl(item, explorerDir),
-      explorerInitialDir: kind === "explorer" ? this.explorerInitialDir() : undefined,
+      explorerInitialDir: kind === "explorer" ? explorerDir ?? this.explorerInitialDir() : undefined,
       explorerSelectName: kind === "explorer" && this.currentPath ? basename(this.currentPath) : undefined,
       projectPaths: this.projectPaths,
       scopedBufferId: kind === "diagnostics" || kind === "references" ? this.bufferId : undefined,
@@ -1134,6 +1142,24 @@ class Editor {
 
   private explorerInitialDir(): string | null {
     if (this.currentPath) return dirname(this.currentPath);
+    return this.projectPaths[0] ?? null;
+  }
+
+  /** `Space Alt-f` / `Space Alt-g`: Files/Grep pre-scoped to the buffer's directory (seeded as
+   *  a normal directory chip — visible and removable). Unscoped for scratch buffers or files
+   *  outside every project root. */
+  private openPickerInBufferDir(kind: PickerKind): void {
+    const scope = this.currentPath ? scopeForDir(dirname(this.currentPath), this.projectPaths) : null;
+    this.openPicker(kind, scope ? { directories: [scope] } : undefined);
+  }
+
+  /** The project root containing the buffer's file — `Space Alt-e` opens the explorer here
+   *  instead of the buffer's own directory. First root for scratch / outside-root files. */
+  private bufferRootDir(): string | null {
+    if (this.currentPath) {
+      const scope = scopeForDir(dirname(this.currentPath), this.projectPaths);
+      if (scope) return this.projectPaths[scope.path_index] ?? null;
+    }
     return this.projectPaths[0] ?? null;
   }
 

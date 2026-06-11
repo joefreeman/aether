@@ -244,6 +244,11 @@ pub enum Action {
 
     // ---- pickers / app-level ----
     OpenPicker(PickerKind),
+    /// `Space Alt-f` / `Space Alt-g` — Files/Grep pre-scoped to the active buffer's directory
+    /// (seeded as a directory filter chip, removable like any chip).
+    OpenPickerInBufferDir(PickerKind),
+    /// `Space Alt-e` — Explorer starting at the buffer's project root rather than its directory.
+    OpenExplorerAtRoot,
     OpenProjectSettings,
     OpenHelp,
     Quit,
@@ -283,6 +288,8 @@ impl Action {
                 | Action::OpenPicker(PickerKind::Diagnostics)
                 | Action::OpenPicker(PickerKind::LspServers)
                 | Action::OpenPicker(PickerKind::References)
+                | Action::OpenPickerInBufferDir(_)
+                | Action::OpenExplorerAtRoot
                 | Action::CloseBuffer
                 | Action::Save
                 | Action::SaveAs
@@ -656,9 +663,12 @@ static SEARCH: &[Binding] = &[
 #[rustfmt::skip]
 static LEADER: &[Binding] = &[
     bind!(LEADER_CTX, ch('f'), Exact(NONE), A::OpenPicker(PickerKind::Files), "Files", "Find files"),
+    bind!(LEADER_CTX, ch('f'), Exact(ALT), A::OpenPickerInBufferDir(PickerKind::Files), "Files", "Find files in buffer's directory"),
     bind!(LEADER_CTX, ch('b'), Exact(NONE), A::OpenPicker(PickerKind::Buffers), "Files", "Switch buffer"),
     bind!(LEADER_CTX, ch('g'), Exact(NONE), A::OpenPicker(PickerKind::Grep), "Files", "Grep workspace"),
+    bind!(LEADER_CTX, ch('g'), Exact(ALT), A::OpenPickerInBufferDir(PickerKind::Grep), "Files", "Grep buffer's directory"),
     bind!(LEADER_CTX, ch('e'), Exact(NONE), A::OpenPicker(PickerKind::Explorer), "Files", "File explorer"),
+    bind!(LEADER_CTX, ch('e'), Exact(ALT), A::OpenExplorerAtRoot, "Files", "File explorer at project root"),
     bind!(LEADER_CTX, ch('p'), Exact(NONE), A::OpenPicker(PickerKind::Projects), "Project", "Switch project"),
     bind!(LEADER_CTX, ch(','), Exact(NONE), A::OpenProjectSettings, "Project", "Project settings"),
     bind!(LEADER_CTX, ch('q'), Exact(NONE), A::Quit, "App", "Quit"),

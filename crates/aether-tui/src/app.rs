@@ -1895,6 +1895,13 @@ async fn run_action(
 
         // ---- pickers / app-level ----
         Action::OpenPicker(kind) => open_picker(client, state, kind).await?,
+        Action::OpenPickerInBufferDir(kind) => {
+            open_picker_in_buffer_dir(client, state, kind).await?
+        }
+        Action::OpenExplorerAtRoot => {
+            let dir = buffer_root_dir(state);
+            open_picker_seeded(client, state, PickerKind::Explorer, None, dir).await?
+        }
         Action::OpenProjectSettings => {
             if !state.project_name.is_empty() {
                 open_project_settings(state);
@@ -2095,18 +2102,21 @@ fn picker_fetch_limit(state: &AppState) -> u32 {
 }
 
 async fn open_picker(client: &mut Client, state: &mut AppState, kind: PickerKind) -> Result<()> {
-    open_picker_seeded(client, state, kind, None).await
+    open_picker_seeded(client, state, kind, None, None).await
 }
 
 /// `open_picker` with a filter seed: when `Some`, the view request carries the set and the
 /// server replaces its persisted filters before building candidates (and echoes them back, so
 /// the adoption below picks them up). Used by the Explorer→Grep/Files switch to scope the
-/// target picker to the browsed directory.
+/// target picker to the browsed directory. `explorer_dir` (Explorer only) overrides the
+/// default starting directory (the buffer's own) — `Space Alt-e` passes the buffer's project
+/// root.
 async fn open_picker_seeded(
     client: &mut Client,
     state: &mut AppState,
     kind: PickerKind,
     seed_filters: Option<PickerFilters>,
+    explorer_dir: Option<String>,
 ) -> Result<()> {
     let pane_rows = picker_pane_rows(state);
     let limit = picker_fetch_limit(state);
@@ -2134,7 +2144,7 @@ async fn open_picker_seeded(
     // but on reopen we throw it away — the picker is contextual to the current buffer, not
     // a persistent file-manager session.
     let explorer_path_for_view: Option<String> = if kind == PickerKind::Explorer {
-        default_explorer_dir(state)
+        explorer_dir.or_else(|| default_explorer_dir(state))
     } else {
         None
     };
@@ -2270,7 +2280,45 @@ async fn switch_explorer_picker(
         })
         .await;
     state.picker.open = false;
-    open_picker_seeded(client, state, target, Some(seeded)).await
+    open_picker_seeded(client, state, target, Some(seeded), None).await
+}
+
+/// `Space Alt-f` / `Space Alt-g`: open Files/Grep pre-scoped to the active buffer's directory.
+/// The scope arrives as a normal directory filter chip — visible and removable like any chip.
+/// Falls back to an unscoped open for scratch buffers or files outside every project root.
+async fn open_picker_in_buffer_dir(
+    client: &mut Client,
+    state: &mut AppState,
+    kind: PickerKind,
+) -> Result<()> {
+    let seed = state
+        .ed()
+        .file_path
+        .is_some()
+        .then(|| default_explorer_dir(state))
+        .flatten()
+        .and_then(|abs| strip_longest_root(&abs, &state.project_paths))
+        .map(|(path_index, relative_path)| PickerFilters {
+            directories: vec![ScopedPath {
+                path_index: path_index as u32,
+                relative_path,
+            }],
+            ..PickerFilters::default()
+        });
+    open_picker_seeded(client, state, kind, seed, None).await
+}
+
+/// The project root containing the active buffer's file — `Space Alt-e` opens the Explorer
+/// here instead of the buffer's own directory. First root for scratch buffers or files
+/// outside every root.
+fn buffer_root_dir(state: &AppState) -> Option<String> {
+    state
+        .ed()
+        .file_path
+        .as_deref()
+        .and_then(|p| strip_longest_root(p, &state.project_paths))
+        .and_then(|(i, _)| state.project_paths.get(i).cloned())
+        .or_else(|| state.project_paths.first().cloned())
 }
 
 /// Translate the Explorer's filter set for a Grep/Files switch. The dir scope is the browsed

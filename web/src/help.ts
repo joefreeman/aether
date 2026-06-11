@@ -139,7 +139,9 @@ const TABS: Tab[] = [
         title: "Pickers (Space …)",
         rows: [
           ["Space f  b  g", "files / buffers / grep"],
+          ["Space Alt-f  Alt-g", "files / grep scoped to buffer's directory"],
           ["Space e", "explorer"],
+          ["Space Alt-e", "explorer at buffer's project root"],
           ["Space p  t  l", "projects / diagnostics / LSP servers"],
           ["Alt-j/k  Enter  Esc", "move / open / close (in a picker)"],
           ["Ctrl-Enter", "open in new tab (in a picker)"],
