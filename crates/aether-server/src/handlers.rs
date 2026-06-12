@@ -18,8 +18,8 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState,
-    CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, GrepPosition, Motion,
-    VerticalDirection,
+    CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, Granularity,
+    GrepPosition, Motion, VerticalDirection,
 };
 use aether_protocol::directory::{
     DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryListParams,
@@ -33,8 +33,9 @@ use aether_protocol::git::{
     GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, EditResult, InputMoveLinesParams, InputSurroundParams, InputTextParams,
-    InputUnsurroundParams, SurroundTarget, UndoResult,
+    BufferOnlyParams, CountedEditParams, EditResult, InputMoveLinesParams, InputOpenLineParams,
+    InputSurroundParams, InputTextParams, InputUnsurroundParams, LineSide, SurroundTarget,
+    UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -202,6 +203,31 @@ pub async fn project_activate(
     });
 
     tracing::info!(%client_id, project = %params.name, "client activated project");
+    drop(s);
+
+    // Composite post-step (docs/protocol-composites.md, C): open the landing buffer — the
+    // project's MRU buffer, or a fresh transient scratch on a first visit — in the same
+    // round-trip. Mirrors the convention every client implemented by hand.
+    let opened = if params.open_last {
+        Some(
+            buffer_open(
+                state,
+                ctx,
+                BufferOpenParams {
+                    buffer_id: last_buffer_id,
+                    transient: if last_buffer_id.is_none() {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     Ok(ProjectActivateResult {
         project: ProjectInfo {
@@ -209,6 +235,7 @@ pub async fn project_activate(
             paths: entry_paths,
         },
         last_buffer_id,
+        opened,
     })
 }
 
@@ -289,6 +316,7 @@ pub async fn project_create(
             paths: Vec::new(),
         },
         last_buffer_id: None,
+        opened: None,
     })
 }
 
@@ -719,6 +747,86 @@ pub async fn buffer_open(
     ctx: &mut ConnectionCtx,
     params: BufferOpenParams,
 ) -> Result<BufferOpenResult, RpcError> {
+    // Composite pre-step (docs/protocol-composites.md, A): record the jump origin onto this
+    // client's nav history — `nav/record` folded in, so result-style opens are one round-trip.
+    if let Some(from) = params.record_nav_from {
+        let mut s = state.lock().await;
+        if let Some(entry) = nav_entry_for(&s, ctx.client_id, from) {
+            s.nav_history
+                .entry(ctx.client_id)
+                .or_default()
+                .record(entry);
+        }
+    }
+    let prime = params.prime_search.clone();
+    let mut result = buffer_open_inner(state, ctx, params).await?;
+    // Composite post-step: prime the opened buffer's search, anchored at the just-jumped
+    // cursor so the first match at-or-after lands SELECTED (a grep jump selects the match).
+    // The result's cursor is patched to the selection so clients adopt it directly.
+    if let Some(query) = prime.filter(|q| !q.is_empty()) {
+        if let Some(cursor) = prime_search_for(state, ctx, result.buffer_id, &query).await {
+            result.cursor = cursor;
+        }
+    }
+    Ok(result)
+}
+
+/// The `prime_search` post-step of [`buffer_open`]: a `search/set` anchored at the
+/// post-open cursor (the `jump_to` hit), so the match lands selected — the anchored prime
+/// the TUI/web grep flows always used. Errors are dropped (an invalid pattern simply
+/// doesn't prime); the summary goes out as a `search/state_changed` push since the prime
+/// rides another method's response. Returns the post-prime cursor (the selection).
+async fn prime_search_for(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    buffer_id: BufferId,
+    query: &str,
+) -> Option<CursorState> {
+    let anchor = {
+        let s = state.lock().await;
+        s.cursors
+            .get(&(ctx.client_id, buffer_id))
+            .copied()
+            .unwrap_or_default()
+            .position
+    };
+    let r = search_set(
+        state,
+        ctx,
+        SearchSetParams {
+            buffer_id,
+            query: query.to_string(),
+            anchor: Some(anchor),
+            extend: false,
+            from_selection: false,
+        },
+    )
+    .await
+    .ok()?;
+    let push = {
+        let s = state.lock().await;
+        s.clients.get(&ctx.client_id).map(|session| {
+            (
+                session.outbound.clone(),
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: SearchStateChanged::NAME.into(),
+                    params: serde_json::to_value(&r.summary).unwrap_or(serde_json::Value::Null),
+                },
+            )
+        })
+    };
+    if let Some((sender, notif)) = push {
+        let _ = sender.send(notif).await;
+    }
+    Some(r.cursor)
+}
+
+async fn buffer_open_inner(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOpenParams,
+) -> Result<BufferOpenResult, RpcError> {
     // `Option` wrapping is vestigial — every connected client has an id now (assigned at WS
     // accept). Kept locally so the surrounding code (which threads cursor/scroll lookups through
     // `Option<ClientId>`) stays unchanged.
@@ -1021,7 +1129,10 @@ pub async fn git_blame_line(
         .get(&params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     if buf.canonical_path.is_none() {
-        return Ok(GitBlameLineResult { blame: None }); // scratch buffer
+        return Ok(GitBlameLineResult {
+            blame: None,
+            commit_info: None,
+        }); // scratch buffer
     }
     let revision = buf.revision;
 
@@ -1049,7 +1160,17 @@ pub async fn git_blame_line(
         .git_blame
         .get(&params.buffer_id)
         .and_then(|c| c.lines.get(params.line as usize).cloned().flatten());
-    Ok(GitBlameLineResult { blame })
+    // Composite post-step (docs/protocol-composites.md, G): resolve the commit's details in
+    // the same round-trip. Best-effort, like `git/commit_info`.
+    let commit_info = match &blame {
+        Some(b) if params.include_commit_info && !b.is_uncommitted => s
+            .git_baseline
+            .get(&params.buffer_id)
+            .and_then(|base| base.repo.as_ref())
+            .and_then(|repo| crate::git::commit_info(repo, &b.commit)),
+        _ => None,
+    };
+    Ok(GitBlameLineResult { blame, commit_info })
 }
 
 /// Full details for a single commit (the blame "commit details" popover). Best-effort: a buffer
@@ -2175,7 +2296,7 @@ pub fn compute_search_entry(buf: &Buffer, query: &str) -> Result<SearchEntry, Rp
 pub async fn search_set(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: SearchSetParams,
+    mut params: SearchSetParams,
 ) -> Result<SearchSetResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -2186,6 +2307,27 @@ pub async fn search_set(
     let key = (client_id, params.buffer_id);
 
     let mut cursor = s.cursors.get(&key).copied().unwrap_or_default();
+    // Composite pre-step (docs/protocol-composites.md, H): derive the query from the
+    // selection — `Alt-/` searches the selected text literally. Empty selection = no-op.
+    let mut effective_query = None;
+    if params.from_selection {
+        let (start, end) = scope_range(buf, &cursor, CopyScope::Selection);
+        let text = buf.text.slice(start..end).to_string();
+        if text.is_empty() {
+            return Ok(SearchSetResult {
+                cursor: wrap_for_response(&s, client_id, params.buffer_id, cursor),
+                summary: SearchSummary {
+                    buffer_id: params.buffer_id,
+                    total: 0,
+                    truncated: false,
+                    current_index: 0,
+                },
+                query: None,
+            });
+        }
+        params.query = regex::escape(&text);
+        effective_query = Some(params.query.clone());
+    }
     let (summary, pushes) = if params.query.is_empty() {
         s.searches.remove(&key);
         let summary = SearchSummary {
@@ -2245,7 +2387,11 @@ pub async fn search_set(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    Ok(SearchSetResult { cursor, summary })
+    Ok(SearchSetResult {
+        cursor,
+        summary,
+        query: effective_query,
+    })
 }
 
 /// First match at-or-after `pos`, falling back to the first match in the buffer (a wrap). Returns
@@ -2289,14 +2435,43 @@ pub async fn search_next(
     ctx: &mut ConnectionCtx,
     params: SearchNavParams,
 ) -> Result<SearchNavResult, RpcError> {
-    search_navigate(
-        state,
-        ctx,
-        params.buffer_id,
-        Direction::Forward,
-        params.extend,
-    )
-    .await
+    search_navigate_counted(state, ctx, params, Direction::Forward).await
+}
+
+/// Shared `search/next`+`search/prev` wrapper handling the composite params
+/// (docs/protocol-composites.md, I): optional query revive first (skipping the step when it
+/// has no matches — same early-out the clients used), then `count` steps.
+async fn search_navigate_counted(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: SearchNavParams,
+    direction: Direction,
+) -> Result<SearchNavResult, RpcError> {
+    if let Some(query) = params.set_query.clone() {
+        let set = search_set(
+            state,
+            ctx,
+            SearchSetParams {
+                buffer_id: params.buffer_id,
+                query,
+                anchor: None,
+                extend: false,
+                from_selection: false,
+            },
+        )
+        .await?;
+        if set.summary.total == 0 {
+            return Ok(SearchNavResult {
+                cursor: set.cursor,
+                summary: set.summary,
+            });
+        }
+    }
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        last = Some(search_navigate(state, ctx, params.buffer_id, direction, params.extend).await?);
+    }
+    Ok(last.expect("count.max(1) iterations"))
 }
 
 pub async fn search_prev(
@@ -2304,14 +2479,7 @@ pub async fn search_prev(
     ctx: &mut ConnectionCtx,
     params: SearchNavParams,
 ) -> Result<SearchNavResult, RpcError> {
-    search_navigate(
-        state,
-        ctx,
-        params.buffer_id,
-        Direction::Backward,
-        params.extend,
-    )
-    .await
+    search_navigate_counted(state, ctx, params, Direction::Backward).await
 }
 
 async fn search_navigate(
@@ -2869,7 +3037,27 @@ pub async fn buffer_close(
         let _ = sender.send(notif).await;
     }
     tracing::info!(buffer_id = params.buffer_id, "buffer closed");
-    Ok(aether_protocol::buffer::BufferCloseResult { next_buffer_id })
+    // Composite post-step (docs/protocol-composites.md, B): attach the client to its next
+    // buffer (or a fresh scratch) in the same round-trip.
+    let opened = if params.open_next {
+        Some(
+            buffer_open(
+                state,
+                ctx,
+                BufferOpenParams {
+                    buffer_id: next_buffer_id,
+                    ..Default::default()
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    Ok(aether_protocol::buffer::BufferCloseResult {
+        next_buffer_id,
+        opened,
+    })
 }
 
 // ---- nav (jump list) ----------------------------------------------------------------------------
@@ -2946,6 +3134,8 @@ async fn navigate_to(
         // transient so walking the jump list doesn't re-accumulate buffers. No effect when the
         // buffer is still open (an open never demotes).
         transient: Some(true),
+        record_nav_from: None,
+        prime_search: None,
     };
     let mut result = buffer_open(state, ctx, open_params).await?;
 
@@ -4947,6 +5137,11 @@ pub async fn cursor_move(
             new_virtual_col = target_vcol;
             pos
         }
+        // Selection-edge motions read the whole selection (anchor + cursor), which
+        // `resolve_motion` doesn't see — dispatch to the dedicated resolver.
+        Motion::SelectionEdge { edge } => {
+            motion::resolve_selection_edge(buf, current.position, current.anchor, *edge)
+        }
         _ => motion::resolve_motion(buf, current.position, &params.motion),
     };
     // Extending: keep the current anchor (which may already equal position, i.e. a point).
@@ -5002,6 +5197,19 @@ pub async fn cursor_select_line(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: CursorSelectLineParams,
+) -> Result<CursorState, RpcError> {
+    // The repeat loop lives server-side (`3x` = one round-trip).
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        last = Some(cursor_select_line_once(state, ctx, &params).await?);
+    }
+    Ok(last.expect("count.max(1) iterations"))
+}
+
+async fn cursor_select_line_once(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: &CursorSelectLineParams,
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -5172,6 +5380,25 @@ pub async fn cursor_undo(
     ctx: &mut ConnectionCtx,
     params: CursorUndoParams,
 ) -> Result<CursorUndoResult, RpcError> {
+    // The repeat loop lives server-side, stopping once the history is exhausted (the
+    // `applied: false` result is returned so the client still learns the final state).
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        let r = cursor_undo_once(state, ctx, &params).await?;
+        let applied = r.applied;
+        last = Some(r);
+        if !applied {
+            break;
+        }
+    }
+    Ok(last.expect("count.max(1) iterations"))
+}
+
+async fn cursor_undo_once(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: &CursorUndoParams,
+) -> Result<CursorUndoResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if !s.buffers.contains_key(&params.buffer_id) {
@@ -5212,6 +5439,25 @@ pub async fn cursor_redo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: CursorUndoParams,
+) -> Result<CursorUndoResult, RpcError> {
+    // The repeat loop lives server-side, stopping once the history is exhausted (the
+    // `applied: false` result is returned so the client still learns the final state).
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        let r = cursor_redo_once(state, ctx, &params).await?;
+        let applied = r.applied;
+        last = Some(r);
+        if !applied {
+            break;
+        }
+    }
+    Ok(last.expect("count.max(1) iterations"))
+}
+
+async fn cursor_redo_once(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: &CursorUndoParams,
 ) -> Result<CursorUndoResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -5255,6 +5501,24 @@ pub async fn cursor_expand(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: CursorBufferOnlyParams,
+) -> Result<CursorState, RpcError> {
+    // Repeat server-side, stopping once the cursor stops changing (top of the tree /
+    // single node — repeated presses are a no-op, not an error).
+    let mut last: Option<CursorState> = None;
+    for _ in 0..params.count.max(1) {
+        let r = cursor_expand_once(state, ctx, &params).await?;
+        if last == Some(r) {
+            break;
+        }
+        last = Some(r);
+    }
+    Ok(last.expect("count.max(1) iterations"))
+}
+
+async fn cursor_expand_once(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: &CursorBufferOnlyParams,
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -5324,6 +5588,24 @@ pub async fn cursor_contract(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: CursorBufferOnlyParams,
+) -> Result<CursorState, RpcError> {
+    // Repeat server-side, stopping once the cursor stops changing (top of the tree /
+    // single node — repeated presses are a no-op, not an error).
+    let mut last: Option<CursorState> = None;
+    for _ in 0..params.count.max(1) {
+        let r = cursor_contract_once(state, ctx, &params).await?;
+        if last == Some(r) {
+            break;
+        }
+        last = Some(r);
+    }
+    Ok(last.expect("count.max(1) iterations"))
+}
+
+async fn cursor_contract_once(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: &CursorBufferOnlyParams,
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -5432,6 +5714,28 @@ pub async fn input_text(
     params: InputTextParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
+    // Composite pre-step (docs/protocol-composites.md, D): collapse to the requested
+    // selection edge before inserting — the same state changes as a `cursor/set`.
+    if let Some(edge) = params.at {
+        let mut s = state.lock().await;
+        let buf = s
+            .buffers
+            .get(&params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let key = (client_id, params.buffer_id);
+        let current = s.cursors.get(&key).copied().unwrap_or_default();
+        let pos = motion::resolve_selection_edge(buf, current.position, current.anchor, edge);
+        let collapsed = CursorState {
+            position: pos,
+            anchor: pos,
+            match_bracket: None,
+            grep_position: None,
+        };
+        s.cursors.insert(key, collapsed);
+        s.record_motion(key, current, collapsed);
+        s.virtual_col.remove(&key);
+        s.clear_tree_selection_history(client_id, params.buffer_id);
+    }
     apply_edit(
         state,
         client_id,
@@ -5447,16 +5751,15 @@ pub async fn input_text(
 pub async fn input_delete(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: BufferOnlyParams,
+    params: CountedEditParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
-    apply_edit(
-        state,
-        client_id,
-        params.buffer_id,
-        EditKind::DeleteSelection,
-    )
-    .await
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        last =
+            Some(apply_edit(state, client_id, params.buffer_id, EditKind::DeleteSelection).await?);
+    }
+    Ok(last.expect("count.max(1) iterations"))
 }
 
 pub async fn input_backspace(
@@ -5564,25 +5867,127 @@ pub async fn input_unsurround(
 pub async fn input_undo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: BufferOnlyParams,
+    params: CountedEditParams,
 ) -> Result<UndoResult, RpcError> {
-    apply_undo_or_redo(state, ctx, params.buffer_id, UndoDirection::Undo).await
+    undo_redo_counted(state, ctx, params, UndoDirection::Undo).await
 }
 
 pub async fn input_redo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: BufferOnlyParams,
+    params: CountedEditParams,
 ) -> Result<UndoResult, RpcError> {
-    apply_undo_or_redo(state, ctx, params.buffer_id, UndoDirection::Redo).await
+    undo_redo_counted(state, ctx, params, UndoDirection::Redo).await
+}
+
+/// `3u`: step the undo/redo stack `count` times, stopping early once it's exhausted (the
+/// `applied: false` result is returned so the client still learns the final state).
+async fn undo_redo_counted(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CountedEditParams,
+    direction: UndoDirection,
+) -> Result<UndoResult, RpcError> {
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        let r = apply_undo_or_redo(state, ctx, params.buffer_id, direction).await?;
+        let applied = r.applied;
+        last = Some(r);
+        if !applied {
+            break;
+        }
+    }
+    Ok(last.expect("count.max(1) iterations"))
 }
 
 pub async fn input_indent(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: BufferOnlyParams,
+    params: CountedEditParams,
 ) -> Result<EditResult, RpcError> {
-    apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Indent).await
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        last = Some(apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Indent).await?);
+    }
+    Ok(last.expect("count.max(1) iterations"))
+}
+
+/// `input/open_line` — the open-line chains (cursor-park, edit, land) composed server-side
+/// from the same handlers the clients used to call in sequence, so undo grouping, pushes,
+/// and cursor stamping are identical (docs/protocol-composites.md, E).
+pub async fn input_open_line(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: InputOpenLineParams,
+) -> Result<EditResult, RpcError> {
+    let line = {
+        let s = state.lock().await;
+        if !s.buffers.contains_key(&params.buffer_id) {
+            return Err(RpcError::buffer_not_found(params.buffer_id));
+        }
+        s.cursors
+            .get(&(ctx.client_id, params.buffer_id))
+            .copied()
+            .unwrap_or_default()
+            .position
+            .line
+    };
+    let park = |col: u32| {
+        let target = LogicalPosition { line, col };
+        CursorSetParams {
+            buffer_id: params.buffer_id,
+            position: target,
+            anchor: target,
+            granularity: Granularity::Char,
+        }
+    };
+    match params.side {
+        LineSide::Below => {
+            // Park at the line's end, then newline + smart indent; stay there.
+            cursor_set(state, ctx, park(u32::MAX)).await?;
+            input_newline_and_indent(
+                state,
+                ctx,
+                BufferOnlyParams {
+                    buffer_id: params.buffer_id,
+                },
+            )
+            .await
+        }
+        LineSide::Above => {
+            // Park at col 0, insert "\n" (pushes the line down), step back up.
+            cursor_set(state, ctx, park(0)).await?;
+            let r = input_text(
+                state,
+                ctx,
+                InputTextParams {
+                    buffer_id: params.buffer_id,
+                    text: "\n".into(),
+                    select_pasted: false,
+                    at: None,
+                },
+            )
+            .await?;
+            let cursor = cursor_move(
+                state,
+                ctx,
+                CursorMoveParams {
+                    buffer_id: params.buffer_id,
+                    motion: Motion::LogicalLine {
+                        direction: Direction::Backward,
+                        count: 1,
+                        preserve_col: false,
+                    },
+                    extend_selection: false,
+                },
+            )
+            .await?;
+            Ok(EditResult {
+                revision: r.revision,
+                cursor,
+            })
+        }
+    }
 }
 
 pub async fn input_newline_and_indent(
@@ -6440,9 +6845,13 @@ fn shift_cursor_by_line_map(
 pub async fn input_dedent(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: BufferOnlyParams,
+    params: CountedEditParams,
 ) -> Result<EditResult, RpcError> {
-    apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Dedent).await
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        last = Some(apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Dedent).await?);
+    }
+    Ok(last.expect("count.max(1) iterations"))
 }
 
 #[derive(Clone, Copy)]
@@ -6630,6 +7039,19 @@ pub async fn input_move_lines(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: InputMoveLinesParams,
+) -> Result<EditResult, RpcError> {
+    // The repeat loop lives server-side.
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        last = Some(input_move_lines_once(state, ctx, &params).await?);
+    }
+    Ok(last.expect("count.max(1) iterations"))
+}
+
+async fn input_move_lines_once(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: &InputMoveLinesParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
     let buffer_id = params.buffer_id;
@@ -6838,7 +7260,20 @@ fn swap_segments(top: &str, bottom: &str) -> String {
 pub async fn input_join_lines(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: BufferOnlyParams,
+    params: CountedEditParams,
+) -> Result<EditResult, RpcError> {
+    // The repeat loop lives server-side (`3J` = one round-trip).
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        last = Some(input_join_lines_once(state, ctx, &params).await?);
+    }
+    Ok(last.expect("count.max(1) iterations"))
+}
+
+async fn input_join_lines_once(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: &CountedEditParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
     let buffer_id = params.buffer_id;
@@ -7018,6 +7453,7 @@ pub async fn input_join_lines(
     })
 }
 
+#[derive(Clone, Copy)]
 enum UndoDirection {
     Undo,
     Redo,
@@ -8788,13 +9224,48 @@ pub async fn picker_grep_navigate(
         Direction::Backward => find_prev_grep_hit(hits, current_key_ref, min_edge),
     };
     let query = picker.query.clone();
-    Ok(target.map(|c| PickerGrepNavigateTarget {
-        path: c.abs_path.clone(),
-        position: LogicalPosition {
-            line: c.line,
-            col: c.col,
-        },
-        query: query.clone(),
+    let target = target.map(|c| {
+        (
+            c.path_index,
+            c.relative_path.clone(),
+            c.abs_path.clone(),
+            LogicalPosition {
+                line: c.line,
+                col: c.col,
+            },
+        )
+    });
+    drop(s);
+    let Some((path_index, relative_path, path, position)) = target else {
+        return Ok(None);
+    };
+    // Composite post-step (docs/protocol-composites.md, J): open the hit — transient, at
+    // the hit position, jump origin recorded, search primed — in the same round-trip.
+    let opened = if params.open {
+        Some(
+            buffer_open(
+                state,
+                ctx,
+                BufferOpenParams {
+                    path_index: Some(path_index),
+                    relative_path: Some(relative_path),
+                    jump_to: Some(position),
+                    transient: Some(true),
+                    record_nav_from: Some(params.buffer_id),
+                    prime_search: Some(query.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    Ok(Some(PickerGrepNavigateTarget {
+        path,
+        position,
+        query,
+        opened,
     }))
 }
 

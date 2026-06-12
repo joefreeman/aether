@@ -1,14 +1,11 @@
 //! Effects — what core logic asks its shell to do. The core mutates its own state and
-//! returns these; the shell executes them (spawning futures on its runtime, presenting
-//! toasts, touching the clipboard) and feeds resulting events back into the core.
-//!
-//! Generic over the event type `E` so logic can migrate into the core piecemeal: shell code
-//! mid-migration produces `Effects<Message>`, core code produces `Effects<Event>` — the
-//! shell maps the latter back through its bridge variant.
+//! returns these; the shell executes them (performing RPC requests, presenting toasts,
+//! touching the clipboard) and feeds outcomes back into the core. Pure data: the core is
+//! sans-IO — it never constructs futures, so the whole surface is inspectable and the
+//! update loop unit-testable with canned results (docs/client-core.md).
 
 use super::keymap::Action;
 use super::session::{HoverText, PasteKind};
-use futures_util::future::BoxFuture;
 
 /// Web-client toast kinds; the colour of the toast's accent bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,9 +16,16 @@ pub enum ToastKind {
     Success,
 }
 
-pub enum Effect<E> {
-    /// Run a future on the shell's executor; feed the produced event back into update.
-    Spawn(BoxFuture<'static, E>),
+pub enum Effect {
+    /// Perform this JSON-RPC call and feed the outcome back through
+    /// `Session::on_rpc_result` with the same token. Requests are performed in emission
+    /// order on the single connection — sequenced flows rely on it. (The sans-IO
+    /// replacement for `Spawn`-ing an RPC future; docs/client-core.md.)
+    Request {
+        token: u64,
+        method: &'static str,
+        params: serde_json::Value,
+    },
     /// Show a transient message (display duration and styling are the shell's).
     Toast(String, ToastKind),
     /// Put text on the system clipboard.
@@ -51,7 +55,9 @@ pub enum Effect<E> {
     PickerScrollReset,
     /// Dial the server again after this attempt's backoff (the mechanism — discovery, the
     /// socket — is the shell's; the core owns the policy that asked for it).
-    Reconnect { attempt: u32 },
+    Reconnect {
+        attempt: u32,
+    },
     /// Quit the application.
     Exit,
     /// Read the system clipboard; the text comes back as `Event::ClipboardRead`.
@@ -63,19 +69,15 @@ pub enum Effect<E> {
 
 /// An ordered batch of effects, with builder conveniences mirroring how `iced::Task` reads
 /// at the call sites it replaces.
-pub struct Effects<E>(pub Vec<Effect<E>>);
+pub struct Effects(pub Vec<Effect>);
 
-impl<E> Effects<E> {
+impl Effects {
     pub fn none() -> Self {
         Effects(Vec::new())
     }
 
-    pub fn one(e: Effect<E>) -> Self {
+    pub fn one(e: Effect) -> Self {
         Effects(vec![e])
-    }
-
-    pub fn spawn(fut: impl std::future::Future<Output = E> + Send + 'static) -> Self {
-        Effects::one(Effect::Spawn(Box::pin(fut)))
     }
 
     pub fn toast(message: impl Into<String>, kind: ToastKind) -> Self {
@@ -87,13 +89,13 @@ impl<E> Effects<E> {
     }
 
     #[allow(dead_code)] // exercised as more update arms migrate into core
-    pub fn push(&mut self, e: Effect<E>) {
+    pub fn push(&mut self, e: Effect) {
         self.0.push(e);
     }
 
     /// Append `other`'s effects after this batch's (the `Task::batch` analogue).
     #[allow(dead_code)] // exercised as more update arms migrate into core
-    pub fn and(mut self, other: Effects<E>) -> Self {
+    pub fn and(mut self, other: Effects) -> Self {
         self.0.extend(other.0);
         self
     }

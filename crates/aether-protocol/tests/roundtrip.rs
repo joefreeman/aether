@@ -5,7 +5,7 @@
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Granularity,
-    Motion, WordBoundary,
+    Motion, SelectionEdge, WordBoundary,
 };
 use aether_protocol::directory::{
     DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryList,
@@ -56,6 +56,7 @@ fn request_roundtrip() {
         params: Some(
             to_value(ProjectActivateParams {
                 name: "aether".into(),
+                open_last: false,
             })
             .unwrap(),
         ),
@@ -92,9 +93,13 @@ fn git_blame_line_params_shape() {
     let p = GitBlameLineParams {
         buffer_id: 3,
         line: 41,
+        include_commit_info: false,
     };
     let v = to_value(&p).unwrap();
-    assert_eq!(v, json!({"buffer_id": 3, "line": 41}));
+    assert_eq!(
+        v,
+        json!({"buffer_id": 3, "line": 41, "include_commit_info": false})
+    );
     assert_eq!(GitBlameLine::NAME, "git/blame_line");
 }
 
@@ -108,6 +113,7 @@ fn git_blame_line_result_roundtrip() {
             timestamp: 1_700_000_000,
             is_uncommitted: false,
         }),
+        commit_info: None,
     };
     let v = to_value(&committed).unwrap();
     assert_eq!(v["blame"]["commit"], "a1b2c3d");
@@ -119,7 +125,10 @@ fn git_blame_line_result_roundtrip() {
     let back: GitBlameLineResult = from_value(v).unwrap();
     assert_eq!(back.blame.unwrap().author, "Ada");
 
-    let none = GitBlameLineResult { blame: None };
+    let none = GitBlameLineResult {
+        blame: None,
+        commit_info: None,
+    };
     assert_eq!(to_value(&none).unwrap(), json!({"blame": null}));
 }
 
@@ -387,6 +396,12 @@ fn motion_is_internally_tagged() {
     let v = to_value(&m).unwrap();
     assert_eq!(v, json!({"kind": "line_start"}));
 
+    let m = Motion::SelectionEdge {
+        edge: SelectionEdge::AfterEnd,
+    };
+    let v = to_value(&m).unwrap();
+    assert_eq!(v, json!({"kind": "selection_edge", "edge": "after_end"}));
+
     let m = Motion::LogicalLineFirstNonblank {
         direction: Direction::Forward,
         count: 3,
@@ -501,6 +516,7 @@ fn search_set_params() {
         query: "foo".into(),
         anchor: Some(LogicalPosition { line: 2, col: 5 }),
         extend: true,
+        from_selection: false,
     })
     .unwrap();
     assert_eq!(
@@ -510,6 +526,7 @@ fn search_set_params() {
             "query": "foo",
             "anchor": {"line": 2, "col": 5},
             "extend": true,
+            "from_selection": false,
         })
     );
 
@@ -526,6 +543,7 @@ fn input_text_params() {
         buffer_id: 1,
         text: "hi".into(),
         select_pasted: false,
+        at: None,
     })
     .unwrap();
     assert_eq!(
@@ -946,6 +964,7 @@ fn project_activate_result_wraps_info() {
             paths: vec!["/p".into()],
         },
         last_buffer_id: None,
+        opened: None,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["project"]["name"], "aether");
@@ -1091,6 +1110,7 @@ fn project_activate_result_includes_last_buffer_id_when_set() {
             paths: vec!["/p".into()],
         },
         last_buffer_id: Some(7),
+        opened: None,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["last_buffer_id"], 7);
@@ -1107,6 +1127,7 @@ fn buffer_open_scratch_form() {
         language: Some("rust".into()),
         create_if_missing: false,
         jump_to: None,
+        ..Default::default()
     })
     .unwrap();
     assert_eq!(v["path_index"], serde_json::Value::Null);
@@ -1835,6 +1856,7 @@ fn buffer_open_params_buffer_id_skipped_when_none() {
         language: None,
         create_if_missing: false,
         jump_to: None,
+        ..Default::default()
     };
     let v = to_value(&p).unwrap();
     assert!(v.get("buffer_id").is_none());
@@ -1852,6 +1874,7 @@ fn buffer_open_params_buffer_id_round_trips() {
         language: None,
         create_if_missing: false,
         jump_to: None,
+        ..Default::default()
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["buffer_id"], 11);
@@ -1868,6 +1891,7 @@ fn buffer_open_params_jump_to_skipped_when_none() {
         language: None,
         create_if_missing: false,
         jump_to: None,
+        ..Default::default()
     };
     let v = to_value(&p).unwrap();
     assert!(v.get("jump_to").is_none());
@@ -1884,6 +1908,7 @@ fn buffer_open_params_jump_to_round_trips() {
         language: None,
         create_if_missing: false,
         jump_to: Some(LogicalPosition { line: 7, col: 13 }),
+        ..Default::default()
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["jump_to"], json!({"line": 7, "col": 13}));
@@ -1940,6 +1965,7 @@ fn buffer_open_params_transient_shape() {
         language: None,
         create_if_missing: false,
         jump_to: None,
+        ..Default::default()
     };
     let v = to_value(&p).unwrap();
     assert!(

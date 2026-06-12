@@ -182,6 +182,9 @@ pub enum Message {
     },
     ToastExpired(u64),
     /// Fire-and-forget RPC completed (e.g. `search/clear`); result ignored.
+    /// An RPC outcome for a core-issued `Effect::Request` (the token routes it back to
+    /// the parked mapping in the session).
+    RpcResult(u64, Result<serde_json::Value, crate::connection::RpcError>),
     Noop,
     /// Frame tick while a smooth scroll is in flight.
     AnimTick(std::time::Instant),
@@ -598,22 +601,18 @@ impl App {
         let handle = boot.handle.clone();
         Task::perform(
             async move {
+                // One composite: activate + land on the project's MRU buffer (or a fresh
+                // transient scratch on first visit).
                 let activated = handle
-                    .rpc::<ProjectActivate>(ProjectActivateParams { name })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let open = handle
-                    .rpc::<BufferOpen>(BufferOpenParams {
-                        buffer_id: activated.last_buffer_id,
-                        transient: if activated.last_buffer_id.is_none() {
-                            Some(true)
-                        } else {
-                            None
-                        },
-                        ..Default::default()
+                    .rpc::<ProjectActivate>(ProjectActivateParams {
+                        name,
+                        open_last: true,
                     })
                     .await
                     .map_err(|e| e.to_string())?;
+                let open = activated
+                    .opened
+                    .ok_or_else(|| "project/activate returned no landing buffer".to_string())?;
                 Ok(Box::new((activated.project, open)))
             },
             Message::SessionReady,
@@ -789,8 +788,7 @@ impl App {
             }
 
             Message::Core(ev) => {
-                let t = self.transport();
-                let fx = self.session.on_event(ev, &t);
+                let fx = self.session.on_event(ev);
                 self.run_core(fx)
             }
 
@@ -816,8 +814,7 @@ impl App {
                 self.picker_scroll_y = y;
                 match p.scrolled_refetch(crate::picker::first_visible_row(y)) {
                     Some(offset) => {
-                        let t = self.transport();
-                        let fx = self.session.picker_refetch(&t, offset);
+                        let fx = self.session.picker_refetch(offset);
                         self.run_core(fx)
                     }
                     None => Task::none(),
@@ -827,6 +824,10 @@ impl App {
             Message::ToastExpired(id) => {
                 self.toasts.retain(|t| t.id != id);
                 Task::none()
+            }
+            Message::RpcResult(token, result) => {
+                let fx = self.session.on_rpc_result(token, result);
+                self.run_core(fx)
             }
             Message::Noop => Task::none(),
 
@@ -845,13 +846,11 @@ impl App {
             }
 
             Message::Notified(Some(n)) => {
-                let t = self.transport();
-                let fx = self.session.on_event(CoreEvent::ServerPush(n), &t);
+                let fx = self.session.on_event(CoreEvent::ServerPush(n));
                 Task::batch([self.run_core(fx), pump(self.notifications.clone())])
             }
             Message::Notified(None) => {
-                let t = self.transport();
-                let fx = self.session.on_event(CoreEvent::ConnectionLost, &t);
+                let fx = self.session.on_event(CoreEvent::ConnectionLost);
                 self.run_core(fx)
             }
 
@@ -863,25 +862,19 @@ impl App {
                 self.server_started_at = r.server_started_at;
                 self.handle = r.handle;
                 self.notifications = r.notifications.clone();
-                let t = self.transport();
-                let fx = self.session.on_event(
-                    CoreEvent::Reestablished {
-                        project: r.project,
-                        open: r.open,
-                        restarted,
-                    },
-                    &t,
-                );
+                let fx = self.session.on_event(CoreEvent::Reestablished {
+                    project: r.project,
+                    open: r.open,
+                    restarted,
+                });
                 Task::batch([pump(r.notifications), self.run_core(fx)])
             }
             Message::Reconnected(Err(ReconnectError::NotUp)) => {
-                let t = self.transport();
-                let fx = self.session.on_event(CoreEvent::ReconnectRetry, &t);
+                let fx = self.session.on_event(CoreEvent::ReconnectRetry);
                 self.run_core(fx)
             }
             Message::Reconnected(Err(ReconnectError::Fatal(e))) => {
-                let t = self.transport();
-                let fx = self.session.on_event(CoreEvent::ReconnectFatal(e), &t);
+                let fx = self.session.on_event(CoreEvent::ReconnectFatal(e));
                 self.run_core(fx)
             }
             // Boot-only message that slipped past a finished boot — nothing to do.
@@ -914,12 +907,11 @@ impl App {
 
     /// Execute a batch of core effects: futures spawn onto iced's executor with their events
     /// routed back through the bridge; presentation effects run against shell state.
-    fn run_core(&mut self, fx: Effects<CoreEvent>) -> Task<Message> {
+    fn run_core(&mut self, fx: Effects) -> Task<Message> {
         let mut tasks = Vec::new();
         for e in fx.0 {
             match e {
-                Effect::Spawn(fut) => tasks.push(Task::perform(fut, Message::Core)),
-                Effect::Toast(message, kind) => tasks.push(self.toast(message, kind)),
+                                Effect::Toast(message, kind) => tasks.push(self.toast(message, kind)),
                 Effect::WriteClipboard(text) => tasks.push(iced::clipboard::write(text)),
                 Effect::RevealCursor => tasks.push(self.ensure_cursor_visible()),
                 Effect::Resubscribe => {
@@ -954,6 +946,16 @@ impl App {
                     self.clamp_scroll();
                     self.reveal_cursor();
                 }
+                Effect::Request {
+                    token,
+                    method,
+                    params,
+                } => {
+                    // Enqueue NOW (Handle::call sends synchronously) so requests hit the
+                    // wire in effect-emission order; only the response ride is async.
+                    let fut = self.handle.call(method, params);
+                    tasks.push(Task::perform(fut, move |r| Message::RpcResult(token, r)));
+                }
                 Effect::RevealPickerSelection(reveal) => {
                     tasks.push(self.picker_reveal_selected_with(reveal));
                 }
@@ -976,12 +978,6 @@ impl App {
             }
         }
         Task::batch(tasks)
-    }
-
-    /// The session's transport as the core sees it (a fresh `Arc` per dispatch is fine —
-    /// `Handle` is a channel sender).
-    fn transport(&self) -> crate::core::transport::SharedTransport {
-        std::sync::Arc::new(self.handle.clone())
     }
 
     // ---- editor (widget) events ------------------------------------------------------------
@@ -1052,8 +1048,7 @@ impl App {
                     return Task::none();
                 }
                 if self.session.picker.is_some() {
-                    let t = self.transport();
-                    let fx = self.session.close_picker(&t);
+                    let fx = self.session.close_picker();
                     return self.run_core(fx);
                 }
                 let Some(window) = &self.session.window else {
@@ -1120,8 +1115,7 @@ impl App {
             }
         }
         let visible_rows = self.visible_rows();
-        let t = self.transport();
-        let fx = self.session.on_key(&t, code, mods, text, visible_rows);
+        let fx = self.session.on_key(code, mods, text, visible_rows);
         self.run_core(fx)
     }
 
@@ -1242,7 +1236,7 @@ impl App {
                     .await
                     .map_err(|_| ReconnectError::NotUp)?;
                 let activated = handle
-                    .rpc::<ProjectActivate>(ProjectActivateParams { name: project })
+                    .rpc::<ProjectActivate>(ProjectActivateParams { name: project, open_last: false })
                     .await
                     .map_err(|e| ReconnectError::Fatal(e.to_string()))?;
                 let params = match &path {
@@ -1468,7 +1462,13 @@ impl App {
             self.session.blame = None; // stale line's text shouldn't linger while the request flies
         }
         let buffer_id = self.session.buffer.buffer_id;
-        self.rpc::<GitBlameLine>(GitBlameLineParams { buffer_id, line }, move |result| {
+        self.rpc::<GitBlameLine>(
+            GitBlameLineParams {
+                buffer_id,
+                line,
+                include_commit_info: false,
+            },
+            move |result| {
             // Format here: "3w ago" needs a clock, which the core deliberately lacks.
             let text = result.ok().and_then(|r| r.blame).map(|b| {
                 if b.is_uncommitted {

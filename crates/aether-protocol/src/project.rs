@@ -4,6 +4,7 @@
 
 use crate::envelope::RpcMethod;
 use crate::BufferId;
+use crate::buffer::BufferOpenResult;
 use serde::{Deserialize, Serialize};
 
 /// Enumerate configured projects (the `*.toml` files under `$XDG_CONFIG_HOME/aether/projects/`).
@@ -43,6 +44,12 @@ impl RpcMethod for ProjectActivate {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectActivateParams {
     pub name: String,
+    /// Also open the landing buffer — the project's `last_buffer_id` when there is one, a
+    /// fresh *transient* scratch otherwise — and return it in `opened`. The bootstrap
+    /// convention (activate, then land somewhere) folded into one round-trip
+    /// (docs/protocol-composites.md, C).
+    #[serde(default)]
+    pub open_last: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +62,9 @@ pub struct ProjectActivateResult {
     /// buffer you last had open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_buffer_id: Option<BufferId>,
+    /// With `open_last`: the landing buffer, fully opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened: Option<BufferOpenResult>,
 }
 
 /// Describes the active project: its name and absolute root paths. Returned by

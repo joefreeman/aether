@@ -10,8 +10,8 @@ use aether_protocol::buffer::{
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
     CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
-    CursorUndoParams, CursorUndoResult, Direction, Granularity, Motion, VerticalDirection,
-    WordBoundary,
+    CursorUndoParams, CursorUndoResult, Direction, Granularity, Motion, SelectionEdge,
+    VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
@@ -21,10 +21,12 @@ use aether_protocol::git::{
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
+    CountedEditParams,
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
     InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
     InputUnsurround, InputUnsurroundParams, SurroundTarget, UndoResult,
+    InputOpenLine, InputOpenLineParams, LineSide,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -175,6 +177,7 @@ async fn hello_then_open_file() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -193,6 +196,7 @@ async fn hello_then_open_file() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -218,6 +222,7 @@ async fn hello_then_open_file() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -248,6 +253,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -263,6 +269,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -327,6 +334,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -362,6 +370,7 @@ async fn buffer_open_isolates_scroll_per_client() {
             1,
             &ProjectActivateParams {
                 name: "test-proj".into(),
+                open_last: false,
             },
         )
         .await;
@@ -376,6 +385,7 @@ async fn buffer_open_isolates_scroll_per_client() {
                 language: None,
                 create_if_missing: false,
                 jump_to: None,
+                ..Default::default()
             },
         )
         .await;
@@ -440,6 +450,7 @@ async fn buffer_open_isolates_scroll_per_client() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -454,6 +465,7 @@ async fn buffer_open_isolates_scroll_per_client() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -539,6 +551,7 @@ async fn rejects_path_outside_project() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -557,6 +570,7 @@ async fn rejects_path_outside_project() {
                 language: None,
                 create_if_missing: false,
                 jump_to: None,
+                ..Default::default()
             })
             .unwrap(),
         ),
@@ -591,6 +605,7 @@ async fn viewport_subscribe_renders_window() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -606,6 +621,7 @@ async fn viewport_subscribe_renders_window() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -660,6 +676,7 @@ async fn viewport_subscribe_wraps_long_line() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -674,6 +691,7 @@ async fn viewport_subscribe_wraps_long_line() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -743,6 +761,7 @@ async fn viewport_scroll_returns_new_window() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -757,6 +776,7 @@ async fn viewport_scroll_returns_new_window() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -825,6 +845,7 @@ async fn setup_with_buffer(
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -839,6 +860,7 @@ async fn setup_with_buffer(
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -884,6 +906,581 @@ async fn cursor_starts_at_origin_and_moves_by_char() {
     assert_eq!(st.position, LogicalPosition { line: 1, col: 2 });
 
     drop(server);
+}
+
+#[tokio::test]
+async fn buffer_open_composite_records_nav_and_primes_search() {
+    // docs/protocol-composites.md, A: `record_nav_from` + `prime_search` fold the old
+    // NavRecord -> BufferOpen -> SearchSet client chain into one open.
+    let (_server, mut ws, origin_id) = setup_with_buffer("alpha beta\n").await;
+
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            relative_path: Some("other.txt".into()),
+            path_index: Some(0),
+            create_if_missing: true,
+            record_nav_from: Some(origin_id),
+            prime_search: Some("nd".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_ne!(opened.buffer_id, origin_id);
+
+    // The search was primed: stepping works without a prior search/set. ("nd" has no match
+    // in an empty created buffer — prime a buffer with content instead via reopening the
+    // origin.) The primed state exists even with zero matches; total reflects it.
+    let nav: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id: opened.buffer_id,
+            extend: false,
+            count: 1,
+            set_query: None,
+        },
+    )
+    .await;
+    assert_eq!(nav.summary.total, 0, "primed query has no match in the empty buffer");
+
+    // The origin was recorded: nav/back from the new buffer returns to it.
+    let back: NavStepResult = send_request::<NavBack>(
+        &mut ws,
+        12,
+        &NavStepParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
+    let landed = back.target.expect("nav history has the recorded origin");
+    assert_eq!(landed.buffer_id, origin_id);
+
+    // Prime against real content: reopen the new buffer recording origin again, priming
+    // with a query that matches the ORIGIN buffer? No — prime applies to the OPENED buffer.
+    // Open the origin (has "alpha beta") with a matching prime and step onto a hit.
+    let reopened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        13,
+        &BufferOpenParams {
+            buffer_id: Some(origin_id),
+            prime_search: Some("beta".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(reopened.buffer_id, origin_id);
+    // The anchored prime SELECTS the match: "beta" spans cols 6..=9 of "alpha beta".
+    assert_eq!(reopened.cursor.anchor, LogicalPosition { line: 0, col: 6 });
+    assert_eq!(reopened.cursor.position, LogicalPosition { line: 0, col: 9 });
+    let nav: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        14,
+        &SearchNavParams {
+            buffer_id: origin_id,
+            extend: false,
+            count: 1,
+            set_query: None,
+        },
+    )
+    .await;
+    assert_eq!(nav.summary.total, 1);
+    assert_eq!(nav.cursor.position, LogicalPosition { line: 0, col: 9 });
+}
+
+#[tokio::test]
+async fn buffer_close_open_next_attaches_in_one_trip() {
+    // docs/protocol-composites.md, B: closing with `open_next` returns the successor fully
+    // opened — the MRU buffer when one exists, a fresh scratch when none remain.
+    let (_server, mut ws, first) = setup_with_buffer("one\n").await;
+    let second: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            relative_path: Some("two.txt".into()),
+            path_index: Some(0),
+            create_if_missing: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Closing the second falls back to the first (MRU successor).
+    let closed: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        11,
+        &BufferCloseParams {
+            buffer_id: second.buffer_id,
+            open_next: true,
+        },
+    )
+    .await;
+    let opened = closed.opened.expect("open_next returns the successor");
+    assert_eq!(opened.buffer_id, first);
+    assert_eq!(closed.next_buffer_id, Some(first));
+
+    // Closing the last buffer opens a fresh scratch.
+    let closed: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        12,
+        &BufferCloseParams {
+            buffer_id: first,
+            open_next: true,
+        },
+    )
+    .await;
+    let opened = closed.opened.expect("open_next opens a scratch when none remain");
+    assert_eq!(closed.next_buffer_id, None);
+    assert!(opened.path.is_none(), "fresh scratch has no path");
+    assert!(opened.scratch_number.is_some());
+}
+
+#[tokio::test]
+async fn project_activate_open_last_lands_in_one_trip() {
+    // docs/protocol-composites.md, C: activate + land (MRU buffer, or a fresh transient
+    // scratch on first visit) in one message.
+    let (_server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
+
+    // Re-activating with open_last reattaches to the MRU buffer.
+    let r: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        10,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+            open_last: true,
+        },
+    )
+    .await;
+    assert_eq!(r.last_buffer_id, Some(buffer_id));
+    let opened = r.opened.expect("open_last returns the landing buffer");
+    assert_eq!(opened.buffer_id, buffer_id);
+
+    // First visit (no MRU): a fresh TRANSIENT scratch.
+    send_request::<BufferClose>(
+        &mut ws,
+        11,
+        &BufferCloseParams {
+            buffer_id,
+            open_next: false,
+        },
+    )
+    .await;
+    let r: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        12,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+            open_last: true,
+        },
+    )
+    .await;
+    assert_eq!(r.last_buffer_id, None);
+    let opened = r.opened.expect("open_last opens a scratch on first visit");
+    assert!(opened.path.is_none());
+    assert!(opened.transient, "first-visit scratch is a transient placeholder");
+}
+
+#[tokio::test]
+async fn input_text_at_selection_start_inserts_before() {
+    // docs/protocol-composites.md, D: paste-before's collapse rides the edit itself.
+    let (_server, mut ws, buffer_id) = setup_with_buffer("abcde\n").await;
+    // Select "bcd" (cursor on 'd', anchor on 'b').
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputText>(
+        &mut ws,
+        11,
+        &InputTextParams {
+            buffer_id,
+            text: "XY".into(),
+            select_pasted: true,
+            at: Some(SelectionEdge::Start),
+        },
+    )
+    .await;
+    // Inserted BEFORE 'b' — nothing replaced — with the pasted text selected.
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "aXYbcde\n");
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 1 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
+}
+
+#[tokio::test]
+async fn input_open_line_below_and_above() {
+    // docs/protocol-composites.md, E: vim's o/O as one edit. Below smart-indents; Above
+    // opens an unindented line and lands on it.
+    let (_server, mut ws, buffer_id) = setup_with_buffer("    indented\nplain\n").await;
+    // Cursor mid-line-0 (col 6); `o` opens below with the line's indent copied.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 6 },
+            anchor: LogicalPosition { line: 0, col: 6 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputOpenLine>(
+        &mut ws,
+        11,
+        &InputOpenLineParams {
+            buffer_id,
+            side: LineSide::Below,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "    indented\n    \nplain\n");
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
+
+    // `O` above the (now) "plain" line: pushes it down, lands at col 0 of the new line.
+    send_request::<CursorSet>(
+        &mut ws,
+        13,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 2, col: 3 },
+            anchor: LogicalPosition { line: 2, col: 3 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputOpenLine>(
+        &mut ws,
+        14,
+        &InputOpenLineParams {
+            buffer_id,
+            side: LineSide::Above,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 15, buffer_id).await,
+        "    indented\n    \n\nplain\n"
+    );
+    assert_eq!(r.cursor.position, LogicalPosition { line: 2, col: 0 });
+}
+
+#[tokio::test]
+async fn git_blame_line_include_commit_info_resolves_in_one_trip() {
+    // docs/protocol-composites.md, G: the blame-then-commit-lookup chain in one message.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "tracked.rs", "fn main() {}\n");
+    let server = spawn_for_test("blame-composite-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "blame-composite-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("tracked.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let r: GitBlameLineResult = send_request::<GitBlameLine>(
+        &mut ws,
+        3,
+        &GitBlameLineParams {
+            buffer_id: open.buffer_id,
+            line: 0,
+            include_commit_info: true,
+        },
+    )
+    .await;
+    let blame = r.blame.expect("committed line blames");
+    assert!(!blame.is_uncommitted);
+    let info = r.commit_info.expect("details resolved in the same trip");
+    assert_eq!(info.message.trim(), "init commit");
+
+    // An uncommitted line never gets details, even when asked.
+    send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: open.buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+            at: None,
+        },
+    )
+    .await;
+    let r: GitBlameLineResult = send_request::<GitBlameLine>(
+        &mut ws,
+        5,
+        &GitBlameLineParams {
+            buffer_id: open.buffer_id,
+            line: 0,
+            include_commit_info: true,
+        },
+    )
+    .await;
+    assert!(r.blame.expect("blame exists").is_uncommitted);
+    assert!(r.commit_info.is_none());
+}
+
+#[tokio::test]
+async fn search_set_from_selection_escapes_and_echoes() {
+    // docs/protocol-composites.md, H: Alt-/ in one trip — the server takes the selection's
+    // text, regex-escapes it, sets the search, and echoes the effective query.
+    let (_server, mut ws, buffer_id) = setup_with_buffer("a.c x\na.c y\nabc z\n").await;
+    // Select "a.c" on line 0 (chars 0..=2) — the dot must match literally, not as a regex.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        11,
+        &SearchSetParams {
+            buffer_id,
+            query: String::new(),
+            anchor: None,
+            extend: false,
+            from_selection: true,
+        },
+    )
+    .await;
+    assert_eq!(r.query.as_deref(), Some("a\\.c"));
+    assert_eq!(r.summary.total, 2, "literal a.c matches twice, NOT abc");
+
+    // Empty selection (point cursor on the blank end) → nothing set, query None.
+    send_request::<CursorSet>(
+        &mut ws,
+        12,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 3, col: 0 },
+            anchor: LogicalPosition { line: 3, col: 0 },
+        },
+    )
+    .await;
+    let r: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        13,
+        &SearchSetParams {
+            buffer_id,
+            query: String::new(),
+            anchor: None,
+            extend: false,
+            from_selection: true,
+        },
+    )
+    .await;
+    assert_eq!(r.query, None);
+}
+
+#[tokio::test]
+async fn search_nav_count_and_revive() {
+    // docs/protocol-composites.md, I: `3n` and the history-revive both ride one nav RPC.
+    let (_server, mut ws, buffer_id) = setup_with_buffer("x a x b x c\n").await;
+    // count: step two matches forward in one trip (cursor starts on the first x, so two
+    // steps land on the third; wrapping semantics untouched).
+    let r: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        10,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+            count: 2,
+            set_query: Some("x".into()),
+        },
+    )
+    .await;
+    assert_eq!(r.summary.total, 3);
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 8 }, "third x");
+
+    // Reviving a query with no matches: the step is skipped, zero summary comes back.
+    let r: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        11,
+        &SearchNavParams {
+            buffer_id,
+            extend: false,
+            count: 1,
+            set_query: Some("zzz".into()),
+        },
+    )
+    .await;
+    assert_eq!(r.summary.total, 0);
+}
+
+#[tokio::test]
+async fn counted_edits_run_server_side() {
+    // docs/protocol-composites.md, K: the count loops live server-side — one trip each.
+    let (_server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\nd\n").await;
+
+    // 3J from line 0 joins three times: "a b c d".
+    let r: EditResult = send_request::<InputJoinLines>(
+        &mut ws,
+        10,
+        &CountedEditParams {
+            buffer_id,
+            count: 3,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 11, buffer_id).await, "a b c d\n");
+    assert!(r.revision > 0);
+
+    // Counted undo larger than the stack: stops when exhausted (applied: false comes back),
+    // buffer fully reverted.
+    let r: UndoResult = send_request::<InputUndo>(
+        &mut ws,
+        12,
+        &CountedEditParams {
+            buffer_id,
+            count: 10,
+        },
+    )
+    .await;
+    assert!(!r.applied, "the last step hit the stack bottom");
+    assert_eq!(buffer_text(&mut ws, 13, buffer_id).await, "a\nb\nc\nd\n");
+
+    // Counted select-line without extend: each press selects the NEXT whole line, so
+    // count 2 lands the selection on line 1 (same as two presses did client-side).
+    let st: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        14,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+            count: 2,
+        },
+    )
+    .await;
+    assert_eq!(st.anchor, LogicalPosition { line: 1, col: 0 });
+    assert_eq!(st.position.line, 1, "whole line 1 selected");
+
+    // Counted move-lines: the selected line ("b") rides down two rows in one trip.
+    let r: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        15,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            count: 2,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 16, buffer_id).await, "a\nc\nd\nb\n");
+    assert_eq!(r.cursor.position.line, 3);
+}
+
+#[tokio::test]
+async fn cursor_move_selection_edges() {
+    // Line 0: "  aé cd" — 'a' at byte col 2, 'é' spans cols 3–4 (2 bytes), line len 8.
+    let (_server, mut ws, buffer_id) = setup_with_buffer("  a\u{e9} cd\nxy z\n\nend\n").await;
+
+    // The selection runs from 'é' (line 0) to 'x' (line 1), built with the CURSOR on the
+    // earlier endpoint — the resolver must order the endpoints itself.
+    let select = CursorSetParams {
+        granularity: Granularity::Char,
+        buffer_id,
+        position: LogicalPosition { line: 0, col: 3 },
+        anchor: LogicalPosition { line: 1, col: 0 },
+    };
+    let edge_move = |edge| CursorMoveParams {
+        buffer_id,
+        motion: Motion::SelectionEdge { edge },
+        extend_selection: false,
+    };
+    let cases = [
+        (SelectionEdge::Start, LogicalPosition { line: 0, col: 3 }),
+        // One char past 'x' — the append position.
+        (SelectionEdge::AfterEnd, LogicalPosition { line: 1, col: 1 }),
+        // Line 0's first non-blank is 'a' at byte col 2.
+        (
+            SelectionEdge::FirstLineNonblank,
+            LogicalPosition { line: 0, col: 2 },
+        ),
+        // One past line 1's last char ("xy z" → col 4) — the end-of-line caret slot.
+        (SelectionEdge::LastLineEnd, LogicalPosition { line: 1, col: 4 }),
+    ];
+    let mut id = 10;
+    for (edge, want) in cases {
+        send_request::<CursorSet>(&mut ws, id, &select).await;
+        let st: CursorState =
+            send_request::<CursorMove>(&mut ws, id + 1, &edge_move(edge)).await;
+        assert_eq!(st.position, want, "{edge:?}");
+        assert_eq!(st.anchor, want, "{edge:?} collapses to a point");
+        id += 2;
+    }
+
+    // AfterEnd advances by CHARS, not bytes: a selection ending on the 2-byte 'é' lands on
+    // the space at byte col 5, not mid-char.
+    send_request::<CursorSet>(
+        &mut ws,
+        id,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 3 },
+        },
+    )
+    .await;
+    let st: CursorState =
+        send_request::<CursorMove>(&mut ws, id + 1, &edge_move(SelectionEdge::AfterEnd)).await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
+
+    // A point cursor on the empty line: every edge degenerates sensibly.
+    let point = CursorSetParams {
+        granularity: Granularity::Char,
+        buffer_id,
+        position: LogicalPosition { line: 2, col: 0 },
+        anchor: LogicalPosition { line: 2, col: 0 },
+    };
+    let degenerate = [
+        (SelectionEdge::Start, LogicalPosition { line: 2, col: 0 }),
+        // One past the empty line's newline = the start of "end".
+        (SelectionEdge::AfterEnd, LogicalPosition { line: 3, col: 0 }),
+        (
+            SelectionEdge::FirstLineNonblank,
+            LogicalPosition { line: 2, col: 0 },
+        ),
+        (SelectionEdge::LastLineEnd, LogicalPosition { line: 2, col: 0 }),
+    ];
+    id += 2;
+    for (edge, want) in degenerate {
+        send_request::<CursorSet>(&mut ws, id, &point).await;
+        let st: CursorState =
+            send_request::<CursorMove>(&mut ws, id + 1, &edge_move(edge)).await;
+        assert_eq!(st.position, want, "{edge:?} from a point on the empty line");
+        id += 2;
+    }
 }
 
 #[tokio::test]
@@ -1222,6 +1819,7 @@ async fn input_text_inserts_and_pushes_notification() {
             buffer_id,
             text: "XY".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -1305,6 +1903,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1319,6 +1918,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -1380,6 +1980,7 @@ async fn match_bracket_motion_jumps_to_pair() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1394,6 +1995,7 @@ async fn match_bracket_motion_jumps_to_pair() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -1455,6 +2057,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1469,6 +2072,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -1518,6 +2122,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1532,6 +2137,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -1580,6 +2186,7 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1594,6 +2201,7 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -1658,6 +2266,7 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1672,6 +2281,7 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -1720,6 +2330,7 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1734,6 +2345,7 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -1785,6 +2397,7 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1799,6 +2412,7 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -1835,8 +2449,9 @@ async fn end_of_unit_extend_then_delete_removes_whole_function() {
     let _: EditResult = send_request::<InputDelete>(
         &mut ws,
         5,
-        &BufferOnlyParams {
+        &CountedEditParams {
             buffer_id: open.buffer_id,
+            count: 1,
         },
     )
     .await;
@@ -1876,6 +2491,7 @@ async fn end_of_unit_works_on_last_function() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1890,6 +2506,7 @@ async fn end_of_unit_works_on_last_function() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -1942,6 +2559,7 @@ async fn start_of_unit_extends_back_to_function_start() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -1956,6 +2574,7 @@ async fn start_of_unit_extends_back_to_function_start() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2007,6 +2626,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2021,6 +2641,7 @@ async fn repeated_end_of_unit_walks_through_adjacent_units() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2110,6 +2731,7 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2124,6 +2746,7 @@ async fn repeated_start_of_unit_walks_backward_through_adjacent_units() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2186,6 +2809,7 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2200,6 +2824,7 @@ async fn end_of_unit_outside_any_unit_jumps_to_next_unit_end() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2252,6 +2877,7 @@ async fn nav_motion_jumps_between_top_level_rust_items() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2266,6 +2892,7 @@ async fn nav_motion_jumps_between_top_level_rust_items() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2327,6 +2954,7 @@ async fn nav_motion_prev_walks_backward() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2341,6 +2969,7 @@ async fn nav_motion_prev_walks_backward() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2389,6 +3018,7 @@ async fn nav_motion_noop_at_end_of_file() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2403,6 +3033,7 @@ async fn nav_motion_noop_at_end_of_file() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2455,6 +3086,7 @@ async fn nav_motion_inside_python_class_finds_next_method() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2469,6 +3101,7 @@ async fn nav_motion_inside_python_class_finds_next_method() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2521,6 +3154,7 @@ async fn nav_motion_from_last_method_stays_in_class() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2535,6 +3169,7 @@ async fn nav_motion_from_last_method_stays_in_class() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2590,6 +3225,7 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2604,6 +3240,7 @@ async fn nav_motion_at_python_class_header_jumps_to_next_top_level() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2653,6 +3290,7 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2667,6 +3305,7 @@ async fn nav_motion_inside_html_head_jumps_between_elements() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2752,6 +3391,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2766,6 +3406,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2822,6 +3463,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2836,6 +3478,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2891,6 +3534,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             buffer_id: open.buffer_id,
             text: "!".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -2938,6 +3582,7 @@ async fn save_preserves_crlf_endings() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -2952,6 +3597,7 @@ async fn save_preserves_crlf_endings() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -2995,6 +3641,7 @@ async fn save_scratch_returns_buffer_has_no_path() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -3009,6 +3656,7 @@ async fn save_scratch_returns_buffer_has_no_path() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -3214,6 +3862,7 @@ async fn input_text_with_select_pasted_makes_selection() {
             buffer_id,
             text: "XYZ".into(),
             select_pasted: true,
+            at: None,
         },
     )
     .await;
@@ -3265,6 +3914,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
             buffer_id,
             text: "XY".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -3274,7 +3924,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     // Undo: should revert "XY", cursor back to col 3, and (since saved_revision is 0) the
     // revision drops to 0 — client derives `dirty == false` from that.
     let undo: UndoResult =
-        send_request::<InputUndo>(&mut ws, 13, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputUndo>(&mut ws, 13, &CountedEditParams { buffer_id, count: 1 }).await;
     assert!(undo.applied);
     assert_eq!(undo.cursor.position, LogicalPosition { line: 0, col: 3 });
     assert_eq!(undo.revision, 0, "undo back to saved revision");
@@ -3287,7 +3937,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
 
     // Redo: re-applies "XY", revision advances past saved.
     let redo: UndoResult =
-        send_request::<InputRedo>(&mut ws, 14, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputRedo>(&mut ws, 14, &CountedEditParams { buffer_id, count: 1 }).await;
     assert!(redo.applied);
     assert!(redo.revision > 0);
     let notif =
@@ -3304,7 +3954,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
 async fn undo_on_empty_stack_returns_applied_false() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hi\n").await;
     let r: UndoResult =
-        send_request::<InputUndo>(&mut ws, 10, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputUndo>(&mut ws, 10, &CountedEditParams { buffer_id, count: 1 }).await;
     assert!(!r.applied);
     drop(server);
 }
@@ -3351,6 +4001,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -3378,7 +4029,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
 
     // Undo: should put "X" back, taking us back to the saved revision → derived dirty == false.
     let undo: UndoResult =
-        send_request::<InputUndo>(&mut ws, 15, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputUndo>(&mut ws, 15, &CountedEditParams { buffer_id, count: 1 }).await;
     assert!(undo.applied);
     assert_eq!(
         undo.revision, save.revision,
@@ -3541,7 +4192,7 @@ async fn join_lines_collapses_lines_with_single_space() {
     )
     .await;
     let r: EditResult =
-        send_request::<InputJoinLines>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputJoinLines>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
     assert!(r.revision > 0);
     let notif =
         expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
@@ -3614,6 +4265,7 @@ async fn input_text_with_selection_replaces_it() {
             buffer_id,
             text: "DELTA".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -3663,6 +4315,7 @@ async fn select_line_forward_picks_current_then_advances_at_end() {
             buffer_id,
             direction: Direction::Forward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3677,6 +4330,7 @@ async fn select_line_forward_picks_current_then_advances_at_end() {
             buffer_id,
             direction: Direction::Forward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3710,6 +4364,7 @@ async fn select_line_forward_at_end_of_line_no_anchor_picks_current_line() {
             buffer_id,
             direction: Direction::Forward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3745,6 +4400,7 @@ async fn select_line_forward_on_empty_line_advances() {
             buffer_id,
             direction: Direction::Forward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3781,6 +4437,7 @@ async fn select_line_forward_extend_on_empty_line_includes_it() {
             buffer_id,
             direction: Direction::Forward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -3814,6 +4471,7 @@ async fn select_line_backward_on_empty_line_walks_up() {
             buffer_id,
             direction: Direction::Backward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3849,6 +4507,7 @@ async fn select_line_backward_from_point_picks_line_above_then_walks_up() {
             buffer_id,
             direction: Direction::Backward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3863,6 +4522,7 @@ async fn select_line_backward_from_point_picks_line_above_then_walks_up() {
             buffer_id,
             direction: Direction::Backward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3895,6 +4555,7 @@ async fn select_line_backward_walks_up_via_anchor_on_repeat() {
             buffer_id,
             direction: Direction::Backward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3909,6 +4570,7 @@ async fn select_line_backward_walks_up_via_anchor_on_repeat() {
             buffer_id,
             direction: Direction::Backward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3923,6 +4585,7 @@ async fn select_line_backward_walks_up_via_anchor_on_repeat() {
             buffer_id,
             direction: Direction::Backward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3955,6 +4618,7 @@ async fn select_line_forward_extend_walks_cursor_down() {
             buffer_id,
             direction: Direction::Forward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -3967,6 +4631,7 @@ async fn select_line_forward_extend_walks_cursor_down() {
             buffer_id,
             direction: Direction::Forward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -3981,6 +4646,7 @@ async fn select_line_forward_extend_walks_cursor_down() {
             buffer_id,
             direction: Direction::Forward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -4013,6 +4679,7 @@ async fn select_line_backward_extend_walks_anchor_up() {
             buffer_id,
             direction: Direction::Forward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -4025,6 +4692,7 @@ async fn select_line_backward_extend_walks_anchor_up() {
             buffer_id,
             direction: Direction::Backward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -4039,6 +4707,7 @@ async fn select_line_backward_extend_walks_anchor_up() {
             buffer_id,
             direction: Direction::Backward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -4071,6 +4740,7 @@ async fn select_line_after_swap_preserves_backward_orientation() {
             buffer_id,
             direction: Direction::Forward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -4087,6 +4757,7 @@ async fn select_line_after_swap_preserves_backward_orientation() {
             buffer_id,
             direction: Direction::Forward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -4120,6 +4791,7 @@ async fn select_line_backward_from_point_on_first_line_clamps() {
             buffer_id,
             direction: Direction::Backward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -4154,6 +4826,7 @@ async fn select_line_backward_on_partial_selection_snaps_to_top_edge() {
             buffer_id,
             direction: Direction::Backward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -4189,6 +4862,7 @@ async fn select_line_backward_extend_from_point_jumps_to_line_above() {
             buffer_id,
             direction: Direction::Backward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -4203,6 +4877,7 @@ async fn select_line_backward_extend_from_point_jumps_to_line_above() {
             buffer_id,
             direction: Direction::Backward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -4237,6 +4912,7 @@ async fn select_line_snaps_partial_selection_to_whole_lines() {
             buffer_id,
             direction: Direction::Forward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -4272,6 +4948,7 @@ async fn select_line_snaps_partial_selection_when_cursor_at_line_end() {
             buffer_id,
             direction: Direction::Forward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -4286,6 +4963,7 @@ async fn select_line_snaps_partial_selection_when_cursor_at_line_end() {
             buffer_id,
             direction: Direction::Forward,
             extend: true,
+            count: 1,
         },
     )
     .await;
@@ -4423,13 +5101,13 @@ async fn motion_undo_restores_previous_cursor() {
 
     // Undo: back to (1,2).
     let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 12, &CursorUndoParams { buffer_id }).await;
+        send_request::<CursorUndo>(&mut ws, 12, &CursorUndoParams { buffer_id, count: 1 }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
 
     // Undo again: back to the initial (0, 0).
     let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id }).await;
+        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id, count: 1 }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
 
@@ -4453,11 +5131,11 @@ async fn motion_undo_then_redo_round_trips() {
     .await;
 
     // Undo → back to (0, 0).
-    send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id }).await;
+    send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id, count: 1 }).await;
 
     // Redo → forward to (1, 3).
     let r: CursorUndoResult =
-        send_request::<CursorRedo>(&mut ws, 12, &CursorUndoParams { buffer_id }).await;
+        send_request::<CursorRedo>(&mut ws, 12, &CursorUndoParams { buffer_id, count: 1 }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 3 });
 
@@ -4469,7 +5147,7 @@ async fn motion_undo_returns_not_applied_when_stack_empty() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n").await;
 
     let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 10, &CursorUndoParams { buffer_id }).await;
+        send_request::<CursorUndo>(&mut ws, 10, &CursorUndoParams { buffer_id, count: 1 }).await;
     assert!(!r.applied);
     // Cursor unchanged.
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
@@ -4513,12 +5191,13 @@ async fn motion_undo_stack_cleared_by_mutation() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
 
     let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id }).await;
+        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id, count: 1 }).await;
     assert!(!r.applied, "motion stack should be empty after a mutation");
 
     drop(server);
@@ -4540,7 +5219,7 @@ async fn motion_redo_cleared_by_new_motion() {
     )
     .await;
     // Undo populates redo.
-    send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id }).await;
+    send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id, count: 1 }).await;
     // New motion should clear the redo stack.
     send_request::<CursorSet>(
         &mut ws,
@@ -4555,7 +5234,7 @@ async fn motion_redo_cleared_by_new_motion() {
     .await;
 
     let r: CursorUndoResult =
-        send_request::<CursorRedo>(&mut ws, 13, &CursorUndoParams { buffer_id }).await;
+        send_request::<CursorRedo>(&mut ws, 13, &CursorUndoParams { buffer_id, count: 1 }).await;
     assert!(
         !r.applied,
         "redo stack should be empty after a fresh motion"
@@ -4588,6 +5267,7 @@ async fn motion_undo_records_select_line_and_swap() {
             buffer_id,
             direction: Direction::Forward,
             extend: false,
+            count: 1,
         },
     )
     .await;
@@ -4598,14 +5278,14 @@ async fn motion_undo_records_select_line_and_swap() {
 
     // Undo the swap.
     let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id }).await;
+        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id, count: 1 }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 0 });
 
     // Undo the select_line.
     let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 14, &CursorUndoParams { buffer_id }).await;
+        send_request::<CursorUndo>(&mut ws, 14, &CursorUndoParams { buffer_id, count: 1 }).await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
     assert_eq!(r.cursor.anchor, r.cursor.position);
@@ -5280,6 +5960,7 @@ async fn virtual_col_cleared_by_mutation() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -5396,6 +6077,7 @@ async fn move_lines_swaps_with_neighbor_below() {
         &InputMoveLinesParams {
             buffer_id,
             direction: VerticalDirection::Down,
+            count: 1,
         },
     )
     .await;
@@ -5428,6 +6110,7 @@ async fn move_lines_swaps_with_neighbor_above() {
         &InputMoveLinesParams {
             buffer_id,
             direction: VerticalDirection::Up,
+            count: 1,
         },
     )
     .await;
@@ -5459,6 +6142,7 @@ async fn move_lines_moves_whole_selection() {
         &InputMoveLinesParams {
             buffer_id,
             direction: VerticalDirection::Down,
+            count: 1,
         },
     )
     .await;
@@ -5479,6 +6163,7 @@ async fn move_lines_at_top_is_noop_up() {
         &InputMoveLinesParams {
             buffer_id,
             direction: VerticalDirection::Up,
+            count: 1,
         },
     )
     .await;
@@ -5509,6 +6194,7 @@ async fn move_lines_at_bottom_is_noop_down() {
         &InputMoveLinesParams {
             buffer_id,
             direction: VerticalDirection::Down,
+            count: 1,
         },
     )
     .await;
@@ -5541,6 +6227,7 @@ async fn move_lines_preserves_missing_trailing_newline() {
         &InputMoveLinesParams {
             buffer_id,
             direction: VerticalDirection::Up,
+            count: 1,
         },
     )
     .await;
@@ -5568,7 +6255,7 @@ async fn indent_single_line_adds_two_spaces() {
     )
     .await;
     let r: EditResult =
-        send_request::<InputIndent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputIndent>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
     // Cursor follows the inserted indent.
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 5 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
@@ -5592,7 +6279,7 @@ async fn dedent_strips_two_spaces() {
     )
     .await;
     let r: EditResult =
-        send_request::<InputDedent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputDedent>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "alpha\nbeta\n");
@@ -5615,7 +6302,7 @@ async fn indent_multi_line_selection() {
     )
     .await;
     let r: EditResult =
-        send_request::<InputIndent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputIndent>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
     // Anchor and cursor both shift +2 since both lines were indented.
     assert_eq!(r.cursor.position, LogicalPosition { line: 2, col: 2 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
@@ -5641,7 +6328,7 @@ async fn dedent_line_without_indent_is_noop_for_that_line() {
     )
     .await;
     let r: EditResult =
-        send_request::<InputDedent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputDedent>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
     // Line 0 lost 2 chars, line 1 unchanged.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 1 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
@@ -5655,7 +6342,7 @@ async fn dedent_line_without_indent_is_noop_for_that_line() {
 async fn dedent_with_single_leading_space_strips_one() {
     let (server, mut ws, buffer_id) = setup_with_buffer(" alpha\n").await;
     let r: EditResult =
-        send_request::<InputDedent>(&mut ws, 10, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputDedent>(&mut ws, 10, &CountedEditParams { buffer_id, count: 1 }).await;
     let text = buffer_text(&mut ws, 11, buffer_id).await;
     assert_eq!(text, "alpha\n");
     // Cursor was at (0, 0); dedent removes 1 char, cursor stays at 0 (saturated).
@@ -5708,6 +6395,7 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -5722,6 +6410,7 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -5768,6 +6457,7 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -5782,6 +6472,7 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -5837,6 +6528,7 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -5851,6 +6543,7 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -5894,6 +6587,7 @@ async fn newline_and_indent_engine_python_def() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -5908,6 +6602,7 @@ async fn newline_and_indent_engine_python_def() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -5952,6 +6647,7 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -5966,6 +6662,7 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6008,6 +6705,7 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6022,6 +6720,7 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6035,6 +6734,7 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
             buffer_id,
             text: "func foo() {".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -6092,6 +6792,7 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6106,6 +6807,7 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6152,6 +6854,7 @@ async fn toggle_comment_strips_when_already_commented() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6166,6 +6869,7 @@ async fn toggle_comment_strips_when_already_commented() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6213,6 +6917,7 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6227,6 +6932,7 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6276,6 +6982,7 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6290,6 +6997,7 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6336,6 +7044,7 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6350,6 +7059,7 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6397,6 +7107,7 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6411,6 +7122,7 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6460,6 +7172,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6474,6 +7187,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6525,6 +7239,7 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6539,6 +7254,7 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6590,6 +7306,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6604,6 +7321,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6673,6 +7391,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6687,6 +7406,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6737,6 +7457,7 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6751,6 +7472,7 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6801,6 +7523,7 @@ async fn toggle_comment_round_trip_partial_selection() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6815,6 +7538,7 @@ async fn toggle_comment_round_trip_partial_selection() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6876,6 +7600,7 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6890,6 +7615,7 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6937,6 +7663,7 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -6951,6 +7678,7 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -6998,6 +7726,7 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -7012,6 +7741,7 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -7048,6 +7778,7 @@ async fn toggle_comment_is_noop_for_json() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -7062,6 +7793,7 @@ async fn toggle_comment_is_noop_for_json() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -7095,6 +7827,7 @@ async fn search_set_returns_summary_and_jumps_to_first_match() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7121,6 +7854,7 @@ async fn search_set_extend_grows_selection_from_anchor_through_match() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 4 }),
             extend: true,
+            from_selection: false,
         },
     )
     .await;
@@ -7145,6 +7879,7 @@ async fn search_set_extend_resets_to_match_on_wrap() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 1, col: 4 }),
             extend: true,
+            from_selection: false,
         },
     )
     .await;
@@ -7166,6 +7901,7 @@ async fn search_smartcase_lowercase_is_case_insensitive() {
             query: "foo".into(),
             anchor: None,
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7185,6 +7921,7 @@ async fn search_smartcase_uppercase_is_case_sensitive() {
             query: "Foo".into(),
             anchor: None,
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7204,6 +7941,7 @@ async fn search_regex_metacharacters() {
             query: r"\d+".into(),
             anchor: None,
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7223,6 +7961,7 @@ async fn search_no_matches_returns_zero_summary() {
             query: "zzz".into(),
             anchor: None,
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7244,6 +7983,7 @@ async fn search_empty_query_clears_active_search() {
             query: "alpha".into(),
             anchor: None,
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7255,6 +7995,7 @@ async fn search_empty_query_clears_active_search() {
             query: String::new(),
             anchor: None,
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7274,6 +8015,7 @@ async fn search_next_cycles_forward_and_wraps() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7283,6 +8025,8 @@ async fn search_next_cycles_forward_and_wraps() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7294,6 +8038,8 @@ async fn search_next_cycles_forward_and_wraps() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7305,6 +8051,8 @@ async fn search_next_cycles_forward_and_wraps() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7324,6 +8072,7 @@ async fn search_prev_cycles_backward_with_wrap() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7334,6 +8083,8 @@ async fn search_prev_cycles_backward_with_wrap() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7354,6 +8105,7 @@ async fn search_prev_orients_backward() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 8 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7365,6 +8117,8 @@ async fn search_prev_orients_backward() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7387,6 +8141,7 @@ async fn search_next_wrap_stays_forward_oriented() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 1, col: 0 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7399,6 +8154,8 @@ async fn search_next_wrap_stays_forward_oriented() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7421,6 +8178,7 @@ async fn search_prev_wrap_stays_backward_oriented() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7433,6 +8191,8 @@ async fn search_prev_wrap_stays_backward_oriented() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7458,6 +8218,7 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 8 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7468,6 +8229,8 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7481,6 +8244,8 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7504,6 +8269,7 @@ async fn search_extend_resets_to_single_match_on_wrap() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 4 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7514,6 +8280,8 @@ async fn search_extend_resets_to_single_match_on_wrap() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7523,6 +8291,8 @@ async fn search_extend_resets_to_single_match_on_wrap() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7536,6 +8306,8 @@ async fn search_extend_resets_to_single_match_on_wrap() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7560,6 +8332,7 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7570,6 +8343,8 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7581,6 +8356,8 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7602,6 +8379,7 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7612,6 +8390,8 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7622,6 +8402,8 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7644,6 +8426,7 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7655,6 +8438,8 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7671,6 +8456,8 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7692,6 +8479,7 @@ async fn search_prev_extend_keeps_anchor_and_grows_backward() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 1, col: 0 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7705,6 +8493,8 @@ async fn search_prev_extend_keeps_anchor_and_grows_backward() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7728,6 +8518,7 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
             query: "foo".into(),
             anchor: Some(LogicalPosition { line: 0, col: 8 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7739,6 +8530,8 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7753,6 +8546,8 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
         &SearchNavParams {
             buffer_id,
             extend: true,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7773,6 +8568,7 @@ async fn search_clear_removes_active_search() {
             query: "foo".into(),
             anchor: None,
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -7784,6 +8580,8 @@ async fn search_clear_removes_active_search() {
         &SearchNavParams {
             buffer_id,
             extend: false,
+            count: 1,
+            set_query: None,
         },
     )
     .await;
@@ -7818,6 +8616,7 @@ async fn setup_picker_workspace() -> (
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -8168,6 +8967,7 @@ async fn setup_buffer_picker_workspace() -> (
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -8190,6 +8990,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8204,6 +9005,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8218,6 +9020,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8297,6 +9100,7 @@ async fn buffers_picker_select_returns_buffer_id() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8353,6 +9157,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8369,6 +9174,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8384,6 +9190,7 @@ async fn buffer_open_by_id_attaches_to_scratch() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8411,6 +9218,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8464,6 +9272,7 @@ async fn scratch_number_is_per_project_lowest_unused() {
         language: None,
         create_if_missing: false,
         jump_to: None,
+        ..Default::default()
     };
 
     let s1: BufferOpenResult = send_request::<BufferOpen>(&mut ws, 100, &scratch_params()).await;
@@ -8484,6 +9293,7 @@ async fn scratch_number_is_per_project_lowest_unused() {
         102,
         &BufferCloseParams {
             buffer_id: s1.buffer_id,
+            open_next: false,
         },
     )
     .await;
@@ -8509,6 +9319,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8565,6 +9376,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             buffer_id: opened.buffer_id,
             text: "x".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -8606,6 +9418,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8652,6 +9465,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             buffer_id: opened.buffer_id,
             text: "a".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -8666,6 +9480,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             buffer_id: opened.buffer_id,
             text: "b".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -8704,6 +9519,7 @@ async fn buffers_picker_pushes_on_save() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8732,6 +9548,7 @@ async fn buffers_picker_pushes_on_save() {
             buffer_id: opened.buffer_id,
             text: "z".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -8793,6 +9610,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8807,6 +9625,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8875,6 +9694,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8889,6 +9709,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -8902,6 +9723,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -8962,6 +9784,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -8977,6 +9800,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9005,6 +9829,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             buffer_id: scratch.buffer_id,
             text: "hello world\n".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -9038,6 +9863,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9073,6 +9899,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9088,6 +9915,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9098,6 +9926,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
             buffer_id: scratch.buffer_id,
             text: "in B\n".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -9135,6 +9964,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9174,6 +10004,7 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9189,6 +10020,7 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
             language: None,
             create_if_missing: true,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9211,6 +10043,7 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
             buffer_id: open.buffer_id,
             text: "hello\n".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -9253,6 +10086,7 @@ async fn save_as_creates_missing_parent_directories() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9267,6 +10101,7 @@ async fn save_as_creates_missing_parent_directories() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9277,6 +10112,7 @@ async fn save_as_creates_missing_parent_directories() {
             buffer_id: scratch.buffer_id,
             text: "deep\n".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -9328,6 +10164,7 @@ async fn save_as_does_not_create_dirs_outside_project() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9342,6 +10179,7 @@ async fn save_as_does_not_create_dirs_outside_project() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9384,6 +10222,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9400,6 +10239,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9415,6 +10255,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9459,6 +10300,7 @@ async fn save_as_to_same_path_is_in_place_save() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9473,6 +10315,7 @@ async fn save_as_to_same_path_is_in_place_save() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9501,6 +10344,7 @@ async fn save_as_to_same_path_is_in_place_save() {
             buffer_id: opened.buffer_id,
             text: "y".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -9541,6 +10385,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9557,6 +10402,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9585,6 +10431,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
             buffer_id: scratch.buffer_id,
             text: "fresh\n".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -9650,6 +10497,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9664,6 +10512,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9692,6 +10541,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
             buffer_id: opened.buffer_id,
             text: "x".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -9741,6 +10591,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9755,6 +10606,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9783,6 +10635,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
             buffer_id: scratch.buffer_id,
             text: "one\n".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -9806,6 +10659,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
             buffer_id: scratch.buffer_id,
             text: "two\n".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -9845,6 +10699,7 @@ async fn buffer_close_drops_buffer() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9859,6 +10714,7 @@ async fn buffer_close_drops_buffer() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9873,6 +10729,7 @@ async fn buffer_close_drops_buffer() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9882,6 +10739,7 @@ async fn buffer_close_drops_buffer() {
         4,
         &BufferCloseParams {
             buffer_id: b.buffer_id,
+            open_next: false,
         },
     )
     .await;
@@ -9898,6 +10756,7 @@ async fn buffer_close_drops_buffer() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9926,6 +10785,7 @@ async fn buffer_close_last_buffer_returns_none() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9940,6 +10800,7 @@ async fn buffer_close_last_buffer_returns_none() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -9948,6 +10809,7 @@ async fn buffer_close_last_buffer_returns_none() {
         3,
         &BufferCloseParams {
             buffer_id: opened.buffer_id,
+            open_next: false,
         },
     )
     .await;
@@ -9973,6 +10835,7 @@ async fn buffer_close_drops_viewports() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -9987,6 +10850,7 @@ async fn buffer_close_drops_viewports() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -10013,6 +10877,7 @@ async fn buffer_close_drops_viewports() {
         4,
         &BufferCloseParams {
             buffer_id: opened.buffer_id,
+            open_next: false,
         },
     )
     .await;
@@ -10206,6 +11071,7 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -10221,6 +11087,7 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
             language: None,
             create_if_missing: false,
             jump_to: Some(LogicalPosition { line: 1, col: 2 }),
+            ..Default::default()
         },
     )
     .await;
@@ -10239,6 +11106,7 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -10265,6 +11133,7 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -10281,6 +11150,7 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
             language: None,
             create_if_missing: false,
             jump_to: Some(LogicalPosition { line: 99, col: 99 }),
+            ..Default::default()
         },
     )
     .await;
@@ -10322,6 +11192,7 @@ async fn setup_grep_workspace() -> (
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -10669,6 +11540,7 @@ async fn open_test_buffer(
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -10739,6 +11611,72 @@ async fn set_point_cursor(
 }
 
 #[tokio::test]
+async fn grep_navigate_open_composite_returns_opened_buffer() {
+    // docs/protocol-composites.md, J: `<`/`>` navigates, opens transient at the hit,
+    // records the jump origin, and primes search — one message.
+    let (_server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
+
+    // Backward from main.rs's first hit crosses into lib.rs — a different file, so the
+    // composite opens it.
+    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+        &mut ws,
+        22,
+        &PickerGrepNavigateParams {
+            direction: Direction::Backward,
+            buffer_id,
+            open: true,
+        },
+    )
+    .await;
+    let target = target.expect("hit in earlier file");
+    assert!(target.path.ends_with("src/lib.rs"));
+    let opened = target.opened.expect("composite opens the target");
+    assert_ne!(opened.buffer_id, buffer_id);
+    assert!(opened.transient, "grep jumps open transient previews");
+    // The primed search selects the hit: anchor at its start, head on its last char
+    // ("needle" = 6 chars).
+    assert_eq!(opened.cursor.anchor, target.position, "selection starts at the hit");
+    assert_eq!(
+        opened.cursor.position,
+        LogicalPosition {
+            line: target.position.line,
+            col: target.position.col + 5,
+        },
+        "head on the match's last char"
+    );
+
+    // The opened buffer's search is primed: stepping works immediately.
+    let nav: SearchNavResult = send_request::<SearchNext>(
+        &mut ws,
+        23,
+        &SearchNavParams {
+            buffer_id: opened.buffer_id,
+            extend: false,
+            count: 1,
+            set_query: None,
+        },
+    )
+    .await;
+    assert!(nav.summary.total > 0, "search primed with the grep query");
+
+    // And the origin was recorded: nav/back returns to main.rs.
+    let back: NavStepResult = send_request::<NavBack>(
+        &mut ws,
+        24,
+        &NavStepParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
+    assert_eq!(
+        back.target.expect("origin recorded").buffer_id,
+        buffer_id
+    );
+}
+
+#[tokio::test]
 async fn grep_navigate_forward_within_file_then_falls_through_to_next_file() {
     // Workspace has needle hits at src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4. The walker
     // visits files in path order, so the cached candidates list is in (path, line, col) order.
@@ -10753,6 +11691,7 @@ async fn grep_navigate_forward_within_file_then_falls_through_to_next_file() {
         &PickerGrepNavigateParams {
             direction: Direction::Forward,
             buffer_id,
+            open: false,
         },
     )
     .await;
@@ -10770,6 +11709,7 @@ async fn grep_navigate_forward_within_file_then_falls_through_to_next_file() {
         &PickerGrepNavigateParams {
             direction: Direction::Forward,
             buffer_id,
+            open: false,
         },
     )
     .await;
@@ -10783,6 +11723,7 @@ async fn grep_navigate_forward_within_file_then_falls_through_to_next_file() {
         &PickerGrepNavigateParams {
             direction: Direction::Backward,
             buffer_id,
+            open: false,
         },
     )
     .await;
@@ -10808,6 +11749,7 @@ async fn grep_navigate_virtual_insert_when_current_file_has_no_hits() {
         &PickerGrepNavigateParams {
             direction: Direction::Forward,
             buffer_id,
+            open: false,
         },
     )
     .await;
@@ -10821,6 +11763,7 @@ async fn grep_navigate_virtual_insert_when_current_file_has_no_hits() {
         &PickerGrepNavigateParams {
             direction: Direction::Backward,
             buffer_id,
+            open: false,
         },
     )
     .await;
@@ -10846,6 +11789,7 @@ async fn grep_navigate_returns_none_when_no_cached_grep() {
         &PickerGrepNavigateParams {
             direction: Direction::Forward,
             buffer_id,
+            open: false,
         },
     )
     .await;
@@ -11024,6 +11968,7 @@ async fn search_set_response_carries_grep_position() {
             query: "needle".into(),
             anchor: Some(LogicalPosition { line: 1, col: 4 }),
             extend: false,
+            from_selection: false,
         },
     )
     .await;
@@ -11092,6 +12037,7 @@ async fn grep_navigate_backward_skips_currently_selected_match() {
         &PickerGrepNavigateParams {
             direction: Direction::Backward,
             buffer_id,
+            open: false,
         },
     )
     .await;
@@ -11107,6 +12053,7 @@ async fn grep_navigate_backward_skips_currently_selected_match() {
         &PickerGrepNavigateParams {
             direction: Direction::Forward,
             buffer_id,
+            open: false,
         },
     )
     .await;
@@ -11146,6 +12093,7 @@ async fn setup_explorer_workspace() -> (
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -11376,6 +12324,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -11862,6 +12811,7 @@ async fn directory_create_refuses_outside_project_boundary() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -11993,6 +12943,7 @@ async fn setup_explorer_git_workspace() -> (
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -12208,6 +13159,7 @@ async fn setup_watched_buffer(
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -12222,6 +13174,7 @@ async fn setup_watched_buffer(
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -12277,6 +13230,7 @@ async fn watcher_flags_dirty_buffer_on_external_write() {
             buffer_id,
             text: "x".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -12392,6 +13346,7 @@ async fn connect_and_open_watched(
         1,
         &ProjectActivateParams {
             name: project.into(),
+            open_last: false,
         },
     )
     .await;
@@ -12406,6 +13361,7 @@ async fn connect_and_open_watched(
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -12503,6 +13459,7 @@ async fn save_in_one_project_reloads_other_projects_buffer() {
             buffer_id: buf_a,
             text: "from-a-".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -12558,6 +13515,7 @@ async fn buffer_reload_discards_local_changes() {
             buffer_id,
             text: "local-edit-".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -12655,6 +13613,7 @@ async fn project_activate_returns_info_and_unlocks_buffer_ops() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -12668,6 +13627,7 @@ async fn project_activate_returns_info_and_unlocks_buffer_ops() {
         2,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -12686,6 +13646,7 @@ async fn project_activate_returns_info_and_unlocks_buffer_ops() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -12709,6 +13670,7 @@ async fn project_activate_rejects_unknown_name() {
         1,
         &ProjectActivateParams {
             name: "no-such-project-12345".into(),
+            open_last: false,
         },
     )
     .await;
@@ -12737,6 +13699,7 @@ async fn project_activate_same_project_is_idempotent() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -12751,6 +13714,7 @@ async fn project_activate_same_project_is_idempotent() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -12761,6 +13725,7 @@ async fn project_activate_same_project_is_idempotent() {
         3,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -12778,6 +13743,7 @@ async fn project_activate_same_project_is_idempotent() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -13344,6 +14310,7 @@ async fn git_blame_line_reports_committed_author() {
         1,
         &ProjectActivateParams {
             name: "blame-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -13358,6 +14325,7 @@ async fn git_blame_line_reports_committed_author() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -13368,6 +14336,7 @@ async fn git_blame_line_reports_committed_author() {
         &GitBlameLineParams {
             buffer_id: open.buffer_id,
             line: 0,
+            include_commit_info: false,
         },
     )
     .await;
@@ -13416,6 +14385,7 @@ async fn git_blame_line_is_none_without_repo() {
         1,
         &ProjectActivateParams {
             name: "norepo-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -13430,6 +14400,7 @@ async fn git_blame_line_is_none_without_repo() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -13440,6 +14411,7 @@ async fn git_blame_line_is_none_without_repo() {
         &GitBlameLineParams {
             buffer_id: open.buffer_id,
             line: 0,
+            include_commit_info: false,
         },
     )
     .await;
@@ -13464,6 +14436,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
         1,
         &ProjectActivateParams {
             name: "diff-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -13478,6 +14451,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -13508,6 +14482,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
             buffer_id: open.buffer_id,
             text: "X".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -13582,6 +14557,7 @@ async fn git_status_counts_ride_the_window() {
         1,
         &ProjectActivateParams {
             name: "counts-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -13596,6 +14572,7 @@ async fn git_status_counts_ride_the_window() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -13635,6 +14612,7 @@ async fn git_status_counts_ride_the_window() {
             buffer_id: open.buffer_id,
             text: "X".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -13688,6 +14666,7 @@ async fn git_status_splits_staged_and_unstaged() {
         1,
         &ProjectActivateParams {
             name: "status-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -13702,6 +14681,7 @@ async fn git_status_splits_staged_and_unstaged() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -13768,6 +14748,7 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
         1,
         &ProjectActivateParams {
             name: "base-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -13782,6 +14763,7 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -13846,7 +14828,7 @@ async fn setup_git_apply(
         .await
         .unwrap();
     let _act: ProjectActivateResult =
-        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: proj.into() })
+        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: proj.into(), open_last: false })
             .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
@@ -13859,6 +14841,7 @@ async fn setup_git_apply(
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -13944,6 +14927,7 @@ async fn apply_hunk_stage_requires_clean_buffer() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -14105,7 +15089,7 @@ async fn apply_hunk_reverts_modification_and_is_undoable() {
 
     // The revert is an ordinary edit: one undo step brings the change back.
     let _: UndoResult =
-        send_request::<InputUndo>(&mut ws, 7, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputUndo>(&mut ws, 7, &CountedEditParams { buffer_id, count: 1 }).await;
     assert_eq!(
         buffer_text(&mut ws, 8, buffer_id).await,
         "alpha\nBETA\ngamma\n"
@@ -14183,6 +15167,7 @@ async fn apply_hunk_revert_works_on_dirty_buffer() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -14391,6 +15376,7 @@ async fn git_gutter_marker_present_without_diff_view() {
         1,
         &ProjectActivateParams {
             name: "gutter-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -14405,6 +15391,7 @@ async fn git_gutter_marker_present_without_diff_view() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -14435,6 +15422,7 @@ async fn git_gutter_marker_present_without_diff_view() {
             buffer_id: open.buffer_id,
             text: "X".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -14468,6 +15456,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
         1,
         &ProjectActivateParams {
             name: "nav-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -14482,6 +15471,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -14495,6 +15485,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -14516,6 +15507,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
             buffer_id,
             text: "Y".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -14609,6 +15601,7 @@ async fn open_and_subscribe(
         1,
         &ProjectActivateParams {
             name: project.into(),
+            open_last: false,
         },
     )
     .await;
@@ -14623,6 +15616,7 @@ async fn open_and_subscribe(
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -15038,6 +16032,7 @@ async fn lsp_diagnostics_clear_on_undo() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -15062,6 +16057,7 @@ async fn lsp_diagnostics_clear_on_undo() {
             buffer_id,
             text: "@".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -15072,7 +16068,7 @@ async fn lsp_diagnostics_clear_on_undo() {
 
     // Undo — the fix must send didChange so the server re-analyzes the reverted text and clears it.
     let undo: UndoResult =
-        send_request::<InputUndo>(&mut ws, 13, &BufferOnlyParams { buffer_id }).await;
+        send_request::<InputUndo>(&mut ws, 13, &CountedEditParams { buffer_id, count: 1 }).await;
     assert!(undo.applied);
     let cleared = wait_for_diag_state(&mut ws, false, 90).await;
     drop(server);
@@ -15120,6 +16116,7 @@ async fn lsp_hover_returns_contents() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -15172,6 +16169,7 @@ async fn lsp_goto_definition_resolves() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -15230,6 +16228,7 @@ async fn references_picker_lists_all_uses() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -15339,6 +16338,7 @@ async fn lsp_format_reformats() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -15408,6 +16408,7 @@ async fn lsp_format_json_reformats() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -15481,6 +16482,7 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -15780,6 +16782,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
                 language: None,
                 create_if_missing: false,
                 jump_to: None,
+                ..Default::default()
             },
         )
         .await
@@ -15787,6 +16790,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
 
     let activate = ProjectActivateParams {
         name: "test-proj".into(),
+        open_last: false,
     };
 
     // Client A: open a.txt (the shared buffer) and b.txt (so a next buffer exists after the close).
@@ -15812,7 +16816,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
 
     // Client A closes the shared buffer. It gets its next buffer in the RPC result...
     let result: BufferCloseResult =
-        send_request::<BufferClose>(&mut ws_a, 5, &BufferCloseParams { buffer_id: buf_a }).await;
+        send_request::<BufferClose>(&mut ws_a, 5, &BufferCloseParams { buffer_id: buf_a, open_next: false }).await;
     assert_eq!(result.next_buffer_id, Some(buf_b));
 
     // ...and client B is pushed `buffer/closed` for the buffer it was viewing, with its own next.
@@ -15854,6 +16858,7 @@ async fn nav_open_file(
             language: None,
             create_if_missing: false,
             jump_to: None,
+            ..Default::default()
         },
     )
     .await;
@@ -15895,6 +16900,7 @@ async fn nav_back_and_forward_across_files() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -15961,6 +16967,7 @@ async fn nav_back_empty_is_noop() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -15989,12 +16996,13 @@ async fn nav_goto_reopens_by_path() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
     let (buf_a, _) = nav_open_file(&mut ws, 10, "a.txt", None).await;
     // Close it so the stale buffer_id forces the path fallback.
-    send_request::<BufferClose>(&mut ws, 20, &BufferCloseParams { buffer_id: buf_a }).await;
+    send_request::<BufferClose>(&mut ws, 20, &BufferCloseParams { buffer_id: buf_a, open_next: false }).await;
 
     let res: NavStepResult = send_request::<NavGoto>(
         &mut ws,
@@ -16092,6 +17100,7 @@ async fn setup_grep_filter_workspace() -> (
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -16326,6 +17335,7 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -16405,6 +17415,7 @@ async fn grep_flood_does_not_deadlock_request_dispatch() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -16670,6 +17681,7 @@ async fn grep_filter_root_scope() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -16998,6 +18010,7 @@ async fn setup_transient_workspace() -> (
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -17014,6 +18027,7 @@ fn file_open_params(rel: &str, transient: Option<bool>) -> BufferOpenParams {
         create_if_missing: false,
         jump_to: None,
         transient,
+        ..Default::default()
     }
 }
 
@@ -17027,6 +18041,7 @@ fn attach_open_params(buffer_id: u64, transient: Option<bool>) -> BufferOpenPara
         create_if_missing: false,
         jump_to: None,
         transient,
+        ..Default::default()
     }
 }
 
@@ -17063,6 +18078,7 @@ async fn transient_buffer_closes_on_disconnect() {
             create_if_missing: false,
             jump_to: None,
             transient: Some(true),
+            ..Default::default()
         },
     )
     .await;
@@ -17081,6 +18097,7 @@ async fn transient_buffer_closes_on_disconnect() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;
@@ -17156,6 +18173,7 @@ async fn edit_promotes_transient_buffer() {
             buffer_id: a.buffer_id,
             text: "x".into(),
             select_pasted: false,
+            at: None,
         },
     )
     .await;
@@ -17252,6 +18270,7 @@ async fn transient_scratch_closes_when_replaced_by_file() {
             create_if_missing: false,
             jump_to: None,
             transient: Some(true),
+            ..Default::default()
         },
     )
     .await;
@@ -17297,6 +18316,7 @@ async fn transient_buffer_survives_while_another_client_views_it() {
         1,
         &ProjectActivateParams {
             name: "test-proj".into(),
+            open_last: false,
         },
     )
     .await;

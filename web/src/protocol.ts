@@ -152,6 +152,8 @@ export interface ProjectActivateParams {
 export interface ProjectActivateResult {
   project: ProjectInfo;
   last_buffer_id?: BufferId | null;
+  /** With `open_last`: the landing buffer (MRU or fresh transient scratch), fully opened. */
+  opened?: BufferOpenResult | null;
 }
 export interface ProjectRemoveRootResult {
   project: ProjectInfo;
@@ -279,6 +281,9 @@ export type VerticalDirection = "up" | "down";
 export type WordBoundary = "word" | "WORD" | "subword";
 
 /** Mirrors aether-protocol::cursor::Motion (serde tag = "kind", snake_case variants). */
+/** Where `selection_edge` lands, relative to the selection's inclusive [start, end]. */
+export type SelectionEdge = "start" | "after_end" | "first_line_nonblank" | "last_line_end";
+
 export type Motion =
   | { kind: "char"; direction: Direction; count: number }
   | { kind: "word"; direction: Direction; count: number; boundary: WordBoundary; exclusive: boolean }
@@ -287,6 +292,7 @@ export type Motion =
   | { kind: "line_start" }
   | { kind: "line_end" }
   | { kind: "line_first_nonblank" }
+  | { kind: "selection_edge"; edge: SelectionEdge }
   | { kind: "logical_line_first_nonblank"; direction: Direction; count: number }
   | { kind: "buffer_start" }
   | { kind: "buffer_end" }
@@ -411,6 +417,8 @@ export interface BlameInfo {
 }
 export interface GitBlameLineResult {
   blame?: BlameInfo | null;
+  /** With `include_commit_info`: the blamed commit's full details (best-effort). */
+  commit_info?: CommitInfo | null;
 }
 export interface GitCommitInfoParams {
   buffer_id: BufferId;
@@ -437,6 +445,8 @@ export interface PickerGrepNavigateTarget {
   path: string;
   position: LogicalPosition;
   query: string;
+  /** With `open`: the target, fully opened (transient, at position, search primed). */
+  opened?: BufferOpenResult | null;
 }
 
 // ---- LSP editor actions -------------------------------------------------------------------------
@@ -488,6 +498,8 @@ export interface SearchSetParams {
 export interface SearchSetResult {
   cursor: CursorState;
   summary: SearchSummary;
+  /** With `from_selection`: the effective (escaped) query, or null when the selection was empty. */
+  query?: string | null;
 }
 export interface SearchNavParams {
   buffer_id: BufferId;
@@ -521,6 +533,8 @@ export interface BufferSaveResult {
 }
 export interface BufferCloseResult {
   next_buffer_id?: BufferId | null;
+  /** With `open_next`: the successor (MRU buffer or fresh scratch), fully opened. */
+  opened?: BufferOpenResult | null;
 }
 
 /** `nav/goto` params — open a stored jump-list entry (reopening a closed file by path) and restore

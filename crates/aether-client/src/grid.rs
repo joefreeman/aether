@@ -120,10 +120,7 @@ pub fn position_cell(
     pos: LogicalPosition,
     tab_width: u32,
 ) -> Option<(u32, u32, u32)> {
-    let line = window
-        .lines
-        .iter()
-        .find(|l| l.logical_line == pos.line)?;
+    let line = window.lines.iter().find(|l| l.logical_line == pos.line)?;
     // The cursor never lands on phantom rows; content starts below them.
     let line_start = window.first_visual_row
         + rows_before_line(window, pos.line)?
@@ -156,7 +153,12 @@ pub fn position_cell(
 /// Map a grid cell back to a buffer position — the mouse path. Rows above/below the loaded
 /// window clamp to its first/last row; a display col past the row's text maps to just past the
 /// last char (the server clamps to the line end). `None` only when the window has no lines.
-pub fn hit_test(window: &Window, abs_row: i64, dcol: u32, tab_width: u32) -> Option<LogicalPosition> {
+pub fn hit_test(
+    window: &Window,
+    abs_row: i64,
+    dcol: u32,
+    tab_width: u32,
+) -> Option<LogicalPosition> {
     let rel = (abs_row - window.first_visual_row as i64).max(0) as u32;
     let mut remaining = rel;
     let mut target: Option<(&LogicalLineRender, &VisualRow)> = None;
@@ -205,7 +207,9 @@ pub fn hit_test(window: &Window, abs_row: i64, dcol: u32, tab_width: u32) -> Opt
 /// they don't overlap. Used for search-match and diagnostic spans (both are line-relative byte
 /// ranges; the cells only carry this row's bytes, so clipping is implicit).
 pub fn byte_range_span(cells: &[Cell<'_>], start: u32, end: u32) -> Option<(u32, u32)> {
-    let s = cells.iter().find(|c| c.byte >= start || c.byte + c.ch.len_utf8() as u32 > start)?;
+    let s = cells
+        .iter()
+        .find(|c| c.byte >= start || c.byte + c.ch.len_utf8() as u32 > start)?;
     let e = cells
         .iter()
         .rev()
@@ -239,7 +243,11 @@ pub fn row_selection_span(
     let row_end = row_end_byte(row);
     // The selection's inclusive byte range on this line; u32::MAX = "through the newline".
     let sel_start = if line_no == min.line { min.col } else { 0 };
-    let sel_end = if line_no == max.line { max.col } else { u32::MAX };
+    let sel_end = if line_no == max.line {
+        max.col
+    } else {
+        u32::MAX
+    };
     if sel_end < row_start {
         return None;
     }
@@ -362,12 +370,8 @@ mod tests {
             ],
         );
         // Col 12 lives on line 10's continuation row (byte 10 + 2), abs row 21.
-        let (abs, dcol, width) = position_cell(
-            &w,
-            LogicalPosition { line: 10, col: 12 },
-            4,
-        )
-        .unwrap();
+        let (abs, dcol, width) =
+            position_cell(&w, LogicalPosition { line: 10, col: 12 }, 4).unwrap();
         assert_eq!(abs, 21);
         assert_eq!(dcol, CONTINUATION_MARKER_COLS + 2);
         assert_eq!(width, 1);
@@ -375,8 +379,7 @@ mod tests {
         let (abs, dcol, _) = position_cell(&w, LogicalPosition { line: 11, col: 0 }, 4).unwrap();
         assert_eq!((abs, dcol), (22, 0));
         // Past EOL → virtual cell after the text.
-        let (_, dcol, width) =
-            position_cell(&w, LogicalPosition { line: 11, col: 5 }, 4).unwrap();
+        let (_, dcol, width) = position_cell(&w, LogicalPosition { line: 11, col: 5 }, 4).unwrap();
         assert_eq!((dcol, width), (5, 1));
         // Outside the window → None.
         assert!(position_cell(&w, LogicalPosition { line: 9, col: 0 }, 4).is_none());
@@ -507,6 +510,9 @@ mod tests {
         let empty = row(0, 0, "");
         let min = LogicalPosition { line: 9, col: 0 };
         let max = LogicalPosition { line: 11, col: 0 };
-        assert_eq!(row_selection_span(10, &empty, true, min, max, 4), Some((0, 1)));
+        assert_eq!(
+            row_selection_span(10, &empty, true, min, max, 4),
+            Some((0, 1))
+        );
     }
 }

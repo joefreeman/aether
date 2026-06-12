@@ -14,6 +14,12 @@ use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, Window, WrapMode};
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 
+/// A parked RPC result mapping (see [`Session::pending`]).
+pub(crate) type PendingRpc = Box<
+    dyn FnOnce(Result<serde_json::Value, super::transport::RpcError>) -> super::update::Event
+        + Send,
+>;
+
 /// The session's connection lifecycle. The server is authoritative, so a dead socket just
 /// freezes the window: the last buffer view stays rendered, editing input is suspended, and a
 /// retry loop —
@@ -26,7 +32,10 @@ pub enum ConnState {
     /// The socket died; a backoff retry is in flight. `had_unsaved` remembers whether edits
     /// were pending at disconnect — landing on a *restarted* daemon then means they're gone
     /// (buffers live in daemon memory), which warrants a warning.
-    Reconnecting { attempt: u32, had_unsaved: bool },
+    Reconnecting {
+        attempt: u32,
+        had_unsaved: bool,
+    },
     /// A live server answered but the session couldn't be re-established (the project is
     /// gone). Terminal — the window stays frozen.
     Failed,
@@ -91,8 +100,15 @@ pub struct SearchSnapshot {
 /// editor behind it cancels).
 #[derive(Debug)]
 pub enum Prompt {
-    Confirm { message: String, action: ConfirmAction },
-    SaveAs { path_index: u32, input: String, cursor: usize },
+    Confirm {
+        message: String,
+        action: ConfirmAction,
+    },
+    SaveAs {
+        path_index: u32,
+        input: String,
+        cursor: usize,
+    },
     /// LSP server detail (from the LspServers picker): info rows + `r` to restart.
     LspInfo(Box<LspServerStatus>),
 }
@@ -166,6 +182,14 @@ pub enum PasteKind {
 /// The window's editing context over its server connection — exactly what the server calls a
 /// client. `App` holds the window-level shell (chrome, toasts, metrics) around it.
 pub struct Session {
+    /// In-flight RPC result mappings, keyed by the token carried in `Effect::Request`.
+    /// Each entry turns the raw JSON outcome into the [`Event`](super::update::Event) the
+    /// request was for; `on_rpc_result` pops and runs it. Cleared on connection loss —
+    /// results from a dead connection never arrive.
+    pub(crate) pending_rpcs: std::collections::HashMap<u64, PendingRpc>,
+    /// Token source for `Effect::Request`.
+    pub(crate) next_token: u64,
+
     pub project: String,
     pub project_paths: Vec<String>,
     pub buffer: BufferInfo,
@@ -207,6 +231,8 @@ pub struct Session {
 impl Session {
     pub fn new(project: String, project_paths: Vec<String>, buffer: BufferInfo) -> Self {
         Session {
+            pending_rpcs: std::collections::HashMap::new(),
+            next_token: 0,
             project,
             project_paths,
             buffer,

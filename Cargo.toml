@@ -20,7 +20,7 @@ aether-client = { path = "crates/aether-client" }
 # Serde / JSON-RPC
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "serde", "js"] }
 
 # Async runtime & WebSocket transport
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "signal", "fs"] }

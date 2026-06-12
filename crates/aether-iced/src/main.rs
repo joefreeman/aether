@@ -72,6 +72,7 @@ async fn bootstrap(cli: &Cli) -> anyhow::Result<app::Bootstrap> {
     let activated = handle
         .rpc::<ProjectActivate>(ProjectActivateParams {
             name: project.clone(),
+            open_last: false,
         })
         .await?;
     let project_paths = activated.project.paths.clone();

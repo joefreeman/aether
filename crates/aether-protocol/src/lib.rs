@@ -29,3 +29,13 @@ pub struct LogicalPosition {
     pub line: u32,
     pub col: u32,
 }
+
+/// Serde helpers for counted params (`count` defaults to 1 and stays off the wire at 1).
+pub(crate) fn count_one() -> u32 {
+    1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn count_is_one(n: &u32) -> bool {
+    *n == 1
+}

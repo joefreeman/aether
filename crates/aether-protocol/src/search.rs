@@ -33,12 +33,23 @@ pub struct SearchSetParams {
     /// `search/next` handles a wrap) or when `anchor` is `None`.
     #[serde(default)]
     pub extend: bool,
+    /// Derive the query from the current selection instead of `query` (which is ignored):
+    /// the server takes the selection's text, regex-escapes it, and searches for it
+    /// literally — `Alt-/` in one round-trip (docs/protocol-composites.md, H). The result's
+    /// `query` echoes what was searched; `None` there means the selection was empty and
+    /// nothing was set.
+    #[serde(default)]
+    pub from_selection: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchSetResult {
     pub cursor: CursorState,
     pub summary: SearchSummary,
+    /// With `from_selection`: the effective (regex-escaped) query that was set, or `None`
+    /// when the selection was empty (no search was set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
 }
 
 // ---- search/clear -------------------------------------------------------------------------------
@@ -81,6 +92,24 @@ pub struct SearchNavParams {
     /// `Shift-Alt-n`), so the selection grows from the anchor to the match. When false the
     /// navigation re-selects just the match (anchor at its start, head at its end).
     pub extend: bool,
+    /// Step this many matches (`3n`). `0` is treated as `1`. Default `1`.
+    #[serde(default = "default_nav_count", skip_serializing_if = "is_one")]
+    pub count: u32,
+    /// Set this query first (`search/set` with no anchor), then step — the history-revive
+    /// chain (`n` after the search was dropped) folded into one round-trip
+    /// (docs/protocol-composites.md, I). When the revived query has no matches, the step is
+    /// skipped and the zero-total summary comes back as-is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_query: Option<String>,
+}
+
+fn default_nav_count() -> u32 {
+    1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_one(n: &u32) -> bool {
+    *n == 1
 }
 
 #[derive(Debug, Serialize, Deserialize)]

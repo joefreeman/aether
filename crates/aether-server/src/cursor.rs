@@ -6,7 +6,9 @@
 
 use crate::state::Buffer;
 use crate::wrap::{self, RowInfo};
-use aether_protocol::cursor::{Direction, Granularity, Motion, VerticalDirection, WordBoundary};
+use aether_protocol::cursor::{
+    Direction, Granularity, Motion, SelectionEdge, VerticalDirection, WordBoundary,
+};
 use aether_protocol::viewport::WrapMode;
 use aether_protocol::LogicalPosition;
 use unicode_width::UnicodeWidthChar;
@@ -98,6 +100,38 @@ pub fn ordered(a: LogicalPosition, b: LogicalPosition) -> (LogicalPosition, Logi
         (a, b)
     } else {
         (b, a)
+    }
+}
+
+/// Resolve [`Motion::SelectionEdge`] — the Insert-entry collapse targets. Unlike the rest
+/// of the motions this reads the whole selection, so it gets its own resolver taking both
+/// endpoints (`resolve_motion` only sees the cursor position).
+pub fn resolve_selection_edge(
+    buf: &Buffer,
+    position: LogicalPosition,
+    anchor: LogicalPosition,
+    edge: SelectionEdge,
+) -> LogicalPosition {
+    let (start, end) = ordered(clamp_position(buf, position), clamp_position(buf, anchor));
+    match edge {
+        SelectionEdge::Start => start,
+        SelectionEdge::AfterEnd => {
+            // One char past the selection's last char — the same char arithmetic as
+            // `Motion::Char { Forward, 1 }`, so multi-byte chars and end-of-line behave
+            // identically to the old set-then-step client chain.
+            let c = pos_to_char(buf, end)
+                .saturating_add(1)
+                .min(buf.text.len_chars());
+            char_to_pos(buf, c)
+        }
+        SelectionEdge::FirstLineNonblank => LogicalPosition {
+            line: start.line,
+            col: first_nonblank_col(buf, start.line),
+        },
+        SelectionEdge::LastLineEnd => LogicalPosition {
+            line: end.line,
+            col: line_byte_len_excl_newline(buf, end.line),
+        },
     }
 }
 
@@ -207,10 +241,12 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             char_to_pos(buf, end)
         }
         // Visual motions are resolved separately by the cursor/move handler (they need viewport
-        // state for wrap mode + width). resolve_motion is for buffer-only motions.
+        // state for wrap mode + width), as are selection-edge motions (they need the anchor).
+        // resolve_motion is for buffer-only, cursor-position-only motions.
         Motion::VisualLine { .. }
         | Motion::VisualLineStart { .. }
-        | Motion::VisualLineEnd { .. } => current,
+        | Motion::VisualLineEnd { .. }
+        | Motion::SelectionEdge { .. } => current,
         Motion::MatchBracket { inner } => {
             let Some(syntax) = buf.syntax.as_ref() else {
                 return current;

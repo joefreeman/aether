@@ -43,13 +43,32 @@ pub struct Mods {
 }
 
 impl Mods {
-    const NONE: Mods = Mods { ctrl: false, alt: false, shift: false };
-    const ALT: Mods = Mods { ctrl: false, alt: true, shift: false };
-    const CTRL: Mods = Mods { ctrl: true, alt: false, shift: false };
-    const CTRL_ALT: Mods = Mods { ctrl: true, alt: true, shift: false };
+    pub const NONE: Mods = Mods {
+        ctrl: false,
+        alt: false,
+        shift: false,
+    };
+    pub const ALT: Mods = Mods {
+        ctrl: false,
+        alt: true,
+        shift: false,
+    };
+    pub const CTRL: Mods = Mods {
+        ctrl: true,
+        alt: false,
+        shift: false,
+    };
+    const CTRL_ALT: Mods = Mods {
+        ctrl: true,
+        alt: true,
+        shift: false,
+    };
 
     fn without_shift(self) -> Mods {
-        Mods { shift: false, ..self }
+        Mods {
+            shift: false,
+            ..self
+        }
     }
 }
 
@@ -110,20 +129,38 @@ pub enum InsertWhere {
 pub enum Action {
     // ---- motions (extend = Shift) ----
     MoveChar(Direction),
-    MoveWord { dir: Direction, boundary: WordBoundary },
-    MoveWordEnd { dir: Direction, boundary: WordBoundary },
+    MoveWord {
+        dir: Direction,
+        boundary: WordBoundary,
+    },
+    MoveWordEnd {
+        dir: Direction,
+        boundary: WordBoundary,
+    },
     MoveVisualLine(VerticalDirection),
     MoveLogicalLine(Direction),
     MoveLineStart,
     MoveLineEnd,
     MoveLineFirstNonblank,
     MoveLogicalLineFirstNonblank(Direction),
-    GotoLine { last: bool },
-    MatchBracket { inner: bool },
-    PageMotion { dir: VerticalDirection, half: bool },
+    GotoLine {
+        last: bool,
+    },
+    MatchBracket {
+        inner: bool,
+    },
+    PageMotion {
+        dir: VerticalDirection,
+        half: bool,
+    },
     NavUnit(Direction),
-    NavUnitEdge { start: bool },
-    BeginFind { dir: Direction, till: bool },
+    NavUnitEdge {
+        start: bool,
+    },
+    BeginFind {
+        dir: Direction,
+        till: bool,
+    },
 
     // ---- selection ----
     SelectLine(Direction),
@@ -139,7 +176,10 @@ pub enum Action {
     NavForward,
 
     // ---- viewport ----
-    Scroll { dir: ScrollDir, unit: ScrollUnit },
+    Scroll {
+        dir: ScrollDir,
+        unit: ScrollUnit,
+    },
     ToggleWrap,
 
     // ---- mode transitions ----
@@ -298,7 +338,12 @@ const fn ch(c: char) -> KeyCode {
 
 macro_rules! bind {
     ($ctx:expr, $code:expr, $mods:expr, $action:expr) => {
-        Binding { ctx: $ctx, code: $code, mods: $mods, action: $action }
+        Binding {
+            ctx: $ctx,
+            code: $code,
+            mods: $mods,
+            action: $action,
+        }
     };
 }
 
@@ -501,8 +546,15 @@ mod tests {
             Some(Action::MoveChar(Direction::Backward))
         ));
         assert!(matches!(
-            lookup(KeyContext::Normal, ch('h'), Mods { shift: true, ..Mods::NONE })
-                .map(|b| b.action),
+            lookup(
+                KeyContext::Normal,
+                ch('h'),
+                Mods {
+                    shift: true,
+                    ..Mods::NONE
+                }
+            )
+            .map(|b| b.action),
             Some(Action::MoveChar(Direction::Backward))
         ));
         assert!(matches!(
@@ -526,8 +578,15 @@ mod tests {
         ));
         // Alt-Shift motions still resolve (IgnoreShift on the Alt arm).
         assert!(matches!(
-            lookup(KeyContext::Normal, ch('j'), Mods { shift: true, ..Mods::ALT })
-                .map(|b| b.action),
+            lookup(
+                KeyContext::Normal,
+                ch('j'),
+                Mods {
+                    shift: true,
+                    ..Mods::ALT
+                }
+            )
+            .map(|b| b.action),
             Some(Action::MoveVisualLine(VerticalDirection::Down))
         ));
     }
@@ -545,7 +604,10 @@ mod tests {
         ));
         assert!(matches!(
             lookup(KeyContext::Normal, KeyCode::Left, Mods::NONE).map(|b| b.action),
-            Some(Action::Scroll { dir: ScrollDir::Left, .. })
+            Some(Action::Scroll {
+                dir: ScrollDir::Left,
+                ..
+            })
         ));
     }
 
@@ -575,9 +637,17 @@ mod tests {
         assert!(Action::GotoLine { last: false }.is_repeatable());
         // Edits, scroll, nav history, and the find *arming* never repeat.
         assert!(!Action::DeleteSelection.is_repeatable());
-        assert!(!Action::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Line }.is_repeatable());
+        assert!(!Action::Scroll {
+            dir: ScrollDir::Up,
+            unit: ScrollUnit::Line
+        }
+        .is_repeatable());
         assert!(!Action::NavBack.is_repeatable());
-        assert!(!Action::BeginFind { dir: Direction::Forward, till: false }.is_repeatable());
+        assert!(!Action::BeginFind {
+            dir: Direction::Forward,
+            till: false
+        }
+        .is_repeatable());
         assert!(!Action::RepeatMotion.is_repeatable());
     }
 
@@ -590,8 +660,15 @@ mod tests {
             Some(Action::EnterSearch)
         ));
         assert!(matches!(
-            lookup(KeyContext::Normal, ch('?'), Mods { shift: true, ..Mods::NONE })
-                .map(|b| b.action),
+            lookup(
+                KeyContext::Normal,
+                ch('?'),
+                Mods {
+                    shift: true,
+                    ..Mods::NONE
+                }
+            )
+            .map(|b| b.action),
             Some(Action::EnterSearchToCursor)
         ));
         assert!(matches!(
@@ -618,5 +695,4 @@ mod tests {
         assert!(matches!(n.action, Action::SearchCycle(Direction::Forward)));
         assert!(n.action.is_repeatable());
     }
-
 }

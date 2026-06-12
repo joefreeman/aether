@@ -19,7 +19,6 @@ pub type NotifRx =
     std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Notification>>>;
 
 pub use crate::core::transport::RpcError;
-use crate::core::transport::Transport;
 
 struct Outgoing {
     method: &'static str,
@@ -34,19 +33,31 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// A typed RPC: serialize, call, deserialize. The error keeps its [`RpcError`] shape so
+    /// callers can branch on server codes (e.g. `WOULD_OVERWRITE`).
     pub async fn rpc<M: RpcMethod>(&self, params: M::Params) -> Result<M::Result, RpcError> {
-        crate::core::transport::rpc::<M>(self, params).await
+        let params = serde_json::to_value(params).expect("params serialize");
+        let v = self.call(M::NAME, params).await?;
+        serde_json::from_value(v).map_err(|e| RpcError {
+            method: M::NAME,
+            code: 0,
+            message: format!("malformed result: {e}"),
+        })
     }
 }
 
 /// The native transport: requests ride the actor's channel; the future awaits the
 /// correlated reply (and is `'static` — it owns its `oneshot` end, not the handle).
-impl Transport for Handle {
-    fn call(
+impl Handle {
+    /// Fire a raw JSON-RPC call. The request is ENQUEUED SYNCHRONOUSLY (before the returned
+    /// future is polled) — callers performing several calls in sequence get them on the
+    /// wire in call order, which the core's `Effect::Request` ordering contract relies on.
+    pub fn call(
         &self,
         method: &'static str,
         params: serde_json::Value,
-    ) -> futures_util::future::BoxFuture<'static, Result<serde_json::Value, RpcError>> {
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, RpcError>> + Send + 'static
+    {
         let transport_err = move |message: &str| RpcError {
             method,
             code: 0,
@@ -61,12 +72,13 @@ impl Transport for Handle {
                 reply,
             })
             .map_err(|_| transport_err("connection closed"));
-        Box::pin(async move {
+        async move {
             sent?;
             rx.await.map_err(|_| transport_err("connection closed"))?
-        })
+        }
     }
 }
+
 
 /// Connect to the server and spawn the actor on the *current* tokio runtime. Returns the RPC
 /// handle and the notification stream; the receiver yields `None` when the connection dies.

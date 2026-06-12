@@ -44,6 +44,18 @@ pub struct BufferOpenParams {
     /// promoted by their first edit, a save, or a user-initiated reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transient: Option<bool>,
+    /// Record the jump origin (the buffer the client is leaving) onto this client's nav
+    /// history before switching — `nav/record` folded into the open, so result-style
+    /// navigation (picker selections, goto-definition, fresh scratch) is one round-trip
+    /// (docs/protocol-composites.md, A). Ignored if the buffer doesn't exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_nav_from: Option<BufferId>,
+    /// Prime the opened buffer's search with this query — a `search/set` anchored at the
+    /// post-open cursor (the `jump_to` hit), so the first match at-or-after lands
+    /// *selected* and `n`/`Alt-n` step on from it. The result's `cursor` reflects the
+    /// selection. Fire-and-forget semantics: pattern errors are dropped. Empty = no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prime_search: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -130,6 +142,11 @@ impl RpcMethod for BufferClose {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BufferCloseParams {
     pub buffer_id: BufferId,
+    /// Also open the next buffer (the MRU successor, or a fresh scratch when none remain)
+    /// and return it in `opened` — the close-then-attach client chain folded into one
+    /// round-trip (docs/protocol-composites.md, B).
+    #[serde(default)]
+    pub open_next: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,6 +155,10 @@ pub struct BufferCloseResult {
     /// no buffers remain — the client should open a fresh scratch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_buffer_id: Option<BufferId>,
+    /// With `open_next`: the buffer the client should now show, fully opened (the MRU
+    /// successor or a fresh scratch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened: Option<BufferOpenResult>,
 }
 
 // ---- buffer/closed (notification) ---------------------------------------------------------------

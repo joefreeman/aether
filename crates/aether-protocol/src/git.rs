@@ -181,6 +181,11 @@ pub struct GitBlameLineParams {
     pub buffer_id: BufferId,
     /// 0-based buffer line whose blame is wanted.
     pub line: u32,
+    /// Also resolve the blamed commit's full details into `commit_info` — the blame-then-
+    /// lookup client chain folded into one round-trip (docs/protocol-composites.md, G).
+    /// No effect for an uncommitted or unblamed line.
+    #[serde(default)]
+    pub include_commit_info: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,6 +193,10 @@ pub struct GitBlameLineResult {
     /// `None` when there's no blame for the line: no repo, untracked file, or a line past the
     /// end of the file. An uncommitted line is `Some` with `is_uncommitted = true`.
     pub blame: Option<BlameInfo>,
+    /// With `include_commit_info`: the blamed commit's full details, when the line blames to
+    /// a real commit that still resolves. Same best-effort semantics as `git/commit_info`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_info: Option<CommitInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

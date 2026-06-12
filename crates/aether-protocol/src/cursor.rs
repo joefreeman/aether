@@ -123,7 +123,31 @@ pub enum Motion {
     EndOfNavigationUnit,
     /// Mirror of [`EndOfNavigationUnit`] — jump to the first char of the enclosing unit.
     StartOfNavigationUnit,
+    /// Collapse to an edge of the current selection — the Insert-entry motions (`I`/`A`
+    /// family). Unlike the other motions this reads the whole selection (anchor and
+    /// cursor), which is exactly why it lives server-side: the client would otherwise
+    /// compute selection bounds the server already owns (docs/protocol-composites.md, F).
+    SelectionEdge {
+        edge: SelectionEdge,
+    },
     // Tree-sitter motions are added when phase 2 lands.
+}
+
+/// Where [`Motion::SelectionEdge`] lands, relative to the selection's inclusive
+/// `[start, end]` char range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionEdge {
+    /// The selection's first char.
+    Start,
+    /// One char *past* the selection's last char (multi-byte and end-of-line handled by
+    /// the server's char arithmetic) — the append position.
+    AfterEnd,
+    /// The first non-blank column of the selection's first line.
+    FirstLineNonblank,
+    /// One past the last char of the selection's last line — the end-of-line append
+    /// position (`col` = the line's byte length excluding the newline).
+    LastLineEnd,
 }
 
 // ---- cursor/move --------------------------------------------------------------------------------
@@ -239,6 +263,9 @@ pub struct CursorSelectLineParams {
     pub buffer_id: BufferId,
     pub direction: Direction,
     pub extend: bool,
+    /// Select this many lines (`0` = `1`) — the repeat loop lives server-side.
+    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    pub count: u32,
 }
 
 // ---- cursor/undo and cursor/redo ----------------------------------------------------------------
@@ -263,6 +290,10 @@ impl RpcMethod for CursorRedo {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CursorUndoParams {
     pub buffer_id: BufferId,
+    /// Step the motion history this many times (`0` = `1`), stopping early once it's
+    /// exhausted — the repeat loop lives server-side.
+    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    pub count: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -296,6 +327,10 @@ impl RpcMethod for CursorContract {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CursorBufferOnlyParams {
     pub buffer_id: BufferId,
+    /// Repeat the expand/contract this many times (`0` = `1`), stopping early once the
+    /// cursor stops changing — the repeat loop lives server-side.
+    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    pub count: u32,
 }
 
 // ---- cursor/swap_anchor -------------------------------------------------------------------------

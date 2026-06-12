@@ -16,7 +16,7 @@ use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams, CursorRedo,
     CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
     CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
-    Direction, Granularity, Motion, VerticalDirection,
+    Direction, Granularity, Motion, SelectionEdge, VerticalDirection,
 };
 use aether_protocol::envelope::{ClientInbound, NotificationMethod};
 use aether_protocol::error::ErrorCode;
@@ -26,10 +26,12 @@ use aether_protocol::git::{
     GitNavigateHunkParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
+    CountedEditParams,
     BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
     InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
     InputUnsurroundParams, SurroundTarget, UndoResult,
+    InputOpenLine, InputOpenLineParams, LineSide,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspDiagnosticsChanged,
@@ -37,7 +39,7 @@ use aether_protocol::lsp::{
     LspRestartServer, LspRestartServerParams, LspServerRef, LspServerStatus, LspStatusChanged,
 };
 use aether_protocol::nav::{
-    NavBack, NavForward, NavRecord, NavRecordParams, NavStepParams, NavStepResult,
+    NavBack, NavForward, NavStepParams, NavStepResult,
 };
 use aether_protocol::picker::{
     PickerFilters, PickerGrepNavigate, PickerGrepNavigateParams, PickerHide, PickerHideParams,
@@ -615,6 +617,7 @@ pub async fn bootstrap(
     let activated: ProjectActivateResult = client
         .rpc::<ProjectActivate>(ProjectActivateParams {
             name: project_name.to_string(),
+            open_last: false,
         })
         .await?;
     let project_paths = activated.project.paths.clone();
@@ -663,6 +666,8 @@ pub async fn bootstrap(
                     create_if_missing: false,
                     jump_to: None,
                     transient: None,
+                    record_nav_from: None,
+                    prime_search: None,
                 },
             )
             .await?
@@ -688,6 +693,8 @@ pub async fn bootstrap(
                     } else {
                         None
                     },
+                    record_nav_from: None,
+                    prime_search: None,
                 },
             )
             .await?
@@ -785,6 +792,7 @@ async fn activate_project_and_rebuild_editor(
     let activated: ProjectActivateResult = client
         .rpc::<ProjectActivate>(ProjectActivateParams {
             name: project_name.to_string(),
+            open_last: false,
         })
         .await?;
     state.project_name = activated.project.name;
@@ -808,6 +816,8 @@ async fn activate_project_and_rebuild_editor(
         } else {
             None
         },
+        record_nav_from: None,
+        prime_search: None,
     };
     let project_paths = state.project_paths.clone();
     let root_labels = state.root_labels.clone();
@@ -1067,7 +1077,11 @@ async fn refresh_blame(client: &mut Client, state: &mut AppState) -> Result<()> 
     }
     let (buffer_id, line) = (ed.buffer_id, key.0);
     let info = match client
-        .rpc::<GitBlameLine>(GitBlameLineParams { buffer_id, line })
+        .rpc::<GitBlameLine>(GitBlameLineParams {
+            buffer_id,
+            line,
+            include_commit_info: false,
+        })
         .await
     {
         Ok(r) => r.blame,
@@ -1842,8 +1856,8 @@ async fn run_action(
         Action::Indent => indent(client, state, count).await?,
         Action::Dedent => dedent(client, state, count).await?,
         Action::ToggleComment => toggle_comment(client, state).await?,
-        Action::OpenLineBelow => open_line_below(client, state).await?,
-        Action::OpenLineAbove => open_line_above(client, state).await?,
+        Action::OpenLineBelow => open_line(client, state, LineSide::Below).await?,
+        Action::OpenLineAbove => open_line(client, state, LineSide::Above).await?,
         Action::Copy => copy_to_clipboard(client, state, CopyScope::Selection).await?,
         Action::CopyLine => copy_to_clipboard(client, state, CopyScope::Line).await?,
         Action::Cut => cut_to_clipboard(client, state, CopyScope::Selection).await?,
@@ -1918,11 +1932,7 @@ async fn run_action(
         Action::Save => save_buffer(client, state).await?,
         Action::SaveAs => begin_save_prompt(client, state).await?,
         Action::Reload => reload_buffer(client, state).await?,
-        Action::NewScratch => {
-            // Opening a fresh scratch is a buffer switch — record the origin so `Alt-Left` returns.
-            record_nav(client, state).await;
-            new_scratch(client, state).await?;
-        }
+        Action::NewScratch => new_scratch(client, state).await?,
         Action::Hover => lsp_hover(client, state).await?,
         Action::GotoDefinition => lsp_goto_definition(client, state).await?,
         Action::ShowCommitInfo => show_commit_info(client, state).await?,
@@ -2023,37 +2033,24 @@ async fn grep_navigate(
     state: &mut AppState,
     direction: Direction,
 ) -> Result<()> {
+    // One composite: navigate, open transient at the hit, record nav, prime search
+    // (the summary arrives via the `search/state_changed` push).
     let target = client
         .rpc::<PickerGrepNavigate>(PickerGrepNavigateParams {
             direction,
             buffer_id: state.ed_mut().buffer_id,
+            open: true,
         })
         .await?;
     let Some(target) = target else {
         return Ok(());
     };
-    open_file_at_path(
-        client,
-        state,
-        target.path,
-        false,
-        Some(target.position),
-        Reveal::Center,
-    )
-    .await?;
+    let Some(open) = target.opened else {
+        return Ok(());
+    };
+    subscribe_to_buffer(client, state, open, Reveal::Center).await?;
     if !target.query.is_empty() {
-        let buffer_id = state.ed_mut().buffer_id;
-        let r = client
-            .rpc::<SearchSet>(SearchSetParams {
-                buffer_id,
-                query: target.query.clone(),
-                anchor: Some(target.position),
-                extend: false,
-            })
-            .await?;
         let ed = state.ed_mut();
-        ed.cursor = r.cursor;
-        ed.search.summary = Some(r.summary);
         ed.search.query.set(target.query.clone());
         ed.search.active = true;
         push_history(state, target.query);
@@ -3749,11 +3746,8 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
             open_file_at_path(client, state, path, false, None, Reveal::Minimal).await?;
         }
         PickerSelectResult::Buffer { buffer_id } => {
-            // Switching to a different buffer is a jump; record the origin first (skip if it's the
-            // buffer we're already on — `attach_buffer` no-ops there).
-            if state.editor.as_ref().map(|e| e.buffer_id) != Some(buffer_id) {
-                record_nav(client, state).await;
-            }
+            // Switching to a different buffer is a jump; `attach_buffer` records the origin
+            // in the open itself (and no-ops when it's the buffer we're already on).
             attach_buffer(client, state, buffer_id).await?;
         }
         PickerSelectResult::FileAt { path, position } => {
@@ -3777,6 +3771,7 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
                         query: query.clone(),
                         anchor: Some(position),
                         extend: false,
+                        from_selection: false,
                     })
                     .await?;
                 let ed = state.ed_mut();
@@ -3803,18 +3798,6 @@ async fn select_picker_item(client: &mut Client, state: &mut AppState) -> Result
     }
     apply_cursor_style(state);
     Ok(())
-}
-
-/// Snapshot the current location onto the server-side jump list before a user-initiated
-/// cross-file navigation. Best-effort — a failure shouldn't abort the navigation itself.
-async fn record_nav(client: &mut Client, state: &AppState) {
-    if let Some(ed) = state.editor.as_ref() {
-        let _ = client
-            .rpc::<NavRecord>(NavRecordParams {
-                buffer_id: ed.buffer_id,
-            })
-            .await;
-    }
 }
 
 /// `Alt-Left` / `Alt-Right`: step the jump list (`forward=false` is back). The server restores the
@@ -3859,7 +3842,8 @@ async fn attach_buffer(
     state: &mut AppState,
     buffer_id: BufferId,
 ) -> Result<()> {
-    if state.ed_mut().buffer_id == buffer_id {
+    let from = state.ed_mut().buffer_id;
+    if from == buffer_id {
         // Already attached. Skip the round-trip; the picker's "current at position 0" feature
         // makes selecting the current buffer a frequent no-op.
         return Ok(());
@@ -3873,6 +3857,10 @@ async fn attach_buffer(
             create_if_missing: false,
             jump_to: None,
             transient: None,
+            // Switching to a different buffer is a jump — record the origin in the same
+            // round-trip so `Alt-Left` returns.
+            record_nav_from: Some(from),
+            prime_search: None,
         })
         .await?;
     subscribe_to_buffer(client, state, open, Reveal::Minimal).await
@@ -3891,6 +3879,9 @@ async fn new_scratch(client: &mut Client, state: &mut AppState) -> Result<()> {
             create_if_missing: false,
             jump_to: None,
             transient: None,
+            // A fresh scratch is a buffer switch — record the origin so `Alt-Left` returns.
+            record_nav_from: state.editor.as_ref().map(|e| e.buffer_id),
+            prime_search: None,
         })
         .await?;
     // New Scratch is an explicit request for a fresh placeholder — don't discard the one we're on.
@@ -3929,14 +3920,16 @@ async fn finalize_close_buffer(
     } else {
         format!("buffer {buffer_id}")
     };
+    // `open_next` folds the successor open (MRU buffer or fresh scratch) into the close.
     let result: aether_protocol::buffer::BufferCloseResult = client
-        .rpc::<BufferClose>(BufferCloseParams { buffer_id })
+        .rpc::<BufferClose>(BufferCloseParams {
+            buffer_id,
+            open_next: true,
+        })
         .await?;
     state.status = StatusMessage::success(format!("closed {closed_label}"));
-    if let Some(next) = result.next_buffer_id {
-        attach_buffer(client, state, next).await?;
-    } else {
-        new_scratch(client, state).await?;
+    if let Some(opened) = result.opened {
+        subscribe_to_buffer(client, state, opened, Reveal::Minimal).await?;
     }
     Ok(())
 }
@@ -4030,6 +4023,7 @@ async fn subscribe_replacing_scratch(
         let _ = client
             .rpc::<BufferClose>(BufferCloseParams {
                 buffer_id: scratch_id,
+                open_next: false,
             })
             .await;
     }
@@ -4267,9 +4261,6 @@ async fn open_file_at_path(
     jump_to: Option<aether_protocol::LogicalPosition>,
     reveal: Reveal,
 ) -> Result<()> {
-    // Opening a file is a jump (every caller here is a user navigation: goto-def, grep nav, file/
-    // grep/explorer/diagnostics picker). Record where we're leaving onto the jump list first.
-    record_nav(client, state).await;
     // Find a `path_index` + `relative_path` pair the server will accept. Each project path is
     // either a file or a directory; we want the directory that contains the target.
     let target = std::path::PathBuf::from(&abs_path);
@@ -4296,8 +4287,11 @@ async fn open_file_at_path(
             jump_to,
             // Every caller here is a result-style navigation (picker select, grep `<`/`>`,
             // goto-definition): open as a transient preview — the buffer auto-closes when
-            // hidden again unless an edit (or `Space r`) pins it.
+            // hidden again unless an edit (or `Space r`) pins it. Opening a file is a jump,
+            // so the origin rides along onto the jump list (`record_nav_from`).
             transient: Some(true),
+            record_nav_from: state.editor.as_ref().map(|e| e.buffer_id),
+            prime_search: None,
         })
         .await?;
     subscribe_replacing_scratch(client, state, open, reveal).await
@@ -4591,6 +4585,7 @@ async fn abort_search(client: &mut Client, state: &mut AppState) -> Result<()> {
                 query: snap.query.clone(),
                 anchor: None,
                 extend: false,
+                from_selection: false,
             })
             .await?;
         state.ed_mut().search.summary = Some(r.summary);
@@ -4674,6 +4669,7 @@ async fn run_incremental_search(client: &mut Client, state: &mut AppState) -> Re
             query,
             anchor,
             extend,
+            from_selection: false,
         })
         .await;
     let revert_needed = match result {
@@ -4784,70 +4780,31 @@ pub fn search_match_count_label(state: &AppState) -> Option<String> {
     })
 }
 
-/// Take the current selection's text, escape its regex metacharacters, and use it as the active
-/// search term. The cursor stays on the original selection — `n` / `Alt-n` then cycle from there.
+/// Search for the current selection's text, literally — the server derives and escapes the
+/// query from its own selection state (`from_selection`), one round-trip. The cursor stays
+/// on the original selection — `n` / `Alt-n` then cycle from there.
 async fn search_from_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let r: BufferCopyResult = client
-        .rpc::<BufferCopy>(BufferCopyParams {
-            buffer_id: state.ed_mut().buffer_id,
-            scope: CopyScope::Selection,
-        })
-        .await?;
-    if r.text.is_empty() {
-        return Ok(());
-    }
-    let query = {
-        let ed = state.ed_mut();
-        ed.search.query.set(regex_escape(&r.text));
-        ed.search.active = true;
-        ed.search.query.text.clone()
-    };
-    push_history(state, query.clone());
     let buffer_id = state.ed_mut().buffer_id;
     let result = client
         .rpc::<SearchSet>(SearchSetParams {
             buffer_id,
-            query: query.clone(),
+            query: String::new(),
             anchor: None,
             extend: false,
+            from_selection: true,
         })
         .await?;
-    state.ed_mut().search.summary = Some(result.summary);
-    // search/set with anchor=None doesn't move the cursor server-side, so state.ed_mut().cursor is still
-    // valid (mirrors the selection that prompted the search).
-    Ok(())
-}
-
-/// Escape regex metacharacters so a literal string can be embedded in the search regex. Mirrors
-/// `regex::escape` (we don't pull `regex` into the TUI just for this one call).
-fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(
-            c,
-            '\\' | '.'
-                | '+'
-                | '*'
-                | '?'
-                | '('
-                | ')'
-                | '|'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '^'
-                | '$'
-                | '#'
-                | '&'
-                | '-'
-                | '~'
-        ) {
-            out.push('\\');
-        }
-        out.push(c);
+    let Some(query) = result.query else {
+        return Ok(()); // empty selection — nothing set
+    };
+    {
+        let ed = state.ed_mut();
+        ed.search.query.set(query.clone());
+        ed.search.active = true;
     }
-    out
+    push_history(state, query);
+    state.ed_mut().search.summary = Some(result.summary);
+    Ok(())
 }
 
 async fn search_cycle(
@@ -4857,46 +4814,40 @@ async fn search_cycle(
     count: u32,
     extend: bool,
 ) -> Result<()> {
-    if !state.ed_mut().search.active {
-        // No active search: revive the most recent history entry server-side, then cycle.
+    // Revive (when no search is active) + count ride the nav RPC itself; the server skips
+    // the step when the revived query has no matches.
+    let revive = if state.ed_mut().search.active {
+        let total = state
+            .ed()
+            .search
+            .summary
+            .as_ref()
+            .map(|s| s.total)
+            .unwrap_or(0);
+        if total == 0 {
+            return Ok(());
+        }
+        None
+    } else {
         let Some(last) = state.ed_mut().search.history.last().cloned() else {
             return Ok(());
         };
         state.ed_mut().search.query.set(last.clone());
-        let r = client
-            .rpc::<SearchSet>(SearchSetParams {
-                buffer_id: state.ed_mut().buffer_id,
-                query: last,
-                anchor: None,
-                extend: false,
-            })
-            .await?;
-        state.ed_mut().cursor = r.cursor;
-        state.ed_mut().search.summary = Some(r.summary);
         state.ed_mut().search.active = true;
-    }
-    let summary_total = state
-        .ed()
-        .search
-        .summary
-        .as_ref()
-        .map(|s| s.total)
-        .unwrap_or(0);
-    if summary_total == 0 {
-        return Ok(());
-    }
-    for _ in 0..count.max(1) {
-        let params = SearchNavParams {
-            buffer_id: state.ed_mut().buffer_id,
-            extend,
-        };
-        let result = match direction {
-            Direction::Forward => client.rpc::<SearchNext>(params).await?,
-            Direction::Backward => client.rpc::<SearchPrev>(params).await?,
-        };
-        state.ed_mut().cursor = result.cursor;
-        state.ed_mut().search.summary = Some(result.summary);
-    }
+        Some(last)
+    };
+    let params = SearchNavParams {
+        buffer_id: state.ed_mut().buffer_id,
+        extend,
+        count,
+        set_query: revive,
+    };
+    let result = match direction {
+        Direction::Forward => client.rpc::<SearchNext>(params).await?,
+        Direction::Backward => client.rpc::<SearchPrev>(params).await?,
+    };
+    state.ed_mut().cursor = result.cursor;
+    state.ed_mut().search.summary = Some(result.summary);
     Ok(())
 }
 
@@ -4979,46 +4930,39 @@ async fn select_line(
     extend: bool,
     count: u32,
 ) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let new = client
-            .rpc::<CursorSelectLine>(CursorSelectLineParams {
-                buffer_id: state.ed_mut().buffer_id,
-                direction,
-                extend,
-            })
-            .await?;
-        state.ed_mut().cursor = new;
-    }
+    let new = client
+        .rpc::<CursorSelectLine>(CursorSelectLineParams {
+            buffer_id: state.ed_mut().buffer_id,
+            direction,
+            extend,
+            count,
+        })
+        .await?;
+    state.ed_mut().cursor = new;
     Ok(())
 }
 
 async fn tree_expand(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let new = client
-            .rpc::<CursorExpand>(CursorBufferOnlyParams {
-                buffer_id: state.ed_mut().buffer_id,
-            })
-            .await?;
-        if new == state.ed_mut().cursor {
-            break; // already at root
-        }
-        state.ed_mut().cursor = new;
-    }
+    // Repeats server-side, stopping once the cursor stops changing (already at root).
+    let new = client
+        .rpc::<CursorExpand>(CursorBufferOnlyParams {
+            buffer_id: state.ed_mut().buffer_id,
+            count,
+        })
+        .await?;
+    state.ed_mut().cursor = new;
     Ok(())
 }
 
 async fn tree_contract(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let new = client
-            .rpc::<CursorContract>(CursorBufferOnlyParams {
-                buffer_id: state.ed_mut().buffer_id,
-            })
-            .await?;
-        if new == state.ed_mut().cursor {
-            break; // history empty
-        }
-        state.ed_mut().cursor = new;
-    }
+    // Repeats server-side, stopping once the cursor stops changing (history empty).
+    let new = client
+        .rpc::<CursorContract>(CursorBufferOnlyParams {
+            buffer_id: state.ed_mut().buffer_id,
+            count,
+        })
+        .await?;
+    state.ed_mut().cursor = new;
     Ok(())
 }
 
@@ -5033,34 +4977,26 @@ async fn swap_anchor(client: &mut Client, state: &mut AppState) -> Result<()> {
 }
 
 async fn motion_undo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let r: CursorUndoResult = client
-            .rpc::<CursorUndo>(CursorUndoParams {
-                buffer_id: state.ed_mut().buffer_id,
-            })
-            .await?;
-        let applied = r.applied;
-        apply_motion_undo_result(state, r, "motion undo");
-        if !applied {
-            break;
-        }
-    }
+    // Repeats server-side, stopping once the history is exhausted.
+    let r: CursorUndoResult = client
+        .rpc::<CursorUndo>(CursorUndoParams {
+            buffer_id: state.ed_mut().buffer_id,
+            count,
+        })
+        .await?;
+    apply_motion_undo_result(state, r, "motion undo");
     Ok(())
 }
 
 async fn motion_redo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let r: CursorUndoResult = client
-            .rpc::<CursorRedo>(CursorUndoParams {
-                buffer_id: state.ed_mut().buffer_id,
-            })
-            .await?;
-        let applied = r.applied;
-        apply_motion_undo_result(state, r, "motion redo");
-        if !applied {
-            break;
-        }
-    }
+    // Repeats server-side, stopping once the history is exhausted.
+    let r: CursorUndoResult = client
+        .rpc::<CursorRedo>(CursorUndoParams {
+            buffer_id: state.ed_mut().buffer_id,
+            count,
+        })
+        .await?;
+    apply_motion_undo_result(state, r, "motion redo");
     Ok(())
 }
 
@@ -5095,78 +5031,21 @@ async fn enter_insert_at(
 ) -> Result<()> {
     // Entering Insert mode always collapses to a 1-char point at the chosen position. The
     // model invariant is that Insert mode never has a multi-char selection — typing inserts at
-    // `position`, motion-based deletes (Backspace/Delete) ignore the anchor.
-    let (pos, cursor, buffer_id) = {
-        let ed = state.ed_mut();
-        (ed.cursor.position, ed.cursor, ed.buffer_id)
-    };
-    let target = match where_ {
-        InsertWhere::SelectionStart => min_pos(pos, cursor.anchor),
-        InsertWhere::SelectionEnd => {
-            // Just past the (possibly multi-char) selection — set to the max position, then
-            // step one char forward server-side to handle multi-byte chars / end-of-line.
-            let max = max_pos(pos, cursor.anchor);
-            let _ = client
-                .rpc::<CursorSet>(CursorSetParams {
-                    granularity: Granularity::Char,
-                    buffer_id,
-                    position: max,
-                    anchor: max,
-                })
-                .await?;
-            let new = client
-                .rpc::<CursorMove>(CursorMoveParams {
-                    buffer_id,
-                    motion: Motion::Char {
-                        direction: Direction::Forward,
-                        count: 1,
-                    },
-                    extend_selection: false,
-                })
-                .await?;
-            state.ed_mut().cursor = new;
-            enter_insert_mode(state);
-            return Ok(());
-        }
-        InsertWhere::FirstLineStart => {
-            // First non-blank of the first line of the selection (consistent with `Alt-h`).
-            // Park the cursor on that line, then let the server resolve the first non-blank
-            // column via the same motion `Alt-h` uses.
-            let line = pos.line.min(cursor.anchor.line);
-            let start = LogicalPosition { line, col: 0 };
-            let _ = client
-                .rpc::<CursorSet>(CursorSetParams {
-                    granularity: Granularity::Char,
-                    buffer_id,
-                    position: start,
-                    anchor: start,
-                })
-                .await?;
-            let new = client
-                .rpc::<CursorMove>(CursorMoveParams {
-                    buffer_id,
-                    motion: Motion::LineFirstNonblank,
-                    extend_selection: false,
-                })
-                .await?;
-            state.ed_mut().cursor = new;
-            enter_insert_mode(state);
-            return Ok(());
-        }
-        InsertWhere::LastLineEnd => {
-            let line = pos.line.max(cursor.anchor.line);
-            LogicalPosition {
-                line,
-                col: u32::MAX,
-            }
-        }
+    // `position`, motion-based deletes (Backspace/Delete) ignore the anchor. The server owns
+    // the selection, so it resolves the edge (`Motion::SelectionEdge` — formerly a
+    // set-cursor-then-adjust chain here).
+    let buffer_id = state.ed_mut().buffer_id;
+    let edge = match where_ {
+        InsertWhere::SelectionStart => SelectionEdge::Start,
+        InsertWhere::SelectionEnd => SelectionEdge::AfterEnd,
+        InsertWhere::FirstLineStart => SelectionEdge::FirstLineNonblank,
+        InsertWhere::LastLineEnd => SelectionEdge::LastLineEnd,
     };
     let new = client
-        .rpc::<CursorSet>(CursorSetParams {
-            granularity: Granularity::Char,
+        .rpc::<CursorMove>(CursorMoveParams {
             buffer_id,
-            position: target,
-            anchor: target,
+            motion: Motion::SelectionEdge { edge },
+            extend_selection: false,
         })
         .await?;
     state.ed_mut().cursor = new;
@@ -5184,21 +5063,6 @@ fn leave_insert(state: &mut AppState) {
     apply_cursor_style(state);
 }
 
-fn min_pos(a: LogicalPosition, b: LogicalPosition) -> LogicalPosition {
-    if (a.line, a.col) <= (b.line, b.col) {
-        a
-    } else {
-        b
-    }
-}
-
-fn max_pos(a: LogicalPosition, b: LogicalPosition) -> LogicalPosition {
-    if (a.line, a.col) >= (b.line, b.col) {
-        a
-    } else {
-        b
-    }
-}
 
 async fn insert_text(client: &mut Client, state: &mut AppState, text: &str) -> Result<()> {
     insert_text_inner(client, state, text, false).await
@@ -5229,6 +5093,7 @@ async fn insert_text_inner(
             buffer_id: state.ed_mut().buffer_id,
             text: text.into(),
             select_pasted,
+            at: None,
         })
         .await?;
     state.ed_mut().revision = r.revision;
@@ -5246,8 +5111,9 @@ async fn change_selection(client: &mut Client, state: &mut AppState) -> Result<(
 
 async fn delete_selection(client: &mut Client, state: &mut AppState) -> Result<()> {
     let r: EditResult = client
-        .rpc::<InputDelete>(BufferOnlyParams {
+        .rpc::<InputDelete>(CountedEditParams {
             buffer_id: state.ed_mut().buffer_id,
+            count: 1,
         })
         .await?;
     state.ed_mut().revision = r.revision;
@@ -5348,41 +5214,38 @@ async fn replace_line_with_clipboard(client: &mut Client, state: &mut AppState) 
 // `run_action` dispatches straight to `copy_to_clipboard(Selection)` / `delete_line` / etc.
 
 async fn join_lines(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let r: EditResult = client
-            .rpc::<InputJoinLines>(BufferOnlyParams {
-                buffer_id: state.ed_mut().buffer_id,
-            })
-            .await?;
-        state.ed_mut().revision = r.revision;
-        state.ed_mut().cursor = r.cursor;
-    }
+    let r: EditResult = client
+        .rpc::<InputJoinLines>(CountedEditParams {
+            buffer_id: state.ed_mut().buffer_id,
+            count,
+        })
+        .await?;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
 async fn indent(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let r: EditResult = client
-            .rpc::<InputIndent>(BufferOnlyParams {
-                buffer_id: state.ed_mut().buffer_id,
-            })
-            .await?;
-        state.ed_mut().revision = r.revision;
-        state.ed_mut().cursor = r.cursor;
-    }
+    let r: EditResult = client
+        .rpc::<InputIndent>(CountedEditParams {
+            buffer_id: state.ed_mut().buffer_id,
+            count,
+        })
+        .await?;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
 async fn dedent(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let r: EditResult = client
-            .rpc::<InputDedent>(BufferOnlyParams {
-                buffer_id: state.ed_mut().buffer_id,
-            })
-            .await?;
-        state.ed_mut().revision = r.revision;
-        state.ed_mut().cursor = r.cursor;
-    }
+    let r: EditResult = client
+        .rpc::<InputDedent>(CountedEditParams {
+            buffer_id: state.ed_mut().buffer_id,
+            count,
+        })
+        .await?;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
@@ -5399,57 +5262,17 @@ async fn toggle_comment(client: &mut Client, state: &mut AppState) -> Result<()>
     Ok(())
 }
 
-/// Add a blank line after the cursor's current line and drop into Insert mode at its start.
-/// Implemented as: park cursor at end of current line, then `newline_and_indent` (which copies
-/// the line's leading whitespace and adds one level if the line ends in an opener). The newline
-/// pushes the cursor onto the new line at the indent column.
-async fn open_line_below(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let line = state.ed_mut().cursor.position.line;
-    let target = LogicalPosition {
-        line,
-        col: u32::MAX,
-    };
-    let new = client
-        .rpc::<CursorSet>(CursorSetParams {
-            granularity: Granularity::Char,
+/// Vim's `o`/`O`: open a line below (smart-indented) or above (unindented) the cursor line
+/// and drop into Insert mode on it — one server-side edit (`input/open_line`).
+async fn open_line(client: &mut Client, state: &mut AppState, side: LineSide) -> Result<()> {
+    let r: EditResult = client
+        .rpc::<InputOpenLine>(InputOpenLineParams {
             buffer_id: state.ed_mut().buffer_id,
-            position: target,
-            anchor: target,
+            side,
         })
         .await?;
-    state.ed_mut().cursor = new;
-    newline_and_indent(client, state).await?;
-    enter_insert_mode(state);
-    Ok(())
-}
-
-/// Insert a blank line *above* the cursor's current line and drop into Insert mode on it.
-/// Park at col 0 of the current line, insert "\n" (which pushes the original line down a row
-/// and lands the cursor at its new start), then step back up onto the freshly-blank line.
-async fn open_line_above(client: &mut Client, state: &mut AppState) -> Result<()> {
-    let line = state.ed_mut().cursor.position.line;
-    let target = LogicalPosition { line, col: 0 };
-    let new = client
-        .rpc::<CursorSet>(CursorSetParams {
-            granularity: Granularity::Char,
-            buffer_id: state.ed_mut().buffer_id,
-            position: target,
-            anchor: target,
-        })
-        .await?;
-    state.ed_mut().cursor = new;
-    insert_text(client, state, "\n").await?;
-    move_motion(
-        client,
-        state,
-        Motion::LogicalLine {
-            direction: Direction::Backward,
-            count: 1,
-            preserve_col: false,
-        },
-        false,
-    )
-    .await?;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     enter_insert_mode(state);
     Ok(())
 }
@@ -5460,16 +5283,15 @@ async fn move_lines(
     direction: VerticalDirection,
     count: u32,
 ) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let r: EditResult = client
-            .rpc::<InputMoveLines>(InputMoveLinesParams {
-                buffer_id: state.ed_mut().buffer_id,
-                direction,
-            })
-            .await?;
-        state.ed_mut().revision = r.revision;
-        state.ed_mut().cursor = r.cursor;
-    }
+    let r: EditResult = client
+        .rpc::<InputMoveLines>(InputMoveLinesParams {
+            buffer_id: state.ed_mut().buffer_id,
+            direction,
+            count,
+        })
+        .await?;
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
     Ok(())
 }
 
@@ -5524,18 +5346,18 @@ async fn paste_before(client: &mut Client, state: &mut AppState, count: u32) -> 
         }
     };
     let text = text.repeat(count.max(1) as usize);
-    // Collapse to the start of the selection (no-op for a point cursor).
-    let start = min_pos(state.ed_mut().cursor.position, state.ed_mut().cursor.anchor);
-    let new = client
-        .rpc::<CursorSet>(CursorSetParams {
-            granularity: Granularity::Char,
+    // The collapse to the selection start rides the edit itself (`at`) — one round-trip.
+    let r: EditResult = client
+        .rpc::<InputText>(InputTextParams {
             buffer_id: state.ed_mut().buffer_id,
-            position: start,
-            anchor: start,
+            text,
+            select_pasted: true,
+            at: Some(SelectionEdge::Start),
         })
         .await?;
-    state.ed_mut().cursor = new;
-    insert_text_inner(client, state, &text, true).await
+    state.ed_mut().revision = r.revision;
+    state.ed_mut().cursor = r.cursor;
+    Ok(())
 }
 
 /// Normal-mode paste-replace: replace the current selection (or the cursor char) with the
@@ -5565,34 +5387,26 @@ async fn paste_at_cursor(client: &mut Client, state: &mut AppState) -> Result<()
 }
 
 async fn undo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let r: UndoResult = client
-            .rpc::<InputUndo>(BufferOnlyParams {
-                buffer_id: state.ed_mut().buffer_id,
-            })
-            .await?;
-        let applied = r.applied;
-        apply_undo_result(state, r, "undo");
-        if !applied {
-            break;
-        }
-    }
+    // Repeats server-side, stopping once the stack is exhausted.
+    let r: UndoResult = client
+        .rpc::<InputUndo>(CountedEditParams {
+            buffer_id: state.ed_mut().buffer_id,
+            count,
+        })
+        .await?;
+    apply_undo_result(state, r, "undo");
     Ok(())
 }
 
 async fn redo(client: &mut Client, state: &mut AppState, count: u32) -> Result<()> {
-    for _ in 0..count.max(1) {
-        let r: UndoResult = client
-            .rpc::<InputRedo>(BufferOnlyParams {
-                buffer_id: state.ed_mut().buffer_id,
-            })
-            .await?;
-        let applied = r.applied;
-        apply_undo_result(state, r, "redo");
-        if !applied {
-            break;
-        }
-    }
+    // Repeats server-side, stopping once the stack is exhausted.
+    let r: UndoResult = client
+        .rpc::<InputRedo>(CountedEditParams {
+            buffer_id: state.ed_mut().buffer_id,
+            count,
+        })
+        .await?;
+    apply_undo_result(state, r, "redo");
     Ok(())
 }
 
@@ -5808,6 +5622,8 @@ async fn create_file_in_explorer_dir(
             jump_to: None,
             // Creating a file is an intentional keep — not a preview.
             transient: None,
+            record_nav_from: None,
+            prime_search: None,
         })
         .await?;
     subscribe_replacing_scratch(client, state, open, Reveal::Minimal).await

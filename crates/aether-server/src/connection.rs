@@ -27,7 +27,8 @@ use aether_protocol::git::{
 };
 use aether_protocol::input::{
     InputBackspace, InputChangeLine, InputDedent, InputDelete, InputDeleteLine, InputIndent,
-    InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputRedo, InputReplaceLine,
+    InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputOpenLine, InputRedo,
+    InputReplaceLine,
     InputSurround, InputText, InputToggleComment, InputUndo, InputUnsurround,
 };
 use aether_protocol::lsp::{
@@ -383,6 +384,9 @@ async fn dispatch(
         InputMoveLines::NAME => run!(InputMoveLines, handlers::input_move_lines),
         InputIndent::NAME => run!(InputIndent, handlers::input_indent),
         InputDedent::NAME => run!(InputDedent, handlers::input_dedent),
+        InputOpenLine::NAME => {
+            run!(InputOpenLine, handlers::input_open_line)
+        }
         InputNewlineAndIndent::NAME => {
             run!(InputNewlineAndIndent, handlers::input_newline_and_indent)
         }

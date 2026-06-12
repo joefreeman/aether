@@ -582,6 +582,11 @@ impl RpcMethod for PickerGrepNavigate {
 pub struct PickerGrepNavigateParams {
     pub direction: Direction,
     pub buffer_id: BufferId,
+    /// Also open the target (transient, jumped to the hit, nav origin recorded, search
+    /// primed with the grep query) and return it in `opened` — the whole `<`/`>` client
+    /// chain in one round-trip (docs/protocol-composites.md, J).
+    #[serde(default)]
+    pub open: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -593,6 +598,9 @@ pub struct PickerGrepNavigateTarget {
     /// The grep query the cached hits came from. Echoed so the client can prime the opened
     /// buffer's search state for `n` / `Alt-n` follow-on, the same way picker selection does.
     pub query: String,
+    /// With `open`: the target, fully opened (transient, at `position`, search primed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened: Option<crate::buffer::BufferOpenResult>,
 }
 
 /// Move the open grep picker's selection to the first hit of the next or previous *file* (grep

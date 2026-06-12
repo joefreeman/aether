@@ -59,6 +59,7 @@ import type {
   LspServerStatus,
   LogicalPosition,
   Motion,
+  SelectionEdge,
   NavGotoParams,
   NavStepResult,
   PickerFilters,
@@ -472,17 +473,23 @@ class Editor {
         this.setStatus("No projects configured on the server.", true);
         return;
       }
-      const activated = await this.client.rpc<ProjectActivateResult>("project/activate", { name });
+      // `open_last` folds the landing open (last MRU buffer, or a fresh transient scratch)
+      // into the activate; URL-directed opens (file/buffer links) go separately and fall
+      // back to the same convention on failure.
+      const directed = Boolean(urlFile) || urlBuffer != null;
+      const activated = await this.client.rpc<ProjectActivateResult>("project/activate", {
+        name,
+        open_last: !directed,
+      });
       this.projectName = activated.project.name;
       this.projectPaths = activated.project.paths;
 
-      // A freshly-spawned placeholder scratch is transient (it auto-closes once a real buffer
-      // replaces it); reattaching to the project's last buffer leaves its flag alone.
-      const lastOrScratch: BufferOpenParams = {
-        buffer_id: activated.last_buffer_id ?? null,
-        create_if_missing: false,
-        ...(activated.last_buffer_id == null ? { transient: true } : {}),
-      };
+      const lastOrScratch = async (): Promise<BufferOpenResult> =>
+        this.client.rpc<BufferOpenResult>("buffer/open", {
+          buffer_id: activated.last_buffer_id ?? null,
+          create_if_missing: false,
+          ...(activated.last_buffer_id == null ? { transient: true } : {}),
+        });
       let open: BufferOpenResult;
       if (urlFile) {
         try {
@@ -493,7 +500,7 @@ class Editor {
           });
         } catch {
           this.toast(`could not open ${urlFile}`, "warning");
-          open = await this.client.rpc<BufferOpenResult>("buffer/open", lastOrScratch);
+          open = await lastOrScratch();
         }
       } else if (urlBuffer != null) {
         // A scratch-buffer link (`?buffer=<id>`). The id is session-scoped: if the buffer was closed
@@ -504,10 +511,10 @@ class Editor {
             create_if_missing: false,
           });
         } catch {
-          open = await this.client.rpc<BufferOpenResult>("buffer/open", lastOrScratch);
+          open = await lastOrScratch();
         }
       } else {
-        open = await this.client.rpc<BufferOpenResult>("buffer/open", lastOrScratch);
+        open = activated.opened!;
       }
       this.adoptOpenedBuffer(open);
       this.scroll = open.scroll ?? { logical_line: 0, sub_row: 0 };
@@ -1598,13 +1605,13 @@ class Editor {
         );
         break;
       case "selectLine":
-        for (let i = 0; i < Math.max(1, count); i++) {
-          this.cursor = await this.client.rpc<CursorState>("cursor/select_line", {
-            buffer_id: this.bufferId,
-            direction: action.dir,
-            extend,
-          });
-        }
+        // The repeat loop lives server-side (one round-trip per keypress).
+        this.cursor = await this.client.rpc<CursorState>("cursor/select_line", {
+          buffer_id: this.bufferId,
+          direction: action.dir,
+          extend,
+          count: Math.max(1, count),
+        });
         break;
       case "swapAnchor":
         this.cursor = await this.client.rpc<CursorState>("cursor/swap_anchor", { buffer_id: this.bufferId });
@@ -1618,27 +1625,21 @@ class Editor {
         break;
       case "treeExpand":
       case "treeContract":
-        for (let i = 0; i < Math.max(1, count); i++) {
-          const next = await this.client.rpc<CursorState>(
-            action.t === "treeExpand" ? "cursor/expand" : "cursor/contract",
-            { buffer_id: this.bufferId },
-          );
-          if (next.position.line === this.cursor.position.line && next.position.col === this.cursor.position.col &&
-              next.anchor.line === this.cursor.anchor.line && next.anchor.col === this.cursor.anchor.col) {
-            break;
-          }
-          this.cursor = next;
-        }
+        // Repeats server-side, stopping once the cursor stops changing.
+        this.cursor = await this.client.rpc<CursorState>(
+          action.t === "treeExpand" ? "cursor/expand" : "cursor/contract",
+          { buffer_id: this.bufferId, count: Math.max(1, count) },
+        );
         break;
       case "motionUndo":
       case "motionRedo":
-        for (let i = 0; i < Math.max(1, count); i++) {
+        // Repeats server-side, stopping once the history is exhausted.
+        {
           const r = await this.client.rpc<CursorUndoResult>(
             action.t === "motionUndo" ? "cursor/undo" : "cursor/redo",
-            { buffer_id: this.bufferId },
+            { buffer_id: this.bufferId, count: Math.max(1, count) },
           );
-          if (!r.applied) break;
-          this.cursor = r.cursor;
+          if (r.applied) this.cursor = r.cursor;
         }
         break;
       case "centerCursor": {
@@ -1669,7 +1670,7 @@ class Editor {
         await this.edit("input/delete");
         break;
       case "deleteSelection":
-        for (let i = 0; i < Math.max(1, count); i++) await this.edit("input/delete");
+        await this.edit("input/delete", { count: Math.max(1, count) });
         break;
       case "deleteLine":
         await this.edit("input/delete_line");
@@ -1684,46 +1685,47 @@ class Editor {
         break;
       case "undo":
       case "redo":
-        for (let i = 0; i < Math.max(1, count); i++) {
+        // Repeats server-side, stopping once the stack is exhausted.
+        {
           const r = await this.client.rpc<UndoResult>(action.t === "undo" ? "input/undo" : "input/redo", {
             buffer_id: this.bufferId,
+            count: Math.max(1, count),
           });
-          if (!r.applied) break;
-          this.cursor = r.cursor;
-          this.revision = r.revision;
+          if (r.applied) {
+            this.cursor = r.cursor;
+            this.revision = r.revision;
+          }
         }
         break;
-      case "moveLines":
-        for (let i = 0; i < Math.max(1, count); i++) {
-          const r = await this.client.rpc<EditResult>("input/move_lines", {
-            buffer_id: this.bufferId,
-            direction: action.dir,
-          });
-          this.cursor = r.cursor;
-          this.revision = r.revision;
-        }
+      case "moveLines": {
+        const r = await this.client.rpc<EditResult>("input/move_lines", {
+          buffer_id: this.bufferId,
+          direction: action.dir,
+          count: Math.max(1, count),
+        });
+        this.cursor = r.cursor;
+        this.revision = r.revision;
         break;
+      }
       case "joinLines":
-        for (let i = 0; i < Math.max(1, count); i++) await this.edit("input/join_lines");
+        await this.edit("input/join_lines", { count: Math.max(1, count) });
         break;
       case "indent":
-        for (let i = 0; i < Math.max(1, count); i++) await this.edit("input/indent");
+        await this.edit("input/indent", { count: Math.max(1, count) });
         break;
       case "dedent":
-        for (let i = 0; i < Math.max(1, count); i++) await this.edit("input/dedent");
+        await this.edit("input/dedent", { count: Math.max(1, count) });
         break;
       case "toggleComment":
         await this.edit("input/toggle_comment");
         break;
       case "openLineBelow":
-        await this.setCursor({ line: this.cursor.position.line, col: LINE_END_COL });
-        await this.edit("input/newline_and_indent");
+        // One server-side edit: park, open (smart-indented below / unindented above), land.
+        await this.edit("input/open_line", { side: "below" });
         this.mode = "insert";
         break;
       case "openLineAbove":
-        await this.setCursor({ line: this.cursor.position.line, col: 0 });
-        await this.insertText("\n");
-        await this.moveMotion({ kind: "logical_line", direction: "backward", count: 1, preserve_col: false }, false);
+        await this.edit("input/open_line", { side: "above" });
         this.mode = "insert";
         break;
 
@@ -1808,30 +1810,25 @@ class Editor {
         break;
       }
       case "grepNavigate": {
+        // One composite: navigate, open transient at the hit, record nav (server-side jump
+        // list), prime search (the summary arrives via `search/state_changed`).
         const target = await this.client.rpc<PickerGrepNavigateTarget | null>("picker/grep_navigate", {
           direction: action.dir,
           buffer_id: this.bufferId,
+          open: true,
         });
-        if (target) {
-          const params = this.resolvePath(target.path);
-          if (params) {
-            params.jump_to = target.position;
-            params.transient = true;
-            await this.switchBuffer(params, { recordJump: true, reveal: "center" });
-            // Prime the buffer's search with the grep query so n / Alt-n continue from here.
-            if (target.query) {
-              const res = await this.client.rpc<SearchSetResult>("search/set", {
-                buffer_id: this.bufferId,
-                query: target.query,
-                anchor: target.position,
-                extend: false,
-              });
-              this.committedQuery = target.query;
-              this.searchCommitted = true;
-              this.searchSummary = res.summary;
-            }
+        if (target?.opened) {
+          // Mirror switchBuffer's recordJump bookkeeping around the pre-opened result.
+          this.replaceHistory();
+          const originKey = this.locationKey();
+          await this.applyOpenedBuffer(target.opened, "center");
+          if (this.locationKey() !== originKey) this.pushHistory();
+          else this.replaceHistory();
+          if (target.query) {
+            this.committedQuery = target.query;
+            this.searchCommitted = true;
           }
-        } else {
+        } else if (!target) {
           this.setStatus("no more grep hits");
         }
         break;
@@ -1864,11 +1861,12 @@ class Editor {
         this.showDiagnosticAtCursor();
         break;
       case "showCommitInfo": {
-        // Blame the cursor line for its commit hash, then resolve full details (the cached EOL
-        // blame keeps only display text, so re-fetch). Mirrors the TUI's `Space o`.
+        // Blame the cursor line and resolve the commit's details in one round-trip
+        // (`include_commit_info`). Mirrors the TUI's `Space o`.
         const bl = await this.client.rpc<GitBlameLineResult>("git/blame_line", {
           buffer_id: this.bufferId,
           line: this.cursor.position.line,
+          include_commit_info: true,
         });
         if (!bl.blame) {
           this.setStatus("No commit details for this line");
@@ -1878,11 +1876,7 @@ class Editor {
           this.setStatus("Uncommitted line — no commit details");
           break;
         }
-        const ci = await this.client.rpc<GitCommitInfoResult>("git/commit_info", {
-          buffer_id: this.bufferId,
-          commit: bl.blame.commit,
-        });
-        if (ci.info) this.showHover(formatCommitDetails(ci.info));
+        if (bl.commit_info) this.showHover(formatCommitDetails(bl.commit_info));
         else this.setStatus("Commit not found");
         break;
       }
@@ -1903,16 +1897,16 @@ class Editor {
         break;
       }
 
-      case "searchCycle":
-        for (let i = 0; i < Math.max(1, count); i++) {
-          const r = await this.client.rpc<SearchNavResult>(
-            action.dir === "forward" ? "search/next" : "search/prev",
-            { buffer_id: this.bufferId, extend },
-          );
-          this.cursor = r.cursor;
-          this.searchSummary = r.summary;
-        }
+      case "searchCycle": {
+        // `count` rides the nav RPC (one trip for `3n`).
+        const r = await this.client.rpc<SearchNavResult>(
+          action.dir === "forward" ? "search/next" : "search/prev",
+          { buffer_id: this.bufferId, extend, count: Math.max(1, count) },
+        );
+        this.cursor = r.cursor;
+        this.searchSummary = r.summary;
         break;
+      }
       case "searchFromSelection":
         await this.searchFromSelection();
         break;
@@ -1989,17 +1983,18 @@ class Editor {
     });
   }
 
-  private async edit(method: string): Promise<void> {
-    const r = await this.client.rpc<EditResult>(method, { buffer_id: this.bufferId });
+  private async edit(method: string, extra: Record<string, unknown> = {}): Promise<void> {
+    const r = await this.client.rpc<EditResult>(method, { buffer_id: this.bufferId, ...extra });
     this.cursor = r.cursor;
     this.revision = r.revision;
   }
 
-  private async insertText(text: string, selectPasted = false): Promise<void> {
+  private async insertText(text: string, selectPasted = false, at?: SelectionEdge): Promise<void> {
     const r = await this.client.rpc<EditResult>("input/text", {
       buffer_id: this.bufferId,
       text,
       select_pasted: selectPasted,
+      ...(at ? { at } : {}),
     });
     this.cursor = r.cursor;
     this.revision = r.revision;
@@ -2045,9 +2040,8 @@ class Editor {
     if (this.mode === "insert") {
       await this.insertText(text);
     } else {
-      const start = minPos(this.cursor.position, this.cursor.anchor);
-      await this.setCursor(start);
-      await this.insertText(text, true);
+      // The collapse to the selection start rides the edit itself (`at`) — one round-trip.
+      await this.insertText(text, true, "start");
     }
   }
 
@@ -2062,28 +2056,15 @@ class Editor {
   }
 
   private async enterInsertAt(where: InsertWhere): Promise<void> {
-    const pos = this.cursor.position;
-    const anchor = this.cursor.anchor;
-    switch (where) {
-      case "selectionStart":
-        await this.setCursor(minPos(pos, anchor));
-        break;
-      case "selectionEnd": {
-        const max = maxPos(pos, anchor);
-        await this.setCursor(max);
-        await this.moveMotion({ kind: "char", direction: "forward", count: 1 }, false);
-        break;
-      }
-      case "firstLineStart":
-        // First non-blank of the first line of the selection (consistent with `Alt-h`):
-        // park on the line, then resolve the column via the same motion `Alt-h` uses.
-        await this.setCursor({ line: Math.min(pos.line, anchor.line), col: 0 });
-        await this.moveMotion({ kind: "line_first_nonblank" }, false);
-        break;
-      case "lastLineEnd":
-        await this.setCursor({ line: Math.max(pos.line, anchor.line), col: LINE_END_COL });
-        break;
-    }
+    // One RPC: the server owns the selection, so it resolves the edge (`selection_edge`
+    // motion — formerly a set-cursor-then-adjust chain here).
+    const edge: SelectionEdge = {
+      selectionStart: "start" as const,
+      selectionEnd: "after_end" as const,
+      firstLineStart: "first_line_nonblank" as const,
+      lastLineEnd: "last_line_end" as const,
+    }[where];
+    await this.moveMotion({ kind: "selection_edge", edge }, false);
     this.mode = "insert";
   }
 
@@ -2179,10 +2160,15 @@ class Editor {
       const ok = await this.modal(() => confirmDialog(`Discard unsaved changes in ${this.label}?`));
       if (!ok) return;
     }
-    const r = await this.client.rpc<BufferCloseResult>("buffer/close", { buffer_id: this.bufferId });
-    await this.switchBuffer(
-      r.next_buffer_id != null ? { buffer_id: r.next_buffer_id, create_if_missing: false } : { create_if_missing: false },
-    );
+    // `open_next` folds the successor open (MRU buffer or fresh scratch) into the close.
+    const r = await this.client.rpc<BufferCloseResult>("buffer/close", {
+      buffer_id: this.bufferId,
+      open_next: true,
+    });
+    if (r.opened) {
+      await this.applyOpenedBuffer(r.opened);
+      this.replaceHistory();
+    }
   }
 
   /** Project-settings overlay: list the active project's roots (with delete), plus an add-root
@@ -2504,18 +2490,16 @@ class Editor {
   /** `Alt-/`: search for the current selection as a literal (regex-escaped), without entering the
    *  search bar — leaves the cursor where it is and lights up the matches. */
   private async searchFromSelection(): Promise<void> {
-    const copied = await this.client.rpc<BufferCopyResult>("buffer/copy", {
-      buffer_id: this.bufferId,
-      scope: "selection",
-    });
-    if (!copied.text) return;
-    const query = regexEscape(copied.text);
+    // The server derives and escapes the query from its own selection state — one trip.
     const res = await this.client.rpc<SearchSetResult>("search/set", {
       buffer_id: this.bufferId,
-      query,
+      query: "",
       anchor: null,
       extend: false,
+      from_selection: true,
     });
+    if (res.query == null) return; // empty selection — nothing set
+    const query = res.query;
     this.committedQuery = query;
     this.searchCommitted = true;
     this.searchSummary = res.summary;

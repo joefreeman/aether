@@ -92,9 +92,13 @@ pub enum ChipValue {
     Lit,
     /// Gitignored-file visibility. `hide` records the per-kind direction at creation time
     /// (the Explorer hides, Grep includes), so the wire conversion needs no kind context.
-    Ignored { hide: bool },
+    Ignored {
+        hide: bool,
+    },
     /// Hidden-file visibility; same `hide` convention as `Ignored`.
-    Hidden { hide: bool },
+    Hidden {
+        hide: bool,
+    },
     Changed,
 }
 
@@ -840,7 +844,7 @@ mod tests {
         assert_eq!(chips[1], ChipValue::Case(CaseMode::Insensitive));
         assert!(apply_chip_toggle(&mut chips, ChipId::Case, false));
         assert_eq!(chips.len(), 1); // back to smart — chip gone
-        // Boolean toggles flip; the explorer direction is recorded in the value.
+                                    // Boolean toggles flip; the explorer direction is recorded in the value.
         assert!(apply_chip_toggle(&mut chips, ChipId::Ignored, true));
         assert_eq!(chips[1], ChipValue::Ignored { hide: true });
         assert!(apply_chip_toggle(&mut chips, ChipId::Ignored, true));

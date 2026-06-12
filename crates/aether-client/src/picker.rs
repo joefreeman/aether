@@ -198,8 +198,8 @@ impl PickerState {
         }
         let max = self.total_matches as i64 - 1;
         self.selected = (self.selected as i64 + delta).clamp(0, max) as u32;
-        let in_window = self.selected >= self.offset
-            && self.selected < self.offset + self.items.len() as u32;
+        let in_window =
+            self.selected >= self.offset && self.selected < self.offset + self.items.len() as u32;
         if in_window {
             return None;
         }
@@ -246,8 +246,7 @@ impl PickerState {
             .items
             .first()
             .is_some_and(|i| matches!(i, PickerItem::GrepHit { .. }));
-        self.display_offset
-            .saturating_sub(leads_with_header as u32)
+        self.display_offset.saturating_sub(leads_with_header as u32)
     }
 
     /// The highlighted item's display-row index in the whole virtual list, when it's inside
