@@ -345,15 +345,22 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         let keys = iced::event::listen_with(|event, _status, _window| match event {
             Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
+                modified_key,
                 modifiers,
                 text,
                 ..
-            }) => crate::input::keycode(&key).map(|code| Message::Key {
-                code,
-                mods: crate::input::mods(modifiers),
-                text: text.map(|t| t.to_string()),
-            }),
+            }) => {
+                // `modified_key`, not `key`: the keymap binds the PRODUCED character
+                // (`<` is `ch('<')`, matching the TUI's crossterm chars and the web's
+                // `e.key`), while iced's `key` strips modifiers — Shift+comma arrives
+                // as `,` there, so shifted-punctuation bindings (`<`, `>`, `?`, `{`,
+                // `}`) would never match.
+                crate::input::keycode(&modified_key).map(|code| Message::Key {
+                    code,
+                    mods: crate::input::mods(modifiers),
+                    text: text.map(|t| t.to_string()),
+                })
+            }
             _ => None,
         });
         if self.boot.is_none() && self.scroll_anim.is_some() {

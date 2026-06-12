@@ -13,7 +13,7 @@ const fn rgb(hex: u32) -> Color {
 
 pub const NORD0: Color = rgb(0x2e3440); // main background
 pub const NORD1: Color = rgb(0x3b4252); // status line / panel
-pub const NORD2: Color = rgb(0x434c5e); // selection background
+pub const NORD2: Color = rgb(0x434c5e); // picker row highlight / chips
 pub const NORD3: Color = rgb(0x4c566a); // comments / dim
 pub const NORD3_BRIGHT: Color = rgb(0x616e88); // lighter dim (legible secondary text on panels)
 pub const NORD4: Color = rgb(0xd8dee9); // main foreground
@@ -21,6 +21,7 @@ pub const NORD6: Color = rgb(0xeceff4); // brightest text (search query, file la
 pub const NORD7: Color = rgb(0x8fbcbb); // types
 pub const NORD8: Color = rgb(0x88c0d0); // functions, accents
 pub const NORD9: Color = rgb(0x81a1c1); // keywords, operators
+pub const NORD10: Color = rgb(0x5e81ac); // Frost — deep blue (active selection bg)
 pub const NORD11: Color = rgb(0xbf616a); // error
 pub const NORD12: Color = rgb(0xd08770); // attributes, macros
 pub const NORD13: Color = rgb(0xebcb8b); // string escapes, warnings

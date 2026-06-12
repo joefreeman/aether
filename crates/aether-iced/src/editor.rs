@@ -368,20 +368,24 @@ where
                 }
 
                 // Search-match fills: a quiet NORD3, under selection and cursor (matching the
-                // web's search-hit < selection < cursor stacking).
-                for m in &line.search_matches {
-                    if let Some((start, end)) = grid::byte_range_span(&cells, m.start, m.end) {
-                        fill_content(
-                            renderer,
-                            Rectangle {
-                                x: text_x(start),
-                                y,
-                                width: (end - start) as f32 * cell.width,
-                                height: cell.height,
-                            },
-                            theme::NORD3,
-                        );
-                    }
+                // web's search-hit < selection < cursor stacking). The spans are kept — the
+                // text pass below lifts NORD3-coloured glyphs inside them.
+                let hit_spans: Vec<(u32, u32)> = line
+                    .search_matches
+                    .iter()
+                    .filter_map(|m| grid::byte_range_span(&cells, m.start, m.end))
+                    .collect();
+                for &(start, end) in &hit_spans {
+                    fill_content(
+                        renderer,
+                        Rectangle {
+                            x: text_x(start),
+                            y,
+                            width: (end - start) as f32 * cell.width,
+                            height: cell.height,
+                        },
+                        theme::NORD3,
+                    );
                 }
 
                 // Gutter change-bar. Under the diff view, removed lines render as phantom
@@ -403,7 +407,8 @@ where
                     );
                 }
 
-                // Selection.
+                // Selection: the saturated NORD10 blue, over the NORD3 search-hit fill
+                // (terminal/web parity — hit < selection < cursor).
                 if draw_selection {
                     if let Some((start, end)) = grid::row_selection_span(
                         line.logical_line,
@@ -421,7 +426,7 @@ where
                                 width: (end - start) as f32 * cell.width,
                                 height: cell.height,
                             },
-                            theme::NORD2,
+                            theme::NORD10,
                         );
                     }
                 }
@@ -462,17 +467,30 @@ where
                     );
                 }
 
-                // Text, as runs of identical highlight kind.
+                // Text, as runs of identical highlight kind. "Inside a search hit" is part
+                // of the run key: comments are themed NORD3 — the same shade as the hit
+                // fill — so a match inside one would be invisible. Lift just that text to
+                // the normal foreground (the web's `.search-hit.hl-comment` rule; every
+                // other syntax colour reads fine on NORD3).
+                let in_hit = |dcol: u32| hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e);
                 let mut run = String::new();
                 let mut run_start: u32 = 0;
                 let mut run_kind: Option<&str> = None;
-                let flush = |run: &mut String, start: u32, kind: Option<&str>, renderer: &mut Renderer| {
+                let mut run_hit = false;
+                let flush = |run: &mut String,
+                             start: u32,
+                             kind: Option<&str>,
+                             hit: bool,
+                             renderer: &mut Renderer| {
                     if run.is_empty() {
                         return;
                     }
-                    let color = kind
+                    let mut color = kind
                         .and_then(theme::highlight_color)
                         .unwrap_or(theme::NORD4);
+                    if hit && color == theme::NORD3 {
+                        color = theme::NORD4;
+                    }
                     draw_run(
                         renderer,
                         std::mem::take(run),
@@ -483,13 +501,16 @@ where
                     );
                 };
                 for c in &cells {
+                    let hit = in_hit(c.dcol);
                     if run.is_empty() {
                         run_start = c.dcol;
                         run_kind = c.kind;
-                    } else if c.kind != run_kind {
-                        flush(&mut run, run_start, run_kind, renderer);
+                        run_hit = hit;
+                    } else if c.kind != run_kind || hit != run_hit {
+                        flush(&mut run, run_start, run_kind, run_hit, renderer);
                         run_start = c.dcol;
                         run_kind = c.kind;
+                        run_hit = hit;
                     }
                     if c.ch == '\t' {
                         for _ in 0..c.width {
@@ -499,7 +520,7 @@ where
                         run.push(c.ch);
                     }
                 }
-                flush(&mut run, run_start, run_kind, renderer);
+                flush(&mut run, run_start, run_kind, run_hit, renderer);
 
                 // Cursor-line blame: dim virtual text after the line's last row.
                 if let Some((bline, btext)) = self.content.blame {
