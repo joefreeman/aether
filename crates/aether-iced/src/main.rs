@@ -4,15 +4,17 @@
 //! runtime for the app's lifetime.
 
 mod app;
-mod chips;
 mod connection;
 mod discovery;
 mod editor;
-mod grid;
-mod keymap;
-mod labels;
+mod input;
 mod picker;
 mod theme;
+
+// The core crate under the path the shell has always used, plus its modules at their
+// pre-extraction paths so references didn't churn during the seam work (docs/client-core.md).
+pub(crate) use aether_client as core;
+pub(crate) use aether_client::{chips, grid, keymap, labels};
 
 use anyhow::{anyhow, bail, Context};
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams};

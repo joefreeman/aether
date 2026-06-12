@@ -1,0 +1,14 @@
+[package]
+name = "aether-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The platform-free Aether client: modal state machine, keymap, picker/session state, update logic. Shells (iced, TUI, …) supply transport + rendering."
+
+[dependencies]
+aether-protocol = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+unicode-width = { workspace = true }

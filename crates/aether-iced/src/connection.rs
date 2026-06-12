@@ -14,14 +14,12 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// JSON-RPC error from the server (or a transport failure surfaced in its shape).
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("RPC {method} returned error {code}: {message}")]
-pub struct RpcError {
-    pub method: &'static str,
-    pub code: i32,
-    pub message: String,
-}
+/// The notification stream's shared receiver — the shell's pump locks it per recv.
+pub type NotifRx =
+    std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Notification>>>;
+
+pub use crate::core::transport::RpcError;
+use crate::core::transport::Transport;
 
 struct Outgoing {
     method: &'static str,
@@ -37,24 +35,36 @@ pub struct Handle {
 
 impl Handle {
     pub async fn rpc<M: RpcMethod>(&self, params: M::Params) -> Result<M::Result, RpcError> {
-        let transport_err = |message: String| RpcError {
-            method: M::NAME,
+        crate::core::transport::rpc::<M>(self, params).await
+    }
+}
+
+/// The native transport: requests ride the actor's channel; the future awaits the
+/// correlated reply (and is `'static` — it owns its `oneshot` end, not the handle).
+impl Transport for Handle {
+    fn call(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> futures_util::future::BoxFuture<'static, Result<serde_json::Value, RpcError>> {
+        let transport_err = move |message: &str| RpcError {
+            method,
             code: 0,
-            message,
+            message: message.into(),
         };
-        let params = serde_json::to_value(&params).map_err(|e| transport_err(e.to_string()))?;
         let (reply, rx) = oneshot::channel();
-        self.tx
+        let sent = self
+            .tx
             .send(Outgoing {
-                method: M::NAME,
+                method,
                 params,
                 reply,
             })
-            .map_err(|_| transport_err("connection closed".into()))?;
-        let value = rx
-            .await
-            .map_err(|_| transport_err("connection closed".into()))??;
-        serde_json::from_value(value).map_err(|e| transport_err(format!("parsing result: {e}")))
+            .map_err(|_| transport_err("connection closed"));
+        Box::pin(async move {
+            sent?;
+            rx.await.map_err(|_| transport_err("connection closed"))?
+        })
     }
 }
 

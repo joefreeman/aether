@@ -1,4 +1,5 @@
-//! Data-driven keybindings — a port of `aether-tui/src/keymap.rs` onto iced key types.
+//! Data-driven keybindings — a port of `aether-tui/src/keymap.rs` onto the core's own
+//! key types (shells map their native key events in at the edge — see `input.rs`).
 //!
 //! The chords and their semantics are copied verbatim from the TUI so the clients stay
 //! consistent; this file should never invent a binding the TUI doesn't have. It currently
@@ -14,7 +15,7 @@ use aether_protocol::cursor::{Direction, VerticalDirection, WordBoundary};
 use aether_protocol::input::SurroundTarget;
 use aether_protocol::picker::PickerKind;
 
-/// Layout-resolved key identity, normalised from `iced::keyboard::Key`: letters lowercase
+/// Layout-resolved key identity, normalised from the platform's key event: letters lowercase
 /// (Shift is carried separately in [`Mods`]), shifted symbols as produced (`?`, `{`, …).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyCode {
@@ -50,51 +51,6 @@ impl Mods {
     fn without_shift(self) -> Mods {
         Mods { shift: false, ..self }
     }
-}
-
-impl From<iced::keyboard::Modifiers> for Mods {
-    fn from(m: iced::keyboard::Modifiers) -> Self {
-        Mods {
-            ctrl: m.control(),
-            alt: m.alt(),
-            shift: m.shift(),
-        }
-    }
-}
-
-/// Normalise an iced key to our [`KeyCode`]. `None` for keys we don't bind (modifiers
-/// themselves, function keys, …).
-pub fn keycode(key: &iced::keyboard::Key) -> Option<KeyCode> {
-    use iced::keyboard::key::Named;
-    use iced::keyboard::Key;
-    Some(match key {
-        Key::Character(s) => {
-            let mut chars = s.chars();
-            let c = chars.next()?;
-            if chars.next().is_some() {
-                return None;
-            }
-            KeyCode::Char(c.to_ascii_lowercase())
-        }
-        Key::Named(named) => match named {
-            Named::Space => KeyCode::Char(' '),
-            Named::Escape => KeyCode::Esc,
-            Named::Enter => KeyCode::Enter,
-            Named::Tab => KeyCode::Tab,
-            Named::Backspace => KeyCode::Backspace,
-            Named::Delete => KeyCode::Delete,
-            Named::Home => KeyCode::Home,
-            Named::End => KeyCode::End,
-            Named::PageUp => KeyCode::PageUp,
-            Named::PageDown => KeyCode::PageDown,
-            Named::ArrowLeft => KeyCode::Left,
-            Named::ArrowRight => KeyCode::Right,
-            Named::ArrowUp => KeyCode::Up,
-            Named::ArrowDown => KeyCode::Down,
-            _ => return None,
-        },
-        _ => return None,
-    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -663,13 +619,4 @@ mod tests {
         assert!(n.action.is_repeatable());
     }
 
-    #[test]
-    fn keycode_normalises_letters_and_named_keys() {
-        use iced::keyboard::{key::Named, Key};
-        assert_eq!(keycode(&Key::Character("H".into())), Some(ch('h')));
-        assert_eq!(keycode(&Key::Character("?".into())), Some(ch('?')));
-        assert_eq!(keycode(&Key::Named(Named::Space)), Some(ch(' ')));
-        assert_eq!(keycode(&Key::Named(Named::Escape)), Some(KeyCode::Esc));
-        assert_eq!(keycode(&Key::Named(Named::Shift)), None);
-    }
 }

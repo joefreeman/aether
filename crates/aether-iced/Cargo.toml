@@ -11,6 +11,7 @@ name = "ae-iced"
 path = "src/main.rs"
 
 [dependencies]
+aether-client = { workspace = true }
 aether-protocol = { workspace = true }
 serde = { workspace = true }
 iced = { workspace = true }

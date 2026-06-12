@@ -4,6 +4,7 @@ members = [
     "crates/aether-protocol",
     "crates/aether-server",
     "crates/aether-tui",
+    "crates/aether-client",
     "crates/aether-iced",
 ]
 
@@ -14,6 +15,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 aether-protocol = { path = "crates/aether-protocol" }
+aether-client = { path = "crates/aether-client" }
 
 # Serde / JSON-RPC
 serde = { version = "1", features = ["derive"] }
