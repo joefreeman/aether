@@ -2034,6 +2034,8 @@ export class Picker {
     const path = this.kind === "explorer" ? this.explorerDisplayPath() : "";
     this.pathEl.textContent = path;
     this.pathEl.style.display = path ? "block" : "none";
+    // The breadcrumb already says where typing will act; don't also dangle the placeholder.
+    this.input.placeholder = path ? "" : PLACEHOLDER[this.kind];
   }
 
   /** Path within the project root (empty at a root's top), matching the terminal — which shows the
@@ -2053,7 +2055,7 @@ export class Picker {
     if (bestIdx < 0) return `${dir}/`;
     // The *disambiguated* root label, not the basename — colliding basenames would read alike.
     const label =
-      this.projectPaths.length > 1 ? `${rootLabels(this.projectPaths)[bestIdx]}/` : "";
+      this.projectPaths.length > 1 ? `${rootLabels(this.projectPaths)[bestIdx]}: ` : "";
     if (dir === best) return label;
     // Segment-elide the path to the breadcrumb's share of the input row (its CSS max-width is
     // 55%); the trailing `/` is the "you're inside this dir" cue, re-appended after.

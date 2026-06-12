@@ -17046,6 +17046,56 @@ fn transient_sub_params(buffer_id: u64) -> ViewportSubscribeParams {
     }
 }
 
+/// A dropped connection — a closed native-client tab, a closed browser tab — hides everything
+/// that client was showing: its viewed transients orphan-close on disconnect like any other
+/// hide, so Ctrl-t/Ctrl-w tab churn doesn't leave scratch buffers behind.
+#[tokio::test]
+async fn transient_buffer_closes_on_disconnect() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            transient: Some(true),
+        },
+    )
+    .await;
+    assert!(scratch.transient, "fresh scratch opened transient");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(scratch.buffer_id))
+            .await;
+    drop(ws); // the tab closes its connection
+
+    // The server processes the close on its own task; give it a beat.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws2,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+        },
+    )
+    .await;
+    let err = send_request_expect_err::<BufferOpen>(
+        &mut ws2,
+        2,
+        &attach_open_params(scratch.buffer_id, None),
+    )
+    .await;
+    assert!(
+        err.to_lowercase().contains("buffer"),
+        "attaching to the orphaned transient should fail (got: {err})"
+    );
+}
+
 /// The core lifecycle: a transient buffer dies when the client's viewport moves elsewhere.
 #[tokio::test]
 async fn transient_buffer_closes_when_hidden() {

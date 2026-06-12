@@ -198,7 +198,17 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         let Some(msg) = reader.next().await else {
             break;
         };
-        let msg = msg?;
+        // A read error is an abrupt disconnect (process killed, TCP reset, a native-client
+        // tab dropping its socket) — it must fall through to the same teardown as a graceful
+        // close, not propagate out past the cleanup below (that leaked the client's state,
+        // including its orphaned transient buffers).
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(%client_id, error = %e, "connection errored; tearing down");
+                break;
+            }
+        };
         match msg {
             Message::Text(text) => {
                 if let Some(reply) = process_text(&text, &state, &mut ctx).await {

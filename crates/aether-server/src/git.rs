@@ -607,7 +607,9 @@ pub fn commit_info(repo: &GitRepo, rev: &str) -> Option<CommitInfo> {
 /// status entry's repo-relative path is bucketed under its first path component below `dir`, so a
 /// change deep in a subtree colours the top-level folder (folder aggregation). Untracked and
 /// ignored subtrees are left collapsed (`recurse_*_dirs` off), so `node_modules/` is a single gray
-/// bucket rather than a walk of thousands of files.
+/// bucket rather than a walk of thousands of files. The one status that does NOT aggregate is
+/// `Ignored`: it only colours the entry it names — a tracked folder containing ignored
+/// descendants isn't itself ignored.
 ///
 /// Best-effort: no repo, `dir` outside any repo, or any libgit2 error → an empty map, and the
 /// explorer falls back to its default colours.
@@ -651,6 +653,25 @@ pub fn dir_statuses(dir: &Path) -> HashMap<String, GitStatus> {
         let Some(status) = classify_status(entry.status()) else {
             continue;
         };
+        if status == GitStatus::Ignored {
+            // Unlike real changes, ignored-ness never aggregates upward: a clean tracked
+            // folder whose only status entries are ignored *descendants* (`__pycache__/`
+            // somewhere beneath it — clean files produce no entries at all) is not itself
+            // ignored, and greying it reads as "this folder is gitignored". Only the entry
+            // that IS the listed child colours.
+            if suffix.components().nth(1).is_some() {
+                continue;
+            }
+            // libgit2 also reports untracked *empty* directories as IGNORED (git can't track
+            // them), which would grey a bare empty folder. Keep an Ignored child only when
+            // an actual ignore rule matches its path.
+            if !repo
+                .is_path_ignored(Path::new(path))
+                .unwrap_or(true)
+            {
+                continue;
+            }
+        }
         let name = child.as_os_str().to_string_lossy().into_owned();
         out.entry(name)
             .and_modify(|cur| {
@@ -1370,6 +1391,66 @@ mod tests {
         );
         assert_eq!(st.get("new.rs"), Some(&GitStatus::Untracked));
         assert_eq!(st.get("debug.log"), Some(&GitStatus::Ignored));
+    }
+
+    /// libgit2 reports untracked empty directories as IGNORED; a tracked folder containing
+    /// one must not grey out (no ignore rule matches it).
+    #[test]
+    fn dir_statuses_ignores_empty_dir_false_positives() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(root, &[("sub/code.rs", "fine\n")]);
+        std::fs::create_dir(root.join("sub/empty")).unwrap();
+        std::fs::create_dir(root.join("hollow")).unwrap();
+
+        let st = dir_statuses(root);
+        assert_eq!(
+            st.get("sub"),
+            None,
+            "clean tracked folder with an empty subdir stays uncoloured"
+        );
+        assert_eq!(
+            st.get("hollow"),
+            None,
+            "a bare empty directory is not 'ignored'"
+        );
+
+        // A real ignore rule still reports — including for directories.
+        std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        std::fs::create_dir(root.join("build")).unwrap();
+        std::fs::write(root.join("build/out.o"), "obj\n").unwrap();
+        let st = dir_statuses(root);
+        assert_eq!(st.get("build"), Some(&GitStatus::Ignored));
+    }
+
+    /// The `__pycache__` case: a clean tracked folder whose only status entries are ignored
+    /// *descendants* must not grey — ignored-ness doesn't aggregate upward (clean files
+    /// produce no status entries, so the ignored ones would otherwise win the bucket).
+    #[test]
+    fn dir_statuses_ignored_descendants_dont_grey_their_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(
+            root,
+            &[
+                ("databricks/src/main.py", "code\n"),
+                (".gitignore", "__pycache__/\n"),
+            ],
+        );
+        std::fs::create_dir_all(root.join("databricks/src/__pycache__")).unwrap();
+        std::fs::write(root.join("databricks/src/__pycache__/main.pyc"), "x").unwrap();
+
+        let st = dir_statuses(root);
+        assert_eq!(
+            st.get("databricks"),
+            None,
+            "clean folder with only-ignored descendants stays uncoloured"
+        );
+
+        // Listing where the ignored directory is an immediate child: it does grey there.
+        let st = dir_statuses(&root.join("databricks/src"));
+        assert_eq!(st.get("__pycache__"), Some(&GitStatus::Ignored));
+        assert_eq!(st.get("main.py"), None);
     }
 
     #[test]

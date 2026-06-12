@@ -616,7 +616,10 @@ static GLOBAL: &[Binding] = &[
     bind!(GLOBAL_CTX, ch('g'), Exact(CTRL), A::JoinLines, "Edit", "Join lines"),
     bind!(GLOBAL_CTX, ch('l'), Exact(CTRL), A::Indent, "Edit", "Indent"),
     bind!(GLOBAL_CTX, ch('h'), Exact(CTRL), A::Dedent, "Edit", "Dedent"),
-    bind!(GLOBAL_CTX, ch('t'), Exact(CTRL), A::ToggleComment, "Edit", "Toggle comment"),
+    // `Ctrl-/` (not `Ctrl-t`) for consistency across clients: the browser can't bind Ctrl-t,
+    // and the native client uses it for new-tab. Needs the kitty keyboard protocol to arrive
+    // disambiguated in terminals (enabled best-effort at startup).
+    bind!(GLOBAL_CTX, ch('/'), Exact(CTRL), A::ToggleComment, "Edit", "Toggle comment"),
     bind!(GLOBAL_CTX, ch('o'), Exact(CTRL), A::OpenLineBelow, "Edit", "Open line below"),
     bind!(GLOBAL_CTX, ch('o'), Exact(CTRL_ALT), A::OpenLineAbove, "Edit", "Open line above"),
     // The selection/clipboard Ctrl keys (Ctrl-y/x/v/c/d/r) are *not* here: they act on the
