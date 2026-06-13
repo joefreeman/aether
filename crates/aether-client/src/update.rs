@@ -154,7 +154,7 @@ pub enum Event {
         noun: &'static str,
         result: Result<PathDeleteResult, String>,
     },
-    /// `directory/create` (Explorer "Ctrl-n name/") resolved: navigate into the new directory.
+    /// `directory/create` (Explorer "+ Create … name/") resolved: navigate into the new directory.
     DirCreated(Result<DirectoryCreateResult, String>),
     /// Project switch resolved: the activated project + the buffer to land on.
     ProjectActivated(Result<(ProjectInfo, BufferOpenResult), String>),
@@ -1931,6 +1931,10 @@ impl Session {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
+        // The Explorer's synthetic "+ Create …" row: confirming it creates the named file/dir.
+        if p.selected_is_create() {
+            return self.explorer_create_from_query();
+        }
         let Some(item) = p.selected_item().cloned() else {
             return Effects::none();
         };
@@ -2091,10 +2095,6 @@ impl Session {
                     && matches!(p.kind, PickerKind::Files | PickerKind::Explorer) =>
             {
                 return self.picker_stage_delete();
-            }
-            // Ctrl-n in the Explorer: create the file/dir named by the query (trailing `/` = dir).
-            KeyCode::Char('n') if mods.ctrl && !mods.alt && p.kind == PickerKind::Explorer => {
-                return self.explorer_create_from_query();
             }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).
             KeyCode::Char('k') if mods.alt && !mods.ctrl => return self.picker_move(-1),
@@ -2869,9 +2869,10 @@ impl Session {
         Effects::none()
     }
 
-    /// Explorer `Ctrl-n`: create whatever the query names in the listed directory — a directory
-    /// when it ends with `/`, otherwise a file (which opens). Multi-segment names create the
-    /// intermediate directories server-side. No-op outside the Explorer.
+    /// Create whatever the Explorer query names in the listed directory — a directory when it ends
+    /// with `/`, otherwise a file (which opens). Reached by selecting the synthetic "+ Create …"
+    /// row (see [`PickerState::pending_create`]). Multi-segment names create the intermediate
+    /// directories server-side. No-op outside the Explorer.
     pub fn explorer_create_from_query(&mut self) -> Effects {
         let (dir, query) = {
             let Some(p) = &self.picker else {

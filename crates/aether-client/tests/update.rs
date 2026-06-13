@@ -395,7 +395,7 @@ fn explorer_delete_confirms_then_trashes_and_relists() {
 }
 
 #[test]
-fn explorer_ctrl_n_creates_a_file_with_create_if_missing() {
+fn explorer_create_makes_a_file_with_create_if_missing() {
     use aether_protocol::picker::PickerKind;
 
     let mut s = session();
@@ -415,7 +415,7 @@ fn explorer_ctrl_n_creates_a_file_with_create_if_missing() {
 }
 
 #[test]
-fn explorer_ctrl_n_with_trailing_slash_creates_a_directory() {
+fn explorer_create_with_trailing_slash_makes_a_directory() {
     use aether_protocol::picker::PickerKind;
 
     let mut s = session();
@@ -434,6 +434,46 @@ fn explorer_ctrl_n_with_trailing_slash_creates_a_directory() {
         find_request(&fx, "buffer/open").is_none(),
         "a trailing slash creates a dir, not a file"
     );
+}
+
+/// Selecting the synthetic "+ Create …" row (the affordance that replaced the old Ctrl-n) runs the
+/// create: a click on its absolute index routes through `picker_accept` → create-on-save.
+#[test]
+fn selecting_the_create_row_creates_the_file() {
+    use aether_client::update::Event;
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
+
+    let mut s = session();
+    s.project_paths = vec!["/proj".into()];
+    let _ = s.open_picker(PickerKind::Explorer, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.directory = Some("/proj/src".into());
+        p.query = "new.rs".into();
+        // One existing entry that the query doesn't match — the create row sits at index 1.
+        p.apply_update(PickerUpdateParams {
+            kind: PickerKind::Explorer,
+            generation: p.generation,
+            offset: 0,
+            items: vec![PickerItem::DirEntry {
+                name: "lib.rs".into(),
+                is_dir: false,
+                match_indices: vec![],
+                git_status: None,
+            }],
+            total_matches: 1,
+            total_candidates: 1,
+            ticking: false,
+            grep_display_offset: None,
+            grep_total_display_rows: None,
+        });
+        assert_eq!(p.create_row_index(), Some(1));
+    }
+    // Click the create row (absolute index 1) → highlight it and accept.
+    let fx = s.on_event(Event::PickerClicked(1));
+    let open = find_request(&fx, "buffer/open").expect("buffer/open fired");
+    assert_eq!(open["create_if_missing"], json!(true));
+    assert_eq!(open["relative_path"], json!("src/new.rs"));
 }
 
 #[test]

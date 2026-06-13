@@ -153,6 +153,9 @@ interface PickerView {
   total_display_rows: number;
   directory: string | null;
   directory_parent: string | null;
+  /** The Explorer's synthetic "+ Create …" affordance (view.rs `create`); null when not offered.
+   *  `abs` is its selection index, one past the last match. */
+  create: { name: string; is_dir: boolean; abs: number } | null;
   chips: { label: string; flag: boolean }[];
   chip_selected: number | null;
   chip_editor: ChipEditorView | null;
@@ -2123,12 +2126,39 @@ export class Shell {
     return true; // the help overlay consumes every key while open
   }
 
+  /** The Explorer's synthetic "+ Create …" row — italic, like the TUI/iced. Selecting it (click or
+   *  Enter on the highlight) routes through `picker_click(abs)` → the core's create action. */
+  private makePickerCreateRow(p: PickerView): HTMLElement {
+    const c = p.create!;
+    const row = document.createElement("div");
+    row.className = p.selected === c.abs ? "picker-row selected" : "picker-row";
+    row.addEventListener("mousedown", (e: MouseEvent) => {
+      e.preventDefault(); // keep focus on the query input; create via the core
+      if (this.session) this.runEffects(this.session.picker_click(c.abs) as CoreEffect[]);
+    });
+    const bullet = document.createElement("span");
+    bullet.className = "picker-bullet"; // empty cell, keeps names column-aligned with entries
+    row.append(bullet);
+    const main = document.createElement("span");
+    main.className = "picker-main picker-italic";
+    main.textContent = c.is_dir ? `+ Create directory ${c.name}/` : `+ Create file ${c.name}`;
+    row.append(main);
+    return row;
+  }
+
   private renderPickerList(p: PickerView, v: CoreView): void {
     const projectPaths = v.project_paths;
     const list = this.pickerListEl;
     // Empty list: show a status line so a slow search (grep streaming, references resolving) reads as
-    // "working", not "broken". `ticking` is the core's in-progress flag.
+    // "working", not "broken". `ticking` is the core's in-progress flag. When the Explorer offers a
+    // create for a name with no matches, the create row stands alone.
     if (p.items.length === 0) {
+      if (p.create) {
+        list.classList.add("filled");
+        list.replaceChildren(this.makePickerCreateRow(p));
+        list.querySelector(".picker-row.selected")?.scrollIntoView({ block: "nearest" });
+        return;
+      }
       let text = "";
       if (p.kind === "references") {
         text = p.ticking ? "Finding references…" : "No references found";
@@ -2242,6 +2272,11 @@ export class Shell {
       }
       rows.push(row);
     });
+    // The Explorer's "+ Create …" row trails the final match — only once the window reaches the
+    // list's end (its abs index sits just past the last item), mirroring the core's display_rows.
+    if (p.create && p.offset + p.items.length >= p.total_matches) {
+      rows.push(this.makePickerCreateRow(p));
+    }
     list.replaceChildren(...rows);
     // Keep the highlighted row visible (keyboard nav and the wheel both move the selection).
     list.querySelector(".picker-row.selected")?.scrollIntoView({ block: "nearest" });

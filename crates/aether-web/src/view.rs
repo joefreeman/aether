@@ -80,6 +80,14 @@ fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
                 "total_display_rows": p.total_display_rows,
                 "directory": p.directory,
                 "directory_parent": p.directory_parent,
+                // The Explorer's synthetic "+ Create …" affordance (core-owned decision). `abs` is
+                // its selection index, one past the last match; the shell appends the row when the
+                // window reaches the list's end and routes a click/Enter through `picker_click`.
+                "create": p.pending_create().map(|pc| json!({
+                    "name": pc.name,
+                    "is_dir": pc.is_dir,
+                    "abs": p.total_matches,
+                })),
                 "chips": chips,
                 "chip_selected": p.chip_selected,
                 "chip_editor": chip_editor(&p.chip_editor, project_paths),

@@ -1022,6 +1022,28 @@ impl Shell {
         p.ticking = core.ticking;
         p.total_display_rows = Some(core.total_display_rows);
         p.selected = (core.selected.saturating_sub(core.offset)) as usize;
+        // The Explorer's synthetic "+ Create …" affordance — the core owns the decision
+        // (`pending_create`); the shell appends it as a trailing row (italicised via
+        // `synthetic_create_idx`) once the fetched window reaches the list's end, mirroring the
+        // core's `display_rows`. Purely visual: Enter routes through the core's `picker_accept`,
+        // which sees the create row on the *core* selection and creates the file/dir.
+        p.synthetic_create_idx = None;
+        if let Some(pc) = core.pending_create() {
+            if core.offset + core.items.len() as u32 >= core.total_matches {
+                let label = if pc.is_dir {
+                    format!("+ Create directory {}/", pc.name)
+                } else {
+                    format!("+ Create file {}", pc.name)
+                };
+                p.items.push(aether_protocol::picker::PickerItem::DirEntry {
+                    name: label,
+                    is_dir: false,
+                    match_indices: Vec::new(),
+                    git_status: None,
+                });
+                p.synthetic_create_idx = Some(p.items.len() - 1);
+            }
+        }
         p.chips = core.chips.iter().map(chip_value_view).collect();
         p.chip_selected = core.chip_selected;
         p.chip_editor = core.chip_editor.as_ref().map(chip_editor_view);

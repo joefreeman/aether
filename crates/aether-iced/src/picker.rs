@@ -143,11 +143,18 @@ pub fn overlay<'a>(
     // as a failed search. Every other kind lists candidates without a query, so an empty
     // result set is informative.
     let unqueried_grep = state.kind == PickerKind::Grep && state.query.is_empty();
-    let show_empty_note = state.total_matches == 0 && !state.ticking && !unqueried_grep;
+    // The Explorer's "+ Create …" row is content in its own right — don't also say "No matches"
+    // when a brand-new name has zero existing matches.
+    let show_empty_note = state.total_matches == 0
+        && !state.ticking
+        && !unqueried_grep
+        && state.pending_create().is_none();
     // Nothing renders below the input (no rows, no message, no editor line): round its bottom
     // corners too, so the NORD0 row doesn't poke out of the panel's rounded border.
-    let input_is_last =
-        state.total_display_rows == 0 && !show_empty_note && state.chip_editor.is_none();
+    let input_is_last = state.total_display_rows == 0
+        && state.pending_create().is_none()
+        && !show_empty_note
+        && state.chip_editor.is_none();
     panel = panel.push(
         container(input)
             .width(Length::Fill)
@@ -220,6 +227,38 @@ pub fn overlay<'a>(
                         .on_exit(PickerMsg::Unhovered(abs)),
                 );
             }
+            DisplayRow::Create { abs, name, is_dir } => {
+                let selected = abs == state.selected;
+                let label = if is_dir {
+                    format!("+ Create directory {name}/")
+                } else {
+                    format!("+ Create file {name}")
+                };
+                let row_el = container(
+                    text(label)
+                        .size(13)
+                        .font(iced::Font {
+                            style: iced::font::Style::Italic,
+                            ..iced::Font::DEFAULT
+                        })
+                        .color(theme::NORD8),
+                )
+                .width(Length::Fill)
+                .height(ROW_H)
+                .padding([3, 12])
+                .align_y(iced::alignment::Vertical::Center)
+                .style(move |_| container::Style {
+                    background: selected.then(|| theme::NORD2.into()),
+                    ..container::Style::default()
+                });
+                list = list.push(
+                    iced::widget::mouse_area(row_el)
+                        .interaction(iced::mouse::Interaction::Pointer)
+                        .on_press(PickerMsg::Click(abs))
+                        .on_enter(PickerMsg::Hovered(abs))
+                        .on_exit(PickerMsg::Unhovered(abs)),
+                );
+            }
         }
     }
     let below = state
@@ -266,6 +305,9 @@ pub fn overlay<'a>(
                             path_index,
                             relative_path,
                         } => Some((path_index, relative_path.to_string())),
+                        // The create row is Explorer-only; grep (the only picker with headers)
+                        // never shows it, so it's never the pinned row.
+                        DisplayRow::Create { .. } => None,
                     })
             })
     };

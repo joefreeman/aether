@@ -153,6 +153,55 @@ impl PickerState {
             .get(self.selected.saturating_sub(self.offset) as usize)
     }
 
+    /// The Explorer's synthetic "+ Create …" affordance: present when the (trimmed) query names
+    /// something the listing doesn't already contain. A trailing `/` means a directory; otherwise
+    /// a file. Returns `None` outside the Explorer, for an empty/invalid name, or when an entry
+    /// already matches it exactly — so the row appears the moment you type a name that doesn't
+    /// exist and vanishes again once it does. Selecting the row runs `explorer_create_from_query`.
+    pub fn pending_create(&self) -> Option<PendingCreate> {
+        if self.kind != PickerKind::Explorer {
+            return None;
+        }
+        let q = self.query.trim();
+        let (base, is_dir) = match q.strip_suffix('/') {
+            Some(stripped) => (stripped, true),
+            None => (q, false),
+        };
+        if base.is_empty()
+            || base
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return None;
+        }
+        // Suppress when an entry already carries this exact name. Only single-segment names can be
+        // checked against the listed window (the Explorer lists one directory, fetched whole once a
+        // query has narrowed it); a multi-segment name's leaf lives in a directory we haven't
+        // listed, so we always offer it. Case-sensitive: `Foo` and `foo` are distinct files.
+        let exact = !base.contains('/')
+            && self
+                .items
+                .iter()
+                .any(|it| matches!(it, PickerItem::DirEntry { name, .. } if name == base));
+        if exact {
+            return None;
+        }
+        Some(PendingCreate {
+            name: base.to_string(),
+            is_dir,
+        })
+    }
+
+    /// Absolute selection index the create row occupies — one past the final match.
+    pub fn create_row_index(&self) -> Option<u32> {
+        self.pending_create().map(|_| self.total_matches)
+    }
+
+    /// Is the synthetic create row the highlighted row?
+    pub fn selected_is_create(&self) -> bool {
+        self.create_row_index() == Some(self.selected)
+    }
+
     /// Apply a `picker/update` push. Stale pushes (older generation, other window) are
     /// discarded per the protocol. Returns false when discarded.
     pub fn apply_update(&mut self, u: PickerUpdateParams) -> bool {
@@ -182,8 +231,11 @@ impl PickerState {
                 self.selected = self.offset + pos as u32;
             }
         }
-        if self.total_matches > 0 {
-            self.selected = self.selected.min(self.total_matches - 1);
+        // The create row (Explorer) adds one selectable slot past the matches; keep the highlight
+        // within `[0, total_matches]` when it's live, otherwise `[0, total_matches - 1]`.
+        let rows = self.total_matches + self.create_row_index().is_some() as u32;
+        if rows > 0 {
+            self.selected = self.selected.min(rows - 1);
         } else {
             self.selected = 0;
         }
@@ -193,11 +245,20 @@ impl PickerState {
     /// Move the highlight by `delta`, returning the new window offset to fetch when the
     /// highlight left the fetched window (the caller sends `picker/view`).
     pub fn move_selection(&mut self, delta: i64) -> Option<u32> {
-        if self.total_matches == 0 {
+        // The synthetic create row (Explorer) is one extra selectable row past the last match.
+        let create = self.create_row_index();
+        let rows = self.total_matches + create.is_some() as u32;
+        if rows == 0 {
             return None;
         }
-        let max = self.total_matches as i64 - 1;
+        let max = rows as i64 - 1;
         self.selected = (self.selected as i64 + delta).clamp(0, max) as u32;
+        // The create row is virtual — never in the fetched item window, so it can't force a
+        // refetch; the move onto the row below it already brought the list's tail into view.
+        if create == Some(self.selected) {
+            self.reveal_on_update = Some(Reveal::Minimal);
+            return None;
+        }
         let in_window =
             self.selected >= self.offset && self.selected < self.offset + self.items.len() as u32;
         if in_window {
@@ -233,6 +294,18 @@ impl PickerState {
                 item,
             });
         }
+        // The Explorer's "+ Create …" affordance trails the final match. Only emit it once the
+        // window reaches the list's end (its absolute row, `total_matches`, sits just past the last
+        // item) — for a mid-list window it isn't adjacent and would render in the wrong place.
+        if let Some(pc) = self.pending_create() {
+            if self.offset + self.items.len() as u32 >= self.total_matches {
+                rows.push(DisplayRow::Create {
+                    abs: self.total_matches,
+                    name: pc.name,
+                    is_dir: pc.is_dir,
+                });
+            }
+        }
         rows
     }
 
@@ -255,7 +328,12 @@ impl PickerState {
         let base = self.window_base();
         let rows = self.display_rows();
         rows.iter()
-            .position(|r| matches!(r, DisplayRow::Item { abs, .. } if *abs == self.selected))
+            .position(|r| match r {
+                DisplayRow::Item { abs, .. } | DisplayRow::Create { abs, .. } => {
+                    *abs == self.selected
+                }
+                DisplayRow::Header { .. } => false,
+            })
             .map(|i| base + i as u32)
     }
 
@@ -339,6 +417,22 @@ pub enum DisplayRow<'a> {
         abs: u32,
         item: &'a PickerItem,
     },
+    /// The Explorer's synthetic "+ Create …" action row (see [`PickerState::pending_create`]).
+    /// `abs` is its selection index; selecting it creates `name` (a directory when `is_dir`).
+    Create {
+        abs: u32,
+        name: String,
+        is_dir: bool,
+    },
+}
+
+/// The Explorer's pending create affordance — the name a "+ Create …" row would create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCreate {
+    /// The leaf/relative name to create (no trailing `/`, validated non-empty).
+    pub name: String,
+    /// `true` when the query ended with `/` — create a directory rather than a file.
+    pub is_dir: bool,
 }
 
 #[cfg(test)]
@@ -515,5 +609,112 @@ mod tests {
         assert!(s.apply_update(update(PickerKind::Grep, 0, 0, 10, 10)));
         assert_eq!(s.selected, 7);
         assert!(s.pending_center.is_none());
+    }
+
+    /// An Explorer window listing the given entry names (all files), with `total_matches` equal to
+    /// the number of names (the whole directory fits the window).
+    fn explorer_with(names: &[&str]) -> PickerState {
+        let mut s = PickerState::new(PickerKind::Explorer);
+        s.directory = Some("/proj/src".into());
+        s.apply_update(PickerUpdateParams {
+            kind: PickerKind::Explorer,
+            generation: 0,
+            offset: 0,
+            items: names
+                .iter()
+                .map(|n| PickerItem::DirEntry {
+                    name: (*n).into(),
+                    is_dir: false,
+                    match_indices: vec![],
+                    git_status: None,
+                })
+                .collect(),
+            total_matches: names.len() as u32,
+            total_candidates: names.len() as u32,
+            ticking: false,
+            grep_display_offset: None,
+            grep_total_display_rows: None,
+        });
+        s
+    }
+
+    #[test]
+    fn pending_create_appears_for_a_novel_name_and_hides_on_exact_match() {
+        let mut s = explorer_with(&["main.rs", "lib.rs"]);
+        // No query: nothing to create.
+        assert_eq!(s.pending_create(), None);
+        // A name that isn't listed: offer to create a file.
+        s.query = "new.rs".into();
+        assert_eq!(
+            s.pending_create(),
+            Some(PendingCreate {
+                name: "new.rs".into(),
+                is_dir: false
+            })
+        );
+        // A name that exactly matches an existing entry: no create offered (you'd open it).
+        s.query = "lib.rs".into();
+        assert_eq!(s.pending_create(), None);
+        // Trailing slash means a directory.
+        s.query = "sub/".into();
+        assert_eq!(
+            s.pending_create(),
+            Some(PendingCreate {
+                name: "sub".into(),
+                is_dir: true
+            })
+        );
+        // Empty / dot segments are never creatable.
+        for bad in ["", "   ", ".", "..", "a//b", "./x"] {
+            s.query = bad.into();
+            assert_eq!(s.pending_create(), None, "{bad:?} should not be creatable");
+        }
+        // Outside the Explorer, never offered.
+        s.kind = PickerKind::Files;
+        s.query = "new.rs".into();
+        assert_eq!(s.pending_create(), None);
+    }
+
+    #[test]
+    fn create_row_is_a_selectable_row_past_the_last_match() {
+        let mut s = explorer_with(&["a.rs", "b.rs"]);
+        s.query = "c.rs".into();
+        assert_eq!(s.create_row_index(), Some(2)); // one past the two matches
+                                                    // Arrow down walks onto the create row without forcing a refetch.
+        assert_eq!(s.move_selection(1), None);
+        assert_eq!(s.selected, 1);
+        assert_eq!(s.move_selection(1), None);
+        assert_eq!(s.selected, 2);
+        assert!(s.selected_is_create());
+        // It's the bottom row — can't move past it.
+        assert_eq!(s.move_selection(1), None);
+        assert_eq!(s.selected, 2);
+    }
+
+    #[test]
+    fn create_row_is_the_only_row_when_nothing_matches() {
+        let mut s = explorer_with(&[]); // empty directory
+        s.query = "first.rs".into();
+        assert_eq!(s.create_row_index(), Some(0));
+        // With zero matches the create row is selected by default and is its own bottom.
+        assert!(s.selected_is_create());
+        assert_eq!(s.move_selection(1), None);
+        assert!(s.selected_is_create());
+    }
+
+    #[test]
+    fn display_rows_appends_the_create_row_at_the_window_end() {
+        let mut s = explorer_with(&["a.rs", "b.rs"]);
+        s.query = "c.rs".into();
+        let rows = s.display_rows();
+        assert_eq!(rows.len(), 3);
+        match &rows[2] {
+            DisplayRow::Create { abs, name, is_dir } => {
+                assert_eq!(*abs, 2);
+                assert_eq!(name, "c.rs");
+                assert!(!is_dir);
+            }
+            _ => panic!("expected a Create row last"),
+        }
     }
 }
