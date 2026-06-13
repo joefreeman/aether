@@ -50,7 +50,7 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   buffers: "Switch buffer…",
   grep: "Grep workspace…",
   explorer: "Explore files…",
-  projects: "Switch project…",
+  projects: "Select project…",
   diagnostics: "List diagnostics…",
   lsp_servers: "List LSPs…",
   references: "List references…",
@@ -634,6 +634,8 @@ export class Shell {
     this.pickerEl.addEventListener("mousedown", (e) => {
       if (e.target === this.pickerEl && this.session) {
         e.preventDefault();
+        // No project selected yet: the chooser is mandatory — a click outside it must not close it.
+        if (this.snapshot?.buffer.buffer_id === 0) return;
         this.runEffects(this.session.close_picker() as CoreEffect[]);
       }
     });
@@ -791,17 +793,24 @@ export class Shell {
         urlBufferRaw != null && Number.isInteger(Number(urlBufferRaw)) ? Number(urlBufferRaw) : null;
       const known = list.projects.some((pr) => pr.name === urlProject);
       const specified = (known ? urlProject : null) ?? cfg.project ?? null;
+      // A URL-directed open (file/buffer link) opens separately; otherwise `open_last` folds the
+      // landing buffer into the activate.
+      const directed = Boolean(urlFile) || urlBuffer != null;
+      // Project selection is explicit. With none specified (and not a direct file/buffer link) we
+      // DON'T activate one: keep a placeholder session and raise the Projects chooser — nothing is
+      // rendered behind it. Picking a project activates it (PickerSelected → ProjectActivated →
+      // adopt_switch) and the editor first appears then. Matches the native shells' no-args start.
+      if (specified === null && !directed) {
+        this.session = new WasmSession();
+        this.runEffects(this.session.open_projects() as CoreEffect[]);
+        this.capture.focus();
+        return;
+      }
       const name = specified ?? list.projects[0]?.name;
       if (!name) {
         this.toast("No projects configured on the server.", "error");
         return;
       }
-      // A URL-directed open (file/buffer link) opens separately; otherwise `open_last` folds the
-      // landing buffer into the activate.
-      const directed = Boolean(urlFile) || urlBuffer != null;
-      // No project named (and not a direct file/buffer link) → land on the first project, then raise
-      // the Projects chooser over it, matching the native shells' no-args start.
-      const chooser = specified === null && !directed && list.projects.length > 1;
       const activated = await this.client.rpc<ProjectActivateResult>("project/activate", {
         name,
         open_last: !directed,
@@ -843,9 +852,6 @@ export class Shell {
       this.session = WasmSession.bootstrap(activated.project.name, activated.project.paths, open);
       await this.subscribe(); // derives its scroll from the buffer (open.scroll / cursor)
       this.capture.focus(); // ensure the menu-suppressing field has focus once we're live
-      // No project named: raise the Projects chooser over the landing buffer (the picker focuses its
-      // own input). Matches the native shells' no-args start.
-      if (chooser) this.runEffects(this.session.open_projects() as CoreEffect[]);
     } catch (e) {
       this.toast(`bootstrap failed: ${String(e)}`, "error");
     }
@@ -985,6 +991,15 @@ export class Shell {
   private async reestablish(): Promise<void> {
     const snap = this.snapshot;
     if (!snap) return;
+    // Reconnected while still choosing a project (no project activated yet): just re-raise the
+    // chooser on the fresh connection rather than activating an empty-named project.
+    if (snap.buffer.buffer_id === 0) {
+      this.session = new WasmSession();
+      this.connBanner.style.display = "none";
+      this.runEffects(this.session.open_projects() as CoreEffect[]);
+      this.capture.focus();
+      return;
+    }
     try {
       const activated = await this.client.rpc<ProjectActivateResult>("project/activate", {
         name: snap.project,
@@ -1166,6 +1181,7 @@ export class Shell {
   private async subscribe(): Promise<void> {
     this.recomputeGrid();
     const v = this.view();
+    if (v.buffer.buffer_id === 0) return; // placeholder session — no buffer to subscribe to yet
     // Position the new viewport at the buffer's restored scroll, else centre the cursor — which, for
     // a grep/goto jump, sits on the target. Derived FRESH from the current buffer every time (never a
     // cached value), so a jump always loads the window containing its target and the reveal lands.
@@ -1430,10 +1446,17 @@ export class Shell {
   private render(): void {
     const v = this.view();
     this.snapshot = v;
-    this.syncUrl(v); // keep the address bar in sync with the current buffer + cursor
     this.renderSearch(v);
     this.renderPrompt(v);
     this.renderPicker(v);
+    // No project yet (placeholder boot session): the mandatory chooser is the whole UI. Render only
+    // a bare backdrop behind it — no buffer, no status bar — and don't sync a bogus `?buffer=0` URL.
+    if (v.buffer.buffer_id === 0) {
+      this.bufferEl.replaceChildren();
+      this.statusEl.replaceChildren();
+      return;
+    }
+    this.syncUrl(v); // keep the address bar in sync with the current buffer + cursor
     this.renderStatus(v);
     if (!v.window) return;
     this.bufferEl.classList.toggle("hscroll", v.wrap === "none");
@@ -1608,6 +1631,12 @@ export class Shell {
    *  start steps into the chip row, then Left/Right navigate, Enter edits, Backspace/Delete removes. */
   private onPickerInputKey(e: KeyboardEvent): void {
     const p = this.snapshot?.picker;
+    // No project selected yet: the chooser is mandatory. Unlike the native clients (which exit on
+    // dismiss), a browser tab has nothing to fall back to, so Esc must not close it.
+    if (e.key === "Escape" && this.snapshot?.buffer.buffer_id === 0) {
+      e.preventDefault();
+      return;
+    }
     // Ctrl/Cmd-Enter opens the selected item in a new browser tab (keyboard parity with Ctrl-click).
     if (p && this.snapshot && (e.ctrlKey || e.metaKey) && !e.altKey && e.key === "Enter") {
       const sel = p.items[p.selected - p.offset];

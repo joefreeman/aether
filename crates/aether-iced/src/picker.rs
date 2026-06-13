@@ -55,7 +55,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::Buffers => "Switch buffer…",
         PickerKind::Grep => "Grep workspace…",
         PickerKind::Explorer => "Explore files…",
-        PickerKind::Projects => "Switch project…",
+        PickerKind::Projects => "Select project…",
         PickerKind::Diagnostics => "List diagnostics…",
         PickerKind::LspServers => "List LSPs…",
         PickerKind::References => "List references…",

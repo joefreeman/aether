@@ -470,6 +470,14 @@ impl Shell {
         let Some((code, mods, text)) = translate_key(&k) else {
             return;
         };
+        // The no-project chooser: Esc dismisses it, which — with nothing behind it to fall back to —
+        // exits the app, matching the native client. (Selecting a project instead lands a buffer and
+        // proceeds; that path goes through `on_key` below.) Handled here, before the core closes the
+        // picker, so it's distinguishable from a project pick (which also closes the picker).
+        if code == KeyCode::Esc && self.session.is_placeholder() && self.session.picker.is_some() {
+            self.should_quit = true;
+            return;
+        }
         let visible_rows = self.visible_rows();
         let fx = self.session.on_key(code, mods, text, visible_rows);
         self.run_effects(fx);
@@ -614,6 +622,9 @@ impl Shell {
     // ---- viewport geometry (iced's px math, in rows) -------------------------------------
 
     fn subscribe(&mut self) {
+        if self.session.is_placeholder() {
+            return; // no buffer to show until a project is picked (the no-project view)
+        }
         let Some((cols, rows)) = self.sent_grid else {
             return;
         };
@@ -862,7 +873,9 @@ impl Shell {
     // ---- view sync (Session → the render model ui::draw reads) ---------------------------
 
     fn sync(&mut self) {
-        let editor = self.editor_view();
+        // No editor until a project is picked: the placeholder session renders the no-project
+        // view, not a buffer behind the chooser.
+        let editor = (!self.session.is_placeholder()).then(|| self.editor_view());
         let s = &self.session;
         let st = &mut self.state;
         st.project_name = s.project.clone();
@@ -894,7 +907,7 @@ impl Shell {
             m
         };
 
-        st.editor = Some(editor);
+        st.editor = editor;
         self.sync_picker();
         self.sync_prompts();
     }
@@ -1337,67 +1350,60 @@ pub async fn bootstrap(
 ) -> Result<(Session, AppState, Effects)> {
     use aether_protocol::buffer::{BufferOpen, BufferOpenParams};
     use aether_protocol::picker::PickerKind;
-    use aether_protocol::project::{
-        ProjectActivate, ProjectActivateParams, ProjectList, ProjectListParams,
-    };
+    use aether_protocol::project::{ProjectActivate, ProjectActivateParams};
 
-    // No project named on the command line: land in the first configured project and raise the
-    // Projects picker on top so the user can choose (the no-args chooser).
-    let chooser = project.is_none();
-    let project = match project {
-        Some(p) => p.to_string(),
+    // Project selection is explicit. When none is named on the command line we DON'T activate
+    // one — we start with a placeholder session (no project, no buffer) and raise the Projects
+    // chooser. Nothing is rendered behind it; picking a project activates it and lands the first
+    // buffer (`PickerSelected` → `ProjectActivated` → `adopt_switch`), which is when the editor
+    // first appears. Its `picker/view` request rides the returned effects, run once the shell is up.
+    let (session, project_name, project_paths, startup) = match project {
         None => {
-            let list = handle.rpc::<ProjectList>(ProjectListParams {}).await?;
-            list.projects
-                .first()
-                .map(|p| p.name.clone())
-                .ok_or_else(|| anyhow::anyhow!("no projects configured on the server"))?
+            let mut session = Session::placeholder();
+            let startup = session.open_picker(PickerKind::Projects, None, None);
+            (session, String::new(), Vec::new(), startup)
         }
-    };
-
-    let activated = handle
-        .rpc::<ProjectActivate>(ProjectActivateParams {
-            name: project,
-            open_last: file.is_none(),
-        })
-        .await?;
-    let project_paths = activated.project.paths.clone();
-
-    let open = match file {
-        Some(f) => {
-            let abs = crate::app::resolve_cli_path(f)?.display().to_string();
-            let (path_index, relative_path) =
-                aether_client::session::strip_longest_root(&abs, &project_paths)
-                    .ok_or_else(|| anyhow::anyhow!("{abs} is outside the project's roots"))?;
-            handle
-                .rpc::<BufferOpen>(BufferOpenParams {
-                    path_index: Some(path_index),
-                    relative_path: Some(relative_path),
-                    create_if_missing: true,
-                    ..Default::default()
+        Some(project) => {
+            let activated = handle
+                .rpc::<ProjectActivate>(ProjectActivateParams {
+                    name: project.to_string(),
+                    open_last: file.is_none(),
                 })
-                .await?
+                .await?;
+            let project_paths = activated.project.paths.clone();
+
+            let open = match file {
+                Some(f) => {
+                    let abs = crate::app::resolve_cli_path(f)?.display().to_string();
+                    let (path_index, relative_path) =
+                        aether_client::session::strip_longest_root(&abs, &project_paths)
+                            .ok_or_else(|| anyhow::anyhow!("{abs} is outside the project's roots"))?;
+                    handle
+                        .rpc::<BufferOpen>(BufferOpenParams {
+                            path_index: Some(path_index),
+                            relative_path: Some(relative_path),
+                            create_if_missing: true,
+                            ..Default::default()
+                        })
+                        .await?
+                }
+                None => activated
+                    .opened
+                    .ok_or_else(|| anyhow::anyhow!("project/activate returned no landing buffer"))?,
+            };
+
+            let session = Session::new(
+                activated.project.name.clone(),
+                project_paths.clone(),
+                buffer_info(open, &project_paths),
+            );
+            (session, activated.project.name, project_paths, Effects::none())
         }
-        None => activated
-            .opened
-            .ok_or_else(|| anyhow::anyhow!("project/activate returned no landing buffer"))?,
     };
 
-    let mut session = Session::new(
-        activated.project.name.clone(),
-        project_paths.clone(),
-        buffer_info(open, &project_paths),
-    );
-    // Raise the Projects chooser over the landing buffer when no project was named; its
-    // `picker/view` request rides the returned effects, run once the shell is up.
-    let startup = if chooser {
-        session.open_picker(PickerKind::Projects, None, None)
-    } else {
-        Effects::none()
-    };
     let root_labels = labels::root_labels(&project_paths);
     let state = AppState {
-        project_name: activated.project.name,
+        project_name,
         project_paths,
         root_labels,
         viewport_cols: cols as u32,

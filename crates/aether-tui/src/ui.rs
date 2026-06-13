@@ -1387,30 +1387,11 @@ fn root_buffer_status(state: &AppState, root: &str) -> Option<BufferStatusKind> 
 /// Drawn instead of the buffer pane when `state.editor` is `None`. Fills the full pane in the
 /// editor's NORD0 background so the no-project state visually matches an open editor instead of
 /// falling through to the terminal's default colors.
+/// The backdrop behind the Projects chooser before any project is selected: a bare NORD0 fill,
+/// matching the native client's boot view. The chooser is the only UI here — dismissing it exits
+/// the app (the shell sets `should_quit`), so this is only ever a momentary flash.
 fn draw_no_project_view(f: &mut Frame, _state: &AppState, area: Rect) {
-    let base = Style::default().bg(NORD0).fg(NORD4);
-    f.render_widget(Paragraph::new("").style(base), area);
-    let hint = vec![
-        Line::from(Span::styled(
-            "no project active",
-            base.add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled("", base)),
-        Line::from(Span::styled("Space p   pick a project", base)),
-        Line::from(Span::styled("Space q   quit", base)),
-    ];
-    let para = Paragraph::new(hint)
-        .alignment(ratatui::layout::Alignment::Center)
-        .style(base);
-    let inner_height = 4u16;
-    let top_pad = area.height.saturating_sub(inner_height) / 2;
-    let target = Rect {
-        x: area.x,
-        y: area.y + top_pad,
-        width: area.width,
-        height: inner_height.min(area.height.saturating_sub(top_pad)),
-    };
-    f.render_widget(para, target);
+    f.render_widget(Paragraph::new("").style(Style::default().bg(NORD0)), area);
 }
 
 // ---- picker overlay ----------------------------------------------------------------------------
@@ -2103,7 +2084,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Buffers) => "Switch buffer…",
         Some(aether_protocol::picker::PickerKind::Grep) => "Grep workspace…",
         Some(aether_protocol::picker::PickerKind::Explorer) => "Explore files…",
-        Some(aether_protocol::picker::PickerKind::Projects) => "Switch project…",
+        Some(aether_protocol::picker::PickerKind::Projects) => "Select project…",
         Some(aether_protocol::picker::PickerKind::Diagnostics) => "List diagnostics…",
         Some(aether_protocol::picker::PickerKind::LspServers) => "List LSPs…",
         Some(aether_protocol::picker::PickerKind::References) => "List references…",

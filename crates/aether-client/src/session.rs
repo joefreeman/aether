@@ -274,6 +274,14 @@ impl Session {
             },
         )
     }
+
+    /// A boot placeholder ([`Session::placeholder`]): no project activated and no real buffer
+    /// (the sentinel `buffer_id == 0`, which the server never assigns). Shells render their
+    /// no-project view — no editor, no viewport subscribe — until a project is picked and
+    /// [`Session::adopt_switch`](crate::update) lands the first real buffer.
+    pub fn is_placeholder(&self) -> bool {
+        self.buffer.buffer_id == 0
+    }
 }
 
 /// Build the client-side buffer record from a `buffer/open` result.
