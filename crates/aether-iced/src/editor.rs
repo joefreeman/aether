@@ -500,7 +500,44 @@ where
                         content_clip,
                     );
                 };
+                // Byte offset where the row's trailing whitespace run begins (row end if none) —
+                // only spaces from here on get the `·` glyph, matching the terminal client.
+                let trailing_ws_start = {
+                    let mut start = grid::row_end_byte(row);
+                    for c in cells.iter().rev() {
+                        if c.ch == ' ' || c.ch == '\t' {
+                            start = c.byte;
+                        } else {
+                            break;
+                        }
+                    }
+                    start
+                };
                 for c in &cells {
+                    // Selected whitespace gets a muted NORD3 indicator glyph over the selection
+                    // fill (terminal parity): `→` for tabs, `·` for trailing spaces. Drawn as its
+                    // own run so the next text run repositions itself past the tab's full width.
+                    let selected = draw_selection
+                        && pos_in_selection(line.logical_line, c.byte, sel_min, sel_max);
+                    let glyph = if selected && c.ch == '\t' {
+                        Some("→")
+                    } else if selected && c.ch == ' ' && c.byte >= trailing_ws_start {
+                        Some("·")
+                    } else {
+                        None
+                    };
+                    if let Some(g) = glyph {
+                        flush(&mut run, run_start, run_kind, run_hit, renderer);
+                        draw_run(
+                            renderer,
+                            g.to_string(),
+                            Point::new(text_x(c.dcol), y),
+                            cell,
+                            theme::NORD3,
+                            content_clip,
+                        );
+                        continue;
+                    }
                     let hit = in_hit(c.dcol);
                     if run.is_empty() {
                         run_start = c.dcol;
@@ -521,6 +558,41 @@ where
                     }
                 }
                 flush(&mut run, run_start, run_kind, run_hit, renderer);
+
+                // Selected newline: a muted `↵` at the line's end on its last visual row, when the
+                // consumed `\n` falls in the selection (terminal parity). The fill ensures the
+                // selection blue sits under the glyph even when the selection ends exactly on it
+                // (where `row_selection_span` stops at the last char).
+                let nl_selected = draw_selection
+                    && row_idx + 1 == n_rows
+                    && line.logical_line >= sel_min.line
+                    && (line.logical_line < sel_max.line
+                        || (line.logical_line == sel_max.line
+                            && sel_max.col >= grid::row_end_byte(row)));
+                if nl_selected {
+                    let end_dcol = cells
+                        .last()
+                        .map(|c| c.dcol + c.width)
+                        .unwrap_or_else(|| grid::row_prefix_cols(row));
+                    fill_content(
+                        renderer,
+                        Rectangle {
+                            x: text_x(end_dcol),
+                            y,
+                            width: cell.width,
+                            height: cell.height,
+                        },
+                        theme::NORD10,
+                    );
+                    draw_run(
+                        renderer,
+                        "↵".to_string(),
+                        Point::new(text_x(end_dcol), y),
+                        cell,
+                        theme::NORD3,
+                        content_clip,
+                    );
+                }
 
                 // Cursor-line blame: dim virtual text after the line's last row.
                 if let Some((bline, btext)) = self.content.blame {
@@ -598,8 +670,29 @@ where
                         },
                         theme::NORD4,
                     );
-                    // Re-draw the char under the block in the background colour.
-                    if let Some(ch) = char_at(window, cursor_pos) {
+                    // Re-draw the char — or, on selected whitespace, its `→`/`·`/`↵` glyph — under
+                    // the block in the background colour, so the cursor doesn't blank the indicator.
+                    let ws = draw_selection
+                        .then(|| {
+                            cursor_ws_glyph(
+                                window,
+                                cursor_pos,
+                                sel_min,
+                                sel_max,
+                                self.content.tab_width,
+                            )
+                        })
+                        .flatten();
+                    if let Some(g) = ws {
+                        draw_run(
+                            renderer,
+                            g.to_string(),
+                            Point::new(x, y),
+                            cell,
+                            theme::NORD0,
+                            content_clip,
+                        );
+                    } else if let Some(ch) = char_at(window, cursor_pos) {
                         if ch != '\t' {
                             draw_run(
                                 renderer,
@@ -711,6 +804,52 @@ fn selection_endpoints(cursor: &CursorState) -> (LogicalPosition, LogicalPositio
         (a, b)
     } else {
         (b, a)
+    }
+}
+
+/// Whether a char at `(line, byte)` falls inside the inclusive selection `[min, max]` — the
+/// per-cell test behind the selected-whitespace glyphs.
+fn pos_in_selection(line: u32, byte: u32, min: LogicalPosition, max: LogicalPosition) -> bool {
+    let after_min = line > min.line || (line == min.line && byte >= min.col);
+    let before_max = line < max.line || (line == max.line && byte <= max.col);
+    after_min && before_max
+}
+
+/// The whitespace glyph to redraw (inverted) under the block cursor when it sits on selected
+/// whitespace — the cursor is painted last, over the text, so without this it would blank the
+/// `→`/`·`/`↵` the text pass drew. Mirrors the per-row glyph rules. `None` when the cursor cell
+/// isn't selected whitespace.
+fn cursor_ws_glyph(
+    window: &Window,
+    pos: LogicalPosition,
+    min: LogicalPosition,
+    max: LogicalPosition,
+    tab_width: u32,
+) -> Option<&'static str> {
+    if !pos_in_selection(pos.line, pos.col, min, max) {
+        return None;
+    }
+    let line = window.lines.iter().find(|l| l.logical_line == pos.line)?;
+    let row_idx = line.visual_rows.iter().rposition(|r| r.byte_offset <= pos.col)?;
+    let row = &line.visual_rows[row_idx];
+    let cells = grid::row_cells(row, tab_width);
+    match cells.iter().find(|c| c.byte == pos.col) {
+        Some(c) if c.ch == '\t' => Some("→"),
+        Some(c) if c.ch == ' ' => {
+            // Only a space in the row's trailing-whitespace run gets the dot.
+            let mut start = grid::row_end_byte(row);
+            for cc in cells.iter().rev() {
+                if cc.ch == ' ' || cc.ch == '\t' {
+                    start = cc.byte;
+                } else {
+                    break;
+                }
+            }
+            (c.byte >= start).then_some("·")
+        }
+        Some(_) => None,
+        // Past the row's last char: the consumed-newline cell, on the line's last row.
+        None => (row_idx + 1 == line.visual_rows.len()).then_some("↵"),
     }
 }
 

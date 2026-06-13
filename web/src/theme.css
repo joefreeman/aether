@@ -339,6 +339,16 @@ html, body, #app {
    outranks .hl-comment so this wins. Every other syntax color reads fine on NORD3. */
 .search-hit.hl-comment { color: var(--nord4); }
 .sel { background: var(--nord10); }
+/* Selected-whitespace indicators (terminal parity): a muted NORD3 glyph over the selection blue —
+   `·` for trailing spaces and `↵` for the consumed newline (width-neutral text), and `→` overlaid
+   on a tab, which keeps its literal `\t` so `tab-size` preserves its width. The `.sel`-compound
+   selectors outrank the `.hl-*` syntax colours, so the glyph is NORD3 even inside a highlight. */
+.sel.ws-dot, .sel.ws-nl { color: var(--nord3); }
+.ws-tab { position: relative; }
+.ws-tab::before { content: "→"; position: absolute; left: 0; color: var(--nord3); pointer-events: none; }
+/* Under the block cursor the cell inverts (NORD4 fill); flip the `→` to NORD0 so it stays legible,
+   matching how the `·`/`↵` glyphs invert via the `.cursor` colour rule above. */
+.ws-tab.cursor:not(.insert):not(.pending)::before { color: var(--nord0); }
 /* Only the plain block cursor (Normal mode) inverts the cell — dark glyph on the NORD4 fill. The
    insert I-beam and the pending underscore are just an edge accent and must leave the character's
    syntax colour intact (`color: inherit` here would override the `.hl-*` colour with the default
