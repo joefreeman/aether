@@ -316,11 +316,23 @@ function renderVisualRow(
     i = j;
   }
 
-  if (cursorAtEnd || selTrailing) {
+  // A diagnostic clamped to the line end (e.g. "expected ;") has no real char to underline; mark
+  // the virtual EOL cell — where the newline glyph sits — on the line's last row.
+  let eolDiag: DiagnosticSeverity | null = null;
+  if (isLastRow) {
+    for (const d of line.diagnostics ?? []) {
+      if (d.start - row.byte_offset >= byteLen) {
+        if (eolDiag === null || SEVERITY_RANK[d.severity] > SEVERITY_RANK[eolDiag]) eolDiag = d.severity;
+      }
+    }
+  }
+
+  if (cursorAtEnd || selTrailing || eolDiag) {
     // The consumed newline reads as `↵` when selected (terminal parity). A cursor parked on it
     // keeps the glyph and renders the block over it (the `.cursor` rule inverts the `↵` to NORD0),
-    // matching the terminal — rather than blanking it out.
-    const style = { hl: null, diag: null, search: false, sel: selTrailing, cursor: cursorAtEnd, bracket: false };
+    // matching the terminal — rather than blanking it out. An end-of-line diagnostic underlines
+    // this cell even with no cursor/selection present.
+    const style = { hl: null, diag: eolDiag, search: false, sel: selTrailing, cursor: cursorAtEnd, bracket: false };
     textEl.appendChild(
       selTrailing ? wsSpan("↵", style, "nl", cursorClass) : makeSpan(" ", style, cursorClass),
     );

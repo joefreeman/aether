@@ -11,7 +11,7 @@
 use crate::grid;
 use crate::theme;
 use aether_protocol::cursor::CursorState;
-use aether_protocol::viewport::{DiffMarker, DiffStage, Window};
+use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker, DiffStage, LogicalLineRender, Window};
 use aether_protocol::LogicalPosition;
 use iced::advanced::widget::{tree, Tree};
 use iced::advanced::{layout, mouse, renderer, text, Clipboard, Layout, Shell, Widget};
@@ -610,19 +610,28 @@ where
                 }
 
                 // Diagnostics underline: 2px line under the span (zero-width ones widened to
-                // one cell so they're visible).
+                // one cell so they're visible). A diagnostic clamped to the line end (e.g.
+                // "expected ;") has no real char to mark, so underline the virtual EOL cell —
+                // where the newline glyph sits — on the line's last visual row.
+                let row_end = grid::row_end_byte(row);
+                let eol_dcol = cells
+                    .last()
+                    .map(|c| c.dcol + c.width)
+                    .unwrap_or_else(|| grid::row_prefix_cols(row));
                 for diag in &line.diagnostics {
-                    let span = grid::byte_range_span(&cells, diag.start, diag.end.max(diag.start + 1));
+                    let span = if row_idx + 1 == n_rows && diag.start >= row_end {
+                        Some((eol_dcol, eol_dcol + 1))
+                    } else {
+                        grid::byte_range_span(&cells, diag.start, diag.end.max(diag.start + 1))
+                    };
                     if let Some((start, end)) = span {
-                        fill_content(
+                        fill_wavy(
                             renderer,
-                            Rectangle {
-                                x: text_x(start),
-                                y: y + cell.height - 2.0,
-                                width: (end - start).max(1) as f32 * cell.width,
-                                height: 2.0,
-                            },
+                            text_x(start),
+                            y + cell.height - 2.0,
+                            (end - start).max(1) as f32 * cell.width,
                             theme::diagnostic_color(diag.severity),
+                            content_left,
                         );
                     }
                 }
@@ -704,6 +713,24 @@ where
                             );
                         }
                     }
+                    // The block covered the row pass's diagnostic underline; redraw it on top so a
+                    // diagnostic on the cursor's char stays visible (the web draws the wavy line
+                    // over the cursor background).
+                    if let Some(sev) = window
+                        .lines
+                        .iter()
+                        .find(|l| l.logical_line == cursor_pos.line)
+                        .and_then(|l| diagnostic_at(l, cursor_pos.col))
+                    {
+                        fill_wavy(
+                            renderer,
+                            x,
+                            y + cell.height - 2.0,
+                            width as f32 * cell.width,
+                            theme::diagnostic_color(sev),
+                            content_left,
+                        );
+                    }
                 }
             }
         }
@@ -769,6 +796,61 @@ fn fill<Renderer: renderer::Renderer>(renderer: &mut Renderer, bounds: Rectangle
         },
         color,
     );
+}
+
+/// A wavy underline — the browser's `text-decoration: underline wavy`, which the web client uses
+/// for diagnostics. The renderer only fills axis-aligned rects, so trace a sine with a row of
+/// 1px-wide quads. `mid_y` is the wave's vertical centre; segments left of `clip_left` (the
+/// gutter) are dropped, mirroring `fill_content`.
+fn fill_wavy<Renderer: renderer::Renderer>(
+    renderer: &mut Renderer,
+    x: f32,
+    mid_y: f32,
+    width: f32,
+    color: Color,
+    clip_left: f32,
+) {
+    const PERIOD: f32 = 4.0; // px per full cycle
+    const AMP: f32 = 1.1; // peak offset from the centre line
+    const TH: f32 = 1.4; // stroke thickness
+    let mut dx = 0.0;
+    while dx < width {
+        let off = AMP * (std::f32::consts::TAU * dx / PERIOD).sin();
+        let seg = (width - dx).min(1.0);
+        if let Some(r) = clamp_left(
+            Rectangle {
+                x: x + dx,
+                y: mid_y + off - TH / 2.0,
+                width: seg,
+                height: TH,
+            },
+            clip_left,
+        ) {
+            fill(renderer, r, color);
+        }
+        dx += 1.0;
+    }
+}
+
+fn severity_rank(s: DiagnosticSeverity) -> u8 {
+    use DiagnosticSeverity as S;
+    match s {
+        S::Error => 3,
+        S::Warning => 2,
+        S::Information => 1,
+        S::Hint => 0,
+    }
+}
+
+/// The worst-severity diagnostic covering byte `col` on `line` (zero-width ones widened one cell,
+/// so a diagnostic clamped to the line end still matches the cursor parked there). Drives the
+/// over-the-cursor underline redraw.
+fn diagnostic_at(line: &LogicalLineRender, col: u32) -> Option<DiagnosticSeverity> {
+    line.diagnostics
+        .iter()
+        .filter(|d| d.start <= col && col < d.end.max(d.start + 1))
+        .map(|d| d.severity)
+        .max_by_key(|s| severity_rank(*s))
 }
 
 fn draw_run<Renderer: text::Renderer>(

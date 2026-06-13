@@ -3333,6 +3333,17 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         };
 
         let last_vrow_idx = render.visual_rows.len().saturating_sub(1);
+        // A diagnostic clamped to the line end (e.g. "expected ;") sits at byte `line_end` with no
+        // real char to underline — its worst severity, so we can mark the EOL cell (where the
+        // newline glyph sits) instead. `None` when no diagnostic reaches the line end.
+        let eol_diag_at = |line_end: u32| -> Option<DiagnosticSeverity> {
+            render
+                .diagnostics
+                .iter()
+                .filter(|d| d.start >= line_end)
+                .map(|d| d.severity)
+                .max_by_key(|s| severity_rank(*s))
+        };
         for (vrow_idx, vrow) in render.visual_rows.iter().enumerate() {
             if skip_rows > 0 {
                 skip_rows -= 1;
@@ -3352,9 +3363,26 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     let empty_newline_selected = is_last_vrow_of_line
                         && selection
                             .is_some_and(|(s, e)| s.line <= logical_line && e.line >= logical_line);
+                    // An empty line's newline is at byte 0; a diagnostic there underlines the cell.
+                    let eol_diag = is_last_vrow_of_line
+                        .then(|| eol_diag_at(vrow.byte_offset))
+                        .flatten();
                     let mut spans: Vec<Span<'static>> = Vec::new();
-                    if empty_newline_selected {
-                        spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
+                    if empty_newline_selected || eol_diag.is_some() {
+                        let mut style = if empty_newline_selected {
+                            Style::default().bg(NORD10).fg(NORD3)
+                        } else {
+                            Style::default()
+                        };
+                        if let Some(sev) = eol_diag {
+                            style = style
+                                .add_modifier(Modifier::UNDERLINED)
+                                .underline_color(diag_color(sev));
+                        }
+                        spans.push(Span::styled(
+                            if empty_newline_selected { "↵" } else { " " },
+                            style,
+                        ));
                     }
                     let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
                     append_eol_blame(
@@ -3443,8 +3471,27 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 &clipped_diags,
                 body_width,
             ));
-            if highlight_trailing_newline {
-                spans.push(Span::styled("↵", Style::default().bg(NORD10).fg(NORD3)));
+            // The EOL cell after the last char: the newline glyph when selected, and/or a
+            // diagnostic underline when one is clamped to the line end (it has no real char to
+            // mark). When neither applies, nothing is drawn here.
+            let eol_diag = is_last_vrow_of_line
+                .then(|| eol_diag_at(vrow.byte_offset + row_text_len))
+                .flatten();
+            if highlight_trailing_newline || eol_diag.is_some() {
+                let mut style = if highlight_trailing_newline {
+                    Style::default().bg(NORD10).fg(NORD3)
+                } else {
+                    Style::default()
+                };
+                if let Some(sev) = eol_diag {
+                    style = style
+                        .add_modifier(Modifier::UNDERLINED)
+                        .underline_color(diag_color(sev));
+                }
+                spans.push(Span::styled(
+                    if highlight_trailing_newline { "↵" } else { " " },
+                    style,
+                ));
             }
             let show_blame = logical_line == cursor_line && is_last_vrow_of_line;
             append_eol_blame(
