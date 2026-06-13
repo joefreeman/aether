@@ -455,6 +455,14 @@ pub struct PickerViewResult {
     /// resuming client can rebuild its chip row, the same way `query` restores the input text.
     #[serde(default, skip_serializing_if = "PickerFilters::is_default")]
     pub filters: PickerFilters,
+    /// The initial result window (items at `effective_offset`). Mirrors the `picker/update` push
+    /// the server also emits, but riding the response lets the client render items atomically with
+    /// adopting `generation`/`effective_offset`. The separate push can arrive *before* this
+    /// response, when the client's `generation`/`offset` still differ and its staleness guard
+    /// discards it — most visible on a Grep resume, where the picker reopens showing the restored
+    /// query but no rows. `None` only when there is no subscribed window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<PickerUpdateParams>,
 }
 
 // ---- picker/query -------------------------------------------------------------------------------
@@ -639,7 +647,7 @@ impl NotificationMethod for PickerUpdate {
     type Params = PickerUpdateParams;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PickerUpdateParams {
     pub kind: PickerKind,
     pub generation: u64,

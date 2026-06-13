@@ -26,8 +26,12 @@ use aether_protocol::cursor::{
     CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
     Granularity, Motion, SelectionEdge,
 };
-use aether_protocol::directory::{DirectoryList, DirectoryListParams, DirectoryListResult};
+use aether_protocol::directory::{
+    DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryList,
+    DirectoryListParams, DirectoryListResult,
+};
 use aether_protocol::envelope::RpcMethod;
+use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::envelope::{Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
@@ -143,6 +147,15 @@ pub enum Event {
     },
     /// `picker/grep_file_jump` resolved: the next/prev file's first hit (None at the ends).
     GrepFileJumped(Result<Option<PickerItem>, String>),
+    /// `path/delete` (Explorer/Files trash) resolved. `noun` labels the success toast; the
+    /// open picker re-lists. Buffer closes for the deleted path arrive via the `buffer/closed`
+    /// push, which already switches us off a deleted current buffer.
+    PathDeleted {
+        noun: &'static str,
+        result: Result<PathDeleteResult, String>,
+    },
+    /// `directory/create` (Explorer "Ctrl-n name/") resolved: navigate into the new directory.
+    DirCreated(Result<DirectoryCreateResult, String>),
     /// Project switch resolved: the activated project + the buffer to land on.
     ProjectActivated(Result<(ProjectInfo, BufferOpenResult), String>),
     /// A server notification arrived on the session's stream.
@@ -225,12 +238,17 @@ impl Session {
             Event::Switched(Err(e)) => Effects::error(e),
 
             Event::SwitchedPrimed(Ok(Some((query, open)))) => {
+                // Grab the primed summary before `open` is consumed: the equivalent
+                // `search/state_changed` push races this switch and the client's `buffer_id`
+                // guard drops it if it lands before the switch, so the count rode the response.
+                let summary = open.search_summary.clone();
                 let fx = self.adopt_switch(open);
                 // adopt_switch reset the search state; adopt the primed query (the
-                // server-side search was already set in the open chain).
+                // server-side search was already set in the open chain) and its summary.
                 self.search.cursor = query.len();
                 self.search.query = query.clone();
                 self.search.active = true;
+                self.search.summary = summary;
                 self.push_history(query);
                 fx
             }
@@ -461,6 +479,17 @@ impl Session {
                             p.total_candidates = r.total_candidates;
                             p.adopt_filters(&r.filters);
                         }
+                        // Apply the window folded into the response now that generation/offset
+                        // are set, so a Grep resume renders its rows even when the redundant
+                        // `picker/update` push raced ahead of this response and was discarded.
+                        // `apply_update` is generation/offset-guarded — a no-op if it doesn't fit.
+                        if let Some(update) = r.update {
+                            if p.apply_update(update) && p.pending_center.is_none() {
+                                if let Some(reveal) = p.reveal_on_update.take() {
+                                    return Effects::one(Effect::RevealPickerSelection(reveal));
+                                }
+                            }
+                        }
                     }
                     Effects::none()
                 }
@@ -592,6 +621,31 @@ impl Session {
                 )
             }
             Event::GrepFileJumped(Err(e)) => Effects::error(format!("file jump failed: {e}")),
+
+            Event::PathDeleted { noun, result } => match result {
+                Err(e) => Effects::error(format!("delete failed: {e}")),
+                Ok(_) => {
+                    // Any close of *our* buffer rides the `buffer/closed` push (it switches us
+                    // to the server's successor). Here we just confirm and re-list the picker.
+                    let mut fx = Effects::toast(format!("trashed {noun}"), ToastKind::Success);
+                    if let Some(p) = &self.picker {
+                        if p.kind == PickerKind::Explorer {
+                            let dir = p.directory.clone();
+                            fx = fx.and(self.explorer_navigate(dir, false, None));
+                        } else if p.kind == PickerKind::Files {
+                            fx = fx.and(self.open_picker(PickerKind::Files, None, None));
+                        }
+                    }
+                    fx
+                }
+            },
+            Event::DirCreated(Err(e)) => Effects::error(format!("create directory failed: {e}")),
+            Event::DirCreated(Ok(r)) => {
+                let mut fx = Effects::toast(format!("created {}", r.path), ToastKind::Success);
+                // Step into the new directory so the user can keep creating inside it.
+                fx = fx.and(self.explorer_navigate(Some(r.path), false, None));
+                fx
+            }
 
             Event::ServerPush(n) => self.on_server_push(n),
 
@@ -743,11 +797,7 @@ impl Session {
 
     /// `buffer/save`, mapping the server's refusal codes to a `[y/N]` confirmation that
     /// retries with `overwrite: true`. `target` is the save-as `(path_index, relative_path)`.
-    pub fn save(
-        &mut self,
-        target: Option<(u32, String)>,
-        overwrite: bool,
-    ) -> Effects {
+    pub fn save(&mut self, target: Option<(u32, String)>, overwrite: bool) -> Effects {
         let buffer_id = self.buffer.buffer_id;
         let (path_index, relative_path) = match &target {
             Some((i, p)) => (Some(*i), Some(p.clone())),
@@ -985,12 +1035,7 @@ impl Session {
 
     /// Keys while a modal prompt is open. Confirm: `y`/Enter accepts, anything else declines
     /// (the `[y/N]` default). Save-as: a one-line path editor (Tab cycles the target root).
-    pub fn on_prompt_key(
-        &mut self,
-        code: KeyCode,
-        mods: Mods,
-        text: Option<String>,
-    ) -> Effects {
+    pub fn on_prompt_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         let Some(prompt) = self.prompt.take() else {
             return Effects::none();
         };
@@ -1244,10 +1289,7 @@ impl Session {
     /// `Space Alt-f` / `Space Alt-g`: open Files/Grep pre-scoped to the active buffer's
     /// directory — a normal dir filter chip, visible and removable. Falls back to an unscoped
     /// open for scratch buffers or files outside every root.
-    pub fn open_picker_in_buffer_dir(
-        &mut self,
-        kind: PickerKind,
-    ) -> Effects {
+    pub fn open_picker_in_buffer_dir(&mut self, kind: PickerKind) -> Effects {
         let seed = self
             .buffer
             .path
@@ -1268,10 +1310,7 @@ impl Session {
     /// `Ctrl-g` / `Ctrl-f` in the Explorer: switch to the Grep / Files picker scoped to the
     /// directory being browsed ("grep here"), the explorer's filters translated along. In
     /// Roots mode no dir scope is seeded — the target covers the whole project.
-    fn switch_explorer_picker(
-        &mut self,
-        target: PickerKind,
-    ) -> Effects {
+    fn switch_explorer_picker(&mut self, target: PickerKind) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
@@ -1372,6 +1411,16 @@ impl Session {
 
     /// Move the picker highlight, refetching when it leaves the fetched window and revealing
     /// it otherwise (the shell scrolls the native list the minimum to keep it visible).
+    /// Wheel scroll over the picker overlay: move the highlight by `delta` rows, like Alt-j/k.
+    /// A no-op when no picker is open. Lets a shell route wheel events to the picker without
+    /// reaching into its private navigation.
+    pub fn picker_wheel(&mut self, delta: i64) -> Effects {
+        if self.picker.is_none() {
+            return Effects::none();
+        }
+        self.picker_move(delta)
+    }
+
     fn picker_move(&mut self, delta: i64) -> Effects {
         let Some(p) = &mut self.picker else {
             return Effects::none();
@@ -1785,12 +1834,7 @@ impl Session {
     }
 
     /// Keys while a picker is open: list navigation + query editing.
-    pub fn on_picker_key(
-        &mut self,
-        code: KeyCode,
-        mods: Mods,
-        text: Option<String>,
-    ) -> Effects {
+    pub fn on_picker_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         // The chip editor line (glob/dir, revealed below the input) owns the keys while open.
         if self
             .picker
@@ -1853,6 +1897,23 @@ impl Session {
         match code {
             KeyCode::Esc => return self.close_picker(),
             KeyCode::Enter => return self.picker_accept(),
+            // Delete / Ctrl-d: trash the highlighted entry (Files + Explorer), behind a confirm.
+            KeyCode::Delete
+                if matches!(p.kind, PickerKind::Files | PickerKind::Explorer) =>
+            {
+                return self.picker_stage_delete();
+            }
+            KeyCode::Char('d')
+                if mods.ctrl
+                    && !mods.alt
+                    && matches!(p.kind, PickerKind::Files | PickerKind::Explorer) =>
+            {
+                return self.picker_stage_delete();
+            }
+            // Ctrl-n in the Explorer: create the file/dir named by the query (trailing `/` = dir).
+            KeyCode::Char('n') if mods.ctrl && !mods.alt && p.kind == PickerKind::Explorer => {
+                return self.explorer_create_from_query();
+            }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).
             KeyCode::Char('k') if mods.alt && !mods.ctrl => return self.picker_move(-1),
             KeyCode::Char('j') if mods.alt && !mods.ctrl => return self.picker_move(1),
@@ -1984,12 +2045,7 @@ impl Session {
     /// value moves into the path, Alt-j/k cycle the focused segment's matches, Alt-Backspace
     /// pops a path segment (then, at an empty path, clears the root selection), and plain
     /// Backspace at an empty path steps back into the root. Enter commits, Esc cancels.
-    fn on_chip_editor_key(
-        &mut self,
-        code: KeyCode,
-        mods: Mods,
-        text: Option<String>,
-    ) -> Effects {
+    fn on_chip_editor_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         let project_paths = self.project_paths.clone();
         let labels = super::labels::root_labels(&project_paths);
         let Some(p) = &mut self.picker else {
@@ -2369,6 +2425,66 @@ impl Session {
         )
     }
 
+    // ---- pointer (mouse) -----------------------------------------------------------------
+    //
+    // Geometry (screen cell → buffer position) is the shell's job — only the shell knows its
+    // viewport/scroll. The core owns the selection semantics: the drag anchor, the click-streak
+    // granularity, and the `cursor/set` round-trip. Shared by every shell so click/drag behaves
+    // identically across terminal, native, and web.
+
+    /// A pointer press at an already-resolved buffer position. `granularity` carries the click
+    /// streak — `Char`/`Word`/`Line` for single/double/triple — and the server expands the
+    /// selection to that unit. `extend` (shift-click) keeps the current anchor instead of
+    /// collapsing the selection to the press. Records the drag anchor so a follow-up
+    /// [`pointer_drag`](Self::pointer_drag) extends from here.
+    pub fn pointer_press(
+        &mut self,
+        pos: LogicalPosition,
+        granularity: Granularity,
+        extend: bool,
+    ) -> Effects {
+        if self.conn != ConnState::Connected {
+            return Effects::none();
+        }
+        let anchor = if extend { self.buffer.cursor.anchor } else { pos };
+        self.drag = Some((anchor, granularity));
+        self.request_str::<CursorSet>(
+            CursorSetParams {
+                buffer_id: self.buffer.buffer_id,
+                position: pos,
+                anchor,
+                granularity,
+            },
+            Event::CursorMsg,
+        )
+    }
+
+    /// Pointer drag to a new position while the button is held: extend the selection from the
+    /// recorded anchor, preserving the press's granularity. A no-op when no press is active (the
+    /// drag began outside the text, or the press was suppressed).
+    pub fn pointer_drag(&mut self, pos: LogicalPosition) -> Effects {
+        let Some((anchor, granularity)) = self.drag else {
+            return Effects::none();
+        };
+        if self.conn != ConnState::Connected {
+            return Effects::none();
+        }
+        self.request_str::<CursorSet>(
+            CursorSetParams {
+                buffer_id: self.buffer.buffer_id,
+                position: pos,
+                anchor,
+                granularity,
+            },
+            Event::CursorMsg,
+        )
+    }
+
+    /// Pointer release — ends the drag. The selection stays as last set.
+    pub fn pointer_release(&mut self) {
+        self.drag = None;
+    }
+
     /// Esc in the prompt: restore the pre-prompt search (query + server state), cursor, and
     /// (via the effect) the shell's scroll anchor.
     pub fn abort_search(&mut self) -> Effects {
@@ -2436,12 +2552,7 @@ impl Session {
 
     /// `n`/`Alt-n`: step match-to-match; with no active search, revive the most recent
     /// history entry first. Steps run sequentially in one future.
-    pub fn search_cycle(
-        &mut self,
-        direction: Direction,
-        count: u32,
-        extend: bool,
-    ) -> Effects {
+    pub fn search_cycle(&mut self, direction: Direction, count: u32, extend: bool) -> Effects {
         let revive = if self.search.active {
             None
         } else {
@@ -2526,13 +2637,110 @@ impl Session {
         )
     }
 
+    // ---- Explorer/Files create + delete --------------------------------------------------
+
+    /// Trash the highlighted Files/Explorer entry, behind a `[y/N]` confirm in the status bar.
+    /// The absolute path comes from the picker's listed directory (Explorer) or the entry's
+    /// project root (Files). The picker stays open under the confirm; on accept the `path/delete`
+    /// fires and the listing re-lists (a close of *our* buffer rides the `buffer/closed` push).
+    pub fn picker_stage_delete(&mut self) -> Effects {
+        let staged = {
+            let Some(p) = &self.picker else {
+                return Effects::none();
+            };
+            let Some(item) = p.selected_item() else {
+                return Effects::none();
+            };
+            match item {
+                PickerItem::DirEntry { name, is_dir, .. } => p.directory.as_ref().map(|dir| {
+                    let noun = if *is_dir { "directory" } else { "file" };
+                    (
+                        format!("{}/{name}", dir.trim_end_matches('/')),
+                        noun,
+                        name.clone(),
+                    )
+                }),
+                PickerItem::File {
+                    path_index,
+                    relative_path,
+                    ..
+                } => self
+                    .project_paths
+                    .get(*path_index as usize)
+                    .map(|root| {
+                        (
+                            format!("{}/{relative_path}", root.trim_end_matches('/')),
+                            "file",
+                            relative_path.clone(),
+                        )
+                    }),
+                _ => None,
+            }
+        };
+        let Some((path, noun, name)) = staged else {
+            return Effects::none();
+        };
+        self.prompt = Some(Prompt::Confirm {
+            message: format!("Delete {noun} \"{name}\"? [y/N]"),
+            action: ConfirmAction::DeletePath { path, noun },
+        });
+        Effects::none()
+    }
+
+    /// Explorer `Ctrl-n`: create whatever the query names in the listed directory — a directory
+    /// when it ends with `/`, otherwise a file (which opens). Multi-segment names create the
+    /// intermediate directories server-side. No-op outside the Explorer.
+    pub fn explorer_create_from_query(&mut self) -> Effects {
+        let (dir, query) = {
+            let Some(p) = &self.picker else {
+                return Effects::none();
+            };
+            if p.kind != PickerKind::Explorer {
+                return Effects::none();
+            }
+            let Some(dir) = p.directory.clone() else {
+                return Effects::none();
+            };
+            (dir, p.query.clone())
+        };
+        let q = query.trim();
+        let (base, is_dir) = match q.strip_suffix('/') {
+            Some(stripped) => (stripped, true),
+            None => (q, false),
+        };
+        if base.is_empty() {
+            return Effects::error("type a name to create");
+        }
+        if base
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Effects::error("invalid name");
+        }
+        let abs = format!("{}/{base}", dir.trim_end_matches('/'));
+        if is_dir {
+            return self
+                .request_str::<DirectoryCreate>(DirectoryCreateParams { path: abs }, Event::DirCreated);
+        }
+        // File: address it under a project root, then open with create-on-save.
+        let Some((path_index, relative_path)) = strip_longest_root(&abs, &self.project_paths) else {
+            return Effects::error("path is outside the project's roots");
+        };
+        let from = self.buffer.buffer_id;
+        self.request_str::<BufferOpen>(
+            BufferOpenParams {
+                path_index: Some(path_index),
+                relative_path: Some(relative_path),
+                create_if_missing: true,
+                record_nav_from: Some(from),
+                ..Default::default()
+            },
+            Event::Switched,
+        )
+    }
+
     /// Keys in the search prompt: the Search keymap table first, then printable input.
-    pub fn on_search_key(
-        &mut self,
-        code: KeyCode,
-        mods: Mods,
-        text: Option<String>,
-    ) -> Effects {
+    pub fn on_search_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         if let Some(b) = lookup(KeyContext::Search, code, mods) {
             return self.search_action(b.action);
         }
@@ -2635,6 +2843,10 @@ impl Session {
             ConfirmAction::Save { target } => self.save(target, true),
             ConfirmAction::ReloadDiscard => self.reload(true),
             ConfirmAction::CloseDiscard => self.close_buffer(),
+            ConfirmAction::DeletePath { path, noun } => self.request_str::<PathDelete>(
+                PathDeleteParams { path },
+                move |result| Event::PathDeleted { noun, result },
+            ),
         }
     }
 
@@ -2844,9 +3056,7 @@ impl Session {
         let buffer_id = self.buffer.buffer_id;
         match action {
             // ---- motions ----
-            A::MoveChar(direction) => {
-                self.move_motion(Motion::Char { direction, count }, extend)
-            }
+            A::MoveChar(direction) => self.move_motion(Motion::Char { direction, count }, extend),
             A::MoveWord { dir, boundary } => self.move_motion(
                 Motion::Word {
                     direction: dir,
@@ -2908,9 +3118,7 @@ impl Session {
                     extend,
                 )
             }
-            A::MatchBracket { inner } => {
-                self.move_motion(Motion::MatchBracket { inner }, extend)
-            }
+            A::MatchBracket { inner } => self.move_motion(Motion::MatchBracket { inner }, extend),
             A::PageMotion { dir, half } => {
                 let Some(viewport_id) = self.viewport_id else {
                     return Effects::none();
@@ -2926,18 +3134,10 @@ impl Session {
                     extend,
                 )
             }
-            A::NavUnit(Direction::Forward) => {
-                self.move_motion(Motion::NextNavigationUnit, false)
-            }
-            A::NavUnit(Direction::Backward) => {
-                self.move_motion(Motion::PrevNavigationUnit, false)
-            }
-            A::NavUnitEdge { start: false } => {
-                self.move_motion(Motion::EndOfNavigationUnit, true)
-            }
-            A::NavUnitEdge { start: true } => {
-                self.move_motion(Motion::StartOfNavigationUnit, true)
-            }
+            A::NavUnit(Direction::Forward) => self.move_motion(Motion::NextNavigationUnit, false),
+            A::NavUnit(Direction::Backward) => self.move_motion(Motion::PrevNavigationUnit, false),
+            A::NavUnitEdge { start: false } => self.move_motion(Motion::EndOfNavigationUnit, true),
+            A::NavUnitEdge { start: true } => self.move_motion(Motion::StartOfNavigationUnit, true),
             A::BeginFind { dir, till } => {
                 self.pending = Pending::Find {
                     dir,
@@ -3004,6 +3204,11 @@ impl Session {
             A::CenterCursor | A::Scroll { .. } | A::ToggleWrap => {
                 // Geometry (pixel scroll, cell metrics) and viewport plumbing — the shell
                 // executes these against its own state.
+                Effects::one(Effect::ShellAction(action))
+            }
+            A::OpenHelp | A::OpenProjectSettings => {
+                // Shell-local overlays (help cheatsheet, project settings). A shell without
+                // the overlay ignores the action.
                 Effects::one(Effect::ShellAction(action))
             }
             A::NavBack | A::NavForward => {

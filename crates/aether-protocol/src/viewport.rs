@@ -20,7 +20,7 @@ pub struct ScrollPosition {
     pub sub_row: f32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LogicalLineRender {
     pub logical_line: u32,
     pub visual_rows: Vec<VisualRow>,
@@ -134,7 +134,7 @@ pub enum VirtualRowKind {
     Deleted,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VisualRow {
     /// Byte offset within the *logical line* where this row's text starts. For the first row
     /// of a logical line this is always 0; for continuation rows it's the byte right after the
@@ -145,7 +145,7 @@ pub struct VisualRow {
     pub segments: Vec<Segment>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Segment {
     pub text: String,
     pub highlights: Vec<Highlight>,

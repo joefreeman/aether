@@ -117,6 +117,7 @@ dependencies = [
 name = "aether-tui"
 version = "0.1.0"
 dependencies = [
+ "aether-client",
  "aether-protocol",
  "anyhow",
  "arboard",

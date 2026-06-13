@@ -122,13 +122,6 @@ impl TextInput {
         self.cursor = 0;
     }
 
-    /// Take the text out, leaving an empty input. Mirrors `String::take` / `mem::take` for the
-    /// underlying buffer specifically — cursor returns to 0.
-    pub fn take_text(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.text)
-    }
-
     /// Replace contents wholesale; cursor parks at the end. Use when restoring from history or
     /// any other "set the whole string" path.
     pub fn set(&mut self, text: impl Into<String>) {
@@ -256,16 +249,6 @@ mod tests {
         t.set("xyzzy");
         assert_eq!(t.text, "xyzzy");
         assert_eq!(t.cursor, 5);
-    }
-
-    #[test]
-    fn take_text_clears_and_returns_string() {
-        let mut t = TextInput::new("abc");
-        t.cursor = 2;
-        let s = t.take_text();
-        assert_eq!(s, "abc");
-        assert_eq!(t.text, "");
-        assert_eq!(t.cursor, 0);
     }
 
     fn key(code: KeyCode) -> KeyEvent {

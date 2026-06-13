@@ -123,6 +123,9 @@ pub enum ConfirmAction {
     ReloadDiscard,
     /// Close the buffer despite unsaved changes.
     CloseDiscard,
+    /// Trash a file/directory from the Files/Explorer picker (`path/delete`). `noun` is
+    /// "file"/"directory" for the success toast; the still-open picker is re-listed after.
+    DeletePath { path: String, noun: &'static str },
 }
 
 /// Outcome of a `buffer/save` attempt: saved, or refused pending user confirmation.

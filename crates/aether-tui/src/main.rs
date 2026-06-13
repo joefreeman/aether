@@ -1,12 +1,12 @@
 mod app;
-mod client;
 mod clipboard;
+mod connection;
 mod discovery;
-mod keymap;
 mod labels;
 mod picker;
 mod save_prompt;
 mod scroll;
+mod shell;
 mod stderr_capture;
 mod text_input;
 mod ui;
@@ -60,14 +60,14 @@ async fn main() -> anyhow::Result<()> {
 
     let info = discovery::read()?;
     let base_url = format!("ws://127.0.0.1:{}", info.port);
-    let mut client = client::Client::connect(&base_url, env!("CARGO_PKG_VERSION")).await?;
+    let (handle, notifications) = connection::connect(&base_url, env!("CARGO_PKG_VERSION")).await?;
 
     let mut terminal = setup_terminal()?;
     install_panic_hook();
 
     let (cols, rows) = crossterm::terminal::size()?;
-    let mut state = match app::bootstrap(
-        &mut client,
+    let (session, state, startup) = match shell::bootstrap(
+        &handle,
         cli.project.as_deref(),
         cli.file.as_deref(),
         cols,
@@ -82,7 +82,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let run_result = app::run(&mut terminal, &mut client, &mut state).await;
+    let run_result =
+        shell::run(&mut terminal, handle, notifications, session, state, startup).await;
     restore_terminal(&mut terminal)?;
     run_result
 }

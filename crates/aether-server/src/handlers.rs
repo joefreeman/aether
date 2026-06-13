@@ -63,9 +63,10 @@ use aether_protocol::search::{
 };
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSpan, DiffMarker, DiffStage, LogicalLineRange,
-    LogicalLineRender, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResizeParams,
-    ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams, ViewportSubscribeResult,
-    ViewportUnsubscribeParams, ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
+    LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
+    ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams,
+    ViewportSubscribeResult, ViewportUnsubscribeParams, ViewportWindowResult, VirtualRow,
+    VirtualRowKind, Window,
 };
 use aether_protocol::LogicalPosition;
 use aether_protocol::{BufferId, ClientId, Revision};
@@ -764,8 +765,10 @@ pub async fn buffer_open(
     // cursor so the first match at-or-after lands SELECTED (a grep jump selects the match).
     // The result's cursor is patched to the selection so clients adopt it directly.
     if let Some(query) = prime.filter(|q| !q.is_empty()) {
-        if let Some(cursor) = prime_search_for(state, ctx, result.buffer_id, &query).await {
+        if let Some((cursor, summary)) = prime_search_for(state, ctx, result.buffer_id, &query).await
+        {
             result.cursor = cursor;
+            result.search_summary = Some(summary);
         }
     }
     Ok(result)
@@ -775,13 +778,15 @@ pub async fn buffer_open(
 /// post-open cursor (the `jump_to` hit), so the match lands selected — the anchored prime
 /// the TUI/web grep flows always used. Errors are dropped (an invalid pattern simply
 /// doesn't prime); the summary goes out as a `search/state_changed` push since the prime
-/// rides another method's response. Returns the post-prime cursor (the selection).
+/// rides another method's response. Returns the post-prime cursor (the selection) and the search
+/// summary, so the caller can also fold the summary into its own response (the push can lose the
+/// race against the buffer switch on the client).
 async fn prime_search_for(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     buffer_id: BufferId,
     query: &str,
-) -> Option<CursorState> {
+) -> Option<(CursorState, SearchSummary)> {
     let anchor = {
         let s = state.lock().await;
         s.cursors
@@ -819,7 +824,25 @@ async fn prime_search_for(
     if let Some((sender, notif)) = push {
         let _ = sender.send(notif).await;
     }
-    Some(r.cursor)
+    Some((r.cursor, r.summary))
+}
+
+/// The scroll position to seed a freshly-opened viewport with. A `jump_to` open (grep
+/// navigation, goto-definition, nav history) deliberately moves the cursor elsewhere, so the
+/// scroll the client last recorded for this buffer predates the jump and would frame the wrong
+/// region — returning `None` lets the client centre on the jumped cursor with a single subscribe.
+/// A plain (re)open with no jump restores the saved scroll, so reopening a file lands where you
+/// left it.
+fn open_scroll(
+    s: &ServerState,
+    client_id: Option<ClientId>,
+    buffer_id: BufferId,
+    jump_to: Option<LogicalPosition>,
+) -> Option<ScrollPosition> {
+    if jump_to.is_some() {
+        return None;
+    }
+    client_id.and_then(|c| s.last_scroll.get(&(c, buffer_id)).copied())
 }
 
 async fn buffer_open_inner(
@@ -854,7 +877,7 @@ async fn buffer_open_inner(
         let scratch_number = buf.scratch_number;
         let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
         let cursor = resolve_open_cursor(&mut s, client_id, buffer_id, clamped_jump);
-        let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, buffer_id)).copied());
+        let scroll = open_scroll(&s, client_id, buffer_id, params.jump_to);
         let mut pushes = pin_buffer_if_requested(&mut s, buffer_id, params.transient);
         let result = BufferOpenResult {
             buffer_id,
@@ -869,6 +892,7 @@ async fn buffer_open_inner(
             scroll,
             lsp_server: buffer_lsp_server_ref(&s, buffer_id),
             transient: s.buffers[&buffer_id].transient,
+            search_summary: None, // set by buffer_open's prime post-step, not here
         };
         s.touch_mru(buffer_id);
         pushes.extend(refresh_buffer_pickers(&mut s));
@@ -888,7 +912,7 @@ async fn buffer_open_inner(
             buf.transient = params.transient == Some(true);
             let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
             let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump);
-            let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, id)).copied());
+            let scroll = open_scroll(&s, client_id, id, params.jump_to);
             let result = BufferOpenResult {
                 buffer_id: id,
                 language: buf.language.clone(),
@@ -902,6 +926,7 @@ async fn buffer_open_inner(
                 scroll,
                 lsp_server: None, // scratch buffers are never language-server-backed
                 transient: buf.transient,
+                search_summary: None, // set by buffer_open's prime post-step, not here
             };
             s.buffers.insert(id, buf);
             s.buffer_projects.insert(id, active_project_name.clone());
@@ -985,7 +1010,7 @@ async fn buffer_open_inner(
                 Some(c) => wrap_for_response(&s, c, existing, cursor),
                 None => cursor,
             };
-            let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, existing)).copied());
+            let scroll = open_scroll(&s, client_id, existing, params.jump_to);
             let mut pushes = pin_buffer_if_requested(&mut s, existing, params.transient);
             let result = BufferOpenResult {
                 buffer_id: existing,
@@ -1000,6 +1025,7 @@ async fn buffer_open_inner(
                 scroll,
                 lsp_server: buffer_lsp_server_ref(&s, existing),
                 transient: s.buffers[&existing].transient,
+                search_summary: None, // set by buffer_open's prime post-step, not here
             };
             s.touch_mru(existing);
             pushes.extend(refresh_buffer_pickers(&mut s));
@@ -1079,7 +1105,7 @@ async fn buffer_open_inner(
         None => cursor,
     };
     let buf = &s.buffers[&id];
-    let scroll = client_id.and_then(|c| s.last_scroll.get(&(c, id)).copied());
+    let scroll = open_scroll(&s, client_id, id, params.jump_to);
     let result = BufferOpenResult {
         buffer_id: id,
         language: buf.language.clone(),
@@ -1093,6 +1119,7 @@ async fn buffer_open_inner(
         scroll,
         lsp_server: buffer_lsp_server_ref(&s, id),
         transient: buf.transient,
+        search_summary: None, // set by buffer_open's prime post-step, not here
     };
     s.touch_mru(id);
     let pushes = refresh_buffer_pickers(&mut s);
@@ -9013,6 +9040,9 @@ pub async fn picker_view(
         directory_path,
         directory_parent,
         filters: picker.filters.clone(),
+        // Carry the window on the response too — see `PickerViewResult::update`. The push below
+        // stays for redundancy (and for the async grep walk's later updates).
+        update: update.clone(),
     };
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
     drop(s);

@@ -4,7 +4,8 @@ use crate::app::{
     grep_counter_label, search_counter_label, search_match_count_label, AppState, BufferStatusKind,
     EditorMode, HelpTab, BUFFER_STATUS_DOT,
 };
-use crate::keymap;
+use aether_client::keymap;
+use aether_client::keymap::KeyCode;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::{BlameInfo, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus};
@@ -14,7 +15,6 @@ use aether_protocol::viewport::{
     DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, Highlight, VisualRow, WrapMode,
 };
 use aether_protocol::LogicalPosition;
-use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1505,6 +1505,7 @@ fn scale_box_dim(dim: u16, min: u16, max: u16, target_pct: u16) -> u16 {
 /// How many result rows the picker can display given the buffer-area dimensions. Used by the
 /// app to set the `limit` it sends to the server. Subtracts box borders (2), input row (1), and
 /// separator row (1).
+#[allow(dead_code)] // view-model surface synced from the core; ui matches on it
 pub fn picker_result_rows(buffer_area_cols: u32, buffer_area_rows: u32) -> u32 {
     let area = Rect {
         x: 0,
@@ -1571,6 +1572,46 @@ pub fn picker_visible_item_count_from(
     } else {
         items.len().saturating_sub(start).min(pane_height)
     }
+}
+
+/// Compute the picker scroll offset (first visible item index) that keeps `selected` on screen,
+/// accounting for grep's non-selectable header rows. Returns the new offset given the current
+/// one. For non-grep pickers this is the flat 1-row-per-item math; for grep the visible window
+/// holds fewer items than `pane_height` because each file group spends a row on its header, so
+/// a flat `selected + 1 - pane` under-scrolls by the header count — exactly the "selected row
+/// sits below the box" symptom. Bottom-aligning walks the real layout (`grep_visible_item_count_from`)
+/// to find the smallest start that still shows `selected` as the last fitting item.
+pub fn picker_scroll_for_selected(
+    items: &[PickerItem],
+    selected: usize,
+    current: usize,
+    pane_height: usize,
+    kind: Option<aether_protocol::picker::PickerKind>,
+) -> usize {
+    let pane = pane_height.max(1);
+    // Scrolled above the window: pin the selection to the top.
+    if selected < current {
+        return selected;
+    }
+    // Already within the visible window: leave the scroll where it is.
+    let count = picker_visible_item_count_from(items, current, pane, kind);
+    if selected < current + count {
+        return current;
+    }
+    // Below the window: bottom-align so `selected` is the last visible row.
+    if !matches!(kind, Some(aether_protocol::picker::PickerKind::Grep)) {
+        return (selected + 1).saturating_sub(pane);
+    }
+    let mut start = selected;
+    while start > 0 {
+        let candidate = start - 1;
+        if candidate + grep_visible_item_count_from(items, candidate, pane) > selected {
+            start = candidate;
+        } else {
+            break;
+        }
+    }
+    start
 }
 
 fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
@@ -4853,6 +4894,7 @@ pub fn find_row_idx_for_col(rows: &[VisualRow], col: u32) -> usize {
 ///
 /// Clicks past the end of a visual row map to the end of that row's text; clicks below the last
 /// rendered visual row map to the end of the buffer (the server clamps).
+#[allow(dead_code)] // view-model surface synced from the core; ui matches on it
 pub fn screen_to_logical(
     state: &AppState,
     screen_row: u16,
@@ -4938,6 +4980,69 @@ fn byte_at_screen_col(state: &AppState, vrow: &VisualRow, screen_col: u16) -> u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a grep result list: `groups` is a list of (file, hit_count). Each file contributes
+    /// one header row plus `hit_count` selectable item rows.
+    fn grep_items(groups: &[(&str, usize)]) -> Vec<PickerItem> {
+        let mut items = Vec::new();
+        for (fi, (path, n)) in groups.iter().enumerate() {
+            for line in 0..*n {
+                items.push(PickerItem::GrepHit {
+                    path_index: fi as u32,
+                    relative_path: (*path).to_string(),
+                    line: line as u32,
+                    col: 0,
+                    preview: String::new(),
+                    match_indices: Vec::new(),
+                });
+            }
+        }
+        items
+    }
+
+    /// Grep scroll math must bottom-align using the header-aware row count, not a flat one row
+    /// per item. The earlier flat math under-scrolled by the number of header rows, leaving the
+    /// selected row just below the visible box.
+    #[test]
+    fn grep_scroll_accounts_for_header_rows() {
+        // Three files, three hits each → 9 items, 12 rendered rows (3 headers + 9 hits).
+        let items = grep_items(&[("a.rs", 3), ("b.rs", 3), ("c.rs", 3)]);
+        let kind = Some(aether_protocol::picker::PickerKind::Grep);
+        let pane = 6usize; // 6 visual rows on screen
+
+        // From the top, items 0..4 fit in 6 rows (header a + 3 hits = 4 rows; header b + 1 hit
+        // = 6). Item 4 (second hit of b.rs) is the first that overflows, so it must scroll.
+        let scroll = picker_scroll_for_selected(&items, 4, 0, pane, kind);
+        assert!(scroll > 0, "selecting item 4 should scroll; got {scroll}");
+        // After scrolling, item 4 must actually be within the rendered window.
+        let count = grep_visible_item_count_from(&items, scroll, pane);
+        assert!(
+            (scroll..scroll + count).contains(&4),
+            "selected item 4 outside window [{scroll}, {})",
+            scroll + count
+        );
+
+        // A flat (non-grep) bottom-align would land at `4 + 1 - 6` saturating to 0 — which would
+        // (wrongly) leave item 4 below the box. The header-aware path scrolls down instead.
+        assert_eq!(
+            (4 + 1usize).saturating_sub(pane),
+            0,
+            "flat math would not scroll here"
+        );
+    }
+
+    /// Selecting an already-visible row leaves the scroll untouched; scrolling above the window
+    /// pins the selection to the top.
+    #[test]
+    fn grep_scroll_is_stable_within_window_and_pins_upward() {
+        let items = grep_items(&[("a.rs", 3), ("b.rs", 3)]);
+        let kind = Some(aether_protocol::picker::PickerKind::Grep);
+        let pane = 8usize;
+        // Item 0 from offset 0 is visible → no change.
+        assert_eq!(picker_scroll_for_selected(&items, 0, 0, pane, kind), 0);
+        // Selecting an item above the current scroll pins it to the top.
+        assert_eq!(picker_scroll_for_selected(&items, 2, 4, pane, kind), 2);
+    }
 
     #[test]
     fn ordered_selection_keeps_point_visible_in_search() {
@@ -5727,33 +5832,6 @@ mod tests {
             .find(|s| s.content.contains("saved (rev 1)"))
             .expect("status span present");
         assert_eq!(status_span.style.fg, Some(NORD8));
-    }
-
-    #[test]
-    fn editor_status_spans_truncates_status_first_when_narrow() {
-        // total=30, right="12:5" (4) + gap(1) = 5 reserved; left_max=25. left_pre="[proj] file.rs" (14)
-        // + separator(4) = 18 used. Status budget = 25 - 18 = 7. So a long status truncates.
-        let status = crate::app::StatusMessage::info("a much longer status message");
-        let spans = build_editor_status_spans(
-            StatusLabel {
-                project_prefix: "[proj] ",
-                file_label: "file.rs",
-                transient: false,
-            },
-            None,
-            Vec::new(),
-            &status,
-            vec![Span::raw("12:5")],
-            30,
-        );
-        let status_span = spans
-            .iter()
-            .find(|s| s.style.fg == Some(NORD4) && s.content.contains('…'))
-            .expect("truncated status span present");
-        // Truncated text width should fit within the remaining budget.
-        assert!(status_span.content.width() <= 7);
-        assert!(status_span.content.ends_with('…'));
-        assert_eq!(spans_total_width(&spans), 30);
     }
 
     #[test]

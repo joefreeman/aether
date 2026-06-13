@@ -600,6 +600,7 @@ fn buffer_open_result_shape() {
             language: "rust".into(),
             workspace_root: "/proj".into(),
         }),
+        search_summary: None,
     })
     .unwrap();
     assert_eq!(v["buffer_id"], 42);
@@ -612,6 +613,11 @@ fn buffer_open_result_shape() {
     assert_eq!(v["cursor"]["position"]["col"], 0);
     // `scroll: None` skips serialisation — keeps the wire shape tight for first-open cases.
     assert!(v.get("scroll").is_none(), "scroll: None should be skipped");
+    // `search_summary: None` (a non-primed open) is skipped too.
+    assert!(
+        v.get("search_summary").is_none(),
+        "search_summary: None should be skipped"
+    );
 }
 
 #[test]
@@ -633,6 +639,7 @@ fn buffer_open_result_restored_scroll() {
             sub_row: 0.5,
         }),
         lsp_server: None,
+        search_summary: None,
     })
     .unwrap();
     assert_eq!(v["scroll"]["logical_line"], 7);
@@ -1732,6 +1739,7 @@ fn picker_view_result_directory_fields_skipped_when_none() {
         directory_path: None,
         directory_parent: None,
         filters: Default::default(),
+        update: None,
     };
     let v = to_value(&r).unwrap();
     assert!(v.get("directory_path").is_none());
@@ -1740,6 +1748,10 @@ fn picker_view_result_directory_fields_skipped_when_none() {
     assert!(
         v.get("filters").is_none(),
         "all-default filters should be skipped from the wire"
+    );
+    assert!(
+        v.get("update").is_none(),
+        "update: None should be skipped from the wire"
     );
 }
 
@@ -1755,6 +1767,7 @@ fn picker_view_result_directory_fields_serialized() {
         directory_path: Some("/proj/src".into()),
         directory_parent: Some("/proj".into()),
         filters: Default::default(),
+        update: None,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["directory_path"], "/proj/src");
@@ -1840,6 +1853,7 @@ fn picker_view_result_filters_serialized_when_non_default() {
             whole_word: true,
             ..Default::default()
         },
+        update: None,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["filters"], json!({"whole_word": true}));

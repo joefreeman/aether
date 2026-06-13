@@ -1,7 +1,6 @@
-//! Read the runtime info file the server writes on startup. The server is multi-project, so
-//! there's exactly one runtime file (`$XDG_RUNTIME_DIR/aether/server.json`) — no project name is
-//! involved at discovery time. The client picks an active project after connecting, via
-//! `project/activate`.
+//! Read the runtime info file the server writes on startup — same discovery as the TUI
+//! (`$XDG_RUNTIME_DIR/aether/server.json`); one server, multi-project, the client activates a
+//! project after connecting.
 
 use anyhow::{anyhow, Context};
 use serde::Deserialize;

@@ -2,6 +2,7 @@
 
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
+use crate::search::SearchSummary;
 use crate::viewport::ScrollPosition;
 use crate::{BufferId, LogicalPosition, Revision};
 use serde::{Deserialize, Serialize};
@@ -81,8 +82,10 @@ pub struct BufferOpenResult {
     #[serde(default)]
     pub cursor: CursorState,
     /// Last scroll position recorded for this `(client, buffer)` on a prior viewport subscription
-    /// for this buffer. `None` when the client has never had a viewport on the buffer — the client
-    /// should default to `{logical_line: 0, sub_row: 0.0}`. Lets reopen restore the prior view.
+    /// for this buffer, so reopen restores the prior view. `None` when the client has never had a
+    /// viewport on the buffer, or when this open carried a `jump_to` (grep nav, goto-definition,
+    /// nav history) — the jump moves the cursor, so the saved scroll predates it and would frame
+    /// the wrong region. On `None` the client frames the open cursor (centring on it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<ScrollPosition>,
     /// The language server backing this buffer, when one is configured for its language and a
@@ -94,6 +97,12 @@ pub struct BufferOpenResult {
     /// [`BufferOpenParams::transient`]). Promotion mid-session is pushed via `buffer/state`.
     #[serde(default)]
     pub transient: bool,
+    /// The search summary produced when this open carried a `prime_search` (grep nav / grep
+    /// selection). Carried on the response so the client adopts the match count atomically with
+    /// the buffer switch — the equivalent `search/state_changed` push races the switch and is
+    /// dropped by the client's `buffer_id` guard when it arrives first. `None` for a plain open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_summary: Option<SearchSummary>,
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------

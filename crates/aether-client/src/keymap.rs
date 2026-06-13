@@ -91,6 +91,14 @@ pub enum ModPattern {
 }
 
 impl ModPattern {
+    /// The modifiers the help overlay displays for this pattern.
+    fn display_mods(self) -> Mods {
+        match self {
+            ModPattern::Exact(m) | ModPattern::IgnoreShift(m) => m,
+            ModPattern::Any => Mods::NONE,
+        }
+    }
+
     fn matches(self, mods: Mods) -> bool {
         match self {
             ModPattern::Exact(m) => mods == m,
@@ -269,9 +277,21 @@ pub enum Action {
     OpenPickerInBufferDir(PickerKind),
     /// `Space Alt-e` — Explorer at the buffer's project root rather than its directory.
     OpenExplorerAtRoot,
+
+    // ---- shell-local overlays (dispatched via `Effect::ShellAction`; a shell without the
+    // overlay ignores them) ----
+    /// `Space ?` — the keyboard-shortcut help overlay, generated from these tables.
+    OpenHelp,
+    /// `Space ,` — the project-settings overlay (roots + rename). TUI-only today.
+    OpenProjectSettings,
 }
 
 impl Action {
+    /// Whether this chord arms a capture (the next keystroke is data, not a binding).
+    pub fn awaits_key(&self) -> bool {
+        matches!(self, Action::BeginFind { .. } | Action::BeginSurround(_))
+    }
+
     /// Whether `r`/`Shift-r` replays this action — the TUI's `is_repeatable`: every
     /// cursor/selection motion (absolute ones included) plus the selection motions; never
     /// edits, scroll, or the non-motion selection ops. (`SearchCycle` joins when search lands.)
@@ -301,31 +321,107 @@ impl Action {
 }
 
 pub struct Binding {
-    /// Kept for table-shape parity with the TUI's `Binding` (and the future help overlay);
-    /// `lookup` selects the table directly so it never reads this.
-    #[allow(dead_code)]
+    /// Kept for table-shape parity; `lookup` selects the table directly so it never reads
+    /// this — the help overlay does.
     pub ctx: KeyContext,
     pub code: KeyCode,
     pub mods: ModPattern,
     pub action: Action,
+    /// Help-overlay section this binding lists under. Empty = hidden from help (an alias
+    /// or internal binding).
+    pub group: &'static str,
+    /// One-line help description.
+    pub desc: &'static str,
 }
 
 impl Binding {
     fn matches(&self, code: KeyCode, mods: Mods) -> bool {
         self.code == code && self.mods.matches(mods)
     }
+
+    pub fn is_alt(&self) -> bool {
+        self.mods.display_mods().alt
+    }
+
+    /// Whether `self` and `other` are the same key differing by *exactly* the Alt modifier —
+    /// the pairing the help overlay folds into one "X / Alt-X" row (e.g. `h`/`Alt-h`,
+    /// `Ctrl-z`/`Ctrl-Alt-z`). Same code but a *different* modifier is not a pair.
+    pub fn is_alt_pair(&self, other: &Binding) -> bool {
+        let (a, b) = (self.mods.display_mods(), other.mods.display_mods());
+        self.code == other.code && a.ctrl == b.ctrl && a.shift == b.shift && a.alt != b.alt
+    }
+
+    /// Render the chord for the help overlay, e.g. `Alt-h`, `Ctrl-z`, `Space f`, `↑`. Chords
+    /// that arm a capture get a trailing `␣` placeholder (`f ␣`) to signal one more
+    /// keystroke is expected.
+    pub fn key_label(&self) -> String {
+        let mut s = String::new();
+        if self.ctx == KeyContext::Leader {
+            s.push_str("Space ");
+        }
+        let m = self.mods.display_mods();
+        if m.ctrl {
+            s.push_str("Ctrl-");
+        }
+        if m.alt {
+            s.push_str("Alt-");
+        }
+        s.push_str(&code_label(self.code));
+        if self.action.awaits_key() {
+            // U+2423 OPEN BOX — an empty "a key goes here" slot.
+            s.push_str(" ␣");
+        }
+        s
+    }
+}
+
+fn code_label(code: KeyCode) -> String {
+    match code {
+        KeyCode::Char(' ') => "Space".into(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Esc => "Esc".into(),
+        KeyCode::Enter => "Enter".into(),
+        KeyCode::Tab => "Tab".into(),
+        KeyCode::Backspace => "Backspace".into(),
+        KeyCode::Delete => "Delete".into(),
+        KeyCode::Home => "Home".into(),
+        KeyCode::End => "End".into(),
+        KeyCode::PageUp => "PageUp".into(),
+        KeyCode::PageDown => "PageDown".into(),
+        KeyCode::Left => "←".into(),
+        KeyCode::Right => "→".into(),
+        KeyCode::Up => "↑".into(),
+        KeyCode::Down => "↓".into(),
+    }
+}
+
+/// Every binding, in context order — for the help overlay.
+pub fn all() -> impl Iterator<Item = &'static Binding> {
+    [
+        KeyContext::Normal,
+        KeyContext::Global,
+        KeyContext::Insert,
+        KeyContext::Search,
+        KeyContext::Leader,
+    ]
+    .into_iter()
+    .flat_map(|cx| table(cx).iter())
 }
 
 /// First binding in `ctx`'s table whose chord matches, scanning in declaration order.
-pub fn lookup(ctx: KeyContext, code: KeyCode, mods: Mods) -> Option<&'static Binding> {
-    let table: &[Binding] = match ctx {
+/// The binding table for a context, in declaration (lookup) order.
+pub fn table(ctx: KeyContext) -> &'static [Binding] {
+    match ctx {
         KeyContext::Normal => NORMAL,
         KeyContext::Insert => INSERT,
         KeyContext::Search => SEARCH,
         KeyContext::Leader => LEADER,
         KeyContext::Global => GLOBAL,
-    };
-    table.iter().find(|b| b.matches(code, mods))
+    }
+}
+
+pub fn lookup(ctx: KeyContext, code: KeyCode, mods: Mods) -> Option<&'static Binding> {
+    table(ctx).iter().find(|b| b.matches(code, mods))
 }
 
 use Action as A;
@@ -338,11 +434,16 @@ const fn ch(c: char) -> KeyCode {
 
 macro_rules! bind {
     ($ctx:expr, $code:expr, $mods:expr, $action:expr) => {
+        bind!($ctx, $code, $mods, $action, "", "")
+    };
+    ($ctx:expr, $code:expr, $mods:expr, $action:expr, $group:literal, $desc:literal) => {
         Binding {
             ctx: $ctx,
             code: $code,
             mods: $mods,
             action: $action,
+            group: $group,
+            desc: $desc,
         }
     };
 }
@@ -350,188 +451,197 @@ macro_rules! bind {
 #[rustfmt::skip]
 static NORMAL: &[Binding] = &[
     // ---- meta / selection ----
-    bind!(N, KeyCode::Esc, Any, A::DropSearch),
-    bind!(N, ch('c'), Exact(Mods::NONE), A::CollapseSelection),
-    bind!(N, ch('o'), Exact(Mods::NONE), A::SwapAnchor),
-    bind!(N, ch('y'), Exact(Mods::NONE), A::TreeExpand),
-    bind!(N, ch('y'), Exact(Mods::ALT), A::TreeContract),
-    bind!(N, ch('z'), Exact(Mods::ALT), A::MotionRedo),
-    bind!(N, ch('z'), Exact(Mods::NONE), A::MotionUndo),
-    bind!(N, ch('r'), IgnoreShift(Mods::NONE), A::RepeatMotion),
+    bind!(N, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
+    bind!(N, ch('c'), Exact(Mods::NONE), A::CollapseSelection, "Selection", "Collapse selection"),
+    bind!(N, ch('o'), Exact(Mods::NONE), A::SwapAnchor, "Selection", "Swap cursor and anchor"),
+    bind!(N, ch('y'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
+    bind!(N, ch('y'), Exact(Mods::ALT), A::TreeContract, "Selection", "Contract selection to child syntax node"),
+    bind!(N, ch('z'), Exact(Mods::ALT), A::MotionRedo, "Selection", "Redo cursor/selection motion"),
+    bind!(N, ch('z'), Exact(Mods::NONE), A::MotionUndo, "Selection", "Undo cursor/selection motion"),
+    bind!(N, ch('r'), IgnoreShift(Mods::NONE), A::RepeatMotion, "Selection", "Repeat last motion"),
 
     // ---- motions: chars / lines ----
-    bind!(N, KeyCode::Home, Any, A::MoveLineStart),
-    bind!(N, KeyCode::End, Any, A::MoveLineEnd),
-    bind!(N, ch('h'), IgnoreShift(Mods::ALT), A::MoveLineFirstNonblank),
-    bind!(N, ch('h'), IgnoreShift(Mods::NONE), A::MoveChar(Direction::Backward)),
-    bind!(N, ch('l'), IgnoreShift(Mods::ALT), A::MoveLineEnd),
-    bind!(N, ch('l'), IgnoreShift(Mods::NONE), A::MoveChar(Direction::Forward)),
-    bind!(N, ch('k'), IgnoreShift(Mods::ALT), A::MoveVisualLine(VerticalDirection::Up)),
-    bind!(N, ch('k'), IgnoreShift(Mods::NONE), A::MoveLogicalLine(Direction::Backward)),
-    bind!(N, ch('j'), IgnoreShift(Mods::ALT), A::MoveVisualLine(VerticalDirection::Down)),
-    bind!(N, ch('j'), IgnoreShift(Mods::NONE), A::MoveLogicalLine(Direction::Forward)),
-    bind!(N, ch('0'), IgnoreShift(Mods::NONE), A::MoveLineStart),
-    bind!(N, KeyCode::Enter, IgnoreShift(Mods::NONE), A::MoveLogicalLineFirstNonblank(Direction::Forward)),
-    bind!(N, KeyCode::Backspace, IgnoreShift(Mods::NONE), A::MoveLogicalLineFirstNonblank(Direction::Backward)),
+    bind!(N, KeyCode::Home, Any, A::MoveLineStart, "Motion", "Logical line start"),
+    bind!(N, KeyCode::End, Any, A::MoveLineEnd, "Motion", "Logical line end"),
+    bind!(N, ch('h'), IgnoreShift(Mods::ALT), A::MoveLineFirstNonblank, "Motion", "First non-blank of line"),
+    bind!(N, ch('h'), IgnoreShift(Mods::NONE), A::MoveChar(Direction::Backward), "Motion", "Character left"),
+    bind!(N, ch('l'), IgnoreShift(Mods::ALT), A::MoveLineEnd, "Motion", "End of line"),
+    bind!(N, ch('l'), IgnoreShift(Mods::NONE), A::MoveChar(Direction::Forward), "Motion", "Character right"),
+    bind!(N, ch('k'), IgnoreShift(Mods::ALT), A::MoveVisualLine(VerticalDirection::Up), "Motion", "Visual row up"),
+    bind!(N, ch('k'), IgnoreShift(Mods::NONE), A::MoveLogicalLine(Direction::Backward), "Motion", "Logical line up"),
+    bind!(N, ch('j'), IgnoreShift(Mods::ALT), A::MoveVisualLine(VerticalDirection::Down), "Motion", "Visual row down"),
+    bind!(N, ch('j'), IgnoreShift(Mods::NONE), A::MoveLogicalLine(Direction::Forward), "Motion", "Logical line down"),
+    bind!(N, ch('0'), IgnoreShift(Mods::NONE), A::MoveLineStart, "Motion", "Logical line start"),
+    bind!(N, KeyCode::Enter, IgnoreShift(Mods::NONE), A::MoveLogicalLineFirstNonblank(Direction::Forward), "Motion", "First non-blank of next line"),
+    bind!(N, KeyCode::Backspace, IgnoreShift(Mods::NONE), A::MoveLogicalLineFirstNonblank(Direction::Backward), "Motion", "First non-blank of previous line"),
 
     // ---- motions: page / half-page ----
-    bind!(N, ch('d'), IgnoreShift(Mods::NONE), A::PageMotion { dir: VerticalDirection::Down, half: false }),
-    bind!(N, ch('u'), IgnoreShift(Mods::NONE), A::PageMotion { dir: VerticalDirection::Up, half: false }),
-    bind!(N, ch('d'), IgnoreShift(Mods::ALT), A::PageMotion { dir: VerticalDirection::Down, half: true }),
-    bind!(N, ch('u'), IgnoreShift(Mods::ALT), A::PageMotion { dir: VerticalDirection::Up, half: true }),
+    bind!(N, ch('d'), IgnoreShift(Mods::NONE), A::PageMotion { dir: VerticalDirection::Down, half: false }, "Motion", "Cursor down a page"),
+    bind!(N, ch('u'), IgnoreShift(Mods::NONE), A::PageMotion { dir: VerticalDirection::Up, half: false }, "Motion", "Cursor up a page"),
+    bind!(N, ch('d'), IgnoreShift(Mods::ALT), A::PageMotion { dir: VerticalDirection::Down, half: true }, "Motion", "Cursor down half a page"),
+    bind!(N, ch('u'), IgnoreShift(Mods::ALT), A::PageMotion { dir: VerticalDirection::Up, half: true }, "Motion", "Cursor up half a page"),
 
     // ---- motions: words ----
-    bind!(N, ch('w'), IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::BigWord }),
-    bind!(N, ch('w'), IgnoreShift(Mods::NONE), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::Word }),
-    bind!(N, ch('b'), IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::BigWord }),
-    bind!(N, ch('b'), IgnoreShift(Mods::NONE), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::Word }),
-    bind!(N, ch('e'), IgnoreShift(Mods::ALT), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord }),
-    bind!(N, ch('e'), Any, A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word }),
+    bind!(N, ch('w'), IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word forward"),
+    bind!(N, ch('w'), IgnoreShift(Mods::NONE), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word forward"),
+    bind!(N, ch('b'), IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::BigWord }, "Motion", "Big word backward"),
+    bind!(N, ch('b'), IgnoreShift(Mods::NONE), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::Word }, "Motion", "Small word backward"),
+    bind!(N, ch('e'), IgnoreShift(Mods::ALT), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word end"),
+    bind!(N, ch('e'), Any, A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word end"),
 
     // ---- motions: find char ----
-    bind!(N, ch('f'), IgnoreShift(Mods::ALT), A::BeginFind { dir: Direction::Backward, till: false }),
-    bind!(N, ch('f'), IgnoreShift(Mods::NONE), A::BeginFind { dir: Direction::Forward, till: false }),
-    bind!(N, ch('t'), IgnoreShift(Mods::ALT), A::BeginFind { dir: Direction::Backward, till: true }),
-    bind!(N, ch('t'), IgnoreShift(Mods::NONE), A::BeginFind { dir: Direction::Forward, till: true }),
+    bind!(N, ch('f'), IgnoreShift(Mods::ALT), A::BeginFind { dir: Direction::Backward, till: false }, "Motion", "Find character backward"),
+    bind!(N, ch('f'), IgnoreShift(Mods::NONE), A::BeginFind { dir: Direction::Forward, till: false }, "Motion", "Find character forward"),
+    bind!(N, ch('t'), IgnoreShift(Mods::ALT), A::BeginFind { dir: Direction::Backward, till: true }, "Motion", "Till character backward"),
+    bind!(N, ch('t'), IgnoreShift(Mods::NONE), A::BeginFind { dir: Direction::Forward, till: true }, "Motion", "Till character forward"),
 
     // ---- motions: brackets / nav units / goto ----
-    bind!(N, ch('m'), IgnoreShift(Mods::NONE), A::MatchBracket { inner: false }),
-    bind!(N, ch('m'), IgnoreShift(Mods::ALT), A::MatchBracket { inner: true }),
-    bind!(N, ch(']'), Exact(Mods::NONE), A::NavUnit(Direction::Forward)),
-    bind!(N, ch('['), Exact(Mods::NONE), A::NavUnit(Direction::Backward)),
-    bind!(N, ch('}'), Any, A::NavUnitEdge { start: false }),
-    bind!(N, ch('{'), Any, A::NavUnitEdge { start: true }),
-    bind!(N, ch('g'), IgnoreShift(Mods::ALT), A::GotoLine { last: true }),
-    bind!(N, ch('g'), IgnoreShift(Mods::NONE), A::GotoLine { last: false }),
+    bind!(N, ch('m'), IgnoreShift(Mods::NONE), A::MatchBracket { inner: false }, "Motion", "Matching bracket"),
+    bind!(N, ch('m'), IgnoreShift(Mods::ALT), A::MatchBracket { inner: true }, "Motion", "Inner matching bracket"),
+    bind!(N, ch(']'), Exact(Mods::NONE), A::NavUnit(Direction::Forward), "Navigation", "Next navigation unit"),
+    bind!(N, ch('['), Exact(Mods::NONE), A::NavUnit(Direction::Backward), "Navigation", "Previous navigation unit"),
+    bind!(N, ch('}'), Any, A::NavUnitEdge { start: false }, "Navigation", "Select to end of unit"),
+    bind!(N, ch('{'), Any, A::NavUnitEdge { start: true }, "Navigation", "Select to start of unit"),
+    bind!(N, ch('g'), IgnoreShift(Mods::ALT), A::GotoLine { last: true }, "Motion", "Go to last line"),
+    bind!(N, ch('g'), IgnoreShift(Mods::NONE), A::GotoLine { last: false }, "Motion", "Go to line (count, default 1)"),
 
     // ---- line selection ----
-    bind!(N, ch('x'), IgnoreShift(Mods::NONE), A::SelectLine(Direction::Forward)),
-    bind!(N, ch('x'), IgnoreShift(Mods::ALT), A::SelectLine(Direction::Backward)),
+    bind!(N, ch('x'), IgnoreShift(Mods::NONE), A::SelectLine(Direction::Forward), "Selection", "Select line downward"),
+    bind!(N, ch('x'), IgnoreShift(Mods::ALT), A::SelectLine(Direction::Backward), "Selection", "Select line upward"),
 
     // ---- mode transitions ----
-    bind!(N, ch('i'), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionStart)),
-    bind!(N, ch('a'), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionEnd)),
-    bind!(N, ch('i'), Exact(Mods::ALT), A::EnterInsert(InsertWhere::FirstLineStart)),
-    bind!(N, ch('a'), Exact(Mods::ALT), A::EnterInsert(InsertWhere::LastLineEnd)),
+    bind!(N, ch('i'), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionStart), "Mode", "Insert at selection start"),
+    bind!(N, ch('a'), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionEnd), "Mode", "Insert at selection end"),
+    bind!(N, ch('i'), Exact(Mods::ALT), A::EnterInsert(InsertWhere::FirstLineStart), "Mode", "Insert at first non-blank of line"),
+    bind!(N, ch('a'), Exact(Mods::ALT), A::EnterInsert(InsertWhere::LastLineEnd), "Mode", "Insert at last line end"),
 
     // ---- viewport scroll ----
-    bind!(N, KeyCode::PageDown, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Page }),
-    bind!(N, KeyCode::PageUp, Any, A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Page }),
-    bind!(N, KeyCode::Up, IgnoreShift(Mods::ALT), A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Half }),
-    bind!(N, KeyCode::Down, IgnoreShift(Mods::ALT), A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Half }),
-    bind!(N, KeyCode::Up, Any, A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Line }),
-    bind!(N, KeyCode::Down, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Line }),
+    bind!(N, KeyCode::PageDown, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Page }, "Scroll", "Scroll page down"),
+    bind!(N, KeyCode::PageUp, Any, A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Page }, "Scroll", "Scroll page up"),
+    bind!(N, KeyCode::Up, IgnoreShift(Mods::ALT), A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Half }, "Scroll", "Scroll half page up"),
+    bind!(N, KeyCode::Down, IgnoreShift(Mods::ALT), A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Half }, "Scroll", "Scroll half page down"),
+    bind!(N, KeyCode::Up, Any, A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Line }, "Scroll", "Scroll up one line"),
+    bind!(N, KeyCode::Down, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Line }, "Scroll", "Scroll down one line"),
     // Alt-Left/Right drive the cross-file jump list; they must precede the plain Left/Right
     // `Any` rows, which still scroll horizontally one column.
-    bind!(N, KeyCode::Left, Exact(Mods::ALT), A::NavBack),
-    bind!(N, KeyCode::Right, Exact(Mods::ALT), A::NavForward),
-    bind!(N, KeyCode::Left, Any, A::Scroll { dir: ScrollDir::Left, unit: ScrollUnit::Line }),
-    bind!(N, KeyCode::Right, Any, A::Scroll { dir: ScrollDir::Right, unit: ScrollUnit::Line }),
-    bind!(N, ch('-'), Exact(Mods::NONE), A::CenterCursor),
+    bind!(N, KeyCode::Left, Exact(Mods::ALT), A::NavBack, "Navigation", "Jump back (history)"),
+    bind!(N, KeyCode::Right, Exact(Mods::ALT), A::NavForward, "Navigation", "Jump forward (history)"),
+    bind!(N, KeyCode::Left, Any, A::Scroll { dir: ScrollDir::Left, unit: ScrollUnit::Line }, "Scroll", "Scroll left one column"),
+    bind!(N, KeyCode::Right, Any, A::Scroll { dir: ScrollDir::Right, unit: ScrollUnit::Line }, "Scroll", "Scroll right one column"),
+    bind!(N, ch('-'), Exact(Mods::NONE), A::CenterCursor, "Scroll", "Center cursor in window"),
 
     // ---- delete / search ----
-    bind!(N, KeyCode::Delete, Any, A::DeleteSelection),
-    bind!(N, ch('/'), IgnoreShift(Mods::NONE), A::EnterSearch),
-    bind!(N, ch('/'), Exact(Mods::ALT), A::SearchFromSelection),
-    bind!(N, ch('?'), IgnoreShift(Mods::NONE), A::EnterSearchToCursor),
-    bind!(N, ch('n'), IgnoreShift(Mods::ALT), A::SearchCycle(Direction::Backward)),
-    bind!(N, ch('n'), IgnoreShift(Mods::NONE), A::SearchCycle(Direction::Forward)),
-    bind!(N, ch('>'), Any, A::GrepNavigate(Direction::Forward)),
-    bind!(N, ch('<'), Any, A::GrepNavigate(Direction::Backward)),
+    bind!(N, KeyCode::Delete, Any, A::DeleteSelection, "Edit", "Delete selection"),
+    bind!(N, ch('/'), IgnoreShift(Mods::NONE), A::EnterSearch, "Search", "Search"),
+    bind!(N, ch('/'), Exact(Mods::ALT), A::SearchFromSelection, "Search", "Search for selection"),
+    bind!(N, ch('?'), IgnoreShift(Mods::NONE), A::EnterSearchToCursor, "Search", "Select from cursor to match"),
+    bind!(N, ch('n'), IgnoreShift(Mods::ALT), A::SearchCycle(Direction::Backward), "Search", "Previous match"),
+    bind!(N, ch('n'), IgnoreShift(Mods::NONE), A::SearchCycle(Direction::Forward), "Search", "Next match"),
+    bind!(N, ch('>'), Any, A::GrepNavigate(Direction::Forward), "Search", "Next grep hit"),
+    bind!(N, ch('<'), Any, A::GrepNavigate(Direction::Backward), "Search", "Previous grep hit"),
 
     // ---- selection editing / clipboard ----
-    bind!(N, ch('c'), Exact(Mods::CTRL), A::Change),
-    bind!(N, ch('d'), Exact(Mods::CTRL), A::DeleteSelection),
-    bind!(N, ch('y'), Exact(Mods::CTRL), A::Copy),
-    bind!(N, ch('x'), Exact(Mods::CTRL), A::Cut),
-    bind!(N, ch('v'), Exact(Mods::CTRL), A::Paste),
-    bind!(N, ch('r'), Exact(Mods::CTRL), A::ReplaceClipboard),
-    bind!(N, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Selection)),
-    bind!(N, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Selection)),
+    bind!(N, ch('c'), Exact(Mods::CTRL), A::Change, "Edit", "Change selection"),
+    bind!(N, ch('d'), Exact(Mods::CTRL), A::DeleteSelection, "Edit", "Delete selection"),
+    bind!(N, ch('y'), Exact(Mods::CTRL), A::Copy, "Clipboard", "Copy selection"),
+    bind!(N, ch('x'), Exact(Mods::CTRL), A::Cut, "Clipboard", "Cut selection"),
+    bind!(N, ch('v'), Exact(Mods::CTRL), A::Paste, "Clipboard", "Paste before selection"),
+    bind!(N, ch('r'), Exact(Mods::CTRL), A::ReplaceClipboard, "Clipboard", "Replace selection with clipboard"),
+    bind!(N, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Selection), "Edit", "Unsurround selection"),
+    bind!(N, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Selection), "Edit", "Surround selection"),
 
     // ---- leader ----
-    bind!(N, ch(' '), Exact(Mods::NONE), A::BeginLeader),
+    bind!(N, ch(' '), Exact(Mods::NONE), A::BeginLeader, "Leader", "Space leader chord"),
 ];
 
 #[rustfmt::skip]
 static GLOBAL: &[Binding] = &[
-    bind!(G, ch('z'), Exact(Mods::CTRL), A::Undo),
-    bind!(G, ch('z'), Exact(Mods::CTRL_ALT), A::Redo),
-    bind!(G, ch('j'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Down)),
-    bind!(G, ch('k'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Up)),
-    bind!(G, ch('g'), Exact(Mods::CTRL), A::JoinLines),
-    bind!(G, ch('l'), Exact(Mods::CTRL), A::Indent),
-    bind!(G, ch('h'), Exact(Mods::CTRL), A::Dedent),
-    bind!(G, ch('/'), Exact(Mods::CTRL), A::ToggleComment),
-    bind!(G, ch('o'), Exact(Mods::CTRL), A::OpenLineBelow),
-    bind!(G, ch('o'), Exact(Mods::CTRL_ALT), A::OpenLineAbove),
+    bind!(G, ch('z'), Exact(Mods::CTRL), A::Undo, "Edit", "Undo"),
+    bind!(G, ch('z'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
+    bind!(G, ch('j'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Down), "Edit", "Move line(s) down"),
+    bind!(G, ch('k'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Up), "Edit", "Move line(s) up"),
+    bind!(G, ch('g'), Exact(Mods::CTRL), A::JoinLines, "Edit", "Join lines"),
+    bind!(G, ch('l'), Exact(Mods::CTRL), A::Indent, "Edit", "Indent"),
+    bind!(G, ch('h'), Exact(Mods::CTRL), A::Dedent, "Edit", "Dedent"),
+    bind!(G, ch('/'), Exact(Mods::CTRL), A::ToggleComment, "Edit", "Toggle comment"),
+    bind!(G, ch('o'), Exact(Mods::CTRL), A::OpenLineBelow, "Edit", "Open line below"),
+    bind!(G, ch('o'), Exact(Mods::CTRL_ALT), A::OpenLineAbove, "Edit", "Open line above"),
 ];
 
 #[rustfmt::skip]
 static INSERT: &[Binding] = &[
-    bind!(I, KeyCode::Esc, Any, A::LeaveInsert),
-    bind!(I, KeyCode::Backspace, Any, A::Backspace),
-    bind!(I, KeyCode::Delete, Any, A::DeletePoint),
-    bind!(I, KeyCode::Enter, Any, A::NewlineIndent),
-    bind!(I, KeyCode::Tab, Any, A::InsertTab),
-    bind!(I, KeyCode::Left, Any, A::MoveChar(Direction::Backward)),
-    bind!(I, KeyCode::Right, Any, A::MoveChar(Direction::Forward)),
-    bind!(I, KeyCode::Up, Any, A::MoveVisualLine(VerticalDirection::Up)),
-    bind!(I, KeyCode::Down, Any, A::MoveVisualLine(VerticalDirection::Down)),
-    bind!(I, ch('c'), Exact(Mods::CTRL), A::ChangeLine),
-    bind!(I, ch('d'), Exact(Mods::CTRL), A::DeleteLine),
-    bind!(I, ch('y'), Exact(Mods::CTRL), A::CopyLine),
-    bind!(I, ch('x'), Exact(Mods::CTRL), A::CutLine),
-    bind!(I, ch('v'), Exact(Mods::CTRL), A::PasteAtCursor),
-    bind!(I, ch('r'), Exact(Mods::CTRL), A::ReplaceLineClipboard),
-    bind!(I, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Line)),
-    bind!(I, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Line)),
+    bind!(I, KeyCode::Esc, Any, A::LeaveInsert, "Mode", "Leave insert mode"),
+    bind!(I, KeyCode::Backspace, Any, A::Backspace, "Edit", "Delete character before cursor"),
+    bind!(I, KeyCode::Delete, Any, A::DeletePoint, "Edit", "Delete character at cursor"),
+    bind!(I, KeyCode::Enter, Any, A::NewlineIndent, "Edit", "Newline and indent"),
+    bind!(I, KeyCode::Tab, Any, A::InsertTab, "Edit", "Insert tab"),
+    bind!(I, KeyCode::Left, Any, A::MoveChar(Direction::Backward), "Motion", "Cursor left"),
+    bind!(I, KeyCode::Right, Any, A::MoveChar(Direction::Forward), "Motion", "Cursor right"),
+    bind!(I, KeyCode::Up, Any, A::MoveVisualLine(VerticalDirection::Up), "Motion", "Cursor up"),
+    bind!(I, KeyCode::Down, Any, A::MoveVisualLine(VerticalDirection::Down), "Motion", "Cursor down"),
+    bind!(I, ch('c'), Exact(Mods::CTRL), A::ChangeLine, "Edit", "Change line"),
+    bind!(I, ch('d'), Exact(Mods::CTRL), A::DeleteLine, "Edit", "Delete line"),
+    bind!(I, ch('y'), Exact(Mods::CTRL), A::CopyLine, "Clipboard", "Copy line"),
+    bind!(I, ch('x'), Exact(Mods::CTRL), A::CutLine, "Clipboard", "Cut line"),
+    bind!(I, ch('v'), Exact(Mods::CTRL), A::PasteAtCursor, "Clipboard", "Paste at cursor"),
+    bind!(I, ch('r'), Exact(Mods::CTRL), A::ReplaceLineClipboard, "Clipboard", "Replace line with clipboard"),
+    bind!(I, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Line), "Edit", "Unsurround line"),
+    bind!(I, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Line), "Edit", "Surround line"),
 ];
 
 #[rustfmt::skip]
 static SEARCH: &[Binding] = &[
-    bind!(KeyContext::Search, KeyCode::Esc, Any, A::SearchAbort),
-    bind!(KeyContext::Search, KeyCode::Enter, Any, A::SearchCommit),
+    bind!(KeyContext::Search, KeyCode::Esc, Any, A::SearchAbort, "Search", "Abort search"),
+    bind!(KeyContext::Search, KeyCode::Enter, Any, A::SearchCommit, "Search", "Commit search"),
     // Alt-k/j (not Up/Down) browse history — same chord as the TUI / picker inputs.
-    bind!(KeyContext::Search, ch('k'), Exact(Mods::ALT), A::SearchHistoryPrev),
-    bind!(KeyContext::Search, ch('j'), Exact(Mods::ALT), A::SearchHistoryNext),
-    bind!(KeyContext::Search, KeyCode::Left, Any, A::SearchCursorLeft),
-    bind!(KeyContext::Search, KeyCode::Right, Any, A::SearchCursorRight),
-    bind!(KeyContext::Search, KeyCode::Backspace, Any, A::SearchBackspace),
+    bind!(KeyContext::Search, ch('k'), Exact(Mods::ALT), A::SearchHistoryPrev, "Search", "Previous query in history"),
+    bind!(KeyContext::Search, ch('j'), Exact(Mods::ALT), A::SearchHistoryNext, "Search", "Next query in history"),
+    bind!(KeyContext::Search, KeyCode::Left, Any, A::SearchCursorLeft, "Search", "Move cursor left"),
+    bind!(KeyContext::Search, KeyCode::Right, Any, A::SearchCursorRight, "Search", "Move cursor right"),
+    bind!(KeyContext::Search, KeyCode::Backspace, Any, A::SearchBackspace, "Search", "Delete character"),
 ];
 
 #[rustfmt::skip]
 static LEADER: &[Binding] = &[
-    bind!(L, ch('f'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Files)),
-    bind!(L, ch('f'), Exact(Mods::ALT), A::OpenPickerInBufferDir(PickerKind::Files)),
-    bind!(L, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Buffers)),
-    bind!(L, ch('g'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Grep)),
-    bind!(L, ch('g'), Exact(Mods::ALT), A::OpenPickerInBufferDir(PickerKind::Grep)),
-    bind!(L, ch('e'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Explorer)),
-    bind!(L, ch('e'), Exact(Mods::ALT), A::OpenExplorerAtRoot),
-    bind!(L, ch('p'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Projects)),
-    bind!(L, ch('t'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics)),
-    bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers)),
-    bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::References)),
-    bind!(L, ch('q'), Exact(Mods::NONE), A::Quit),
-    bind!(L, ch('c'), Exact(Mods::NONE), A::CloseBuffer),
-    bind!(L, ch('s'), Exact(Mods::NONE), A::Save),
-    bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs),
-    bind!(L, ch('r'), Exact(Mods::NONE), A::Reload),
-    bind!(L, ch('n'), Exact(Mods::NONE), A::NewScratch),
-    bind!(L, ch('w'), Exact(Mods::NONE), A::ToggleWrap),
-    bind!(L, ch('a'), Exact(Mods::NONE), A::ToggleStageHunk),
-    bind!(L, ch('v'), Exact(Mods::NONE), A::RevertHunk),
-    bind!(L, ch('h'), Exact(Mods::NONE), A::NextHunk),
-    bind!(L, ch('h'), Exact(Mods::ALT), A::PrevHunk),
-    bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView),
-    bind!(L, ch('o'), Exact(Mods::NONE), A::ShowCommitInfo),
-    bind!(L, ch('m'), Exact(Mods::NONE), A::Format),
-    bind!(L, ch('k'), Exact(Mods::NONE), A::Hover),
-    bind!(L, ch('d'), Exact(Mods::NONE), A::GotoDefinition),
-    bind!(L, ch('j'), Exact(Mods::NONE), A::ShowDiagnostic),
-    bind!(L, ch('x'), Exact(Mods::NONE), A::NextDiagnostic),
-    bind!(L, ch('x'), Exact(Mods::ALT), A::PrevDiagnostic),
+    bind!(L, ch('f'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Files), "Files", "Find files"),
+    bind!(L, ch('f'), Exact(Mods::ALT), A::OpenPickerInBufferDir(PickerKind::Files), "Files", "Find files in buffer's directory"),
+    bind!(L, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Buffers), "Files", "Switch buffer"),
+    bind!(L, ch('g'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Grep), "Files", "Grep workspace"),
+    bind!(L, ch('g'), Exact(Mods::ALT), A::OpenPickerInBufferDir(PickerKind::Grep), "Files", "Grep buffer's directory"),
+    bind!(L, ch('e'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Explorer), "Files", "File explorer"),
+    bind!(L, ch('e'), Exact(Mods::ALT), A::OpenExplorerAtRoot, "Files", "File explorer at project root"),
+    bind!(L, ch('p'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Projects), "Project", "Switch project"),
+    bind!(L, ch('t'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics list"),
+    bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
+    bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
+    bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),
+    bind!(L, ch('?'), Any, A::OpenHelp, "App", "Show keyboard shortcuts"),
+    bind!(
+        L,
+        ch(','),
+        Exact(Mods::NONE),
+        A::OpenProjectSettings,
+        "Project",
+        "Project settings"
+    ),
+    bind!(L, ch('c'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
+    bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
+    bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
+    bind!(L, ch('r'), Exact(Mods::NONE), A::Reload, "App", "Reload from disk"),
+    bind!(L, ch('n'), Exact(Mods::NONE), A::NewScratch, "App", "New scratch buffer"),
+    bind!(L, ch('w'), Exact(Mods::NONE), A::ToggleWrap, "View", "Toggle soft wrap"),
+    bind!(L, ch('a'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
+    bind!(L, ch('v'), Exact(Mods::NONE), A::RevertHunk, "Git", "Revert change"),
+    bind!(L, ch('h'), Exact(Mods::NONE), A::NextHunk, "Git", "Next change (hunk)"),
+    bind!(L, ch('h'), Exact(Mods::ALT), A::PrevHunk, "Git", "Previous change (hunk)"),
+    bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
+    bind!(L, ch('o'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
+    bind!(L, ch('m'), Exact(Mods::NONE), A::Format, "Code", "Format document"),
+    bind!(L, ch('k'), Exact(Mods::NONE), A::Hover, "Code", "Hover (type & docs)"),
+    bind!(L, ch('d'), Exact(Mods::NONE), A::GotoDefinition, "Code", "Go to definition"),
+    bind!(L, ch('j'), Exact(Mods::NONE), A::ShowDiagnostic, "Code", "Show diagnostic at cursor"),
+    bind!(L, ch('x'), Exact(Mods::NONE), A::NextDiagnostic, "Code", "Next diagnostic"),
+    bind!(L, ch('x'), Exact(Mods::ALT), A::PrevDiagnostic, "Code", "Previous diagnostic"),
 ];
 
 #[cfg(test)]

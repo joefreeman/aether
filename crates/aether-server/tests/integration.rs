@@ -347,6 +347,115 @@ async fn buffer_open_restores_cursor_and_scroll() {
 }
 
 #[tokio::test]
+async fn buffer_open_jump_drops_saved_scroll() {
+    // A `jump_to` open (grep `<`/`>`, goto-definition, nav history) moves the cursor, so the
+    // scroll recorded before the jump is stale and must NOT be restored — the server returns
+    // `scroll: None` so the client frames the jumped cursor instead of the old viewport. Without
+    // this the editor "sometimes doesn't scroll" to the match: the subscribe restores the prior
+    // scroll, the match falls outside the loaded window, and the reveal silently bails.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.txt");
+    let mut content = String::new();
+    for i in 0..30 {
+        content.push_str(&format!("line {i}\n"));
+    }
+    std::fs::write(&path, &content).unwrap();
+
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+        },
+    )
+    .await;
+    // Record a non-default scroll for this (client, buffer).
+    let _: ViewportWindowResult = send_request::<ViewportScroll>(
+        &mut ws,
+        4,
+        &ViewportScrollParams {
+            viewport_id: sub.viewport_id,
+            scroll: ScrollPosition {
+                logical_line: 8,
+                sub_row: 0.0,
+            },
+        },
+    )
+    .await;
+
+    // Reopen the same buffer with a jump (the grep-navigate pattern): the cursor lands on the
+    // jump target, and the stale scroll is dropped.
+    let jump = LogicalPosition { line: 20, col: 0 };
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        5,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: Some(jump),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(reopen.buffer_id, buffer_id);
+    assert_eq!(reopen.cursor.position, jump);
+    assert!(
+        reopen.scroll.is_none(),
+        "a jump open must drop the saved scroll, got {:?}",
+        reopen.scroll
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn buffer_open_isolates_scroll_per_client() {
     // Two clients on the same buffer should see independent restored scroll positions.
     let dir = tempfile::tempdir().unwrap();
@@ -928,6 +1037,14 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
     )
     .await;
     assert_ne!(opened.buffer_id, origin_id);
+    // The primed summary rides the open response (so the client adopts the count atomically with
+    // the switch instead of relying on the racing `search/state_changed` push). "nd" has no match
+    // in the freshly created buffer, so total is 0 but the summary is present.
+    let primed = opened
+        .search_summary
+        .as_ref()
+        .expect("a primed open carries its search summary");
+    assert_eq!(primed.total, 0);
 
     // The search was primed: stepping works without a prior search/set. ("nd" has no match
     // in an empty created buffer — prime a buffer with content instead via reopening the
@@ -974,6 +1091,13 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
     // The anchored prime SELECTS the match: "beta" spans cols 6..=9 of "alpha beta".
     assert_eq!(reopened.cursor.anchor, LogicalPosition { line: 0, col: 6 });
     assert_eq!(reopened.cursor.position, LogicalPosition { line: 0, col: 9 });
+    // ...and the summary on the response reflects the single live match.
+    let primed = reopened
+        .search_summary
+        .as_ref()
+        .expect("a primed open carries its search summary");
+    assert_eq!(primed.total, 1);
+    assert_eq!(primed.current_index, 1, "the cursor sits on the match");
     let nav: SearchNavResult = send_request::<SearchNext>(
         &mut ws,
         14,
@@ -8650,6 +8774,17 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
         "expected >=4 candidates, got {}",
         view.total_candidates
     );
+    // The window rides the response too, so a client whose local generation lags the resumed
+    // picker still renders rows when the separate push races ahead and its staleness guard
+    // discards it. It mirrors the push below.
+    let embedded = view
+        .update
+        .as_ref()
+        .expect("the view response carries its initial window");
+    assert_eq!(embedded.kind, PickerKind::Files);
+    assert_eq!(embedded.offset, 0);
+    assert_eq!(embedded.total_candidates, view.total_candidates);
+    assert!(!embedded.items.is_empty());
 
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.kind, PickerKind::Files);
