@@ -1,6 +1,6 @@
-//! Project-root display labels (mirrors the TUI's labels.rs). The status bar and the picker's
-//! root-typeahead field prefix paths with a disambiguating root label when the project has
-//! several roots that would otherwise read the same.
+//! Project-root display labels (mirrors the TUI's labels.rs). The status bar and the picker prefix
+//! paths with a disambiguating root label when the project has several roots that would otherwise
+//! read the same.
 
 /** One label per root, aligned by index. Single root → "" (no prefix needed). Roots that share a
  *  basename grow a parenthesized parent (`api (work)`), deepening until unique. */

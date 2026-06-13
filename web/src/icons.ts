@@ -1,6 +1,6 @@
 //! Status icons — inline SVG drawn with `currentColor`, so the severity/LSP colour classes
-//! (`.sev-*`, `.lsp-*`) apply wherever the icon lands. Shared by the status bar, the LSP picker
-//! rows, and the LSP info dialog.
+//! (`.sev-*`, `.lsp-*`) apply wherever the icon lands. Shared by the status bar and the LSP picker
+//! rows.
 
 export type IconKind =
   | "error"
@@ -35,8 +35,7 @@ export function statusIcon(kind: IconKind, spin = false): SVGSVGElement {
 export type LspIconKind = Extract<IconKind, `lsp-${string}`>;
 
 /** Icon kind / colour class for an LSP lifecycle state. starting/initializing/restarting share
- *  the busy icon — they have no dedicated kind (callers fold "ready + active progress" into
- *  busy themselves, since that needs the progress list). */
+ *  the busy icon; callers fold "ready + active progress" into busy themselves. */
 export function lspStateClass(state: string): LspIconKind {
   return state === "ready" || state === "crashed" || state === "stopped"
     ? (`lsp-${state}` as LspIconKind)

@@ -68,8 +68,8 @@ use aether_protocol::search::{
     SearchSet, SearchSetParams, SearchSetResult, SearchStateChanged, SearchSummary,
 };
 use aether_protocol::viewport::{
-    DiagnosticSeverity, ViewportLinesChanged, ViewportLinesChangedParams, ViewportWindowResult,
-    Window,
+    DiagnosticSeverity, ViewportLinesChanged, ViewportLinesChangedParams, ViewportSubscribeResult,
+    ViewportWindowResult, Window, WrapMode,
 };
 use aether_protocol::LogicalPosition;
 
@@ -242,7 +242,16 @@ impl Session {
                 // `search/state_changed` push races this switch and the client's `buffer_id`
                 // guard drops it if it lands before the switch, so the count rode the response.
                 let summary = open.search_summary.clone();
-                let fx = self.adopt_switch(open);
+                // A hit in the SAME buffer is a move, not a switch: keep the window/viewport/
+                // diagnostics and just reposition the cursor, so the shell animates a short scroll to
+                // it (consecutive same-file hits glide) instead of resubscribing — which replaces the
+                // whole window and reads as an instant jump.
+                let fx = if open.buffer_id == self.buffer.buffer_id {
+                    self.buffer.cursor = open.cursor;
+                    Effects::one(Effect::RevealCursor)
+                } else {
+                    self.adopt_switch(open)
+                };
                 // adopt_switch reset the search state; adopt the primed query (the
                 // server-side search was already set in the open chain) and its summary.
                 self.search.cursor = query.len();
@@ -701,9 +710,6 @@ impl Session {
                 // overlays that fronted it. The frozen window stays rendered until the
                 // resubscribe replaces it.
                 self.viewport_id = None;
-                self.sent_grid = None;
-                self.fetch_in_flight = false;
-                self.refetch_queued = false;
                 self.blame = None;
                 self.blame_requested = None;
                 self.prompt = None;
@@ -939,6 +945,34 @@ impl Session {
         }
     }
 
+    /// Insert literal text at the cursor — an IME composition commit (or any shell-supplied text).
+    /// Insert mode only: composed text is editing input, not a command. Same edit as a typed key
+    /// (no `select_pasted`), so multi-character composed strings land like normal typing.
+    pub fn insert_text(&mut self, text: String) -> Effects {
+        let text: String = text.chars().filter(|c| !c.is_control() || *c == '\t').collect();
+        if self.mode != Mode::Insert || text.is_empty() {
+            return Effects::none();
+        }
+        self.edit::<InputText>(InputTextParams {
+            buffer_id: self.buffer.buffer_id,
+            text,
+            select_pasted: false,
+            at: None,
+        })
+    }
+
+    /// Flip soft-wrap on/off. The wrap mode is core state (it rides every `viewport/subscribe`), but
+    /// re-rendering the viewport at the new wrap is geometry, so the shell follows this with a
+    /// `viewport/set_wrap`. The native shells write `Session.wrap` directly (they own the struct);
+    /// the wasm web shell can't, so it calls this. Returns no effects — pure state.
+    pub fn toggle_wrap(&mut self) -> Effects {
+        self.wrap = match self.wrap {
+            WrapMode::Soft => WrapMode::None,
+            WrapMode::None => WrapMode::Soft,
+        };
+        Effects::none()
+    }
+
     /// Rebind the session to a freshly opened buffer: reset all per-buffer state (modal,
     /// diagnostics, viewport binding, prompts/pickers — an externally-triggered switch can
     /// land mid-pick) and ask the shell to resubscribe. Search history survives switches.
@@ -952,9 +986,6 @@ impl Session {
         self.externally_deleted = false;
         self.window = None;
         self.viewport_id = None;
-        self.fetch_in_flight = false;
-        self.refetch_queued = false;
-        self.reveal_after_fetch = false;
         self.drag = None;
         self.blame = None;
         self.blame_requested = None;
@@ -967,6 +998,27 @@ impl Session {
         };
         self.buffer = buffer_info(open, &self.project_paths);
         Effects::one(Effect::Resubscribe)
+    }
+
+    /// Adopt the result of a `viewport/subscribe` the shell issued: install the viewport binding
+    /// and the buffer-wide status that rides with it atomically (diagnostics, language-server
+    /// health, external-change flags), plus the first window. Pure core state — the shell owns the
+    /// pixel work it does afterward (seeding the scroll, revealing the cursor). One definition
+    /// shared by every shell: the native shells pass the typed result; the wasm shell deserialises
+    /// the same struct. Shells must never write these fields directly (docs/web-core.md).
+    pub fn adopt_subscribe(&mut self, res: ViewportSubscribeResult) {
+        self.viewport_id = Some(res.viewport_id);
+        self.diagnostics = res.buffer_status.diagnostics;
+        self.lsp = res.buffer_status.lsp_status;
+        self.externally_modified = res.buffer_status.externally_modified;
+        self.externally_deleted = res.buffer_status.externally_deleted;
+        self.window = Some(res.window);
+    }
+
+    /// Adopt the window from a geometry RPC the shell issued (`viewport/scroll`, `scroll_to_row`,
+    /// `resize`). Pure core state; the shell clamps its scroll and reveals the cursor around it.
+    pub fn adopt_window(&mut self, res: ViewportWindowResult) {
+        self.window = Some(res.window);
     }
 
     /// Close the buffer, then attach to the server-indicated next MRU buffer (or a fresh
@@ -1469,6 +1521,10 @@ impl Session {
         p.generation += 1;
         p.selected = 0;
         p.offset = 0;
+        // A new query is in flight: mark the picker as searching now, before the first
+        // `picker/update` push arrives, so the shell can show progress in the gap (otherwise a slow
+        // grep reads as "no matches" until results stream). The server's pushes refine it from here.
+        p.ticking = true;
         // A query change invalidates any pending pre-selection (centering / skip-the-
         // active-item default) — the user is steering somewhere new.
         p.pending_center = None;
@@ -1491,6 +1547,116 @@ impl Session {
         );
         fx.push(Effect::PickerScrollReset);
         fx.and(self.picker_refetch(0))
+    }
+
+    /// Replace the picker query wholesale and re-filter. A shell whose query field owns text editing
+    /// (the web client's native `<input>`, with caret/selection/IME/paste) syncs the full value here
+    /// instead of feeding character keys through [`on_picker_key`]. No-op if unchanged.
+    pub fn picker_set_query(&mut self, query: String) -> Effects {
+        let Some(p) = &mut self.picker else {
+            return Effects::none();
+        };
+        if p.query == query {
+            return Effects::none();
+        }
+        p.cursor = query.len();
+        p.query = query;
+        self.picker_query_changed()
+    }
+
+    /// Replace the search query wholesale and re-run the incremental search (the web client's native
+    /// search `<input>` owns text editing and syncs the value here). No-op outside Search mode or if
+    /// unchanged.
+    pub fn search_set_query(&mut self, query: String) -> Effects {
+        if self.mode != Mode::Search || self.search.query == query {
+            return Effects::none();
+        }
+        self.search.query = query;
+        self.search.cursor = self.search.query.len();
+        self.search.history_cursor = None;
+        self.incremental_search()
+    }
+
+    /// Replace the save-as prompt's path input (the web client's native `<input>` owns editing). The
+    /// actual save happens on accept; this is pure state. No-op unless a save-as prompt is open.
+    pub fn prompt_set_input(&mut self, text: String) -> Effects {
+        if let Some(Prompt::SaveAs { input, cursor, .. }) = &mut self.prompt {
+            *cursor = text.len();
+            *input = text;
+        }
+        Effects::none()
+    }
+
+    /// Replace the chip editor's path-field text wholesale (the web client's native `<input>` owns
+    /// editing and syncs the value here). For a dir editor this re-derives the directory suggestion
+    /// listing. No-op unless a chip editor is open.
+    pub fn chip_editor_set_input(&mut self, text: String) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let Some(p) = &mut self.picker else {
+            return Effects::none();
+        };
+        let Some(ed) = p.chip_editor.as_mut() else {
+            return Effects::none();
+        };
+        if ed.input.text == text {
+            return Effects::none();
+        }
+        ed.input.set(text);
+        let refresh = ed.is_dir() && ed.path_edited(&project_paths);
+        if refresh {
+            self.refresh_chip_editor_listing()
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Replace the multi-root dir editor's root-filter text wholesale (native `<input>` parity).
+    /// Resets the typeahead highlight to the best match and re-syncs the listing under the newly
+    /// chosen root. No-op unless a chip editor is open.
+    pub fn chip_editor_set_root_filter(&mut self, text: String) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let Some(p) = &mut self.picker else {
+            return Effects::none();
+        };
+        let Some(ed) = p.chip_editor.as_mut() else {
+            return Effects::none();
+        };
+        if ed.root_filter.text == text {
+            return Effects::none();
+        }
+        ed.root_filter.set(text);
+        ed.root_selected = 0;
+        let refresh = ed.sync_dir_listing(&project_paths);
+        if refresh {
+            self.refresh_chip_editor_listing()
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Move focus between the dir editor's root and path segments (the web client lets you click the
+    /// unfocused segment). The path can't be entered under an invalid root — focus stays pinned to
+    /// the red root, matching the keyboard gate. No-op outside a multi-root dir editor.
+    pub fn chip_editor_set_field(&mut self, root: bool) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let labels = super::labels::root_labels(&project_paths);
+        let Some(p) = &mut self.picker else {
+            return Effects::none();
+        };
+        let Some(ed) = p.chip_editor.as_mut() else {
+            return Effects::none();
+        };
+        if !ed.is_dir() || project_paths.len() <= 1 {
+            return Effects::none();
+        }
+        ed.field = if root {
+            ChipEditorField::Root
+        } else if ed.root_invalid(&labels) {
+            return Effects::none();
+        } else {
+            ChipEditorField::Path
+        };
+        Effects::none()
     }
 
     /// Push a filter (chip) change. For Grep/Files a filter change *is* a query change (same
@@ -1822,6 +1988,22 @@ impl Session {
     }
 
     /// Drop the panel and unsubscribe (the server keeps walker/matcher state for resume).
+    /// Select the rightmost filter chip (the browser tag-input gesture: Left / Backspace at the start
+    /// of the query steps into the chip row). The web client's native query `<input>` owns the caret,
+    /// so the shell detects "at query start" itself and calls this, rather than relying on the core's
+    /// cursor-based entry in [`Self::on_picker_key`]. No-op when there are no chips. Pure selection
+    /// state — no effects. Once a chip is selected, the chip-nav keys route through `on_picker_key`.
+    pub fn picker_select_last_chip(&mut self) -> Effects {
+        let project_paths = self.project_paths.clone();
+        if let Some(p) = &mut self.picker {
+            let n = p.chip_row(&project_paths).len();
+            if n > 0 {
+                p.chip_selected = Some(n - 1);
+            }
+        }
+        Effects::none()
+    }
+
     pub fn close_picker(&mut self) -> Effects {
         let Some(p) = self.picker.take() else {
             return Effects::none();

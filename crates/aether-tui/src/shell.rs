@@ -104,6 +104,14 @@ pub struct Shell {
     /// soft wrap, which never overflows right). The renderer drops this many columns from each
     /// row; cursor moves keep it in `[scroll_col, scroll_col + viewport_cols)`.
     scroll_col: u32,
+    // Viewport/fetch geometry — shell-owned (the core reasons about `window`/`viewport_id`,
+    // never these). The grid last sent to the server, the scroll a subscribe asked for, and the
+    // fetch-coordination flags that gate `maybe_fetch`.
+    sent_grid: Option<(u32, u32)>,
+    subscribe_scroll: ScrollPosition,
+    fetch_in_flight: bool,
+    refetch_queued: bool,
+    reveal_after_fetch: bool,
     /// Picker results scroll (first visible item index) — the shell half of picker
     /// geometry, reset by `Effect::PickerScrollReset`.
     picker_scroll: usize,
@@ -149,6 +157,14 @@ pub async fn run(
         top_visual_row: 0,
         scroll_anchor: None,
         scroll_col: 0,
+        sent_grid: None,
+        subscribe_scroll: ScrollPosition {
+            logical_line: 0,
+            sub_row: 0.0,
+        },
+        fetch_in_flight: false,
+        refetch_queued: false,
+        reveal_after_fetch: false,
         picker_scroll: 0,
         subscribe_epoch: 0,
         last_click: None,
@@ -158,7 +174,7 @@ pub async fn run(
     };
 
     // First subscribe: the session was bootstrapped with a buffer; show it.
-    shell.session.sent_grid = Some(shell.grid());
+    shell.sent_grid = Some(shell.grid());
     shell.subscribe();
     // Fire any bootstrap effects (e.g. the no-args Projects chooser's `picker/view`).
     shell.run_effects(startup);
@@ -263,7 +279,7 @@ impl Shell {
                     // `<`/`>` jumps).
                     self.state.hover = None;
                     self.scroll_col = 0; // a fresh buffer starts flush-left
-                    self.session.sent_grid = Some(self.grid());
+                    self.sent_grid = Some(self.grid());
                     self.subscribe();
                 }
                 Effect::SaveScrollAnchor => self.scroll_anchor = Some(self.top_visual_row),
@@ -320,22 +336,19 @@ impl Shell {
                 // viewport_id and fire fetches that fail with "unknown viewport_id".
             }
             Done::Subscribed(_, Ok(res)) => {
-                self.session.viewport_id = Some(res.viewport_id);
-                self.session.diagnostics = res.buffer_status.diagnostics;
-                self.session.lsp = res.buffer_status.lsp_status;
-                self.session.externally_modified = res.buffer_status.externally_modified;
-                self.session.externally_deleted = res.buffer_status.externally_deleted;
-                let scroll = self.session.subscribe_scroll;
-                if let Some(rel) = rows_before_line(&res.window, scroll.logical_line) {
-                    self.top_visual_row = res.window.first_visual_row + rel;
+                let scroll = self.subscribe_scroll;
+                self.session.adopt_subscribe(res);
+                if let Some(w) = self.session.window.as_ref() {
+                    if let Some(rel) = rows_before_line(w, scroll.logical_line) {
+                        self.top_visual_row = w.first_visual_row + rel;
+                    }
                 }
-                self.session.window = Some(res.window);
                 self.clamp_scroll();
                 self.reveal_cursor();
                 // Diff view is sticky across switches; a fresh viewport starts with it off.
                 if self.session.diff_view {
                     let h = self.handle.clone();
-                    let viewport_id = res.viewport_id;
+                    let viewport_id = self.session.viewport_id.unwrap_or(0);
                     let fut = async move {
                         h.rpc::<aether_protocol::git::GitSetDiffView>(
                             aether_protocol::git::GitSetDiffViewParams {
@@ -356,21 +369,21 @@ impl Shell {
                 self.status(StatusMessage::error(format!("subscribe failed: {e}")))
             }
             Done::Window(Ok(res)) => {
-                self.session.fetch_in_flight = false;
-                self.session.window = Some(res.window);
+                self.fetch_in_flight = false;
+                self.session.adopt_window(res);
                 self.clamp_scroll();
-                if self.session.reveal_after_fetch {
-                    self.session.reveal_after_fetch = false;
+                if self.reveal_after_fetch {
+                    self.reveal_after_fetch = false;
                     self.reveal_cursor();
                 }
-                if self.session.refetch_queued {
-                    self.session.refetch_queued = false;
+                if self.refetch_queued {
+                    self.refetch_queued = false;
                     self.maybe_fetch();
                 }
             }
             Done::Window(Err(e)) => {
-                self.session.fetch_in_flight = false;
-                self.session.refetch_queued = false;
+                self.fetch_in_flight = false;
+                self.refetch_queued = false;
                 // A fetch can race a resubscribe: the viewport it targeted was deleted before
                 // the call landed. The pending newer subscribe reveals the cursor afresh, so
                 // this is expected churn, not a failure worth surfacing.
@@ -527,7 +540,7 @@ impl Shell {
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.term = (cols, rows);
-        self.session.sent_grid = Some(self.grid());
+        self.sent_grid = Some(self.grid());
         let Some(viewport_id) = self.session.viewport_id else {
             return;
         };
@@ -581,7 +594,7 @@ impl Shell {
                     WrapMode::Soft => WrapMode::None,
                     WrapMode::None => WrapMode::Soft,
                 };
-                self.session.sent_grid = Some(self.grid());
+                self.sent_grid = Some(self.grid());
                 self.subscribe();
             }
             Action::OpenHelp => {
@@ -601,9 +614,14 @@ impl Shell {
     // ---- viewport geometry (iced's px math, in rows) -------------------------------------
 
     fn subscribe(&mut self) {
-        let Some((cols, rows)) = self.session.sent_grid else {
+        let Some((cols, rows)) = self.sent_grid else {
             return;
         };
+        // A fresh subscribe invalidates any in-flight fetch (new viewport identity); the core
+        // no longer resets these on switch/reconnect — they live here now.
+        self.fetch_in_flight = false;
+        self.refetch_queued = false;
+        self.reveal_after_fetch = false;
         let scroll = self.session.buffer.scroll.unwrap_or(ScrollPosition {
             logical_line: self
                 .session
@@ -614,7 +632,7 @@ impl Shell {
                 .saturating_sub(rows / 2),
             sub_row: 0.0,
         });
-        self.session.subscribe_scroll = scroll;
+        self.subscribe_scroll = scroll;
         self.subscribe_epoch += 1;
         let epoch = self.subscribe_epoch;
         let h = self.handle.clone();
@@ -679,11 +697,11 @@ impl Shell {
         if !(need_above || need_below) {
             return;
         }
-        if self.session.fetch_in_flight {
-            self.session.refetch_queued = true;
+        if self.fetch_in_flight {
+            self.refetch_queued = true;
             return;
         }
-        self.session.fetch_in_flight = true;
+        self.fetch_in_flight = true;
         let h = self.handle.clone();
         let fut = async move {
             h.rpc::<ViewportScrollToRow>(ViewportScrollToRowParams {
@@ -707,8 +725,8 @@ impl Shell {
             let Some(viewport_id) = self.session.viewport_id else {
                 return;
             };
-            self.session.reveal_after_fetch = true;
-            self.session.fetch_in_flight = true;
+            self.reveal_after_fetch = true;
+            self.fetch_in_flight = true;
             let h = self.handle.clone();
             let fut = async move {
                 h.rpc::<ViewportScroll>(ViewportScrollParams {

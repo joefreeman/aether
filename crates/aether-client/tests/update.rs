@@ -435,3 +435,16 @@ fn explorer_ctrl_n_with_trailing_slash_creates_a_directory() {
         "a trailing slash creates a dir, not a file"
     );
 }
+
+#[test]
+fn toggle_wrap_flips_between_soft_and_none() {
+    use aether_protocol::viewport::WrapMode;
+    let mut s = session();
+    assert_eq!(s.wrap, WrapMode::Soft); // placeholder default
+    // Pure state — the shell follows with a viewport/set_wrap, so no effects here.
+    let fx = s.toggle_wrap();
+    assert_eq!(s.wrap, WrapMode::None);
+    assert!(fx.0.is_empty(), "toggle_wrap emits no effects");
+    s.toggle_wrap();
+    assert_eq!(s.wrap, WrapMode::Soft);
+}

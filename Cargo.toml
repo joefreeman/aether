@@ -6,6 +6,7 @@ members = [
     "crates/aether-tui",
     "crates/aether-client",
     "crates/aether-iced",
+    "crates/aether-web",
 ]
 
 [workspace.package]

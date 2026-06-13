@@ -212,13 +212,6 @@ pub struct Session {
     pub lsp: Option<LspServerStatus>,
     pub externally_modified: bool,
     pub externally_deleted: bool,
-    pub sent_grid: Option<(u32, u32)>, // (cols, rows) last sent to the server
-    /// The scroll position the in-flight `viewport/subscribe` asked for; seeds the shell's
-    /// scroll when the result arrives.
-    pub subscribe_scroll: ScrollPosition,
-    pub fetch_in_flight: bool,
-    pub refetch_queued: bool,
-    pub reveal_after_fetch: bool,
     pub drag: Option<(LogicalPosition, Granularity)>,
     /// Cursor-line blame, rendered as dim text after the line: `(line, "author · age")`.
     pub blame: Option<(u32, String)>,
@@ -252,14 +245,6 @@ impl Session {
             lsp: None,
             externally_modified: false,
             externally_deleted: false,
-            sent_grid: None,
-            subscribe_scroll: ScrollPosition {
-                logical_line: 0,
-                sub_row: 0.0,
-            },
-            fetch_in_flight: false,
-            refetch_queued: false,
-            reveal_after_fetch: false,
             drag: None,
             blame: None,
             blame_requested: None,

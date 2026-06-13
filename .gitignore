@@ -1,4 +1,6 @@
 /target
+# Generated wasm-bindgen glue for the web client (docs/web-core.md) — a build artifact, like web/dist.
+/web/src/wasm/
 **/*.rs.bk
 Cargo.lock.bak
 # Erlang/elixir LSP crash dumps (left by elp/elixir-ls during testing)

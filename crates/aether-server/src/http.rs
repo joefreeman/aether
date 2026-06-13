@@ -138,6 +138,7 @@ fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
     let content_type = match full.extension().and_then(|e| e.to_str()) {
         Some("js") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
+        Some("wasm") => "application/wasm",
         Some("svg") => "image/svg+xml",
         Some("json") => "application/json; charset=utf-8",
         Some("woff2") => "font/woff2",
@@ -168,6 +169,14 @@ fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
                 "/../../web/dist/assets/index.css"
             )),
             "text/css; charset=utf-8",
+        ),
+        // The wasm core (docs/web-core.md), loaded by index.js via `new URL(..., import.meta.url)`.
+        "assets/aether_web_bg.wasm" => (
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/aether_web_bg.wasm"
+            )),
+            "application/wasm",
         ),
         _ => return None,
     };

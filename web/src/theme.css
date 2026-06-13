@@ -229,6 +229,8 @@ html, body, #app {
 }
 #hover code { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--nord8); }
 #hover hr { border: none; border-top: 1px solid var(--nord3); margin: 6px 0; }
+/* Stacked diagnostic / commit blocks: one paragraph each, severity-coloured by its .sev-* class. */
+#hover .hover-block + .hover-block { margin-top: 6px; }
 
 /* Diagnostic hover: tint text + border by severity (id-specificity needed to beat #hover color). */
 #hover.sev-error { color: var(--nord11); border-color: var(--nord11); }
@@ -337,12 +339,15 @@ html, body, #app {
    outranks .hl-comment so this wins. Every other syntax color reads fine on NORD3. */
 .search-hit.hl-comment { color: var(--nord4); }
 .sel { background: var(--nord10); }
-.cursor { background: var(--nord4); color: var(--nord0); }
-.cursor.insert { background: transparent; color: inherit; box-shadow: inset 1.5px 0 0 var(--nord8); }
+/* Only the plain block cursor (Normal mode) inverts the cell — dark glyph on the NORD4 fill. The
+   insert I-beam and the pending underscore are just an edge accent and must leave the character's
+   syntax colour intact (`color: inherit` here would override the `.hl-*` colour with the default
+   foreground, mis-colouring the char under the caret). */
+.cursor:not(.insert):not(.pending) { background: var(--nord4); color: var(--nord0); }
+.cursor.insert { box-shadow: inset 1.5px 0 0 var(--nord8); }
 /* Waiting for the next key of a chord (after f/t, Space, surround, or a partial count): an underscore
-   under the cell, matching the terminal's SteadyUnderScore. Like the insert caret, the glyph stays
-   visible (transparent fill, inherited fg) with the NORD8 accent on the bottom edge. */
-.cursor.pending { background: transparent; color: inherit; box-shadow: inset 0 -2px 0 var(--nord8); }
+   under the cell, matching the terminal's SteadyUnderScore — NORD8 accent on the bottom edge. */
+.cursor.pending { box-shadow: inset 0 -2px 0 var(--nord8); }
 
 /* Matching bracket (cursor on/inside a bracket pair) — bold orange, matching the terminal. */
 .match-bracket { color: var(--nord12); font-weight: bold; }
@@ -410,6 +415,7 @@ html, body, #app {
 .lsp-info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; margin-bottom: 16px; }
 .lsp-info-key { color: var(--nord3-brighter); }
 .lsp-info-val { word-break: break-word; } /* sans-serif (inherits the modal's font) */
+.lsp-info-hint { color: var(--nord3-brighter); font-size: 12px; }
 
 /* Project settings. */
 .modal.project-settings { width: min(640px, 88vw); }

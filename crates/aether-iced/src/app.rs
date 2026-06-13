@@ -231,6 +231,13 @@ pub struct App {
     scroll_anim: Option<ScrollAnim>,
     /// The search prompt's Esc-restore scroll position (`SaveScrollAnchor` effect).
     scroll_anchor: Option<f32>,
+    // Viewport/fetch geometry — shell-owned (the core reasons about `window`/`viewport_id`, never
+    // these). Grid last sent, the scroll a subscribe asked for, and the fetch-coordination flags.
+    sent_grid: Option<(u32, u32)>,
+    subscribe_scroll: ScrollPosition,
+    fetch_in_flight: bool,
+    refetch_queued: bool,
+    reveal_after_fetch: bool,
     /// The picker results list's scroll offset in px (boot chooser or session picker —
     /// never both). The core tracks rows, not pixels; resets arrive as
     /// `Effect::PickerScrollReset`.
@@ -262,6 +269,14 @@ impl App {
             scroll_x_px: 0.0,
             scroll_anim: None,
             scroll_anchor: None,
+            sent_grid: None,
+            subscribe_scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            fetch_in_flight: false,
+            refetch_queued: false,
+            reveal_after_fetch: false,
             picker_scroll_y: 0.0,
             hover: None,
             toasts: Vec::new(),
@@ -741,22 +756,18 @@ impl App {
                     total_visual_rows = res.window.total_visual_rows,
                     "viewport subscribed"
                 );
-                self.session.viewport_id = Some(res.viewport_id);
-                self.session.diagnostics = res.buffer_status.diagnostics;
-                self.session.lsp = res.buffer_status.lsp_status;
-                self.session.externally_modified = res.buffer_status.externally_modified;
-                self.session.externally_deleted = res.buffer_status.externally_deleted;
                 // Position the view at the scroll the subscribe asked for (restored or
                 // cursor-centred), now the window geometry is known, then make sure the cursor
                 // is on-screen (it may sit below a restored scroll after a `jump_to` open).
-                if let Some(cell) = self.cell {
-                    let scroll = self.session.subscribe_scroll;
-                    if let Some(rel) = grid::rows_before_line(&res.window, scroll.logical_line) {
-                        let row = res.window.first_visual_row + rel;
+                let scroll = self.subscribe_scroll;
+                self.session.adopt_subscribe(res);
+                if let (Some(cell), Some(w)) = (self.cell, self.session.window.as_ref()) {
+                    if let Some(rel) = grid::rows_before_line(w, scroll.logical_line) {
+                        let row = w.first_visual_row + rel;
                         self.scroll_px = (row as f32 + scroll.sub_row) * cell.height;
                     }
                 }
-                self.apply_window(res.window);
+                self.clamp_scroll();
                 self.reveal_cursor();
                 // The diff-view toggle is sticky across buffer switches, but a fresh viewport
                 // starts with it off — re-enable server-side.
@@ -764,7 +775,7 @@ impl App {
                     let enabled = true;
                     return self.rpc::<GitSetDiffView>(
                         GitSetDiffViewParams {
-                            viewport_id: res.viewport_id,
+                            viewport_id: self.session.viewport_id.unwrap_or(0),
                             enabled,
                         },
                         move |result| Message::Core(CoreEvent::DiffViewSet { enabled, result }),
@@ -775,22 +786,23 @@ impl App {
             Message::Subscribed(Err(e)) => self.error(format!("subscribe failed: {e}")),
 
             Message::WindowUpdate(Ok(res)) => {
-                self.session.fetch_in_flight = false;
-                self.apply_window(res.window);
+                self.fetch_in_flight = false;
+                self.session.adopt_window(res);
+                self.clamp_scroll();
                 let mut task = Task::none();
-                if self.session.reveal_after_fetch {
-                    self.session.reveal_after_fetch = false;
+                if self.reveal_after_fetch {
+                    self.reveal_after_fetch = false;
                     self.reveal_cursor();
                 }
-                if self.session.refetch_queued {
-                    self.session.refetch_queued = false;
+                if self.refetch_queued {
+                    self.refetch_queued = false;
                     task = self.maybe_fetch();
                 }
                 task
             }
             Message::WindowUpdate(Err(e)) => {
-                self.session.fetch_in_flight = false;
-                self.session.refetch_queued = false;
+                self.fetch_in_flight = false;
+                self.refetch_queued = false;
                 self.error(format!("viewport update failed: {e}"))
             }
 
@@ -928,8 +940,8 @@ impl App {
                     self.hover = None;
                     // Reconnects zero the grid (new viewport identity); re-derive it from
                     // the current metrics so subscribe_task has something to send.
-                    if self.session.sent_grid.is_none() {
-                        self.session.sent_grid = self.current_grid();
+                    if self.sent_grid.is_none() {
+                        self.sent_grid = self.current_grid();
                     }
                     tasks.push(self.subscribe_task());
                 }
@@ -1010,13 +1022,13 @@ impl App {
                     return Task::none();
                 }
                 if self.session.viewport_id.is_none() {
-                    if self.session.sent_grid.is_some() {
+                    if self.sent_grid.is_some() {
                         return Task::none(); // subscribe in flight
                     }
-                    self.session.sent_grid = Some((cols, rows));
+                    self.sent_grid = Some((cols, rows));
                     self.subscribe_task()
-                } else if self.session.sent_grid != Some((cols, rows)) {
-                    self.session.sent_grid = Some((cols, rows));
+                } else if self.sent_grid != Some((cols, rows)) {
+                    self.sent_grid = Some((cols, rows));
                     let viewport_id = self.session.viewport_id.unwrap();
                     self.rpc::<ViewportResize>(
                         ViewportResizeParams {
@@ -1178,14 +1190,19 @@ impl App {
     // ---- actions ----------------------------------------------------------------------------
 
     fn subscribe_task(&mut self) -> Task<Message> {
-        let Some((cols, rows)) = self.session.sent_grid else {
+        let Some((cols, rows)) = self.sent_grid else {
             return Task::none(); // no metrics yet; the first Layout event subscribes
         };
+        // A fresh subscribe invalidates any in-flight fetch (new viewport identity); the core no
+        // longer resets these on switch/reconnect — they live here now.
+        self.fetch_in_flight = false;
+        self.refetch_queued = false;
+        self.reveal_after_fetch = false;
         let scroll = self.session.buffer.scroll.unwrap_or(ScrollPosition {
             logical_line: self.session.buffer.cursor.position.line.saturating_sub(rows / 2),
             sub_row: 0.0,
         });
-        self.session.subscribe_scroll = scroll;
+        self.subscribe_scroll = scroll;
         self.rpc::<ViewportSubscribe>(
             ViewportSubscribeParams {
                 buffer_id: self.session.buffer.buffer_id,
@@ -1430,11 +1447,11 @@ impl App {
         if !(need_above || need_below) {
             return Task::none();
         }
-        if self.session.fetch_in_flight {
-            self.session.refetch_queued = true;
+        if self.fetch_in_flight {
+            self.refetch_queued = true;
             return Task::none();
         }
-        self.session.fetch_in_flight = true;
+        self.fetch_in_flight = true;
         self.rpc::<ViewportScrollToRow>(
             ViewportScrollToRowParams {
                 viewport_id,
@@ -1501,8 +1518,8 @@ impl App {
             let Some(viewport_id) = self.session.viewport_id else {
                 return Task::none();
             };
-            self.session.reveal_after_fetch = true;
-            self.session.fetch_in_flight = true;
+            self.reveal_after_fetch = true;
+            self.fetch_in_flight = true;
             return self.rpc::<ViewportScroll>(
                 ViewportScrollParams {
                     viewport_id,
@@ -1565,10 +1582,6 @@ impl App {
         );
     }
 
-    fn apply_window(&mut self, window: Window) {
-        self.session.window = Some(window);
-        self.clamp_scroll();
-    }
 
     // ---- notifications ------------------------------------------------------------------------
 

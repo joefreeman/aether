@@ -217,8 +217,12 @@ function renderVisualRow(
   }
 
   // Diagnostics & search: byte offsets within the logical line → row-local via row.byte_offset.
+  // Zero-width diagnostics (rust-analyzer's "expected …" points, start == end) widen to one cell so
+  // the squiggle is visible — matching the core's cursor-hit widening for Space j.
   for (const d of line.diagnostics ?? []) {
-    markRange(byteStart, n, d.start - row.byte_offset, d.end - row.byte_offset, (i) => {
+    const start = d.start - row.byte_offset;
+    const end = Math.max(d.end, d.start + 1) - row.byte_offset;
+    markRange(byteStart, n, start, end, (i) => {
       if (diag[i] === null || SEVERITY_RANK[d.severity] > SEVERITY_RANK[diag[i]!]) diag[i] = d.severity;
     });
   }

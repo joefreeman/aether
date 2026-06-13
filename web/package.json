@@ -5,8 +5,9 @@
   "type": "module",
   "description": "Aether editor — browser client.",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "dev": "npm run build:wasm && vite",
+    "build": "npm run build:wasm && tsc && vite build",
+    "build:wasm": "cargo build -p aether-web --target wasm32-unknown-unknown --release && wasm-bindgen --target web --out-dir src/wasm ../target/wasm32-unknown-unknown/release/aether_web.wasm && wasm-opt -Oz src/wasm/aether_web_bg.wasm -o src/wasm/aether_web_bg.wasm",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"
   },
