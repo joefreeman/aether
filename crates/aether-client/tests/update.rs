@@ -207,9 +207,15 @@ fn primed_switch_adopts_summary_from_the_response_not_a_push() {
     };
     let _ = s.on_event(Event::SwitchedPrimed(Ok(Some(("needle".into(), open)))));
 
-    assert!(s.search.active, "the primed search is active after the switch");
+    assert!(
+        s.search.active,
+        "the primed search is active after the switch"
+    );
     assert_eq!(s.search.query, "needle");
-    let summary = s.search.summary.expect("the match count rode the switch response");
+    let summary = s
+        .search
+        .summary
+        .expect("the match count rode the switch response");
     assert_eq!(summary.total, 4);
     assert_eq!(summary.current_index, 1);
 }
@@ -222,26 +228,27 @@ fn picker_view_response_renders_items_without_the_push() {
     // separate `picker/update` push can arrive first, when the generation still differs and the
     // staleness guard drops it, leaving the restored query but no rows. Here NO push is delivered.
     use aether_client::update::Event;
-    use aether_protocol::picker::{
-        PickerItem, PickerKind, PickerUpdateParams, PickerViewResult,
-    };
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams, PickerViewResult};
 
     let mut s = session();
     let _ = s.open_picker(PickerKind::Grep, None, None);
-    assert!(s.picker.is_some(), "open_picker creates the local picker state");
+    assert!(
+        s.picker.is_some(),
+        "open_picker creates the local picker state"
+    );
 
     let update = PickerUpdateParams {
         kind: PickerKind::Grep,
         generation: 9,
         offset: 0,
-        items: vec![PickerItem::GrepHit {
+        items: Some(vec![PickerItem::GrepHit {
             path_index: 0,
             relative_path: "a.rs".into(),
             line: 3,
             col: 1,
             preview: "let x = 1;".into(),
             match_indices: vec![],
-        }],
+        }]),
         total_matches: 1,
         total_candidates: 1,
         ticking: false,
@@ -275,6 +282,28 @@ fn picker_view_response_renders_items_without_the_push() {
 }
 
 #[test]
+fn grep_open_does_not_reset_scroll_but_fresh_pickers_do() {
+    // A fresh picker (Files) resets the list to the top on open. Grep preserves state and resumes
+    // onto its saved selection — often deep in the results — where `effective_center_on` drives a
+    // reveal; emitting a scroll reset there would snap the window back to the top, blanking the view.
+    use aether_protocol::picker::PickerKind;
+
+    let mut s = session();
+    let fx = s.open_picker(PickerKind::Grep, None, None);
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::PickerScrollReset)),
+        "grep (state-preserving) open must not reset the scroll — it resumes onto its selection"
+    );
+
+    let mut s = session();
+    let fx = s.open_picker(PickerKind::Files, None, None);
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::PickerScrollReset)),
+        "a fresh Files picker resets the scroll to the top on open"
+    );
+}
+
+#[test]
 fn pointer_press_then_drag_extends_from_the_press_anchor() {
     // The shell resolves screen cells to buffer positions and feeds them in; the core owns the
     // selection: the press records the drag anchor + granularity (the click streak), and the drag
@@ -289,15 +318,27 @@ fn pointer_press_then_drag_extends_from_the_press_anchor() {
     assert_eq!(method, "cursor/set");
     assert_eq!(params["position"], json!({"line": 3, "col": 5}));
     assert_eq!(params["anchor"], json!({"line": 3, "col": 5}));
-    assert_eq!(params["granularity"], json!("word"), "double-click selects by word");
+    assert_eq!(
+        params["granularity"],
+        json!("word"),
+        "double-click selects by word"
+    );
 
     // Drag to a new cell: position moves, anchor + granularity stay from the press.
     let fx = s.pointer_drag(LogicalPosition { line: 4, col: 0 });
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "cursor/set");
     assert_eq!(params["position"], json!({"line": 4, "col": 0}));
-    assert_eq!(params["anchor"], json!({"line": 3, "col": 5}), "drag keeps the press anchor");
-    assert_eq!(params["granularity"], json!("word"), "drag keeps the press granularity");
+    assert_eq!(
+        params["anchor"],
+        json!({"line": 3, "col": 5}),
+        "drag keeps the press anchor"
+    );
+    assert_eq!(
+        params["granularity"],
+        json!("word"),
+        "drag keeps the press granularity"
+    );
 
     // The cursor result lands and reveals.
     let fx = s.on_rpc_result(
@@ -371,7 +412,10 @@ fn explorer_delete_confirms_then_trashes_and_relists() {
     assert!(fx.0.is_empty(), "delete stages a confirm, sends nothing");
     match &s.prompt {
         Some(Prompt::Confirm { message, .. }) => {
-            assert!(message.contains("Delete file \"old.rs\""), "got {message:?}");
+            assert!(
+                message.contains("Delete file \"old.rs\""),
+                "got {message:?}"
+            );
         }
         other => panic!("expected a confirm prompt, got {other:?}"),
     }
@@ -455,12 +499,12 @@ fn selecting_the_create_row_creates_the_file() {
             kind: PickerKind::Explorer,
             generation: p.generation,
             offset: 0,
-            items: vec![PickerItem::DirEntry {
+            items: Some(vec![PickerItem::DirEntry {
                 name: "lib.rs".into(),
                 is_dir: false,
                 match_indices: vec![],
                 git_status: None,
-            }],
+            }]),
             total_matches: 1,
             total_candidates: 1,
             ticking: false,
@@ -481,7 +525,7 @@ fn toggle_wrap_flips_between_soft_and_none() {
     use aether_protocol::viewport::WrapMode;
     let mut s = session();
     assert_eq!(s.wrap, WrapMode::Soft); // placeholder default
-    // Pure state — the shell follows with a viewport/set_wrap, so no effects here.
+                                        // Pure state — the shell follows with a viewport/set_wrap, so no effects here.
     let fx = s.toggle_wrap();
     assert_eq!(s.wrap, WrapMode::None);
     assert!(fx.0.is_empty(), "toggle_wrap emits no effects");

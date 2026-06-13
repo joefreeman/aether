@@ -1425,12 +1425,12 @@ fn picker_update_round_trips_through_notification() {
         kind: PickerKind::Files,
         generation: 7,
         offset: 0,
-        items: vec![PickerItem::File {
+        items: Some(vec![PickerItem::File {
             path_index: 0,
             relative_path: "a".into(),
             match_indices: vec![0],
             git_status: None,
-        }],
+        }]),
         total_matches: 1,
         total_candidates: 1,
         ticking: false,

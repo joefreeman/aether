@@ -652,7 +652,13 @@ pub struct PickerUpdateParams {
     pub kind: PickerKind,
     pub generation: u64,
     pub offset: u32,
-    pub items: Vec<PickerItem>,
+    /// The window's items, or `None` to keep the client's current window — only the counts /
+    /// `ticking` changed. The server sends `None` (throttled) as a streaming grep's candidate count
+    /// climbs but the visible window — already full and, being insertion-ordered, stable — doesn't,
+    /// so it isn't re-serialized on every batch. The window is re-sent (`Some`) only while it's
+    /// still filling or when a scroll moves it. `Some(vec![])` is a genuinely empty result set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<PickerItem>>,
     pub total_matches: u32,
     pub total_candidates: u32,
     /// True while the matcher is still consuming candidates (walk in progress, or matcher hasn't
@@ -668,4 +674,13 @@ pub struct PickerUpdateParams {
     /// reachable. `None` for non-grep kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grep_total_display_rows: Option<u32>,
+}
+
+impl PickerUpdateParams {
+    /// The window's items as a slice — empty for a count-only tick (`items: None`), where the
+    /// client keeps its current window. Convenience for readers that don't distinguish "unchanged"
+    /// from "empty result set"; consumers that do (e.g. `apply_update`) match on `items` directly.
+    pub fn items(&self) -> &[PickerItem] {
+        self.items.as_deref().unwrap_or(&[])
+    }
 }

@@ -858,7 +858,7 @@ pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<Picker
         kind: state.kind,
         generation: state.generation,
         offset,
-        items,
+        items: Some(items),
         total_matches: state.ranked.len() as u32,
         total_candidates: state.total_candidates(),
         ticking: false,

@@ -1812,14 +1812,21 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let counts = if state.picker.total_matches == 0 {
-        String::new()
+        // Initial phase (still searching, no hits yet): the throbber stands alone.
+        state.picker.spinner.unwrap_or("").to_string()
     } else {
-        let suffix = if state.picker.ticking { " …" } else { "" };
-        // Position-in-results / total: "you're on item N of M". `selected` is a cache index;
-        // `offset + selected + 1` is the 1-based position in the full result set.
-        let position = state.picker.offset as u64 + state.picker.selected as u64 + 1;
-        let position = position.min(state.picker.total_matches as u64);
-        format!("{}/{}{}", position, state.picker.total_matches, suffix)
+        // A filtered file/buffer list shows `matched/total`; an unfiltered list — and grep, where
+        // every candidate is a hit — collapses to a single total. A throbber sits to the left while
+        // results are still streaming.
+        let num = if state.picker.total_matches == state.picker.total_candidates {
+            format!("{}", state.picker.total_matches)
+        } else {
+            format!("{}/{}", state.picker.total_matches, state.picker.total_candidates)
+        };
+        match state.picker.spinner {
+            Some(s) => format!("{s} {num}"),
+            None => num,
+        }
     };
     let counts_w = counts.width();
 
@@ -3470,7 +3477,11 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                         .underline_color(diag_color(sev));
                 }
                 spans.push(Span::styled(
-                    if highlight_trailing_newline { "↵" } else { " " },
+                    if highlight_trailing_newline {
+                        "↵"
+                    } else {
+                        " "
+                    },
                     style,
                 ));
             }

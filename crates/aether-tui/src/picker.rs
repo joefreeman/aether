@@ -56,6 +56,9 @@ pub struct PickerState {
     pub total_matches: u32,
     pub total_candidates: u32,
     pub ticking: bool,
+    /// The throbber glyph while a search is in progress, or `None` when settled (synced from the
+    /// core's `spinner_glyph`).
+    pub spinner: Option<&'static str>,
     /// Total display rows the whole result set occupies, when that differs from `total_matches`.
     /// Server-reported; in practice grep-only (hits + one header per file group — the wire field
     /// is `grep_total_display_rows`), `None` for the other kinds. Sizes the collapsed picker box.

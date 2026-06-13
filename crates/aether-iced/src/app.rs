@@ -6,41 +6,33 @@
 //! client's: a pixel offset into the full document height, with window fetches when the view
 //! nears the loaded range's edge.
 
-pub use crate::core::session::*;
-pub use crate::core::effect::{Effect, Effects, ToastKind};
-use crate::core::update::Event as CoreEvent;
-use crate::connection::NotifRx;
 use crate::connection::Handle;
+use crate::connection::NotifRx;
+pub use crate::core::effect::{Effect, Effects, ToastKind};
+pub use crate::core::session::*;
+use crate::core::update::Event as CoreEvent;
 use crate::editor::{self, ClickKind, EditorEvent, GUTTER_COLS, PAD};
 use crate::grid;
-use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
 use crate::keymap::{Action, KeyCode, Mods, ScrollDir, ScrollUnit};
+use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
 use crate::theme;
-use aether_protocol::buffer::{
-    BufferOpen, BufferOpenParams,
-    BufferOpenResult,
-};
-use aether_protocol::cursor::{
-    CursorSet,
-    CursorSetParams, Granularity,
-};
+use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
+use aether_protocol::cursor::{CursorSet, CursorSetParams, Granularity};
 use aether_protocol::envelope::{NotificationMethod, RpcMethod};
 use aether_protocol::git::{
     GitBlameLine, GitBlameLineParams, GitSetDiffView, GitSetDiffViewParams,
 };
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::{
-    PickerItem, PickerKind, PickerQuery,
-    PickerQueryParams, PickerUpdate,
-    PickerUpdateParams, PickerView, PickerViewParams,
+    PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerUpdate, PickerUpdateParams,
+    PickerView, PickerViewParams,
 };
 use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectInfo};
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{
-    ScrollPosition, ViewportResize,
-    ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportScrollToRow,
-    ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult,
+    ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams,
+    ViewportScrollToRow, ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams,
+    ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult,
     Window, WrapMode,
 };
 use iced::widget::{column, container, row, text};
@@ -162,7 +154,6 @@ struct ScrollAnim {
 
 const SCROLL_ANIM_MS: f32 = 180.0;
 
-
 #[derive(Debug)]
 struct Toast {
     id: u64,
@@ -206,7 +197,6 @@ pub enum Message {
     BootReconnected(Result<BootConn, String>),
 }
 
-
 pub struct App {
     /// The project chooser (no-args start). While set, `session` is an inert placeholder and
     /// all messages route through `update_boot`; picking a project builds the real session
@@ -242,6 +232,10 @@ pub struct App {
     /// never both). The core tracks rows, not pixels; resets arrive as
     /// `Effect::PickerScrollReset`.
     picker_scroll_y: f32,
+    /// The picker search throbber's rotation (radians), advanced from frame ticks while a search is
+    /// in progress, with the time of the last tick so the step is frame-rate independent.
+    spinner_phase: f32,
+    last_anim_tick: Option<std::time::Instant>,
     /// The hover popover (hover info / diagnostics-at-cursor / commit details), anchored at
     /// the cursor; holds *parsed* iced markdown. Dismissed by any key, click, or scroll.
     hover: Option<HoverContent>,
@@ -254,8 +248,11 @@ pub struct App {
 
 impl App {
     pub fn new(b: Bootstrap) -> (Self, Task<Message>) {
-        let shell = |boot: Option<Boot>, session: Session, handle: Handle,
-                     notifications: NotifRx, client_version: String,
+        let shell = |boot: Option<Boot>,
+                     session: Session,
+                     handle: Handle,
+                     notifications: NotifRx,
+                     client_version: String,
                      server_started_at: u64| App {
             boot,
             session,
@@ -278,6 +275,8 @@ impl App {
             refetch_queued: false,
             reveal_after_fetch: false,
             picker_scroll_y: 0.0,
+            spinner_phase: 0.0,
+            last_anim_tick: None,
             hover: None,
             toasts: Vec::new(),
             next_toast: 0,
@@ -322,10 +321,12 @@ impl App {
                             .await
                             .map_err(|e| e.to_string())
                     },
-                    |result| Message::Core(CoreEvent::PickerViewed {
-                        initial: true,
-                        result,
-                    }),
+                    |result| {
+                        Message::Core(CoreEvent::PickerViewed {
+                            initial: true,
+                            result,
+                        })
+                    },
                 );
                 let boot = Boot {
                     handle: b.handle.clone(),
@@ -378,11 +379,18 @@ impl App {
             }
             _ => None,
         });
-        if self.boot.is_none() && self.scroll_anim.is_some() {
+        // Frame ticks drive the scroll easing and the picker's search throbber; subscribe to them
+        // only while one of those is actually animating.
+        if self.boot.is_none() && (self.scroll_anim.is_some() || self.picker_ticking()) {
             Subscription::batch([keys, iced::window::frames().map(Message::AnimTick)])
         } else {
             keys
         }
+    }
+
+    /// Whether a picker search is still streaming (drives the throbber animation).
+    fn picker_ticking(&self) -> bool {
+        self.session.picker.as_ref().is_some_and(|p| p.ticking)
     }
 
     // ---- update ---------------------------------------------------------------------------
@@ -444,8 +452,7 @@ impl App {
                     return Task::none();
                 }
                 boot.down = true;
-                let note =
-                    self.toast("server disconnected — reconnecting…", ToastKind::Warning);
+                let note = self.toast("server disconnected — reconnecting…", ToastKind::Warning);
                 Task::batch([note, self.boot_reconnect()])
             }
             Message::BootReconnected(Ok(c)) => {
@@ -478,10 +485,12 @@ impl App {
                             .await
                             .map_err(|e| e.to_string())
                     },
-                    |result| Message::Core(CoreEvent::PickerViewed {
-                        initial: true,
-                        result,
-                    }),
+                    |result| {
+                        Message::Core(CoreEvent::PickerViewed {
+                            initial: true,
+                            result,
+                        })
+                    },
                 );
                 let note = self.toast("reconnected", ToastKind::Success);
                 Task::batch([pump(c.notifications), view, note])
@@ -703,10 +712,12 @@ impl App {
                 buffer_id: None,
                 filters: None,
             },
-            |result| Message::Core(CoreEvent::PickerViewed {
-                initial: false,
-                result,
-            }),
+            |result| {
+                Message::Core(CoreEvent::PickerViewed {
+                    initial: false,
+                    result,
+                })
+            },
         )
     }
 
@@ -716,7 +727,9 @@ impl App {
         };
         match boot.picker.move_selection(delta) {
             Some(offset) => self.boot_refetch(offset),
-            None => reveal_picker_selection(&boot.picker, &mut self.picker_scroll_y, Reveal::Minimal),
+            None => {
+                reveal_picker_selection(&boot.picker, &mut self.picker_scroll_y, Reveal::Minimal)
+            }
         }
     }
 
@@ -851,6 +864,17 @@ impl App {
             Message::Noop => Task::none(),
 
             Message::AnimTick(now) => {
+                // Advance the picker throbber by elapsed time (clamped so a gap between animation
+                // bursts doesn't jump it); ~1 rotation/sec. Processing the tick re-renders the view.
+                if self.picker_ticking() {
+                    let dt = self
+                        .last_anim_tick
+                        .map_or(0.0, |t| (now - t).as_secs_f32().min(0.1));
+                    self.spinner_phase =
+                        (self.spinner_phase + dt * std::f32::consts::TAU) % std::f32::consts::TAU;
+                }
+                self.last_anim_tick = Some(now);
+                // Scroll easing (independent of the throbber).
                 let Some(anim) = &self.scroll_anim else {
                     return Task::none();
                 };
@@ -930,7 +954,7 @@ impl App {
         let mut tasks = Vec::new();
         for e in fx.0 {
             match e {
-                                Effect::Toast(message, kind) => tasks.push(self.toast(message, kind)),
+                Effect::Toast(message, kind) => tasks.push(self.toast(message, kind)),
                 Effect::WriteClipboard(text) => tasks.push(iced::clipboard::write(text)),
                 Effect::RevealCursor => tasks.push(self.ensure_cursor_visible()),
                 Effect::Resubscribe => {
@@ -1042,7 +1066,10 @@ impl App {
                     Task::none()
                 }
             }
-            EditorEvent::Wheel { delta_px, delta_x_px } => {
+            EditorEvent::Wheel {
+                delta_px,
+                delta_x_px,
+            } => {
                 self.hover = None;
                 // With a picker open, its scrollable owns wheel input over the list; wheel
                 // over the backdrop shouldn't scroll the editor behind it either.
@@ -1081,7 +1108,11 @@ impl App {
                     ClickKind::Double => Granularity::Word,
                     ClickKind::Triple => Granularity::Line,
                 };
-                let anchor = if shift { self.session.buffer.cursor.anchor } else { pos };
+                let anchor = if shift {
+                    self.session.buffer.cursor.anchor
+                } else {
+                    pos
+                };
                 self.session.drag = Some((anchor, granularity));
                 self.rpc::<CursorSet>(
                     CursorSetParams {
@@ -1199,7 +1230,13 @@ impl App {
         self.refetch_queued = false;
         self.reveal_after_fetch = false;
         let scroll = self.session.buffer.scroll.unwrap_or(ScrollPosition {
-            logical_line: self.session.buffer.cursor.position.line.saturating_sub(rows / 2),
+            logical_line: self
+                .session
+                .buffer
+                .cursor
+                .position
+                .line
+                .saturating_sub(rows / 2),
             sub_row: 0.0,
         });
         self.subscribe_scroll = scroll;
@@ -1260,7 +1297,10 @@ impl App {
                     .await
                     .map_err(|_| ReconnectError::NotUp)?;
                 let activated = handle
-                    .rpc::<ProjectActivate>(ProjectActivateParams { name: project, open_last: false })
+                    .rpc::<ProjectActivate>(ProjectActivateParams {
+                        name: project,
+                        open_last: false,
+                    })
                     .await
                     .map_err(|e| ReconnectError::Fatal(e.to_string()))?;
                 let params = match &path {
@@ -1329,8 +1369,7 @@ impl App {
     }
 
     fn read_clipboard(&self, kind: PasteKind) -> Task<Message> {
-        iced::clipboard::read()
-            .map(move |t| Message::Core(CoreEvent::ClipboardRead(kind, t)))
+        iced::clipboard::read().map(move |t| Message::Core(CoreEvent::ClipboardRead(kind, t)))
     }
 
     fn rpc<M>(
@@ -1386,10 +1425,9 @@ impl App {
 
     fn max_scroll_px(&self) -> f32 {
         match (&self.session.window, self.cell) {
-            (Some(w), Some(cell)) => {
-                (PAD * 2.0 + w.total_visual_rows as f32 * cell.height - self.view_size.height)
-                    .max(0.0)
-            }
+            (Some(w), Some(cell)) => (PAD * 2.0 + w.total_visual_rows as f32 * cell.height
+                - self.view_size.height)
+                .max(0.0),
             _ => 0.0,
         }
     }
@@ -1493,20 +1531,21 @@ impl App {
                 include_commit_info: false,
             },
             move |result| {
-            // Format here: "3w ago" needs a clock, which the core deliberately lacks.
-            let text = result.ok().and_then(|r| r.blame).map(|b| {
-                if b.is_uncommitted {
-                    "uncommitted".into()
-                } else {
-                    format!("{} · {}", b.author, time_ago(b.timestamp))
-                }
-            });
-            Message::Core(CoreEvent::BlameLine {
-                buffer_id,
-                line,
-                text,
-            })
-        })
+                // Format here: "3w ago" needs a clock, which the core deliberately lacks.
+                let text = result.ok().and_then(|r| r.blame).map(|b| {
+                    if b.is_uncommitted {
+                        "uncommitted".into()
+                    } else {
+                        format!("{} · {}", b.author, time_ago(b.timestamp))
+                    }
+                });
+                Message::Core(CoreEvent::BlameLine {
+                    buffer_id,
+                    line,
+                    text,
+                })
+            },
+        )
     }
 
     fn ensure_cursor_visible_inner(&mut self) -> Task<Message> {
@@ -1582,7 +1621,6 @@ impl App {
         );
     }
 
-
     // ---- notifications ------------------------------------------------------------------------
 
     // ---- view ----------------------------------------------------------------------------------
@@ -1596,11 +1634,13 @@ impl App {
                 window: self.session.window.as_ref(),
                 cursor: self.session.buffer.cursor,
                 insert_mode: self.session.mode == Mode::Insert,
-                awaiting_key: !matches!(self.session.pending, Pending::None) || self.session.count.is_some(),
+                awaiting_key: !matches!(self.session.pending, Pending::None)
+                    || self.session.count.is_some(),
                 diff_view: self.session.diff_view,
                 scroll_px: self.scroll_px,
                 scroll_x_px: self.scroll_x_px,
-                blame: self.session
+                blame: self
+                    .session
                     .blame
                     .as_ref()
                     .map(|(line, text)| (*line, text.as_str())),
@@ -1620,15 +1660,19 @@ impl App {
         }
         if let Some(p) = &self.session.picker {
             layers.push(
-                Element::from(crate::picker::overlay(p, &self.session.project_paths, self.picker_scroll_y)).map(
-                    |m| match m {
-                        PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
-                        PickerMsg::Scrolled(y) => Message::PickerScrolled(y),
-                        PickerMsg::Hovered(abs) => Message::PickerHovered(Some(abs)),
-                        PickerMsg::Unhovered(abs) => Message::PickerUnhovered(abs),
-                        PickerMsg::ChipClicked(i) => Message::Core(CoreEvent::PickerChipClicked(i)),
-                    },
-                ),
+                Element::from(crate::picker::overlay(
+                    p,
+                    &self.session.project_paths,
+                    self.picker_scroll_y,
+                    self.spinner_phase,
+                ))
+                .map(|m| match m {
+                    PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
+                    PickerMsg::Scrolled(y) => Message::PickerScrolled(y),
+                    PickerMsg::Hovered(abs) => Message::PickerHovered(Some(abs)),
+                    PickerMsg::Unhovered(abs) => Message::PickerUnhovered(abs),
+                    PickerMsg::ChipClicked(i) => Message::Core(CoreEvent::PickerChipClicked(i)),
+                }),
             );
         }
         if self.session.prompt.is_some() {
@@ -1690,7 +1734,13 @@ impl App {
                 background: Some(theme::NORD0.into()),
                 ..container::Style::default()
             });
-        let picker = Element::from(crate::picker::overlay(&boot.picker, &[], self.picker_scroll_y)).map(|m| match m {
+        let picker = Element::from(crate::picker::overlay(
+            &boot.picker,
+            &[],
+            self.picker_scroll_y,
+            self.spinner_phase,
+        ))
+        .map(|m| match m {
             PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
             PickerMsg::Scrolled(y) => Message::PickerScrolled(y),
             PickerMsg::Hovered(abs) => Message::PickerHovered(Some(abs)),
@@ -1710,14 +1760,17 @@ impl App {
         let q = &self.session.search.query;
         let mut inner = row![].spacing(0).align_y(iced::Alignment::Center);
         if q.is_empty() {
-            inner = inner.push(
-                text("search").size(13).font(SANS).color(theme::NORD3),
-            );
+            inner = inner.push(text("search").size(13).font(SANS).color(theme::NORD3));
         } else {
             let pre = &q[..self.session.search.cursor];
             let post = &q[self.session.search.cursor..];
             if !pre.is_empty() {
-                inner = inner.push(text(pre.to_string()).size(13).font(SANS).color(theme::NORD6));
+                inner = inner.push(
+                    text(pre.to_string())
+                        .size(13)
+                        .font(SANS)
+                        .color(theme::NORD6),
+                );
             }
             inner = inner.push(
                 container(iced::widget::Space::new().width(2).height(15)).style(|_| {
@@ -1728,8 +1781,12 @@ impl App {
                 }),
             );
             if !post.is_empty() {
-                inner =
-                    inner.push(text(post.to_string()).size(13).font(SANS).color(theme::NORD6));
+                inner = inner.push(
+                    text(post.to_string())
+                        .size(13)
+                        .font(SANS)
+                        .color(theme::NORD6),
+                );
             }
         }
         let mut bar = row![inner, iced::widget::Space::new().width(Length::Fill)]
@@ -1808,8 +1865,13 @@ impl App {
                 };
                 let kv = |k: &str, v: String| {
                     row![
-                        container(text(k.to_string()).size(13).font(SANS).color(theme::NORD3_BRIGHT))
-                            .width(90),
+                        container(
+                            text(k.to_string())
+                                .size(13)
+                                .font(SANS)
+                                .color(theme::NORD3_BRIGHT)
+                        )
+                        .width(90),
                         text(v).size(13).font(SANS).color(theme::NORD6),
                     ]
                     .spacing(8)
@@ -1829,7 +1891,10 @@ impl App {
                 let mut col = column![
                     row![
                         text("● ").size(14).color(dot),
-                        text(info.name.clone()).size(13).font(SANS_BOLD_UI).color(theme::NORD6),
+                        text(info.name.clone())
+                            .size(13)
+                            .font(SANS_BOLD_UI)
+                            .color(theme::NORD6),
                     ]
                     .align_y(iced::Alignment::Center),
                     kv("Language", info.language.clone()),
@@ -1856,7 +1921,10 @@ impl App {
                 col.spacing(10).into()
             }
             Prompt::Confirm { message, .. } => column![
-                text(format!("{message}?")).size(13).font(SANS).color(theme::NORD6),
+                text(format!("{message}?"))
+                    .size(13)
+                    .font(SANS)
+                    .color(theme::NORD6),
                 row![
                     iced::widget::Space::new().width(Length::Fill),
                     btn("No", false, PromptMsg::Cancel),
@@ -1867,9 +1935,13 @@ impl App {
             .spacing(14)
             .into(),
             Prompt::SaveAs {
-                path_index, input, cursor, ..
+                path_index,
+                input,
+                cursor,
+                ..
             } => {
-                let root = self.session
+                let root = self
+                    .session
                     .project_paths
                     .get(*path_index as usize)
                     .map(|p| {
@@ -1882,15 +1954,17 @@ impl App {
                         )
                     })
                     .unwrap_or_default();
-                let mut field = row![
-                    text(root).size(13).font(SANS).color(theme::NORD3_BRIGHT),
-                ]
-                .align_y(iced::Alignment::Center);
+                let mut field = row![text(root).size(13).font(SANS).color(theme::NORD3_BRIGHT),]
+                    .align_y(iced::Alignment::Center);
                 let pre = &input[..*cursor];
                 let post = &input[*cursor..];
                 if !pre.is_empty() {
-                    field = field
-                        .push(text(pre.to_string()).size(13).font(SANS).color(theme::NORD6));
+                    field = field.push(
+                        text(pre.to_string())
+                            .size(13)
+                            .font(SANS)
+                            .color(theme::NORD6),
+                    );
                 }
                 field = field.push(
                     container(iced::widget::Space::new().width(2).height(15)).style(|_| {
@@ -1901,22 +1975,29 @@ impl App {
                     }),
                 );
                 if !post.is_empty() {
-                    field = field
-                        .push(text(post.to_string()).size(13).font(SANS).color(theme::NORD6));
+                    field = field.push(
+                        text(post.to_string())
+                            .size(13)
+                            .font(SANS)
+                            .color(theme::NORD6),
+                    );
                 }
                 column![
                     text("Save as").size(13).font(SANS).color(theme::NORD6),
-                    container(field).padding([5, 8]).width(Length::Fill).style(|_| {
-                        container::Style {
-                            background: Some(theme::NORD0.into()),
-                            border: iced::Border {
-                                color: theme::NORD3,
-                                width: 1.0,
-                                radius: 4.0.into(),
-                            },
-                            ..container::Style::default()
-                        }
-                    }),
+                    container(field)
+                        .padding([5, 8])
+                        .width(Length::Fill)
+                        .style(|_| {
+                            container::Style {
+                                background: Some(theme::NORD0.into()),
+                                border: iced::Border {
+                                    color: theme::NORD3,
+                                    width: 1.0,
+                                    radius: 4.0.into(),
+                                },
+                                ..container::Style::default()
+                            }
+                        }),
                     row![
                         iced::widget::Space::new().width(Length::Fill),
                         btn("Cancel", false, PromptMsg::Cancel),
@@ -1984,7 +2065,10 @@ impl App {
                 }
                 col.into()
             }
-            HoverContent::Markdown { items, est_lines: n } => {
+            HoverContent::Markdown {
+                items,
+                est_lines: n,
+            } => {
                 est_lines = *n;
                 // Links in hover docs aren't followable yet — clicks are swallowed.
                 let mut settings = iced::widget::markdown::Settings::with_text_size(
@@ -2018,15 +2102,15 @@ impl App {
         )
         .max_width(640)
         .max_height(380)
-            .style(|_| container::Style {
-                background: Some(theme::NORD1.into()),
-                border: iced::Border {
-                    color: theme::NORD3,
-                    width: 1.0,
-                    radius: 4.0.into(),
-                },
-                ..container::Style::default()
-            });
+        .style(|_| container::Style {
+            background: Some(theme::NORD1.into()),
+            border: iced::Border {
+                color: theme::NORD3,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
+        });
 
         // Anchor at the cursor cell. Below the line when the (estimated) height fits;
         // otherwise bottom-ALIGNED in a container ending just above the line, so the popover
@@ -2147,13 +2231,22 @@ impl App {
             .size(13)
             .color(theme::NORD4)
             .font(
-            // A transient (preview) buffer slants the file label, like the other clients.
-                if self.session.buffer.transient { SANS_ITALIC } else { SANS },
+                // A transient (preview) buffer slants the file label, like the other clients.
+                if self.session.buffer.transient {
+                    SANS_ITALIC
+                } else {
+                    SANS
+                },
             );
         left = left.push(name);
         // Git cluster: `⎇  branch  +u(s) ~u(s) -u(s)` — per-class counts combine unstaged with
         // the staged count in parens, each omitted when zero.
-        if let Some(gs) = self.session.window.as_ref().and_then(|w| w.git_status.as_ref()) {
+        if let Some(gs) = self
+            .session
+            .window
+            .as_ref()
+            .and_then(|w| w.git_status.as_ref())
+        {
             if let Some(branch) = &gs.branch {
                 left = left.push(t(format!("   ⎇  {branch}"), theme::NORD9));
             }
@@ -2183,13 +2276,18 @@ impl App {
         if self.session.search.active {
             if let Some(s) = self.session.search.summary.as_ref() {
                 if s.current_index > 0 && s.total > 0 {
-                    right = right
-                        .push(t(format!("{}/{}", s.current_index, format_total(s)), theme::NORD4));
+                    right = right.push(t(
+                        format!("{}/{}", s.current_index, format_total(s)),
+                        theme::NORD4,
+                    ));
                 }
             }
         }
         if let Some(grep) = self.session.buffer.cursor.grep_position {
-            right = right.push(t(format!("grep {}/{}", grep.current, grep.total), theme::NORD4));
+            right = right.push(t(
+                format!("grep {}/{}", grep.current, grep.total),
+                theme::NORD4,
+            ));
         }
         // Diagnostic counts, as a tight cluster left of the position. Text glyphs stand in for
         // the web client's SVG icons (same forms as the TUI).
@@ -2219,12 +2317,7 @@ impl App {
         }
 
         container(
-            row![
-                left,
-                iced::widget::Space::new().width(Length::Fill),
-                right,
-            ]
-            .width(Length::Fill),
+            row![left, iced::widget::Space::new().width(Length::Fill), right,].width(Length::Fill),
         )
         .padding([2, 8])
         .width(Length::Fill)
@@ -2251,7 +2344,10 @@ impl App {
                 container(
                     row![
                         text("▌").size(13).color(accent),
-                        text(toast.message.clone()).size(13).font(SANS).color(theme::NORD4),
+                        text(toast.message.clone())
+                            .size(13)
+                            .font(SANS)
+                            .color(theme::NORD4),
                     ]
                     .spacing(6),
                 )
@@ -2309,8 +2405,6 @@ fn pump(notifications: NotifRx) -> Task<Message> {
     )
 }
 
-
-
 fn loaded_rows(window: &Window) -> u32 {
     window.lines.iter().map(grid::line_rows).sum()
 }
@@ -2352,7 +2446,6 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal) -> Option<f32> 
         Reveal::Minimal => None,
     }
 }
-
 
 /// Segment-elide a path to `budget` chars, dropping leading directories first so the filename
 /// survives; a still-too-long filename tail-truncates.
@@ -2424,25 +2517,21 @@ fn nord_theme(_app: &App) -> iced::Theme {
 
 /// Run the iced application. Called by `main` once the connection and buffer are bootstrapped.
 pub fn run(bootstrap: Bootstrap) -> iced::Result {
-    iced::application(
-        move || App::new(bootstrap.clone()),
-        App::update,
-        App::view,
-    )
-    .title(App::title)
-    .subscription(App::subscription)
-    // Everything we draw sets explicit Nord colours, but theme-inheriting surfaces (markdown
-    // hover body text, scrollbars) must not default to the Light theme.
-    .theme(nord_theme)
-    // The buffer's font + size (chrome sets explicit fonts/sizes): web's 14px monospace.
-    .settings(iced::Settings {
-        default_font: iced::Font::MONOSPACE,
-        default_text_size: iced::Pixels(14.0),
-        antialiasing: true,
-        ..iced::Settings::default()
-    })
-    .window_size(Size::new(1100.0, 750.0))
-    .run()
+    iced::application(move || App::new(bootstrap.clone()), App::update, App::view)
+        .title(App::title)
+        .subscription(App::subscription)
+        // Everything we draw sets explicit Nord colours, but theme-inheriting surfaces (markdown
+        // hover body text, scrollbars) must not default to the Light theme.
+        .theme(nord_theme)
+        // The buffer's font + size (chrome sets explicit fonts/sizes): web's 14px monospace.
+        .settings(iced::Settings {
+            default_font: iced::Font::MONOSPACE,
+            default_text_size: iced::Pixels(14.0),
+            antialiasing: true,
+            ..iced::Settings::default()
+        })
+        .window_size(Size::new(1100.0, 750.0))
+        .run()
 }
 
 #[cfg(test)]
@@ -2467,7 +2556,7 @@ mod tests {
             kind: PickerKind::Grep,
             generation: 0,
             offset: 0,
-            items,
+            items: Some(items),
             total_matches: 23,
             total_candidates: 23,
             ticking: false,
@@ -2513,12 +2602,14 @@ mod tests {
             kind: PickerKind::Projects,
             generation: 0,
             offset: 0,
-            items: (0..30)
-                .map(|i| PickerItem::Project {
-                    name: format!("p{i}"),
-                    match_indices: vec![],
-                })
-                .collect(),
+            items: Some(
+                (0..30)
+                    .map(|i| PickerItem::Project {
+                        name: format!("p{i}"),
+                        match_indices: vec![],
+                    })
+                    .collect(),
+            ),
             total_matches: 30,
             total_candidates: 30,
             ticking: false,
@@ -2529,6 +2620,9 @@ mod tests {
         s.selected = 6; // first visible row — visible as-is
         assert_eq!(reveal_target(&s, scroll, Reveal::Minimal), None);
         s.selected = 5;
-        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal), Some(5.0 * ROW_H));
+        assert_eq!(
+            reveal_target(&s, scroll, Reveal::Minimal),
+            Some(5.0 * ROW_H)
+        );
     }
 }

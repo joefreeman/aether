@@ -31,7 +31,6 @@ use aether_protocol::directory::{
     DirectoryListParams, DirectoryListResult,
 };
 use aether_protocol::envelope::RpcMethod;
-use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::envelope::{Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
@@ -56,6 +55,7 @@ use aether_protocol::lsp::{
 };
 use aether_protocol::nav::NavStepResult;
 use aether_protocol::nav::{NavBack, NavForward, NavStepParams};
+use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     PickerFilters, PickerGrepFileJump, PickerGrepFileJumpParams, PickerGrepNavigate,
     PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
@@ -949,7 +949,10 @@ impl Session {
     /// Insert mode only: composed text is editing input, not a command. Same edit as a typed key
     /// (no `select_pasted`), so multi-character composed strings land like normal typing.
     pub fn insert_text(&mut self, text: String) -> Effects {
-        let text: String = text.chars().filter(|c| !c.is_control() || *c == '\t').collect();
+        let text: String = text
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\t')
+            .collect();
         if self.mode != Mode::Insert || text.is_empty() {
             return Effects::none();
         }
@@ -1315,27 +1318,33 @@ impl Session {
             })
             .flatten();
 
-        Effects::one(Effect::PickerScrollReset).and(
-            self.request::<PickerView>(
-                PickerViewParams {
-                    kind,
-                    reset,
-                    offset: 0,
-                    limit: FETCH_LIMIT,
-                    center_on,
-                    center_on_cursor_grep_hit: (kind == PickerKind::Grep).then_some(buffer_id),
-                    directory_path,
-                    explorer_roots: false,
-                    buffer_id: matches!(kind, PickerKind::Diagnostics | PickerKind::References)
-                        .then_some(buffer_id),
-                    filters: seed_filters,
-                },
-                move |__r| Event::PickerViewed {
-                    initial: true,
-                    result: __r.map_err(|e| e.to_string()),
-                },
-            ),
-        )
+        let request = self.request::<PickerView>(
+            PickerViewParams {
+                kind,
+                reset,
+                offset: 0,
+                limit: FETCH_LIMIT,
+                center_on,
+                center_on_cursor_grep_hit: (kind == PickerKind::Grep).then_some(buffer_id),
+                directory_path,
+                explorer_roots: false,
+                buffer_id: matches!(kind, PickerKind::Diagnostics | PickerKind::References)
+                    .then_some(buffer_id),
+                filters: seed_filters,
+            },
+            move |__r| Event::PickerViewed {
+                initial: true,
+                result: __r.map_err(|e| e.to_string()),
+            },
+        );
+        // Reset the scroll to the top only for a fresh list. A state-preserving picker (grep) resumes
+        // onto its saved selection — often deep in the results — and the `effective_center_on` echo
+        // drives a reveal to it; a scroll reset here would fight that, snapping back to the top.
+        if reset {
+            Effects::one(Effect::PickerScrollReset).and(request)
+        } else {
+            request
+        }
     }
 
     /// `Space Alt-f` / `Space Alt-g`: open Files/Grep pre-scoped to the active buffer's
@@ -2084,9 +2093,7 @@ impl Session {
             KeyCode::Esc => return self.close_picker(),
             KeyCode::Enter => return self.picker_accept(),
             // Delete / Ctrl-d: trash the highlighted entry (Files + Explorer), behind a confirm.
-            KeyCode::Delete
-                if matches!(p.kind, PickerKind::Files | PickerKind::Explorer) =>
-            {
+            KeyCode::Delete if matches!(p.kind, PickerKind::Files | PickerKind::Explorer) => {
                 return self.picker_stage_delete();
             }
             KeyCode::Char('d')
@@ -2628,7 +2635,11 @@ impl Session {
         if self.conn != ConnState::Connected {
             return Effects::none();
         }
-        let anchor = if extend { self.buffer.cursor.anchor } else { pos };
+        let anchor = if extend {
+            self.buffer.cursor.anchor
+        } else {
+            pos
+        };
         self.drag = Some((anchor, granularity));
         self.request_str::<CursorSet>(
             CursorSetParams {
@@ -2846,16 +2857,13 @@ impl Session {
                     path_index,
                     relative_path,
                     ..
-                } => self
-                    .project_paths
-                    .get(*path_index as usize)
-                    .map(|root| {
-                        (
-                            format!("{}/{relative_path}", root.trim_end_matches('/')),
-                            "file",
-                            relative_path.clone(),
-                        )
-                    }),
+                } => self.project_paths.get(*path_index as usize).map(|root| {
+                    (
+                        format!("{}/{relative_path}", root.trim_end_matches('/')),
+                        "file",
+                        relative_path.clone(),
+                    )
+                }),
                 _ => None,
             }
         };
@@ -2902,11 +2910,14 @@ impl Session {
         }
         let abs = format!("{}/{base}", dir.trim_end_matches('/'));
         if is_dir {
-            return self
-                .request_str::<DirectoryCreate>(DirectoryCreateParams { path: abs }, Event::DirCreated);
+            return self.request_str::<DirectoryCreate>(
+                DirectoryCreateParams { path: abs },
+                Event::DirCreated,
+            );
         }
         // File: address it under a project root, then open with create-on-save.
-        let Some((path_index, relative_path)) = strip_longest_root(&abs, &self.project_paths) else {
+        let Some((path_index, relative_path)) = strip_longest_root(&abs, &self.project_paths)
+        else {
             return Effects::error("path is outside the project's roots");
         };
         let from = self.buffer.buffer_id;
@@ -3026,10 +3037,10 @@ impl Session {
             ConfirmAction::Save { target } => self.save(target, true),
             ConfirmAction::ReloadDiscard => self.reload(true),
             ConfirmAction::CloseDiscard => self.close_buffer(),
-            ConfirmAction::DeletePath { path, noun } => self.request_str::<PathDelete>(
-                PathDeleteParams { path },
-                move |result| Event::PathDeleted { noun, result },
-            ),
+            ConfirmAction::DeletePath { path, noun } => self
+                .request_str::<PathDelete>(PathDeleteParams { path }, move |result| {
+                    Event::PathDeleted { noun, result }
+                }),
         }
     }
 

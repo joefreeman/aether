@@ -203,6 +203,13 @@ pub async fn run(
             }
             Some(done) = shell.pending.next() => shell.on_done(done),
         }
+        // Coalesce a burst of already-arrived server pushes into a single redraw — a streaming grep
+        // emits a `picker/update` per batch, and the broad intermediate queries (`as`…) flood them.
+        // Without this we'd sync+draw once per push and fall behind the stream (the native client
+        // coalesces the same way by rendering once per frame).
+        while let Ok(n) = shell.notifications.try_recv() {
+            shell.dispatch(CoreEvent::ServerPush(n));
+        }
         shell.maybe_blame();
         shell.maybe_fetch();
         shell.sync();
@@ -589,9 +596,12 @@ impl Shell {
                                 ScrollUnit::Half => (cols / 2).max(1),
                                 _ => 1,
                             };
-                            let signed = if matches!(dir, ScrollDir::Left) { -mag } else { mag };
-                            self.scroll_col =
-                                (self.scroll_col as i64 + signed).max(0) as u32;
+                            let signed = if matches!(dir, ScrollDir::Left) {
+                                -mag
+                            } else {
+                                mag
+                            };
+                            self.scroll_col = (self.scroll_col as i64 + signed).max(0) as u32;
                         }
                     }
                 }
@@ -1033,6 +1043,7 @@ impl Shell {
         p.total_matches = core.total_matches;
         p.total_candidates = core.total_candidates;
         p.ticking = core.ticking;
+        p.spinner = core.spinner_glyph();
         p.total_display_rows = Some(core.total_display_rows);
         p.selected = (core.selected.saturating_sub(core.offset)) as usize;
         // The Explorer's synthetic "+ Create …" affordance — the core owns the decision
@@ -1377,7 +1388,9 @@ pub async fn bootstrap(
                     let abs = crate::app::resolve_cli_path(f)?.display().to_string();
                     let (path_index, relative_path) =
                         aether_client::session::strip_longest_root(&abs, &project_paths)
-                            .ok_or_else(|| anyhow::anyhow!("{abs} is outside the project's roots"))?;
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("{abs} is outside the project's roots")
+                            })?;
                     handle
                         .rpc::<BufferOpen>(BufferOpenParams {
                             path_index: Some(path_index),
@@ -1387,9 +1400,9 @@ pub async fn bootstrap(
                         })
                         .await?
                 }
-                None => activated
-                    .opened
-                    .ok_or_else(|| anyhow::anyhow!("project/activate returned no landing buffer"))?,
+                None => activated.opened.ok_or_else(|| {
+                    anyhow::anyhow!("project/activate returned no landing buffer")
+                })?,
             };
 
             let session = Session::new(
@@ -1397,7 +1410,12 @@ pub async fn bootstrap(
                 project_paths.clone(),
                 buffer_info(open, &project_paths),
             );
-            (session, activated.project.name, project_paths, Effects::none())
+            (
+                session,
+                activated.project.name,
+                project_paths,
+                Effects::none(),
+            )
         }
     };
 

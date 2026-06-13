@@ -762,9 +762,9 @@ a.picker-row:not(.selected):hover .picker-main {
   z-index: 1;
   background: var(--nord1);
 }
-/* Keep a hit from being hidden under the sticky header when scrolled into view (incl. the
-   scroll-to-top on reopen): the header is one 1.5-line-height row + 2px vertical padding. */
-.grep-section .picker-row:not(.grep-header) { scroll-margin-top: calc(1.5em + 2px); }
+/* Keep a hit from hiding under the sticky file header when revealed (e.g. Alt-k up): clear it by one
+   header row. `--picker-row-h` is the measured display-row height the shell sets on the list. */
+.grep-section .picker-row:not(.grep-header) { scroll-margin-top: var(--picker-row-h, 24px); }
 /* Grep hits are code lines — the editor's mono font. Scoped to the preview text only; the line
    number keeps the picker's sans-serif. */
 .picker-row.grep-hit .picker-main { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
@@ -790,6 +790,21 @@ a.picker-row:not(.selected):hover .picker-main {
   color: var(--nord3-brighter);
   font-size: 12px;
   white-space: nowrap;
+}
+/* "Still searching" throbber: a conventional spinning ring, left of the count. CSS drives the
+   rotation so it's smooth regardless of how often results stream in. */
+.picker-spinner {
+  flex: 0 0 auto;
+  margin-left: 12px;
+  width: 11px;
+  height: 11px;
+  border: 2px solid var(--nord3);
+  border-top-color: var(--nord8);
+  border-radius: 50%;
+  animation: picker-spin 0.7s linear infinite;
+}
+@keyframes picker-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* Syntax highlight kinds — keys match render.ts's HL_CLASS, values mirror ui.rs::lookup_exact. */

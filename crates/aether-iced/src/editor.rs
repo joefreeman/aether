@@ -11,7 +11,9 @@
 use crate::grid;
 use crate::theme;
 use aether_protocol::cursor::CursorState;
-use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker, DiffStage, LogicalLineRender, Window};
+use aether_protocol::viewport::{
+    DiagnosticSeverity, DiffMarker, DiffStage, LogicalLineRender, Window,
+};
 use aether_protocol::LogicalPosition;
 use iced::advanced::widget::{tree, Tree};
 use iced::advanced::{layout, mouse, renderer, text, Clipboard, Layout, Shell, Widget};
@@ -60,11 +62,25 @@ pub enum ClickKind {
 pub enum EditorEvent {
     /// Cell metrics and content-area size are known (or changed). Fired once at startup and on
     /// every resize — the app's cue to subscribe / resize the server viewport.
-    Layout { cell: Size, size: Size },
+    Layout {
+        cell: Size,
+        size: Size,
+    },
     /// Wheel/trackpad scroll; positive = content scrolls down / right.
-    Wheel { delta_px: f32, delta_x_px: f32 },
-    Pressed { row: i64, dcol: u32, kind: ClickKind, shift: bool },
-    Dragged { row: i64, dcol: u32 },
+    Wheel {
+        delta_px: f32,
+        delta_x_px: f32,
+    },
+    Pressed {
+        row: i64,
+        dcol: u32,
+        kind: ClickKind,
+        shift: bool,
+    },
+    Dragged {
+        row: i64,
+        dcol: u32,
+    },
     Released,
 }
 
@@ -172,8 +188,7 @@ where
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let (Some(cell), Some(position)) = (state.cell, cursor.position_over(bounds)) {
-                    let click =
-                        mouse::Click::new(position, mouse::Button::Left, state.last_click);
+                    let click = mouse::Click::new(position, mouse::Button::Left, state.last_click);
                     let kind = match click.kind() {
                         mouse::click::Kind::Single => ClickKind::Single,
                         mouse::click::Kind::Double => ClickKind::Double,
@@ -253,9 +268,7 @@ where
         let (sel_min, sel_max) = selection_endpoints(&self.content.cursor);
         let draw_selection = !self.content.cursor.is_point();
         let scroll_x = self.content.scroll_x_px;
-        let text_x = |dcol: u32| {
-            bounds.x + (GUTTER_COLS + dcol) as f32 * cell.width - scroll_x
-        };
+        let text_x = |dcol: u32| bounds.x + (GUTTER_COLS + dcol) as f32 * cell.width - scroll_x;
         // Under horizontal scroll, content quads/text must not bleed over the gutter column.
         let content_left = bounds.x + GUTTER_COLS as f32 * cell.width;
         let content_clip = Rectangle {
@@ -310,8 +323,17 @@ where
                     },
                     bar,
                 );
-                let text = v.text.replace('\t', &" ".repeat(self.content.tab_width as usize));
-                draw_run(renderer, text, Point::new(text_x(0), y), cell, fg, content_clip);
+                let text = v
+                    .text
+                    .replace('\t', &" ".repeat(self.content.tab_width as usize));
+                draw_run(
+                    renderer,
+                    text,
+                    Point::new(text_x(0), y),
+                    cell,
+                    fg,
+                    content_clip,
+                );
             }
 
             let n_rows = line.visual_rows.len();
@@ -740,10 +762,9 @@ where
 impl<'a, Message> EditorView<'a, Message> {
     /// Pixel position → (absolute visual row, display col).
     fn cell_at(&self, position: Point, bounds: Rectangle, cell: Size) -> (i64, u32) {
-        let row = ((self.content.scroll_px + (position.y - bounds.y) - PAD) / cell.height).floor()
-            as i64;
-        let col = ((position.x - bounds.x + self.content.scroll_x_px) / cell.width).floor()
-            as i64
+        let row =
+            ((self.content.scroll_px + (position.y - bounds.y) - PAD) / cell.height).floor() as i64;
+        let col = ((position.x - bounds.x + self.content.scroll_x_px) / cell.width).floor() as i64
             - GUTTER_COLS as i64;
         (row, col.max(0) as u32)
     }
@@ -912,7 +933,10 @@ fn cursor_ws_glyph(
         return None;
     }
     let line = window.lines.iter().find(|l| l.logical_line == pos.line)?;
-    let row_idx = line.visual_rows.iter().rposition(|r| r.byte_offset <= pos.col)?;
+    let row_idx = line
+        .visual_rows
+        .iter()
+        .rposition(|r| r.byte_offset <= pos.col)?;
     let row = &line.visual_rows[row_idx];
     let cells = grid::row_cells(row, tab_width);
     match cells.iter().find(|c| c.byte == pos.col) {

@@ -9,8 +9,92 @@ use crate::chips::{self, Chip, ChipEditorField, ChipId};
 use crate::theme;
 use aether_protocol::git::GitStatus;
 use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
+use iced::advanced::widget::Tree;
+use iced::advanced::{layout, mouse, renderer, Layout, Widget};
 use iced::widget::{column, container, row, text};
-use iced::{Element, Length};
+use iced::{Border, Color, Element, Length, Rectangle, Size};
+
+/// A conventional rotating "loading" throbber — a ring of dots with a brightness comet trailing the
+/// head, drawn with `fill_quad` (no canvas feature needed). `phase` (radians) is advanced over time
+/// by the app's frame ticks while a search is in progress, so the rotation is smooth regardless of
+/// how fast results stream in.
+struct Spinner {
+    phase: f32,
+}
+
+impl Spinner {
+    const SIZE: f32 = 13.0;
+    const DOTS: usize = 8;
+    const DOT: f32 = 2.4;
+}
+
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Spinner
+where
+    Renderer: renderer::Renderer,
+{
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fixed(Self::SIZE), Length::Fixed(Self::SIZE))
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        _renderer: &Renderer,
+        _limits: &layout::Limits,
+    ) -> layout::Node {
+        layout::Node::new(Size::new(Self::SIZE, Self::SIZE))
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        renderer: &mut Renderer,
+        _theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+        let b = layout.bounds();
+        let cx = b.x + b.width / 2.0;
+        let cy = b.y + b.height / 2.0;
+        let radius = b.width / 2.0 - Self::DOT;
+        for i in 0..Self::DOTS {
+            let a = i as f32 / Self::DOTS as f32 * std::f32::consts::TAU;
+            // Distance behind the rotating head (0 = at the head, brightest), normalised to 0..1.
+            let d = (self.phase - a).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+            let color = Color {
+                a: 0.15 + 0.85 * (1.0 - d),
+                ..theme::NORD8
+            };
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle {
+                        x: cx + radius * a.cos() - Self::DOT / 2.0,
+                        y: cy + radius * a.sin() - Self::DOT / 2.0,
+                        width: Self::DOT,
+                        height: Self::DOT,
+                    },
+                    border: Border {
+                        radius: (Self::DOT / 2.0).into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                color,
+            );
+        }
+    }
+}
+
+impl<'a, Message, Theme, Renderer> From<Spinner> for Element<'a, Message, Theme, Renderer>
+where
+    Renderer: renderer::Renderer,
+{
+    fn from(s: Spinner) -> Self {
+        Element::new(s)
+    }
+}
 
 /// Scrollbar width (rail + scroller) — narrower than iced's default chrome.
 const SCROLLBAR_W: f32 = 5.0;
@@ -74,6 +158,7 @@ pub fn overlay<'a>(
     state: &'a PickerState,
     roots: &'a [String],
     scroll_y: f32,
+    spinner_phase: f32,
 ) -> Element<'a, PickerMsg> {
     let mut panel = column![];
 
@@ -109,7 +194,12 @@ pub fn overlay<'a>(
         .align_y(iced::Alignment::Center);
         // The breadcrumb / a non-empty chip row already says where typing will act.
         if prefix.is_none() && chip_row.is_empty() {
-            q = q.push(text(placeholder(state.kind)).size(13).font(SANS).color(theme::NORD3));
+            q = q.push(
+                text(placeholder(state.kind))
+                    .size(13)
+                    .font(SANS)
+                    .color(theme::NORD3),
+            );
         }
         input = input.push(q);
     } else {
@@ -120,11 +210,9 @@ pub fn overlay<'a>(
             query_row = query_row.push(text(pre).size(13).font(SANS).color(theme::NORD6));
         }
         query_row = query_row.push(
-            container(iced::widget::Space::new().width(2).height(15)).style(|_| {
-                container::Style {
-                    background: Some(theme::NORD8.into()),
-                    ..container::Style::default()
-                }
+            container(iced::widget::Space::new().width(2).height(15)).style(|_| container::Style {
+                background: Some(theme::NORD8.into()),
+                ..container::Style::default()
             }),
         );
         if !post.is_empty() {
@@ -133,8 +221,22 @@ pub fn overlay<'a>(
         input = input.push(query_row);
     }
     input = input.push(iced::widget::Space::new().width(Length::Fill));
-    let counts = if state.ticking {
-        format!("{}/{}…", state.total_matches, state.total_candidates)
+    // A rotating throbber sits to the left of the count while a search is still streaming; the count
+    // itself shows progress. The app drives `spinner_phase` from frame ticks for a smooth spin.
+    if state.ticking {
+        input = input.push(
+            container(Spinner {
+                phase: spinner_phase,
+            })
+            .padding(iced::Padding::ZERO.right(6)),
+        );
+    }
+    // A filtered file/buffer list shows `matched/total`; an unfiltered list — and grep, where every
+    // candidate is a hit — collapses to a single total (rather than the redundant "M/M").
+    let counts = if state.total_matches == 0 {
+        String::new()
+    } else if state.total_matches == state.total_candidates {
+        format!("{}", state.total_matches)
     } else {
         format!("{}/{}", state.total_matches, state.total_candidates)
     };
@@ -183,12 +285,12 @@ pub fn overlay<'a>(
     // web's `.picker-list.filled` border-top). The slot itself is always present.
     let filled = state.total_display_rows > 0;
     panel = panel.push(
-        container(iced::widget::Space::new().width(Length::Fill).height(1)).style(
-            move |_| container::Style {
+        container(iced::widget::Space::new().width(Length::Fill).height(1)).style(move |_| {
+            container::Style {
                 background: filled.then(|| theme::NORD3.into()),
                 ..container::Style::default()
-            },
-        ),
+            }
+        }),
     );
 
     // Results: the fetched window rendered as uniform-height rows inside a native scrollable,
@@ -284,32 +386,30 @@ pub fn overlay<'a>(
     // tree position), which is a scroll-to-top.
     let pinned: Option<(u32, String)> = {
         let first_visible = first_visible_row(scroll_y);
-        first_visible
-            .checked_sub(window_base)
-            .and_then(|rel| {
-                state
-                    .display_rows()
-                    .into_iter()
-                    .nth(rel as usize)
-                    .and_then(|r| match r {
-                        DisplayRow::Item { item, .. } => match item {
-                            PickerItem::GrepHit {
-                                path_index,
-                                relative_path,
-                                ..
-                            } => Some((*path_index, relative_path.clone())),
-                            _ => None,
-                        },
-                        // A header at the top pins itself (identical overlay, no flicker).
-                        DisplayRow::Header {
+        first_visible.checked_sub(window_base).and_then(|rel| {
+            state
+                .display_rows()
+                .into_iter()
+                .nth(rel as usize)
+                .and_then(|r| match r {
+                    DisplayRow::Item { item, .. } => match item {
+                        PickerItem::GrepHit {
                             path_index,
                             relative_path,
-                        } => Some((path_index, relative_path.to_string())),
-                        // The create row is Explorer-only; grep (the only picker with headers)
-                        // never shows it, so it's never the pinned row.
-                        DisplayRow::Create { .. } => None,
-                    })
-            })
+                            ..
+                        } => Some((*path_index, relative_path.clone())),
+                        _ => None,
+                    },
+                    // A header at the top pins itself (identical overlay, no flicker).
+                    DisplayRow::Header {
+                        path_index,
+                        relative_path,
+                    } => Some((path_index, relative_path.to_string())),
+                    // The create row is Explorer-only; grep (the only picker with headers)
+                    // never shows it, so it's never the pinned row.
+                    DisplayRow::Create { .. } => None,
+                })
+        })
     };
     let pin_layer: Element<'_, PickerMsg> = match pinned {
         Some((path_index, relative_path)) => {
@@ -527,7 +627,11 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String]) -> Element<'a, P
 
 /// A grep group header row: bold file path on the panel background, [`ROW_H`] tall (it doubles
 /// as the sticky pinned header, so it must fully cover the row beneath).
-fn grep_header<'a>(roots: &[String], path_index: u32, relative_path: &str) -> Element<'a, PickerMsg> {
+fn grep_header<'a>(
+    roots: &[String],
+    path_index: u32,
+    relative_path: &str,
+) -> Element<'a, PickerMsg> {
     let mut label = root_label(roots, path_index).unwrap_or_default();
     label.push_str(relative_path);
     container(text(label).size(13).font(SANS_BOLD).color(theme::NORD8))
@@ -567,7 +671,11 @@ fn meta<'a>(s: String) -> Element<'a, PickerMsg> {
 
 /// One row's content per item kind. Layout mirrors the web client's row model: optional
 /// fixed-width bullet, primary text with match tinting, right-aligned meta.
-fn render_item<'a>(item: &'a PickerItem, roots: &'a [String], hovered: bool) -> Element<'a, PickerMsg> {
+fn render_item<'a>(
+    item: &'a PickerItem,
+    roots: &'a [String],
+    hovered: bool,
+) -> Element<'a, PickerMsg> {
     match item {
         PickerItem::File {
             path_index,
@@ -578,7 +686,13 @@ fn render_item<'a>(item: &'a PickerItem, roots: &'a [String], hovered: bool) -> 
             let mut r = row![dot_cell(git_status.map(git_status_color))]
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
-            r = r.push(highlighted(relative_path, match_indices, theme::NORD4, SANS, hovered));
+            r = r.push(highlighted(
+                relative_path,
+                match_indices,
+                theme::NORD4,
+                SANS,
+                hovered,
+            ));
             // Multi-root projects: the root's label, dim, after the path (web/terminal style).
             if let Some(label) = root_label(roots, *path_index) {
                 r = r.push(
@@ -760,9 +874,15 @@ fn render_item<'a>(item: &'a PickerItem, roots: &'a [String], hovered: bool) -> 
         PickerItem::Project {
             name,
             match_indices,
-        } => row![highlighted(name, match_indices, theme::NORD6, SANS, hovered)]
-            .align_y(iced::Alignment::Center)
-            .into(),
+        } => row![highlighted(
+            name,
+            match_indices,
+            theme::NORD6,
+            SANS,
+            hovered
+        )]
+        .align_y(iced::Alignment::Center)
+        .into(),
         PickerItem::LspServer {
             name,
             language,
@@ -774,8 +894,8 @@ fn render_item<'a>(item: &'a PickerItem, roots: &'a [String], hovered: bool) -> 
         } => {
             // Health dot (busy colour while progress is in flight), name, then dim metadata:
             // language, monorepo sub-root, and the active operation.
-            let busy = matches!(status, aether_protocol::lsp::LspStatus::Ready)
-                && !progress.is_empty();
+            let busy =
+                matches!(status, aether_protocol::lsp::LspStatus::Ready) && !progress.is_empty();
             let color = if busy {
                 theme::NORD13
             } else {
@@ -846,7 +966,13 @@ fn highlighted<'a>(
     font: iced::Font,
     underline: bool,
 ) -> Element<'a, PickerMsg> {
-    highlighted_owned(display.to_string(), match_indices.to_vec(), base, font, underline)
+    highlighted_owned(
+        display.to_string(),
+        match_indices.to_vec(),
+        base,
+        font,
+        underline,
+    )
 }
 
 /// [`highlighted`] over owned data, for displays derived on the fly (trimmed grep previews).

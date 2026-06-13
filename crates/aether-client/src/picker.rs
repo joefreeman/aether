@@ -85,7 +85,14 @@ pub struct PickerState {
     pub chip_selected: Option<usize>,
     /// Below-input editor line for valued chips (glob / dir); owns all keys while open.
     pub chip_editor: Option<ChipEditor>,
+    /// Spinner animation frame, advanced once per applied push while `ticking` — so the throttled
+    /// streaming-grep ticks (~16/s) drive the throbber without any client-side timer. See
+    /// [`PickerState::spinner_glyph`].
+    pub spinner_frame: u8,
 }
+
+/// Braille throbber frames for the "still searching" spinner (left of the picker's count).
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl PickerState {
     pub fn new(kind: PickerKind) -> Self {
@@ -111,7 +118,16 @@ impl PickerState {
             chips: Vec::new(),
             chip_selected: None,
             chip_editor: None,
+            spinner_frame: 0,
         }
+    }
+
+    /// The throbber glyph to show while a search is in progress (`ticking`), or `None` when settled.
+    /// The frame advances per applied push (see [`apply_update`]), so it animates while results
+    /// stream and stops the moment the search completes.
+    pub fn spinner_glyph(&self) -> Option<&'static str> {
+        self.ticking
+            .then(|| SPINNER_FRAMES[self.spinner_frame as usize % SPINNER_FRAMES.len()])
     }
 
     /// The rendered chip row, derived from the stored list.
@@ -208,10 +224,18 @@ impl PickerState {
         if u.kind != self.kind || u.generation != self.generation || u.offset != self.offset {
             return false;
         }
-        self.items = u.items;
+        // `None` is a throttled count-only tick (streaming grep): keep the current window, update
+        // the counts. `Some` replaces it (an empty vec is a genuinely empty result set).
+        if let Some(items) = u.items {
+            self.items = items;
+        }
         self.total_matches = u.total_matches;
         self.total_candidates = u.total_candidates;
         self.ticking = u.ticking;
+        // Advance the throbber each applied push while a search is still running.
+        if u.ticking {
+            self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        }
         self.display_offset = u.grep_display_offset.unwrap_or(u.offset);
         self.total_display_rows = u.grep_total_display_rows.unwrap_or(u.total_matches);
         if let Some(center) = self.pending_center.take() {
@@ -451,12 +475,14 @@ mod tests {
             kind,
             generation,
             offset,
-            items: (0..n)
-                .map(|i| PickerItem::Project {
-                    name: format!("p{i}"),
-                    match_indices: vec![],
-                })
-                .collect(),
+            items: Some(
+                (0..n)
+                    .map(|i| PickerItem::Project {
+                        name: format!("p{i}"),
+                        match_indices: vec![],
+                    })
+                    .collect(),
+            ),
             total_matches: total,
             total_candidates: total,
             ticking: false,
@@ -499,6 +525,26 @@ mod tests {
     }
 
     #[test]
+    fn count_only_update_keeps_items_and_advances_counts() {
+        // A streaming grep: the window fills, then the server sends throttled count-only ticks
+        // (`items: None`) as the candidate count climbs.
+        let mut s = PickerState::new(PickerKind::Grep);
+        assert!(s.apply_update(update(PickerKind::Grep, 0, 0, 5, 64)));
+        assert_eq!(s.items.len(), 5);
+        assert_eq!(s.total_matches, 64);
+        // Count-only tick: `items: None` → keep the window, bump the counts.
+        let mut tick = update(PickerKind::Grep, 0, 0, 0, 128);
+        tick.items = None;
+        tick.total_candidates = 9000;
+        tick.ticking = true;
+        assert!(s.apply_update(tick));
+        assert_eq!(s.items.len(), 5, "count-only tick must not wipe the window");
+        assert_eq!(s.total_matches, 128);
+        assert_eq!(s.total_candidates, 9000);
+        assert!(s.ticking);
+    }
+
+    #[test]
     fn grep_display_rows_align_with_server_offsets() {
         let hit = |path: &str, line: u32| PickerItem::GrepHit {
             path_index: 0,
@@ -514,7 +560,7 @@ mod tests {
             kind: PickerKind::Grep,
             generation: 0,
             offset: 10,
-            items: vec![hit("a.rs", 1), hit("a.rs", 2), hit("b.rs", 1)],
+            items: Some(vec![hit("a.rs", 1), hit("a.rs", 2), hit("b.rs", 1)]),
             // This window is the END of the result set (rows 13..18 of 18).
             total_matches: 13,
             total_candidates: 13,
@@ -575,7 +621,7 @@ mod tests {
             kind: PickerKind::Explorer,
             generation: 0,
             offset: 0,
-            items: vec![
+            items: Some(vec![
                 PickerItem::DirEntry {
                     name: "docs".into(),
                     is_dir: true,
@@ -588,7 +634,7 @@ mod tests {
                     match_indices: vec![],
                     git_status: Some(GitStatus::Modified), // decoration the anchor lacks
                 },
-            ],
+            ]),
             total_matches: 2,
             total_candidates: 2,
             ticking: false,
@@ -620,15 +666,17 @@ mod tests {
             kind: PickerKind::Explorer,
             generation: 0,
             offset: 0,
-            items: names
-                .iter()
-                .map(|n| PickerItem::DirEntry {
-                    name: (*n).into(),
-                    is_dir: false,
-                    match_indices: vec![],
-                    git_status: None,
-                })
-                .collect(),
+            items: Some(
+                names
+                    .iter()
+                    .map(|n| PickerItem::DirEntry {
+                        name: (*n).into(),
+                        is_dir: false,
+                        match_indices: vec![],
+                        git_status: None,
+                    })
+                    .collect(),
+            ),
             total_matches: names.len() as u32,
             total_candidates: names.len() as u32,
             ticking: false,
@@ -680,7 +728,7 @@ mod tests {
         let mut s = explorer_with(&["a.rs", "b.rs"]);
         s.query = "c.rs".into();
         assert_eq!(s.create_row_index(), Some(2)); // one past the two matches
-                                                    // Arrow down walks onto the create row without forcing a refetch.
+                                                   // Arrow down walks onto the create row without forcing a refetch.
         assert_eq!(s.move_selection(1), None);
         assert_eq!(s.selected, 1);
         assert_eq!(s.move_selection(1), None);

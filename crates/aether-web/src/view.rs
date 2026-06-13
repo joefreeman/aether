@@ -76,8 +76,13 @@ fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
                 "items": p.items.iter().map(jv).collect::<Vec<_>>(),
                 "total_matches": p.total_matches,
                 "total_candidates": p.total_candidates,
+                // The web throbber is CSS-animated off `ticking` (the braille `spinner_glyph` is for
+                // the terminal); no glyph needed here.
                 "ticking": p.ticking,
                 "total_display_rows": p.total_display_rows,
+                // Display-row index of the loaded window's first rendered row (a grep header sits one
+                // row above the first hit) — where the shell positions the window within the spacer.
+                "window_base": p.window_base(),
                 "directory": p.directory,
                 "directory_parent": p.directory_parent,
                 // The Explorer's synthetic "+ Create …" affordance (core-owned decision). `abs` is

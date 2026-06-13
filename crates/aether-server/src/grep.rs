@@ -22,6 +22,7 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Minimum query length that triggers a search. Below this the picker shows an empty result set
@@ -36,6 +37,12 @@ const BATCH_SIZE: usize = 64;
 /// Channel depth between the blocking walker and the async coordinator. A few batches of
 /// backpressure lets the walker stay ahead of the apply path without unbounded memory.
 const CHANNEL_DEPTH: usize = 8;
+
+/// How often, at most, a count-only progress tick is pushed while the visible window is full and
+/// unchanged. The hits keep accumulating server-side every batch; the client only needs the count
+/// to climb smoothly, not on every 64-hit batch (a broad query streams thousands). Window-content
+/// changes and the final result still push immediately.
+const COUNT_THROTTLE: Duration = Duration::from_millis(60);
 
 /// Hard cap on a hit's preview, in chars. Without it a hit on a single-line minified file (or
 /// any long line) ships the whole line per match — multiplied across a result window that's
@@ -139,6 +146,8 @@ async fn run_search(
         // Dropping `batch_tx` here signals end-of-stream to the coordinator.
     });
 
+    // Throttle clock for count-only ticks (see `COUNT_THROTTLE`). Window-content changes ignore it.
+    let mut last_send = Instant::now() - COUNT_THROTTLE;
     loop {
         let batch = batch_rx.recv().await;
         let mut s = state.lock().await;
@@ -152,12 +161,24 @@ async fn run_search(
         }
         match batch {
             Some(batch) => {
+                let mut start_idx = 0;
                 if let PickerCandidates::Grep(ref mut cands) = picker.candidates {
-                    let start_idx = cands.len() as u32;
+                    start_idx = cands.len() as u32;
                     cands.extend(batch);
                     let new_len = cands.len() as u32;
                     picker.ranked.extend(start_idx..new_len);
                 }
+                // Did this batch touch the subscribed window? Grep ranks in insertion order, so the
+                // window only changes while it's still filling (`start_idx` falls inside it); once
+                // full it's stable. An unchanged window is a count-only tick — throttle it and don't
+                // re-serialize the items. (No window subscribed → treat as count-only.)
+                let window_end = picker.subscribed.map_or(0, |w| w.offset + w.limit);
+                let window_changed = start_idx < window_end;
+                let now = Instant::now();
+                if !window_changed && now.duration_since(last_send) < COUNT_THROTTLE {
+                    continue; // skip this tick; the count rides the next send / the final push
+                }
+                last_send = now;
                 let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
                 let crate::state::ServerState {
                     pickers, matcher, ..
@@ -166,6 +187,9 @@ async fn run_search(
                 let mut update = picker_state::build_update(picker, matcher);
                 if let Some(ref mut u) = update {
                     u.ticking = true;
+                    if !window_changed {
+                        u.items = None; // count-only tick: keep the client's (stable) window
+                    }
                 }
                 drop(s);
                 if let (Some(sender), Some(params)) = (outbound, update) {

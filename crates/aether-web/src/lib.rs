@@ -149,6 +149,20 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.picker_wheel(delta as i64)))
     }
 
+    /// The results list was scrolled so its first visible row is `first_visible_row` (display rows;
+    /// the shell converts `scrollTop / row_height`). Refetches the window around that scroll position
+    /// when it has left the loaded range — WITHOUT moving the selection (free scroll, unlike
+    /// `picker_wheel`). Returns `Effect[]` (empty when the window already covers the view).
+    pub fn picker_scrolled(&mut self, first_visible_row: u32) -> Result<JsValue, JsValue> {
+        let offset = self
+            .inner
+            .picker
+            .as_ref()
+            .and_then(|p| p.scrolled_refetch(first_visible_row));
+        let fx = offset.map_or_else(Effects::none, |o| self.inner.picker_refetch(o));
+        to_js(&effects_to_json(fx))
+    }
+
     /// Replace the picker query (the shell's native `<input>` owns text editing and syncs the full
     /// value). Returns `Effect[]`.
     pub fn picker_set_query(&mut self, query: String) -> Result<JsValue, JsValue> {

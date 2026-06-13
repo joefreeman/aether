@@ -151,6 +151,7 @@ interface PickerView {
   total_candidates: number;
   ticking: boolean;
   total_display_rows: number;
+  window_base: number;
   directory: string | null;
   directory_parent: string | null;
   /** The Explorer's synthetic "+ Create …" affordance (view.rs `create`); null when not offered.
@@ -454,6 +455,8 @@ export class Shell {
   private readonly pickerInput: HTMLInputElement;
   private readonly pickerPathEl: HTMLElement;
   private readonly pickerCountEl: HTMLElement;
+  /** CSS-animated throbber to the left of the count, shown while a search streams. */
+  private readonly pickerSpinnerEl: HTMLElement;
   private readonly pickerChipsEl: HTMLElement;
   private readonly pickerEditorRow: HTMLElement;
   private readonly pickerListEl: HTMLElement;
@@ -482,6 +485,16 @@ export class Shell {
   /** The most recent `view()` — refreshed every `render()`, read by the geometry methods so they
    *  don't re-serialize the window on every scroll event. */
   private snapshot: CoreView | null = null;
+  /** Pending coalesced-render frame (see `scheduleRender`); null when none is queued. */
+  private renderRaf: number | null = null;
+  /** Set by the `RevealPickerSelection` effect: the next picker render scrolls the highlighted row
+   *  into view (keyboard nav / refetch reveal). Free wheel-scrolling never sets it. */
+  private pickerReveal = false;
+  /** Set by the `PickerScrollReset` effect (a query change): the next picker render jumps to the top. */
+  private pickerScrollReset = false;
+  /** Measured picker display-row height (px), for the virtual-scroll spacer + window positioning.
+   *  Defaults to the native client's 24; re-measured from a real row each render. */
+  private pickerRowH = 24;
   /** The address-bar URL we last wrote (the boot URL scheme reflecting the current buffer + cursor),
    *  and a debounce timer so a burst of cursor moves coalesces into one replaceState. */
   private lastUrl: string | null = null;
@@ -611,15 +624,28 @@ export class Shell {
     this.pickerInput.setAttribute("autocomplete", "off");
     this.pickerCountEl = document.createElement("span");
     this.pickerCountEl.className = "picker-count";
+    this.pickerSpinnerEl = document.createElement("span");
+    this.pickerSpinnerEl.className = "picker-spinner";
+    this.pickerSpinnerEl.style.display = "none";
     // Chips lead the row, left of the breadcrumb + query they prefix (`:empty` hides the box).
     this.pickerChipsEl = document.createElement("div");
     this.pickerChipsEl.className = "picker-chips";
-    pickerInputRow.append(this.pickerChipsEl, this.pickerPathEl, this.pickerInput, this.pickerCountEl);
+    pickerInputRow.append(
+      this.pickerChipsEl,
+      this.pickerPathEl,
+      this.pickerInput,
+      this.pickerSpinnerEl,
+      this.pickerCountEl,
+    );
     this.pickerEditorRow = document.createElement("div");
     this.pickerEditorRow.className = "picker-editor-row";
     this.pickerEditorRow.style.display = "none";
     this.pickerListEl = document.createElement("div");
     this.pickerListEl.className = "picker-list";
+    // Scrolling into an unloaded range refetches the window around it (no selection change) — the
+    // native client's virtual scroll. `scrolled_refetch` no-ops when the window already covers the
+    // view, so firing on every scroll event is cheap.
+    this.pickerListEl.addEventListener("scroll", () => this.onPickerListScroll(), { passive: true });
     pickerPanel.append(pickerInputRow, this.pickerEditorRow, this.pickerListEl);
     this.pickerEl.append(pickerPanel);
     this.pickerInput.addEventListener("input", () => {
@@ -657,16 +683,9 @@ export class Shell {
     this.editorRootInput.addEventListener("input", () => {
       if (this.session) this.runEffects(this.session.chip_editor_set_root_filter(this.editorRootInput.value) as CoreEffect[]);
     });
-    // Wheel over the list moves the selection (the core's row model); renderPicker keeps it in view.
-    this.pickerListEl.addEventListener(
-      "wheel",
-      (e) => {
-        if (!this.session) return;
-        e.preventDefault();
-        this.runEffects(this.session.picker_wheel(e.deltaY > 0 ? 1 : -1) as CoreEffect[]);
-      },
-      { passive: false },
-    );
+    // The wheel scrolls the list natively (overflow-y: auto) without touching the selection — like
+    // the native client. The highlight only moves on keyboard nav, which reveals it via the
+    // `RevealPickerSelection` effect; free scrolling leaves it where it is.
     this.capture = document.createElement("textarea");
     this.capture.className = "clipboard-capture";
     this.capture.tabIndex = -1;
@@ -955,7 +974,11 @@ export class Shell {
 
   private onNotification(method: string, params: unknown): void {
     if (!this.session) return;
-    this.runEffects(this.session.on_event(method, params) as CoreEffect[]);
+    // Coalesce the redraw: a streaming grep emits a `picker/update` per batch (and the broad
+    // intermediate queries flood them), so rendering synchronously per push falls badly behind —
+    // each render re-serializes the whole wasm view + reconciles the DOM. Apply every push to core
+    // state immediately, but paint at most once per frame (the native client coalesces the same way).
+    this.runEffects(this.session.on_event(method, params) as CoreEffect[], true);
   }
 
   /** Connection-state changes from the transport. `client.ts` owns the socket reconnect (backoff);
@@ -1030,8 +1053,9 @@ export class Shell {
   }
 
   /** Execute one batch of effects, then repaint from the fresh view. Async effects (Request, the
-   *  geometry reveals) repaint again when they settle. */
-  private runEffects(effects: CoreEffect[]): void {
+   *  geometry reveals) repaint again when they settle. `coalesce` defers the final paint to the next
+   *  animation frame so a burst (streaming server pushes) collapses into one render. */
+  private runEffects(effects: CoreEffect[], coalesce = false): void {
     for (const e of effects) {
       switch (e.tag) {
         case "Request":
@@ -1075,13 +1099,31 @@ export class Shell {
             this.scrollAnchor = null;
           }
           break;
-        // RevealPickerSelection / PickerScrollReset: renderPicker keeps the selected row in view.
+        // Reveal the highlighted row on the next render (keyboard nav / refetch) — but not on a
+        // free wheel-scroll, which emits no effect. A query change resets the scroll to the top.
+        case "RevealPickerSelection":
+          this.pickerReveal = true;
+          break;
+        case "PickerScrollReset":
+          this.pickerScrollReset = true;
+          break;
         // Deferred to later milestones: Reconnect, Exit.
         default:
           break;
       }
     }
-    this.render();
+    if (coalesce) this.scheduleRender();
+    else this.render();
+  }
+
+  /** Paint at most once per animation frame. Used for streaming server pushes so a flood collapses
+   *  into one render; any direct `render()` in the meantime cancels the pending frame. */
+  private scheduleRender(): void {
+    if (this.renderRaf !== null) return;
+    this.renderRaf = requestAnimationFrame(() => {
+      this.renderRaf = null;
+      this.render();
+    });
   }
 
   /** A core-issued (semantic) RPC: send it, feed the outcome back through `on_rpc_result`. */
@@ -1444,6 +1486,11 @@ export class Shell {
   // ---- render ---------------------------------------------------------------------------------
 
   private render(): void {
+    // A direct paint supersedes any frame queued by scheduleRender — drop it so we don't double-render.
+    if (this.renderRaf !== null) {
+      cancelAnimationFrame(this.renderRaf);
+      this.renderRaf = null;
+    }
     const v = this.view();
     this.snapshot = v;
     this.renderSearch(v);
@@ -1691,8 +1738,18 @@ export class Shell {
     // The input is the source of truth for the text while focused; only write when the core changed
     // it out from under us (grep priming, a seeded open) to avoid clobbering the caret mid-type.
     if (this.pickerInput.value !== p.query) this.pickerInput.value = p.query;
+    // A CSS-animated throbber to the left of the count while a search streams (`ticking`); the
+    // count itself shows progress. CSS drives the rotation, so it stays smooth regardless of the
+    // push cadence.
+    this.pickerSpinnerEl.style.display = p.ticking ? "" : "none";
+    // A filtered file/buffer list shows `matched/total`; an unfiltered list — and grep, where every
+    // candidate is a hit — collapses to a single total (rather than the redundant "M/M").
     this.pickerCountEl.textContent =
-      `${p.total_matches}/${p.total_candidates}${p.ticking ? " …" : ""}`;
+      p.total_matches === 0
+        ? ""
+        : p.total_matches === p.total_candidates
+          ? `${p.total_matches}`
+          : `${p.total_matches}/${p.total_candidates}`;
     this.renderPickerChips(p);
     this.renderChipEditor(p.chip_editor);
     this.renderPickerList(p, v);
@@ -2175,13 +2232,24 @@ export class Shell {
     return row;
   }
 
+  /** The results list scrolled: refetch the window around the new position when it's left the loaded
+   *  range. `picker_scrolled` returns no effects (and we don't repaint) when the window still covers
+   *  the view — including the programmatic scrolls from reveal / scroll-reset. */
+  private onPickerListScroll(): void {
+    if (!this.session || !this.snapshot?.picker) return;
+    const first = Math.max(0, Math.floor(this.pickerListEl.scrollTop / this.pickerRowH));
+    const fx = this.session.picker_scrolled(first) as CoreEffect[];
+    if (fx.length) this.runEffects(fx, true);
+  }
+
   private renderPickerList(p: PickerView, v: CoreView): void {
     const projectPaths = v.project_paths;
     const list = this.pickerListEl;
-    // Empty list: show a status line so a slow search (grep streaming, references resolving) reads as
-    // "working", not "broken". `ticking` is the core's in-progress flag. When the Explorer offers a
-    // create for a name with no matches, the create row stands alone.
-    if (p.items.length === 0) {
+    // No results at all: show a status line so a slow search (grep streaming, references resolving)
+    // reads as "working", not "broken". Gated on `total_matches`, NOT `items.length` — a scroll
+    // refetch momentarily empties the window while results still exist, and collapsing the spacer
+    // here would reset scrollTop to the top. That case falls through to the spacer render below.
+    if (p.total_matches === 0) {
       if (p.create) {
         list.classList.add("filled");
         list.replaceChildren(this.makePickerCreateRow(p));
@@ -2213,15 +2281,25 @@ export class Shell {
     const ls = getComputedStyle(list);
     const budget = charBudget(list.clientWidth * 0.6, `${ls.fontSize} ${ls.fontFamily}`);
     const labels = rootLabels(projectPaths);
-    const rows: Node[] = [];
+    // Virtual scroll (matching the native client): a full-height spacer sized to the whole result set
+    // (in display rows) holds the loaded window, absolutely positioned `window_base` rows down — so
+    // the scrollbar spans every result and scrolling into an unloaded range refetches it
+    // (onPickerListScroll). Grep rows are grouped per file in a `.grep-section` so the file header can
+    // stick while its hits scroll; a hit's `scroll-margin-top` keeps it clear of that sticky header.
+    const win = document.createElement("div");
+    win.className = "picker-window";
     const localSel = p.selected - p.offset;
+    let selectedRow: HTMLElement | null = null;
     let prevGrepKey: string | null = null;
+    let section: HTMLElement | null = null;
     p.items.forEach((item, i) => {
       // Grep: a non-selectable file header before the first hit of each file in the window.
       if (item.kind === "grep_hit") {
         const key = `${item.path_index}\0${item.relative_path}`;
         if (key !== prevGrepKey) {
           prevGrepKey = key;
+          section = document.createElement("div");
+          section.className = "grep-section";
           const h = document.createElement("div");
           h.className = "picker-row grep-header";
           if (labels.length > 1) {
@@ -2231,7 +2309,8 @@ export class Shell {
           } else {
             h.textContent = truncatePath(item.relative_path, undefined, budget).display;
           }
-          rows.push(h);
+          section.append(h);
+          win.append(section);
         }
       }
       // File-backed rows are <a> so Ctrl/Cmd/middle-click opens in a new browser tab (the boot URL
@@ -2241,6 +2320,7 @@ export class Shell {
       if (href) (row as HTMLAnchorElement).href = href;
       row.className = i === localSel ? "picker-row selected" : "picker-row";
       if (item.kind === "grep_hit") row.classList.add("grep-hit");
+      if (i === localSel) selectedRow = row;
       row.addEventListener("mousedown", (e: MouseEvent) => {
         // New-tab gesture on an anchor row: let the browser open the <a> itself.
         if (href && (e.ctrlKey || e.metaKey || e.button === 1)) return;
@@ -2299,16 +2379,58 @@ export class Shell {
         dot.textContent = "●";
         row.append(dot);
       }
-      rows.push(row);
+      (section ?? win).append(row);
     });
-    // The Explorer's "+ Create …" row trails the final match — only once the window reaches the
-    // list's end (its abs index sits just past the last item), mirroring the core's display_rows.
+
+    const spacer = document.createElement("div");
+    spacer.className = "picker-spacer";
+    spacer.append(win);
+    // The Explorer's "+ Create …" row trails the final match (non-grep), absolutely placed within the
+    // spacer at display-row `total_matches` so it follows the last item.
+    let createRow: HTMLElement | null = null;
     if (p.create && p.offset + p.items.length >= p.total_matches) {
-      rows.push(this.makePickerCreateRow(p));
+      createRow = this.makePickerCreateRow(p);
+      if (p.selected === p.total_matches) selectedRow = createRow;
+      spacer.append(createRow);
     }
-    list.replaceChildren(...rows);
-    // Keep the highlighted row visible (keyboard nav and the wheel both move the selection).
-    list.querySelector(".picker-row.selected")?.scrollIntoView({ block: "nearest" });
+
+    // Position the window/create row and size the spacer from the row height (a `picker/update` push
+    // never carries the create row, so add a row for it). Applied before insertion — the window/create
+    // are absolute, so without an explicit spacer height the list would collapse and clamp scrollTop.
+    const applyGeometry = () => {
+      win.style.top = `${p.window_base * this.pickerRowH}px`;
+      spacer.style.height = `${(p.total_display_rows + (createRow ? 1 : 0)) * this.pickerRowH}px`;
+      if (createRow) createRow.style.top = `${p.total_matches * this.pickerRowH}px`;
+      list.style.setProperty("--picker-row-h", `${this.pickerRowH}px`);
+    };
+    applyGeometry();
+    list.replaceChildren(spacer);
+    // Re-measure the row height once in the DOM (fractional, so it doesn't drift over a long list) and
+    // re-apply if it changed.
+    const probe = win.querySelector(".picker-row:not(.grep-header)") as HTMLElement | null;
+    const measured = probe?.getBoundingClientRect().height ?? 0;
+    if (measured > 0 && Math.abs(measured - this.pickerRowH) > 0.5) {
+      this.pickerRowH = measured;
+      applyGeometry();
+    }
+
+    // Only move the scroll on an explicit signal: jump to the top on a query change, or reveal the
+    // highlighted row after keyboard nav / a refetch. A free wheel-scroll sets neither, so it stays
+    // where the user left it. (`scroll-margin-top` on grep hits keeps a revealed hit below the sticky
+    // file header.) Reset wins — the selection is row 0.
+    if (this.pickerScrollReset) {
+      list.scrollTop = 0;
+      this.pickerScrollReset = false;
+      this.pickerReveal = false;
+    } else if (this.pickerReveal && selectedRow) {
+      selectedRow.scrollIntoView({ block: "nearest" });
+      this.pickerReveal = false;
+    } else if (this.pickerReveal && p.total_matches === 0) {
+      // Nothing to reveal (empty result) — drop the pending reveal so it doesn't fire later.
+      this.pickerReveal = false;
+    }
+    // Otherwise keep `pickerReveal` armed: the resumed window hasn't painted the selected row yet
+    // (it arrives a render later), and we want to scroll to it once it does.
   }
 
   /** The status bar, matching the TUI / old web client: left = buffer-state dot + `[project] label`

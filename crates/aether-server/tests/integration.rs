@@ -21,12 +21,11 @@ use aether_protocol::git::{
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    CountedEditParams,
-    BufferOnlyParams, EditResult, InputBackspace, InputDedent, InputDelete, InputIndent,
-    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputRedo,
-    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
-    InputUnsurround, InputUnsurroundParams, SurroundTarget, UndoResult,
-    InputOpenLine, InputOpenLineParams, LineSide,
+    BufferOnlyParams, CountedEditParams, EditResult, InputBackspace, InputDedent, InputDelete,
+    InputIndent, InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent,
+    InputOpenLine, InputOpenLineParams, InputRedo, InputSurround, InputSurroundParams, InputText,
+    InputTextParams, InputToggleComment, InputUndo, InputUnsurround, InputUnsurroundParams,
+    LineSide, SurroundTarget, UndoResult,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -1060,7 +1059,10 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
         },
     )
     .await;
-    assert_eq!(nav.summary.total, 0, "primed query has no match in the empty buffer");
+    assert_eq!(
+        nav.summary.total, 0,
+        "primed query has no match in the empty buffer"
+    );
 
     // The origin was recorded: nav/back from the new buffer returns to it.
     let back: NavStepResult = send_request::<NavBack>(
@@ -1090,7 +1092,10 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
     assert_eq!(reopened.buffer_id, origin_id);
     // The anchored prime SELECTS the match: "beta" spans cols 6..=9 of "alpha beta".
     assert_eq!(reopened.cursor.anchor, LogicalPosition { line: 0, col: 6 });
-    assert_eq!(reopened.cursor.position, LogicalPosition { line: 0, col: 9 });
+    assert_eq!(
+        reopened.cursor.position,
+        LogicalPosition { line: 0, col: 9 }
+    );
     // ...and the summary on the response reflects the single live match.
     let primed = reopened
         .search_summary
@@ -1154,7 +1159,9 @@ async fn buffer_close_open_next_attaches_in_one_trip() {
         },
     )
     .await;
-    let opened = closed.opened.expect("open_next opens a scratch when none remain");
+    let opened = closed
+        .opened
+        .expect("open_next opens a scratch when none remain");
     assert_eq!(closed.next_buffer_id, None);
     assert!(opened.path.is_none(), "fresh scratch has no path");
     assert!(opened.scratch_number.is_some());
@@ -1202,7 +1209,10 @@ async fn project_activate_open_last_lands_in_one_trip() {
     assert_eq!(r.last_buffer_id, None);
     let opened = r.opened.expect("open_last opens a scratch on first visit");
     assert!(opened.path.is_none());
-    assert!(opened.transient, "first-visit scratch is a transient placeholder");
+    assert!(
+        opened.transient,
+        "first-visit scratch is a transient placeholder"
+    );
 }
 
 #[tokio::test]
@@ -1264,7 +1274,10 @@ async fn input_open_line_below_and_above() {
         },
     )
     .await;
-    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "    indented\n    \nplain\n");
+    assert_eq!(
+        buffer_text(&mut ws, 12, buffer_id).await,
+        "    indented\n    \nplain\n"
+    );
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
 
     // `O` above the (now) "plain" line: pushes it down, lands at col 0 of the new line.
@@ -1443,7 +1456,11 @@ async fn search_nav_count_and_revive() {
     )
     .await;
     assert_eq!(r.summary.total, 3);
-    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 8 }, "third x");
+    assert_eq!(
+        r.cursor.position,
+        LogicalPosition { line: 0, col: 8 },
+        "third x"
+    );
 
     // Reviving a query with no matches: the step is skipped, zero summary comes back.
     let r: SearchNavResult = send_request::<SearchNext>(
@@ -1551,13 +1568,15 @@ async fn cursor_move_selection_edges() {
             LogicalPosition { line: 0, col: 2 },
         ),
         // One past line 1's last char ("xy z" → col 4) — the end-of-line caret slot.
-        (SelectionEdge::LastLineEnd, LogicalPosition { line: 1, col: 4 }),
+        (
+            SelectionEdge::LastLineEnd,
+            LogicalPosition { line: 1, col: 4 },
+        ),
     ];
     let mut id = 10;
     for (edge, want) in cases {
         send_request::<CursorSet>(&mut ws, id, &select).await;
-        let st: CursorState =
-            send_request::<CursorMove>(&mut ws, id + 1, &edge_move(edge)).await;
+        let st: CursorState = send_request::<CursorMove>(&mut ws, id + 1, &edge_move(edge)).await;
         assert_eq!(st.position, want, "{edge:?}");
         assert_eq!(st.anchor, want, "{edge:?} collapses to a point");
         id += 2;
@@ -1595,13 +1614,15 @@ async fn cursor_move_selection_edges() {
             SelectionEdge::FirstLineNonblank,
             LogicalPosition { line: 2, col: 0 },
         ),
-        (SelectionEdge::LastLineEnd, LogicalPosition { line: 2, col: 0 }),
+        (
+            SelectionEdge::LastLineEnd,
+            LogicalPosition { line: 2, col: 0 },
+        ),
     ];
     id += 2;
     for (edge, want) in degenerate {
         send_request::<CursorSet>(&mut ws, id, &point).await;
-        let st: CursorState =
-            send_request::<CursorMove>(&mut ws, id + 1, &edge_move(edge)).await;
+        let st: CursorState = send_request::<CursorMove>(&mut ws, id + 1, &edge_move(edge)).await;
         assert_eq!(st.position, want, "{edge:?} from a point on the empty line");
         id += 2;
     }
@@ -4047,8 +4068,15 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
 
     // Undo: should revert "XY", cursor back to col 3, and (since saved_revision is 0) the
     // revision drops to 0 — client derives `dirty == false` from that.
-    let undo: UndoResult =
-        send_request::<InputUndo>(&mut ws, 13, &CountedEditParams { buffer_id, count: 1 }).await;
+    let undo: UndoResult = send_request::<InputUndo>(
+        &mut ws,
+        13,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(undo.applied);
     assert_eq!(undo.cursor.position, LogicalPosition { line: 0, col: 3 });
     assert_eq!(undo.revision, 0, "undo back to saved revision");
@@ -4060,8 +4088,15 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     );
 
     // Redo: re-applies "XY", revision advances past saved.
-    let redo: UndoResult =
-        send_request::<InputRedo>(&mut ws, 14, &CountedEditParams { buffer_id, count: 1 }).await;
+    let redo: UndoResult = send_request::<InputRedo>(
+        &mut ws,
+        14,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(redo.applied);
     assert!(redo.revision > 0);
     let notif =
@@ -4077,8 +4112,15 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
 #[tokio::test]
 async fn undo_on_empty_stack_returns_applied_false() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hi\n").await;
-    let r: UndoResult =
-        send_request::<InputUndo>(&mut ws, 10, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: UndoResult = send_request::<InputUndo>(
+        &mut ws,
+        10,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(!r.applied);
     drop(server);
 }
@@ -4152,8 +4194,15 @@ async fn dirty_clears_when_undoing_back_past_save() {
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     // Undo: should put "X" back, taking us back to the saved revision → derived dirty == false.
-    let undo: UndoResult =
-        send_request::<InputUndo>(&mut ws, 15, &CountedEditParams { buffer_id, count: 1 }).await;
+    let undo: UndoResult = send_request::<InputUndo>(
+        &mut ws,
+        15,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(undo.applied);
     assert_eq!(
         undo.revision, save.revision,
@@ -4315,8 +4364,15 @@ async fn join_lines_collapses_lines_with_single_space() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputJoinLines>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputJoinLines>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(r.revision > 0);
     let notif =
         expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
@@ -5224,14 +5280,28 @@ async fn motion_undo_restores_previous_cursor() {
     .await;
 
     // Undo: back to (1,2).
-    let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 12, &CursorUndoParams { buffer_id, count: 1 }).await;
+    let r: CursorUndoResult = send_request::<CursorUndo>(
+        &mut ws,
+        12,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
 
     // Undo again: back to the initial (0, 0).
-    let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id, count: 1 }).await;
+    let r: CursorUndoResult = send_request::<CursorUndo>(
+        &mut ws,
+        13,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
 
@@ -5255,11 +5325,26 @@ async fn motion_undo_then_redo_round_trips() {
     .await;
 
     // Undo → back to (0, 0).
-    send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id, count: 1 }).await;
+    send_request::<CursorUndo>(
+        &mut ws,
+        11,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
 
     // Redo → forward to (1, 3).
-    let r: CursorUndoResult =
-        send_request::<CursorRedo>(&mut ws, 12, &CursorUndoParams { buffer_id, count: 1 }).await;
+    let r: CursorUndoResult = send_request::<CursorRedo>(
+        &mut ws,
+        12,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 3 });
 
@@ -5270,8 +5355,15 @@ async fn motion_undo_then_redo_round_trips() {
 async fn motion_undo_returns_not_applied_when_stack_empty() {
     let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n").await;
 
-    let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 10, &CursorUndoParams { buffer_id, count: 1 }).await;
+    let r: CursorUndoResult = send_request::<CursorUndo>(
+        &mut ws,
+        10,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(!r.applied);
     // Cursor unchanged.
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
@@ -5320,8 +5412,15 @@ async fn motion_undo_stack_cleared_by_mutation() {
     )
     .await;
 
-    let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id, count: 1 }).await;
+    let r: CursorUndoResult = send_request::<CursorUndo>(
+        &mut ws,
+        13,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(!r.applied, "motion stack should be empty after a mutation");
 
     drop(server);
@@ -5343,7 +5442,15 @@ async fn motion_redo_cleared_by_new_motion() {
     )
     .await;
     // Undo populates redo.
-    send_request::<CursorUndo>(&mut ws, 11, &CursorUndoParams { buffer_id, count: 1 }).await;
+    send_request::<CursorUndo>(
+        &mut ws,
+        11,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     // New motion should clear the redo stack.
     send_request::<CursorSet>(
         &mut ws,
@@ -5357,8 +5464,15 @@ async fn motion_redo_cleared_by_new_motion() {
     )
     .await;
 
-    let r: CursorUndoResult =
-        send_request::<CursorRedo>(&mut ws, 13, &CursorUndoParams { buffer_id, count: 1 }).await;
+    let r: CursorUndoResult = send_request::<CursorRedo>(
+        &mut ws,
+        13,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(
         !r.applied,
         "redo stack should be empty after a fresh motion"
@@ -5401,15 +5515,29 @@ async fn motion_undo_records_select_line_and_swap() {
     assert_eq!(after_swap.position, LogicalPosition { line: 1, col: 0 });
 
     // Undo the swap.
-    let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 13, &CursorUndoParams { buffer_id, count: 1 }).await;
+    let r: CursorUndoResult = send_request::<CursorUndo>(
+        &mut ws,
+        13,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 0 });
 
     // Undo the select_line.
-    let r: CursorUndoResult =
-        send_request::<CursorUndo>(&mut ws, 14, &CursorUndoParams { buffer_id, count: 1 }).await;
+    let r: CursorUndoResult = send_request::<CursorUndo>(
+        &mut ws,
+        14,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
     assert_eq!(r.cursor.anchor, r.cursor.position);
@@ -6378,8 +6506,15 @@ async fn indent_single_line_adds_two_spaces() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputIndent>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputIndent>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     // Cursor follows the inserted indent.
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 5 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
@@ -6402,8 +6537,15 @@ async fn dedent_strips_two_spaces() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputDedent>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputDedent>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "alpha\nbeta\n");
@@ -6425,8 +6567,15 @@ async fn indent_multi_line_selection() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputIndent>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputIndent>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     // Anchor and cursor both shift +2 since both lines were indented.
     assert_eq!(r.cursor.position, LogicalPosition { line: 2, col: 2 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
@@ -6451,8 +6600,15 @@ async fn dedent_line_without_indent_is_noop_for_that_line() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputDedent>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputDedent>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     // Line 0 lost 2 chars, line 1 unchanged.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 1 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
@@ -6465,8 +6621,15 @@ async fn dedent_line_without_indent_is_noop_for_that_line() {
 #[tokio::test]
 async fn dedent_with_single_leading_space_strips_one() {
     let (server, mut ws, buffer_id) = setup_with_buffer(" alpha\n").await;
-    let r: EditResult =
-        send_request::<InputDedent>(&mut ws, 10, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputDedent>(
+        &mut ws,
+        10,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     let text = buffer_text(&mut ws, 11, buffer_id).await;
     assert_eq!(text, "alpha\n");
     // Cursor was at (0, 0); dedent removes 1 char, cursor stays at 0 (saturated).
@@ -8784,7 +8947,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
     assert_eq!(embedded.kind, PickerKind::Files);
     assert_eq!(embedded.offset, 0);
     assert_eq!(embedded.total_candidates, view.total_candidates);
-    assert!(!embedded.items.is_empty());
+    assert!(!embedded.items().is_empty());
 
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.kind, PickerKind::Files);
@@ -8795,7 +8958,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
         "empty query matches all"
     );
     let names: Vec<&str> = update
-        .items
+        .items()
         .iter()
         .map(|i| {
             let PickerItem::File { relative_path, .. } = i else {
@@ -8846,7 +9009,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
 
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.generation, 1);
-    let top = update.items.first().expect("at least one match");
+    let top = update.items().first().expect("at least one match");
     let PickerItem::File {
         relative_path,
         match_indices,
@@ -8900,7 +9063,7 @@ async fn picker_select_returns_absolute_path() {
     )
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let item = update.items.first().expect("a match for 'lib'").clone();
+    let item = update.items().first().expect("a match for 'lib'").clone();
     let PickerItem::File {
         ref relative_path, ..
     } = item
@@ -9005,7 +9168,7 @@ async fn picker_resume_centers_on_remembered_item() {
     assert_eq!(resume.effective_offset, 0);
 
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    assert!(update.items.iter().any(
+    assert!(update.items().iter().any(
         |i| matches!(i, PickerItem::File { relative_path, .. } if relative_path == "src/lib.rs")
     ));
 
@@ -9179,7 +9342,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let displays: Vec<&str> = update
-        .items
+        .items()
         .iter()
         .map(|i| {
             let PickerItem::Buffer { display, .. } = i else {
@@ -9193,7 +9356,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
     // File-backed buffers also carry their (root index, relative path) so the web client can build
     // an opener URL. Single-root project here, so the relative path equals the display string.
     let paths: Vec<(Option<u32>, Option<&str>)> = update
-        .items
+        .items()
         .iter()
         .map(|i| {
             let PickerItem::Buffer {
@@ -9257,7 +9420,7 @@ async fn buffers_picker_select_returns_buffer_id() {
     )
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let item = update.items.first().expect("at least one buffer").clone();
+    let item = update.items().first().expect("at least one buffer").clone();
     let result: PickerSelectResult = send_request::<PickerSelect>(
         &mut ws,
         11,
@@ -9382,11 +9545,11 @@ async fn buffers_picker_renders_scratch_placeholder() {
     );
     assert!(
         update
-            .items
+            .items()
             .iter()
             .any(|i| matches!(i, PickerItem::Buffer { display, .. } if display == &expected)),
         "expected display {expected:?} in items: {:?}",
-        update.items,
+        update.items(),
     );
 
     drop(server);
@@ -9497,7 +9660,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
     )
     .await;
     let initial: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let initial_status = match initial.items.first().unwrap() {
+    let initial_status = match initial.items().first().unwrap() {
         PickerItem::Buffer { status, .. } => *status,
         other => panic!("expected Buffer, got {other:?}"),
     };
@@ -9519,7 +9682,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
     // — may arrive first).
     let next: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let status_after = next
-        .items
+        .items()
         .iter()
         .find_map(|i| match i {
             PickerItem::Buffer {
@@ -9705,7 +9868,7 @@ async fn buffers_picker_pushes_on_save() {
     )
     .await;
     let dirty_view: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let saw_dirty = dirty_view.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Unsaved));
+    let saw_dirty = dirty_view.items().iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Unsaved));
     assert!(saw_dirty, "main.rs should be dirty after the edit");
 
     let _: BufferSaveResult = send_request::<BufferSave>(
@@ -9720,7 +9883,7 @@ async fn buffers_picker_pushes_on_save() {
     )
     .await;
     let clean: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let saw_clean = clean.items.iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Clean));
+    let saw_clean = clean.items().iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Clean));
     assert!(
         saw_clean,
         "save should flip dirty back off and re-push the picker"
@@ -9787,7 +9950,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let ids: Vec<u64> = update
-        .items
+        .items()
         .iter()
         .filter_map(|i| match i {
             PickerItem::Buffer { buffer_id, .. } => Some(*buffer_id),
@@ -9881,7 +10044,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws_b).await;
     let ids: Vec<u64> = update
-        .items
+        .items()
         .iter()
         .map(|i| {
             let PickerItem::Buffer { buffer_id, .. } = i else {
@@ -11389,7 +11552,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
     // 2 hits in main.rs + 1 hit in lib.rs = 3 GrepHits total.
     assert_eq!(final_update.total_matches, 3);
     let hit = final_update
-        .items
+        .items()
         .iter()
         .find(|i| matches!(i, PickerItem::GrepHit { relative_path, .. } if relative_path == "src/lib.rs"))
         .expect("lib.rs hit present");
@@ -11772,7 +11935,10 @@ async fn grep_navigate_open_composite_returns_opened_buffer() {
     assert!(opened.transient, "grep jumps open transient previews");
     // The primed search selects the hit: anchor at its start, head on its last char
     // ("needle" = 6 chars).
-    assert_eq!(opened.cursor.anchor, target.position, "selection starts at the hit");
+    assert_eq!(
+        opened.cursor.anchor, target.position,
+        "selection starts at the hit"
+    );
     assert_eq!(
         opened.cursor.position,
         LogicalPosition {
@@ -11805,10 +11971,7 @@ async fn grep_navigate_open_composite_returns_opened_buffer() {
         },
     )
     .await;
-    assert_eq!(
-        back.target.expect("origin recorded").buffer_id,
-        buffer_id
-    );
+    assert_eq!(back.target.expect("origin recorded").buffer_id, buffer_id);
 }
 
 #[tokio::test]
@@ -12038,7 +12201,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
     let update = drain_grep_until_done(&mut ws).await;
     // Resolved hit is src/main.rs:1:4.
     let item = update
-        .items
+        .items()
         .iter()
         .find(|i| matches!(i, PickerItem::GrepHit { relative_path, line, col, .. } if relative_path == "src/main.rs" && *line == 1 && *col == 4))
         .expect("main.rs:1:4 should be in the pushed window");
@@ -12266,7 +12429,7 @@ async fn picker_explorer_default_lists_project_root() {
 
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     let names: Vec<(String, bool)> = update
-        .items
+        .items()
         .iter()
         .map(|it| match it {
             PickerItem::DirEntry { name, is_dir, .. } => (name.clone(), *is_dir),
@@ -12319,7 +12482,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
     );
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     let names: Vec<String> = update
-        .items
+        .items()
         .iter()
         .map(|it| match it {
             PickerItem::DirEntry { name, .. } => name.clone(),
@@ -12367,7 +12530,7 @@ async fn picker_explorer_query_filters_by_prefix() {
     .await;
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     let kept: Vec<(String, Vec<u32>)> = update
-        .items
+        .items()
         .iter()
         .map(|it| match it {
             PickerItem::DirEntry {
@@ -12432,7 +12595,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
         update.total_matches, 0,
         "non-prefix `rc` should not match `src`"
     );
-    assert!(update.items.is_empty());
+    assert!(update.items().is_empty());
     drop(server);
 }
 
@@ -12496,7 +12659,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
     .await;
     let plain = expect_notification::<PickerUpdate>(&mut ws).await;
     let names: Vec<String> = plain
-        .items
+        .items()
         .iter()
         .map(|i| match i {
             PickerItem::DirEntry { name, .. } => name.clone(),
@@ -12519,7 +12682,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
     .await;
     let slashed = expect_notification::<PickerUpdate>(&mut ws).await;
     let names: Vec<String> = slashed
-        .items
+        .items()
         .iter()
         .map(|i| match i {
             PickerItem::DirEntry { name, is_dir, .. } => {
@@ -12637,7 +12800,7 @@ async fn picker_explorer_query_is_smartcase() {
     .await;
     let lower = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(lower.total_matches, 1);
-    match &lower.items[0] {
+    match &lower.items()[0] {
         PickerItem::DirEntry { name, .. } => assert_eq!(name, "README.md"),
         other => panic!("expected DirEntry, got {other:?}"),
     }
@@ -13113,7 +13276,7 @@ async fn picker_explorer_tags_entries_with_git_status() {
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     let status_of = |target: &str| -> Option<GitStatus> {
         update
-            .items
+            .items()
             .iter()
             .find_map(|it| match it {
                 PickerItem::DirEntry {
@@ -13168,7 +13331,7 @@ async fn picker_files_tags_entries_with_git_status() {
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     let status_of = |target: &str| -> Option<GitStatus> {
         update
-            .items
+            .items()
             .iter()
             .find_map(|it| match it {
                 PickerItem::File {
@@ -13178,7 +13341,7 @@ async fn picker_files_tags_entries_with_git_status() {
                 } if relative_path == target => Some(*git_status),
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("file {target:?} not in listing: {:?}", update.items))
+            .unwrap_or_else(|| panic!("file {target:?} not in listing: {:?}", update.items()))
     };
 
     assert_eq!(status_of("mod.rs"), Some(GitStatus::Modified));
@@ -13195,7 +13358,7 @@ async fn picker_files_tags_entries_with_git_status() {
     );
     assert!(
         !update
-            .items
+            .items()
             .iter()
             .any(|it| matches!(it, PickerItem::File { relative_path, .. } if relative_path == "debug.log")),
         "ignored files never appear in the Files picker"
@@ -14962,9 +15125,15 @@ async fn setup_git_apply(
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult =
-        send_request::<ProjectActivate>(&mut ws, 1, &ProjectActivateParams { name: proj.into(), open_last: false })
-            .await;
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: proj.into(),
+            open_last: false,
+        },
+    )
+    .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
@@ -15223,8 +15392,15 @@ async fn apply_hunk_reverts_modification_and_is_undoable() {
     );
 
     // The revert is an ordinary edit: one undo step brings the change back.
-    let _: UndoResult =
-        send_request::<InputUndo>(&mut ws, 7, &CountedEditParams { buffer_id, count: 1 }).await;
+    let _: UndoResult = send_request::<InputUndo>(
+        &mut ws,
+        7,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert_eq!(
         buffer_text(&mut ws, 8, buffer_id).await,
         "alpha\nBETA\ngamma\n"
@@ -16202,8 +16378,15 @@ async fn lsp_diagnostics_clear_on_undo() {
     );
 
     // Undo — the fix must send didChange so the server re-analyzes the reverted text and clears it.
-    let undo: UndoResult =
-        send_request::<InputUndo>(&mut ws, 13, &CountedEditParams { buffer_id, count: 1 }).await;
+    let undo: UndoResult = send_request::<InputUndo>(
+        &mut ws,
+        13,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert!(undo.applied);
     let cleared = wait_for_diag_state(&mut ws, false, 90).await;
     drop(server);
@@ -16422,7 +16605,7 @@ async fn references_picker_lists_all_uses() {
         final_update.total_matches
     );
     let lines: Vec<u32> = final_update
-        .items
+        .items()
         .iter()
         .map(|i| {
             let PickerItem::Reference {
@@ -16648,7 +16831,7 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.kind, PickerKind::Diagnostics);
 
-    let diag_item = update.items.iter().find_map(|i| match i {
+    let diag_item = update.items().iter().find_map(|i| match i {
         PickerItem::Diagnostic { message, .. } if !message.is_empty() => Some(i.clone()),
         _ => None,
     });
@@ -16950,8 +17133,15 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     subscribe(&mut ws_b, 3, buf_a).await;
 
     // Client A closes the shared buffer. It gets its next buffer in the RPC result...
-    let result: BufferCloseResult =
-        send_request::<BufferClose>(&mut ws_a, 5, &BufferCloseParams { buffer_id: buf_a, open_next: false }).await;
+    let result: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws_a,
+        5,
+        &BufferCloseParams {
+            buffer_id: buf_a,
+            open_next: false,
+        },
+    )
+    .await;
     assert_eq!(result.next_buffer_id, Some(buf_b));
 
     // ...and client B is pushed `buffer/closed` for the buffer it was viewing, with its own next.
@@ -17137,7 +17327,15 @@ async fn nav_goto_reopens_by_path() {
     .await;
     let (buf_a, _) = nav_open_file(&mut ws, 10, "a.txt", None).await;
     // Close it so the stale buffer_id forces the path fallback.
-    send_request::<BufferClose>(&mut ws, 20, &BufferCloseParams { buffer_id: buf_a, open_next: false }).await;
+    send_request::<BufferClose>(
+        &mut ws,
+        20,
+        &BufferCloseParams {
+            buffer_id: buf_a,
+            open_next: false,
+        },
+    )
+    .await;
 
     let res: NavStepResult = send_request::<NavGoto>(
         &mut ws,
@@ -17295,7 +17493,7 @@ async fn grep_with_filters(
 /// The relative paths hit by an update, deduplicated, in result order.
 fn grep_hit_files(update: &PickerUpdateParams) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for item in &update.items {
+    for item in update.items() {
         if let PickerItem::GrepHit { relative_path, .. } = item {
             if out.last() != Some(relative_path) {
                 out.push(relative_path.clone());
@@ -17497,7 +17695,7 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
     // Only the text file hits — the binary is skipped, not searched as raw bytes.
     assert_eq!(grep_hit_files(&update), vec!["minified.js"]);
     assert_eq!(update.total_matches, 1);
-    match &update.items[0] {
+    match &update.items()[0] {
         PickerItem::GrepHit {
             preview,
             match_indices,
@@ -17848,7 +18046,7 @@ async fn grep_filter_root_scope() {
     };
     let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
     assert_eq!(update.total_matches, 1);
-    match &update.items[0] {
+    match &update.items()[0] {
         PickerItem::GrepHit {
             path_index,
             relative_path,
@@ -17958,7 +18156,7 @@ async fn files_picker_filters_narrow_candidates() {
     };
     let update = files_query(&mut ws, 12, "ma", filters.clone(), 2).await;
     let names: Vec<&str> = update
-        .items
+        .items()
         .iter()
         .filter_map(|i| match i {
             PickerItem::File { relative_path, .. } => Some(relative_path.as_str()),
@@ -17978,7 +18176,7 @@ async fn files_picker_filters_narrow_candidates() {
     };
     let update = files_query(&mut ws, 13, "", filters, 3).await;
     let names: Vec<&str> = update
-        .items
+        .items()
         .iter()
         .filter_map(|i| match i {
             PickerItem::File { relative_path, .. } => Some(relative_path.as_str()),
@@ -18043,7 +18241,7 @@ async fn explorer_filters_hide_and_changed_only() {
 
     fn entry_names(update: &PickerUpdateParams) -> Vec<&str> {
         update
-            .items
+            .items()
             .iter()
             .filter_map(|i| match i {
                 PickerItem::DirEntry { name, .. } => Some(name.as_str()),
@@ -18226,7 +18424,9 @@ async fn transient_buffer_closes_on_disconnect() {
     // The server processes the close on its own task; give it a beat.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _: ProjectActivateResult = send_request::<ProjectActivate>(
         &mut ws2,
         1,
@@ -18584,7 +18784,7 @@ async fn buffers_picker_reports_transient_flag() {
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let flags: Vec<(u64, bool)> = update
-        .items
+        .items()
         .iter()
         .map(|i| {
             let PickerItem::Buffer {
