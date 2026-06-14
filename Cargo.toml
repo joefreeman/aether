@@ -23,6 +23,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde", "js"] }
 
+# Markdown (hover popovers) — parsed once in the core into an AST the shells render. Only the
+# parser is needed (no HTML renderer); already present transitively via iced's markdown widget.
+pulldown-cmark = { version = "0.12", default-features = false }
+
 # Async runtime & WebSocket transport
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "signal", "fs"] }
 tokio-tungstenite = "0.24"

@@ -796,12 +796,17 @@ fn lsp_hover_and_goto_shapes() {
     // Cursor-relative params carry only the buffer.
     let v = to_value(LspBufferParams { buffer_id: 3 }).unwrap();
     assert_eq!(v, json!({"buffer_id": 3}));
-    // Hover: optional contents.
+    // Hover: optional contents + the markdown-kind flag.
     let v = to_value(LspHoverResult {
         contents: Some("fn x()".into()),
+        markdown: true,
     })
     .unwrap();
     assert_eq!(v["contents"], "fn x()");
+    assert_eq!(v["markdown"], true);
+    // `markdown` defaults to false when absent (older servers / no content).
+    let r: LspHoverResult = serde_json::from_value(json!({ "contents": null })).unwrap();
+    assert!(!r.markdown);
     // Goto: optional location with absolute path + byte-col position.
     let r = LspGotoDefinitionResult {
         location: Some(LspLocation {

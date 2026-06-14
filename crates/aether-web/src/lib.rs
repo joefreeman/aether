@@ -10,7 +10,9 @@
 mod view;
 
 use aether_client::effect::{Effect, Effects, ToastKind};
-use aether_client::keymap::{Action, KeyCode, Mods};
+use aether_client::keymap::{
+    hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
+};
 use aether_client::session::{buffer_info, HoverText, PasteKind, Session};
 use aether_client::transport::RpcError;
 use aether_client::update::Event;
@@ -350,6 +352,30 @@ impl WasmSession {
     }
 }
 
+/// Resolve a key for an open hover popover, reusing the editor's own Copy / Scroll bindings (see
+/// [`aether_client::keymap::hover_action`]) so the web popover's keys never drift from the keymap.
+/// Returns `null` for a non-popover key (the shell then dismisses the popover), `{kind:"copy"}`, or
+/// `{kind:"scroll", down:bool, unit:"line"|"half"|"page"}`.
+#[wasm_bindgen]
+pub fn hover_key(key: &str, ctrl: bool, alt: bool, shift: bool) -> Result<JsValue, JsValue> {
+    let value = parse_keycode(key)
+        .and_then(|code| hover_action(code, Mods { ctrl, alt, shift }))
+        .map(|action| match action {
+            HoverAction::Copy => json!({ "kind": "copy" }),
+            HoverAction::Scroll { dir, unit } => json!({
+                "kind": "scroll",
+                "down": matches!(dir, ScrollDir::Down),
+                "unit": match unit {
+                    ScrollUnit::Line => "line",
+                    ScrollUnit::Half => "half",
+                    ScrollUnit::Page => "page",
+                },
+            }),
+        })
+        .unwrap_or(Value::Null);
+    to_js(&value)
+}
+
 // ---- key normalisation (mirrors aether-iced/src/input.rs) -----------------------------------
 
 /// Browser `KeyboardEvent.key` → the core's [`KeyCode`]. `None` for keys we don't bind (modifier
@@ -463,7 +489,11 @@ fn hover_value(h: HoverText) -> Value {
                 "severity": b.severity.map(aether_client::session::severity_label),
             })).collect::<Vec<_>>(),
         }),
-        HoverText::Markdown(source) => json!({ "kind": "markdown", "source": source }),
+        // The parsed AST (Block/Inline derive Serialize) — the web shell renders it to DOM.
+        HoverText::Markdown(blocks) => json!({
+            "kind": "markdown",
+            "blocks": serde_json::to_value(&blocks).unwrap_or(Value::Null),
+        }),
     }
 }
 

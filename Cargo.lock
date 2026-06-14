@@ -29,6 +29,8 @@ name = "aether-client"
 version = "0.1.0"
 dependencies = [
  "aether-protocol",
+ "pulldown-cmark",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tracing",

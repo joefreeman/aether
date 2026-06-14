@@ -1715,20 +1715,27 @@ pub async fn lsp_hover(
         lsp_cursor_request(&s, ctx.client_id, params.buffer_id)
     };
     let Some(req) = req else {
-        return Ok(LspHoverResult { contents: None });
+        return Ok(LspHoverResult {
+            contents: None,
+            markdown: false,
+        });
     };
     let params_json = serde_json::json!({
         "textDocument": { "uri": req.uri },
         "position": { "line": req.line, "character": req.character },
     });
-    let contents = match req.client.request("textDocument/hover", params_json).await {
+    let parsed = match req.client.request("textDocument/hover", params_json).await {
         Ok(v) => parse_hover_contents(&v),
         Err(e) => {
             tracing::debug!(error = %e, "lsp hover request failed");
             None
         }
     };
-    Ok(LspHoverResult { contents })
+    let (contents, markdown) = match parsed {
+        Some((s, md)) => (Some(s), md),
+        None => (None, false),
+    };
+    Ok(LspHoverResult { contents, markdown })
 }
 
 /// Definition location for the symbol at the cursor. Returns `None` when there's no ready server
@@ -2112,21 +2119,45 @@ fn lsp_pos_to_byte(
     Some(text.line_to_byte(line) + byte_in_line)
 }
 
-/// Flatten an LSP hover `contents` (MarkupContent, MarkedString, or an array of them) to a string.
-fn parse_hover_contents(v: &serde_json::Value) -> Option<String> {
-    let s = markup_to_string(v.get("contents")?)?;
+/// Flatten an LSP hover `contents` (MarkupContent, MarkedString, or an array of them) to a string
+/// plus whether it's Markdown — so the client renders Markdown vs. literal plain text rather than
+/// assuming Markdown for everything.
+fn parse_hover_contents(v: &serde_json::Value) -> Option<(String, bool)> {
+    let (s, markdown) = markup_to_string(v.get("contents")?)?;
     let s = s.trim().to_string();
-    (!s.is_empty()).then_some(s)
+    (!s.is_empty()).then_some((s, markdown))
 }
 
-fn markup_to_string(c: &serde_json::Value) -> Option<String> {
+/// Returns `(text, is_markdown)`. Per LSP: a bare string and `MarkedString` are Markdown;
+/// `MarkupContent` carries an explicit `kind` (only `"plaintext"` is not Markdown); a
+/// `MarkedString { language, value }` is a code block, fenced so it renders as Markdown.
+fn markup_to_string(c: &serde_json::Value) -> Option<(String, bool)> {
     match c {
-        serde_json::Value::String(s) => Some(s.clone()),
-        // MarkupContent { kind, value } or the legacy MarkedString { language, value }.
-        serde_json::Value::Object(o) => o.get("value").and_then(|v| v.as_str()).map(String::from),
+        serde_json::Value::String(s) => Some((s.clone(), true)),
+        serde_json::Value::Object(o) => {
+            let value = o.get("value")?.as_str()?;
+            if let Some(lang) = o.get("language").and_then(|v| v.as_str()) {
+                // Legacy MarkedString { language, value }: a code block → fence it as Markdown.
+                Some((format!("```{lang}\n{value}\n```"), true))
+            } else {
+                // MarkupContent { kind, value }: Markdown unless explicitly plaintext.
+                let markdown = o.get("kind").and_then(|v| v.as_str()) != Some("plaintext");
+                Some((value.to_string(), markdown))
+            }
+        }
+        // MarkedString[] (legacy) — Markdown if any part is; parts joined as paragraphs.
         serde_json::Value::Array(a) => {
-            let parts: Vec<String> = a.iter().filter_map(markup_to_string).collect();
-            (!parts.is_empty()).then(|| parts.join("\n\n"))
+            let parts: Vec<(String, bool)> = a.iter().filter_map(markup_to_string).collect();
+            if parts.is_empty() {
+                return None;
+            }
+            let markdown = parts.iter().any(|(_, md)| *md);
+            let text = parts
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            Some((text, markdown))
         }
         _ => None,
     }
@@ -9887,19 +9918,30 @@ mod lsp_parse_tests {
 
     #[test]
     fn hover_markup_content_string_and_array() {
+        // MarkupContent markdown → text + markdown=true.
         assert_eq!(
-            parse_hover_contents(&json!({"contents": {"kind": "markdown", "value": "fn foo()"}}))
-                .as_deref(),
-            Some("fn foo()")
+            parse_hover_contents(&json!({"contents": {"kind": "markdown", "value": "fn foo()"}})),
+            Some(("fn foo()".into(), true))
         );
+        // MarkupContent plaintext → markdown=false (render literally).
         assert_eq!(
-            parse_hover_contents(&json!({"contents": "plain"})).as_deref(),
-            Some("plain")
+            parse_hover_contents(&json!({"contents": {"kind": "plaintext", "value": "a*b_c"}})),
+            Some(("a*b_c".into(), false))
         );
+        // A bare string is a MarkedString → markdown.
         assert_eq!(
-            parse_hover_contents(&json!({"contents": [{"language": "rust", "value": "a"}, "b"]}))
-                .as_deref(),
-            Some("a\n\nb")
+            parse_hover_contents(&json!({"contents": "plain"})),
+            Some(("plain".into(), true))
+        );
+        // Legacy MarkedString { language, value } → fenced as a markdown code block.
+        assert_eq!(
+            parse_hover_contents(&json!({"contents": {"language": "rust", "value": "let x = 1;"}})),
+            Some(("```rust\nlet x = 1;\n```".into(), true))
+        );
+        // Array (MarkedString[]) → joined, markdown if any part is.
+        assert_eq!(
+            parse_hover_contents(&json!({"contents": [{"language": "rust", "value": "a"}, "b"]})),
+            Some(("```rust\na\n```\n\nb".into(), true))
         );
     }
 

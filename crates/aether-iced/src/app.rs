@@ -12,8 +12,9 @@ pub use crate::core::effect::{Effect, Effects, ToastKind};
 pub use crate::core::session::*;
 use crate::core::update::Event as CoreEvent;
 use crate::editor::{self, ClickKind, EditorEvent, GUTTER_COLS, PAD};
+use crate::core::markdown::{Block as MdBlock, Inline as MdInline};
 use crate::grid;
-use crate::keymap::{Action, KeyCode, Mods, ScrollDir, ScrollUnit};
+use crate::keymap::{hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit};
 use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
 use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
@@ -136,10 +137,27 @@ enum PromptMsg {
 enum HoverContent {
     Blocks(Vec<HoverBlock>),
     Markdown {
-        items: Vec<iced::widget::markdown::Item>,
-        /// Source line count, for the place-above-or-below estimate.
+        /// The shared hover AST (parsed in the core), rendered by `md_doc`.
+        blocks: Vec<MdBlock>,
+        /// Estimated wrapped-row count, for the place-above-or-below decision.
         est_lines: usize,
     },
+}
+
+impl HoverContent {
+    /// The whole popover as plain text, for "copy popover content" (`Ctrl-y`) — iced's `rich_text`
+    /// can't be drag-selected, so this is the copy affordance. Diagnostic/commit blocks join by
+    /// blank lines; Markdown flattens via the shared AST serializer.
+    fn to_plain_text(&self) -> String {
+        match self {
+            HoverContent::Blocks(blocks) => blocks
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            HoverContent::Markdown { blocks, .. } => crate::core::markdown::to_plain(blocks),
+        }
+    }
 }
 
 /// An in-flight smooth scroll: `scroll_px` eases from `from` to `to` over
@@ -176,6 +194,8 @@ pub enum Message {
     /// An RPC outcome for a core-issued `Effect::Request` (the token routes it back to
     /// the parked mapping in the session).
     RpcResult(u64, Result<serde_json::Value, crate::connection::RpcError>),
+    /// A Markdown link in the hover popover was clicked — open it in the OS handler.
+    OpenLink(String),
     Noop,
     /// Frame tick while a smooth scroll is in flight.
     AnimTick(std::time::Instant),
@@ -879,6 +899,10 @@ impl App {
                 let fx = self.session.on_rpc_result(token, result);
                 self.run_core(fx)
             }
+            Message::OpenLink(url) => {
+                open_link(&url);
+                Task::none()
+            }
             Message::Noop => Task::none(),
 
             Message::AnimTick(now) => {
@@ -994,19 +1018,9 @@ impl App {
                         crate::core::session::HoverText::Blocks(blocks) => {
                             HoverContent::Blocks(blocks)
                         }
-                        crate::core::session::HoverText::Markdown(text) => {
-                            // Estimate wrapped rows (not just raw lines) so the above/below flip
-                            // sees the real height — matching the Blocks heuristic below. Without
-                            // this, long markdown underestimates its height and never flips up.
-                            let est_lines = text
-                                .lines()
-                                .map(|l| 1 + l.len() / 90)
-                                .sum::<usize>()
-                                .max(1);
-                            HoverContent::Markdown {
-                                items: iced::widget::markdown::parse(&text).collect(),
-                                est_lines,
-                            }
+                        crate::core::session::HoverText::Markdown(blocks) => {
+                            let est_lines = md_estimate(&blocks).max(1);
+                            HoverContent::Markdown { blocks, est_lines }
                         }
                     });
                 }
@@ -1193,11 +1207,27 @@ impl App {
         // While a hover popover is open, scroll keys pan it (and keep it open); any other key
         // dismisses it — Esc is then consumed, everything else still acts.
         if self.hover.is_some() {
-            if let Some(delta) = hover_scroll_delta(code, mods, self.cell) {
-                return iced::widget::operation::scroll_by(
-                    hover_scroll_id(),
-                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: delta },
-                );
+            // The popover reuses the editor's own Copy / Scroll bindings (`keymap::hover_action`), so
+            // its chords never drift from the keymap. Copy / scroll keep it open; any other key
+            // dismisses it (Esc is then consumed).
+            match hover_action(code, mods) {
+                // rich_text can't be drag-selected, so copy-all is the affordance; toast mirrors the
+                // normal copy.
+                Some(HoverAction::Copy) => {
+                    let text = self.hover.as_ref().unwrap().to_plain_text();
+                    let note = self.toast("copied popover", ToastKind::Success);
+                    return Task::batch([iced::clipboard::write(text), note]);
+                }
+                Some(HoverAction::Scroll { dir, unit }) => {
+                    return iced::widget::operation::scroll_by(
+                        hover_scroll_id(),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: 0.0,
+                            y: hover_scroll_px(dir, unit, self.cell),
+                        },
+                    );
+                }
+                None => {}
             }
             self.hover = None;
             if code == KeyCode::Esc {
@@ -2156,26 +2186,11 @@ impl App {
                 col.into()
             }
             HoverContent::Markdown {
-                items,
+                blocks,
                 est_lines: n,
             } => {
                 est_lines = *n;
-                // Links in hover docs aren't followable yet — clicks are swallowed.
-                let mut settings = iced::widget::markdown::Settings::with_text_size(
-                    13,
-                    iced::widget::markdown::Style::from_palette(iced::Theme::Nord.palette()),
-                );
-                // Hover docs are a popover, not a document — headings step down gently
-                // instead of doubling.
-                settings.h1_size = iced::Pixels(16.0);
-                settings.h2_size = iced::Pixels(15.0);
-                settings.h3_size = iced::Pixels(14.0);
-                settings.h4_size = iced::Pixels(13.0);
-                settings.h5_size = iced::Pixels(13.0);
-                settings.h6_size = iced::Pixels(13.0);
-                settings.code_size = iced::Pixels(12.0);
-                Element::from(iced::widget::markdown::view(items, settings))
-                    .map(|_uri| Message::Noop)
+                md_doc(blocks)
             }
         };
         // Anchor at the cursor cell. Pick below/above by the room each side has for the
@@ -2280,6 +2295,12 @@ impl App {
             },
             ..container::Style::default()
         });
+        // Make the box opaque to mouse presses so a click on it doesn't fall through to the editor
+        // below (which would dismiss the popover *and* move the cursor). `opaque` updates its content
+        // first, so link clicks inside still open; it only swallows presses that nothing else
+        // consumed. Clicks in the transparent area *outside* the box still reach — and dismiss — the
+        // editor.
+        let boxed = iced::widget::opaque(boxed);
         match anchor {
             // Hangs down: top edge at `top`. `clip` keeps a height-underestimated popover from
             // drawing past the editor (over the status bar).
@@ -2575,27 +2596,240 @@ enum HoverPlace {
     Bottom(f32),
 }
 
+// ---- hover Markdown rendering (the shared AST → iced widgets) ----------------------------------
+//
+// Renders `aether_client::markdown` directly, so the native client matches the web (Nord0 code
+// blocks, accent inline code with no background, white headings, underlined links). Sizes/spacing
+// mirror the web client's CSS.
+
+const MD_TEXT: f32 = 13.0;
+const MD_CODE: f32 = 12.0;
+const MD_SPACING: f32 = 11.0;
+
+/// Render the hover Markdown AST: a column of block elements. Everything is cloned, so the result
+/// doesn't borrow the AST (`'static`).
+fn md_doc(blocks: &[MdBlock]) -> Element<'static, Message> {
+    let mut col = column![].spacing(MD_SPACING);
+    for b in blocks {
+        col = col.push(md_block(b));
+    }
+    col.into()
+}
+
+fn md_block(b: &MdBlock) -> Element<'static, Message> {
+    match b {
+        MdBlock::Heading { level, content } => {
+            let size = match level {
+                1 => 16.0,
+                2 => 15.0,
+                3 => 14.0,
+                _ => MD_TEXT,
+            };
+            md_rich(content, true, theme::NORD6, size)
+        }
+        MdBlock::Paragraph { content } => md_rich(content, false, theme::NORD4, MD_TEXT),
+        MdBlock::Code { code, .. } => container(
+            text(code.clone())
+                .font(iced::Font::MONOSPACE)
+                .size(MD_CODE)
+                .color(theme::NORD4),
+        )
+        .width(Length::Fill)
+        .padding([6, 8])
+        .style(|_| container::Style {
+            background: Some(theme::NORD0.into()),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..iced::Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into(),
+        MdBlock::List { ordered, items } => {
+            let mut col = column![].spacing(MD_SPACING * 0.5);
+            for (i, item) in items.iter().enumerate() {
+                let marker = if *ordered {
+                    format!("{}.", i + 1)
+                } else {
+                    "•".to_string()
+                };
+                col = col.push(
+                    row![
+                        text(marker).size(MD_TEXT).color(theme::NORD4),
+                        md_doc(item),
+                    ]
+                    .spacing(6),
+                );
+            }
+            col.into()
+        }
+        MdBlock::Quote { content } => row![md_bar(), md_doc(content)].spacing(8).into(),
+        MdBlock::Rule => container(iced::widget::Space::new())
+            .width(Length::Fill)
+            .height(1)
+            .style(md_bar_style)
+            .into(),
+    }
+}
+
+/// A thin Nord3 bar (the blockquote rule / horizontal rule fill).
+fn md_bar() -> Element<'static, Message> {
+    container(iced::widget::Space::new())
+        .width(2)
+        .height(Length::Fill)
+        .style(md_bar_style)
+        .into()
+}
+
+fn md_bar_style(_: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(theme::NORD3.into()),
+        ..container::Style::default()
+    }
+}
+
+/// A `rich_text` of the inline AST. `bold`/`base_color` seed the styling (headings pass bold +
+/// white); code and link spans override colour, and links also get an underline + click handler.
+fn md_rich(inlines: &[MdInline], bold: bool, base_color: iced::Color, size: f32) -> Element<'static, Message> {
+    let mut spans = Vec::new();
+    md_spans(inlines, bold, false, None, base_color, &mut spans);
+    iced::widget::rich_text(spans)
+        .size(size)
+        .on_link_click(Message::OpenLink)
+        .into()
+}
+
+fn md_spans(
+    inlines: &[MdInline],
+    bold: bool,
+    italic: bool,
+    link: Option<&str>,
+    base: iced::Color,
+    out: &mut Vec<iced::advanced::text::Span<'static, String>>,
+) {
+    for inl in inlines {
+        match inl {
+            MdInline::Text { text } => out.push(md_span(text, bold, italic, false, link, base)),
+            MdInline::Code { text } => out.push(md_span(text, bold, italic, true, link, base)),
+            MdInline::Strong { content } => md_spans(content, true, italic, link, base, out),
+            MdInline::Emphasis { content } => md_spans(content, bold, true, link, base, out),
+            MdInline::Link { href, content } => {
+                md_spans(content, bold, italic, Some(href), base, out)
+            }
+        }
+    }
+}
+
+fn md_span(
+    text: &str,
+    bold: bool,
+    italic: bool,
+    code: bool,
+    link: Option<&str>,
+    base: iced::Color,
+) -> iced::advanced::text::Span<'static, String> {
+    let font = if code {
+        iced::Font::MONOSPACE
+    } else {
+        iced::Font {
+            weight: if bold {
+                iced::font::Weight::Bold
+            } else {
+                iced::font::Weight::Normal
+            },
+            style: if italic {
+                iced::font::Style::Italic
+            } else {
+                iced::font::Style::Normal
+            },
+            ..iced::Font::default()
+        }
+    };
+    let color = if link.is_some() {
+        theme::NORD9
+    } else if code {
+        theme::NORD8
+    } else {
+        base
+    };
+    let s = iced::widget::span(text.to_string()).font(font).color(color);
+    match link {
+        Some(href) => s.link(href.to_string()).underline(true),
+        None => s.link_maybe(None::<String>),
+    }
+}
+
+/// Estimate the rendered height (wrapped rows) of the AST, for the place-above-or-below decision.
+fn md_estimate(blocks: &[MdBlock]) -> usize {
+    blocks.iter().map(md_estimate_block).sum()
+}
+
+fn md_estimate_block(b: &MdBlock) -> usize {
+    match b {
+        MdBlock::Heading { content, .. } | MdBlock::Paragraph { content } => {
+            1 + md_text_len(content) / 80
+        }
+        MdBlock::Code { code, .. } => code.lines().count().max(1) + 1,
+        MdBlock::List { items, .. } => items.iter().map(|it| md_estimate(it)).sum::<usize>().max(1),
+        MdBlock::Quote { content } => md_estimate(content),
+        MdBlock::Rule => 1,
+    }
+}
+
+fn md_text_len(inlines: &[MdInline]) -> usize {
+    inlines
+        .iter()
+        .map(|i| match i {
+            MdInline::Text { text } | MdInline::Code { text } => text.len(),
+            MdInline::Strong { content }
+            | MdInline::Emphasis { content }
+            | MdInline::Link { content, .. } => md_text_len(content),
+        })
+        .sum()
+}
+
+/// Open a hover-link URL in the OS's default handler. Restricted to web/mail/file schemes so an
+/// LSP-supplied link can't run an arbitrary command via the shell-out.
+fn open_link(url: &str) {
+    if !["http://", "https://", "mailto:", "file:"]
+        .iter()
+        .any(|p| url.starts_with(p))
+    {
+        return;
+    }
+    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("open", &[])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", &["/C", "start", ""])
+    } else {
+        ("xdg-open", &[])
+    };
+    let _ = std::process::Command::new(program)
+        .args(args)
+        .arg(url)
+        .spawn();
+}
+
 /// The hover popover's scrollable id, for programmatic `scroll_by` (keyboard panning).
 fn hover_scroll_id() -> iced::advanced::widget::Id {
     iced::advanced::widget::Id::new("hover-scroll")
 }
 
-/// Vertical scroll delta (px) for a key while the hover popover is open, or `None` if the key
-/// isn't a scroll key (so the popover dismisses instead). Up/Down move a line, Alt-Up/Down half
-/// a page, PageUp/Down a page — mirroring the editor's scroll units. The page proxy is the
-/// popover's max content height (its `max_height` less padding).
-fn hover_scroll_delta(code: KeyCode, mods: Mods, cell: Option<Size>) -> Option<f32> {
+/// Vertical scroll delta (px) for a resolved popover [`HoverAction::Scroll`]: a line is one cell
+/// height, half/page use the popover's max content height (its `max_height` less padding) as the
+/// page proxy — mirroring the editor's scroll units.
+fn hover_scroll_px(dir: ScrollDir, unit: ScrollUnit, cell: Option<Size>) -> f32 {
     const PAGE: f32 = 360.0;
-    let line = cell.map_or(18.0, |c| c.height);
-    Some(match code {
-        KeyCode::Up if mods.alt => -PAGE / 2.0,
-        KeyCode::Down if mods.alt => PAGE / 2.0,
-        KeyCode::Up => -line,
-        KeyCode::Down => line,
-        KeyCode::PageUp => -PAGE,
-        KeyCode::PageDown => PAGE,
-        _ => return None,
-    })
+    let mag = match unit {
+        ScrollUnit::Line => cell.map_or(18.0, |c| c.height),
+        ScrollUnit::Half => PAGE / 2.0,
+        ScrollUnit::Page => PAGE,
+    };
+    if matches!(dir, ScrollDir::Down) {
+        mag
+    } else {
+        -mag
+    }
 }
 
 /// Scroll the picker's results list so the highlighted row is in view. `Minimal` moves the

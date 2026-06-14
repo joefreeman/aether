@@ -108,7 +108,7 @@ impl ModPattern {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollDir {
     Up,
     Down,
@@ -116,7 +116,7 @@ pub enum ScrollDir {
     Right,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollUnit {
     Line,
     Half,
@@ -424,6 +424,34 @@ pub fn lookup(ctx: KeyContext, code: KeyCode, mods: Mods) -> Option<&'static Bin
     table(ctx).iter().find(|b| b.matches(code, mods))
 }
 
+/// What a key does to an *open hover popover*.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HoverAction {
+    /// Pan the popover (vertical only).
+    Scroll { dir: ScrollDir, unit: ScrollUnit },
+    /// Copy the whole popover to the clipboard.
+    Copy,
+}
+
+/// Resolve a key for an open hover popover, reusing the *same* Normal-context bindings the editor
+/// uses — `Ctrl-y` → [`Action::Copy`], the arrow / page keys → [`Action::Scroll`]. This keeps the
+/// popover's keys in lockstep with the real keymap (change a binding once and every client's popover
+/// follows) instead of each shell hardcoding the chords. Returns `None` for any other key, on which
+/// the shell dismisses the popover. Only vertical scrolls apply (a popover has no horizontal pan).
+pub fn hover_action(code: KeyCode, mods: Mods) -> Option<HoverAction> {
+    match lookup(KeyContext::Normal, code, mods).map(|b| &b.action) {
+        Some(Action::Scroll {
+            dir: dir @ (ScrollDir::Up | ScrollDir::Down),
+            unit,
+        }) => Some(HoverAction::Scroll {
+            dir: *dir,
+            unit: *unit,
+        }),
+        Some(Action::Copy) => Some(HoverAction::Copy),
+        _ => None,
+    }
+}
+
 use Action as A;
 use KeyContext::{Global as G, Insert as I, Leader as L, Normal as N};
 use ModPattern::{Any, Exact, IgnoreShift};
@@ -647,6 +675,37 @@ static LEADER: &[Binding] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_action_reuses_normal_copy_and_scroll_bindings() {
+        // Ctrl-y is the Normal-mode Copy binding; the popover reuses it.
+        assert_eq!(hover_action(ch('y'), Mods::CTRL), Some(HoverAction::Copy));
+        // Arrow / page keys resolve to the same Scroll units the editor uses.
+        assert_eq!(
+            hover_action(KeyCode::Down, Mods::NONE),
+            Some(HoverAction::Scroll {
+                dir: ScrollDir::Down,
+                unit: ScrollUnit::Line
+            })
+        );
+        assert_eq!(
+            hover_action(KeyCode::Up, Mods::ALT),
+            Some(HoverAction::Scroll {
+                dir: ScrollDir::Up,
+                unit: ScrollUnit::Half
+            })
+        );
+        assert_eq!(
+            hover_action(KeyCode::PageDown, Mods::NONE),
+            Some(HoverAction::Scroll {
+                dir: ScrollDir::Down,
+                unit: ScrollUnit::Page
+            })
+        );
+        // Horizontal scrolls and unrelated keys aren't popover actions (→ dismiss).
+        assert_eq!(hover_action(KeyCode::Left, Mods::NONE), None);
+        assert_eq!(hover_action(ch('a'), Mods::NONE), None);
+    }
 
     #[test]
     fn lookups_mirror_the_tui_tables() {

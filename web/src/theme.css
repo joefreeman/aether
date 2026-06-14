@@ -218,6 +218,11 @@ html, body, #app {
   max-height: 40vh;
   overflow: auto;
   overscroll-behavior: contain; /* wheeling the popover never chains to the buffer's scroll */
+  /* The buffer sets `user-select: none` (it draws its own selection); lift that here so popover
+     prose can be selected and copied with the mouse. The popover's own `mousedown` handler stops
+     propagation, so a drag-select here never starts an editor selection. */
+  user-select: text;
+  cursor: auto;
   background: var(--nord1);
   color: var(--nord4);
   border: 1px solid var(--nord3);
@@ -229,20 +234,50 @@ html, body, #app {
      code spans/fences stay monospace (see `#hover code` / `.md-code` below). */
   font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
-/* Markdown hover (LSP): code fences as blocks, inline code tinted, headings bold, rules dim. */
-#hover.markdown { white-space: normal; }
-#hover .md-line { margin: 2px 0; }
-#hover .md-heading { font-weight: bold; color: var(--nord8); }
+/* Markdown hover (LSP). A flex column with a uniform `gap` matches the native client's markdown
+   inter-element spacing; heading/base/code sizes match it too, and headings are white (not tinted)
+   like native. */
+#hover.markdown {
+  white-space: normal;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+#hover .md-line { margin: 0; }
+#hover .md-heading { font-weight: bold; color: var(--nord6); }
+#hover .md-h1 { font-size: 16px; }
+#hover .md-h2 { font-size: 15px; }
+#hover .md-h3 { font-size: 14px; }
+#hover .md-h4,
+#hover .md-h5,
+#hover .md-h6 { font-size: 13px; }
 #hover .md-code {
-  margin: 6px 0;
+  margin: 0;
   padding: 6px 8px;
   background: var(--nord0);
   border-radius: 4px;
   white-space: pre-wrap;
   font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
 }
 #hover code { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--nord8); }
-#hover hr { border: none; border-top: 1px solid var(--nord3); margin: 6px 0; }
+/* Lists: the list is one flex item (outer spacing via the gap); items get a small internal gap. */
+#hover .md-list { margin: 0; padding-left: 1.4em; }
+#hover .md-list li { margin: 2px 0; }
+/* Blockquote: a Nord3 left rule (matches the native client's bar). */
+#hover .md-quote {
+  margin: 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--nord3);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* Links: blue + underline (matches the native client's link colour). */
+#hover a,
+#hover .md-link { color: var(--nord9); text-decoration: underline; }
+#hover a:hover { color: var(--nord8); }
+#hover hr { border: none; border-top: 1px solid var(--nord3); margin: 0; }
 /* Stacked diagnostic / commit blocks: one paragraph each, severity-coloured by its .sev-* class. */
 #hover .hover-block + .hover-block { margin-top: 6px; }
 

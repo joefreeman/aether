@@ -349,12 +349,12 @@ pub struct HoverBlock {
     pub text: String,
 }
 
-/// The hover popover's *content* — what the core decides to show. The shell renders it
-/// (parsing markdown into its widget model is presentation, so the parse lives there).
+/// The hover popover's *content* — what the core decides to show. Markdown is parsed to a shared
+/// AST here (in the core) so every shell renders the same structure rather than re-parsing.
 #[derive(Debug)]
 pub enum HoverText {
     Blocks(Vec<HoverBlock>),
-    Markdown(String),
+    Markdown(Vec<crate::markdown::Block>),
 }
 
 /// What `Space o`'s blame → commit-info chain resolved to.

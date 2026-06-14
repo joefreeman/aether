@@ -26,9 +26,13 @@ impl RpcMethod for LspHover {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LspHoverResult {
-    /// Hover text (markdown or plain), or `None` when the server has nothing for the cursor / no
-    /// server is attached.
+    /// Hover text, or `None` when the server has nothing for the cursor / no server is attached.
     pub contents: Option<String>,
+    /// Whether `contents` is Markdown — the LSP `MarkupContent.kind` (or a `MarkedString` code
+    /// block), preserved so the client renders it as Markdown vs. literal plain text. `false` for
+    /// `kind: "plaintext"` (and when there's no content).
+    #[serde(default)]
+    pub markdown: bool,
 }
 
 // ---- lsp/goto_definition ------------------------------------------------------------------------

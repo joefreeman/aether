@@ -15,14 +15,14 @@
 //! milestones — `view().has_picker`/`has_prompt` and a few effects are intentionally stubbed below.
 
 import "./theme.css";
-import init, { WasmSession } from "./wasm/aether_web";
+import init, { WasmSession, hover_key } from "./wasm/aether_web";
 import { RpcClient, type ConnState } from "./client";
 import { renderBuffer } from "./render";
 import { decodeRow } from "./text";
 import { statusIcon, severityIcon, lspStateClass, type IconKind } from "./icons";
 import { truncatePath, charBudget } from "./paths";
 import { rootLabels } from "./labels";
-import { renderMarkdown } from "./markdown";
+import { renderHoverDoc, mdToPlain, type MdBlock } from "./markdown";
 import type {
   BufferOpenResult,
   BufferWindow,
@@ -112,8 +112,15 @@ interface CoreEffect {
 /** Hover-popover content from the core (Effect::ShowHover): rendered markdown (LSP hover) or stacked
  *  severity-coloured blocks (diagnostics-at-cursor, commit details). */
 type HoverContent =
-  | { kind: "markdown"; source: string }
+  | { kind: "markdown"; blocks: MdBlock[] }
   | { kind: "blocks"; blocks: { text: string; severity: string | null }[] };
+
+/** Result of the core's `hover_key` resolver: what an open popover does with a key (null = none, so
+ *  the shell dismisses it). Mirrors `aether_client::keymap::HoverAction`. */
+type HoverKeyResult =
+  | null
+  | { kind: "copy" }
+  | { kind: "scroll"; down: boolean; unit: "line" | "half" | "page" };
 
 /** Map a hover block's severity label (the core sends "Error"/"Warning"/"Info"/"Hint") to its
  *  text-colour CSS class. */
@@ -510,6 +517,8 @@ export class Shell {
   private readonly hoverEl: HTMLElement;
   private readonly hoverStrut: HTMLElement;
   private hoverOpen = false;
+  /** Content of the currently-shown popover, retained so Ctrl-y can copy it as plain text. */
+  private hoverContent?: HoverContent;
   /** The keyboard-shortcut help overlay (Space ?). A shell-local overlay — the core only triggers it
    *  (Effect::ShellAction OpenHelp); its content is sourced from the core's keymap (help_entries) and
    *  its tab/scroll/close keys are handled here, not the core. Built once, cached. */
@@ -949,13 +958,22 @@ export class Shell {
       this.handleHelpKey(e);
       return;
     }
-    // While a hover popover is open, scroll keys pan it (and keep it open); any other key
-    // dismisses it — Esc is then consumed, every other key still acts on the buffer.
+    // While a hover popover is open, it reuses the editor's own Copy / Scroll bindings — resolved
+    // by the core (`keymap::hover_action` via the wasm `hover_key`), so the chords never drift.
+    // Copy/scroll keep it open; any other key dismisses it — Esc is then consumed, every other key
+    // still acts on the buffer. (Content is also freely mouse-selectable; theme.css lifts
+    // `user-select` on #hover — this Ctrl-y path is the copy-all.)
     if (this.hoverOpen) {
-      const delta = this.hoverScrollDelta(e);
-      if (delta !== null) {
+      const ha = hover_key(e.key, e.ctrlKey, e.altKey, e.shiftKey) as HoverKeyResult;
+      if (ha?.kind === "copy") {
         e.preventDefault();
-        this.hoverEl.scrollBy({ top: delta });
+        void navigator.clipboard?.writeText(this.hoverPlainText()).catch(() => {});
+        this.toast("copied popover", "success");
+        return;
+      }
+      if (ha?.kind === "scroll") {
+        e.preventDefault();
+        this.hoverEl.scrollBy({ top: this.hoverScrollDelta(ha) });
         return;
       }
       // A lone modifier press (e.g. holding Alt to begin an Alt-Up chord) must not dismiss the
@@ -999,26 +1017,25 @@ export class Shell {
     this.runEffects(effects);
   }
 
+  /** The current popover as plain text (for Ctrl-y). Markdown flattens via the shared serializer;
+   *  diagnostic/commit blocks join by blank lines. */
+  private hoverPlainText(): string {
+    const c = this.hoverContent;
+    if (!c) return "";
+    return c.kind === "markdown"
+      ? mdToPlain(c.blocks)
+      : c.blocks.map((b) => b.text).join("\n\n");
+  }
+
   /**
-   * Vertical scroll delta (px) for a key while the hover popover is open, or null if it isn't a
-   * scroll key (so the popover dismisses instead). Up/Down move a line, Alt-Up/Down half a page,
-   * PageUp/Down a page — mirroring the editor's scroll units. Native `scrollBy` clamps to range.
+   * Vertical scroll delta (px) for a resolved popover scroll action. A line is one cell height;
+   * half/page use the popover's client height — mirroring the editor's scroll units. Native
+   * `scrollBy` clamps to range.
    */
-  private hoverScrollDelta(e: KeyboardEvent): number | null {
-    const line = this.cell.h;
+  private hoverScrollDelta(s: { down: boolean; unit: "line" | "half" | "page" }): number {
     const page = this.hoverEl.clientHeight;
-    switch (e.key) {
-      case "ArrowUp":
-        return e.altKey ? -page / 2 : -line;
-      case "ArrowDown":
-        return e.altKey ? page / 2 : line;
-      case "PageUp":
-        return -page;
-      case "PageDown":
-        return page;
-      default:
-        return null;
-    }
+    const mag = s.unit === "line" ? this.cell.h : s.unit === "half" ? page / 2 : page;
+    return s.down ? mag : -mag;
   }
 
   private onNotification(method: string, params: unknown): void {
@@ -2135,9 +2152,10 @@ export class Shell {
   /** Show the hover popover with content the core produced (Effect::ShowHover): rendered markdown
    *  (LSP hover) or stacked severity-coloured blocks (diagnostics-at-cursor, commit details). */
   private showHover(content: HoverContent): void {
+    this.hoverContent = content;
     this.hoverEl.classList.toggle("markdown", content.kind === "markdown");
     if (content.kind === "markdown") {
-      this.hoverEl.replaceChildren(renderMarkdown(content.source));
+      this.hoverEl.replaceChildren(renderHoverDoc(content.blocks));
     } else {
       const blocks = content.blocks.map((b) => {
         const el = document.createElement("div");
@@ -2215,6 +2233,7 @@ export class Shell {
   private dismissHover(): void {
     if (!this.hoverOpen) return;
     this.hoverOpen = false;
+    this.hoverContent = undefined;
     this.hoverEl.remove(); // detach popover + its offset strut from the buffer spacer
     this.hoverStrut.remove();
     this.hoverEl.replaceChildren();

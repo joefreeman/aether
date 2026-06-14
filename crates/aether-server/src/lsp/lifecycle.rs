@@ -53,6 +53,12 @@ pub async fn initialize(
             "textDocument": {
                 "synchronization": { "dynamicRegistration": false, "didSave": true },
                 "publishDiagnostics": { "relatedInformation": true },
+                // We render hover text as Markdown (preferred) or plain — advertise both so servers
+                // (e.g. rust-analyzer) send rich Markdown instead of falling back to plaintext.
+                "hover": { "contentFormat": ["markdown", "plaintext"] },
+                // We parse `LocationLink` (its precise `targetSelectionRange`), so let servers send
+                // it for goto-definition instead of the coarser `Location`.
+                "definition": { "linkSupport": true },
             },
             // Let servers report background work (indexing, `cargo check`, …) via `$/progress`,
             // which we surface as the status-bar busy glyph and in the LSP picker.

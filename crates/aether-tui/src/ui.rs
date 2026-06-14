@@ -6,6 +6,7 @@ use crate::app::{
 };
 use aether_client::keymap;
 use aether_client::keymap::KeyCode;
+use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::{BlameInfo, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus};
@@ -62,6 +63,7 @@ const NORD2: Color = Color::Rgb(67, 76, 94); // Polar Night — selection backgr
 const NORD3: Color = Color::Rgb(76, 86, 106); // Polar Night — comments / dim
 const NORD3_BRIGHT: Color = Color::Rgb(97, 110, 136); // Polar Night — lighter dim (ignored entries)
 const NORD4: Color = Color::Rgb(216, 222, 233); // Snow Storm — main foreground
+const NORD6: Color = Color::Rgb(236, 239, 244); // Snow Storm — brightest (headings)
 const NORD7: Color = Color::Rgb(143, 188, 187); // Frost — types
 const NORD8: Color = Color::Rgb(136, 192, 208); // Frost — functions, accents
 const NORD9: Color = Color::Rgb(129, 161, 193); // Frost — keywords, operators
@@ -217,6 +219,10 @@ fn draw_project_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
 /// `state.help.scroll` pans the (possibly taller-than-the-box) content vertically.
 /// Max body height (rows of text) for the hover box — beyond this it scrolls.
 const HOVER_MAX_BODY: u16 = 16;
+/// Horizontal padding (cols) between the hover box border and its text, each side. When a
+/// scrollbar is shown it occupies the column flush against the right border, with this padding to
+/// its left (so the gap sits between the text and the scrollbar, not the scrollbar and the border).
+const HOVER_HPAD: u16 = 1;
 
 /// Computed placement of the hover popup within `area`: where the box sits and how its body is laid
 /// out. Shared by the renderer and the caret placement (which hides the terminal cursor when the box
@@ -226,8 +232,16 @@ struct HoverLayout {
     body_h: u16,
     text_w: u16,
     needs_scrollbar: bool,
-    /// Display lines paired with the severity color to render them in (`None` = plain).
-    lines: Vec<(String, Option<DiagnosticSeverity>)>,
+    /// Fully-styled, width-wrapped display lines.
+    lines: Vec<Line<'static>>,
+}
+
+/// The on-screen rectangle of the hover popup (border included), or `None` when no popup is showing.
+/// Used by the mouse handler to hit-test clicks/wheel against the popover. Reconstructs the editor
+/// area from the stored viewport size (the popup floats over the buffer, above the status row).
+pub fn hover_rect(state: &AppState) -> Option<Rect> {
+    let area = Rect::new(0, 0, state.viewport_cols as u16, state.viewport_rows as u16);
+    hover_layout(state, area).map(|l| l.area)
 }
 
 /// Lay out the hover popup: bottom-anchored, capped at [`HOVER_MAX_BODY`] rows (taller content
@@ -239,19 +253,20 @@ fn hover_layout(state: &AppState, area: Rect) -> Option<HoverLayout> {
     if content_w < 8 || max_body == 0 {
         return None;
     }
-    let full = hover_display_lines(&hover.blocks, content_w as usize);
+    // Text wraps inside the horizontal padding (one column reserved each side).
+    let text_w_plain = content_w.saturating_sub(2 * HOVER_HPAD);
+    let full = render_hover_lines(&hover.body, text_w_plain as usize);
     if full.is_empty() {
         return None;
     }
     let needs_scrollbar = full.len() as u16 > max_body;
-    // The scrollbar takes the last column plus a blank gap column before it.
+    // With a scrollbar, it takes the column flush against the right border; the right-side padding
+    // sits between the text and the scrollbar (so the text loses one more column).
     let (lines, text_w) = if needs_scrollbar {
-        (
-            hover_display_lines(&hover.blocks, content_w.saturating_sub(2) as usize),
-            content_w.saturating_sub(2),
-        )
+        let w = content_w.saturating_sub(2 * HOVER_HPAD + 1);
+        (render_hover_lines(&hover.body, w as usize), w)
     } else {
-        (full, content_w)
+        (full, text_w_plain)
     };
     let body_h = (lines.len() as u16).min(max_body);
     let box_h = body_h + 2;
@@ -280,7 +295,7 @@ fn draw_hover_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     f.render_widget(Clear, layout.area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(hover_border_color(&hover.blocks)))
+        .border_style(Style::default().fg(hover_border_color(&hover.body)))
         .style(Style::default().bg(NORD0).fg(NORD4));
     f.render_widget(block, layout.area);
     let inner = Rect {
@@ -292,20 +307,15 @@ fn draw_hover_overlay(f: &mut Frame, state: &AppState, area: Rect) {
 
     hover.scroll.record(total, layout.body_h);
     let offset = hover.scroll.offset();
+    // Inset the text by the left padding; the scrollbar (when shown) still sits in the last inner
+    // column, flush against the right border.
     let text_area = Rect {
+        x: inner.x + HOVER_HPAD,
         width: layout.text_w,
         ..inner
     };
-    let shown: Vec<Line> = layout
-        .lines
-        .into_iter()
-        .map(|(text, severity)| {
-            let fg = severity.map_or(NORD4, diag_color);
-            Line::from(Span::styled(text, Style::default().fg(fg)))
-        })
-        .collect();
     f.render_widget(
-        Paragraph::new(shown)
+        Paragraph::new(layout.lines)
             .style(Style::default().bg(NORD0).fg(NORD4))
             .scroll((offset, 0)),
         text_area,
@@ -345,14 +355,261 @@ fn hover_lines(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Border color for the hover popup: the worst severity among its blocks (matching the gutter dot /
-/// text), or frost blue (`NORD8`) for a plain LSP-hover popup with no severities.
-fn hover_border_color(blocks: &[crate::app::HoverBlock]) -> Color {
-    blocks
-        .iter()
-        .filter_map(|b| b.severity)
-        .max_by_key(|s| severity_rank(*s))
-        .map_or(NORD8, diag_color)
+/// Border color for the hover popup: the worst severity among its diagnostic blocks (matching the
+/// gutter dot / text), or frost blue (`NORD8`) for a Markdown LSP-hover popup.
+fn hover_border_color(body: &crate::app::HoverBody) -> Color {
+    match body {
+        crate::app::HoverBody::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.severity)
+            .max_by_key(|s| severity_rank(*s))
+            .map_or(NORD8, diag_color),
+        crate::app::HoverBody::Markdown(_) => NORD8,
+    }
+}
+
+/// Background for code (block & inline) in Markdown hovers.
+const MD_CODE_BG: Color = NORD1;
+
+/// Render a hover body to fully-styled, width-wrapped display lines. Diagnostic blocks keep their
+/// severity-icon prefix and colour; Markdown is rendered with headings, code backgrounds, inline
+/// emphasis, list indentation, and styled (non-clickable) links.
+fn render_hover_lines(body: &crate::app::HoverBody, width: usize) -> Vec<Line<'static>> {
+    match body {
+        crate::app::HoverBody::Blocks(blocks) => hover_display_lines(blocks, width)
+            .into_iter()
+            .map(|(text, severity)| {
+                let fg = severity.map_or(NORD4, diag_color);
+                Line::from(Span::styled(text, Style::default().fg(fg)))
+            })
+            .collect(),
+        crate::app::HoverBody::Markdown(blocks) => md_hover_lines(blocks, width),
+    }
+}
+
+/// Render a parsed Markdown document (the shared `aether_client::markdown` AST) to styled lines,
+/// wrapped to `width`. Blocks are separated by a blank line.
+fn md_hover_lines(blocks: &[MdBlock], width: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for block in blocks {
+        let lines = md_block_lines(block, width);
+        if lines.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(Line::default());
+        }
+        out.extend(lines);
+    }
+    out
+}
+
+fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
+    match block {
+        MdBlock::Heading { content, .. } => {
+            let base = Style::default().fg(NORD6).add_modifier(Modifier::BOLD);
+            let segs = md_inline_segs(content, base);
+            wrap_styled(&segs, width)
+                .into_iter()
+                .map(Line::from)
+                .collect()
+        }
+        MdBlock::Paragraph { content } => {
+            let segs = md_inline_segs(content, Style::default().fg(NORD4));
+            wrap_styled(&segs, width)
+                .into_iter()
+                .map(Line::from)
+                .collect()
+        }
+        MdBlock::Code { code, .. } => {
+            // Each code line gets a code background, padded out to the full width so the block reads
+            // as a solid panel.
+            let style = Style::default().fg(NORD4).bg(MD_CODE_BG);
+            code.split('\n')
+                .map(|raw| {
+                    let mut s: String = raw.chars().take(width).collect();
+                    let pad = width.saturating_sub(s.width());
+                    if pad > 0 {
+                        s.push_str(&" ".repeat(pad));
+                    }
+                    Line::from(Span::styled(s, style))
+                })
+                .collect()
+        }
+        MdBlock::List { ordered, items } => {
+            let mut out = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                let marker = if *ordered {
+                    format!("{}. ", i + 1)
+                } else {
+                    "• ".to_string()
+                };
+                let indent = " ".repeat(marker.width());
+                let inner_w = width.saturating_sub(marker.width());
+                let item_lines = md_hover_lines(item, inner_w);
+                for (j, line) in item_lines.into_iter().enumerate() {
+                    // First line of the item carries the bullet/number; continuation lines hang under
+                    // the text with a matching indent.
+                    let prefix = if j == 0 { marker.clone() } else { indent.clone() };
+                    let mut spans = vec![Span::styled(prefix, Style::default().fg(NORD4))];
+                    spans.extend(line.spans);
+                    out.push(Line::from(spans));
+                }
+            }
+            out
+        }
+        MdBlock::Quote { content } => {
+            let bar = Span::styled("│ ", Style::default().fg(NORD3));
+            let inner = md_hover_lines(content, width.saturating_sub(2));
+            inner
+                .into_iter()
+                .map(|line| {
+                    let mut spans = vec![bar.clone()];
+                    spans.extend(line.spans);
+                    Line::from(spans)
+                })
+                .collect()
+        }
+        MdBlock::Rule => {
+            vec![Line::from(Span::styled(
+                "─".repeat(width),
+                Style::default().fg(NORD3),
+            ))]
+        }
+    }
+}
+
+/// Flatten inline nodes into styled `(text, style)` segments, given the base style for plain text.
+fn md_inline_segs(inlines: &[MdInline], base: Style) -> Vec<(String, Style)> {
+    let mut out = Vec::new();
+    md_collect_segs(inlines, base, &mut out);
+    out
+}
+
+fn md_collect_segs(inlines: &[MdInline], base: Style, out: &mut Vec<(String, Style)>) {
+    for inl in inlines {
+        match inl {
+            MdInline::Text { text } => out.push((text.clone(), base)),
+            MdInline::Code { text } => {
+                out.push((text.clone(), base.fg(NORD8).bg(MD_CODE_BG)));
+            }
+            MdInline::Strong { content } => {
+                md_collect_segs(content, base.add_modifier(Modifier::BOLD), out);
+            }
+            MdInline::Emphasis { content } => {
+                md_collect_segs(content, base.add_modifier(Modifier::ITALIC), out);
+            }
+            MdInline::Link { content, .. } => {
+                // Terminals (ratatui's cell model) can't emit OSC 8 hyperlinks, so links are styled
+                // (frost blue + underline) but not clickable.
+                md_collect_segs(
+                    content,
+                    base.fg(NORD9).add_modifier(Modifier::UNDERLINED),
+                    out,
+                );
+            }
+        }
+    }
+}
+
+/// Greedy word-wrap over styled segments, preserving per-segment styling. Words longer than `width`
+/// are hard-broken. Returns one `Vec<Span>` per visual line.
+fn wrap_styled(segs: &[(String, Style)], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    for (text, style) in segs {
+        // Split into words while keeping the whitespace runs that separate them, so we can drop a
+        // space at a wrap point but keep interior spacing otherwise.
+        for word in split_keep_spaces(text) {
+            if word.chars().all(|c| c == ' ') {
+                // Whitespace: emit only if not at the start of a line.
+                if cur_w > 0 {
+                    let w = word.width();
+                    if cur_w + w <= width {
+                        cur.push(Span::styled(word, *style));
+                        cur_w += w;
+                    } else {
+                        lines.push(std::mem::take(&mut cur));
+                        cur_w = 0;
+                    }
+                }
+                continue;
+            }
+            let mut word = word;
+            loop {
+                let w = word.width();
+                if cur_w + w <= width {
+                    cur.push(Span::styled(word, *style));
+                    cur_w += w;
+                    break;
+                }
+                if cur_w == 0 {
+                    // Word alone is wider than the line: hard-break it at the column limit and keep
+                    // wrapping the remainder.
+                    let (head, remainder) = break_at(&word, width);
+                    cur.push(Span::styled(head, *style));
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                    if remainder.is_empty() {
+                        break;
+                    }
+                    word = remainder;
+                } else {
+                    // Retry the word on a fresh line.
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+    lines
+}
+
+/// Split `s` at the largest prefix whose display width is `<= width` (at least one char), returning
+/// `(head, remainder)`.
+fn break_at(s: &str, width: usize) -> (String, String) {
+    let mut head = String::new();
+    let mut head_w = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        let cw = c.width().unwrap_or(0);
+        if !head.is_empty() && head_w + cw > width {
+            break;
+        }
+        head.push(c);
+        head_w += cw;
+        chars.next();
+    }
+    (head, chars.collect())
+}
+
+/// Split a string into runs that are either all-spaces or all-non-spaces, preserving order.
+fn split_keep_spaces(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_space: Option<bool> = None;
+    for c in s.chars() {
+        let is_space = c == ' ';
+        if in_space != Some(is_space) {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            in_space = Some(is_space);
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Wrap each hover block to `width` and tag every produced line with the block's severity (for
@@ -5459,25 +5716,99 @@ mod tests {
         );
     }
 
+    /// Concatenate a styled line's span text for assertions.
+    #[cfg(test)]
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wrap_styled_breaks_on_spaces_and_preserves_style() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let segs = vec![("hello world foo".to_string(), bold)];
+        let lines = wrap_styled(&segs, 11);
+        // "hello world" fits in 11; "foo" wraps.
+        assert_eq!(lines.len(), 2);
+        let l0: String = lines[0].iter().map(|s| s.content.as_ref()).collect();
+        let l1: String = lines[1].iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(l0, "hello world");
+        assert_eq!(l1, "foo");
+        assert!(lines[0].iter().all(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn wrap_styled_hard_breaks_overlong_word() {
+        let segs = vec![("abcdefghij".to_string(), Style::default())];
+        let lines = wrap_styled(&segs, 4);
+        let joined: Vec<String> = lines
+            .iter()
+            .map(|l| l.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(joined, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn md_hover_lines_renders_heading_code_and_list() {
+        let blocks = aether_client::markdown::parse(
+            "# Title\n\nSome `inline` text.\n\n- one\n- two\n\n```\ncode\n```\n",
+        );
+        let lines = md_hover_lines(&blocks, 40);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        // Heading present and bold + brightest fg.
+        let heading = &lines[0];
+        assert_eq!(line_text(heading), "Title");
+        assert!(heading.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(heading.spans[0].style.fg, Some(NORD6));
+        // List bullets rendered.
+        assert!(texts.iter().any(|t| t.starts_with("• one")));
+        assert!(texts.iter().any(|t| t.starts_with("• two")));
+        // Inline code span carries the code background.
+        assert!(lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .any(|s| s.content.as_ref() == "inline" && s.style.bg == Some(MD_CODE_BG)));
+        // Fenced code line gets the code background and is width-padded.
+        assert!(lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.style.bg == Some(MD_CODE_BG))
+                && line_text(l).starts_with("code")));
+    }
+
+    #[test]
+    fn md_list_continuation_lines_hang_indent() {
+        let blocks = aether_client::markdown::parse("- alpha beta gamma delta\n");
+        // Narrow width forces the item to wrap onto a continuation line.
+        let lines = md_hover_lines(&blocks, 12);
+        assert!(lines.len() >= 2);
+        assert!(line_text(&lines[0]).starts_with("• "));
+        // Continuation indents under the text (two spaces, matching "• ").
+        assert!(line_text(&lines[1]).starts_with("  "));
+        assert!(!line_text(&lines[1]).starts_with("• "));
+    }
+
     #[test]
     fn hover_border_color_matches_worst_severity() {
-        use crate::app::HoverBlock;
+        use crate::app::{HoverBlock, HoverBody};
         let blk = |severity| HoverBlock {
             text: "m".into(),
             severity,
         };
-        // Plain hover → frost blue.
-        assert_eq!(hover_border_color(&[blk(None)]), NORD8);
+        // Plain (severity-less) diagnostic block → frost blue.
+        assert_eq!(hover_border_color(&HoverBody::Blocks(vec![blk(None)])), NORD8);
+        // Markdown hover → frost blue.
+        assert_eq!(hover_border_color(&HoverBody::Markdown(vec![])), NORD8);
         // Worst severity wins.
         assert_eq!(
-            hover_border_color(&[
+            hover_border_color(&HoverBody::Blocks(vec![
                 blk(Some(DiagnosticSeverity::Hint)),
                 blk(Some(DiagnosticSeverity::Error))
-            ]),
+            ])),
             diag_color(DiagnosticSeverity::Error)
         );
         assert_eq!(
-            hover_border_color(&[blk(Some(DiagnosticSeverity::Warning))]),
+            hover_border_color(&HoverBody::Blocks(vec![blk(Some(
+                DiagnosticSeverity::Warning
+            ))])),
             diag_color(DiagnosticSeverity::Warning)
         );
     }

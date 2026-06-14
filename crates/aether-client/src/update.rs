@@ -353,7 +353,15 @@ impl Session {
             Event::DiagNav(Err(e)) => Effects::error(e),
 
             Event::HoverInfo(Ok(r)) => match r.contents {
-                Some(text) => Effects::one(Effect::ShowHover(HoverText::Markdown(text))),
+                // Render per the server-reported kind: Markdown as Markdown, plaintext literally
+                // (a single block) so its `*`/`_`/`#`/backticks aren't misinterpreted as Markdown.
+                Some(text) if r.markdown => Effects::one(Effect::ShowHover(
+                    HoverText::Markdown(crate::markdown::parse(&text)),
+                )),
+                Some(text) => Effects::one(Effect::ShowHover(HoverText::Blocks(vec![HoverBlock {
+                    severity: None,
+                    text,
+                }]))),
                 None => {
                     let mut fx = Effects::one(Effect::DismissHover);
                     fx.push(Effect::Toast("No hover info".into(), ToastKind::Info));

@@ -226,15 +226,37 @@ pub struct HoverBlock {
 
 /// A showing hover/diagnostic popup: its content blocks plus the scroll offset within it (the box
 /// caps its height and scrolls when the content is taller).
+/// Hover popover content: severity-coloured paragraphs (diagnostics / commit details), or the
+/// shared Markdown AST (LSP hover) which the UI renders to styled lines.
+pub enum HoverBody {
+    Blocks(Vec<HoverBlock>),
+    Markdown(Vec<aether_client::markdown::Block>),
+}
+
+impl HoverBody {
+    /// The whole popover as plain text, for "copy popover content" (`Ctrl-y`). Diagnostic blocks are
+    /// joined by blank lines; Markdown is flattened via the shared AST serializer.
+    pub fn to_plain_text(&self) -> String {
+        match self {
+            HoverBody::Blocks(blocks) => blocks
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            HoverBody::Markdown(blocks) => aether_client::markdown::to_plain(blocks),
+        }
+    }
+}
+
 pub struct HoverPopup {
-    pub blocks: Vec<HoverBlock>,
+    pub body: HoverBody,
     pub scroll: crate::scroll::ScrollState,
 }
 
 impl HoverPopup {
-    pub fn from_blocks(blocks: Vec<HoverBlock>) -> Self {
+    pub fn new(body: HoverBody) -> Self {
         Self {
-            blocks,
+            body,
             scroll: crate::scroll::ScrollState::default(),
         }
     }

@@ -10,14 +10,16 @@
 //! `viewport/scroll_to_row` when the view nears the loaded range's edge.
 
 use crate::app::{
-    AppState, BlameState, EditorMode, EditorState, HoverBlock, HoverPopup, PendingLeader,
-    SearchState as TuiSearchState, StatusKind, StatusMessage,
+    AppState, BlameState, EditorMode, EditorState, HoverBlock, HoverBody, HoverPopup,
+    PendingLeader, SearchState as TuiSearchState, StatusKind, StatusMessage,
 };
 use crate::connection::Handle;
 use crate::connection::RpcError;
 use crate::{clipboard, labels, ui};
 use aether_client::effect::{Effect, Effects, ToastKind};
-use aether_client::keymap::{Action, KeyCode, Mods, ScrollDir, ScrollUnit};
+use aether_client::keymap::{
+    hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
+};
 use aether_client::session::{
     buffer_info, reconnect_backoff, HoverText, Mode, Pending, Prompt, Session,
 };
@@ -300,21 +302,20 @@ impl Shell {
                     }
                 }
                 Effect::ShowHover(text) => {
-                    let blocks = match text {
-                        HoverText::Blocks(blocks) => blocks
-                            .into_iter()
-                            .map(|b| HoverBlock {
-                                text: b.text,
-                                severity: b.severity,
-                            })
-                            .collect(),
-                        // Markdown rendered as its source — fine on a terminal.
-                        HoverText::Markdown(src) => vec![HoverBlock {
-                            text: src,
-                            severity: None,
-                        }],
+                    let body = match text {
+                        HoverText::Blocks(blocks) => HoverBody::Blocks(
+                            blocks
+                                .into_iter()
+                                .map(|b| HoverBlock {
+                                    text: b.text,
+                                    severity: b.severity,
+                                })
+                                .collect(),
+                        ),
+                        // The shared Markdown AST — the UI renders it to styled, wrapped lines.
+                        HoverText::Markdown(blocks) => HoverBody::Markdown(blocks),
                     };
-                    self.state.hover = Some(HoverPopup::from_blocks(blocks));
+                    self.state.hover = Some(HoverPopup::new(body));
                 }
                 Effect::DismissHover => self.state.hover = None,
                 Effect::WindowAdopted => {
@@ -448,40 +449,39 @@ impl Shell {
     }
 
     async fn on_key(&mut self, k: KeyEvent) {
-        // Hover: scroll keys pan the popover and keep it open; any other key dismisses it.
+        // Hover: the popover reuses the editor's own Copy / Scroll bindings (resolved by
+        // `keymap::hover_action`, so the chords never drift) — Ctrl-y copies its content, the scroll
+        // keys pan it and keep it open; any other key dismisses it.
         if self.state.hover.is_some() {
             if let Some((code, mods, _)) = translate_key(&k) {
-                if let Some(h) = self.state.hover.as_mut() {
-                    let handled = match code {
-                        KeyCode::Up if mods.alt => {
-                            h.scroll.half(false);
-                            true
+                match hover_action(code, mods) {
+                    // The terminal can't drag-select a cell-grid overlay, so copy-all is the
+                    // affordance. Leaves the popover open.
+                    Some(HoverAction::Copy) => {
+                        if let Some(h) = self.state.hover.as_ref() {
+                            let text = h.body.to_plain_text();
+                            match clipboard::copy(&mut self.state.clipboard, text) {
+                                Ok(()) => self
+                                    .status(StatusMessage::success("copied popover".to_string())),
+                                Err(e) => {
+                                    self.status(StatusMessage::error(format!("copy failed: {e}")))
+                                }
+                            }
                         }
-                        KeyCode::Down if mods.alt => {
-                            h.scroll.half(true);
-                            true
-                        }
-                        KeyCode::Up => {
-                            h.scroll.scroll_by(-1);
-                            true
-                        }
-                        KeyCode::Down => {
-                            h.scroll.scroll_by(1);
-                            true
-                        }
-                        KeyCode::PageUp => {
-                            h.scroll.page(false);
-                            true
-                        }
-                        KeyCode::PageDown => {
-                            h.scroll.page(true);
-                            true
-                        }
-                        _ => false,
-                    };
-                    if handled {
                         return;
                     }
+                    Some(HoverAction::Scroll { dir, unit }) => {
+                        if let Some(h) = self.state.hover.as_mut() {
+                            let down = matches!(dir, ScrollDir::Down);
+                            match unit {
+                                ScrollUnit::Line => h.scroll.scroll_by(if down { 1 } else { -1 }),
+                                ScrollUnit::Half => h.scroll.half(down),
+                                ScrollUnit::Page => h.scroll.page(down),
+                            }
+                        }
+                        return;
+                    }
+                    None => {}
                 }
             }
             self.state.hover = None;
@@ -548,6 +548,41 @@ impl Shell {
             let fx = self.session.picker_wheel(delta);
             self.run_effects(fx);
             return;
+        }
+        // The hover popover owns the wheel while the cursor is over it (scrolls the popover, not the
+        // buffer behind), and any click dismisses it — a click *inside* is consumed (so it doesn't
+        // also move the editor cursor), a click *outside* falls through to the editor below.
+        if self.state.hover.is_some() {
+            let over = ui::hover_rect(&self.state)
+                .map(|r| {
+                    m.column >= r.x
+                        && m.column < r.x + r.width
+                        && m.row >= r.y
+                        && m.row < r.y + r.height
+                })
+                .unwrap_or(false);
+            match m.kind {
+                MouseEventKind::ScrollUp if over => {
+                    if let Some(h) = self.state.hover.as_mut() {
+                        h.scroll.scroll_by(-3);
+                    }
+                    return;
+                }
+                MouseEventKind::ScrollDown if over => {
+                    if let Some(h) = self.state.hover.as_mut() {
+                        h.scroll.scroll_by(3);
+                    }
+                    return;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.state.hover = None;
+                    if over {
+                        return;
+                    }
+                    // Click outside the popover: fall through and treat it as an editor click.
+                }
+                _ => {}
+            }
         }
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_by(-3),
