@@ -519,6 +519,14 @@ export class Shell {
   private hoverOpen = false;
   /** Content of the currently-shown popover, retained so Ctrl-y can copy it as plain text. */
   private hoverContent?: HoverContent;
+  /** Tab favicon: the "ae" app mark when the buffer is clean, a state-coloured dot when dirty (the
+   *  tab's stand-in for the status bar's dirty marker). The clean mark is monochrome, so its ink
+   *  follows the tab's light/dark theme. */
+  private readonly faviconEl: HTMLLinkElement;
+  private readonly faviconDark = window.matchMedia("(prefers-color-scheme: dark)");
+  /** Last-applied (state, theme) key, so the <link> is only rewritten when it actually changes
+   *  (this runs on every status render). */
+  private faviconKey = "";
   /** The keyboard-shortcut help overlay (Space ?). A shell-local overlay — the core only triggers it
    *  (Effect::ShellAction OpenHelp); its content is sourced from the core's keymap (help_entries) and
    *  its tab/scroll/close keys are handled here, not the core. Built once, cached. */
@@ -762,6 +770,11 @@ export class Shell {
     // click-to-dismiss handler.
     this.hoverEl.addEventListener("wheel", (e) => e.stopPropagation());
     this.hoverEl.addEventListener("mousedown", (e) => e.stopPropagation());
+    // Tab favicon — a state dot when dirty, the "ae" mark when clean (which flips with the tab theme).
+    this.faviconEl = document.createElement("link");
+    this.faviconEl.rel = "icon";
+    document.head.appendChild(this.faviconEl);
+    this.faviconDark.addEventListener("change", () => this.updateFavicon());
     // The help overlay (Space ?): a backdrop + a tabbed, scrollable modal. Content is filled lazily
     // from the core's keymap on first open; clicking the backdrop closes it.
     this.helpEl = document.createElement("div");
@@ -2683,6 +2696,31 @@ export class Shell {
 
     this.statusEl.replaceChildren(left, right);
     document.title = v.project ? (v.buffer.label ? `[${v.project}] ${v.buffer.label}` : `[${v.project}]`) : "Aether";
+    this.updateFavicon(v);
+  }
+
+  /** Point the tab favicon (transparent background) at either the "ae" app mark when the buffer is
+   *  clean or a bold state-coloured dot when it's dirty — distinct shapes, not just a colour swap
+   *  (colours match the status bar's dirty dot, via `bufferStateColor`). The clean mark is
+   *  monochrome, so its ink follows the tab's light/dark theme. Skipped when the (state, theme) pair
+   *  is unchanged, since this runs on every status render. Ported from the pre-core web client. */
+  private updateFavicon(v?: CoreView): void {
+    if (!this.session) return;
+    const color = bufferStateColor(v ?? this.view());
+    const dark = this.faviconDark.matches;
+    const key = `${color ?? "ae"}:${dark ? "d" : "l"}`;
+    if (key === this.faviconKey) return;
+    this.faviconKey = key;
+    const mark = color
+      ? `<circle cx="16" cy="16" r="8" fill="${color}"/>`
+      : // The "æ" app mark as vector text (crisp at favicon size, unlike a hairline glyph path),
+        // inked light on a dark tab / dark on a light tab so it reads against the browser chrome.
+        // `&#230;` is the ASCII entity for æ, so the data URI stays pure-ASCII through encoding.
+        `<text x="16" y="15" text-anchor="middle" dominant-baseline="central" ` +
+        `font-family="system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif" ` +
+        `font-weight="400" font-size="32" fill="${dark ? "#d8dee9" : "#2e3440"}">&#230;</text>`;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">${mark}</svg>`;
+    this.faviconEl.href = `data:image/svg+xml,${encodeURIComponent(svg)}`;
   }
 
   // ---- toasts ---------------------------------------------------------------------------------
