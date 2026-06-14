@@ -386,6 +386,12 @@ pub struct EditorState {
     /// Highest legal `scroll_logical_line` — server-computed so it accounts for wrap, putting
     /// the buffer's last visual row at the bottom of the viewport.
     pub max_scroll_logical_line: u32,
+    /// Total visual rows in the whole buffer (wrapped rows + diff phantoms), from the window.
+    /// Drives the editor scrollbar's thumb size; `0` means unknown (no window yet).
+    pub total_visual_rows: u32,
+    /// Absolute visual row at the top of the viewport (accounts for wrap and `scroll_skip_rows`).
+    /// The editor scrollbar's thumb position.
+    pub top_visual_row: u32,
     pub wrap: WrapMode,
     /// Inline diff view toggle. Server-authoritative (per-viewport); mirrored here so the
     /// keybinding can flip it. When on, the server interleaves phantom "deleted" rows into the
@@ -1305,6 +1311,8 @@ mod tests {
             line_count: 0,
             git_status: None,
             max_scroll_logical_line: 0,
+            total_visual_rows: 0,
+            top_visual_row: 0,
             wrap: aether_protocol::viewport::WrapMode::None,
             diff_view: false,
             scroll_col: 0,

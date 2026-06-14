@@ -72,7 +72,10 @@ html, body, #app {
 #buffer.hscroll { overflow-x: auto; } /* native horizontal scroll when word wrap is off */
 /* Keep horizontal overscroll inside the buffer — never chain to the browser's back/forward swipe. */
 #buffer { overscroll-behavior-x: contain; }
-.buffer-spacer { position: relative; width: 100%; }
+/* `flow-root` establishes a block formatting context so the sticky hover popover's large
+   `margin-top` (its anchor offset) can't margin-collapse through the spacer and shove the
+   absolutely-positioned content down. (Not `overflow`, which would break the popover's sticky.) */
+.buffer-spacer { position: relative; width: 100%; display: flow-root; }
 .buffer-content { position: absolute; left: 0; right: 0; will-change: top; }
 
 /* Offscreen, focusable (not display:none) so it can hold focus and receive native paste events. */
@@ -136,7 +139,7 @@ html, body, #app {
 .sev-error { color: var(--nord11); }
 .sev-warning { color: var(--nord13); }
 .sev-information { color: var(--nord8); }
-.sev-hint { color: var(--nord3); }
+.sev-hint { color: var(--nord4); } /* near-white: readable on dark chrome, distinct from info */
 .lsp-ready { color: var(--nord14); }
 .lsp-busy { color: var(--nord13); }
 .lsp-crashed { color: var(--nord11); }
@@ -202,11 +205,19 @@ html, body, #app {
 }
 
 #hover {
-  position: fixed;
+  /* Lives inside the buffer's full-height spacer; `position: sticky` lets the browser glue it to
+     its anchor line as the buffer scrolls and clamp it to the editor's top/bottom edges (the
+     `top`/`bottom` insets) — on the compositor, so it tracks smoothly with no JS-on-scroll. The
+     anchor offset within the spacer is set via margin-top/left in `positionHover`. */
+  position: sticky;
+  top: 4px;
+  bottom: 4px;
   z-index: 20;
+  width: fit-content;
   max-width: 600px;
   max-height: 40vh;
   overflow: auto;
+  overscroll-behavior: contain; /* wheeling the popover never chains to the buffer's scroll */
   background: var(--nord1);
   color: var(--nord4);
   border: 1px solid var(--nord3);
@@ -214,6 +225,9 @@ html, body, #app {
   padding: 6px 10px;
   white-space: pre-wrap;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  /* Popover prose (hover/commit/diagnostic) is sans-serif like the rest of the chrome; only
+     code spans/fences stay monospace (see `#hover code` / `.md-code` below). */
+  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 /* Markdown hover (LSP): code fences as blocks, inline code tinted, headings bold, rules dim. */
 #hover.markdown { white-space: normal; }
@@ -236,7 +250,7 @@ html, body, #app {
 #hover.sev-error { color: var(--nord11); border-color: var(--nord11); }
 #hover.sev-warning { color: var(--nord13); border-color: var(--nord13); }
 #hover.sev-information { color: var(--nord8); border-color: var(--nord8); }
-#hover.sev-hint { color: var(--nord3); border-color: var(--nord3); }
+#hover.sev-hint { color: var(--nord4); border-color: var(--nord4); }
 
 /* Floating search input — sits above the status bar on the left, with a limited width (JS sets
    `bottom` to clear the status bar; `display` toggles flex/none). */
@@ -368,7 +382,7 @@ html, body, #app {
 .diag-error { text-decoration: underline wavy var(--nord11); }
 .diag-warning { text-decoration: underline wavy var(--nord13); }
 .diag-information { text-decoration: underline wavy var(--nord8); }
-.diag-hint { text-decoration: underline wavy var(--nord3); }
+.diag-hint { text-decoration: underline wavy var(--nord4); }
 
 /* ---- Modal dialogs (confirm / save-as) ---- */
 .modal {
@@ -705,7 +719,7 @@ a.picker-row:not(.selected):hover .picker-main {
 .sev-error { color: var(--nord11); }
 .sev-warning { color: var(--nord13); }
 .sev-information { color: var(--nord8); }
-.sev-hint { color: var(--nord3); }
+.sev-hint { color: var(--nord4); } /* near-white: readable on dark chrome, distinct from info */
 .picker-main { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
 /* Dim suffix right after the primary text (multi-root file rows: the root's name) — the path
    shrinks/ellipsizes first, like the terminal's budget math. */

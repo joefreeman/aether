@@ -228,6 +228,9 @@ pub struct App {
     fetch_in_flight: bool,
     refetch_queued: bool,
     reveal_after_fetch: bool,
+    /// Like `reveal_after_fetch`, but centres the cursor once its (out-of-window) line lands — for
+    /// `-` (center-cursor) when the cursor has been scrolled out of the loaded window.
+    center_after_fetch: bool,
     /// The picker results list's scroll offset in px (boot chooser or session picker —
     /// never both). The core tracks rows, not pixels; resets arrive as
     /// `Effect::PickerScrollReset`.
@@ -239,6 +242,14 @@ pub struct App {
     /// The hover popover (hover info / diagnostics-at-cursor / commit details), anchored at
     /// the cursor; holds *parsed* iced markdown. Dismissed by any key, click, or scroll.
     hover: Option<HoverContent>,
+    /// Last horizontal anchor (px) computed for the hover popover, cached so it's retained when the
+    /// cursor scrolls out of the loaded window (otherwise its column is unknown and the popover
+    /// would jump to the left edge). Interior-mutable: refreshed from the render path (`&self`).
+    hover_anchor_x: std::cell::Cell<f32>,
+    /// Popover orientation (`Some(below)`), decided the first frame a hover is shown and retained
+    /// so it doesn't flip sides as the buffer scrolls (it slides with the line and clamps to an
+    /// edge instead). Reset to `None` when a new hover opens. Interior-mutable (render path).
+    hover_below: std::cell::Cell<Option<bool>>,
 
     // Transient messages are toasts; the status bar shows persistent state only (web client
     // convention).
@@ -274,10 +285,13 @@ impl App {
             fetch_in_flight: false,
             refetch_queued: false,
             reveal_after_fetch: false,
+            center_after_fetch: false,
             picker_scroll_y: 0.0,
             spinner_phase: 0.0,
             last_anim_tick: None,
             hover: None,
+            hover_anchor_x: std::cell::Cell::new(4.0),
+            hover_below: std::cell::Cell::new(None),
             toasts: Vec::new(),
             next_toast: 0,
         };
@@ -807,6 +821,10 @@ impl App {
                     self.reveal_after_fetch = false;
                     self.reveal_cursor();
                 }
+                if self.center_after_fetch {
+                    self.center_after_fetch = false;
+                    self.center_cursor_in_window();
+                }
                 if self.refetch_queued {
                     self.refetch_queued = false;
                     task = self.maybe_fetch();
@@ -971,12 +989,20 @@ impl App {
                 }
                 Effect::SaveScrollAnchor => self.scroll_anchor = Some(self.scroll_px),
                 Effect::ShowHover(content) => {
+                    self.hover_below.set(None); // re-pick orientation for this fresh hover
                     self.hover = Some(match content {
                         crate::core::session::HoverText::Blocks(blocks) => {
                             HoverContent::Blocks(blocks)
                         }
                         crate::core::session::HoverText::Markdown(text) => {
-                            let est_lines = text.lines().count().max(1);
+                            // Estimate wrapped rows (not just raw lines) so the above/below flip
+                            // sees the real height — matching the Blocks heuristic below. Without
+                            // this, long markdown underestimates its height and never flips up.
+                            let est_lines = text
+                                .lines()
+                                .map(|l| 1 + l.len() / 90)
+                                .sum::<usize>()
+                                .max(1);
                             HoverContent::Markdown {
                                 items: iced::widget::markdown::parse(&text).collect(),
                                 est_lines,
@@ -1070,7 +1096,8 @@ impl App {
                 delta_px,
                 delta_x_px,
             } => {
-                self.hover = None;
+                // The hover popover stays open while wheel-scrolling the buffer behind it —
+                // `hover_overlay` re-anchors it to its line (clamped to the window) each frame.
                 // With a picker open, its scrollable owns wheel input over the list; wheel
                 // over the backdrop shouldn't scroll the editor behind it either.
                 if self.session.picker.is_some() {
@@ -1078,6 +1105,13 @@ impl App {
                 }
                 self.scroll_by(delta_px);
                 self.scroll_x_by(delta_x_px);
+                self.maybe_fetch()
+            }
+            EditorEvent::ScrollTo { offset_px } => {
+                self.hover = None;
+                // Dragging the thumb snaps directly to the offset (no easing) and may pull in a
+                // not-yet-loaded window.
+                self.scroll_to_px(offset_px, false);
                 self.maybe_fetch()
             }
             EditorEvent::Pressed {
@@ -1156,9 +1190,15 @@ impl App {
     /// Key events: the shell's edge — dismiss the hover popover (its parse cache lives
     /// here), then hand the key to the core with the viewport height it may need.
     fn on_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Task<Message> {
-        // Any keystroke dismisses an open hover popover; Esc is consumed by the dismissal
-        // (matching the web client), everything else still acts.
+        // While a hover popover is open, scroll keys pan it (and keep it open); any other key
+        // dismisses it — Esc is then consumed, everything else still acts.
         if self.hover.is_some() {
+            if let Some(delta) = hover_scroll_delta(code, mods, self.cell) {
+                return iced::widget::operation::scroll_by(
+                    hover_scroll_id(),
+                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: delta },
+                );
+            }
             self.hover = None;
             if code == KeyCode::Esc {
                 return Task::none();
@@ -1196,8 +1236,8 @@ impl App {
                 self.maybe_fetch()
             }
             A::CenterCursor => {
-                self.center_cursor();
-                self.maybe_fetch()
+                let task = self.center_cursor();
+                Task::batch([task, self.maybe_fetch()])
             }
             A::ToggleWrap => {
                 let Some(viewport_id) = self.session.viewport_id else {
@@ -1606,7 +1646,43 @@ impl App {
         }
     }
 
-    fn center_cursor(&mut self) {
+    fn center_cursor(&mut self) -> Task<Message> {
+        let line = self.session.buffer.cursor.position.line;
+        let loaded = self
+            .session
+            .window
+            .as_ref()
+            .map(|w| (w.first_logical_line, w.last_logical_line_exclusive));
+        let Some((first, last)) = loaded else {
+            return Task::none();
+        };
+        // When the cursor's line has been scrolled out of the loaded window, its visual row is
+        // unknown — pull that region from the server (scrolling the viewport to the line), then
+        // centre once it lands. Mirrors `ensure_cursor_visible_inner`.
+        if line < first || line >= last {
+            let Some(viewport_id) = self.session.viewport_id else {
+                return Task::none();
+            };
+            self.center_after_fetch = true;
+            self.fetch_in_flight = true;
+            return self.rpc::<ViewportScroll>(
+                ViewportScrollParams {
+                    viewport_id,
+                    scroll: ScrollPosition {
+                        logical_line: line,
+                        sub_row: 0.0,
+                    },
+                },
+                Message::WindowUpdate,
+            );
+        }
+        self.center_cursor_in_window();
+        Task::none()
+    }
+
+    /// Centre the cursor's line in the viewport. Assumes the line is in the loaded window (the
+    /// caller pulls it in first otherwise); a no-op if its cell isn't resolvable.
+    fn center_cursor_in_window(&mut self) {
         let (Some(cell), Some(window)) = (self.cell, &self.session.window) else {
             return;
         };
@@ -2061,7 +2137,21 @@ impl App {
                         .severity
                         .map(theme::diagnostic_color)
                         .unwrap_or(theme::NORD4);
-                    col = col.push(text(b.text.clone()).size(13).color(color));
+                    // Sans-serif, matching the markdown (LSP) hover and the rest of the chrome —
+                    // the app default font is monospace, so diagnostic/commit blocks must opt in.
+                    // Diagnostic blocks (those with a severity) lead with the severity glyph,
+                    // matching the status-bar count and picker.
+                    let line: Element<'_, Message> = match b.severity {
+                        Some(sev) => row![
+                            text(theme::diag_glyph(sev)).size(13).font(SANS).color(color),
+                            text(b.text.clone()).size(13).font(SANS).color(color),
+                        ]
+                        .spacing(6)
+                        .align_y(iced::Alignment::Start)
+                        .into(),
+                        None => text(b.text.clone()).size(13).font(SANS).color(color).into(),
+                    };
+                    col = col.push(line);
                 }
                 col.into()
             }
@@ -2088,20 +2178,99 @@ impl App {
                     .map(|_uri| Message::Noop)
             }
         };
+        // Anchor at the cursor cell. Pick below/above by the room each side has for the
+        // (estimated) height, then cap the popover to that room so tall (scrolled) content fits
+        // *within* the window instead of overflowing its edge. The popover stays open while the
+        // buffer scrolls, and even once the cursor scrolls out of the loaded window it keeps its
+        // horizontal column and parks against the edge it left by (rather than jumping to a corner).
+        const MARGIN: f32 = 4.0;
+        const MAX_H: f32 = 380.0;
+        let est_h = est_lines as f32 * 19.0 + 20.0;
+        let mut anchor = None;
+        let mut max_h = MAX_H;
+        if let (Some(cell), Some(window)) = (self.cell, &self.session.window) {
+            let pc = grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH);
+            // Horizontal anchor: refreshed while the cursor is in the loaded window, and retained
+            // when it scrolls out of range so the popover keeps its column instead of jumping left.
+            let x = match pc {
+                Some((_, dcol, _)) => {
+                    let x = ((GUTTER_COLS + dcol) as f32 * cell.width)
+                        .min((self.view_size.width - 360.0).max(8.0))
+                        .max(4.0);
+                    self.hover_anchor_x.set(x);
+                    x
+                }
+                None => self.hover_anchor_x.get(),
+            };
+            let view_h = self.view_size.height;
+            // Constant size once open (like the web client): a fixed height cap, never resized by
+            // how much room is left as the buffer scrolls. `h_est` is the assumed rendered height,
+            // used only to clamp the anchor so the popover stays within the view.
+            max_h = MAX_H.min((view_h - 2.0 * MARGIN).max(40.0));
+            let h_est = est_h.min(max_h);
+            let place = match pc {
+                // Cursor scrolled out of the loaded window: park against the edge it left by
+                // (orientation no longer matters — the line isn't visible).
+                None if self.session.buffer.cursor.position.line < window.first_logical_line => {
+                    HoverPlace::Top(MARGIN)
+                }
+                None => HoverPlace::Bottom(view_h - MARGIN),
+                Some((row, _, _)) => {
+                    let line_top = PAD + row as f32 * cell.height - self.scroll_px;
+                    let line_bottom = line_top + cell.height;
+                    // Orientation is decided once (the first frame, line on-screen) and retained, so
+                    // the popover never flips sides mid-scroll: below if it fits there, else above if
+                    // it fits, else the roomier side.
+                    let below = match self.hover_below.get() {
+                        Some(b) => b,
+                        None => {
+                            let ab = view_h - (line_bottom + 2.0) - MARGIN;
+                            let aa = (line_top - 2.0) - MARGIN;
+                            let b = if est_h <= ab {
+                                true
+                            } else if est_h <= aa {
+                                false
+                            } else {
+                                ab >= aa
+                            };
+                            self.hover_below.set(Some(b));
+                            b
+                        }
+                    };
+                    // Hang on the chosen side, following the line; once it no longer fits there,
+                    // pin to that edge — *edge-anchored* so the clamped position is exact regardless
+                    // of the height estimate (the estimate only decides when to switch, not where it
+                    // lands, so the clamp is consistent for short and tall popovers alike).
+                    if below {
+                        if line_bottom + 2.0 + h_est <= view_h - MARGIN {
+                            HoverPlace::Top((line_bottom + 2.0).max(MARGIN))
+                        } else {
+                            HoverPlace::Bottom(view_h - MARGIN)
+                        }
+                    } else if line_top - 2.0 - h_est >= MARGIN {
+                        HoverPlace::Bottom((line_top - 2.0).min(view_h - MARGIN))
+                    } else {
+                        HoverPlace::Top(MARGIN)
+                    }
+                }
+            };
+            anchor = Some((x, place));
+        }
+
         // Long content scrolls within the popover rather than growing past the view. The
         // padding lives inside the scrollable so its scrollbar sits against the popover edge.
         let boxed = container(
-            iced::widget::scrollable(container(body).padding([8, 10])).direction(
-                iced::widget::scrollable::Direction::Vertical(
+            iced::widget::scrollable(container(body).padding([8, 10]))
+                .id(hover_scroll_id())
+                .direction(iced::widget::scrollable::Direction::Vertical(
                     iced::widget::scrollable::Scrollbar::new()
                         .width(5)
                         .margin(0)
                         .scroller_width(5),
-                ),
-            ),
+                )),
         )
         .max_width(640)
-        .max_height(380)
+        .max_height(max_h)
         .style(|_| container::Style {
             background: Some(theme::NORD1.into()),
             border: iced::Border {
@@ -2111,41 +2280,25 @@ impl App {
             },
             ..container::Style::default()
         });
-
-        // Anchor at the cursor cell. Below the line when the (estimated) height fits;
-        // otherwise bottom-ALIGNED in a container ending just above the line, so the popover
-        // sits flush against it regardless of how far off the height estimate was. The
-        // top-left corner is the fallback when the cursor isn't in the loaded window.
-        let mut anchor = None;
-        if let (Some(cell), Some(window)) = (self.cell, &self.session.window) {
-            if let Some((row, dcol, _)) =
-                grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH)
-            {
-                let row_top = PAD + row as f32 * cell.height - self.scroll_px;
-                let x = ((GUTTER_COLS + dcol) as f32 * cell.width)
-                    .min((self.view_size.width - 360.0).max(8.0))
-                    .max(4.0);
-                let est_h = est_lines as f32 * 19.0 + 20.0;
-                let below = row_top + cell.height + est_h + 8.0 <= self.view_size.height;
-                anchor = Some((x, row_top, below, cell.height));
-            }
-        }
         match anchor {
-            Some((x, row_top, true, cell_h)) => container(boxed)
+            // Hangs down: top edge at `top`. `clip` keeps a height-underestimated popover from
+            // drawing past the editor (over the status bar).
+            Some((x, HoverPlace::Top(top))) => container(boxed)
                 .width(Length::Fill)
                 .height(Length::Fill)
+                .clip(true)
                 .padding(iced::Padding {
-                    top: (row_top + cell_h + 2.0).max(4.0),
+                    top,
                     right: 12.0,
                     bottom: 0.0,
                     left: x,
                 })
                 .into(),
-            Some((x, row_top, false, _)) => container(
-                // A box ending just above the cursor line; the popover hugs its bottom.
+            // Hangs up: a box ending at `bottom`, the popover hugging its lower edge.
+            Some((x, HoverPlace::Bottom(bottom))) => container(
                 container(boxed)
                     .width(Length::Fill)
-                    .height((row_top - 2.0).max(40.0))
+                    .height(bottom.max(40.0))
                     .align_y(iced::alignment::Vertical::Bottom)
                     .padding(iced::Padding {
                         right: 12.0,
@@ -2155,6 +2308,7 @@ impl App {
             )
             .width(Length::Fill)
             .height(Length::Fill)
+            .clip(true)
             .align_y(iced::alignment::Vertical::Top)
             .into(),
             None => container(boxed)
@@ -2292,15 +2446,19 @@ impl App {
         // Diagnostic counts, as a tight cluster left of the position. Text glyphs stand in for
         // the web client's SVG icons (same forms as the TUI).
         if !self.session.diagnostics.is_empty() {
+            use aether_protocol::viewport::DiagnosticSeverity as S;
             let mut diag = row![].spacing(8);
-            for (n, glyph, color) in [
-                (self.session.diagnostics.errors, "✗", theme::NORD11),
-                (self.session.diagnostics.warnings, "⚠", theme::NORD13),
-                (self.session.diagnostics.infos, "ℹ", theme::NORD8),
-                (self.session.diagnostics.hints, "·", theme::NORD8),
+            for (n, sev) in [
+                (self.session.diagnostics.errors, S::Error),
+                (self.session.diagnostics.warnings, S::Warning),
+                (self.session.diagnostics.infos, S::Information),
+                (self.session.diagnostics.hints, S::Hint),
             ] {
                 if n > 0 {
-                    diag = diag.push(t(format!("{glyph} {n}"), color));
+                    diag = diag.push(t(
+                        format!("{} {n}", theme::diag_glyph(sev)),
+                        theme::diagnostic_color(sev),
+                    ));
                 }
             }
             right = right.push(diag);
@@ -2407,6 +2565,37 @@ fn pump(notifications: NotifRx) -> Task<Message> {
 
 fn loaded_rows(window: &Window) -> u32 {
     window.lines.iter().map(grid::line_rows).sum()
+}
+
+/// Where the hover popover hangs relative to the cursor line: `Top(y)` puts its top edge at `y`
+/// (hangs down — below the line, or clamped to the top edge); `Bottom(y)` puts its bottom edge at
+/// `y` (hangs up — above the line, or clamped to the bottom edge).
+enum HoverPlace {
+    Top(f32),
+    Bottom(f32),
+}
+
+/// The hover popover's scrollable id, for programmatic `scroll_by` (keyboard panning).
+fn hover_scroll_id() -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::new("hover-scroll")
+}
+
+/// Vertical scroll delta (px) for a key while the hover popover is open, or `None` if the key
+/// isn't a scroll key (so the popover dismisses instead). Up/Down move a line, Alt-Up/Down half
+/// a page, PageUp/Down a page — mirroring the editor's scroll units. The page proxy is the
+/// popover's max content height (its `max_height` less padding).
+fn hover_scroll_delta(code: KeyCode, mods: Mods, cell: Option<Size>) -> Option<f32> {
+    const PAGE: f32 = 360.0;
+    let line = cell.map_or(18.0, |c| c.height);
+    Some(match code {
+        KeyCode::Up if mods.alt => -PAGE / 2.0,
+        KeyCode::Down if mods.alt => PAGE / 2.0,
+        KeyCode::Up => -line,
+        KeyCode::Down => line,
+        KeyCode::PageUp => -PAGE,
+        KeyCode::PageDown => PAGE,
+        _ => return None,
+    })
 }
 
 /// Scroll the picker's results list so the highlighted row is in view. `Minimal` moves the

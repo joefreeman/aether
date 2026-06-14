@@ -53,6 +53,12 @@ impl ScrollState {
         self.scroll_by(if down { step } else { -step });
     }
 
+    /// Scroll by half the viewport (the editor's `ScrollUnit::Half`), for Alt-Up/Down.
+    pub fn half(&mut self, down: bool) {
+        let step = i32::from((self.viewport.get() / 2).max(1));
+        self.scroll_by(if down { step } else { -step });
+    }
+
     pub fn scroll_to_top(&mut self) {
         self.offset = 0;
     }

@@ -16,6 +16,7 @@ pub mod grid;
 pub mod keymap;
 pub mod labels;
 pub mod picker;
+pub mod scrollbar;
 pub mod session;
 pub mod transport;
 pub mod update;

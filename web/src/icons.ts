@@ -32,6 +32,14 @@ export function statusIcon(kind: IconKind, spin = false): SVGSVGElement {
   return svg;
 }
 
+/** The status-icon kind for a diagnostic severity. The protocol's `"information"` maps to the
+ *  `"info"` icon; the others map by name. */
+export function severityIcon(
+  sev: "error" | "warning" | "information" | "hint",
+): IconKind {
+  return sev === "information" ? "info" : sev;
+}
+
 export type LspIconKind = Extract<IconKind, `lsp-${string}`>;
 
 /** Icon kind / colour class for an LSP lifecycle state. starting/initializing/restarting share

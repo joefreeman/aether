@@ -93,7 +93,23 @@ pub fn diagnostic_color(severity: aether_protocol::viewport::DiagnosticSeverity)
     match severity {
         S::Error => NORD11,
         S::Warning => NORD13,
-        S::Information | S::Hint => NORD8,
+        S::Information => NORD8,
+        // Near-white, not a hue: readable on the dark popover/status backgrounds and distinct
+        // from the coloured severities (was NORD8, which made it indistinguishable from info).
+        S::Hint => NORD4,
+    }
+}
+
+/// Severity glyph for the status-bar count, diagnostics picker, and hover popover, so all three
+/// native surfaces match. Refined Unicode approximations of the web client's icons (circled ✕ /
+/// warning triangle / circled i); Hint is a hollow circle `○`.
+pub fn diag_glyph(severity: aether_protocol::viewport::DiagnosticSeverity) -> &'static str {
+    use aether_protocol::viewport::DiagnosticSeverity as S;
+    match severity {
+        S::Error => "⊗",
+        S::Warning => "⚠",
+        S::Information => "ⓘ",
+        S::Hint => "○",
     }
 }
 

@@ -658,6 +658,15 @@ fn dot_cell<'a>(color: Option<iced::Color>) -> Element<'a, PickerMsg> {
         .into()
 }
 
+/// A fixed-width leading cell holding a severity glyph (diagnostics picker) — same footprint as
+/// [`dot_cell`] so rows stay aligned, and the same glyph the status-bar count shows.
+fn glyph_cell<'a>(glyph: &'static str, color: iced::Color) -> Element<'a, PickerMsg> {
+    container(text(glyph).size(13).font(SANS).color(color))
+        .width(14)
+        .align_x(iced::alignment::Horizontal::Center)
+        .into()
+}
+
 /// Right-aligned dim metadata (line numbers, ranges, paths). Never wraps — rows are exactly
 /// [`ROW_H`] tall, so a wrapped second line would spill into the row below.
 fn meta<'a>(s: String) -> Element<'a, PickerMsg> {
@@ -769,7 +778,7 @@ fn render_item<'a>(
             message,
             match_indices,
         } => row![
-            dot_cell(Some(theme::diagnostic_color(*severity))),
+            glyph_cell(theme::diag_glyph(*severity), theme::diagnostic_color(*severity)),
             highlighted(
                 message.split('\n').next().unwrap_or(message),
                 match_indices,

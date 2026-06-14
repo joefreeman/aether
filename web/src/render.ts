@@ -469,10 +469,18 @@ export function renderBuffer(container: HTMLElement, opts: RenderOpts): void {
   const widthCss = contentWidthPx > 0 ? `max(100%, ${contentWidthPx}px)` : "";
   content.style.width = widthCss;
   content.appendChild(frag);
-  const spacer = document.createElement("div");
-  spacer.className = "buffer-spacer";
+  // Reuse a persistent spacer and swap only the content layer, so other spacer children survive a
+  // re-render — namely the sticky hover popover, which lives in the spacer's coordinate space so the
+  // browser glues it to its line and clamps it to the editor edges on scroll (no JS repositioning).
+  let spacer = container.querySelector(":scope > .buffer-spacer") as HTMLElement | null;
+  if (!spacer) {
+    spacer = document.createElement("div");
+    spacer.className = "buffer-spacer";
+    container.replaceChildren(spacer);
+  }
   spacer.style.height = `${spacerHeightPx}px`;
   spacer.style.width = widthCss;
-  spacer.appendChild(content);
-  container.replaceChildren(spacer);
+  const oldContent = spacer.querySelector(":scope > .buffer-content");
+  if (oldContent) oldContent.replaceWith(content);
+  else spacer.insertBefore(content, spacer.firstChild);
 }

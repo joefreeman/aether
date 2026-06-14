@@ -25,6 +25,11 @@ pub const PAD: f32 = 8.0;
 /// Change-bar gutter width, in cells (TUI's `GUTTER_WIDTH`).
 pub const GUTTER_COLS: u32 = 1;
 
+/// Scrollbar rail/thumb width in px — matches the picker's `SCROLLBAR_W` for a consistent look.
+const SCROLLBAR_W: f32 = 5.0;
+/// Smallest the thumb may shrink to on very long files, so it stays grabbable.
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
 const CONTINUATION_MARKER: &str = "↪ ";
 
 /// Line height for buffer text — the web client's `14px/1.4`; the measured cell height (and
@@ -71,6 +76,11 @@ pub enum EditorEvent {
         delta_px: f32,
         delta_x_px: f32,
     },
+    /// Absolute vertical scroll request from dragging the scrollbar thumb. `offset_px` is the
+    /// desired content offset (clamped app-side); applied without scroll easing.
+    ScrollTo {
+        offset_px: f32,
+    },
     Pressed {
         row: i64,
         dcol: u32,
@@ -107,11 +117,21 @@ struct State {
     last_click: Option<mouse::Click>,
     dragging: bool,
     last_drag: Option<(i64, u32)>,
+    /// Dragging the scrollbar thumb (started by a press in the right-edge band); suppresses
+    /// text selection until release.
+    scrollbar_drag: bool,
+    /// Cursor is over the scrollbar band. Tracked so a redraw can be requested on enter/leave —
+    /// a custom widget won't otherwise repaint on plain cursor motion, so the hover highlight
+    /// would lag.
+    scrollbar_hover: bool,
 }
 
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer> for EditorView<'a, Message>
 where
     Renderer: text::Renderer,
+    // The editor draws its own scrollbar but styles it from the theme's scrollable catalog, so
+    // it matches the picker/popover scrollbars (same source of truth) including hover/drag.
+    Theme: iced::widget::scrollable::Catalog,
 {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
@@ -187,6 +207,20 @@ where
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                // A press in the right-edge scrollbar band grabs the thumb instead of starting a
+                // text selection: jump the thumb under the cursor, then drag it on move.
+                if let Some(position) = cursor.position_over(bounds) {
+                    if self.over_scrollbar(bounds, position.x) {
+                        if let Some((thumb_h, max_scroll)) = self.scrollbar_metrics(state, bounds) {
+                            state.scrollbar_drag = true;
+                            let offset_px =
+                                self.scroll_offset_for(thumb_h, max_scroll, bounds, position.y);
+                            shell.publish((self.on_event)(EditorEvent::ScrollTo { offset_px }));
+                            shell.capture_event();
+                            return;
+                        }
+                    }
+                }
                 if let (Some(cell), Some(position)) = (state.cell, cursor.position_over(bounds)) {
                     let click = mouse::Click::new(position, mouse::Button::Left, state.last_click);
                     let kind = match click.kind() {
@@ -208,7 +242,26 @@ where
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                if state.dragging {
+                // Track hover over the scrollbar band so the thumb's hover highlight repaints on
+                // enter/leave (no redraw happens on bare cursor motion otherwise).
+                let hovering = cursor
+                    .position_over(bounds)
+                    .is_some_and(|p| self.over_scrollbar(bounds, p.x))
+                    && self.scrollbar_metrics(state, bounds).is_some();
+                if hovering != state.scrollbar_hover {
+                    state.scrollbar_hover = hovering;
+                    shell.request_redraw();
+                }
+                if state.scrollbar_drag {
+                    // Drag tracks `y` anywhere (the cursor may leave the band horizontally).
+                    if let (Some((thumb_h, max_scroll)), Some(position)) =
+                        (self.scrollbar_metrics(state, bounds), cursor.position())
+                    {
+                        let offset_px =
+                            self.scroll_offset_for(thumb_h, max_scroll, bounds, position.y);
+                        shell.publish((self.on_event)(EditorEvent::ScrollTo { offset_px }));
+                    }
+                } else if state.dragging {
                     if let (Some(cell), Some(position)) = (state.cell, cursor.position()) {
                         let (row, dcol) = self.cell_at(position, bounds, cell);
                         // Only re-publish when the cell changed — drags otherwise flood the
@@ -221,7 +274,9 @@ where
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if state.dragging {
+                if state.scrollbar_drag {
+                    state.scrollbar_drag = false;
+                } else if state.dragging {
                     state.dragging = false;
                     state.last_drag = None;
                     shell.publish((self.on_event)(EditorEvent::Released));
@@ -233,27 +288,35 @@ where
 
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if cursor.is_over(layout.bounds()) {
-            mouse::Interaction::Text
-        } else {
-            mouse::Interaction::None
+        let state = tree.state.downcast_ref::<State>();
+        let bounds = layout.bounds();
+        // Over the scrollbar band (or actively dragging it) reads as a control, not text.
+        if state.scrollbar_drag {
+            return mouse::Interaction::Idle;
         }
+        if let Some(p) = cursor.position_over(bounds) {
+            if self.over_scrollbar(bounds, p.x) && self.scrollbar_metrics(state, bounds).is_some() {
+                return mouse::Interaction::Idle;
+            }
+            return mouse::Interaction::Text;
+        }
+        mouse::Interaction::None
     }
 
     fn draw(
         &self,
         tree: &Tree,
         renderer: &mut Renderer,
-        _theme: &Theme,
+        theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<State>();
@@ -756,7 +819,94 @@ where
                 }
             }
         }
+
+        // Editor scrollbar: a thin overlay at the right edge, shown only when the document is
+        // taller than the viewport. Geometry from the shared `scrollbar::thumb` (same as the TUI
+        // and picker); appearance pulled from the theme's scrollable catalog — the exact style
+        // the picker/popover scrollbars use, so they match including hover/drag highlighting.
+        let content_h = PAD * 2.0 + window.total_visual_rows as f32 * cell.height;
+        if let Some((thumb_y, thumb_h)) = crate::core::scrollbar::thumb(
+            bounds.height as f64,
+            content_h as f64,
+            bounds.height as f64,
+            scroll as f64,
+            SCROLLBAR_MIN_THUMB as f64,
+        ) {
+            let rail_x = bounds.x + bounds.width - SCROLLBAR_W;
+            // `scrollbar_hover` is tracked in `update` (which also requests the repaint); fall back
+            // to the live cursor so the very first frame after layout is correct too.
+            let hovered = state.scrollbar_hover
+                || cursor
+                    .position_over(bounds)
+                    .is_some_and(|p| self.over_scrollbar(bounds, p.x));
+            let rail = scrollbar_rail(theme, state.scrollbar_drag, hovered);
+
+            // Rail background (drawn only when the theme gives the track a fill).
+            if let Some(bg) = rail.background {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle {
+                            x: rail_x,
+                            y: bounds.y,
+                            width: SCROLLBAR_W,
+                            height: bounds.height,
+                        },
+                        border: rail.border,
+                        ..renderer::Quad::default()
+                    },
+                    bg,
+                );
+            }
+            // Thumb.
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle {
+                        x: rail_x,
+                        y: bounds.y + thumb_y as f32,
+                        width: SCROLLBAR_W,
+                        height: thumb_h as f32,
+                    },
+                    border: rail.scroller.border,
+                    ..renderer::Quad::default()
+                },
+                rail.scroller.background,
+            );
+        }
     }
+}
+
+/// The vertical scrollbar [`Rail`](iced::widget::scrollable::Rail) style for the given
+/// interaction state, read from the theme's scrollable catalog — the same default style the
+/// picker's `scrollable` uses, so the editor's hand-drawn bar matches it (track/thumb colours,
+/// border radius, and the hover/drag accent).
+fn scrollbar_rail<Theme: iced::widget::scrollable::Catalog>(
+    theme: &Theme,
+    dragged: bool,
+    hovered: bool,
+) -> iced::widget::scrollable::Rail {
+    use iced::widget::scrollable::{Catalog, Status};
+    let status = if dragged {
+        Status::Dragged {
+            is_horizontal_scrollbar_dragged: false,
+            is_vertical_scrollbar_dragged: true,
+            is_horizontal_scrollbar_disabled: true,
+            is_vertical_scrollbar_disabled: false,
+        }
+    } else if hovered {
+        Status::Hovered {
+            is_horizontal_scrollbar_hovered: false,
+            is_vertical_scrollbar_hovered: true,
+            is_horizontal_scrollbar_disabled: true,
+            is_vertical_scrollbar_disabled: false,
+        }
+    } else {
+        Status::Active {
+            is_horizontal_scrollbar_disabled: true,
+            is_vertical_scrollbar_disabled: false,
+        }
+    };
+    let class = <Theme as Catalog>::default();
+    <Theme as Catalog>::style(theme, &class, status).vertical_rail
 }
 
 impl<'a, Message> EditorView<'a, Message> {
@@ -768,12 +918,44 @@ impl<'a, Message> EditorView<'a, Message> {
             - GUTTER_COLS as i64;
         (row, col.max(0) as u32)
     }
+
+    /// Scrollbar thumb height and max scroll offset (px), or `None` when the document fits and
+    /// no bar is shown. The thumb geometry uses the shared [`scrollbar::thumb`] so it tracks the
+    /// TUI and picker; this returns just the pieces the drag math needs.
+    fn scrollbar_metrics(&self, state: &State, bounds: Rectangle) -> Option<(f32, f32)> {
+        let (cell, window) = (state.cell?, self.content.window?);
+        let content_h = PAD * 2.0 + window.total_visual_rows as f32 * cell.height;
+        let (_, thumb_h) = crate::core::scrollbar::thumb(
+            bounds.height as f64,
+            content_h as f64,
+            bounds.height as f64,
+            self.content.scroll_px as f64,
+            SCROLLBAR_MIN_THUMB as f64,
+        )?;
+        Some((thumb_h as f32, (content_h - bounds.height).max(0.0)))
+    }
+
+    /// Whether `x` falls in the right-edge scrollbar band (only meaningful when a bar shows).
+    fn over_scrollbar(&self, bounds: Rectangle, x: f32) -> bool {
+        x >= bounds.x + bounds.width - SCROLLBAR_W
+    }
+
+    /// Content offset (px) that centres the thumb under cursor `y` while dragging.
+    fn scroll_offset_for(&self, thumb_h: f32, max_scroll: f32, bounds: Rectangle, y: f32) -> f32 {
+        let travel = bounds.height - thumb_h;
+        if travel <= 0.0 {
+            return 0.0;
+        }
+        let frac = ((y - bounds.y - thumb_h / 2.0) / travel).clamp(0.0, 1.0);
+        frac * max_scroll
+    }
 }
 
 impl<'a, Message: 'a, Theme: 'a, Renderer> From<EditorView<'a, Message>>
     for Element<'a, Message, Theme, Renderer>
 where
     Renderer: text::Renderer + 'a,
+    Theme: iced::widget::scrollable::Catalog,
 {
     fn from(editor: EditorView<'a, Message>) -> Self {
         Element::new(editor)

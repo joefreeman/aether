@@ -19,7 +19,7 @@ import init, { WasmSession } from "./wasm/aether_web";
 import { RpcClient, type ConnState } from "./client";
 import { renderBuffer } from "./render";
 import { decodeRow } from "./text";
-import { statusIcon, lspStateClass, type IconKind } from "./icons";
+import { statusIcon, severityIcon, lspStateClass, type IconKind } from "./icons";
 import { truncatePath, charBudget } from "./paths";
 import { rootLabels } from "./labels";
 import { renderMarkdown } from "./markdown";
@@ -199,6 +199,9 @@ interface RowDesc {
   bulletStatus?: string;
   bulletIcon?: IconKind;
   bulletSpin?: boolean;
+  /** Colour class for `bulletIcon` (the SVG inherits `currentColor`). Defaults to the icon kind
+   *  name (LSP rows use `.lsp-*`); diagnostics pass a `.sev-*` class. */
+  bulletIconClass?: string;
   /** Buffer dirty-state dot on the right (non-"clean"). */
   dirty?: string;
   /** Ignored entry — dim the text, no bullet. */
@@ -387,8 +390,10 @@ function describePickerItem(
       return {
         primary: item.message.split("\n")[0],
         matches: item.match_indices,
-        prefix: "● ",
-        prefixClass: `sev-${item.severity}`,
+        // Same SVG icon + severity colour the status-bar count uses.
+        bullet: true,
+        bulletIcon: severityIcon(item.severity),
+        bulletIconClass: `sev-${item.severity}`,
         meta: `${item.line + 1}:${item.col}`,
       };
     case "dir_entry": {
@@ -503,6 +508,7 @@ export class Shell {
    *  content (Effect::ShowHover); this element renders+positions it. Anchored at the cursor cell,
    *  scrollable, dismissed on the next key / scroll / click / buffer switch. */
   private readonly hoverEl: HTMLElement;
+  private readonly hoverStrut: HTMLElement;
   private hoverOpen = false;
   /** The keyboard-shortcut help overlay (Space ?). A shell-local overlay — the core only triggers it
    *  (Effect::ShellAction OpenHelp); its content is sourced from the core's keymap (help_entries) and
@@ -732,13 +738,21 @@ export class Shell {
         this.ensureFocus();
       }, 0);
     });
+    // A zero-content strut placed before the popover in the spacer; its height sets the popover's
+    // flow offset to the anchor line. (A large `margin-top` on the popover itself would block its
+    // `position: sticky` bottom-edge clamp — the reserved margin can't be shifted up; a real strut
+    // can. See `positionHover`.)
+    this.hoverStrut = document.createElement("div");
+    this.hoverStrut.className = "hover-strut";
+    this.hoverStrut.style.pointerEvents = "none";
     this.hoverEl = document.createElement("div");
     this.hoverEl.id = "hover";
-    this.hoverEl.style.display = "none";
-    // Wheeling over the popover scrolls the popover (its own overflow), not the buffer — and a wheel
-    // inside it must not bubble out to the buffer's scroll-dismiss. (The popover is position:fixed, so
-    // it's outside the buffer's scroll container anyway; stopping propagation is belt-and-braces.)
+    // The popover is a sticky child of the buffer's spacer (see `placeHover`). Wheeling over it
+    // scrolls its own overflow, never the buffer (CSS `overscroll-behavior: contain` + this guard);
+    // and a mousedown on it (e.g. dragging its scrollbar) must not reach the buffer's
+    // click-to-dismiss handler.
     this.hoverEl.addEventListener("wheel", (e) => e.stopPropagation());
+    this.hoverEl.addEventListener("mousedown", (e) => e.stopPropagation());
     // The help overlay (Space ?): a backdrop + a tabbed, scrollable modal. Content is filled lazily
     // from the core's keymap on first open; clicking the backdrop closes it.
     this.helpEl = document.createElement("div");
@@ -764,7 +778,8 @@ export class Shell {
       this.overlayEl,
       this.saveAsEl,
       this.pickerEl,
-      this.hoverEl,
+      // `hoverEl` is not appended here — it's parented into the buffer's spacer while shown (so it
+      // can be `position: sticky` relative to the scrolling buffer) and removed on dismiss.
       this.helpEl,
       this.connBanner,
     );
@@ -934,13 +949,25 @@ export class Shell {
       this.handleHelpKey(e);
       return;
     }
-    // Any keystroke dismisses an open hover popover; Esc is consumed by the dismissal (matching iced /
-    // the old web client), every other key still acts on the buffer.
+    // While a hover popover is open, scroll keys pan it (and keep it open); any other key
+    // dismisses it — Esc is then consumed, every other key still acts on the buffer.
     if (this.hoverOpen) {
-      this.dismissHover();
-      if (e.key === "Escape") {
+      const delta = this.hoverScrollDelta(e);
+      if (delta !== null) {
         e.preventDefault();
+        this.hoverEl.scrollBy({ top: delta });
         return;
+      }
+      // A lone modifier press (e.g. holding Alt to begin an Alt-Up chord) must not dismiss the
+      // popover — fall through to the shared modifier guard below, which swallows it.
+      const loneModifier =
+        e.key === "Shift" || e.key === "Control" || e.key === "Alt" || e.key === "Meta";
+      if (!loneModifier) {
+        this.dismissHover();
+        if (e.key === "Escape") {
+          e.preventDefault();
+          return;
+        }
       }
     }
     // A native-input overlay owns the keyboard while open; let its own handler take the event.
@@ -970,6 +997,28 @@ export class Shell {
       this.visibleRows(),
     ) as CoreEffect[];
     this.runEffects(effects);
+  }
+
+  /**
+   * Vertical scroll delta (px) for a key while the hover popover is open, or null if it isn't a
+   * scroll key (so the popover dismisses instead). Up/Down move a line, Alt-Up/Down half a page,
+   * PageUp/Down a page — mirroring the editor's scroll units. Native `scrollBy` clamps to range.
+   */
+  private hoverScrollDelta(e: KeyboardEvent): number | null {
+    const line = this.cell.h;
+    const page = this.hoverEl.clientHeight;
+    switch (e.key) {
+      case "ArrowUp":
+        return e.altKey ? -page / 2 : -line;
+      case "ArrowDown":
+        return e.altKey ? page / 2 : line;
+      case "PageUp":
+        return -page;
+      case "PageDown":
+        return page;
+      default:
+        return null;
+    }
   }
 
   private onNotification(method: string, params: unknown): void {
@@ -1179,7 +1228,7 @@ export class Shell {
         this.scrollView(a.dir ?? "down", a.unit ?? "line");
         break;
       case "center_cursor":
-        this.centerCursor();
+        void this.centerCursor();
         break;
       case "toggle_wrap":
         this.session.toggle_wrap(); // flip core wrap state (no effects); then re-render the viewport
@@ -1291,7 +1340,8 @@ export class Shell {
 
   /** Native scroll event: fetch a new window when the view nears the loaded window's edge. */
   private onScroll(): void {
-    this.dismissHover(); // scrolling the buffer dismisses the popover (its anchor would go stale)
+    // The popover tracks its line via CSS `position: sticky` (it lives in the buffer's spacer), so
+    // scrolling needs no repositioning here — just the window prefetch below.
     const w = this.snapshot?.window;
     if (!w || this.fetchInFlight) return;
     const topRow = Math.round((this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h);
@@ -1339,7 +1389,28 @@ export class Shell {
     }
   }
 
-  private centerCursor(): void {
+  private async centerCursor(): Promise<void> {
+    const v = this.view();
+    if (!v.window) return;
+    const cl = v.buffer.cursor.position.line;
+    // When the cursor's line has been scrolled out of the loaded window its visual row is unknown —
+    // pull that region from the server (scrolling the viewport to the line), then centre. Mirrors
+    // `ensureCursorVisible`.
+    if (cl < v.window.first_logical_line || cl >= v.window.last_logical_line_exclusive) {
+      const epoch = this.viewportEpoch;
+      let res: ViewportWindowResult;
+      try {
+        res = await this.client.rpc<ViewportWindowResult>("viewport/scroll", {
+          viewport_id: v.viewport_id,
+          scroll: { logical_line: cl, sub_row: 0 },
+        });
+      } catch {
+        return; // viewport gone (e.g. a resubscribe raced in)
+      }
+      if (epoch !== this.viewportEpoch) return; // a resubscribe superseded this fetch
+      this.session.adopt_window(res);
+      this.render();
+    }
     const row = this.cursorAbsoluteVisualRow();
     if (row === null) return;
     this.scrollTopTo((row - Math.floor(this.visibleRows() / 2)) * this.cell.h + BUFFER_PAD, true);
@@ -2071,7 +2142,14 @@ export class Shell {
       const blocks = content.blocks.map((b) => {
         const el = document.createElement("div");
         el.className = b.severity ? `hover-block ${hoverSevClass(b.severity)}` : "hover-block";
-        el.textContent = b.text;
+        // Diagnostic blocks lead with the severity icon (the core sends "Error"/"Warning"/"Info"/
+        // "Hint"; lowercased these are the IconKinds); commit/plain blocks have no severity.
+        if (b.severity) {
+          const kind = b.severity.toLowerCase() as IconKind;
+          el.append(statusIcon(kind), " ", b.text);
+        } else {
+          el.textContent = b.text;
+        }
         return el;
       });
       this.hoverEl.replaceChildren(...blocks);
@@ -2083,28 +2161,62 @@ export class Shell {
    *  fits, flipped above otherwise; clamped into the viewport so it never spills off-screen. The body
    *  scrolls within its max-height (theme.css #hover). Mirrors the old web client + iced. */
   private placeHover(): void {
+    const spacer = this.bufferEl.querySelector(".buffer-spacer") as HTMLElement | null;
+    if (!spacer) return;
     const el = this.hoverEl;
-    el.style.display = "block";
     el.scrollTop = 0;
     this.hoverOpen = true;
-    const cell = this.bufferEl.querySelector(".cursor") as HTMLElement | null;
-    const r = (cell ?? this.bufferEl).getBoundingClientRect();
+    // Park the popover (preceded by its offset strut) in the spacer's coordinate space; CSS
+    // `position: sticky` then keeps it glued to its line and clamped to the editor edges as the
+    // buffer scrolls — no JS on scroll.
+    if (this.hoverStrut.parentElement !== spacer) spacer.appendChild(this.hoverStrut);
+    if (el.parentElement !== spacer) spacer.appendChild(el);
+    this.positionHover();
+  }
+
+  /** Set the popover's flow offset within the spacer (via the strut height) so it rests at the
+   *  anchor line — below it when there's room, else above. Done once when shown; the browser's
+   *  sticky positioning takes over for all scrolling (tracking the line, then clamping to the
+   *  editor's top/bottom). Anchor coordinates are read in the spacer's space, so they're stable
+   *  across scroll/re-render. The strut (not a `margin-top`) is what makes the bottom-edge clamp
+   *  work — a large top margin can't be shifted up by sticky, a real element can. */
+  private positionHover(): void {
+    const el = this.hoverEl;
+    const spacer = el.parentElement;
+    if (!spacer) return;
+    const sr = spacer.getBoundingClientRect();
+    const cur = this.bufferEl.querySelector(".cursor") as HTMLElement | null;
     const margin = 4;
-    const box = el.getBoundingClientRect();
-    const left = Math.max(margin, Math.min(r.left, window.innerWidth - box.width - margin));
-    let top = r.bottom + margin;
-    if (top + box.height > window.innerHeight - margin) {
-      const above = r.top - box.height - margin;
-      top = above >= margin ? above : Math.max(margin, window.innerHeight - box.height - margin);
+    let lineTop: number, lineH: number, lineLeft: number;
+    if (cur) {
+      const cr = cur.getBoundingClientRect();
+      lineTop = cr.top - sr.top; // anchor line top in spacer (content) coords
+      lineH = cr.height;
+      lineLeft = cr.left - sr.left;
+    } else {
+      lineTop = this.bufferEl.scrollTop + margin;
+      lineH = this.cell.h;
+      lineLeft = this.cell.w;
     }
-    el.style.left = `${Math.round(left)}px`;
-    el.style.top = `${Math.round(top)}px`;
+    const h = el.offsetHeight;
+    const w = el.offsetWidth;
+    // Orientation: the line is on-screen when shown, so decide by the room above/below it now.
+    const lineScreenTop = lineTop - this.bufferEl.scrollTop;
+    const viewH = this.bufferEl.clientHeight;
+    const fitsBelow = lineScreenTop + lineH + margin + h <= viewH - margin;
+    const fitsAbove = lineScreenTop - margin - h >= margin;
+    const top = fitsBelow || !fitsAbove ? lineTop + lineH + margin : lineTop - h - margin;
+    const left = Math.max(margin, Math.min(lineLeft, spacer.offsetWidth - w - margin));
+    this.hoverStrut.style.height = `${Math.max(0, Math.round(top))}px`;
+    el.style.marginTop = "0";
+    el.style.marginLeft = `${Math.round(left)}px`;
   }
 
   private dismissHover(): void {
     if (!this.hoverOpen) return;
     this.hoverOpen = false;
-    this.hoverEl.style.display = "none";
+    this.hoverEl.remove(); // detach popover + its offset strut from the buffer spacer
+    this.hoverStrut.remove();
     this.hoverEl.replaceChildren();
   }
 
@@ -2338,8 +2450,9 @@ export class Shell {
       if (d.bullet) {
         const b = document.createElement("span");
         if (d.bulletIcon) {
-          // LSP rows: the status bar's SVG icon (spinning when busy), coloured by its lsp-* class.
-          b.className = `picker-bullet icon ${d.bulletIcon}`;
+          // The status bar's SVG icon, coloured by its class: lsp-* for LSP rows (default), or a
+          // sev-* class for diagnostics. Spins when busy.
+          b.className = `picker-bullet icon ${d.bulletIconClass ?? d.bulletIcon}`;
           b.append(statusIcon(d.bulletIcon, d.bulletSpin));
         } else {
           // Fixed-width cell so names stay aligned; the • only shows when coloured (a git change).

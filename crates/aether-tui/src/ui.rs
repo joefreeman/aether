@@ -363,14 +363,25 @@ fn hover_display_lines(
 ) -> Vec<(String, Option<DiagnosticSeverity>)> {
     let mut out: Vec<(String, Option<DiagnosticSeverity>)> = Vec::new();
     for block in blocks {
-        let block_lines = hover_lines(&block.text, width);
+        // Diagnostic blocks (those carrying a severity) get a leading severity icon on their first
+        // line, matching the status-bar count and picker; reserve its 2 cols when wrapping and
+        // indent continuation lines so they align under the text.
+        let prefix_w = if block.severity.is_some() { 2 } else { 0 };
+        let block_lines = hover_lines(&block.text, width.saturating_sub(prefix_w));
         if block_lines.is_empty() {
             continue;
         }
         if !out.is_empty() {
             out.push((String::new(), None));
         }
-        out.extend(block_lines.into_iter().map(|line| (line, block.severity)));
+        for (i, line) in block_lines.into_iter().enumerate() {
+            let text = match block.severity {
+                Some(sev) if i == 0 => format!("{} {line}", diag_glyph(sev)),
+                Some(_) => format!("  {line}"),
+                None => line,
+            };
+            out.push((text, block.severity));
+        }
     }
     out
 }
@@ -449,27 +460,48 @@ fn draw_help_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     }
 }
 
-/// A 1-column vertical scrollbar over `total` lines with `visible` rows shown from `offset`. Thumb
-/// size and position mirror [`draw_picker_scrollbar`]: `visible/total` of the track, at `offset/total`.
+/// A 1-column vertical scrollbar over `total` lines with `visible` rows shown from `offset`.
+/// Thin wrapper over [`render_scrollbar`] for static overlays (help, search popover).
 fn draw_vertical_scrollbar(f: &mut Frame, area: Rect, offset: u16, total: u16, visible: u16) {
+    render_scrollbar(f, area, u64::from(offset), u64::from(total), u64::from(visible));
+}
+
+/// The one TUI scrollbar renderer: a 1-column track in the leftmost column of `area`, with a
+/// thumb sized `visible/total` of the height and positioned at `offset/total`. Geometry comes
+/// from [`aether_client::scrollbar::thumb`] (shared with the other shells); the glyphs/colours
+/// (`█` thumb NORD8, `│` track NORD3) are the TUI's house style, shared by the editor pane,
+/// pickers, and overlays. Draws nothing when the content fits (no [`thumb`] result).
+///
+/// Inputs are `u64` so the editor can pass full visual-row counts on very large files without
+/// the old `u16` ceiling.
+fn render_scrollbar(f: &mut Frame, area: Rect, offset: u64, total: u64, visible: u64) {
     let track_h = area.height;
     if track_h == 0 {
         return;
     }
-    let total = u64::from(total.max(1));
-    let window = u64::from(visible.min(total as u16).max(1));
-    let th = u64::from(track_h);
-    let thumb_h = (window * th).div_ceil(total).max(1).min(th) as u16;
-    let max_thumb_y = track_h.saturating_sub(thumb_h);
-    let thumb_y = ((u64::from(offset) * th) / total) as u16;
-    let thumb_y = thumb_y.min(max_thumb_y);
+    let Some((thumb_y, thumb_h)) = aether_client::scrollbar::thumb(
+        f64::from(track_h),
+        total as f64,
+        visible as f64,
+        offset as f64,
+        1.0,
+    ) else {
+        return;
+    };
+    // Round to whole cells; the thumb is at least one cell tall by `min_len = 1.0` above.
+    let thumb_y = thumb_y.round() as u16;
+    let thumb_h = (thumb_h.round() as u16).max(1);
 
     let buf = f.buffer_mut();
-    let thumb_style = Style::default().fg(NORD8).bg(NORD0);
-    let track_style = Style::default().fg(NORD3).bg(NORD0);
+    // Subtle bar: a faint `│` track whose current segment is a slightly bolder grey `┃`. Both
+    // glyphs are centred in the cell, so the thumb reads as a denser stretch of one thin line
+    // rather than a block punched out of it — and the thumb is a grey, not an accent, matching
+    // the iced editor's theme-grey scrollbar.
+    let thumb_style = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+    let track_style = Style::default().fg(NORD2).bg(NORD0);
     for i in 0..track_h {
         let in_thumb = i >= thumb_y && i < thumb_y + thumb_h;
-        let glyph = if in_thumb { "█" } else { "│" };
+        let glyph = if in_thumb { "┃" } else { "│" };
         let style = if in_thumb { thumb_style } else { track_style };
         buf.set_string(area.x, area.y + i, glyph, style);
     }
@@ -2145,14 +2177,12 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         return;
     }
 
-    // Reserve the rightmost column for the scroll indicator (plus a blank gap column before it)
-    // when the result set is taller than the visible window. Otherwise use the full width.
+    // The scrollbar (when the result set overflows) sits in the right-hand padding column —
+    // flush against the box's right border — so text fills the full content width right up to
+    // it, with no gap on either side. `area` is already inset one column from the border, so its
+    // trailing edge (`area.x + area.width`) is that padding column, still inside the frame.
     let needs_scrollbar = state.picker.total_matches as u16 > area.height;
-    let text_width = if needs_scrollbar {
-        area.width.saturating_sub(2)
-    } else {
-        area.width
-    };
+    let text_width = area.width;
     let text_area = Rect {
         x: area.x,
         y: area.y,
@@ -2250,7 +2280,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
 
     if needs_scrollbar {
         let scrollbar = Rect {
-            x: area.x + area.width.saturating_sub(1), // last column; a gap column sits before it
+            x: area.x + area.width, // right padding column, flush against the border
             y: area.y,
             width: 1,
             height: area.height,
@@ -2260,7 +2290,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
-    let total = state.picker.total_matches.max(1) as u64;
+    let total = state.picker.total_matches as u64;
     // Use the actual on-screen item count for the thumb size, and the absolute position of the
     // visible window's top item (`offset + visible_start`) for the thumb position. With
     // over-fetch, `items.len()` would oversize the thumb and `offset` alone would peg it.
@@ -2272,25 +2302,7 @@ fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
         state.picker.kind,
     ) as u64;
     let offset = state.picker.offset as u64 + visible_start as u64;
-    let track_h = area.height as u64;
-    if track_h == 0 {
-        return;
-    }
-    // Thumb spans `window / total` of the track, at least 1 cell. Position is `offset / total`.
-    let thumb_h = (window * track_h).div_ceil(total).max(1).min(track_h) as u16;
-    let max_thumb_y = (track_h as u16).saturating_sub(thumb_h);
-    let thumb_y = ((offset * track_h) / total) as u16;
-    let thumb_y = thumb_y.min(max_thumb_y);
-
-    let buf = f.buffer_mut();
-    let thumb_style = Style::default().fg(NORD8).bg(NORD0);
-    let track_style = Style::default().fg(NORD3).bg(NORD0);
-    for i in 0..(area.height) {
-        let in_thumb = i >= thumb_y && i < thumb_y + thumb_h;
-        let glyph = if in_thumb { "█" } else { "│" };
-        let style = if in_thumb { thumb_style } else { track_style };
-        buf.set_string(area.x, area.y + i, glyph, style);
-    }
+    render_scrollbar(f, area, offset, total, window);
 }
 
 fn picker_item_spans(
@@ -2752,7 +2764,11 @@ fn diagnostic_item_spans(
     let base = Style::default().fg(diag_color(severity)).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
     let line_suffix = format!(" ({})", diag_range_label(range));
-    let msg_budget = max_width.saturating_sub(line_suffix.width());
+    // Leading severity icon, matching the status-bar count.
+    let icon = format!("{} ", diag_glyph(severity));
+    let msg_budget = max_width
+        .saturating_sub(line_suffix.width())
+        .saturating_sub(icon.width());
 
     let truncated: String = message
         .chars()
@@ -2773,7 +2789,7 @@ fn diagnostic_item_spans(
         .filter(|&i| i < kept)
         .collect();
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(icon, base)];
     if kept_indices.is_empty() {
         spans.push(Span::styled(truncated, base));
     } else {
@@ -3224,6 +3240,22 @@ fn truncate_path_with_indices(
 }
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
+    // When the buffer is taller than the viewport, carve the rightmost column for a scrollbar
+    // (drawn last, below). The decision uses the whole-buffer `total_visual_rows` from the
+    // server's window, which is independent of this 1-col narrowing — so it can't flicker. The
+    // narrowing clips content by one column rather than reflowing it (the server wrapped to the
+    // full width); acceptable, and only while the bar is shown.
+    let total_visual_rows = state.ed().total_visual_rows;
+    let needs_scrollbar = total_visual_rows as usize > area.height as usize;
+    let area = if needs_scrollbar {
+        Rect {
+            width: area.width.saturating_sub(1),
+            ..area
+        }
+    } else {
+        area
+    };
+
     let top = state.ed().scroll_logical_line;
     let selection = ordered_selection(&state.ed().cursor, state.ed().mode);
     let viewport_rows = area.height as usize;
@@ -3505,6 +3537,25 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
         area,
     );
+
+    // The editor scrollbar, in the column reserved above. Same glyphs/colours as the picker
+    // and overlays. `top_visual_row` is the absolute viewport-top row; the thumb reflects how
+    // far through the whole buffer that is.
+    if needs_scrollbar {
+        let scrollbar = Rect {
+            x: area.x + area.width,
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
+        render_scrollbar(
+            f,
+            scrollbar,
+            u64::from(state.ed().top_visual_row),
+            u64::from(total_visual_rows),
+            area.height as u64,
+        );
+    }
 }
 
 /// The content spans of one inline-diff phantom row: the removed baseline line, red on a dark-red
@@ -3799,7 +3850,20 @@ fn diag_color(severity: DiagnosticSeverity) -> Color {
         DiagnosticSeverity::Error => NORD11,      // red
         DiagnosticSeverity::Warning => NORD13,    // yellow
         DiagnosticSeverity::Information => NORD8, // frost blue
-        DiagnosticSeverity::Hint => NORD3,        // dim gray
+        // Near-white: readable on the status/popover backgrounds and distinct from the coloured
+        // severities (was NORD3 dim gray, which was hard to read).
+        DiagnosticSeverity::Hint => NORD4,
+    }
+}
+
+/// Severity glyph, shared by the status-bar count, the diagnostics picker, and the hover popover so
+/// all three match within the terminal client. Hint uses a hollow circle `○`.
+fn diag_glyph(severity: DiagnosticSeverity) -> &'static str {
+    match severity {
+        DiagnosticSeverity::Error => "⊗",
+        DiagnosticSeverity::Warning => "⚠",
+        DiagnosticSeverity::Information => "ⓘ",
+        DiagnosticSeverity::Hint => "○",
     }
 }
 
@@ -4531,18 +4595,18 @@ fn diagnostic_count_spans(state: &AppState) -> Vec<Span<'static>> {
     else {
         return parts;
     };
-    for (n, glyph, severity) in [
-        (counts.errors, "✗", DiagnosticSeverity::Error),
-        (counts.warnings, "⚠", DiagnosticSeverity::Warning),
-        (counts.infos, "ℹ", DiagnosticSeverity::Information),
-        (counts.hints, "·", DiagnosticSeverity::Hint),
+    for (n, severity) in [
+        (counts.errors, DiagnosticSeverity::Error),
+        (counts.warnings, DiagnosticSeverity::Warning),
+        (counts.infos, DiagnosticSeverity::Information),
+        (counts.hints, DiagnosticSeverity::Hint),
     ] {
         if n > 0 {
             if !parts.is_empty() {
                 parts.push(Span::styled(" ".to_string(), bg));
             }
             parts.push(Span::styled(
-                format!("{glyph} {n}"),
+                format!("{} {n}", diag_glyph(severity)),
                 bg.fg(diag_color(severity)),
             ));
         }
@@ -5367,10 +5431,11 @@ mod tests {
             },
         ];
         let lines = hover_display_lines(&blocks, 80);
+        // Diagnostic blocks are prefixed with the severity icon on their first line.
         assert_eq!(
             lines[0],
             (
-                "Error: bad thing".to_string(),
+                "⊗ Error: bad thing".to_string(),
                 Some(DiagnosticSeverity::Error)
             )
         );
@@ -5381,7 +5446,7 @@ mod tests {
         );
         assert_eq!(
             lines[2],
-            ("Hint: maybe".to_string(), Some(DiagnosticSeverity::Hint))
+            ("○ Hint: maybe".to_string(), Some(DiagnosticSeverity::Hint))
         );
         // A plain (hover) block carries no severity → default color.
         let plain = vec![HoverBlock {
@@ -5996,7 +6061,7 @@ mod tests {
         ];
         let cells = underline_cols(&build_spans("xyz", &[], None, &[], &[], &diags, 80));
         assert_eq!(cells[1].1, Some(NORD11), "overlap shows error red");
-        assert_eq!(cells[0].1, Some(NORD3), "non-overlap keeps hint gray");
+        assert_eq!(cells[0].1, Some(NORD4), "non-overlap keeps hint colour");
     }
 
     #[test]

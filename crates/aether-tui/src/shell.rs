@@ -112,6 +112,9 @@ pub struct Shell {
     fetch_in_flight: bool,
     refetch_queued: bool,
     reveal_after_fetch: bool,
+    /// Like `reveal_after_fetch`, but centres the cursor once its (out-of-window) line lands — for
+    /// `-` (center-cursor) when the cursor has been scrolled out of the loaded window.
+    center_after_fetch: bool,
     /// Picker results scroll (first visible item index) — the shell half of picker
     /// geometry, reset by `Effect::PickerScrollReset`.
     picker_scroll: usize,
@@ -165,6 +168,7 @@ pub async fn run(
         fetch_in_flight: false,
         refetch_queued: false,
         reveal_after_fetch: false,
+        center_after_fetch: false,
         picker_scroll: 0,
         subscribe_epoch: 0,
         last_click: None,
@@ -383,6 +387,10 @@ impl Shell {
                     self.reveal_after_fetch = false;
                     self.reveal_cursor();
                 }
+                if self.center_after_fetch {
+                    self.center_after_fetch = false;
+                    self.center_cursor_in_window();
+                }
                 if self.refetch_queued {
                     self.refetch_queued = false;
                     self.maybe_fetch();
@@ -440,8 +448,42 @@ impl Shell {
     }
 
     async fn on_key(&mut self, k: KeyEvent) {
-        // Hover: any key dismisses (scroll keys pan it — v1 dismisses uniformly).
+        // Hover: scroll keys pan the popover and keep it open; any other key dismisses it.
         if self.state.hover.is_some() {
+            if let Some((code, mods, _)) = translate_key(&k) {
+                if let Some(h) = self.state.hover.as_mut() {
+                    let handled = match code {
+                        KeyCode::Up if mods.alt => {
+                            h.scroll.half(false);
+                            true
+                        }
+                        KeyCode::Down if mods.alt => {
+                            h.scroll.half(true);
+                            true
+                        }
+                        KeyCode::Up => {
+                            h.scroll.scroll_by(-1);
+                            true
+                        }
+                        KeyCode::Down => {
+                            h.scroll.scroll_by(1);
+                            true
+                        }
+                        KeyCode::PageUp => {
+                            h.scroll.page(false);
+                            true
+                        }
+                        KeyCode::PageDown => {
+                            h.scroll.page(true);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if handled {
+                        return;
+                    }
+                }
+            }
             self.state.hover = None;
             return;
         }
@@ -805,6 +847,45 @@ impl Shell {
     }
 
     fn center_cursor(&mut self) {
+        let line = self.session.buffer.cursor.position.line;
+        let loaded = self
+            .session
+            .window
+            .as_ref()
+            .map(|w| (w.first_logical_line, w.last_logical_line_exclusive));
+        let Some((first, last)) = loaded else {
+            return;
+        };
+        // When the cursor's line has been scrolled out of the loaded window, its visual row is
+        // unknown — pull that region from the server (scrolling the viewport to the line), then
+        // centre once it lands. Mirrors `ensure_cursor_visible`.
+        if line < first || line >= last {
+            let Some(viewport_id) = self.session.viewport_id else {
+                return;
+            };
+            self.center_after_fetch = true;
+            self.fetch_in_flight = true;
+            let h = self.handle.clone();
+            let fut = async move {
+                h.rpc::<ViewportScroll>(ViewportScrollParams {
+                    viewport_id,
+                    scroll: ScrollPosition {
+                        logical_line: line,
+                        sub_row: 0.0,
+                    },
+                })
+                .await
+            };
+            self.pending
+                .push(Box::pin(async move { Done::Window(fut.await) }));
+            return;
+        }
+        self.center_cursor_in_window();
+    }
+
+    /// Centre the cursor's line in the viewport. Assumes its line is in the loaded window (the
+    /// caller pulls it in first otherwise); a no-op if its visual row isn't resolvable.
+    fn center_cursor_in_window(&mut self) {
         self.reveal_cursor_col();
         let Some(window) = &self.session.window else {
             return;
@@ -964,6 +1045,16 @@ impl Shell {
             max_scroll_logical_line: window
                 .map(|w| w.max_scroll_logical_line)
                 .or(prev.map(|p| p.max_scroll_logical_line))
+                .unwrap_or(0),
+            total_visual_rows: window
+                .map(|w| w.total_visual_rows)
+                .or(prev.map(|p| p.total_visual_rows))
+                .unwrap_or(0),
+            // `top_visual_row` is absolute (whole-buffer) already; while a switch is in flight
+            // (no window) keep the previous frame's value so the thumb doesn't jump.
+            top_visual_row: window
+                .map(|_| self.top_visual_row)
+                .or(prev.map(|p| p.top_visual_row))
                 .unwrap_or(0),
             wrap: s.wrap,
             diff_view: s.diff_view,
