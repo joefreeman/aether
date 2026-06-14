@@ -424,6 +424,48 @@ pub fn lookup(ctx: KeyContext, code: KeyCode, mods: Mods) -> Option<&'static Bin
     table(ctx).iter().find(|b| b.matches(code, mods))
 }
 
+/// One row of the keyboard-shortcuts help: a formatted chord + its description, filed under a tab
+/// and a section group. Built straight from the binding tables so every client renders identical
+/// content.
+pub struct HelpEntry {
+    /// `Normal` / `Insert` / `Search` / `Application`.
+    pub tab: &'static str,
+    /// Section heading within the tab (the binding's `group`).
+    pub group: &'static str,
+    /// Display chord, e.g. `Ctrl-w`, `Space f ␣`, `↑`.
+    pub keys: String,
+    pub desc: &'static str,
+}
+
+/// Every user-facing binding, grouped for the help dialog: the four tabs in display order, the
+/// `Global` (shared Ctrl-editing) keys folded into both Normal and Insert, leader chords as the
+/// Application tab. Bindings with no `group` (internal aliases) and the leader-trigger itself are
+/// omitted. The single source the web and native help dialogs both render.
+pub fn help_entries() -> Vec<HelpEntry> {
+    const TABS: [(&str, &[KeyContext]); 4] = [
+        ("Normal", &[KeyContext::Normal, KeyContext::Global]),
+        ("Insert", &[KeyContext::Insert, KeyContext::Global]),
+        ("Search", &[KeyContext::Search]),
+        ("Application", &[KeyContext::Leader]),
+    ];
+    let mut entries = Vec::new();
+    for (tab, contexts) in TABS {
+        for &cx in contexts {
+            for b in table(cx) {
+                if !b.group.is_empty() && !matches!(b.action, Action::BeginLeader) {
+                    entries.push(HelpEntry {
+                        tab,
+                        group: b.group,
+                        keys: b.key_label(),
+                        desc: b.desc,
+                    });
+                }
+            }
+        }
+    }
+    entries
+}
+
 /// What a key does to an *open hover popover*.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HoverAction {
@@ -675,6 +717,37 @@ static LEADER: &[Binding] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_entries_group_into_the_four_tabs() {
+        let entries = help_entries();
+        for tab in ["Normal", "Insert", "Search", "Application"] {
+            assert!(entries.iter().any(|e| e.tab == tab), "tab {tab} present");
+        }
+        // Internal bindings are hidden: never an empty group, and the leader-trigger (bare
+        // "Space", action BeginLeader) is filtered out.
+        assert!(entries.iter().all(|e| !e.group.is_empty()));
+        assert!(entries.iter().all(|e| e.keys != "Space"));
+        // The Application tab is the leader chords — every chord is `Space …`.
+        assert!(entries
+            .iter()
+            .filter(|e| e.tab == "Application")
+            .all(|e| e.keys.starts_with("Space ")));
+        // Global (shared Ctrl-editing) keys fold into both Normal and Insert: at least one
+        // description shows up under both tabs.
+        let in_tab = |t: &str| {
+            entries
+                .iter()
+                .filter(move |e| e.tab == t)
+                .map(|e| e.desc)
+                .collect::<Vec<_>>()
+        };
+        let (normal, insert) = (in_tab("Normal"), in_tab("Insert"));
+        assert!(
+            normal.iter().any(|d| insert.contains(d)),
+            "Global bindings appear in both Normal and Insert"
+        );
+    }
 
     #[test]
     fn hover_action_reuses_normal_copy_and_scroll_bindings() {

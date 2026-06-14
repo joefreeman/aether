@@ -262,6 +262,11 @@ pub struct App {
     /// The hover popover (hover info / diagnostics-at-cursor / commit details), anchored at
     /// the cursor; holds *parsed* iced markdown. Dismissed by any key, click, or scroll.
     hover: Option<HoverContent>,
+    /// The keyboard-shortcuts help dialog (`Space ?`), or `None` when closed. A shell-local overlay
+    /// (the core only triggers it via `Effect::ShellAction(OpenHelp)`); content comes from the
+    /// core keymap (`keymap::help_entries`). Holds the selected tab index; scroll lives in the
+    /// scrollable widget, keyed by `help_scroll_id`.
+    help: Option<usize>,
     /// Last horizontal anchor (px) computed for the hover popover, cached so it's retained when the
     /// cursor scrolls out of the loaded window (otherwise its column is unknown and the popover
     /// would jump to the left edge). Interior-mutable: refreshed from the render path (`&self`).
@@ -310,6 +315,7 @@ impl App {
             spinner_phase: 0.0,
             last_anim_tick: None,
             hover: None,
+            help: None,
             hover_anchor_x: std::cell::Cell::new(4.0),
             hover_below: std::cell::Cell::new(None),
             toasts: Vec::new(),
@@ -1233,6 +1239,11 @@ impl App {
     /// Key events: the shell's edge — dismiss the hover popover (its parse cache lives
     /// here), then hand the key to the core with the viewport height it may need.
     fn on_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Task<Message> {
+        // The help dialog owns the keyboard while open: tab nav, scrolling, close — every key is
+        // consumed so nothing leaks to the editor behind it.
+        if self.help.is_some() {
+            return self.on_help_key(code, mods);
+        }
         // While a hover popover is open, scroll keys pan it (and keep it open); any other key
         // dismisses it — Esc is then consumed, everything else still acts.
         if self.hover.is_some() {
@@ -1266,6 +1277,56 @@ impl App {
         let visible_rows = self.visible_rows();
         let fx = self.session.on_key(code, mods, text, visible_rows);
         self.run_core(fx)
+    }
+
+    /// Keyboard handling while the help dialog is open (mirrors the TUI / web help): Esc / `q` / `?`
+    /// close it; `h`/`l`, arrows, Tab, or `1`-`4` switch tabs (resetting scroll); `j`/`k`, arrows,
+    /// PageUp/Down and Space scroll the body. Every key is consumed.
+    fn on_help_key(&mut self, code: KeyCode, mods: Mods) -> Task<Message> {
+        let n = HELP_TABS.len();
+        let tab = self.help.unwrap_or(0);
+        let scroll_to_top = || {
+            iced::widget::operation::scroll_to(
+                help_scroll_id(),
+                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+            )
+        };
+        let scroll_by = |dy: f32| {
+            iced::widget::operation::scroll_by(
+                help_scroll_id(),
+                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy },
+            )
+        };
+        const LINE: f32 = 40.0;
+        const PAGE: f32 = 320.0;
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                self.help = None;
+                Task::none()
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.help = Some((tab + n - 1) % n);
+                scroll_to_top()
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.help = Some((tab + 1) % n);
+                scroll_to_top()
+            }
+            KeyCode::Tab => {
+                self.help = Some(if mods.shift { (tab + n - 1) % n } else { (tab + 1) % n });
+                scroll_to_top()
+            }
+            KeyCode::Char(c @ '1'..='4') => {
+                let idx = (c as usize - '1' as usize).min(n - 1);
+                self.help = Some(idx);
+                scroll_to_top()
+            }
+            KeyCode::Up | KeyCode::Char('k') => scroll_by(-LINE),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char(' ') => scroll_by(LINE),
+            KeyCode::PageUp => scroll_by(-PAGE),
+            KeyCode::PageDown => scroll_by(PAGE),
+            _ => Task::none(),
+        }
     }
 
     /// Actions whose execution is irreducibly shell-side (`Effect::ShellAction`).
@@ -1311,6 +1372,15 @@ impl App {
                 self.rpc::<ViewportSetWrap>(
                     ViewportSetWrapParams { viewport_id, wrap },
                     Message::WindowUpdate,
+                )
+            }
+            A::OpenHelp => {
+                self.help = Some(0);
+                // Fresh scrollable starts at the top, but reset defensively in case its widget
+                // state persisted from a prior open.
+                iced::widget::operation::scroll_to(
+                    help_scroll_id(),
+                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
                 )
             }
             _ => Task::none(),
@@ -1827,6 +1897,9 @@ impl App {
         if self.session.prompt.is_some() {
             layers.push(self.prompt_overlay());
         }
+        if let Some(tab) = self.help {
+            layers.push(self.help_overlay(tab));
+        }
         if !self.toasts.is_empty() {
             layers.push(self.toast_overlay());
         }
@@ -1872,6 +1945,108 @@ impl App {
                 ..iced::Padding::ZERO
             })
             .into()
+    }
+
+    /// The keyboard-shortcuts dialog (`Space ?`): a centred modal with a tab bar
+    /// (Normal/Insert/Search/Application) over a scrollable, two-column list of the active tab's
+    /// bindings — content from `keymap::help_entries`, matching the web client. Keyboard-driven
+    /// (see `on_help_key`); `opaque` blocks the editor behind it.
+    fn help_overlay(&self, tab: usize) -> Element<'_, Message> {
+        // Tab bar: active tab in frost-blue bold, the rest dim.
+        let mut tabs = row![].spacing(16).align_y(iced::Alignment::Center);
+        for (i, name) in HELP_TABS.iter().enumerate() {
+            let active = i == tab;
+            tabs = tabs.push(
+                text(*name)
+                    .size(14)
+                    .font(if active { SANS_BOLD_UI } else { SANS })
+                    .color(if active {
+                        theme::NORD8
+                    } else {
+                        theme::NORD3_BRIGHT
+                    }),
+            );
+        }
+
+        // Group the active tab's entries into ordered sections.
+        let tab_name = HELP_TABS[tab];
+        let mut sections: Vec<(&'static str, Vec<(String, &'static str)>)> = Vec::new();
+        for e in crate::keymap::help_entries() {
+            if e.tab != tab_name {
+                continue;
+            }
+            match sections.iter_mut().find(|(g, _)| *g == e.group) {
+                Some((_, rows)) => rows.push((e.keys, e.desc)),
+                None => sections.push((e.group, vec![(e.keys, e.desc)])),
+            }
+        }
+
+        // Spread sections across two columns, balancing by accumulated row count.
+        let mut col_a = column![].spacing(16);
+        let mut col_b = column![].spacing(16);
+        let (mut a_rows, mut b_rows) = (0usize, 0usize);
+        for (group, rows) in sections {
+            let n = rows.len() + 1;
+            let sec = help_section(group, rows);
+            if a_rows <= b_rows {
+                col_a = col_a.push(sec);
+                a_rows += n;
+            } else {
+                col_b = col_b.push(sec);
+                b_rows += n;
+            }
+        }
+        let grid = row![
+            col_a.width(Length::FillPortion(1)),
+            col_b.width(Length::FillPortion(1)),
+        ]
+        .spacing(28);
+
+        let body = iced::widget::scrollable(container(grid).padding([4, 2]))
+            .id(help_scroll_id())
+            .height(Length::Fill)
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                iced::widget::scrollable::Scrollbar::new()
+                    .width(5)
+                    .margin(0)
+                    .scroller_width(5),
+            ));
+
+        // Modal box, sized to the window with margins (web: min(760, 92vw) × 80vh).
+        let w = (self.view_size.width - 64.0).clamp(320.0, 760.0);
+        let h = (self.view_size.height * 0.8).max(200.0);
+        let modal = container(column![tabs, body].spacing(12))
+            .width(Length::Fixed(w))
+            .max_height(h)
+            .padding(16)
+            .style(|_| container::Style {
+                background: Some(theme::NORD1.into()),
+                border: iced::Border {
+                    color: theme::NORD3,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba8(0, 0, 0, 0.4),
+                    offset: iced::Vector::new(0.0, 12.0),
+                    blur_radius: 40.0,
+                },
+                ..container::Style::default()
+            });
+
+        // Dimmed full-screen backdrop, centred. `opaque` swallows clicks so they don't fall through
+        // to the editor (the dialog is keyboard-driven: Esc / q / ? close it).
+        iced::widget::opaque(
+            container(modal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center)
+                .style(|_| container::Style {
+                    background: Some(iced::Color::from_rgba8(20, 24, 30, 0.5).into()),
+                    ..container::Style::default()
+                }),
+        )
     }
 
     /// The no-args start screen: just the Projects picker over the editor background.
@@ -2642,6 +2817,11 @@ const SANS_BOLD_UI: iced::Font = iced::Font {
     weight: iced::font::Weight::Bold,
     ..SANS
 };
+/// Monospace, for the help dialog's key-chord column.
+const MONO: iced::Font = iced::Font::MONOSPACE;
+
+/// Help-dialog tabs, in display order. Indexes `App::help`.
+const HELP_TABS: [&str; 4] = ["Normal", "Insert", "Search", "Application"];
 
 fn pump(notifications: NotifRx) -> Task<Message> {
     Task::perform(
@@ -2879,6 +3059,38 @@ fn open_link(url: &str) {
 /// The hover popover's scrollable id, for programmatic `scroll_by` (keyboard panning).
 fn hover_scroll_id() -> iced::advanced::widget::Id {
     iced::advanced::widget::Id::new("hover-scroll")
+}
+
+fn help_scroll_id() -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::new("help-scroll")
+}
+
+/// One help section: an uppercase group heading over its `keys → desc` rows (key column monospace,
+/// matching the web's `.help-section`). Mirrors the web layout in iced.
+fn help_section(group: &str, rows: Vec<(String, &'static str)>) -> Element<'static, Message> {
+    let mut col = column![text(group.to_uppercase())
+        .size(11)
+        .font(SANS)
+        .color(theme::NORD13)]
+    .spacing(2);
+    for (keys, desc) in rows {
+        col = col.push(
+            row![
+                text(keys)
+                    .size(12)
+                    .font(MONO)
+                    .color(theme::NORD8)
+                    .width(Length::FillPortion(2)),
+                text(desc)
+                    .size(13)
+                    .font(SANS)
+                    .color(theme::NORD4)
+                    .width(Length::FillPortion(3)),
+            ]
+            .spacing(8),
+        );
+    }
+    col.into()
 }
 
 /// Vertical scroll delta (px) for a resolved popover [`HoverAction::Scroll`]: a line is one cell

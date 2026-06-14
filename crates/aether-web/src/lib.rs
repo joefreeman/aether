@@ -214,28 +214,17 @@ impl WasmSession {
     /// groups it into tabs → sections. Hidden bindings (the leader trigger, empty-group internals)
     /// are filtered out. Returns the array.
     pub fn help_entries(&self) -> Result<JsValue, JsValue> {
-        use aether_client::keymap::{self, Action, KeyContext};
-        let tabs: [(&str, &[KeyContext]); 4] = [
-            ("Normal", &[KeyContext::Normal, KeyContext::Global]),
-            ("Insert", &[KeyContext::Insert, KeyContext::Global]),
-            ("Search", &[KeyContext::Search]),
-            ("Application", &[KeyContext::Leader]),
-        ];
-        let mut entries = Vec::new();
-        for (tab, contexts) in tabs {
-            for &cx in contexts {
-                for b in keymap::all() {
-                    if b.ctx == cx && !b.group.is_empty() && !matches!(b.action, Action::BeginLeader) {
-                        entries.push(json!({
-                            "tab": tab,
-                            "group": b.group,
-                            "keys": b.key_label(),
-                            "desc": b.desc,
-                        }));
-                    }
-                }
-            }
-        }
+        let entries: Vec<Value> = aether_client::keymap::help_entries()
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "tab": e.tab,
+                    "group": e.group,
+                    "keys": e.keys,
+                    "desc": e.desc,
+                })
+            })
+            .collect();
         to_js(&Value::Array(entries))
     }
 
