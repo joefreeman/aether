@@ -72,7 +72,13 @@ enum Done {
     Reconnected(Box<Result<Reestablished, ReconnectError>>),
     /// Re-enabling the sticky diff view after a fresh subscribe.
     DiffViewSet(Result<aether_protocol::viewport::ViewportWindowResult, String>),
+    /// A floating toast's time-to-live elapsed; removes the toast with this id from the stack.
+    ToastExpired(u64),
 }
+
+/// How long a floating toast (bottom-right) stays before it auto-dismisses — matching the web/native
+/// clients' transient toasts.
+const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 
 struct Reestablished {
     handle: Handle,
@@ -132,6 +138,9 @@ pub struct Shell {
     should_quit: bool,
     /// Terminal size (cols, rows); the text viewport is `rows - 1` (status row).
     term: (u16, u16),
+    /// Monotonic id source for floating toasts — each toast's expiry timer carries its id so the
+    /// right one is removed from the stack when it elapses.
+    next_toast_id: u64,
 }
 
 pub async fn run(
@@ -177,6 +186,7 @@ pub async fn run(
         click_streak: 0,
         should_quit: false,
         term,
+        next_toast_id: 0,
     };
 
     // First subscribe: the session was bootstrapped with a buffer; show it.
@@ -237,7 +247,30 @@ impl Shell {
     }
 
     fn status(&mut self, msg: StatusMessage) {
-        self.state.status = msg;
+        self.push_toast(msg);
+    }
+
+    /// Push a transient toast onto the bottom-right stack and arm its expiry timer. Empty messages
+    /// are dropped. The stack is capped so a burst can't grow it without bound (oldest fall off).
+    fn push_toast(&mut self, msg: StatusMessage) {
+        if msg.is_empty() {
+            return;
+        }
+        const MAX_TOASTS: usize = 5;
+        let id = self.next_toast_id;
+        self.next_toast_id = self.next_toast_id.wrapping_add(1);
+        self.state.toasts.push(crate::app::Toast {
+            id,
+            text: msg.text,
+            kind: msg.kind,
+        });
+        if self.state.toasts.len() > MAX_TOASTS {
+            self.state.toasts.remove(0);
+        }
+        self.pending.push(Box::pin(async move {
+            tokio::time::sleep(TOAST_TTL).await;
+            Done::ToastExpired(id)
+        }));
     }
 
     // ---- core dispatch -----------------------------------------------------------------
@@ -438,6 +471,7 @@ impl Shell {
                 enabled: true,
                 result,
             }),
+            Done::ToastExpired(id) => self.state.toasts.retain(|t| t.id != id),
             Done::Reconnected(result) => match *result {
                 Ok(r) => {
                     self.handle = r.handle;
@@ -518,6 +552,10 @@ impl Shell {
             {
                 self.status(StatusMessage::error(format!("project settings: {e}")));
             }
+            // The handler reports success by writing `state.status` directly (it has no shell
+            // access to push a toast); drain that into the toast stack here.
+            let drained = std::mem::take(&mut self.state.status);
+            self.push_toast(drained);
             // Root edits change the project paths server-side; mirror into the session.
             self.session.project_paths = self.state.project_paths.clone();
             // A removal that closed the active buffer routes through the same
@@ -1582,6 +1620,7 @@ pub async fn bootstrap(
         viewport_rows: (rows as u32).saturating_sub(1),
         should_quit: false,
         status: StatusMessage::default(),
+        toasts: Vec::new(),
         last_terminal_title: String::new(),
         clipboard: clipboard::new_handle(),
         pending_leader: None,

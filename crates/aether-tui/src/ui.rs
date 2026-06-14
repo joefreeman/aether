@@ -104,12 +104,11 @@ const CURSOR_LINE_STAGED_ADDED_BG: Color = Color::Rgb(58, 69, 60);
 const CURSOR_LINE_STAGED_MODIFIED_BG: Color = Color::Rgb(67, 65, 56);
 
 pub fn draw(f: &mut Frame, state: &AppState) {
-    // The status row carries activation feedback, save-as / new-file prompts, and the dirty +
-    // cursor indicator for an active editor. The add-root prompt lives *inside* the settings
-    // overlay, not here. We show the row when an editor exists, or when a transient status
-    // message is up (e.g. after activating a project) — otherwise hide so the no-project view
-    // gets full vertical space.
-    let show_status = state.has_editor() || !state.status.is_empty();
+    // The status row carries save-as / new-file prompts and the dirty + cursor indicator for an
+    // active editor. The add-root prompt lives *inside* the settings overlay, not here. Transient
+    // feedback no longer lives here — it floats as a toast (see `draw_toast_overlay`) — so the row
+    // is shown only for an active editor, leaving the no-project view its full vertical space.
+    let show_status = state.has_editor();
     let constraints: &[Constraint] = if show_status {
         &[Constraint::Min(1), Constraint::Length(1)]
     } else {
@@ -165,6 +164,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         let status_area = chunks.get(1).copied().unwrap_or(Rect::default());
         place_terminal_cursor(f, state, buffer_area, status_area);
     }
+    // Transient toasts: stacked in the bottom-right of the content area (above the status row) over
+    // everything, since they're ephemeral feedback. Drawn last so a modal never hides them.
+    draw_toast_overlay(f, state, chunks[0]);
 }
 
 /// Mute every cell in `area` to a faint grey on the base background — the modal backdrop. Keeps the
@@ -4548,13 +4550,81 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             },
             status_dot,
             git_spans,
-            &state.status,
+            // The transient message now floats as a toast (see `draw_toast_overlay`), so it's kept
+            // out of the status row — the bar shows only the persistent project / file / git info.
+            &crate::app::StatusMessage::default(),
             right_spans,
             area.width as usize,
         ))
     };
     let p = Paragraph::new(line).style(Style::default().bg(NORD1).fg(NORD4));
     f.render_widget(p, area);
+}
+
+/// Accent colour for a toast's left bar — matches the web/native toast border colours
+/// (info → frost blue, success → green, warning → yellow, error → red).
+fn toast_accent_color(kind: crate::app::StatusKind) -> Color {
+    use crate::app::StatusKind;
+    match kind {
+        StatusKind::Info => NORD8,
+        StatusKind::Success => NORD14,
+        StatusKind::Warning => NORD13,
+        StatusKind::Error => NORD11,
+    }
+}
+
+/// Floating toasts stacked in the bottom-right of `area`: each is a fat status-coloured left bar
+/// followed by its message on a tinted background — deliberately subtle (no full outline), mirroring
+/// the web/native transient toasts. The newest sits at the bottom; older ones stack upward with a
+/// blank gap row between them (until they run out of vertical room). The shell expires each on a TTL
+/// timer, so they auto-dismiss.
+fn draw_toast_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+    const BAR_W: u16 = 1; // a solid accent-coloured cell — the "fat" left bar
+    const PAD: u16 = 1; // one space between the bar and the text, and after the text
+    const MARGIN_X: u16 = 2;
+    const MARGIN_Y: u16 = 1;
+    const GAP: u16 = 1; // blank row between stacked toasts
+    if state.toasts.is_empty() || area.height <= MARGIN_Y {
+        return;
+    }
+    let max_text =
+        (area.width as usize).saturating_sub((BAR_W + PAD * 2 + MARGIN_X * 2) as usize);
+    if max_text == 0 {
+        return;
+    }
+    // Newest toast hugs the bottom; older ones march upward a row + gap at a time.
+    let mut y = area.y + area.height.saturating_sub(1 + MARGIN_Y);
+    for toast in state.toasts.iter().rev() {
+        let text = if toast.text.width() <= max_text {
+            toast.text.clone()
+        } else {
+            truncate_to_width(&toast.text, max_text)
+        };
+        let box_w = BAR_W + PAD + text.width() as u16 + PAD;
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(box_w + MARGIN_X),
+            y,
+            width: box_w,
+            height: 1,
+        };
+        f.render_widget(Clear, rect);
+        let tint = Style::default().bg(NORD2).fg(NORD6);
+        let spans = vec![
+            Span::styled(
+                " ".to_string(),
+                Style::default().bg(toast_accent_color(toast.kind)),
+            ),
+            Span::styled(" ".to_string(), tint),
+            Span::styled(text, tint),
+            Span::styled(" ".to_string(), tint),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)).style(tint), rect);
+        // Step up for the next (older) toast; stop once there's no room left in the area.
+        if y < area.y + 1 + GAP {
+            break;
+        }
+        y -= 1 + GAP;
+    }
 }
 
 /// Display width of the save-prompt's committed root prefix. Only non-zero in multi-root
@@ -6092,6 +6162,16 @@ mod tests {
         assert!(text.contains("let x = 1;  "));
         let num = spans.last().expect("line-number span");
         assert_eq!(num.style.fg, Some(NORD3));
+    }
+
+    #[test]
+    fn toast_accent_color_matches_kind() {
+        use crate::app::StatusKind;
+        // Matches the web/native toast border colours.
+        assert_eq!(toast_accent_color(StatusKind::Info), NORD8);
+        assert_eq!(toast_accent_color(StatusKind::Success), NORD14);
+        assert_eq!(toast_accent_color(StatusKind::Warning), NORD13);
+        assert_eq!(toast_accent_color(StatusKind::Error), NORD11);
     }
 
     #[test]

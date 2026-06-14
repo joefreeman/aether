@@ -2554,20 +2554,43 @@ impl App {
                 ToastKind::Warning => theme::NORD13,
                 ToastKind::Success => theme::NORD14,
             };
+            // The accent left strip is rendered the way the web does a rounded `border-left`: an
+            // accent-coloured rounded base (outer) showing through a 3px left inset, with the NORD1
+            // content layer (inner) covering everything else. So the strip's left corners ARE the
+            // base's rounded corners — matching the rounded right corners — and the height is just
+            // the content's (no `Fill` to bound).
             stack_col = stack_col.push(
                 container(
-                    row![
-                        text("▌").size(13).color(accent),
+                    container(
                         text(toast.message.clone())
                             .size(13)
                             .font(SANS)
                             .color(theme::NORD4),
-                    ]
-                    .spacing(6),
+                    )
+                    .padding([6, 12])
+                    .style(|_| container::Style {
+                        background: Some(theme::NORD1.into()),
+                        // Square against the accent strip on the left; rounded on the right (just
+                        // inside the 1px border, so ~3) to sit within the base's rounded corners.
+                        border: iced::Border {
+                            radius: iced::border::Radius {
+                                top_left: 0.0,
+                                bottom_left: 0.0,
+                                top_right: 3.0,
+                                bottom_right: 3.0,
+                            },
+                            ..iced::Border::default()
+                        },
+                        ..container::Style::default()
+                    }),
                 )
-                .padding([6, 12])
-                .style(|_| container::Style {
-                    background: Some(theme::NORD1.into()),
+                // Reveal a 3px accent strip down the left; the content is flush on the other sides.
+                .padding(iced::Padding {
+                    left: 3.0,
+                    ..iced::Padding::ZERO
+                })
+                .style(move |_| container::Style {
+                    background: Some(accent.into()),
                     border: iced::Border {
                         color: theme::NORD3,
                         width: 1.0,

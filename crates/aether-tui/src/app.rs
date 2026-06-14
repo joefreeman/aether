@@ -148,6 +148,16 @@ impl std::fmt::Display for StatusMessage {
     }
 }
 
+/// A floating toast: a transient notification, stacked in the bottom-right (newest at the bottom).
+/// Fed from the same `StatusMessage` stream as before; the shell assigns the `id` and expires it on
+/// a timer. Mirrors the web/native clients' toasts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub id: u64,
+    pub text: String,
+    pub kind: StatusKind,
+}
+
 /// Top-level UI state. Anything that exists regardless of whether a buffer is open lives on
 /// `AppState`; anything that's per-screen (editor vs file browser) lives inside `Screen`.
 ///
@@ -169,10 +179,15 @@ pub struct AppState {
     pub viewport_cols: u32,
     pub viewport_rows: u32,
     pub should_quit: bool,
-    /// Transient feedback rendered on the status row. Carries a `StatusKind` so the renderer
-    /// can colour the message — "saved" reads as success, "save failed" reads as error, etc.
-    /// Constructed via `StatusMessage::info` / `::success` / `::warning` / `::error`.
+    /// Transient feedback. Carries a `StatusKind` so the renderer can colour the message — "saved"
+    /// reads as success, "save failed" reads as error, etc. Constructed via `StatusMessage::info` /
+    /// `::success` / `::warning` / `::error`. This is now a *handoff* slot: the shell drains it into
+    /// a [`Toast`] (see [`AppState::toasts`]); only code without shell access (project-settings
+    /// handlers) writes it directly.
     pub status: StatusMessage,
+    /// Active floating toasts, stacked bottom-right (newest at the bottom). Each is expired on a
+    /// timer by the shell, keyed by its `id`. Fed from the same stream as `status`.
+    pub toasts: Vec<Toast>,
     /// Mirror of the most recently emitted terminal-title escape sequence. We only re-emit
     /// when [`terminal_title`] derives something different, so frame-loop draws don't spam OSC
     /// sequences down stdout. Empty string at startup; populated on the first render.
@@ -1231,6 +1246,7 @@ mod tests {
             viewport_rows: 24,
             should_quit: false,
             status: StatusMessage::default(),
+            toasts: Vec::new(),
             last_terminal_title: String::new(),
             clipboard: None,
             pending_leader: None,
@@ -1258,6 +1274,7 @@ mod tests {
             viewport_rows: 24,
             should_quit: false,
             status: StatusMessage::default(),
+            toasts: Vec::new(),
             last_terminal_title: String::new(),
             clipboard: None,
             pending_leader: None,
@@ -1288,6 +1305,7 @@ mod tests {
             viewport_rows: 24,
             should_quit: false,
             status: StatusMessage::default(),
+            toasts: Vec::new(),
             last_terminal_title: String::new(),
             clipboard: None,
             pending_leader: None,
