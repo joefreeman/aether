@@ -170,13 +170,12 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 }
 
 /// Mute every cell in `area` to a faint grey on the base background — the modal backdrop. Keeps the
-/// glyphs (so the content stays faintly legible) but drops their colour and emphasis, so a dialog
+/// glyphs (so the content stays faintly legible) and their emphasis (italics / bold / underline are
+/// preserved — `set_style` only patches the fields we set), just flattening the colour, so a dialog
 /// painted on top reads as the only live thing on screen.
 fn dim_backdrop(buf: &mut Buffer, area: Rect) {
-    let dim = Style::default()
-        .fg(NORD3)
-        .bg(NORD0)
-        .remove_modifier(Modifier::all());
+    // Override only fg/bg; leave the cell's existing modifiers (italic etc.) intact.
+    let dim = Style::default().fg(NORD3).bg(NORD0);
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(cell) = buf.cell_mut((x, y)) {
@@ -5655,16 +5654,24 @@ mod tests {
             0,
             0,
             "code",
-            Style::default().fg(NORD8).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(NORD8)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         );
         dim_backdrop(&mut buf, area);
         let cell = buf.cell((0, 0)).expect("cell present");
         assert_eq!(cell.symbol(), "c", "glyph is preserved");
         assert_eq!(cell.fg, NORD3, "foreground muted to grey");
         assert_eq!(cell.bg, NORD0, "background flattened to base");
+        // Emphasis is preserved — only the colour is flattened — so italic/bold text keeps reading
+        // as italic/bold behind the dialog.
         assert!(
-            !cell.modifier.contains(Modifier::BOLD),
-            "emphasis is dropped"
+            cell.modifier.contains(Modifier::BOLD),
+            "bold emphasis preserved"
+        );
+        assert!(
+            cell.modifier.contains(Modifier::ITALIC),
+            "italic emphasis preserved"
         );
     }
 
