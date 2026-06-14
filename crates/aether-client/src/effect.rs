@@ -41,11 +41,19 @@ pub enum Effect {
     SaveScrollAnchor,
     /// Jump back to the remembered scroll position (and forget it).
     RestoreScrollAnchor,
+    /// Capture a *content* scroll anchor before a wrap/diff re-layout: the shell calls
+    /// [`crate::session::Session::capture_scroll_anchor`] with its current top visual row, so the
+    /// view can be restored to the same content once the re-laid-out window arrives. Distinct from
+    /// the geometry-based [`Effect::SaveScrollAnchor`] (correct for search, which doesn't relayout).
+    /// The restore side is folded into [`Effect::WindowAdopted`] and the shells' wrap-adopt paths,
+    /// which call [`crate::session::Session::resolve_scroll_anchor`].
+    SaveContentAnchor,
     /// Show the hover popover with this content (the shell parses/styles it).
     ShowHover(HoverText),
     DismissHover,
-    /// The core replaced the window wholesale (diff toggle): re-derive view geometry —
-    /// clamp the scroll, reveal the cursor.
+    /// The core replaced the window wholesale (wrap/diff toggle): re-derive view geometry. If a
+    /// content anchor is pending (see [`Effect::SaveContentAnchor`]) the shell restores the view to
+    /// it; otherwise it clamps the scroll and reveals the cursor.
     WindowAdopted,
     /// Scroll the picker's results list so the highlighted row is in view (geometry — the
     /// pixel math and the scrollable live in the shell).

@@ -222,7 +222,15 @@ pub struct Session {
     /// An open picker overlay; owns the keyboard while open.
     pub picker: Option<PickerState>,
     pub conn: ConnState,
+    /// A content scroll anchor captured before a re-layout (wrap / diff toggle), so the view can be
+    /// restored to the same content afterwards. Set by [`Session::capture_scroll_anchor`] and
+    /// consumed by [`Session::resolve_scroll_anchor`]. See [`crate::grid::ScrollAnchor`].
+    relayout_anchor: Option<crate::grid::ScrollAnchor>,
 }
+
+/// Tab stop width used for all cell math (mirrors the value the shells pass to the server on
+/// subscribe). Single-sourced here so the anchor math agrees with the rendered layout.
+pub const TAB_WIDTH: u32 = 4;
 
 impl Session {
     pub fn new(project: String, project_paths: Vec<String>, buffer: BufferInfo) -> Self {
@@ -251,7 +259,45 @@ impl Session {
             prompt: None,
             picker: None,
             conn: ConnState::Connected,
+            relayout_anchor: None,
         }
+    }
+
+    /// Capture a content scroll anchor for the current view, ahead of a wrap/diff re-layout. The
+    /// shell supplies its current top visual row and viewport height (the only geometry the core
+    /// lacks); the cursor and window come from the session. Pairs with [`resolve_scroll_anchor`].
+    pub fn capture_scroll_anchor(&mut self, top_row: u32, viewport_rows: u32) {
+        self.relayout_anchor = self.window.as_ref().map(|w| {
+            crate::grid::capture_scroll_anchor(
+                w,
+                top_row,
+                viewport_rows,
+                self.buffer.cursor.position,
+                TAB_WIDTH,
+            )
+        });
+    }
+
+    /// Consume the anchor captured by [`capture_scroll_anchor`] and resolve it against the current
+    /// (post-relayout) window into a new absolute top visual row. `None` when no anchor is pending
+    /// (so the shell falls back to its usual clamp + reveal-cursor).
+    pub fn resolve_scroll_anchor(&mut self) -> Option<u32> {
+        let anchor = self.relayout_anchor.take()?;
+        let w = self.window.as_ref()?;
+        Some(crate::grid::resolve_scroll_anchor(
+            w,
+            anchor,
+            self.buffer.cursor.position,
+            TAB_WIDTH,
+        ))
+    }
+
+    /// The logical line the pending relayout anchor references — a re-subscribe (the TUI's wrap
+    /// path) must load a window around it so [`resolve_scroll_anchor`] can place it. `None` when no
+    /// anchor is pending.
+    pub fn relayout_anchor_line(&self) -> Option<u32> {
+        self.relayout_anchor
+            .map(|a| a.reference_line(self.buffer.cursor.position))
     }
 
     /// An inert stand-in for the boot chooser (no project picked yet): never rendered and

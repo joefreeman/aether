@@ -301,6 +301,9 @@ impl Shell {
                         self.scroll_to_row(row);
                     }
                 }
+                Effect::SaveContentAnchor => self
+                    .session
+                    .capture_scroll_anchor(self.top_visual_row, self.visible_rows()),
                 Effect::ShowHover(text) => {
                     let body = match text {
                         HoverText::Blocks(blocks) => HoverBody::Blocks(
@@ -319,8 +322,15 @@ impl Shell {
                 }
                 Effect::DismissHover => self.state.hover = None,
                 Effect::WindowAdopted => {
-                    self.clamp_scroll();
-                    self.reveal_cursor();
+                    // Diff toggle re-layout: if a content anchor is pending, restore the view to
+                    // it (keep the same content on screen); otherwise clamp + reveal as before.
+                    if let Some(row) = self.session.resolve_scroll_anchor() {
+                        self.top_visual_row = row;
+                        self.clamp_scroll();
+                    } else {
+                        self.clamp_scroll();
+                        self.reveal_cursor();
+                    }
                 }
                 Effect::RevealPickerSelection(_) | Effect::PickerScrollReset => {
                     // Selection reveals are handled by the sync (`visible_start` follows
@@ -350,13 +360,21 @@ impl Shell {
             Done::Subscribed(_, Ok(res)) => {
                 let scroll = self.subscribe_scroll;
                 self.session.adopt_subscribe(res);
-                if let Some(w) = self.session.window.as_ref() {
-                    if let Some(rel) = rows_before_line(w, scroll.logical_line) {
-                        self.top_visual_row = w.first_visual_row + rel;
+                // A wrap toggle left a content anchor pending: restore the view to it (keeping the
+                // same content on screen across the reflow). Otherwise position the top at the
+                // subscribe's scroll line and reveal the cursor as usual.
+                if let Some(row) = self.session.resolve_scroll_anchor() {
+                    self.top_visual_row = row;
+                    self.clamp_scroll();
+                } else {
+                    if let Some(w) = self.session.window.as_ref() {
+                        if let Some(rel) = rows_before_line(w, scroll.logical_line) {
+                            self.top_visual_row = w.first_visual_row + rel;
+                        }
                     }
+                    self.clamp_scroll();
+                    self.reveal_cursor();
                 }
-                self.clamp_scroll();
-                self.reveal_cursor();
                 // Diff view is sticky across switches; a fresh viewport starts with it off.
                 if self.session.diff_view {
                     let h = self.handle.clone();
@@ -720,16 +738,26 @@ impl Shell {
         self.fetch_in_flight = false;
         self.refetch_queued = false;
         self.reveal_after_fetch = false;
-        let scroll = self.session.buffer.scroll.unwrap_or(ScrollPosition {
-            logical_line: self
-                .session
-                .buffer
-                .cursor
-                .position
-                .line
-                .saturating_sub(rows / 2),
-            sub_row: 0.0,
-        });
+        // A pending relayout anchor (wrap toggle) wins: load a window around its reference line so
+        // the anchor can be resolved precisely once it arrives. Otherwise restore the buffer's
+        // saved scroll, else center on the cursor.
+        let scroll = if let Some(line) = self.session.relayout_anchor_line() {
+            ScrollPosition {
+                logical_line: line,
+                sub_row: 0.0,
+            }
+        } else {
+            self.session.buffer.scroll.unwrap_or(ScrollPosition {
+                logical_line: self
+                    .session
+                    .buffer
+                    .cursor
+                    .position
+                    .line
+                    .saturating_sub(rows / 2),
+                sub_row: 0.0,
+            })
+        };
         self.subscribe_scroll = scroll;
         self.subscribe_epoch += 1;
         let epoch = self.subscribe_epoch;

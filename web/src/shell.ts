@@ -1143,10 +1143,15 @@ export class Shell {
         case "DismissHover":
           this.dismissHover();
           break;
-        case "WindowAdopted":
+        case "WindowAdopted": {
           this.render();
-          this.revealCursor();
+          // Diff toggle re-layout: restore the view to the pending content anchor (same content on
+          // screen) if there is one; otherwise reveal the cursor as before.
+          const row = this.session.resolve_scroll_anchor();
+          if (row != null) this.scrollTopTo(row * this.cell.h + BUFFER_PAD, false);
+          else this.revealCursor();
           break;
+        }
         case "WriteClipboard":
           if (e.text != null) void navigator.clipboard?.writeText(e.text).catch(() => {});
           break;
@@ -1159,6 +1164,12 @@ export class Shell {
         case "SaveScrollAnchor":
           this.scrollAnchor = this.bufferEl.scrollTop;
           break;
+        case "SaveContentAnchor": {
+          // Capture the top-of-viewport content anchor before a wrap/diff re-layout.
+          const topRow = Math.max(0, Math.round((this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h));
+          this.session.capture_scroll_anchor(topRow, this.visibleRows());
+          break;
+        }
         case "RestoreScrollAnchor":
           if (this.scrollAnchor !== null) {
             this.scrollTopTo(this.scrollAnchor, false);
@@ -1281,7 +1292,11 @@ export class Shell {
     if (epoch !== this.viewportEpoch) return; // superseded
     this.session.adopt_window(res);
     this.render();
-    this.revealCursor();
+    // Restore the view to the content anchor captured before the toggle (same content on screen
+    // across the reflow); fall back to revealing the cursor when none is pending.
+    const row = this.session.resolve_scroll_anchor();
+    if (row != null) this.scrollTopTo(row * this.cell.h + BUFFER_PAD, false);
+    else this.revealCursor();
   }
 
   // ---- geometry (shell-owned; viewport RPCs issued here, results adopted by the core) ----------

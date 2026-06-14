@@ -835,15 +835,28 @@ impl App {
             Message::WindowUpdate(Ok(res)) => {
                 self.fetch_in_flight = false;
                 self.session.adopt_window(res);
+                // A wrap toggle left a content anchor pending: restore the view to it (same content
+                // on screen across the reflow), suppressing the reveal/center this fetch would do.
+                let anchored = if let Some(px) = self.resolve_anchor_px() {
+                    self.scroll_px = px;
+                    true
+                } else {
+                    false
+                };
                 self.clamp_scroll();
                 let mut task = Task::none();
-                if self.reveal_after_fetch {
+                if anchored {
                     self.reveal_after_fetch = false;
-                    self.reveal_cursor();
-                }
-                if self.center_after_fetch {
                     self.center_after_fetch = false;
-                    self.center_cursor_in_window();
+                } else {
+                    if self.reveal_after_fetch {
+                        self.reveal_after_fetch = false;
+                        self.reveal_cursor();
+                    }
+                    if self.center_after_fetch {
+                        self.center_after_fetch = false;
+                        self.center_cursor_in_window();
+                    }
                 }
                 if self.refetch_queued {
                     self.refetch_queued = false;
@@ -1012,6 +1025,12 @@ impl App {
                     tasks.push(self.subscribe_task());
                 }
                 Effect::SaveScrollAnchor => self.scroll_anchor = Some(self.scroll_px),
+                Effect::SaveContentAnchor => {
+                    if let Some(cell) = self.cell {
+                        let top_row = (self.scroll_px / cell.height).round().max(0.0) as u32;
+                        self.session.capture_scroll_anchor(top_row, self.visible_rows());
+                    }
+                }
                 Effect::ShowHover(content) => {
                     self.hover_below.set(None); // re-pick orientation for this fresh hover
                     self.hover = Some(match content {
@@ -1026,8 +1045,15 @@ impl App {
                 }
                 Effect::DismissHover => self.hover = None,
                 Effect::WindowAdopted => {
-                    self.clamp_scroll();
-                    self.reveal_cursor();
+                    // Diff toggle re-layout: restore the view to the pending content anchor (same
+                    // content on screen) if there is one; otherwise clamp + reveal as before.
+                    if let Some(px) = self.resolve_anchor_px() {
+                        self.scroll_px = px;
+                        self.clamp_scroll();
+                    } else {
+                        self.clamp_scroll();
+                        self.reveal_cursor();
+                    }
                 }
                 Effect::Request {
                     token,
@@ -1481,6 +1507,15 @@ impl App {
             return;
         }
         self.scroll_x_px = (self.scroll_x_px + delta_px).clamp(0.0, self.max_scroll_x_px());
+    }
+
+    /// Consume a pending relayout content anchor (set before a wrap/diff toggle) and resolve it into
+    /// the new `scroll_px`. `None` when no anchor is pending (or no cell metrics yet) — the caller
+    /// then falls back to clamp + reveal-cursor.
+    fn resolve_anchor_px(&mut self) -> Option<f32> {
+        let cell = self.cell?;
+        let row = self.session.resolve_scroll_anchor()?;
+        Some(row as f32 * cell.height)
     }
 
     fn max_scroll_x_px(&self) -> f32 {

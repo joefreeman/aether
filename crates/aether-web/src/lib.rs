@@ -145,6 +145,21 @@ impl WasmSession {
         self.inner.pointer_release();
     }
 
+    /// Capture a content scroll anchor before a wrap/diff re-layout (in response to the
+    /// `SaveContentAnchor` effect). `top_row` is the absolute visual row at the top of the viewport
+    /// (`(scrollTop - pad) / lineHeight`); `viewport_rows` its height in rows.
+    pub fn capture_scroll_anchor(&mut self, top_row: u32, viewport_rows: u32) {
+        self.inner.capture_scroll_anchor(top_row, viewport_rows);
+    }
+
+    /// Resolve the anchor captured by [`WasmSession::capture_scroll_anchor`] against the new window
+    /// into the absolute visual row that should be at the top of the viewport, or `null` when no
+    /// anchor is pending (the shell then reveals the cursor as usual). Call after adopting the
+    /// re-laid-out window (wrap `set_wrap` result / diff `WindowAdopted`).
+    pub fn resolve_scroll_anchor(&mut self) -> Option<u32> {
+        self.inner.resolve_scroll_anchor()
+    }
+
     /// Mouse wheel over the picker results list: move the highlighted row (+down / -up), refetching
     /// the window as needed. Returns `Effect[]`.
     pub fn picker_wheel(&mut self, delta: i32) -> Result<JsValue, JsValue> {
@@ -447,6 +462,7 @@ fn effect_value(e: Effect) -> Value {
         Effect::Resubscribe => json!({ "tag": "Resubscribe" }),
         Effect::SaveScrollAnchor => json!({ "tag": "SaveScrollAnchor" }),
         Effect::RestoreScrollAnchor => json!({ "tag": "RestoreScrollAnchor" }),
+        Effect::SaveContentAnchor => json!({ "tag": "SaveContentAnchor" }),
         Effect::ShowHover(hover) => json!({ "tag": "ShowHover", "hover": hover_value(hover) }),
         Effect::DismissHover => json!({ "tag": "DismissHover" }),
         Effect::WindowAdopted => json!({ "tag": "WindowAdopted" }),

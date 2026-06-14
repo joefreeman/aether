@@ -112,6 +112,104 @@ pub fn rows_before_line(window: &Window, logical_line: u32) -> Option<u32> {
     None
 }
 
+/// The logical line owning absolute visual `abs_row`, and how many of that line's visual rows sit
+/// above it (the sub-row offset into the line — phantom diff rows included). Clamps to the loaded
+/// window's last row when `abs_row` is past it. The inverse of [`rows_before_line`] + first row.
+pub fn line_at_row(window: &Window, abs_row: u32) -> (u32, u32) {
+    let mut rel = abs_row.saturating_sub(window.first_visual_row);
+    for line in &window.lines {
+        let h = line_rows(line);
+        if rel < h {
+            return (line.logical_line, rel);
+        }
+        rel -= h;
+    }
+    match window.lines.last() {
+        Some(l) => (l.logical_line, line_rows(l).saturating_sub(1)),
+        None => (window.first_logical_line, 0),
+    }
+}
+
+/// A scroll position pinned to *content* rather than an absolute visual row, so it survives a
+/// re-layout (wrap toggle, diff toggle) that changes how many visual rows lines occupy. Captured
+/// from the current window before the toggle, resolved against the new window after it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScrollAnchor {
+    /// The cursor was visible: keep it at this row offset below the top of the viewport.
+    Cursor { screen_row_offset: u32 },
+    /// The cursor was off-screen: keep this logical line's `sub_row`-th visual row at the top.
+    Line { logical_line: u32, sub_row: u32 },
+}
+
+impl ScrollAnchor {
+    /// The logical line this anchor references — the line a re-subscribe must load a window around
+    /// so [`resolve_scroll_anchor`] can place it.
+    pub fn reference_line(&self, cursor: LogicalPosition) -> u32 {
+        match self {
+            ScrollAnchor::Cursor { .. } => cursor.line,
+            ScrollAnchor::Line { logical_line, .. } => *logical_line,
+        }
+    }
+}
+
+/// Capture a [`ScrollAnchor`] for the current view: pin the cursor if it's visible (so the user's
+/// focus stays put), else pin the top visible line (so the content stays put). `top_row` is the
+/// absolute visual row at the top of the viewport; `viewport_rows` its height.
+pub fn capture_scroll_anchor(
+    window: &Window,
+    top_row: u32,
+    viewport_rows: u32,
+    cursor: LogicalPosition,
+    tab_width: u32,
+) -> ScrollAnchor {
+    if let Some((cursor_row, _, _)) = position_cell(window, cursor, tab_width) {
+        if cursor_row >= top_row && cursor_row < top_row + viewport_rows {
+            return ScrollAnchor::Cursor {
+                screen_row_offset: cursor_row - top_row,
+            };
+        }
+    }
+    let (logical_line, sub_row) = line_at_row(window, top_row);
+    ScrollAnchor::Line {
+        logical_line,
+        sub_row,
+    }
+}
+
+/// Resolve a captured anchor against the (post-toggle) window into a new absolute top visual row.
+/// `cursor` is re-read here because the cursor's visual row moves under the new layout.
+pub fn resolve_scroll_anchor(
+    window: &Window,
+    anchor: ScrollAnchor,
+    cursor: LogicalPosition,
+    tab_width: u32,
+) -> u32 {
+    match anchor {
+        ScrollAnchor::Cursor { screen_row_offset } => {
+            let cursor_row = position_cell(window, cursor, tab_width)
+                .map(|(row, _, _)| row)
+                .unwrap_or(window.first_visual_row);
+            cursor_row.saturating_sub(screen_row_offset)
+        }
+        ScrollAnchor::Line {
+            logical_line,
+            sub_row,
+        } => {
+            let Some(rel) = rows_before_line(window, logical_line) else {
+                return window.first_visual_row;
+            };
+            // Wrap may have shrunk the line; clamp the sub-row into its new height.
+            let height = window
+                .lines
+                .iter()
+                .find(|l| l.logical_line == logical_line)
+                .map(line_rows)
+                .unwrap_or(1);
+            window.first_visual_row + rel + sub_row.min(height.saturating_sub(1))
+        }
+    }
+}
+
 /// Locate a position's grid cell: `(absolute visual row, display col, width)`. The width covers
 /// the char under a block cursor; a position past the line's last char (Insert mode at EOL, or
 /// the empty line) gets a 1-col cell just past the text. `None` when the line isn't loaded.
@@ -513,6 +611,96 @@ mod tests {
         assert_eq!(
             row_selection_span(10, &empty, true, min, max, 4),
             Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn line_at_row_maps_absolute_row_to_line_and_suboffset() {
+        // line 5: 2 rows, line 6: 1 row, line 7: 3 rows. Window starts at visual row 100.
+        let w = window(
+            5,
+            100,
+            vec![
+                line(5, vec![row(0, 0, "aa"), row(2, 0, "bb")]),
+                line(6, vec![row(0, 0, "c")]),
+                line(7, vec![row(0, 0, "d"), row(1, 0, "e"), row(2, 0, "f")]),
+            ],
+        );
+        assert_eq!(line_at_row(&w, 100), (5, 0));
+        assert_eq!(line_at_row(&w, 101), (5, 1)); // 2nd row of line 5
+        assert_eq!(line_at_row(&w, 102), (6, 0));
+        assert_eq!(line_at_row(&w, 104), (7, 1)); // 2nd row of line 7
+        // Past the loaded window clamps to the last line's last row.
+        assert_eq!(line_at_row(&w, 999), (7, 2));
+    }
+
+    #[test]
+    fn scroll_anchor_pins_cursor_when_visible_else_top_line() {
+        let w = window(
+            5,
+            100,
+            vec![
+                line(5, vec![row(0, 0, "aa"), row(2, 0, "bb")]),
+                line(6, vec![row(0, 0, "cccc")]),
+                line(7, vec![row(0, 0, "d")]),
+            ],
+        );
+        // Cursor on line 6 (visual row 102), viewport [100, 105): visible → Cursor anchor at offset 2.
+        let cursor = LogicalPosition { line: 6, col: 0 };
+        assert_eq!(
+            capture_scroll_anchor(&w, 100, 5, cursor, 4),
+            ScrollAnchor::Cursor {
+                screen_row_offset: 2
+            }
+        );
+        // Cursor off-screen (viewport [100, 101)) → pin the top line + sub-row.
+        assert_eq!(
+            capture_scroll_anchor(&w, 101, 1, cursor, 4),
+            ScrollAnchor::Line {
+                logical_line: 5,
+                sub_row: 1
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_scroll_anchor_keeps_cursor_offset_after_relayout() {
+        // After a wrap toggle the top line now wraps to 3 rows (was 2), shifting later lines down.
+        let after = window(
+            5,
+            100,
+            vec![
+                line(
+                    5,
+                    vec![row(0, 0, "a"), row(1, 0, "a"), row(2, 0, "a")],
+                ),
+                line(6, vec![row(0, 0, "cccc")]),
+                line(7, vec![row(0, 0, "d")]),
+            ],
+        );
+        let cursor = LogicalPosition { line: 6, col: 0 };
+        // Cursor anchor (offset 2): line 6 now sits at visual row 103, so top = 103 - 2 = 101.
+        let row = resolve_scroll_anchor(
+            &after,
+            ScrollAnchor::Cursor {
+                screen_row_offset: 2,
+            },
+            cursor,
+            4,
+        );
+        assert_eq!(row, 101);
+        // Line anchor for line 6 → its first row (103), sub-row clamped into the line.
+        assert_eq!(
+            resolve_scroll_anchor(
+                &after,
+                ScrollAnchor::Line {
+                    logical_line: 6,
+                    sub_row: 0
+                },
+                cursor,
+                4,
+            ),
+            103
         );
     }
 }

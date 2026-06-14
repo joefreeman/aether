@@ -3403,10 +3403,18 @@ impl Session {
                 }
                 fx
             }
-            A::CenterCursor | A::Scroll { .. } | A::ToggleWrap => {
+            A::CenterCursor | A::Scroll { .. } => {
                 // Geometry (pixel scroll, cell metrics) and viewport plumbing — the shell
                 // executes these against its own state.
                 Effects::one(Effect::ShellAction(action))
+            }
+            A::ToggleWrap => {
+                // Re-layout: capture a content anchor first (against the current window), then let
+                // the shell flip wrap + re-render; the shell restores the anchor when it adopts the
+                // new window. Keeps the viewport on the same content across the reflow.
+                let mut fx = Effects::one(Effect::SaveContentAnchor);
+                fx.push(Effect::ShellAction(action));
+                fx
             }
             A::OpenHelp | A::OpenProjectSettings => {
                 // Shell-local overlays (help cheatsheet, project settings). A shell without
@@ -3580,13 +3588,18 @@ impl Session {
                     return Effects::none();
                 };
                 let enabled = !self.diff_view;
-                self.request_str::<GitSetDiffView>(
+                // Re-layout: capture a content anchor first (against the current window); it's
+                // restored when the re-laid-out window is adopted (Event::DiffViewSet →
+                // WindowAdopted), keeping the viewport on the same content across the toggle.
+                let mut fx = Effects::one(Effect::SaveContentAnchor);
+                fx = fx.and(self.request_str::<GitSetDiffView>(
                     GitSetDiffViewParams {
                         viewport_id,
                         enabled,
                     },
                     move |result| Event::DiffViewSet { enabled, result },
-                )
+                ));
+                fx
             }
             A::NextHunk | A::PrevHunk => {
                 let direction = if matches!(action, A::NextHunk) {
