@@ -6,6 +6,7 @@ use crate::app::{
 };
 use aether_client::keymap;
 use aether_client::keymap::KeyCode;
+use aether_client::session::ConnState;
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::{BlameInfo, GitStatus};
@@ -4541,6 +4542,20 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             right_spans.push(Span::styled(" ".to_string(), base));
         }
 
+        // Transient feedback floats as a toast now; the left status slot instead carries the
+        // persistent connection indicator (empty while connected) — sitting after the file/git with
+        // a 3-space gap (see `build_editor_status_spans`), coloured yellow/red by its kind.
+        let conn_status = match state.conn {
+            ConnState::Connected => crate::app::StatusMessage::default(),
+            ConnState::Reconnecting { .. } => crate::app::StatusMessage {
+                text: "Reconnecting...".to_string(),
+                kind: crate::app::StatusKind::Warning,
+            },
+            ConnState::Failed => crate::app::StatusMessage {
+                text: "Disconnected".to_string(),
+                kind: crate::app::StatusKind::Error,
+            },
+        };
         Line::from(build_editor_status_spans(
             StatusLabel {
                 project_prefix: &project_prefix,
@@ -4549,9 +4564,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             },
             status_dot,
             git_spans,
-            // The transient message now floats as a toast (see `draw_toast_overlay`), so it's kept
-            // out of the status row — the bar shows only the persistent project / file / git info.
-            &crate::app::StatusMessage::default(),
+            &conn_status,
             right_spans,
             area.width as usize,
         ))
@@ -4826,9 +4839,10 @@ fn build_editor_status_spans(
                 spans.push(s);
             }
         }
-        // Status message after a separator, truncated to whatever's left.
+        // Status message (now the connection indicator) after a 3-space separator — matching the
+        // file→git gap — truncated to whatever's left.
         if !status.is_empty() {
-            let separator = "    ";
+            let separator = "   ";
             let remaining = left_max.saturating_sub(used + separator.width());
             if remaining > 0 {
                 let text = if status.text.width() <= remaining {
@@ -6354,6 +6368,38 @@ mod tests {
             .find(|s| s.content.contains("saved (rev 1)"))
             .expect("status span present");
         assert_eq!(status_span.style.fg, Some(NORD8));
+    }
+
+    #[test]
+    fn editor_status_spans_connection_indicator_left_with_three_space_gap() {
+        // The connection indicator rides the left status slot: capitalised, no icon, a 3-space gap
+        // after the file label (matching the file→git gap), yellow for reconnecting.
+        let status = crate::app::StatusMessage {
+            text: "Reconnecting...".to_string(),
+            kind: crate::app::StatusKind::Warning,
+        };
+        let spans = build_editor_status_spans(
+            StatusLabel {
+                project_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: false,
+            },
+            None,
+            Vec::new(),
+            &status,
+            vec![Span::raw("12:5")],
+            60,
+        );
+        let text = spans_text(&spans);
+        assert!(
+            text.contains("file.rs   Reconnecting..."),
+            "3-space gap before the indicator: {text:?}"
+        );
+        let span = spans
+            .iter()
+            .find(|s| s.content.contains("Reconnecting"))
+            .expect("indicator span present");
+        assert_eq!(span.style.fg, Some(NORD13), "reconnecting is yellow");
     }
 
     #[test]

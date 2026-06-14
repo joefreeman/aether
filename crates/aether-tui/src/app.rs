@@ -3,6 +3,7 @@
 
 use crate::text_input::PromptKeyOutcome;
 use aether_client::keymap::Action;
+use aether_client::session::ConnState;
 use aether_protocol::buffer::BufferClosedParams;
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
 use aether_protocol::git::{BlameInfo, GitBufferStatus};
@@ -188,6 +189,9 @@ pub struct AppState {
     /// Active floating toasts, stacked bottom-right (newest at the bottom). Each is expired on a
     /// timer by the shell, keyed by its `id`. Fed from the same stream as `status`.
     pub toasts: Vec<Toast>,
+    /// Connection state, mirrored from the session. The disconnect toast auto-expires, so the
+    /// status bar shows a persistent `reconnecting…` / `disconnected` indicator while it's down.
+    pub conn: ConnState,
     /// Mirror of the most recently emitted terminal-title escape sequence. We only re-emit
     /// when [`terminal_title`] derives something different, so frame-loop draws don't spam OSC
     /// sequences down stdout. Empty string at startup; populated on the first render.
@@ -1247,6 +1251,7 @@ mod tests {
             should_quit: false,
             status: StatusMessage::default(),
             toasts: Vec::new(),
+            conn: ConnState::Connected,
             last_terminal_title: String::new(),
             clipboard: None,
             pending_leader: None,
@@ -1275,6 +1280,7 @@ mod tests {
             should_quit: false,
             status: StatusMessage::default(),
             toasts: Vec::new(),
+            conn: ConnState::Connected,
             last_terminal_title: String::new(),
             clipboard: None,
             pending_leader: None,
@@ -1306,6 +1312,7 @@ mod tests {
             should_quit: false,
             status: StatusMessage::default(),
             toasts: Vec::new(),
+            conn: ConnState::Connected,
             last_terminal_title: String::new(),
             clipboard: None,
             pending_leader: None,

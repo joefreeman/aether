@@ -414,8 +414,11 @@ impl App {
             _ => None,
         });
         // Frame ticks drive the scroll easing and the picker's search throbber; subscribe to them
-        // only while one of those is actually animating.
-        if self.boot.is_none() && (self.scroll_anim.is_some() || self.picker_ticking()) {
+        // only while one of those is actually animating — and never while disconnected, where a
+        // picker throbber stuck mid-search (the server stopped answering) would otherwise pin the
+        // 60fps redraw loop for the whole reconnect window.
+        let animating = self.scroll_anim.is_some() || self.picker_ticking();
+        if self.boot.is_none() && animating && self.session.conn == ConnState::Connected {
             Subscription::batch([keys, iced::window::frames().map(Message::AnimTick)])
         } else {
             keys
@@ -1574,6 +1577,11 @@ impl App {
 
     /// Fetch a new window when the view nears the loaded range's edge (web's `onScroll`).
     fn maybe_fetch(&mut self) -> Task<Message> {
+        // No window fetches while the socket is down — the RPC would fail instantly and (on the
+        // per-frame AnimTick path) spin a doomed retry every frame. The reconnect re-subscribes.
+        if self.session.conn != ConnState::Connected {
+            return Task::none();
+        }
         let (Some(window), Some(cell), Some(viewport_id)) =
             (&self.session.window, self.cell, self.session.viewport_id)
         else {

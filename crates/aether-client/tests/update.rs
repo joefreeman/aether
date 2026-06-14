@@ -152,12 +152,28 @@ fn connection_loss_drops_in_flight_results() {
 }
 
 #[test]
-fn input_is_suspended_while_disconnected() {
+fn disconnected_drops_server_requests_but_allows_quit() {
+    use aether_client::update::Event;
+
+    // A motion that would hit the server (`j` → cursor/move) emits no request while the socket is
+    // down — the gate now lives at the point of issue, not a blanket key block.
     let mut s = session();
-    let _ = s.on_event(aether_client::update::Event::ConnectionLost);
-    let fx = key(&mut s, 'i');
-    assert!(fx.0.is_empty(), "keys are inert until reestablished");
-    assert_eq!(s.mode, aether_client::session::Mode::Normal);
+    let _ = s.on_event(Event::ConnectionLost);
+    let fx = key(&mut s, 'j');
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "server requests are dropped while disconnected"
+    );
+
+    // ...but client-only actions still run, so the user can always quit (`Space q` → Exit).
+    let mut s = session();
+    let _ = s.on_event(Event::ConnectionLost);
+    let _ = key(&mut s, ' '); // leader
+    let fx = key(&mut s, 'q');
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Exit)),
+        "quit works while disconnected"
+    );
 }
 
 #[test]

@@ -542,6 +542,9 @@ export class Shell {
    *  stale window — the robust guard against the reply/push interleaving + concurrent-jump races. */
   private viewportEpoch = 0;
   private fetchInFlight = false;
+  /** Socket up? Gates scroll-driven window prefetches — while down, a smooth-scroll animation fires
+   *  ~60 scroll events/sec and each `viewport/scroll_to_row` rejects instantly, spinning the CPU. */
+  private connected = true;
   /** A left-button drag-select is in progress (mousedown → mouseup), extending the selection. */
   private dragging = false;
   /** The search prompt's Esc-restore scroll position (`SaveScrollAnchor` effect). */
@@ -1065,6 +1068,7 @@ export class Shell {
    *  `on_key` no-ops and stray RPCs don't error) and shows a banner. `reestablish` (on socket-up)
    *  rebuilds the session. */
   private onConnState(s: ConnState): void {
+    this.connected = s === "connected";
     if (s === "connected") {
       this.connBanner.style.display = "none";
       return;
@@ -1387,8 +1391,10 @@ export class Shell {
   private onScroll(): void {
     // The popover tracks its line via CSS `position: sticky` (it lives in the buffer's spacer), so
     // scrolling needs no repositioning here — just the window prefetch below.
+    // Skip the prefetch while disconnected: the RPC would reject instantly, and a smooth-scroll
+    // animation firing scroll events would otherwise spin doomed fetches for the reconnect window.
     const w = this.snapshot?.window;
-    if (!w || this.fetchInFlight) return;
+    if (!w || this.fetchInFlight || !this.connected) return;
     const topRow = Math.round((this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h);
     const loadedStart = w.first_visual_row;
     const loadedEnd = loadedStart + this.loadedVisualRows(w);

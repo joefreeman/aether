@@ -867,6 +867,13 @@ impl Session {
     where
         M: RpcMethod + 'static,
     {
+        // The socket is down: drop the request rather than parking a mapping that can never
+        // resolve (and would fire stale on reconnect). The reconnect path re-subscribes from
+        // scratch, so nothing is lost by not queuing here. This is the single place the
+        // connection state gates server I/O — callers run their client-side logic regardless.
+        if self.conn != ConnState::Connected {
+            return Effects::none();
+        }
         let token = self.next_token;
         self.next_token += 1;
         self.pending_rpcs.insert(
@@ -2640,9 +2647,6 @@ impl Session {
         granularity: Granularity,
         extend: bool,
     ) -> Effects {
-        if self.conn != ConnState::Connected {
-            return Effects::none();
-        }
         let anchor = if extend {
             self.buffer.cursor.anchor
         } else {
@@ -2667,9 +2671,6 @@ impl Session {
         let Some((anchor, granularity)) = self.drag else {
             return Effects::none();
         };
-        if self.conn != ConnState::Connected {
-            return Effects::none();
-        }
         self.request_str::<CursorSet>(
             CursorSetParams {
                 buffer_id: self.buffer.buffer_id,
@@ -3114,9 +3115,10 @@ impl Session {
         text: Option<String>,
         visible_rows: u32,
     ) -> Effects {
-        if self.conn != ConnState::Connected {
-            return Effects::none(); // editing input is suspended while the connection is down
-        }
+        // Input isn't gated here: client-only actions (Quit, scroll, help, mode toggles) stay
+        // usable while the connection is down — most importantly, the user can still quit. Anything
+        // that actually talks to the server is dropped at the point of issue (see `request`), so a
+        // disconnected key press just no-ops instead of corrupting state.
 
         // An open modal prompt owns the keyboard outright; a picker likewise.
         if self.prompt.is_some() {

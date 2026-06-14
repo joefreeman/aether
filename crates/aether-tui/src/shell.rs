@@ -21,7 +21,7 @@ use aether_client::keymap::{
     hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
 };
 use aether_client::session::{
-    buffer_info, reconnect_backoff, HoverText, Mode, Pending, Prompt, Session,
+    buffer_info, reconnect_backoff, ConnState, HoverText, Mode, Pending, Prompt, Session,
 };
 use aether_client::update::Event as CoreEvent;
 use aether_protocol::envelope::Notification;
@@ -211,7 +211,12 @@ pub async fn run(
                     }
                 }
             }
-            n = shell.notifications.recv() => {
+            // Only poll the notifications channel while connected. Once the socket dies the channel
+            // is closed, so `recv()` returns `None` *immediately* — without this guard the `select!`
+            // would spin on that arm (re-dispatching `ConnectionLost` + redrawing) and peg a core
+            // during the whole reconnect backoff. The first `None` (handled while still Connected)
+            // flips us to Reconnecting, disabling the arm until `Reconnected` installs a fresh one.
+            n = shell.notifications.recv(), if shell.session.conn == ConnState::Connected => {
                 match n {
                     Some(n) => shell.dispatch(CoreEvent::ServerPush(n)),
                     None => shell.dispatch(CoreEvent::ConnectionLost),
@@ -1078,6 +1083,7 @@ impl Shell {
         let (cols, rows) = self.term;
         st.viewport_cols = cols as u32;
         st.viewport_rows = (rows as u32).saturating_sub(1);
+        st.conn = s.conn;
         st.pending_leader = match s.pending {
             Pending::Leader => Some(PendingLeader::Space),
             _ => None,
@@ -1621,6 +1627,7 @@ pub async fn bootstrap(
         should_quit: false,
         status: StatusMessage::default(),
         toasts: Vec::new(),
+        conn: ConnState::Connected,
         last_terminal_title: String::new(),
         clipboard: clipboard::new_handle(),
         pending_leader: None,
