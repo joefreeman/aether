@@ -112,14 +112,12 @@ pub enum Prompt {
         kind: ConfirmKind,
         action: ConfirmAction,
     },
-    SaveAs {
-        path_index: u32,
-        /// The typed path value. Text editing (caret, insert, delete) is owned by each shell's
-        /// input — native `text_input`/`<input>` in the rich clients, a shell-local editor in the
-        /// TUI — which syncs the whole value here via [`super::update`]'s `prompt_set_input`. The
-        /// core keeps only the value (for save / root-cycle) and the command keys (Enter/Esc/Tab).
-        input: String,
-    },
+    /// The save-as path editor (`Alt-s`): a project-relative path field with the picker dir-chip
+    /// editor's directory-completion UX (ghost suggestions, `Tab`/`Alt-l` accept, multi-root inline
+    /// root field). Text editing is owned by each shell's input, which syncs the value via
+    /// [`super::update`]'s `save_as_set_input` / `save_as_set_root_filter`; the core keeps the value
+    /// and the command keys. See [`crate::save_as::SaveAsEditor`].
+    SaveAs(Box<crate::save_as::SaveAsEditor>),
     /// LSP server detail (from the LspServers picker): info rows + `r` to restart.
     LspInfo(Box<LspServerStatus>),
 }
@@ -447,11 +445,18 @@ impl Session {
 }
 
 /// Build the client-side buffer record from a `buffer/open` result.
+/// The display label for a saved buffer at `path`: its project-relative path, falling back to the
+/// absolute path when it sits outside every root. Shared by buffer-open and the save-as rename
+/// adoption so both relabel identically.
+pub fn label_for_path(path: &str, roots: &[String]) -> String {
+    strip_longest_root(path, roots)
+        .map(|(_, rel)| rel)
+        .unwrap_or_else(|| path.to_string())
+}
+
 pub fn buffer_info(open: BufferOpenResult, roots: &[String]) -> BufferInfo {
     let label = match (&open.path, open.scratch_number) {
-        (Some(path), _) => strip_longest_root(path, roots)
-            .map(|(_, rel)| rel)
-            .unwrap_or_else(|| path.clone()),
+        (Some(path), _) => label_for_path(path, roots),
         (None, Some(n)) => format!("(scratch {n})"),
         (None, None) => "(scratch)".into(),
     };

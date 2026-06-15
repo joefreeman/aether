@@ -7,6 +7,7 @@ use super::chips::{self, ChipEditor, ChipEditorField, ChipId};
 use super::effect::{Effect, Effects, ToastKind};
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
+use super::save_as::SaveAsEditor;
 use super::session::{
     buffer_info, min_pos, severity_label, strip_longest_root, CommitDetails, ConfirmAction,
     ConfirmKind, ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending, ProjectSettings,
@@ -154,6 +155,11 @@ pub enum Event {
         abs: String,
         result: Result<DirectoryListResult, String>,
     },
+    /// `directory/list` for the save-as path editor resolved; `abs` is the staleness key.
+    SaveAsListing {
+        abs: String,
+        result: Result<DirectoryListResult, String>,
+    },
     /// `picker/grep_file_jump` resolved: the next/prev file's first hit (None at the ends).
     GrepFileJumped(Result<Option<PickerItem>, String>),
     /// `path/delete` (Explorer/Files trash) resolved. `noun` labels the success toast; the
@@ -288,10 +294,7 @@ impl Session {
             Event::SwitchedPrimed(Err(e)) => Effects::error(e),
 
             Event::PromptAccept => self.accept_prompt(),
-            Event::PromptCancel => {
-                self.decline_prompt();
-                Effects::none()
-            }
+            Event::PromptCancel => self.decline_prompt(),
 
             Event::SearchApplied(Ok(r)) => {
                 self.buffer.cursor = r.cursor;
@@ -764,6 +767,21 @@ impl Session {
                 // The listing just resolved a held (Pending) preview — apply the now-validated
                 // scope, or drop it if the path turned out invalid. No-op for a stale response.
                 self.sync_live_filters()
+            }
+
+            Event::SaveAsListing { abs, result } => {
+                // Stale responses (the editor moved to another directory, or closed) are dropped
+                // by the abs-path staleness key. Refreshes only the ghost — no live results behind
+                // the save prompt, so nothing else to re-run.
+                if let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() {
+                    if ed.listing_dir_abs == abs {
+                        match result {
+                            Ok(r) => ed.set_dir_listing(r.entries),
+                            Err(_) => ed.set_dir_listing_failed(),
+                        }
+                    }
+                }
+                Effects::none()
             }
 
             Event::GrepFileJumped(Ok(None)) => Effects::none(), // already at the first/last
@@ -1271,8 +1289,10 @@ impl Session {
         }
     }
 
-    /// Keys while a modal prompt is open. Confirm: `y`/Enter accepts, anything else declines
-    /// (the `[y/N]` default). Save-as: a one-line path editor (Tab cycles the target root).
+    /// Keys while a modal prompt is open. Confirm: only `y`/`Y` accepts; everything else —
+    /// **Enter included** — declines, honouring the capital `N` in the rendered `[y/N]`. Every
+    /// confirm we raise is destructive (overwrite / discard / delete / remove), so the safe option
+    /// is the default and Enter never silently destroys. Save-as routes to its own editor.
     pub fn on_prompt_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         let Some(prompt) = self.prompt.take() else {
             return Effects::none();
@@ -1281,12 +1301,13 @@ impl Session {
             Prompt::Confirm { kind: _, action } => {
                 let accepts = !mods.ctrl
                     && !mods.alt
-                    && (code == KeyCode::Char('y') || code == KeyCode::Enter);
+                    && matches!(code, KeyCode::Char('y') | KeyCode::Char('Y'));
                 if accepts {
                     self.run_confirm(action)
                 } else {
-                    self.decline_confirm(action);
-                    Effects::none()
+                    // `decline_confirm` re-opens the save-as prompt (and refetches its ghost) for an
+                    // overwrite decline; pass its effects through rather than dropping them.
+                    self.decline_confirm(action)
                 }
             }
             Prompt::LspInfo(mut info) => {
@@ -1315,48 +1336,12 @@ impl Session {
                 }
                 Effects::none()
             }
-            Prompt::SaveAs { path_index, input } => {
+            Prompt::SaveAs(editor) => {
                 // Text editing (insert / delete / caret) is owned by the shell's input, which syncs
-                // the value via `prompt_set_input`. The core handles only the command keys; any
-                // other key (a stray char that reached here) leaves the prompt unchanged.
-                let _ = text;
-                match code {
-                    KeyCode::Esc => Effects::none(), // prompt stays closed
-                    // Tab cycles the target root in multi-root projects.
-                    KeyCode::Tab => {
-                        let n = self.project_paths.len().max(1) as u32;
-                        self.prompt = Some(Prompt::SaveAs {
-                            path_index: (path_index + 1) % n,
-                            input,
-                        });
-                        Effects::none()
-                    }
-                    KeyCode::Enter => {
-                        let path = input.trim().to_string();
-                        if path.is_empty() {
-                            self.prompt = Some(Prompt::SaveAs { path_index, input });
-                            return Effects::none();
-                        }
-                        // An absolute path re-resolves against the project roots.
-                        let target = if path.starts_with('/') {
-                            match strip_longest_root(&path, &self.project_paths) {
-                                Some(target) => target,
-                                None => {
-                                    return Effects::error(format!(
-                                        "{path} is outside the project's roots"
-                                    ));
-                                }
-                            }
-                        } else {
-                            (path_index, path)
-                        };
-                        self.save(Some(target), false)
-                    }
-                    _ => {
-                        self.prompt = Some(Prompt::SaveAs { path_index, input });
-                        Effects::none()
-                    }
-                }
+                // the value via `save_as_set_input` / `save_as_set_root_filter`. The command keys
+                // route through `on_save_as_key` — put the editor back so it can read/mutate it.
+                self.prompt = Some(Prompt::SaveAs(editor));
+                self.on_save_as_key(code, mods, text)
             }
         }
     }
@@ -1767,12 +1752,64 @@ impl Session {
         self.incremental_search()
     }
 
-    /// Replace the save-as prompt's path input (the web client's native `<input>` owns editing). The
-    /// actual save happens on accept; this is pure state. No-op unless a save-as prompt is open.
-    pub fn prompt_set_input(&mut self, text: String) -> Effects {
-        if let Some(Prompt::SaveAs { input, .. }) = &mut self.prompt {
-            *input = text;
+    /// Replace the save-as prompt's path-field text wholesale (each shell's input owns editing and
+    /// syncs the value here). Re-derives the directory suggestion listing when the dir portion
+    /// moved. No-op unless a save-as prompt is open.
+    pub fn save_as_set_input(&mut self, text: String) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
+            return Effects::none();
+        };
+        if ed.input.text == text {
+            return Effects::none();
         }
+        ed.input.set(text);
+        if ed.path_edited(&project_paths) {
+            self.refresh_save_as_listing()
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Replace the multi-root save-as editor's root-filter text wholesale (native `<input>`
+    /// parity). Resets the typeahead highlight to the best match and re-syncs the listing under the
+    /// newly chosen root. No-op unless a save-as prompt is open.
+    pub fn save_as_set_root_filter(&mut self, text: String) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
+            return Effects::none();
+        };
+        if ed.root_filter.text == text {
+            return Effects::none();
+        }
+        ed.root_filter.set(text);
+        ed.root_selected = 0;
+        if ed.sync_dir_listing(&project_paths) {
+            self.refresh_save_as_listing()
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Move focus between the save-as editor's root and path segments (the web client lets you
+    /// click the unfocused segment). The path can't be entered under an invalid root — focus stays
+    /// pinned to the red root. No-op outside a multi-root save-as prompt.
+    pub fn save_as_set_field(&mut self, root: bool) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let labels = super::labels::root_labels(&project_paths);
+        let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
+            return Effects::none();
+        };
+        if project_paths.len() <= 1 {
+            return Effects::none();
+        }
+        ed.field = if root {
+            ChipEditorField::Root
+        } else if ed.root_invalid(&labels) {
+            return Effects::none();
+        } else {
+            ChipEditorField::Path
+        };
         Effects::none()
     }
 
@@ -2592,6 +2629,165 @@ impl Session {
         fx.and(self.sync_live_filters())
     }
 
+    /// Command keys while the save-as prompt is open. Mirrors [`Self::on_chip_editor_key`] — the
+    /// editor reads as one `root: path` field: Tab / Alt-l accept the focused segment's ghost,
+    /// `:` on a completed root moves into the path, Alt-j/k cycle the focused segment's matches,
+    /// Alt-Backspace pops a path segment (then, at an empty path, the root selection), plain
+    /// Backspace at an empty path steps back into the root. Enter saves (or, in the root field,
+    /// confirms the root and moves on); Esc cancels.
+    fn on_save_as_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let labels = super::labels::root_labels(&project_paths);
+        let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
+            return Effects::none();
+        };
+        let multi_root = project_paths.len() > 1;
+        let in_root = multi_root && ed.field == ChipEditorField::Root;
+        let no_chord = !mods.ctrl && !mods.alt;
+        // Whether the path field's suggestion listing went stale and needs a directory/list.
+        let mut refresh = false;
+        match code {
+            // Enter in the path field saves; in the root field it confirms the root and advances.
+            KeyCode::Enter if no_chord && !in_root => return self.commit_save_as(),
+            KeyCode::Enter if no_chord => {
+                refresh = ed.commit_root_field(&labels, &project_paths);
+            }
+            KeyCode::Esc => {
+                self.prompt = None;
+                return Effects::none();
+            }
+            // Tab / Alt-l: accept the focused segment's suggestion (root — adopt + advance; path —
+            // absorb the next directory segment, repeated presses walk down the tree).
+            KeyCode::Tab if no_chord => {
+                if in_root {
+                    refresh = ed.commit_root_field(&labels, &project_paths);
+                } else {
+                    refresh = ed.accept_path_suggestion(&project_paths);
+                }
+            }
+            KeyCode::Char('l') if mods.alt && !mods.ctrl => {
+                if in_root {
+                    refresh = ed.commit_root_field(&labels, &project_paths);
+                } else {
+                    refresh = ed.accept_path_suggestion(&project_paths);
+                }
+            }
+            KeyCode::Char('h') if mods.alt && !mods.ctrl && multi_root => {
+                ed.field = ChipEditorField::Root;
+            }
+            // `:` on a completed root value confirms it and moves into the path.
+            KeyCode::Char(':') if no_chord && in_root => {
+                if ed.root_complete(&labels) {
+                    refresh = ed.commit_root_field(&labels, &project_paths);
+                }
+            }
+            // Alt-Backspace: in the path it deletes the rightmost segment, fish-style; at an empty
+            // path it clears the root selection. In the root field it clears the filter.
+            KeyCode::Backspace if mods.alt && !mods.ctrl => {
+                if ed.field == ChipEditorField::Path {
+                    if ed.input.text.is_empty() {
+                        if multi_root {
+                            ed.field = ChipEditorField::Root;
+                            ed.root_filter.clear();
+                            ed.root_selected = 0;
+                        }
+                    } else {
+                        refresh = ed.pop_path_segment(&project_paths);
+                    }
+                } else {
+                    ed.root_filter.clear();
+                    ed.root_selected = 0;
+                }
+            }
+            // Backspace at an empty path steps back into the root field.
+            KeyCode::Backspace
+                if no_chord
+                    && multi_root
+                    && ed.field == ChipEditorField::Path
+                    && ed.input.text.is_empty() =>
+            {
+                ed.field = ChipEditorField::Root;
+            }
+            // Cycle the focused segment's matches: root typeahead (wrapping) or path suggestions
+            // (clamped).
+            KeyCode::Char(c @ ('j' | 'k')) if mods.alt && !mods.ctrl => {
+                let down = c == 'j';
+                if in_root {
+                    let n = chips::root_candidates(&labels, &ed.root_filter.text).len();
+                    if n > 0 {
+                        let sel = ed.root_selected.min(n - 1);
+                        ed.root_selected = if down { (sel + 1) % n } else { (sel + n - 1) % n };
+                        refresh = ed.sync_dir_listing(&project_paths);
+                    }
+                } else {
+                    ed.cycle_path_suggestion(down);
+                }
+            }
+            // In-field text entry (chars, plain Backspace, caret) is owned by each shell's input,
+            // synced via `save_as_set_input` / `save_as_set_root_filter`. Anything else is a no-op.
+            _ => {
+                let _ = text;
+            }
+        }
+        if refresh {
+            self.refresh_save_as_listing()
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Fire `directory/list` for the save-as editor's current (root, dir-portion) pair. The
+    /// requested path rides on the result event so a stale response (the editor moved on) can be
+    /// discarded. No-op for an invalid root or a closed prompt.
+    fn refresh_save_as_listing(&mut self) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let path = match self.prompt.as_ref() {
+            Some(Prompt::SaveAs(ed)) => ed.dir_listing_path(&project_paths),
+            _ => None,
+        };
+        let Some(path) = path else {
+            return Effects::none();
+        };
+        let abs = path.clone();
+        self.request::<DirectoryList>(DirectoryListParams { path }, move |__r| {
+            Event::SaveAsListing {
+                abs,
+                result: __r.map_err(|e| e.to_string()),
+            }
+        })
+    }
+
+    /// Commit the save-as prompt: save the literal typed path under the chosen root. A leading `/`
+    /// re-resolves against the project roots; an empty path keeps the prompt open. Closes the
+    /// prompt on submit — the overwrite confirm (if any) re-opens it via [`Self::decline_confirm`].
+    fn commit_save_as(&mut self) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let Some(Prompt::SaveAs(ed)) = self.prompt.as_ref() else {
+            return Effects::none();
+        };
+        let raw = ed.input.text.trim().to_string();
+        let relative_target = ed.save_target(&project_paths);
+        if raw.is_empty() {
+            return Effects::none(); // nothing typed — keep the prompt open
+        }
+        let target = if raw.starts_with('/') {
+            match strip_longest_root(&raw, &project_paths) {
+                Some(target) => target,
+                None => {
+                    self.prompt = None;
+                    return Effects::error(format!("{raw} is outside the project's roots"));
+                }
+            }
+        } else {
+            match relative_target {
+                Some(target) => target,
+                None => return Effects::none(),
+            }
+        };
+        self.prompt = None;
+        self.save(Some(target), false)
+    }
+
     /// Jump the grep picker's selection to the first hit of the next / previous file. The
     /// server finds the boundary across the *whole* result list (so it works past the
     /// over-fetch window); the result lands as [`Event::GrepFileJumped`].
@@ -2650,6 +2846,16 @@ impl Session {
                 }
                 self.buffer.saved_revision = p.saved_revision;
                 self.buffer.transient = p.transient;
+                // A save-as renames the shared buffer; follow it — adopt the new path and re-derive
+                // the label. Only on an actual change, so in-place save/reload pushes are no-ops
+                // (and a legacy server omitting `path` never clobbers our label).
+                if let Some(new_path) = p.path {
+                    if self.buffer.path.as_deref() != Some(new_path.as_str()) {
+                        self.buffer.label =
+                            super::session::label_for_path(&new_path, &self.project_paths);
+                        self.buffer.path = Some(new_path);
+                    }
+                }
                 let was_external = self.externally_modified || self.externally_deleted;
                 self.externally_modified = p.externally_modified;
                 self.externally_deleted = p.externally_deleted;
@@ -3496,22 +3702,40 @@ impl Session {
         }
     }
 
-    /// Declining a save-as overwrite returns to the path input (the TUI keeps the prompt
-    /// open beneath the confirm); other declines just close the dialog.
-    fn decline_confirm(&mut self, action: ConfirmAction) {
+    /// Open the save-as prompt pre-filled with `(path_index, input)`. A brand-new buffer (empty
+    /// input) in a multi-root project starts focused in the root field so you choose where to save;
+    /// otherwise the path field has focus (the root is known). Kicks off a `directory/list` so the
+    /// path field's ghost suggestions are ready.
+    fn open_save_as(&mut self, path_index: u32, input: String) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let field = if project_paths.len() > 1 && input.is_empty() {
+            ChipEditorField::Root
+        } else {
+            ChipEditorField::Path
+        };
+        let mut ed = SaveAsEditor::new(input, field, path_index);
+        ed.sync_dir_listing(&project_paths);
+        self.prompt = Some(Prompt::SaveAs(Box::new(ed)));
+        self.refresh_save_as_listing()
+    }
+
+    /// Declining a save-as overwrite returns to the path input (re-opened pre-filled, so a tweak
+    /// and re-save is one gesture); other declines just close the dialog.
+    fn decline_confirm(&mut self, action: ConfirmAction) -> Effects {
         if let ConfirmAction::Save {
             target: Some((path_index, input)),
         } = action
         {
-            self.prompt = Some(Prompt::SaveAs { path_index, input });
+            return self.open_save_as(path_index, input);
         }
+        Effects::none()
     }
 
     /// The prompt's Yes/Save button.
     fn accept_prompt(&mut self) -> Effects {
         match self.prompt.take() {
             Some(Prompt::Confirm { action, .. }) => self.run_confirm(action),
-            Some(p @ Prompt::SaveAs { .. }) => {
+            Some(p @ Prompt::SaveAs(_)) => {
                 // Submit via the same path as Enter.
                 self.prompt = Some(p);
                 self.on_prompt_key(KeyCode::Enter, Mods::default(), None)
@@ -3521,10 +3745,11 @@ impl Session {
     }
 
     /// Dismiss the prompt without accepting (Esc / backdrop click).
-    pub fn decline_prompt(&mut self) {
+    pub fn decline_prompt(&mut self) -> Effects {
         if let Some(Prompt::Confirm { action, .. }) = self.prompt.take() {
-            self.decline_confirm(action);
+            return self.decline_confirm(action);
         }
+        Effects::none()
     }
 
     /// `buffer/reload`, mapping `WOULD_DISCARD_CHANGES` to a confirmation that retries with
@@ -4005,8 +4230,7 @@ impl Session {
                     .as_deref()
                     .and_then(|p| strip_longest_root(p, &self.project_paths))
                     .unwrap_or((0, String::new()));
-                self.prompt = Some(Prompt::SaveAs { path_index, input });
-                Effects::none()
+                self.open_save_as(path_index, input)
             }
             A::Reload => {
                 if self.buffer.path.is_none() {

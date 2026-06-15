@@ -12,6 +12,7 @@
 
 use aether_client::chips::{ChipEditor, ChipEditorField};
 use aether_client::picker::PickerState;
+use aether_client::save_as::SaveAsEditor;
 use aether_client::session::{ConfirmKind, ConnState, Mode, Pending, Prompt, Session};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -46,7 +47,7 @@ pub fn build_view(s: &Session) -> Value {
         "count": s.count,
         "pending": pending(&s.pending),
         "search": search(s),
-        "prompt": prompt(&s.prompt),
+        "prompt": prompt(&s.prompt, &s.project_paths),
         "picker": picker(&s.picker, &s.project_paths),
         "project_settings": project_settings(s),
     })
@@ -145,17 +146,42 @@ fn chip_editor(ce: &Option<ChipEditor>, project_paths: &[String]) -> Value {
     })
 }
 
+/// The save-as path editor's projection — same shape as [`chip_editor`]'s dir half, since the UX
+/// mirrors it. The core owns the editing/ghost/validity logic; the shell renders this and syncs
+/// text via `save_as_set_input` / `save_as_set_root_filter`.
+fn save_as(ed: &SaveAsEditor, project_paths: &[String]) -> Value {
+    let labels = aether_client::labels::root_labels(project_paths);
+    let multi_root = project_paths.len() > 1;
+    json!({
+        "kind": "saveas",
+        "field": match ed.field {
+            ChipEditorField::Root => "root",
+            ChipEditorField::Path => "path",
+        },
+        "input": ed.input.text,
+        "root_filter": ed.root_filter.text,
+        "multi_root": multi_root,
+        "root_ghost": if multi_root { ed.root_ghost(&labels).map(|(_, suffix)| suffix) } else { None },
+        "root_invalid": multi_root && ed.root_invalid(&labels),
+        "root_display": if multi_root {
+            labels.get(ed.chosen_root(&labels) as usize).cloned()
+        } else {
+            None
+        },
+        "path_ghost": ed.path_ghost(),
+        "path_invalid": ed.path_invalid(),
+    })
+}
+
 /// The modal prompt overlay, when one is open (confirm / save-as / LSP info). Keys flow through the
 /// core's `on_prompt_key` (the shell only renders this); see docs/web-core.md.
-fn prompt(p: &Option<Prompt>) -> Value {
+fn prompt(p: &Option<Prompt>, project_paths: &[String]) -> Value {
     match p {
         None => Value::Null,
         Some(Prompt::Confirm { kind, .. }) => {
             json!({ "kind": "confirm", "confirm": confirm_kind(kind) })
         }
-        Some(Prompt::SaveAs { path_index, input }) => json!({
-            "kind": "saveas", "path_index": path_index, "input": input,
-        }),
+        Some(Prompt::SaveAs(ed)) => save_as(ed, project_paths),
         Some(Prompt::LspInfo(status)) => json!({ "kind": "lspinfo", "status": jv(status) }),
     }
 }

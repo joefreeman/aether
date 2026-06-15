@@ -185,6 +185,8 @@ pub enum OverlayField {
     Search,
     /// The save-as prompt's path input.
     SaveAs,
+    /// The save-as prompt's root-filter input (multi-root projects).
+    SaveAsRoot,
     /// The project-settings name field.
     ProjectName,
     /// The project-settings add-root input.
@@ -202,6 +204,7 @@ impl OverlayField {
             OverlayField::PickerQuery => "overlay-picker-query",
             OverlayField::Search => "overlay-search",
             OverlayField::SaveAs => "overlay-saveas",
+            OverlayField::SaveAsRoot => "overlay-saveas-root",
             OverlayField::ProjectName => "overlay-project-name",
             OverlayField::ProjectAddRoot => "overlay-project-addroot",
             OverlayField::ChipRoot => "overlay-chip-root",
@@ -593,9 +596,19 @@ impl App {
         if self.boot.is_some() {
             return None;
         }
-        // A confirm / LSP-info prompt has no text field; only the save-as prompt does.
+        // A confirm / LSP-info prompt has no text field; only the save-as prompt does. Its two
+        // segments (root filter / path) are controlled `text_input`s with ghost overlays behind
+        // them, exactly like the chip editor — focus the active one so its caret shows and plain
+        // typing flows through `on_input`. The root segment only exists in multi-root projects.
         match &self.session.prompt {
-            Some(Prompt::SaveAs { .. }) => return Some(OverlayField::SaveAs),
+            Some(Prompt::SaveAs(ed)) => {
+                let multi_root = self.session.project_paths.len() > 1;
+                return Some(if multi_root && ed.field == crate::chips::ChipEditorField::Root {
+                    OverlayField::SaveAsRoot
+                } else {
+                    OverlayField::SaveAs
+                });
+            }
             Some(_) => return None,
             None => {}
         }
@@ -1685,10 +1698,20 @@ impl App {
         self.session.picker.as_ref().map(|p| p.chips.len())
     }
 
-    /// The active chip-editor field (the one with a focused `text_input`) and its current text, or
-    /// `None` when no chip editor is open. Used to spot core-driven text changes that need the
-    /// `text_input` caret moved to the end (see `on_key`).
+    /// The active chip-editor / save-as field (the one with a focused `text_input`) and its current
+    /// text, or `None` when neither is open. Used to spot core-driven text changes that need the
+    /// `text_input` caret moved to the end (see `on_key`). The save-as prompt's root/path segments
+    /// are the same controlled-input-over-ghost shape as the chip editor, so they get the same
+    /// caret-to-end treatment when the core rewrites them (Tab-complete, cycle, root↔path switch).
     fn chip_field_snapshot(&self) -> Option<(OverlayField, String)> {
+        if let Some(Prompt::SaveAs(ed)) = &self.session.prompt {
+            let multi_root = self.session.project_paths.len() > 1;
+            return Some(if multi_root && ed.field == crate::chips::ChipEditorField::Root {
+                (OverlayField::SaveAsRoot, ed.root_filter.text.clone())
+            } else {
+                (OverlayField::SaveAs, ed.input.text.clone())
+            });
+        }
         let ed = self.session.picker.as_ref()?.chip_editor.as_ref()?;
         Some(if ed.field == crate::chips::ChipEditorField::Root {
             (OverlayField::ChipRoot, ed.root_filter.text.clone())
@@ -1703,7 +1726,8 @@ impl App {
         match field {
             OverlayField::PickerQuery => self.session.picker_set_query(value),
             OverlayField::Search => self.session.search_set_query(value),
-            OverlayField::SaveAs => self.session.prompt_set_input(value),
+            OverlayField::SaveAs => self.session.save_as_set_input(value),
+            OverlayField::SaveAsRoot => self.session.save_as_set_root_filter(value),
             OverlayField::ProjectName => self.session.project_settings_set_name(value),
             OverlayField::ProjectAddRoot => self.session.project_settings_set_add(value),
             OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
@@ -2809,7 +2833,17 @@ impl App {
         // The save-as arm embeds a controlled `text_input` (which produces `Message`), so the
         // whole body is built in `Message` space: the Clone-only buttons map their `PromptMsg`
         // immediately rather than the whole tree being mapped at the end.
-        let btn = |label: &str, primary: bool, msg: PromptMsg| -> Element<'_, Message> {
+        // The modal button roles, mirroring the web client's `.modal-btn` classes: `Default` is the
+        // safe, Enter-target option (Cancel/No) — a plain, subtly bordered button; `Danger` is a
+        // destructive confirm (Yes) in red; `Primary` is a non-destructive affirmative (Save) in
+        // frost blue.
+        #[derive(Clone, Copy)]
+        enum BtnRole {
+            Default,
+            Danger,
+            Primary,
+        }
+        let btn = |label: &str, role: BtnRole, msg: PromptMsg| -> Element<'_, Message> {
             Element::from(
                 iced::widget::button(
                     text(label.to_string())
@@ -2818,19 +2852,22 @@ impl App {
                         .color(theme::NORD6),
                 )
                 .padding([5, 14])
-                .style(move |_, _| iced::widget::button::Style {
-                    background: Some(if primary {
-                        // Red to mark the confirm as destructive (matches the web/TUI `[y/N]`).
-                        theme::NORD11.into()
-                    } else {
-                        theme::NORD3.into()
-                    }),
-                    text_color: theme::NORD6,
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        ..iced::Border::default()
-                    },
-                    ..iced::widget::button::Style::default()
+                .style(move |_, _| {
+                    let (bg, border_width, border_color) = match role {
+                        BtnRole::Default => (theme::NORD2, 1.0, theme::NORD3),
+                        BtnRole::Danger => (theme::NORD11, 0.0, iced::Color::TRANSPARENT),
+                        BtnRole::Primary => (theme::NORD10, 0.0, iced::Color::TRANSPARENT),
+                    };
+                    iced::widget::button::Style {
+                        background: Some(bg.into()),
+                        text_color: theme::NORD6,
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            width: border_width,
+                            color: border_color,
+                        },
+                        ..iced::widget::button::Style::default()
+                    }
                 })
                 .on_press(msg),
             )
@@ -2905,38 +2942,90 @@ impl App {
                     .color(theme::NORD6),
                 row![
                     iced::widget::Space::new().width(Length::Fill),
-                    btn("No", false, PromptMsg::Cancel),
-                    btn("Yes", true, PromptMsg::Accept),
+                    btn("No", BtnRole::Default, PromptMsg::Cancel),
+                    btn("Yes", BtnRole::Danger, PromptMsg::Accept),
                 ]
                 .spacing(8),
             ]
             .spacing(14)
             .into(),
-            Prompt::SaveAs {
-                path_index, input, ..
-            } => {
-                let root = self
-                    .session
-                    .project_paths
-                    .get(*path_index as usize)
-                    .map(|p| {
-                        format!(
-                            "{}/",
-                            std::path::Path::new(p)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| p.clone())
-                        )
-                    })
-                    .unwrap_or_default();
-                // The root prefix is a dim non-editable lead; the path is a controlled
-                // `text_input` (value = the prompt's `input`, edits sync via `prompt_set_input`).
-                // Enter / Esc bubble to `on_key` (accept / cancel) since `on_submit` is unset.
-                let field = row![
-                    text(root).size(13).font(SANS).color(theme::NORD3_BRIGHT),
-                    overlay_input(OverlayField::SaveAs, "", input),
-                ]
-                .align_y(iced::Alignment::Center);
+            Prompt::SaveAs(ed) => {
+                // The save-as editor mirrors the dir chip editor's directory-completion UX: in
+                // multi-root projects a leading root-filter segment (smartcase typeahead + gray
+                // ghost), a `:` separator, then the root-relative path; single-root shows just the
+                // path. Both segments are the controlled-`text_input`-over-ghost-layer shape from
+                // the picker (`field_with_ghost`), so the look stays consistent. Edits sync via
+                // `OverlayInput`; Enter / Esc / Tab / Alt-* bubble to `on_key`, and the `:` /
+                // Backspace boundaries forward through `CoreKey` (web/TUI parity). The whole row is
+                // built in `PickerMsg` space then mapped to `Message`.
+                use crate::picker::{field_with_ghost, Boundary, PickerMsg};
+                let roots = &self.session.project_paths;
+                let labels = crate::labels::root_labels(roots);
+                let multi_root = roots.len() > 1;
+                let mut field = row![].align_y(iced::Alignment::Center);
+                if multi_root {
+                    let invalid = ed.root_invalid(&labels);
+                    // The root segment and its flush `:` separator sit at zero spacing (the colon
+                    // hugs the root rather than dangling 6px off it); the row gap separates this
+                    // group from the path that follows.
+                    let mut root_group = row![].spacing(0).align_y(iced::Alignment::Center);
+                    if ed.field == crate::chips::ChipEditorField::Root {
+                        let ghost = ed.root_ghost(&labels).map(|(_, suffix)| suffix);
+                        root_group = root_group.push(field_with_ghost(
+                            &ed.root_filter,
+                            ghost,
+                            invalid,
+                            OverlayField::SaveAsRoot.id(),
+                            "",
+                            PickerMsg::EditorRoot,
+                            true,
+                            Boundary::ConfirmRoot,
+                        ));
+                    } else {
+                        // Unfocused root: the chosen label in breadcrumb blue — or the raw filter
+                        // text, red, when it matches nothing.
+                        let display = if invalid {
+                            ed.root_filter.text.clone()
+                        } else {
+                            labels
+                                .get(ed.chosen_root(&labels) as usize)
+                                .cloned()
+                                .unwrap_or_default()
+                        };
+                        let color = if invalid { theme::NORD11 } else { theme::NORD8 };
+                        root_group =
+                            root_group.push(text(display).size(13).font(SANS).color(color));
+                    }
+                    root_group =
+                        root_group.push(text(":").size(13).font(SANS).color(theme::NORD3_BRIGHT));
+                    field = field.push(root_group).spacing(6);
+                }
+                // The path field: typed value plus the gray `path_ghost` suffix, red on invalid
+                // (parent dir failed to list). Only a multi-root path can step back into the root.
+                let path_boundary = if multi_root {
+                    Boundary::PathToRoot
+                } else {
+                    Boundary::None
+                };
+                field = field.push(field_with_ghost(
+                    &ed.input,
+                    ed.path_ghost(),
+                    ed.path_invalid(),
+                    OverlayField::SaveAs.id(),
+                    "",
+                    PickerMsg::EditorPath,
+                    false,
+                    path_boundary,
+                ));
+                let field: Element<'_, Message> = Element::from(field).map(|m| match m {
+                    PickerMsg::EditorRoot(s) => {
+                        Message::OverlayInput(OverlayField::SaveAsRoot, s)
+                    }
+                    PickerMsg::EditorPath(s) => Message::OverlayInput(OverlayField::SaveAs, s),
+                    PickerMsg::CoreKey(code) => core_key_message(code),
+                    // The save-as segments never emit row/scroll/chip messages.
+                    _ => Message::Noop,
+                });
                 column![
                     text("Save as").size(13).font(SANS).color(theme::NORD6),
                     container(field)
@@ -2955,8 +3044,8 @@ impl App {
                         }),
                     row![
                         iced::widget::Space::new().width(Length::Fill),
-                        btn("Cancel", false, PromptMsg::Cancel),
-                        btn("Save", true, PromptMsg::Accept),
+                        btn("Cancel", BtnRole::Default, PromptMsg::Cancel),
+                        btn("Save", BtnRole::Primary, PromptMsg::Accept),
                     ]
                     .spacing(8),
                 ]
@@ -3906,12 +3995,12 @@ fn format_total(s: &SearchSummary) -> String {
 /// appends `?` and offers Yes/No).
 fn confirm_phrase(kind: &ConfirmKind) -> String {
     match kind {
-        ConfirmKind::Overwrite { path: Some(p) } => format!("overwrite {p}"),
-        ConfirmKind::Overwrite { path: None } => "overwrite".into(),
-        ConfirmKind::OverwriteModified => "file changed on disk — overwrite".into(),
-        ConfirmKind::RecreateDeleted => "file removed on disk — recreate".into(),
-        ConfirmKind::DiscardOnReload => "discard local changes and reload".into(),
-        ConfirmKind::DiscardOnClose { label } => format!("discard unsaved changes in {label}"),
+        ConfirmKind::Overwrite { path: Some(p) } => format!("Overwrite {p}"),
+        ConfirmKind::Overwrite { path: None } => "Overwrite".into(),
+        ConfirmKind::OverwriteModified => "File changed on disk — overwrite".into(),
+        ConfirmKind::RecreateDeleted => "File removed on disk — recreate".into(),
+        ConfirmKind::DiscardOnReload => "Discard local changes and reload".into(),
+        ConfirmKind::DiscardOnClose { label } => format!("Discard unsaved changes in {label}"),
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
         ConfirmKind::DeleteProject { name } => format!("Delete project \"{name}\""),
@@ -4149,6 +4238,7 @@ mod tests {
             OverlayField::PickerQuery,
             OverlayField::Search,
             OverlayField::SaveAs,
+            OverlayField::SaveAsRoot,
             OverlayField::ProjectName,
             OverlayField::ProjectAddRoot,
             OverlayField::ChipRoot,

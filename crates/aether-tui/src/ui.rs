@@ -4470,7 +4470,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![Span::raw(format!(" {}? [y/N]", confirm.message))])
     } else if let Some(prompt) = state.save_prompt.as_ref() {
         // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
-        Line::from(draw_save_prompt_spans(prompt, state, area.width as usize))
+        Line::from(draw_save_prompt_spans(prompt, state, area.width as usize).0)
     } else if !state.has_editor() {
         // No editor: at boot while `Connecting` the row carries the connection indicator (the
         // same slot that shows "Reconnecting…" mid-session); otherwise just transient feedback.
@@ -4647,105 +4647,91 @@ fn draw_toast_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     }
 }
 
-/// Display width of the save-prompt's committed root prefix. Only non-zero in multi-root
-/// `Editing` mode (where we render `{label}: ` before the input). In SelectingRoot we show no
-/// label — the input itself carries the typed root filter / cycled-root suggestion. Used by
-/// the terminal-cursor placement to land in sync with the rendered text.
-fn save_prompt_prefix_width(
-    prompt: &crate::save_prompt::SavePromptState,
-    state: &AppState,
-) -> usize {
-    use crate::save_prompt::PromptMode;
-    match &prompt.mode {
-        PromptMode::Editing(e) => {
-            let label = state
-                .root_labels
-                .get(e.path_index as usize)
-                .map(String::as_str)
-                .unwrap_or("");
-            if label.is_empty() {
-                0
-            } else {
-                label.width() + ": ".width()
-            }
-        }
-        PromptMode::SelectingRoot(_) => 0,
-    }
-}
-
-/// Build the save-prompt's status-row spans. In multi-root projects we render a blue committed
-/// root label to the left of the input (e.g. `proj_a: `); in single-root we skip it. After the
-/// input, when the prompt has a ghost suggestion to offer (cursor at end, at least one match),
-/// the dim suffix completing the user's partial leaf is appended in gray. A right-aligned
-/// `[N/M]` counter appears when the filtered match set has more than one entry.
+/// Build the save-prompt's status-row spans and the caret column offset (from the start of the
+/// status area). A render mirror of [`chip_editor_spans`], differing only in its `" save as: "`
+/// label and the path ghost including files:
+///
+/// - a `" save as: "` label;
+/// - (multi-root) the **root** segment — when focused, the typed filter (red if it matches no
+///   label) plus a gray ghost suffix; when unfocused, the chosen root's label in committed blue
+///   (or the raw red filter if it matches nothing). Then a `:` separator once the path is in play;
+/// - the **path** segment — the typed text (red if the parent dir failed to list) plus a gray
+///   ghost suffix completing the highlighted entry (a trailing `/` only behind a directory).
 fn draw_save_prompt_spans(
     prompt: &crate::save_prompt::SavePromptState,
     state: &AppState,
-    total_width: usize,
-) -> Vec<Span<'static>> {
-    use crate::save_prompt::PromptMode;
+    _total_width: usize,
+) -> (Vec<Span<'static>>, u16) {
+    use crate::picker::ChipEditorField;
     let base_style = Style::default().bg(NORD1).fg(NORD4);
-    // The committed root prefix (multi-root only) shares the explorer's blue treatment.
+    // The chosen-root label / `:` separator share the explorer's committed-prefix blue.
     let prefix_style = Style::default().bg(NORD1).fg(NORD8);
-    // Ghost / suggestion text. We can't use NORD3 — it's only ~17 brightness off NORD1 and
-    // reads as invisible on the status bar. We also can't rely on the `DIM` modifier — some
-    // terminals ignore it for bright foregrounds. So we explicitly pick a mid-tone that's
-    // clearly readable on NORD1 yet plainly dimmer than NORD4.
-    let dim_style = Style::default().bg(NORD1).fg(Color::Rgb(140, 150, 165));
+    // Ghost / suggestion text. We can't use NORD3 — it's only ~17 brightness off NORD1 and reads
+    // as invisible on the status bar; nor the `DIM` modifier (some terminals ignore it for bright
+    // foregrounds). A mid-tone readable on NORD1 yet plainly dimmer than NORD4.
+    let ghost_style = Style::default().bg(NORD1).fg(Color::Rgb(140, 150, 165));
+    // An invalid segment (root matching no label / path whose parent doesn't exist) renders red.
+    let invalid_style = Style::default().bg(NORD1).fg(NORD11);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(" save as: ".to_string(), base_style));
-
-    // Root label, in multi-root projects only. In SelectingRoot mode the label has been peeled
-    // — we show nothing to the left of the input; the input itself carries the typed root-
-    // filter or the cycled-root suggestion.
-    let label_text = match &prompt.mode {
-        PromptMode::Editing(e) => {
-            let label = state
-                .root_labels
-                .get(e.path_index as usize)
-                .map(String::as_str)
-                .unwrap_or("");
-            if label.is_empty() {
-                String::new()
-            } else {
-                format!("{label}: ")
-            }
-        }
-        PromptMode::SelectingRoot(_) => String::new(),
+    let mut w: usize = 0;
+    let mut cursor: usize = 0;
+    let push = |spans: &mut Vec<Span<'static>>, w: &mut usize, text: String, style: Style| {
+        *w += text.width();
+        spans.push(Span::styled(text, style));
     };
-    let label_w = label_text.width();
-    if !label_text.is_empty() {
-        spans.push(Span::styled(label_text, prefix_style));
-    }
 
-    // The input itself, always in the base (white) style — the user's typed text never gets
-    // dimmed. The committed/uncommitted contrast lives in the prefix (blue) and the ghost
-    // (dim) instead.
-    spans.push(Span::styled(prompt.input.text.clone(), base_style));
+    push(&mut spans, &mut w, " save as: ".into(), base_style);
 
-    // Ghost suggestion: gray suffix after the cursor when one's available.
-    let ghost = prompt
-        .ghost_suffix(&state.project_paths)
-        .unwrap_or_default();
-    let ghost_w = ghost.width();
-    if !ghost.is_empty() {
-        spans.push(Span::styled(ghost, dim_style));
-    }
-
-    // Right-aligned cycle counter (`N/M`) — only meaningful when the user has more than one
-    // candidate to choose between.
-    if let Some((pos, total)) = prompt.cycle_position(&state.project_paths) {
-        let counter = format!("[{pos}/{total}]");
-        let counter_w = counter.width();
-        let used = " save as: ".width() + label_w + prompt.input.text.width() + ghost_w;
-        if used + counter_w < total_width {
-            let pad = total_width.saturating_sub(used + counter_w);
-            spans.push(Span::styled(" ".repeat(pad), base_style));
-            spans.push(Span::styled(counter, base_style));
+    if prompt.multi_root {
+        let labels = crate::labels::root_labels(&state.project_paths);
+        let invalid = prompt.root_invalid(&labels);
+        if prompt.field == ChipEditorField::Root {
+            cursor = w + prompt.root_filter.width_to_cursor();
+            let style = if invalid { invalid_style } else { base_style };
+            push(&mut spans, &mut w, prompt.root_filter.text.clone(), style);
+            // Ghost = the current match beyond the typed prefix; nothing matches → no ghost (the
+            // red typed text is the cue).
+            if let Some((_, suffix)) = prompt.root_ghost(&labels) {
+                push(&mut spans, &mut w, suffix, ghost_style);
+            }
+        } else if invalid {
+            // An unfocused-but-unmatched root shows the raw red filter — not the fallback label,
+            // which would advertise a commit target the gate would refuse.
+            push(
+                &mut spans,
+                &mut w,
+                prompt.root_filter.text.clone(),
+                invalid_style,
+            );
+        } else {
+            push(&mut spans, &mut w, prompt.root_display(&labels), prefix_style);
+        }
+        // The separator appears once the path is in play (focused, or already holding text).
+        if prompt.field == ChipEditorField::Path || !prompt.input.text.is_empty() {
+            push(&mut spans, &mut w, ": ".into(), prefix_style);
         }
     }
-    spans
+
+    // The path segment. Red only when its parent dir failed to list (a non-matching filename leaf
+    // is fine). The caret tracks the path field unless the root field is focused.
+    let path_style = if prompt.path_invalid() {
+        invalid_style
+    } else {
+        base_style
+    };
+    if prompt.field == ChipEditorField::Path || !prompt.multi_root {
+        cursor = w + prompt.input.width_to_cursor();
+        push(&mut spans, &mut w, prompt.input.text.clone(), path_style);
+        // Ghost suggestion: the rest of the current match (files included; `/` only behind a dir),
+        // gray after the caret.
+        if let Some(suffix) = prompt.path_ghost() {
+            push(&mut spans, &mut w, suffix, ghost_style);
+        }
+    } else {
+        push(&mut spans, &mut w, prompt.input.text.clone(), path_style);
+    }
+    (spans, cursor as u16)
 }
 
 /// Style for a `StatusMessage` based on its kind: success → blue (matches the committed-prefix
@@ -5203,17 +5189,13 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         return;
     }
     if let Some(prompt) = state.save_prompt.as_ref() {
-        const PROMPT: &str = " save as: ";
-        let prompt_w = PROMPT.width() as u16;
-        let dir_w = save_prompt_prefix_width(prompt, state) as u16;
-        let typed_w = prompt.input.width_to_cursor() as u16;
+        // The span builder reports the caret offset of the focused segment (root or path), so the
+        // terminal cursor lands in sync with the rendered text.
+        let (_, cursor_off) = draw_save_prompt_spans(prompt, state, status_area.width as usize);
         let max_col = status_area
             .x
             .saturating_add(status_area.width.saturating_sub(1));
-        let col = status_area
-            .x
-            .saturating_add(prompt_w.saturating_add(dir_w).saturating_add(typed_w))
-            .min(max_col);
+        let col = status_area.x.saturating_add(cursor_off).min(max_col);
         f.set_cursor_position((col, status_area.y));
         return;
     }

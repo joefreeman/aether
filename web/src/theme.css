@@ -452,6 +452,18 @@ html, body, #app {
 }
 .modal-input { flex: 1 1 auto; min-width: 0; }
 .modal-input:focus, .modal-select:focus { border-color: var(--nord8); }
+/* The save-as completion editor reuses the dir chip editor's ghost-stacking inputs (`picker-editor-*`)
+   inside a modal field, so the root/path segments + `:` separator + gray ghost suggestions read the
+   same as the picker. The field is a bordered box (like `.modal-input`) holding those inline parts. */
+.saveas-field {
+  align-items: center;
+  gap: 6px;
+  background: var(--nord0);
+  border: 1px solid var(--nord3);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+.saveas-field:focus-within { border-color: var(--nord8); }
 .modal-buttons { display: flex; justify-content: flex-end; gap: 8px; }
 .modal-btn {
   font: inherit;

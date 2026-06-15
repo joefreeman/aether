@@ -1978,13 +1978,22 @@ fn buffer_state_params_external_flags_round_trip() {
         saved_at_unix_ms: Some(123),
         externally_modified: true,
         externally_deleted: false,
+        path: Some("/p/bar.md".into()),
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["externally_modified"], true);
     assert_eq!(v["externally_deleted"], false);
+    assert_eq!(v["path"], "/p/bar.md");
     let p2: BufferStateParams = from_value(v).unwrap();
     assert!(p2.externally_modified);
     assert!(!p2.externally_deleted);
+    assert_eq!(p2.path.as_deref(), Some("/p/bar.md"));
+    // Back-compat: a payload without `path` (older server) deserializes to `None`.
+    let legacy = from_value::<BufferStateParams>(serde_json::json!({
+        "buffer_id": 5, "saved_revision": 7,
+    }))
+    .unwrap();
+    assert_eq!(legacy.path, None);
 }
 
 // ---- transient buffers ---------------------------------------------------------------------

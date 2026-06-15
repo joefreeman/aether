@@ -293,4 +293,10 @@ pub struct BufferStateParams {
     /// `buffer/open { transient: false }`.
     #[serde(default)]
     pub transient: bool,
+    /// The buffer's current canonical path on disk (`None` for an unsaved scratch). Carried so a
+    /// save-as — which renames the *shared* buffer — relabels every other client viewing it: they
+    /// adopt the new path and re-derive their project-relative label. Unchanged on in-place
+    /// save/reload (the client only adopts a differing path).
+    #[serde(default)]
+    pub path: Option<String>,
 }

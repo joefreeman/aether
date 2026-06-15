@@ -19,8 +19,10 @@ use aether_client::keymap::{KeyCode, Mods};
 /// `desired_overlay_field` rule that decides when it's focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayField {
-    /// The save-as path prompt (`Prompt::SaveAs`).
+    /// The save-as path prompt's path segment (`Prompt::SaveAs`).
     SaveAs,
+    /// The save-as prompt's root-typeahead segment (multi-root projects only).
+    SaveAsRoot,
     /// The incremental-search query bar (`Mode::Search`).
     Search,
     /// The project-settings overlay's name field.
@@ -86,12 +88,13 @@ pub fn is_command_override(field: OverlayField, code: KeyCode, cursor: usize) ->
             KeyCode::Left | KeyCode::Backspace => cursor == 0,
             _ => false,
         },
-        // `:` on the chip editor's root segment confirms it and moves into the path (it can never
-        // extend a root-label prefix), so it's a command, not text.
-        OverlayField::ChipRoot => code == KeyCode::Char(':'),
+        // `:` on a root-typeahead segment confirms it and moves into the path (it can never
+        // extend a root-label prefix), so it's a command, not text. The chip editor's root and the
+        // save-as prompt's root share this gesture.
+        OverlayField::ChipRoot | OverlayField::SaveAsRoot => code == KeyCode::Char(':'),
         // Backspace at the path-segment start steps back into the root field (multi-root) — the
         // same leftward gesture the chip row uses from the query.
-        OverlayField::ChipPath => code == KeyCode::Backspace && cursor == 0,
+        OverlayField::ChipPath | OverlayField::SaveAs => code == KeyCode::Backspace && cursor == 0,
         _ => false,
     }
 }
@@ -171,7 +174,10 @@ mod tests {
         assert!(!is_command_override(PickerQuery, KeyCode::Delete, 5));
         assert!(!is_command_override(PickerQuery, KeyCode::Char('a'), 0));
         assert!(!is_command_override(PickerQuery, KeyCode::Right, 0));
-        // Other fields have no overrides.
+        // The save-as path segment steps into the root field on Backspace at the start (its only
+        // override); Delete / Left there are plain editing keys.
+        assert!(is_command_override(SaveAs, KeyCode::Backspace, 0));
+        assert!(!is_command_override(SaveAs, KeyCode::Backspace, 3));
         assert!(!is_command_override(SaveAs, KeyCode::Delete, 0));
         assert!(!is_command_override(SaveAs, KeyCode::Left, 0));
     }

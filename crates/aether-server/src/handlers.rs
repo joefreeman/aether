@@ -2938,6 +2938,11 @@ pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) 
         externally_modified: buf.externally_modified,
         externally_deleted: buf.externally_deleted,
         transient: buf.transient,
+        // Lets a save-as rename follow to every other client viewing this shared buffer.
+        path: buf
+            .canonical_path
+            .as_ref()
+            .map(|p| p.display().to_string()),
     };
     let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
     let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();

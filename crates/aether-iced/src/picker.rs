@@ -152,9 +152,10 @@ pub enum PickerMsg {
 }
 
 /// Which boundary gesture a chip-editor field forwards to the core (a focused `text_input` captures
-/// these, so the wrapper intercepts them — web/TUI parity).
+/// these, so the wrapper intercepts them — web/TUI parity). Shared with the save-as prompt, whose
+/// root/path segments reuse [`field_with_ghost`] and the same `:`/Backspace boundaries.
 #[derive(Clone, Copy)]
-enum Boundary {
+pub(crate) enum Boundary {
     /// No boundary key (glob field, single-root dir path).
     None,
     /// Root segment: `:` confirms the root and moves into the path.
@@ -649,7 +650,7 @@ fn chip_el<'a>(chip: &Chip, idx: usize, selected: bool) -> Element<'a, PickerMsg
 /// fake-caret rendering). `placeholder` shows only when the field is empty (the glob hint).
 /// `on_input` carries the typed value back to the core via the shell's `OverlayInput` mapping.
 #[allow(clippy::too_many_arguments)]
-fn field_with_ghost<'a>(
+pub(crate) fn field_with_ghost<'a>(
     input: &chips::Input,
     ghost: Option<String>,
     invalid: bool,

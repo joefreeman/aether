@@ -238,9 +238,22 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.search_set_query(query)))
     }
 
-    /// Replace the save-as path input (native `<input>` owns editing). Returns `Effect[]`.
-    pub fn prompt_set_input(&mut self, text: String) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.prompt_set_input(text)))
+    /// Replace the save-as editor's path-field text (native `<input>` owns editing). Returns
+    /// `Effect[]`.
+    pub fn save_as_set_input(&mut self, text: String) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.save_as_set_input(text)))
+    }
+
+    /// Replace the multi-root save-as editor's root-filter text (native `<input>`). Returns
+    /// `Effect[]`.
+    pub fn save_as_set_root_filter(&mut self, text: String) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.save_as_set_root_filter(text)))
+    }
+
+    /// Click an unfocused save-as segment to focus it (`root: true` for the root). Returns
+    /// `Effect[]`.
+    pub fn save_as_set_field(&mut self, root: bool) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.save_as_set_field(root)))
     }
 
     /// Replace the project-settings name field (native `<input>` owns editing). Returns `Effect[]`.

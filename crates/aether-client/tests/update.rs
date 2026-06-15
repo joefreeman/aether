@@ -74,30 +74,260 @@ fn insert_entry_is_one_selection_edge_request() {
 
 #[test]
 fn save_as_prompt_is_value_synced_not_keycode_edited() {
+    use aether_client::chips::ChipEditorField;
+    use aether_client::save_as::SaveAsEditor;
     use aether_client::session::Prompt;
     let mut s = session();
     // The save-as prompt's text is owned by each shell's input; the core only stores the value
     // and handles command keys. A typed char reaching the core must NOT edit the value.
-    s.prompt = Some(Prompt::SaveAs {
-        path_index: 0,
-        input: "notes".into(),
-    });
+    s.prompt = Some(Prompt::SaveAs(Box::new(SaveAsEditor::new(
+        "notes".into(),
+        ChipEditorField::Path,
+        0,
+    ))));
     let _ = key(&mut s, 'x');
     match &s.prompt {
-        Some(Prompt::SaveAs { input, .. }) => {
-            assert_eq!(input, "notes", "the core must not key-edit the save-as value");
+        Some(Prompt::SaveAs(ed)) => {
+            assert_eq!(
+                ed.input.text, "notes",
+                "the core must not key-edit the save-as value"
+            );
         }
         other => panic!("expected the save-as prompt to stay open, got {other:?}"),
     }
     // The shell's value-sync entry point is what changes the text.
-    s.prompt_set_input("notes.md".into());
+    s.save_as_set_input("notes.md".into());
     match &s.prompt {
-        Some(Prompt::SaveAs { input, .. }) => assert_eq!(input, "notes.md"),
+        Some(Prompt::SaveAs(ed)) => assert_eq!(ed.input.text, "notes.md"),
         other => panic!("expected the save-as prompt, got {other:?}"),
     }
     // Esc is a command the core owns: it closes the prompt.
     let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
     assert!(s.prompt.is_none(), "Esc closes the save-as prompt");
+}
+
+#[test]
+fn save_as_completes_dir_and_files_then_saves_the_literal_path() {
+    use aether_client::session::Prompt;
+    use aether_client::update::Event;
+    use aether_protocol::directory::{DirectoryEntry, DirectoryListResult};
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    // `Space Alt-s` opens the save-as prompt and fires a directory/list for the root (empty path).
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "directory/list").expect("open fires a directory/list");
+    assert_eq!(params["path"], json!("/p"));
+
+    // The listing lands with a directory and a file — unlike the dir-scope chip, files are kept.
+    let _ = s.on_event(Event::SaveAsListing {
+        abs: "/p".into(),
+        result: Ok(DirectoryListResult {
+            path: "/p".into(),
+            parent: None,
+            entries: vec![
+                DirectoryEntry {
+                    name: "src".into(),
+                    is_dir: true,
+                },
+                DirectoryEntry {
+                    name: "main.rs".into(),
+                    is_dir: false,
+                },
+            ],
+        }),
+    });
+
+    // A directory ghost ends in `/`; a file ghost does not.
+    let _ = s.save_as_set_input("s".into());
+    let ghost = match &s.prompt {
+        Some(Prompt::SaveAs(ed)) => ed.path_ghost(),
+        other => panic!("expected save-as, got {other:?}"),
+    };
+    assert_eq!(ghost.as_deref(), Some("rc/"), "directory ghost keeps the slash");
+    let _ = s.save_as_set_input("m".into());
+    let ghost = match &s.prompt {
+        Some(Prompt::SaveAs(ed)) => ed.path_ghost(),
+        _ => unreachable!(),
+    };
+    assert_eq!(ghost.as_deref(), Some("ain.rs"), "file ghost has no slash");
+
+    // Enter saves the *literal* typed path (not the highlighted suggestion).
+    let _ = s.save_as_set_input("notes.md".into());
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "buffer/save").expect("Enter saves");
+    assert_eq!(params["relative_path"], json!("notes.md"));
+    assert_eq!(params["path_index"], json!(0));
+    assert!(s.prompt.is_none(), "the prompt closes on submit");
+}
+
+/// Saving-as onto an existing file: the first request carries `overwrite: false`; the server's
+/// `WOULD_OVERWRITE` refusal raises a confirm, and accepting retries with the flag set.
+#[test]
+fn save_as_overwrite_confirms_then_retries_with_the_flag_set() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_client::update::Event;
+    use aether_protocol::error::ErrorCode;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
+    let _ = s.save_as_set_input("existing.md".into());
+
+    // Enter saves with the confirm flag unset.
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "buffer/save").expect("Enter saves");
+    assert_eq!(params["overwrite"], json!(false));
+    let token = match fx.0.iter().find_map(|e| match e {
+        Effect::Request { token, method, .. } if *method == "buffer/save" => Some(*token),
+        _ => None,
+    }) {
+        Some(t) => t,
+        None => unreachable!(),
+    };
+    assert!(s.prompt.is_none(), "the save-as prompt closes on submit");
+
+    // The server refuses: the file already exists. The client raises an overwrite confirmation.
+    let _ = s.on_rpc_result(
+        token,
+        Err(RpcError {
+            method: "buffer/save",
+            code: ErrorCode::WOULD_OVERWRITE.code(),
+            message: "exists".into(),
+        }),
+    );
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::Overwrite { path },
+            ..
+        }) => assert_eq!(path.as_deref(), Some("existing.md")),
+        other => panic!("expected an overwrite confirm, got {other:?}"),
+    }
+
+    // Accepting retries the save with `overwrite: true`.
+    let fx = s.on_event(Event::PromptAccept);
+    let params = find_request(&fx, "buffer/save").expect("the confirmed save retries");
+    assert_eq!(params["overwrite"], json!(true));
+    assert_eq!(params["relative_path"], json!("existing.md"));
+}
+
+/// Declining the overwrite confirm re-opens the save-as prompt pre-filled, so a tweak and re-save
+/// is one gesture (and re-fetches the directory listing for the ghost).
+#[test]
+fn declining_save_as_overwrite_reopens_the_prompt_prefilled() {
+    use aether_client::session::Prompt;
+    use aether_client::update::Event;
+    use aether_protocol::error::ErrorCode;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
+    let _ = s.save_as_set_input("existing.md".into());
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let token = match fx.0.iter().find_map(|e| match e {
+        Effect::Request { token, method, .. } if *method == "buffer/save" => Some(*token),
+        _ => None,
+    }) {
+        Some(t) => t,
+        None => unreachable!(),
+    };
+    let _ = s.on_rpc_result(
+        token,
+        Err(RpcError {
+            method: "buffer/save",
+            code: ErrorCode::WOULD_OVERWRITE.code(),
+            message: "exists".into(),
+        }),
+    );
+    // Decline → the prompt returns pre-filled, and re-issues the directory/list for the ghost.
+    let fx = s.on_event(Event::PromptCancel);
+    assert!(
+        find_request(&fx, "directory/list").is_some(),
+        "reopening re-fetches the listing"
+    );
+    match &s.prompt {
+        Some(Prompt::SaveAs(ed)) => assert_eq!(ed.input.text, "existing.md"),
+        other => panic!("expected the save-as prompt to reopen, got {other:?}"),
+    }
+}
+
+/// On a `[y/N]` confirm, only `y`/`Y` accepts; Enter (and anything else) declines — honouring the
+/// capital `N`, so Enter never runs the destructive action.
+#[test]
+fn confirm_enter_declines_and_only_y_accepts() {
+    use aether_client::session::{ConfirmAction, ConfirmKind, Prompt};
+    let stage = |s: &mut Session| {
+        s.prompt = Some(Prompt::Confirm {
+            kind: ConfirmKind::DiscardOnReload,
+            action: ConfirmAction::ReloadDiscard,
+        });
+    };
+
+    // Enter dismisses the confirm without running the action.
+    let mut s = session();
+    stage(&mut s);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(s.prompt.is_none(), "Enter dismisses the confirm");
+    assert!(
+        find_request(&fx, "buffer/reload").is_none(),
+        "Enter must not run the destructive action"
+    );
+
+    // `y` accepts → the action runs (reload forced).
+    stage(&mut s);
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    assert!(s.prompt.is_none());
+    let params = find_request(&fx, "buffer/reload").expect("`y` runs the confirmed action");
+    assert_eq!(params["force"], json!(true));
+
+    // `Y` (shifted) accepts too.
+    stage(&mut s);
+    let fx = s.on_key(KeyCode::Char('Y'), Mods::NONE, Some("Y".into()), ROWS);
+    assert!(find_request(&fx, "buffer/reload").is_some(), "`Y` also accepts");
+}
+
+/// A `buffer/state` push carrying a *new* path (a save-as on the shared buffer from another
+/// client) is adopted: this client follows the rename, re-deriving its project-relative label. An
+/// unchanged path (in-place save / reload) leaves the label alone.
+#[test]
+fn buffer_state_push_follows_a_save_as_rename() {
+    use aether_client::update::Event;
+    use aether_protocol::buffer::{BufferState, BufferStateParams};
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    s.buffer.buffer_id = 10;
+    s.buffer.path = Some("/p/foo.md".into());
+    s.buffer.label = "foo.md".into();
+
+    let push = |path: Option<&str>| {
+        Event::ServerPush(Notification {
+            jsonrpc: JsonRpc,
+            method: BufferState::NAME.into(),
+            params: serde_json::to_value(BufferStateParams {
+                buffer_id: 10,
+                saved_revision: 3,
+                saved_at_unix_ms: Some(1),
+                externally_modified: false,
+                externally_deleted: false,
+                transient: false,
+                path: path.map(Into::into),
+            })
+            .unwrap(),
+        })
+    };
+
+    // Another client saved-as foo.md -> sub/bar.md: we follow, relabelling to the new rel path.
+    let _ = s.on_event(push(Some("/p/sub/bar.md")));
+    assert_eq!(s.buffer.path.as_deref(), Some("/p/sub/bar.md"));
+    assert_eq!(s.buffer.label, "sub/bar.md");
+
+    // An in-place save (same path) is a no-op for the label; a legacy push (no path) too.
+    let _ = s.on_event(push(Some("/p/sub/bar.md")));
+    assert_eq!(s.buffer.label, "sub/bar.md");
+    let _ = s.on_event(push(None));
+    assert_eq!(s.buffer.path.as_deref(), Some("/p/sub/bar.md"));
+    assert_eq!(s.buffer.label, "sub/bar.md");
 }
 
 #[test]

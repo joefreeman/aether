@@ -17,6 +17,7 @@ pub mod keymap;
 pub mod labels;
 pub mod markdown;
 pub mod picker;
+pub mod save_as;
 pub mod scrollbar;
 pub mod session;
 pub mod transport;

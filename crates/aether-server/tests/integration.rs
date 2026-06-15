@@ -3755,6 +3755,81 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let state_push: BufferStateParams = expect_notification::<BufferState>(&mut ws).await;
     assert_eq!(state_push.buffer_id, open.buffer_id);
     assert_eq!(state_push.saved_revision, save.revision);
+    // In-place save: the path is unchanged (the client treats a same-path push as a no-op).
+    assert!(state_push.path.as_deref().is_some_and(|p| p.ends_with("greet.txt")));
+
+    drop(server);
+}
+
+/// A save-as renames the *shared* buffer; a second client viewing it receives a `buffer/state`
+/// push carrying the new path, so its label can follow the rename.
+#[tokio::test]
+async fn save_as_broadcasts_new_path_to_other_viewers() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("orig.txt"), "hi\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+
+    // Client 1 opens orig.txt and subscribes a viewport.
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("orig.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+
+    // Client 2 opens the same file — the same shared buffer — and subscribes.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws2,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let a2: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws2, 2, &file_open_params("orig.txt", None)).await;
+    assert_eq!(a2.buffer_id, a.buffer_id, "same file → shared buffer");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws2, 3, &transient_sub_params(a.buffer_id)).await;
+
+    // Client 1 saves-as to a new path.
+    let save: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        4,
+        &BufferSaveParams {
+            buffer_id: a.buffer_id,
+            path_index: Some(0),
+            relative_path: Some("renamed.txt".into()),
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(save.saved_at_unix_ms > 0);
+
+    // Client 2 receives a buffer/state push carrying the new path — it can follow the rename.
+    let push: BufferStateParams = expect_notification::<BufferState>(&mut ws2).await;
+    assert_eq!(push.buffer_id, a.buffer_id);
+    assert!(
+        push.path.as_deref().is_some_and(|p| p.ends_with("renamed.txt")),
+        "save-as broadcasts the new path, got {:?}",
+        push.path
+    );
 
     drop(server);
 }

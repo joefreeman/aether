@@ -155,7 +155,21 @@ type ConfirmKind =
 
 type PromptView =
   | { kind: "confirm"; confirm: ConfirmKind }
-  | { kind: "saveas"; path_index: number; input: string }
+  | {
+      /** Save-as: a root + path completion editor mirroring the dir chip editor — the focused
+       *  segment is a native `<input>` over a gray ghost-suggestion span; the core owns the
+       *  completion/validity logic and feeds the ghosts + validity back through the view. */
+      kind: "saveas";
+      field: "root" | "path";
+      input: string;
+      root_filter: string;
+      multi_root: boolean;
+      root_ghost: string | null;
+      root_invalid: boolean;
+      root_display: string | null;
+      path_ghost: string | null;
+      path_invalid: boolean;
+    }
   | { kind: "lspinfo"; status: LspServerStatus };
 
 /** The web client's phrasing for each confirmation reason — a presentational choice, matching the
@@ -163,15 +177,15 @@ type PromptView =
 function confirmMessage(c: ConfirmKind): string {
   switch (c.kind) {
     case "overwrite":
-      return c.path === null ? "overwrite?" : `overwrite ${c.path}?`;
+      return c.path === null ? "Overwrite?" : `Overwrite ${c.path}?`;
     case "overwrite_modified":
-      return "file changed on disk — overwrite?";
+      return "File changed on disk — overwrite?";
     case "recreate_deleted":
-      return "file removed on disk — recreate?";
+      return "File removed on disk — recreate?";
     case "discard_reload":
-      return "discard local changes and reload?";
+      return "Discard local changes and reload?";
     case "discard_close":
-      return `discard unsaved changes in ${c.label}?`;
+      return `Discard unsaved changes in ${c.label}?`;
     case "delete":
       return `Delete ${c.noun} "${c.name}"?`;
     case "remove_root":
@@ -504,11 +518,21 @@ export class Shell {
   private readonly searchPrefixEl: HTMLElement;
   private readonly searchCountEl: HTMLElement;
   private readonly overlayEl: HTMLElement;
-  /** Save-as has its own persistent overlay (with a native <input>); confirm/lsp-info prompts are
-   *  rebuilt in overlayEl (no input, so rebuilding is fine). */
+  /** Save-as has its own persistent overlay (with native <input>s); confirm/lsp-info prompts are
+   *  rebuilt in overlayEl (no input, so rebuilding is fine). The editor mirrors the dir chip editor:
+   *  a root segment (multi-root only) + a path segment, the focused one a native input over a ghost
+   *  suggestion span. The inputs are persistent so they keep focus; only the *focused* segment is
+   *  mounted as an input, the other as a clickable span, rebuilt only when the structure changes. */
   private readonly saveAsEl: HTMLElement;
-  private readonly saveAsInput: HTMLInputElement;
-  private readonly saveAsPrefixEl: HTMLElement;
+  private readonly saveAsFieldEl: HTMLElement;
+  private readonly saveAsRootInput: HTMLInputElement;
+  private readonly saveAsPathInput: HTMLInputElement;
+  private saveAsRootGhost: HTMLElement | null = null;
+  private saveAsPathGhost: HTMLElement | null = null;
+  private saveAsRootSpan: HTMLElement | null = null;
+  private saveAsPathSpan: HTMLElement | null = null;
+  private saveAsSepEl: HTMLElement | null = null;
+  private saveAsStructKey: string | null = null;
   private readonly pickerEl: HTMLElement;
   private readonly pickerInput: HTMLInputElement;
   private readonly pickerPathEl: HTMLElement;
@@ -666,8 +690,10 @@ export class Shell {
     this.overlayEl = document.createElement("div");
     this.overlayEl.style.display = "none";
 
-    // Save-as has its own persistent overlay with a native path <input> (owns editing, syncs via
-    // prompt_set_input); accept/cancel route through on_key.
+    // Save-as has its own persistent overlay with a root + path completion editor mirroring the dir
+    // chip editor (native inputs own editing + sync via save_as_set_input / save_as_set_root_filter;
+    // ghosts/validity come from the view). Command keys — accept/cancel/Tab/Alt-chords — route
+    // through on_key via the overlay-key router.
     this.saveAsEl = document.createElement("div");
     this.saveAsEl.className = "overlay";
     this.saveAsEl.style.display = "none";
@@ -676,24 +702,48 @@ export class Shell {
     const saveMsg = document.createElement("div");
     saveMsg.className = "modal-message";
     saveMsg.textContent = "Save as";
-    const saveField = document.createElement("div");
-    saveField.className = "modal-field";
-    this.saveAsPrefixEl = document.createElement("span");
-    this.saveAsPrefixEl.className = "search-count";
-    this.saveAsInput = document.createElement("input");
-    this.saveAsInput.className = "modal-input";
-    this.saveAsInput.spellcheck = false;
-    this.saveAsInput.autocapitalize = "off";
-    this.saveAsInput.setAttribute("autocomplete", "off");
-    saveField.append(this.saveAsPrefixEl, this.saveAsInput);
-    saveModal.append(saveMsg, saveField);
+    this.saveAsFieldEl = document.createElement("div");
+    this.saveAsFieldEl.className = "modal-field saveas-field";
+    // Cancel/Save affordances mirroring the confirm modal (and the native client): Cancel is the
+    // plain, subtly bordered button, Save the non-destructive frost-blue `primary`. Both route
+    // through the same `on_key` path as Esc/Enter, so the core stays the single source of truth.
+    const saveButtons = document.createElement("div");
+    saveButtons.className = "modal-buttons";
+    const saveCancel = document.createElement("span");
+    saveCancel.className = "modal-btn";
+    saveCancel.textContent = "Cancel";
+    saveCancel.addEventListener("click", () => this.saveAsCommand("Escape"));
+    const saveOk = document.createElement("span");
+    saveOk.className = "modal-btn primary";
+    saveOk.textContent = "Save";
+    saveOk.addEventListener("click", () => this.saveAsCommand("Enter"));
+    saveButtons.append(saveCancel, saveOk);
+    saveModal.append(saveMsg, this.saveAsFieldEl, saveButtons);
     this.saveAsEl.append(saveModal);
-    this.saveAsInput.addEventListener("input", () => {
+    // The persistent native inputs (real caret/selection/IME): the path field (dir/file path) and,
+    // for a multi-root project, the root typeahead. Editing stays native and syncs to the core; the
+    // core owns the suggestion/validity logic and feeds the ghost + invalid state back via the view.
+    this.saveAsRootInput = document.createElement("input");
+    this.saveAsPathInput = document.createElement("input");
+    for (const inp of [this.saveAsRootInput, this.saveAsPathInput]) {
+      inp.className = "picker-editor-input";
+      inp.spellcheck = false;
+      inp.autocapitalize = "off";
+      inp.setAttribute("autocomplete", "off");
+      inp.addEventListener("keydown", (e) => this.onSaveAsInputKey(e));
+    }
+    this.saveAsPathInput.addEventListener("input", () => {
       if (this.session) {
-        this.runEffects(this.session.prompt_set_input(this.saveAsInput.value) as CoreEffect[]);
+        this.runEffects(this.session.save_as_set_input(this.saveAsPathInput.value) as CoreEffect[]);
       }
     });
-    this.saveAsInput.addEventListener("keydown", (e) => this.onSaveAsInputKey(e));
+    this.saveAsRootInput.addEventListener("input", () => {
+      if (this.session) {
+        this.runEffects(
+          this.session.save_as_set_root_filter(this.saveAsRootInput.value) as CoreEffect[],
+        );
+      }
+    });
     // The picker overlay is persistent DOM (built once) so its native <input> keeps focus + caret
     // across re-renders — only the results list is rebuilt. The input owns text editing and syncs
     // its value to the core (picker_set_query); nav/accept/cancel keys route through on_key.
@@ -1077,7 +1127,11 @@ export class Shell {
     // field (the chip-row keys route through the global handler) so the query input shows no caret.
     if (v?.picker) return v.picker.chip_selected !== null ? this.capture : this.pickerInput;
     if (v?.mode === "search") return this.searchInput;
-    if (v?.prompt?.kind === "saveas") return this.saveAsInput;
+    if (v?.prompt?.kind === "saveas") {
+      return v.prompt.multi_root && v.prompt.field === "root"
+        ? this.saveAsRootInput
+        : this.saveAsPathInput;
+    }
     // The project-settings overlay: focus the input matching the selected row — the name field, or
     // the add-root input. A selected *root* row has no text field, so park focus on the hidden
     // capture field (its keys route through the global handler) rather than the add input, which
@@ -1112,7 +1166,8 @@ export class Shell {
       t === this.editorPathInput ||
       t === this.editorRootInput ||
       t === this.searchInput ||
-      t === this.saveAsInput ||
+      t === this.saveAsRootInput ||
+      t === this.saveAsPathInput ||
       t === this.psNameInput ||
       t === this.psAddInput
     ) {
@@ -1855,8 +1910,39 @@ export class Shell {
     this.routeOverlayKey(e);
   }
 
+  /** A save-as input's keydown. Text editing (chars, plain Backspace/Delete, arrows) stays native and
+   *  syncs through the input's `input` event; the keys the core owns — commit/cancel, field nav,
+   *  ghost-accept, segment ops — are forwarded to `on_key` (`:` in the root field switches to the path
+   *  field, so it can't stay native the way `routeOverlayKey` would leave it). Mirrors `onEditorKey`. */
+  /** Cancel/Save button clicks: drive the core via the same key path as Esc/Enter, so the editor
+   *  logic stays single-sourced (matches the confirm modal's click→synthetic-key handling). */
+  private saveAsCommand(key: string): void {
+    if (!this.session) return;
+    this.runEffects(this.session.on_key(key, false, false, false, this.visibleRows()) as CoreEffect[]);
+  }
+
   private onSaveAsInputKey(e: KeyboardEvent): void {
-    this.routeOverlayKey(e);
+    const p = this.snapshot?.prompt;
+    if (p?.kind !== "saveas" || !this.session) return;
+    const k = e.key;
+    if (k === "Shift" || k === "Control" || k === "Alt" || k === "Meta") {
+      e.preventDefault(); // swallow lone modifiers so they don't reach the window handler
+      return;
+    }
+    const inRoot = p.multi_root && p.field === "root";
+    const emptyPath = p.multi_root && p.field === "path" && p.input.length === 0;
+    const coreKey =
+      k === "Enter" ||
+      k === "Escape" ||
+      k === "Tab" ||
+      (e.altKey && (k === "l" || k === "h" || k === "j" || k === "k" || k === "Backspace")) ||
+      (k === ":" && inRoot && !e.altKey && !e.ctrlKey) ||
+      (k === "Backspace" && !e.altKey && !e.ctrlKey && emptyPath);
+    if (!coreKey) return; // native editing; the `input` event syncs the new text to the core
+    e.preventDefault();
+    this.runEffects(
+      this.session.on_key(k, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+    );
   }
 
   private renderSearch(v: CoreView): void {
@@ -1889,14 +1975,12 @@ export class Shell {
       this.overlayEl.style.display = "none";
       this.overlayEl.replaceChildren();
       this.saveAsEl.style.display = "";
-      const root = v.project_paths[p.path_index] ?? "";
-      this.saveAsPrefixEl.textContent = root ? `${root}/` : "";
-      if (this.saveAsInput.value !== p.input) this.saveAsInput.value = p.input;
-      if (document.activeElement !== this.saveAsInput) this.saveAsInput.focus();
+      this.renderSaveAs(p);
       return;
     }
     if (wasSaveAs) {
       this.saveAsEl.style.display = "none";
+      this.saveAsStructKey = null;
       this.capture.focus();
     }
     if (!p) {
@@ -1929,6 +2013,8 @@ export class Shell {
         );
       };
       const cancel = document.createElement("span");
+      // "No" is the safe default (Enter declines via the core's on_prompt_key) — a plain, subtly
+      // bordered button; the destructive "Yes" carries the red `danger` accent.
       cancel.className = "modal-btn";
       cancel.textContent = "No";
       cancel.addEventListener("click", () => sendKey("Escape"));
@@ -1984,6 +2070,118 @@ export class Shell {
       modal.append(header, rows);
     }
     this.overlayEl.replaceChildren(modal);
+  }
+
+  /** Paint the save-as completion editor (mirrors `renderChipEditor`): a multi-root project shows a
+   *  root segment + `:` separator + path segment; single-root shows just the path. The focused segment
+   *  is a native `<input>` over a gray ghost-suggestion span; the other is a clickable span. The field
+   *  structure is rebuilt only when it changes (open / multi-root / field switch) — never per keystroke,
+   *  which would drop a live input's caret — while ghosts, validity and text sync every render. */
+  private renderSaveAs(p: Extract<PromptView, { kind: "saveas" }>): void {
+    const structKey = `${p.multi_root}|${p.field}`;
+    if (structKey !== this.saveAsStructKey) {
+      this.rebuildSaveAsField(p);
+      this.saveAsStructKey = structKey;
+    }
+    this.syncSaveAsField(p);
+  }
+
+  /** (Re)build the save-as field for the current focused segment. Mounts the persistent inputs into
+   *  their ghost wraps; clicking the unfocused segment moves focus there (via the core). Reuses the
+   *  chip editor's `picker-editor-*` ghost-stacking DOM/CSS for a consistent look. */
+  private rebuildSaveAsField(p: Extract<PromptView, { kind: "saveas" }>): void {
+    this.saveAsRootGhost = null;
+    this.saveAsPathGhost = null;
+    this.saveAsRootSpan = null;
+    this.saveAsPathSpan = null;
+    this.saveAsSepEl = null;
+    this.saveAsFieldEl.replaceChildren();
+    if (p.multi_root) {
+      if (p.field === "root") {
+        this.saveAsFieldEl.append(this.saveAsWrap(this.saveAsRootInput, true));
+      } else {
+        this.saveAsRootSpan = this.saveAsSeg(
+          p.root_invalid ? p.root_filter : (p.root_display ?? ""),
+          p.root_invalid ? "picker-editor-seg invalid" : "picker-editor-seg root",
+          true,
+        );
+        this.saveAsFieldEl.append(this.saveAsRootSpan);
+      }
+      this.saveAsSepEl = document.createElement("span");
+      this.saveAsSepEl.className = "picker-editor-sep";
+      this.saveAsSepEl.textContent = ":";
+      this.saveAsFieldEl.append(this.saveAsSepEl);
+    }
+    if (p.field === "path" || !p.multi_root) {
+      this.saveAsFieldEl.append(this.saveAsWrap(this.saveAsPathInput, false));
+    } else {
+      this.saveAsPathSpan = this.saveAsSeg(p.input, "picker-editor-seg", false);
+      this.saveAsFieldEl.append(this.saveAsPathSpan);
+    }
+  }
+
+  /** Per-render sync of the save-as field's mutable bits: each native input's value (only when the
+   *  core changed it out from under the caret — Tab-accept, segment-pop, root-commit), the ghosts, the
+   *  invalid colouring, the separator visibility, and focus on the active input. Mirrors
+   *  `syncEditorState`. */
+  private syncSaveAsField(p: Extract<PromptView, { kind: "saveas" }>): void {
+    const sepVisible = p.field === "path" || p.input.length > 0;
+    if (this.saveAsSepEl) this.saveAsSepEl.style.display = sepVisible ? "" : "none";
+    if (p.multi_root && p.field === "root") {
+      if (this.saveAsRootInput.value !== p.root_filter) {
+        this.setInputValue(this.saveAsRootInput, p.root_filter);
+      }
+      this.saveAsRootInput.classList.toggle("invalid", p.root_invalid);
+      this.fillGhost(this.saveAsRootGhost, p.root_filter, p.root_ghost);
+    } else if (this.saveAsRootSpan && p.multi_root) {
+      this.saveAsRootSpan.textContent = p.root_invalid ? p.root_filter : (p.root_display ?? "");
+      this.saveAsRootSpan.className = p.root_invalid
+        ? "picker-editor-seg invalid"
+        : "picker-editor-seg root";
+    }
+    if (p.field === "path" || !p.multi_root) {
+      if (this.saveAsPathInput.value !== p.input) this.setInputValue(this.saveAsPathInput, p.input);
+      this.saveAsPathInput.classList.toggle("invalid", p.path_invalid);
+      this.fillGhost(this.saveAsPathGhost, p.input, p.path_ghost);
+    } else if (this.saveAsPathSpan) {
+      this.saveAsPathSpan.textContent = p.input;
+      this.saveAsPathSpan.classList.toggle("invalid", p.path_invalid);
+    }
+    // Keep the focused segment's input focused (idempotent when already so).
+    const active = p.multi_root && p.field === "root" ? this.saveAsRootInput : this.saveAsPathInput;
+    if (document.activeElement !== active) {
+      active.focus();
+      active.setSelectionRange(active.value.length, active.value.length);
+    }
+  }
+
+  /** Save-as analog of `editorWrap`: a ghost-overlay wrap for a focused segment (transparent input
+   *  over a gray ghost span). `hug` sizes to content (the root segment, so the `:` sits flush);
+   *  otherwise it stretches across the row (the path segment). Records the ghost for per-keystroke
+   *  refills. */
+  private saveAsWrap(input: HTMLInputElement, hug: boolean): HTMLElement {
+    const wrap = document.createElement("span");
+    wrap.className = hug ? "picker-editor-rootwrap hug" : "picker-editor-rootwrap";
+    const ghost = document.createElement("span");
+    ghost.className = "picker-editor-ghost";
+    input.classList.add("picker-editor-root");
+    wrap.append(ghost, input);
+    if (hug) this.saveAsRootGhost = ghost;
+    else this.saveAsPathGhost = ghost;
+    return wrap;
+  }
+
+  /** Save-as analog of `editorSeg`: an unfocused segment as plain text; clicking it focuses that
+   *  segment via the core (which enforces the can't-enter-path-under-invalid-root gate). */
+  private saveAsSeg(text: string, cls: string, root: boolean): HTMLElement {
+    const span = document.createElement("span");
+    span.className = cls;
+    span.textContent = text;
+    span.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      if (this.session) this.runEffects(this.session.save_as_set_field(root) as CoreEffect[]);
+    });
+    return span;
   }
 
   /** The project-settings overlay (`Space ,`): the editable project name, the roots list, and an

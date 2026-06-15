@@ -718,7 +718,17 @@ impl Shell {
         // (their keys are commands), so they suppress any overlay editor behind them.
         if let Some(prompt) = &self.session.prompt {
             return match prompt {
-                Prompt::SaveAs { .. } => Some(OverlayField::SaveAs),
+                // Multi-root save-as has a leading root-typeahead segment; focus follows the core
+                // editor's `field`. Single-root projects only ever have the path segment.
+                Prompt::SaveAs(ed) => Some(
+                    if self.session.project_paths.len() > 1
+                        && ed.field == aether_client::chips::ChipEditorField::Root
+                    {
+                        OverlayField::SaveAsRoot
+                    } else {
+                        OverlayField::SaveAs
+                    },
+                ),
                 _ => None,
             };
         }
@@ -755,7 +765,11 @@ impl Shell {
         use crate::overlay_input::OverlayField;
         match field {
             OverlayField::SaveAs => match &self.session.prompt {
-                Some(Prompt::SaveAs { input, .. }) => input.clone(),
+                Some(Prompt::SaveAs(ed)) => ed.input.text.clone(),
+                _ => String::new(),
+            },
+            OverlayField::SaveAsRoot => match &self.session.prompt {
+                Some(Prompt::SaveAs(ed)) => ed.root_filter.text.clone(),
                 _ => String::new(),
             },
             OverlayField::Search => self.session.search.query.clone(),
@@ -803,7 +817,8 @@ impl Shell {
     ) -> Effects {
         use crate::overlay_input::OverlayField;
         match field {
-            OverlayField::SaveAs => self.session.prompt_set_input(value),
+            OverlayField::SaveAs => self.session.save_as_set_input(value),
+            OverlayField::SaveAsRoot => self.session.save_as_set_root_filter(value),
             OverlayField::Search => self.session.search_set_query(value),
             OverlayField::ProjectName => self.session.project_settings_set_name(value),
             OverlayField::ProjectAddRoot => self.session.project_settings_set_add(value),
@@ -1599,12 +1614,19 @@ impl Shell {
 
     fn sync_prompts(&mut self) {
         // `sync` has already reconciled the overlay editor with the focused field; read the live
-        // save-as caret from it (the value mechanics are shell-side now).
-        let save_cursor = self
+        // save-as caret from it (the value mechanics are shell-side now). Only one of the root /
+        // path segments is focused at a time, so at most one of these is `Some`.
+        let save_path_cursor = self
             .overlay_edit
             .as_ref()
             .filter(|e| e.field == crate::overlay_input::OverlayField::SaveAs)
             .map(|e| e.input.cursor);
+        let save_root_cursor = self
+            .overlay_edit
+            .as_ref()
+            .filter(|e| e.field == crate::overlay_input::OverlayField::SaveAsRoot)
+            .map(|e| e.input.cursor);
+        let multi_root = self.session.project_paths.len() > 1;
         let st = &mut self.state;
         st.confirm_prompt = None;
         st.save_prompt = None;
@@ -1619,23 +1641,9 @@ impl Shell {
                     action: crate::app::ConfirmAction::OverwriteSaveAs,
                 });
             }
-            Some(Prompt::SaveAs { path_index, input }) => {
-                let mut text = crate::text_input::TextInput::default();
-                text.set(input.clone());
-                // The caret lives in the shell-owned overlay editor (text mechanics are shell-side
-                // now); fall back to end-of-text if it hasn't been seeded yet.
-                text.cursor = save_cursor.unwrap_or(input.len());
-                st.save_prompt = Some(crate::save_prompt::SavePromptState {
-                    mode: crate::save_prompt::PromptMode::Editing(
-                        crate::save_prompt::EditingState {
-                            path_index: *path_index,
-                            listing: Vec::new(),
-                            listing_dir_abs: String::new(),
-                            suggestion_idx: 0,
-                        },
-                    ),
-                    input: text,
-                });
+            Some(Prompt::SaveAs(ed)) => {
+                st.save_prompt =
+                    Some(save_as_view(ed, multi_root, save_root_cursor, save_path_cursor));
             }
             Some(Prompt::LspInfo(status)) => {
                 // The dedicated detail pane the LSP-servers picker renders. Scroll is
@@ -1659,12 +1667,12 @@ impl Shell {
 /// ([`ConfirmKind`]); this is the TUI's presentational choice. `draw_status` then appends `? [y/N]`.
 fn confirm_phrase(kind: &ConfirmKind) -> String {
     match kind {
-        ConfirmKind::Overwrite { path: Some(p) } => format!("overwrite {p}"),
-        ConfirmKind::Overwrite { path: None } => "overwrite".into(),
-        ConfirmKind::OverwriteModified => "file changed on disk — overwrite".into(),
-        ConfirmKind::RecreateDeleted => "file removed on disk — recreate".into(),
-        ConfirmKind::DiscardOnReload => "discard local changes and reload".into(),
-        ConfirmKind::DiscardOnClose { label } => format!("discard unsaved changes in {label}"),
+        ConfirmKind::Overwrite { path: Some(p) } => format!("Overwrite {p}"),
+        ConfirmKind::Overwrite { path: None } => "Overwrite".into(),
+        ConfirmKind::OverwriteModified => "File changed on disk — overwrite".into(),
+        ConfirmKind::RecreateDeleted => "File removed on disk — recreate".into(),
+        ConfirmKind::DiscardOnReload => "Discard local changes and reload".into(),
+        ConfirmKind::DiscardOnClose { label } => format!("Discard unsaved changes in {label}"),
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
         ConfirmKind::DeleteProject { name } => format!("Delete project \"{name}\""),
@@ -1717,6 +1725,44 @@ fn chip_editor_view(
         root_filter: input(&e.root_filter, root_cursor),
         root_selected: e.root_selected,
         root_index: e.root_index,
+        listing: e.listing.clone(),
+        listing_dir_abs: e.listing_dir_abs.clone(),
+        listing_state: match e.listing_state {
+            c::DirListingState::Pending => t::DirListingState::Pending,
+            c::DirListingState::Loaded => t::DirListingState::Loaded,
+            c::DirListingState::Failed => t::DirListingState::Failed,
+        },
+        suggestion_idx: e.suggestion_idx,
+    }
+}
+
+/// Project the core's save-as editor into the TUI view model — the save-as counterpart of
+/// [`chip_editor_view`]. `root_cursor` / `path_cursor` carry the shell-owned caret for whichever
+/// segment is focused (`None` → that field's caret at end, the unfocused convention).
+fn save_as_view(
+    e: &aether_client::save_as::SaveAsEditor,
+    multi_root: bool,
+    root_cursor: Option<usize>,
+    path_cursor: Option<usize>,
+) -> crate::save_prompt::SavePromptState {
+    use crate::picker as t;
+    use aether_client::chips as c;
+    let input = |i: &c::Input, cursor: Option<usize>| {
+        let mut x = crate::text_input::TextInput::default();
+        x.set(i.text.clone());
+        x.cursor = cursor.unwrap_or(i.text.len());
+        x
+    };
+    crate::save_prompt::SavePromptState {
+        field: match e.field {
+            c::ChipEditorField::Root => t::ChipEditorField::Root,
+            c::ChipEditorField::Path => t::ChipEditorField::Path,
+        },
+        input: input(&e.input, path_cursor),
+        root_filter: input(&e.root_filter, root_cursor),
+        root_selected: e.root_selected,
+        root_index: e.root_index,
+        multi_root,
         listing: e.listing.clone(),
         listing_dir_abs: e.listing_dir_abs.clone(),
         listing_state: match e.listing_state {

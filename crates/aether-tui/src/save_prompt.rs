@@ -1,148 +1,121 @@
-//! Save-as prompt state + transitions.
+//! Save-as prompt view model (`Alt-s`).
 //!
-//! Two modes:
+//! A render-side mirror of the core [`aether_client::save_as::SaveAsEditor`], shaped exactly like
+//! the picker's dir [`crate::picker::ChipEditor`] so the two share their look and muscle memory:
+//! a multi-root projects' leading **root** field (smartcase typeahead, `:` separator) ahead of a
+//! `directory/list`-backed **path** field with ghost suggestions, `Tab`/`Alt-l` accept, `Alt-j`/`k`
+//! cycle, and `Alt-Backspace` segment pop.
 //!
-//! - `Editing`: the common case. The user types a project-relative path into a single input
-//!   field. A ghost-style suggestion (gray text after the cursor) shows the first matching
-//!   directory entry; Alt-j/Alt-k cycles matches; Tab / Alt-l commits the ghost into the
-//!   input (the same accept gesture as the pickers' dir editor). The typed `/` is just a
-//!   separator — there's no "committed path prefix" concept any more. Alt-Backspace deletes
-//!   the rightmost path segment (fish-style); at empty input it (and plain Backspace) peels
-//!   into `SelectingRoot` (multi-root only).
+//! Two deliberate departures from the dir chip editor, because the path's final segment is a *new
+//! filename* rather than an existing subdirectory:
 //!
-//! - `SelectingRoot`: only entered in multi-root projects, when the user has Backspaced past
-//!   the empty input. The user picks one of the project roots — by cycling via Alt-j/k
-//!   (wrapping, like the dir editor's root typeahead) or by typing a smartcase prefix filter
-//!   against root labels. Tab / Alt-l / Enter commits, as does typing `:` on a completed
-//!   label. Alt-Backspace clears any typed filter / cycled candidate back to the bare
-//!   just-peeled state.
+//! - The cached listing keeps **files as well as directories**; completing onto an existing file is
+//!   how you overwrite it. The path ghost appends `/` only behind a directory (a file completes
+//!   outright).
+//! - The path is only ever flagged red when its *parent* directory failed to list
+//!   ([`SavePromptState::path_invalid`]); a non-matching filename leaf is fine (you're naming a file
+//!   that needn't exist yet).
 //!
-//! In multi-root projects the chosen root's label renders as a blue committed prefix to the
-//! left of the editable area. The label is not part of the input — you can't type into it.
-//!
-//! State is held entirely client-side; the only server contact is a `directory/list` RPC,
-//! fired whenever the dir portion of the typed path changes (or when SelectingRoot transitions
-//! into a fresh Editing).
+//! This struct holds no logic the commit cares about — the core owns the value and the command
+//! keys. The shell syncs the focused field's text via `save_as_set_input` / `save_as_set_root_filter`
+//! and keeps the caret in its own [`crate::overlay_input`] editor. Everything here exists only to
+//! render: `field`, the per-segment text (with carets baked into the `TextInput`s during the
+//! `save_as_view` projection), the cached listing, and the typeahead bookkeeping.
 
+use crate::picker::{ChipEditorField, DirListingState};
 use crate::text_input::TextInput;
 use aether_protocol::directory::DirectoryEntry;
 
-/// One save-prompt instance.
+/// One save-prompt instance — the render mirror of [`aether_client::save_as::SaveAsEditor`].
 #[derive(Debug, Clone)]
 pub struct SavePromptState {
-    pub mode: PromptMode,
+    /// Which segment has focus. Always `Path` in single-root projects.
+    pub field: ChipEditorField,
+    /// The root-relative path being typed (directory portion + filename leaf). Caret baked in.
     pub input: TextInput,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-pub enum PromptMode {
-    Editing(EditingState),
-    SelectingRoot(SelectingRoot),
-}
-
-/// Editing-mode state. The whole project-relative path lives in `input.text`; this struct just
-/// remembers which root we're saving into, the most recently fetched directory listing, and the
-/// position within the filtered match set that produces the current ghost suggestion.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-pub struct EditingState {
-    pub path_index: u32,
-    /// Cached listing for the directory portion of `input.text` (whatever was typed up to and
-    /// including the last `/`). Refetched whenever `dir_of_input` would differ from
-    /// `listing_dir_abs`.
+    /// Multi-root: the prefix filter typed into the root field. Caret baked in.
+    pub root_filter: TextInput,
+    /// Multi-root: highlight within the root candidates matching the current filter.
+    pub root_selected: usize,
+    /// The root the editor opened with — the fallback when the filter matches nothing.
+    pub root_index: u32,
+    /// Whether the project has more than one root (so the root field exists at all).
+    pub multi_root: bool,
+    /// Cached `directory/list` entries (files *and* directories) for the dir portion of `input`.
     pub listing: Vec<DirectoryEntry>,
-    /// Canonical absolute path of the directory `listing` was fetched against. Lets us detect
-    /// when an edit moved the dir portion (e.g. user typed `/` or Alt-Backspaced) and the
-    /// listing is stale.
+    /// The absolute path `listing` was last synced against — the staleness key (unused by the
+    /// renderer, carried for parity with the core editor / debugging).
+    #[allow(dead_code)] // view-model surface synced from the core
     pub listing_dir_abs: String,
-    /// Position in the filtered match set (`matches`) of the currently-displayed ghost
-    /// suggestion. Reset to 0 on any edit. Alt-j/k navigates within matches.
-    pub suggestion_idx: usize,
-}
-
-/// Root-selection state. Reached by Alt-Backspace at empty input in multi-root projects. Uses
-/// the same ghost-suggestion shape as Editing: `suggestion_idx` is a position in the *filtered*
-/// match list; the renderer pulls the suffix of `labels[matches[suggestion_idx]]` (beyond the
-/// typed input) as the gray ghost; Tab commits.
-///
-/// `from_root` is the root that was active when we peeled. On entry `suggestion_idx` defaults
-/// to from_root's position in the (initially unfiltered) match list — so an untouched Tab
-/// commits the root we came from, making an accidental peel one keystroke to undo. Any typing
-/// resets `suggestion_idx` to 0 (the first filtered match).
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-pub struct SelectingRoot {
-    pub from_root: u32,
+    /// Where `listing` stands relative to `listing_dir_abs`.
+    pub listing_state: DirListingState,
+    /// Position within the filtered match set producing the current path ghost.
     pub suggestion_idx: usize,
 }
 
 impl SavePromptState {
-    /// The gray suffix to render after the cursor, or `None` when no ghost is visible. Visible
-    /// only when (a) the cursor is at the end of the input, and (b) at least one candidate
-    /// prefix-matches the relevant portion of the input — the partial leaf in Editing, or the
-    /// whole input in SelectingRoot (root labels are matched as a whole, not segment-wise).
-    pub fn ghost_suffix(&self, project_paths: &[String]) -> Option<String> {
-        if !self.cursor_at_end() {
-            return None;
-        }
-        match &self.mode {
-            PromptMode::Editing(e) => {
-                let partial = partial_of_input(&self.input.text);
-                let matches = matching_indices(&e.listing, partial);
-                let pick = *matches.get(e.suggestion_idx)?;
-                let entry = e.listing.get(pick)?;
-                let mut suffix: String = entry.name.chars().skip(partial.chars().count()).collect();
-                if entry.is_dir {
-                    suffix.push('/');
-                }
-                Some(suffix)
-            }
-            PromptMode::SelectingRoot(sr) => {
-                let labels = crate::labels::root_labels(project_paths);
-                let matches = matching_root_indices(&labels, &self.input.text);
-                let pick = *matches.get(sr.suggestion_idx)?;
-                let label = labels.get(pick)?;
-                let typed = self.input.text.chars().count();
-                let suffix: String = label.chars().skip(typed).collect();
-                Some(suffix)
-            }
-        }
+    // ---- root field (multi-root only) ----------------------------------------------------------
+
+    /// The root field's ghost completion: the current match's root index and the part of its label
+    /// beyond the typed prefix (rendered gray after the caret). `None` when nothing matches — the
+    /// red typed filter is then the cue. `labels` are the project's disambiguated root labels.
+    pub fn root_ghost(&self, labels: &[String]) -> Option<(usize, String)> {
+        let candidates = matching_root_indices(labels, &self.root_filter.text);
+        let &idx = candidates.get(self.root_selected.min(candidates.len().saturating_sub(1)))?;
+        let typed_chars = self.root_filter.text.chars().count();
+        let suffix: String = labels[idx].chars().skip(typed_chars).collect();
+        Some((idx, suffix))
     }
 
-    /// `(position, total)` for the cycle counter — 1-based position within the *filtered*
-    /// match set, total match count. Returns `None` when there's nothing useful to show
-    /// (cursor not at end, or ≤ 1 match).
-    pub fn cycle_position(&self, project_paths: &[String]) -> Option<(usize, usize)> {
-        if !self.cursor_at_end() {
-            return None;
-        }
-        let (idx, total) = match &self.mode {
-            PromptMode::Editing(e) => {
-                let partial = partial_of_input(&self.input.text);
-                let matches = matching_indices(&e.listing, partial);
-                (e.suggestion_idx, matches.len())
-            }
-            PromptMode::SelectingRoot(sr) => {
-                let labels = crate::labels::root_labels(project_paths);
-                let matches = matching_root_indices(&labels, &self.input.text);
-                (sr.suggestion_idx, matches.len())
-            }
+    /// The chosen root's label — the blue committed prefix shown while focus is in the path.
+    /// Falls back to the opening root's label when the filter matches nothing.
+    pub fn root_display(&self, labels: &[String]) -> String {
+        let chosen = match self.root_ghost(labels) {
+            Some((idx, _)) => idx,
+            None => self.root_index as usize,
         };
-        if total <= 1 {
-            return None;
-        }
-        Some((idx + 1, total))
+        labels.get(chosen).cloned().unwrap_or_default()
     }
 
-    /// `true` when the input cursor sits at the very end of the input text. Many UI rules
-    /// depend on this (ghost visibility, Tab semantics).
-    pub fn cursor_at_end(&self) -> bool {
-        self.input.cursor == self.input.text.len()
+    /// True when the root field would refuse a commit: a non-empty filter that prefix-matches no
+    /// root label. (An empty filter matches every root.) The invalid field renders red.
+    pub fn root_invalid(&self, labels: &[String]) -> bool {
+        matching_root_indices(labels, &self.root_filter.text).is_empty()
+    }
+
+    // ---- path field ----------------------------------------------------------------------------
+
+    /// The path field's ghost: the rest of the current match beyond the partial leaf, plus a
+    /// trailing `/` only when the match is a directory (a file completes outright — the save-as
+    /// idiom's one departure from the dir chip editor). Visible only with the caret at the end of
+    /// the input.
+    pub fn path_ghost(&self) -> Option<String> {
+        if self.input.cursor != self.input.text.len() {
+            return None;
+        }
+        let partial = partial_of_input(&self.input.text);
+        let matches = matching_indices(&self.listing, partial);
+        let pick = *matches.get(self.suggestion_idx)?;
+        let entry = self.listing.get(pick)?;
+        let mut suffix: String = entry.name.chars().skip(partial.chars().count()).collect();
+        if entry.is_dir {
+            suffix.push('/');
+        }
+        Some(suffix)
+    }
+
+    /// True when the path is *definitely* unsaveable as typed — the red-worthy condition: the dir
+    /// portion failed to list (its parent directory doesn't exist or sits outside the project
+    /// boundary). The filename leaf is free, so it never invalidates; a `Pending` listing is
+    /// unknown, not invalid.
+    pub fn path_invalid(&self) -> bool {
+        matches!(self.listing_state, DirListingState::Failed)
     }
 }
 
 // ---- pure helpers ------------------------------------------------------------------------------
+// These are re-used by `crate::picker::ChipEditor` (path-validity, ghost matching), so their names
+// and signatures are load-bearing — keep them.
 
 /// Split an input string at the last `/`, returning the `dir_part` (everything up to and
 /// including the last `/`, possibly empty) and the `partial_leaf` (everything after, the
@@ -218,21 +191,27 @@ fn prefix_matches(haystack: &str, needle: &str, has_upper: bool, buf: &mut Strin
 mod tests {
     use super::*;
 
-    // ---- prompt-open ----
+    fn entry(name: &str, is_dir: bool) -> DirectoryEntry {
+        DirectoryEntry {
+            name: name.into(),
+            is_dir,
+        }
+    }
 
-    // ---- ghost suggestion ----
-
-    // ---- Tab ----
-
-    // ---- typing / backspace / `/` ----
-
-    // ---- Alt-Backspace ----
-
-    // ---- SelectingRoot retained behaviour ----
-
-    // ---- save_target / enter_action ----
-
-    // ---- pure helpers ----
+    fn prompt(input: &str, listing: Vec<DirectoryEntry>) -> SavePromptState {
+        SavePromptState {
+            field: ChipEditorField::Path,
+            input: TextInput::new(input),
+            root_filter: TextInput::default(),
+            root_selected: 0,
+            root_index: 0,
+            multi_root: false,
+            listing,
+            listing_dir_abs: String::new(),
+            listing_state: DirListingState::Loaded,
+            suggestion_idx: 0,
+        }
+    }
 
     #[test]
     fn split_input_examples() {
@@ -240,5 +219,47 @@ mod tests {
         assert_eq!(split_input("src/foo/"), ("src/foo/", ""));
         assert_eq!(split_input("src"), ("", "src"));
         assert_eq!(split_input(""), ("", ""));
+    }
+
+    #[test]
+    fn path_ghost_includes_files_and_marks_dirs() {
+        let p = prompt("s", vec![entry("src", true), entry("setup.rs", false)]);
+        // A directory ghost ends in `/`.
+        assert_eq!(p.path_ghost().as_deref(), Some("rc/"));
+        // A file completes without a trailing slash.
+        let p = prompt("se", vec![entry("setup.rs", false)]);
+        assert_eq!(p.path_ghost().as_deref(), Some("tup.rs"));
+    }
+
+    #[test]
+    fn path_ghost_hidden_when_caret_not_at_end() {
+        let mut p = prompt("src", vec![entry("src", true)]);
+        p.input.cursor = 1; // caret mid-input
+        assert_eq!(p.path_ghost(), None);
+    }
+
+    #[test]
+    fn path_invalid_only_when_parent_failed() {
+        let mut p = prompt("nope/file.rs", Vec::new());
+        p.listing_state = DirListingState::Pending;
+        assert!(!p.path_invalid());
+        p.listing_state = DirListingState::Failed;
+        assert!(p.path_invalid());
+    }
+
+    #[test]
+    fn root_ghost_and_invalid() {
+        let labels = vec!["api".to_string(), "web".to_string()];
+        let mut p = prompt("", Vec::new());
+        p.multi_root = true;
+        p.field = ChipEditorField::Root;
+        p.root_filter.set("we");
+        p.root_selected = 0;
+        assert_eq!(p.root_ghost(&labels), Some((1, "b".into())));
+        assert!(!p.root_invalid(&labels));
+        // A filter matching nothing is invalid (and has no ghost).
+        p.root_filter.set("zzz");
+        assert_eq!(p.root_ghost(&labels), None);
+        assert!(p.root_invalid(&labels));
     }
 }
