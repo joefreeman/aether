@@ -2031,9 +2031,25 @@ pub async fn bootstrap(
                 .await?;
             let project_paths = activated.project.paths.clone();
 
-            let open = match file {
-                Some(f) => {
-                    let abs = crate::app::resolve_cli_path(f)?.display().to_string();
+            // Resolve the CLI path once, then branch on file vs directory. A directory lands in a
+            // transient scratch and opens the file explorer over it (the `startup` effects below);
+            // a file opens normally.
+            let resolved = match file {
+                Some(f) => Some(crate::app::resolve_cli_path(f)?),
+                None => None,
+            };
+
+            let open = match &resolved {
+                Some(abs) if abs.is_dir() => {
+                    handle
+                        .rpc::<BufferOpen>(BufferOpenParams {
+                            transient: Some(true),
+                            ..Default::default()
+                        })
+                        .await?
+                }
+                Some(abs) => {
+                    let abs = abs.display().to_string();
                     let (path_index, relative_path) =
                         aether_client::session::strip_longest_root(&abs, &project_paths)
                             .ok_or_else(|| {
@@ -2053,17 +2069,20 @@ pub async fn bootstrap(
                 })?,
             };
 
-            let session = Session::new(
+            let mut session = Session::new(
                 activated.project.name.clone(),
                 project_paths.clone(),
                 buffer_info(open, &project_paths),
             );
-            (
-                session,
-                activated.project.name,
-                project_paths,
-                Effects::none(),
-            )
+            let startup = match &resolved {
+                Some(abs) if abs.is_dir() => session.open_picker(
+                    PickerKind::Explorer,
+                    Some(abs.display().to_string()),
+                    None,
+                ),
+                _ => Effects::none(),
+            };
+            (session, activated.project.name, project_paths, startup)
         }
     };
 

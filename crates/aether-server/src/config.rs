@@ -84,6 +84,104 @@ pub fn list_project_names() -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
+/// Outcome of inferring which configured project owns a given path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectMatch {
+    /// Exactly one project (most-specific root wins) owns the path.
+    One(String),
+    /// No configured project's roots contain the path.
+    None,
+    /// Several projects contain the path with equal specificity — the caller must disambiguate.
+    /// Names are sorted.
+    Ambiguous(Vec<String>),
+}
+
+/// Best-effort absolute, symlink-resolved form of a path that may not exist yet (e.g. a file the
+/// user is about to create): canonicalize the longest existing ancestor and re-append the
+/// remaining tail. This lets `ae src/new_file.rs` still resolve into a project even though the
+/// file isn't on disk. Falls back to a plain absolute path if nothing can be canonicalized.
+pub fn resolve_path_for_match(path: &Path) -> PathBuf {
+    let expanded = expand_home(path);
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&expanded))
+            .unwrap_or(expanded)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(ancestor) {
+            let mut result = canon;
+            for comp in tail.iter().rev() {
+                result.push(comp);
+            }
+            return result;
+        }
+        match (ancestor.file_name(), ancestor.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                ancestor = parent;
+            }
+            _ => return absolute,
+        }
+    }
+}
+
+/// Infer which configured project owns `path` by matching it against every project's canonical
+/// roots. The path is resolved (and made absolute) first. Most-specific match wins: the project
+/// with the deepest containing root is chosen, so a project rooted inside another doesn't collide
+/// with its parent. A genuine tie at the deepest root is reported as [`ProjectMatch::Ambiguous`].
+pub fn infer_project_for_path(path: &Path) -> anyhow::Result<ProjectMatch> {
+    let target = resolve_path_for_match(path);
+    let mut projects: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for name in list_project_names()? {
+        // Skip projects whose config won't load — one stale config shouldn't break inference for
+        // everything else.
+        let Ok(config) = load_project(&name) else {
+            continue;
+        };
+        let roots = config
+            .paths
+            .iter()
+            .filter_map(|root| canonicalize_project_path(root).ok())
+            .collect();
+        projects.push((name, roots));
+    }
+    Ok(match_project(&target, &projects))
+}
+
+/// Pure core of [`infer_project_for_path`]: pick the most-specific project for a resolved target
+/// among each project's canonical roots. Kept free of disk access so it can be unit-tested.
+fn match_project(target: &Path, projects: &[(String, Vec<PathBuf>)]) -> ProjectMatch {
+    let mut matches: Vec<(String, usize)> = Vec::new();
+    for (name, roots) in projects {
+        let best = roots
+            .iter()
+            .filter(|root| target == root.as_path() || target.starts_with(root))
+            .map(|root| root.components().count())
+            .max();
+        if let Some(depth) = best {
+            matches.push((name.clone(), depth));
+        }
+    }
+    let Some(max_depth) = matches.iter().map(|(_, d)| *d).max() else {
+        return ProjectMatch::None;
+    };
+    let mut winners: Vec<String> = matches
+        .into_iter()
+        .filter(|(_, d)| *d == max_depth)
+        .map(|(name, _)| name)
+        .collect();
+    winners.sort();
+    if winners.len() == 1 {
+        ProjectMatch::One(winners.into_iter().next().unwrap())
+    } else {
+        ProjectMatch::Ambiguous(winners)
+    }
+}
+
 pub fn runtime_info_path() -> anyhow::Result<PathBuf> {
     let base = directories::BaseDirs::new()
         .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
@@ -198,5 +296,85 @@ pub fn delete_project_config(name: &str) -> anyhow::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("deleting project config at {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proj(name: &str, roots: &[&str]) -> (String, Vec<PathBuf>) {
+        (name.to_string(), roots.iter().map(PathBuf::from).collect())
+    }
+
+    #[test]
+    fn no_project_contains_path() {
+        let projects = [proj("work", &["/home/joe/work"])];
+        assert_eq!(
+            match_project(Path::new("/tmp/elsewhere/file.rs"), &projects),
+            ProjectMatch::None
+        );
+    }
+
+    #[test]
+    fn single_project_match() {
+        let projects = [proj("work", &["/home/joe/work"]), proj("dots", &["/home/joe/.config"])];
+        assert_eq!(
+            match_project(Path::new("/home/joe/work/src/main.rs"), &projects),
+            ProjectMatch::One("work".to_string())
+        );
+    }
+
+    #[test]
+    fn path_equal_to_root_matches() {
+        let projects = [proj("work", &["/home/joe/work"])];
+        assert_eq!(
+            match_project(Path::new("/home/joe/work"), &projects),
+            ProjectMatch::One("work".to_string())
+        );
+    }
+
+    #[test]
+    fn most_specific_nested_root_wins() {
+        // `sub` is rooted inside `work`; a path under `sub` belongs to the deeper project.
+        let projects = [
+            proj("work", &["/home/joe/work"]),
+            proj("sub", &["/home/joe/work/sub"]),
+        ];
+        assert_eq!(
+            match_project(Path::new("/home/joe/work/sub/file.rs"), &projects),
+            ProjectMatch::One("sub".to_string())
+        );
+        // A sibling under `work` but outside `sub` still resolves to `work`.
+        assert_eq!(
+            match_project(Path::new("/home/joe/work/other/file.rs"), &projects),
+            ProjectMatch::One("work".to_string())
+        );
+    }
+
+    #[test]
+    fn equal_depth_tie_is_ambiguous() {
+        // Two projects share the same root — a genuine tie.
+        let projects = [
+            proj("alpha", &["/home/joe/shared"]),
+            proj("beta", &["/home/joe/shared"]),
+        ];
+        assert_eq!(
+            match_project(Path::new("/home/joe/shared/x.rs"), &projects),
+            ProjectMatch::Ambiguous(vec!["alpha".to_string(), "beta".to_string()])
+        );
+    }
+
+    #[test]
+    fn deepest_root_across_projects_breaks_what_would_be_a_tie() {
+        // Both contain the path, but `beta`'s root is one level deeper, so it wins outright.
+        let projects = [
+            proj("alpha", &["/home/joe"]),
+            proj("beta", &["/home/joe/work"]),
+        ];
+        assert_eq!(
+            match_project(Path::new("/home/joe/work/file.rs"), &projects),
+            ProjectMatch::One("beta".to_string())
+        );
     }
 }

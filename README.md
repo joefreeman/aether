@@ -156,17 +156,19 @@ Aether is a standard Cargo workspace.
 cargo build --release
 ```
 
-This produces two binaries:
+This produces a single binary:
 
-- `aether` — the server daemon
-- `ae` — the terminal client
+- `ae` — runs the server daemon, the terminal client, and (when built with the `gui` feature, on
+  by default) the native GUI client. The build that ships the GUI is the default; a headless build
+  for a box with no display libraries drops it with `cargo build --release -p aether-ae
+  --no-default-features` (then `iced`/`winit`/`wgpu` never enter the dependency graph).
 
 ## Running
 
 1. **Start the server:**
 
    ```sh
-   aether
+   ae --server
    ```
 
 2. **Start the client**, optionally naming a project and a file/directory to open:
@@ -178,7 +180,11 @@ This produces two binaries:
    ae aether src/         # open the file explorer at a directory
    ```
 
-   `file` is resolved against the current working directory and must fall within one of the
+   With no `--gui`/`--tui` flag, `ae` picks a client automatically: a terminal on stdout means the
+   terminal client; no terminal but a display set (a desktop launcher) means the GUI. Pass `--gui`
+   or `--tui` to force one.
+
+   `path` is resolved against the current working directory and must fall within one of the
    project's roots. A directory opens the file browser there.
 
    Projects are created and managed from the project picker (`Space p`); running `ae` with no

@@ -5,10 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "Aether editor — terminal client."
 
-[[bin]]
-name = "ae"
-path = "src/main.rs"
-
 [dependencies]
 aether-client = { workspace = true }
 aether-protocol.workspace = true
@@ -23,7 +19,6 @@ futures-util.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
-clap = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 
 ratatui.workspace = true

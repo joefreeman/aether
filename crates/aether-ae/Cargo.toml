@@ -1,0 +1,26 @@
+[package]
+name = "aether-ae"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Aether editor — unified `ae` binary (server + terminal client, optional GUI)."
+
+[[bin]]
+name = "ae"
+path = "src/main.rs"
+
+[features]
+# The daily workstation build ships the GUI. Headless builds (e.g. a server on a box with no
+# display libraries) pass `--no-default-features` so `iced`/`winit`/`wgpu` never enter the graph.
+default = ["gui"]
+gui = ["dep:aether-iced"]
+
+[dependencies]
+aether-server = { workspace = true }
+aether-tui = { workspace = true }
+aether-iced = { workspace = true, optional = true }
+
+tokio = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+anyhow.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

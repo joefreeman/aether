@@ -25,6 +25,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aether-ae"
+version = "0.1.0"
+dependencies = [
+ "aether-iced",
+ "aether-server",
+ "aether-tui",
+ "anyhow",
+ "clap",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aether-client"
 version = "0.1.0"
 dependencies = [
@@ -44,7 +57,6 @@ dependencies = [
  "aether-client",
  "aether-protocol",
  "anyhow",
- "clap",
  "directories",
  "futures-util",
  "iced",
@@ -123,7 +135,6 @@ dependencies = [
  "aether-protocol",
  "anyhow",
  "arboard",
- "clap",
  "crossterm",
  "directories",
  "futures-util",

@@ -3,12 +3,7 @@ name = "aether-iced"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-# Dev binary while the iced client grows toward parity; once usable it folds into a
-# feature-gated top-level `ae` crate alongside the TUI.
-[[bin]]
-name = "ae-iced"
-path = "src/main.rs"
+description = "Aether editor — iced (native GUI) client."
 
 [dependencies]
 aether-client = { workspace = true }
@@ -21,7 +16,6 @@ futures-util = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }

@@ -90,6 +90,9 @@ pub struct SessionBootstrap {
     pub project: String,
     pub project_paths: Vec<String>,
     pub buffer: BufferInfo,
+    /// Set when the CLI path was a directory: the absolute dir to open the file explorer at,
+    /// over the transient scratch in `buffer`. `None` for the file / no-path cases.
+    pub explorer_dir: Option<String>,
 }
 
 /// A bare connection for the no-args start: the project picker browses on it, and the picked
@@ -1143,7 +1146,18 @@ impl App {
                 // we're Connected. `subscribe_task` is a no-op if no metrics arrived yet, and the
                 // first real Layout then handles it.
                 self.sent_grid = self.current_grid();
-                Task::batch([pump(b.notifications), self.subscribe_task()])
+                // A directory CLI arg opens the file explorer over the scratch buffer.
+                let startup = match b.explorer_dir {
+                    Some(dir) => self
+                        .session
+                        .open_picker(PickerKind::Explorer, Some(dir), None),
+                    None => Effects::none(),
+                };
+                Task::batch([
+                    pump(b.notifications),
+                    self.subscribe_task(),
+                    self.run_core(startup),
+                ])
             }
             Message::Booted(Ok(Bootstrap::Choose(b))) => {
                 self.boot_args = None;
@@ -4165,15 +4179,23 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
     let server_started_at = activated.server_started_at;
     let project_paths = activated.project.paths.clone();
 
-    let open = match &args.file {
-        Some(f) => {
-            let abs = resolve_cli_path(f)?;
-            if abs.is_dir() {
-                return Err(format!(
-                    "{} is a directory — the iced client can't browse yet",
-                    abs.display()
-                ));
-            }
+    // Resolve the CLI path once, then branch on file vs directory. A directory lands in a
+    // transient scratch and opens the file explorer over it (`explorer_dir`, run once the session
+    // installs); a file opens normally.
+    let resolved = match &args.file {
+        Some(f) => Some(resolve_cli_path(f)?),
+        None => None,
+    };
+
+    let open = match &resolved {
+        Some(abs) if abs.is_dir() => handle
+            .rpc::<BufferOpen>(BufferOpenParams {
+                transient: Some(true),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| e.to_string())?,
+        Some(abs) => {
             let abs_str = abs.display().to_string();
             let (path_index, relative_path) = strip_longest_root(&abs_str, &project_paths)
                 .ok_or_else(|| format!("{} is outside the project's roots", abs.display()))?;
@@ -4197,6 +4219,11 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
             .map_err(|e| e.to_string())?,
     };
 
+    let explorer_dir = match &resolved {
+        Some(abs) if abs.is_dir() => Some(abs.display().to_string()),
+        _ => None,
+    };
+
     Ok(Bootstrap::Session(Box::new(SessionBootstrap {
         handle,
         notifications,
@@ -4205,6 +4232,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
         project: activated.project.name,
         buffer: buffer_info(open, &project_paths),
         project_paths,
+        explorer_dir,
     })))
 }
 
