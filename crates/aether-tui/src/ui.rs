@@ -109,7 +109,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // active editor. The add-root prompt lives *inside* the settings overlay, not here. Transient
     // feedback no longer lives here — it floats as a toast (see `draw_toast_overlay`) — so the row
     // is shown only for an active editor, leaving the no-project view its full vertical space.
-    let show_status = state.has_editor();
+    // The status row shows for an active editor, and also at boot while `Connecting` (no editor
+    // yet) so the connection indicator has its familiar home — the chrome is up from the start.
+    let show_status = state.has_editor() || state.conn == ConnState::Connecting;
     let constraints: &[Constraint] = if show_status {
         &[Constraint::Min(1), Constraint::Length(1)]
     } else {
@@ -4461,14 +4463,20 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
         Line::from(draw_save_prompt_spans(prompt, state, area.width as usize))
     } else if !state.has_editor() {
-        // No editor: status row only shows transient feedback (project activation, errors).
-        Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                state.status.text.clone(),
-                status_message_style(&state.status),
-            ),
-        ])
+        // No editor: at boot while `Connecting` the row carries the connection indicator (the
+        // same slot that shows "Reconnecting…" mid-session); otherwise just transient feedback.
+        let (text, style) = if state.conn == ConnState::Connecting {
+            (
+                "Connecting...".to_string(),
+                status_message_style(&crate::app::StatusMessage {
+                    text: String::new(),
+                    kind: crate::app::StatusKind::Warning,
+                }),
+            )
+        } else {
+            (state.status.text.clone(), status_message_style(&state.status))
+        };
+        Line::from(vec![Span::raw(" "), Span::styled(text, style)])
     } else if matches!(state.ed().mode, EditorMode::Search) {
         let prompt = format!("/{}", state.ed().search.query.text);
         let text = match search_match_count_label(state) {
@@ -4532,6 +4540,12 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // a 3-space gap (see `build_editor_status_spans`), coloured yellow/red by its kind.
         let conn_status = match state.conn {
             ConnState::Connected => crate::app::StatusMessage::default(),
+            // Boot-time `Connecting` has no editor (so this status row isn't shown then); the
+            // backdrop carries the indicator instead. Mapped here for exhaustiveness.
+            ConnState::Connecting => crate::app::StatusMessage {
+                text: "Connecting...".to_string(),
+                kind: crate::app::StatusKind::Warning,
+            },
             ConnState::Reconnecting { .. } => crate::app::StatusMessage {
                 text: "Reconnecting...".to_string(),
                 kind: crate::app::StatusKind::Warning,

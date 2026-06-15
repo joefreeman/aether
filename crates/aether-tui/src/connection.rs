@@ -30,6 +30,22 @@ pub struct Handle {
     tx: mpsc::UnboundedSender<Outgoing>,
 }
 
+/// A placeholder transport for the boot `Connecting` state, before any socket exists. Its actor
+/// channel has no receiver, so a `call` would error — but the core drops every RPC while not
+/// `Connected`, so the dummy is never actually exercised; it's swapped for the real handle the
+/// moment the boot dial lands. Pairs with [`dummy_notifications`].
+pub fn dummy_handle() -> Handle {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    Handle { tx }
+}
+
+/// A closed notification stream for the boot `Connecting` state — `recv` returns `None` at once,
+/// but the run loop only polls notifications while `Connected`, so it's never read.
+pub fn dummy_notifications() -> mpsc::UnboundedReceiver<Notification> {
+    let (_tx, rx) = mpsc::unbounded_channel();
+    rx
+}
+
 impl Handle {
     /// A typed RPC: serialize, call, deserialize. The error keeps its [`RpcError`] shape so
     /// callers can branch on server codes (e.g. `WOULD_OVERWRITE`).

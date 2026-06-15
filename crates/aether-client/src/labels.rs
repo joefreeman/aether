@@ -6,6 +6,30 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// The window/terminal title's *body* for `(project, buffer label)`: `None` before a project is
+/// active (the title is then just the app name), otherwise `[project]` or `[project] label`. The
+/// `[…]` is omitted entirely when there's no project, so a connecting/chooser state never shows a
+/// stray `[]`. Shells append `" - Aether"` (and the TUI prepends a dirty dot).
+pub fn title_body(project: &str, label: &str) -> Option<String> {
+    if project.is_empty() {
+        return None;
+    }
+    Some(if label.is_empty() {
+        format!("[{project}]")
+    } else {
+        format!("[{project}] {label}")
+    })
+}
+
+/// The full window title: the [`title_body`] plus `" - Aether"`, or just `"Aether"` when no
+/// project is active (so a fresh/connecting window reads `Aether`, not `[] `).
+pub fn window_title(project: &str, label: &str) -> String {
+    match title_body(project, label) {
+        Some(body) => format!("{body} - Aether"),
+        None => "Aether".to_string(),
+    }
+}
+
 /// Cap on disambiguation passes. Real projects never need more than a couple, but the loop has
 /// to terminate when two paths are literally identical (which `add_root` refuses, but defensive
 /// belt-and-braces is cheap).
@@ -102,6 +126,17 @@ mod tests {
     #[test]
     fn empty_input_returns_empty() {
         assert!(root_labels(&[]).is_empty());
+    }
+
+    #[test]
+    fn window_title_omits_empty_project_and_appends_app_name() {
+        // No project (boot/connecting/chooser): just the app name — never a stray `[]`.
+        assert_eq!(window_title("", ""), "Aether");
+        assert_eq!(window_title("", "ignored"), "Aether");
+        assert_eq!(title_body("", ""), None);
+        // With a project, the `[project] label` body gains the " - Aether" suffix.
+        assert_eq!(window_title("demo", ""), "[demo] - Aether");
+        assert_eq!(window_title("demo", "src/main.rs"), "[demo] src/main.rs - Aether");
     }
 
     #[test]

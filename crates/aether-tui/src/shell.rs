@@ -71,6 +71,9 @@ enum Done {
     },
     /// A reconnect dial attempt (see `Effect::Reconnect`).
     Reconnected(Box<Result<Reestablished, ReconnectError>>),
+    /// The initial boot dial: connect + bootstrap from the `Connecting` launch state. `NotUp`
+    /// retries (the daemon may still be coming up); `Fatal` (e.g. a bad CLI project) ends the run.
+    Booted(Box<Result<Booted, ReconnectError>>),
     /// Re-enabling the sticky diff view after a fresh subscribe.
     DiffViewSet(Result<aether_protocol::viewport::ViewportWindowResult, String>),
     /// A floating toast's time-to-live elapsed; removes the toast with this id from the stack.
@@ -99,6 +102,26 @@ enum ReconnectError {
     NotUp,
     /// Connected but restoring state failed — give up with a message.
     Fatal(String),
+}
+
+/// A successful initial boot: the live connection plus the bootstrapped session/state and any
+/// startup effects (e.g. the no-args Projects chooser's `picker/view`), ready to install in place
+/// of the connecting placeholder.
+struct Booted {
+    handle: Handle,
+    notifications: mpsc::UnboundedReceiver<Notification>,
+    session: Session,
+    state: AppState,
+    startup: Effects,
+}
+
+/// The CLI args the boot dial needs, retained so a `NotUp` failure can re-dial. Held while the
+/// shell is in the `Connecting` state.
+#[derive(Clone)]
+struct BootSpec {
+    project: Option<String>,
+    file: Option<String>,
+    version: String,
 }
 
 type DoneFuture = Pin<Box<dyn std::future::Future<Output = Done> + Send>>;
@@ -152,15 +175,21 @@ pub struct Shell {
     /// Monotonic id source for floating toasts — each toast's expiry timer carries its id so the
     /// right one is removed from the stack when it elapses.
     next_toast_id: u64,
+    /// Set while in the boot `Connecting` state: the CLI args to (re)dial with. Cleared once a
+    /// connection lands and the real session is installed.
+    boot: Option<BootSpec>,
+    /// Boot dial attempt count, for the retry backoff while `boot` is set.
+    boot_attempt: u32,
+    /// A fatal boot error (e.g. the named project doesn't exist) — surfaced as the run's `Err`
+    /// after the loop unwinds and the terminal is restored.
+    fatal: Option<String>,
 }
 
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    handle: Handle,
-    notifications: mpsc::UnboundedReceiver<Notification>,
-    session: Session,
-    state: AppState,
-    startup: Effects,
+    project: Option<String>,
+    file: Option<String>,
+    version: String,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
     tokio::spawn(async move {
@@ -173,11 +202,18 @@ pub async fn run(
     });
 
     let term = crossterm::terminal::size()?;
+    // Launch connectionless: a placeholder session flagged `Connecting` and dummy transport that's
+    // never exercised (the core drops RPCs while not `Connected`). The editor chrome renders from
+    // the start — empty buffer area, status row showing "Connecting…" — and client-side keys work,
+    // exactly the feel of a mid-session reconnect. The boot dial runs in the background and
+    // installs the real session once the socket lands.
+    let mut session = Session::placeholder();
+    session.conn = ConnState::Connecting;
     let mut shell = Shell {
-        handle,
-        notifications,
+        handle: crate::connection::dummy_handle(),
+        notifications: crate::connection::dummy_notifications(),
         session,
-        state,
+        state: connecting_state(term.0, term.1),
         pending: FuturesUnordered::new(),
         top_visual_row: 0,
         scroll_anchor: None,
@@ -199,13 +235,17 @@ pub async fn run(
         overlay_edit: None,
         term,
         next_toast_id: 0,
+        boot: Some(BootSpec {
+            project,
+            file,
+            version,
+        }),
+        boot_attempt: 0,
+        fatal: None,
     };
 
-    // First subscribe: the session was bootstrapped with a buffer; show it.
-    shell.sent_grid = Some(shell.grid());
-    shell.subscribe();
-    // Fire any bootstrap effects (e.g. the no-args Projects chooser's `picker/view`).
-    shell.run_effects(startup);
+    // Kick the boot dial; no subscribe yet (no buffer until it lands).
+    shell.spawn_boot_dial();
     shell.sync();
     crate::app::apply_cursor_style(&shell.state);
     terminal.draw(|f| ui::draw(f, &shell.state))?;
@@ -243,14 +283,23 @@ pub async fn run(
         while let Ok(n) = shell.notifications.try_recv() {
             shell.dispatch(CoreEvent::ServerPush(n));
         }
-        shell.maybe_blame();
-        shell.maybe_fetch();
+        // No buffer/window exists until a connection lands; these are no-ops while connecting but
+        // gated explicitly so a dummy-handle call can never slip out.
+        if shell.session.conn == ConnState::Connected {
+            shell.maybe_blame();
+            shell.maybe_fetch();
+        }
         shell.sync();
         crate::app::apply_cursor_style(&shell.state);
         terminal.draw(|f| ui::draw(f, &shell.state))?;
         crate::app::refresh_terminal_title(&mut shell.state);
     }
-    Ok(())
+    // A fatal boot failure (bad CLI project, etc.) surfaces as the run's error once the terminal
+    // is restored by the caller.
+    match shell.fatal.take() {
+        Some(e) => Err(anyhow::anyhow!(e)),
+        None => Ok(()),
+    }
 }
 
 impl Shell {
@@ -508,6 +557,33 @@ impl Shell {
                 }
                 Err(ReconnectError::NotUp) => self.dispatch(CoreEvent::ReconnectRetry),
                 Err(ReconnectError::Fatal(e)) => self.dispatch(CoreEvent::ReconnectFatal(e)),
+            },
+            Done::Booted(result) => match *result {
+                Ok(b) => {
+                    // The dial landed: swap the dummy transport for the real one and install the
+                    // bootstrapped session over the connecting placeholder, then subscribe + fire
+                    // startup effects — the same setup the old synchronous boot did inline.
+                    self.boot = None;
+                    self.boot_attempt = 0;
+                    self.handle = b.handle;
+                    self.notifications = b.notifications;
+                    self.session = b.session;
+                    self.state = b.state;
+                    self.sent_grid = Some(self.grid());
+                    self.subscribe();
+                    self.run_effects(b.startup);
+                }
+                // Daemon not up yet — keep dialing (the whole point of launching first).
+                Err(ReconnectError::NotUp) => {
+                    self.boot_attempt = self.boot_attempt.saturating_add(1);
+                    self.spawn_boot_dial();
+                }
+                // A live server but the bootstrap refused (e.g. unknown CLI project) — end the run
+                // with the error once the terminal is restored.
+                Err(ReconnectError::Fatal(e)) => {
+                    self.fatal = Some(e);
+                    self.should_quit = true;
+                }
             },
         }
     }
@@ -1202,6 +1278,19 @@ impl Shell {
         ));
     }
 
+    /// Push the boot dial (connect + bootstrap) onto the pending set; its `Done::Booted` result
+    /// installs the session or schedules a retry. No-op once boot has completed (`boot` is `None`).
+    fn spawn_boot_dial(&mut self) {
+        let Some(spec) = self.boot.clone() else {
+            return;
+        };
+        let attempt = self.boot_attempt;
+        let (cols, rows) = self.term;
+        self.pending.push(Box::pin(async move {
+            Done::Booted(Box::new(boot_dial(attempt, spec, cols, rows).await))
+        }));
+    }
+
     fn spawn_reconnect(&mut self, attempt: u32) {
         let project = self.session.project.clone();
         let path = self.session.buffer.path.clone();
@@ -1712,7 +1801,42 @@ fn translate_key(k: &KeyEvent) -> Option<(KeyCode, Mods, Option<String>)> {
     Some((code, mods, text))
 }
 
-/// One paced reconnect attempt: back off, re-read discovery, dial, restore.
+/// One boot dial: after the first attempt back off, dial the fixed address, then run the same
+/// `bootstrap` the synchronous boot used (activate the CLI project + open the file/MRU buffer, or
+/// hand back a placeholder + chooser startup). `NotUp` (server down) retries; a bootstrap refusal
+/// is `Fatal`.
+async fn boot_dial(
+    attempt: u32,
+    spec: BootSpec,
+    cols: u16,
+    rows: u16,
+) -> Result<Booted, ReconnectError> {
+    if attempt > 0 {
+        tokio::time::sleep(reconnect_backoff(attempt)).await;
+    }
+    let url = aether_protocol::default_server_url();
+    let (handle, notifications) = crate::connection::connect(&url, &spec.version)
+        .await
+        .map_err(|_| ReconnectError::NotUp)?;
+    let (session, state, startup) = bootstrap(
+        &handle,
+        spec.project.as_deref(),
+        spec.file.as_deref(),
+        cols,
+        rows,
+    )
+    .await
+    .map_err(|e| ReconnectError::Fatal(e.to_string()))?;
+    Ok(Booted {
+        handle,
+        notifications,
+        session,
+        state,
+        startup,
+    })
+}
+
+/// One paced reconnect attempt: back off, dial the fixed address, restore.
 #[allow(clippy::too_many_arguments)]
 async fn dial(
     attempt: u32,
@@ -1727,8 +1851,7 @@ async fn dial(
     use aether_protocol::project::{ProjectActivate, ProjectActivateParams};
 
     tokio::time::sleep(reconnect_backoff(attempt)).await;
-    let info = crate::discovery::read().map_err(|_| ReconnectError::NotUp)?;
-    let server_url = format!("ws://127.0.0.1:{}", info.port);
+    let server_url = aether_protocol::default_server_url();
     let (handle, notifications) = crate::connection::connect(&server_url, &version)
         .await
         .map_err(|_| ReconnectError::NotUp)?;
@@ -1880,8 +2003,22 @@ pub async fn bootstrap(
         }
     };
 
+    let state = make_state(project_name, project_paths, cols, rows, ConnState::Connected);
+    Ok((session, state, startup))
+}
+
+/// Build the shell's view-model state. Shared by [`bootstrap`] (a live `Connected` session) and
+/// the boot-time connecting screen ([`connecting_state`]), so the two can't drift on the long
+/// field list.
+fn make_state(
+    project_name: String,
+    project_paths: Vec<String>,
+    cols: u16,
+    rows: u16,
+    conn: ConnState,
+) -> AppState {
     let root_labels = labels::root_labels(&project_paths);
-    let state = AppState {
+    AppState {
         project_name,
         project_paths,
         root_labels,
@@ -1890,7 +2027,7 @@ pub async fn bootstrap(
         should_quit: false,
         status: StatusMessage::default(),
         toasts: Vec::new(),
-        conn: ConnState::Connected,
+        conn,
         last_terminal_title: String::new(),
         clipboard: clipboard::new_handle(),
         pending_leader: None,
@@ -1903,6 +2040,11 @@ pub async fn bootstrap(
         lsp_status: Default::default(),
         hover: None,
         diagnostic_counts: Default::default(),
-    };
-    Ok((session, state, startup))
+    }
+}
+
+/// The view-model for the boot-time "Connecting…" backdrop: no project, no editor, `Connecting`
+/// conn state. `ui::draw` renders its no-project backdrop with the centered indicator.
+pub fn connecting_state(cols: u16, rows: u16) -> AppState {
+    make_state(String::new(), Vec::new(), cols, rows, ConnState::Connecting)
 }

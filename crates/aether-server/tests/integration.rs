@@ -185,6 +185,12 @@ async fn hello_then_open_file() {
     .await;
     assert_eq!(activated.project.name, "test-proj");
     assert_eq!(activated.project.paths.len(), 1);
+    // The instance stamp rides the activation result (clients use it for restart detection
+    // instead of reading the discovery file). A running server has a non-zero start time.
+    assert_ne!(
+        activated.server_started_at, 0,
+        "project/activate reports the server's instance start stamp over the wire"
+    );
 
     // Open the file.
     let open: BufferOpenResult = send_request::<BufferOpen>(

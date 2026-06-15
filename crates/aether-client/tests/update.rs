@@ -254,6 +254,39 @@ fn picker_query_is_value_synced_and_chip_row_gestures_work() {
 }
 
 #[test]
+fn editing_is_refused_while_disconnected_and_insert_drops_on_disconnect() {
+    use aether_client::session::{ConnState, Mode};
+    use aether_client::update::Event;
+
+    // Boot-connecting (or any non-Connected state): pressing `i` must NOT enter Insert — a live
+    // insert cursor that silently drops keystrokes reads as a hang. It stays Normal with a hint.
+    let mut s = session();
+    s.conn = ConnState::Connecting;
+    let fx = key(&mut s, 'i');
+    assert_eq!(s.mode, Mode::Normal, "insert is refused while connecting");
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Toast(_, ToastKind::Info))),
+        "a hint explains why nothing happened"
+    );
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "no RPC is attempted while disconnected"
+    );
+
+    // A mid-session disconnect drops out of Insert so the cursor doesn't sit in a dead insert mode.
+    let mut s = session();
+    let _ = key(&mut s, 'i'); // connected → enters Insert
+    assert_eq!(s.mode, Mode::Insert);
+    let _ = s.on_event(Event::ConnectionLost);
+    assert_eq!(
+        s.mode,
+        Mode::Normal,
+        "losing the connection drops out of Insert"
+    );
+    assert!(matches!(s.conn, ConnState::Reconnecting { .. }));
+}
+
+#[test]
 fn glob_editor_live_previews_results_and_reverts_on_cancel() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
@@ -1029,6 +1062,7 @@ fn project_created_with_no_roots_opens_a_scratch_and_settings() {
         },
         last_buffer_id: None,
         opened: None,
+        server_started_at: 0,
     })));
     assert_eq!(s.project, "fresh");
     // Rather than leave the previous project's buffer behind, a scratch is opened (a `buffer/open`

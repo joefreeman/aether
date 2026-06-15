@@ -99,6 +99,10 @@ pub struct ServerState {
     /// Latest diagnostics per buffer, in buffer coordinates (byte columns). Replaced wholesale on
     /// each `publishDiagnostics`; cleared on close. Empty/absent when a buffer has none.
     pub diagnostics: HashMap<BufferId, Vec<crate::lsp::diagnostics::BufferDiagnostic>>,
+    /// This server instance's start time (unix ms) — its identity, reported to clients on
+    /// `project/activate` so they can detect a daemon restart across a reconnect. Set once at
+    /// construction; the same value is written to the runtime file.
+    pub started_at_unix_ms: u64,
     next_buffer_id: u64,
     next_viewport_id: u64,
 }
@@ -243,6 +247,10 @@ impl ServerState {
             matcher: picker_state::make_matcher(),
             lsp: crate::lsp::manager::LspManager::default(),
             diagnostics: HashMap::new(),
+            started_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
             next_buffer_id: 1,
             next_viewport_id: 1,
         }

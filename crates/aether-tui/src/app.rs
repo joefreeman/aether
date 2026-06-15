@@ -576,23 +576,22 @@ pub fn refresh_terminal_title(state: &mut AppState) {
 /// colour-codes it). Before any project is active we fall back to a bare `Aether` placeholder;
 /// without a buffer (transient project-switch window) we just show the project name.
 fn terminal_title(state: &AppState) -> String {
-    if state.project_name.is_empty() {
+    // The label is only meaningful with an open editor (the transient project-switch window has
+    // none). `title_body` yields `None` before a project is active → the title is just `Aether`.
+    let label = if state.has_editor() {
+        state.ed().file_label.as_str()
+    } else {
+        ""
+    };
+    let Some(body) = aether_client::labels::title_body(&state.project_name, label) else {
         return "Aether".to_string();
-    }
-    if !state.has_editor() {
-        return format!("[{}]", state.project_name);
-    }
-    let prefix = if state.buffer_status().is_some() {
+    };
+    let dot = if state.has_editor() && state.buffer_status().is_some() {
         format!("{BUFFER_STATUS_DOT} ")
     } else {
         String::new()
     };
-    format!(
-        "{}[{}] {}",
-        prefix,
-        state.project_name,
-        state.ed().file_label
-    )
+    format!("{dot}{body} - Aether")
 }
 
 /// Whether a keybinding is mid-entry and waiting for the next keystroke to complete it: `f`/`t`
@@ -899,10 +898,10 @@ mod tests {
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
             };
-        assert_eq!(terminal_title(&state), "[demo]");
+        assert_eq!(terminal_title(&state), "[demo] - Aether");
         // Once a buffer exists, the title grows to include the file label.
         state.editor = Some(stub_editor_state("(scratch 0)"));
-        assert_eq!(terminal_title(&state), "[demo] (scratch 0)");
+        assert_eq!(terminal_title(&state), "[demo] (scratch 0) - Aether");
     }
 
     #[test]
@@ -931,17 +930,17 @@ mod tests {
             diagnostic_counts: std::collections::HashMap::new(),
             };
         // Clean buffer → no dot.
-        assert_eq!(terminal_title(&state), "[demo] src/main.rs");
+        assert_eq!(terminal_title(&state), "[demo] src/main.rs - Aether");
         // Local edits → leading dot.
         if let Some(ed) = state.editor.as_mut() {
             ed.revision = 5;
         }
-        assert_eq!(terminal_title(&state), "● [demo] src/main.rs");
+        assert_eq!(terminal_title(&state), "● [demo] src/main.rs - Aether");
         // External delete is still a (single, plain) leading dot — the title can't colour-code it.
         if let Some(ed) = state.editor.as_mut() {
             ed.externally_deleted = true;
         }
-        assert_eq!(terminal_title(&state), "● [demo] src/main.rs");
+        assert_eq!(terminal_title(&state), "● [demo] src/main.rs - Aether");
     }
 
     /// Minimal `EditorState` for title tests — only the fields the title code reads matter

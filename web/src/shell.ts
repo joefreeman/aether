@@ -2975,7 +2975,10 @@ export class Shell {
     }
 
     this.statusEl.replaceChildren(left, right);
-    document.title = v.project ? (v.buffer.label ? `[${v.project}] ${v.buffer.label}` : `[${v.project}]`) : "Aether";
+    // Mirror the native clients: "[project] label - Aether", or just "Aether" with no project.
+    document.title = v.project
+      ? `${v.buffer.label ? `[${v.project}] ${v.buffer.label}` : `[${v.project}]`} - Aether`
+      : "Aether";
     this.updateFavicon(v);
   }
 

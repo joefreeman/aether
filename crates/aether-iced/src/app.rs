@@ -48,8 +48,33 @@ const TAB_WIDTH: u32 = 4;
 /// the project picker and builds the session over it when the user picks ([`ChooseBootstrap`]).
 #[derive(Clone)]
 pub enum Bootstrap {
+    /// No connection yet: the app launches immediately into an immersive "Connecting…" backdrop
+    /// and dials the daemon from within (a client can start before the server). Carries the CLI
+    /// args the connect task needs to bootstrap once the socket lands.
+    Connecting(ConnectingBootstrap),
     Session(Box<SessionBootstrap>),
     Choose(ChooseBootstrap),
+}
+
+impl std::fmt::Debug for Bootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Carries non-Debug transport handles; the variant name is all a log needs.
+        let name = match self {
+            Bootstrap::Connecting(_) => "Connecting",
+            Bootstrap::Session(_) => "Session",
+            Bootstrap::Choose(_) => "Choose",
+        };
+        f.debug_tuple(name).finish()
+    }
+}
+
+/// The CLI args a boot-connect task needs: which project/file to open once connected, and the
+/// client version for the handshake. No live connection — that's what the task establishes.
+#[derive(Clone)]
+pub struct ConnectingBootstrap {
+    pub project: Option<String>,
+    pub file: Option<String>,
+    pub client_version: String,
 }
 
 /// The live connection and opened buffer for the window's session.
@@ -58,8 +83,9 @@ pub struct SessionBootstrap {
     pub handle: Handle,
     pub notifications: NotifRx,
     pub client_version: String,
-    /// The daemon's start stamp from discovery — reconnects compare it to tell "same daemon,
-    /// connection blipped" from "daemon restarted" (where unsaved buffer state died with it).
+    /// The daemon's start stamp, learned from the `project/activate` result — reconnects compare
+    /// it to tell "same daemon, connection blipped" from "daemon restarted" (where unsaved buffer
+    /// state died with it).
     pub server_started_at: u64,
     pub project: String,
     pub project_paths: Vec<String>,
@@ -97,7 +123,7 @@ impl std::fmt::Debug for Reestablished {
 /// Why a reconnect attempt didn't produce a session.
 #[derive(Debug)]
 pub enum ReconnectError {
-    /// No daemon reachable (discovery/dial failed) — retry, silently.
+    /// No daemon reachable (dial failed) — retry, silently.
     NotUp,
     /// A server answered but re-establishing failed — terminal.
     Fatal(String),
@@ -234,8 +260,12 @@ struct Toast {
 
 #[derive(Debug)]
 pub enum Message {
-    /// The boot chooser's pick resolved: the activated project + the buffer to land on.
-    SessionReady(Result<Box<(ProjectInfo, BufferOpenResult)>, String>),
+    /// The boot chooser's pick resolved: the activated project, the buffer to land on, and the
+    /// server instance's start stamp (for restart detection once the session exists).
+    SessionReady(Result<Box<(ProjectInfo, BufferOpenResult, u64)>, String>),
+    /// The boot-connect dial resolved (from the `Connecting` launch state): either a connected
+    /// `Session`/`Choose` bootstrap to install, or a failure to retry.
+    Booted(Result<Bootstrap, String>),
     Editor(EditorEvent),
     Key {
         code: KeyCode,
@@ -278,6 +308,11 @@ pub struct App {
     /// all messages route through `update_boot`; picking a project builds the real session
     /// over the boot connection and clears this.
     boot: Option<Boot>,
+    /// Set while the app is in the boot-connecting state (`ConnState::Connecting`): the CLI args
+    /// the dial task needs, retained so a failed attempt can retry. Cleared the moment a
+    /// connection lands and the real session/chooser is installed. While `Some`, input is parked
+    /// and the immersive "Connecting…" backdrop shows.
+    boot_args: Option<ConnectingBootstrap>,
     /// The window's one editing context (one connection — the server's client).
     session: Session,
     /// The session's transport — shell-owned (native sockets don't exist on every shell;
@@ -352,6 +387,7 @@ impl App {
                      client_version: String,
                      server_started_at: u64| App {
             boot,
+            boot_args: None,
             session,
             handle,
             notifications,
@@ -384,6 +420,25 @@ impl App {
             focused_field: None,
         };
         match b {
+            // Launch immediately, connectionless: a placeholder session flagged `Connecting`
+            // (the view renders an empty backdrop + the "Connecting…" banner) plus dummy transport
+            // that's never used while input is parked. The returned task dials and bootstraps; its
+            // `Booted` result installs the real session/chooser. No pump yet — the real
+            // notification stream arrives with the connection.
+            Bootstrap::Connecting(args) => {
+                let mut session = Session::placeholder();
+                session.conn = ConnState::Connecting;
+                let mut app = shell(
+                    None,
+                    session,
+                    crate::connection::dummy_handle(),
+                    crate::connection::dummy_notifications(),
+                    args.client_version.clone(),
+                    0,
+                );
+                app.boot_args = Some(args.clone());
+                (app, spawn_connect(args))
+            }
             Bootstrap::Session(b) => {
                 let pump = pump(b.notifications.clone());
                 let session = Session::new(b.project, b.project_paths, b.buffer);
@@ -455,10 +510,7 @@ impl App {
 
     /// `[project] file` — mirrors the web client's page title and the TUI's terminal title.
     pub fn title(&self) -> String {
-        if self.boot.is_some() {
-            return "Aether".into();
-        }
-        format!("[{}] {}", self.session.project, self.session.buffer.label)
+        crate::labels::window_title(&self.session.project, &self.session.buffer.label)
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -518,9 +570,11 @@ impl App {
     // ---- update ---------------------------------------------------------------------------
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        // Pre-session: the project chooser owns every message; `SessionReady` is the
-        // hand-off back to the normal path.
-        let task = if self.boot.is_some() {
+        // Boot-connecting (no socket yet): input is parked; only the dial result moves us on.
+        // Then the project chooser (if any) owns every message until `SessionReady` hands off.
+        let task = if self.boot_args.is_some() {
+            self.update_connecting(message)
+        } else if self.boot.is_some() {
             self.update_boot(message)
         } else {
             self.update_inner(message)
@@ -641,8 +695,8 @@ impl App {
                 }
                 Task::none()
             }
-            // The boot connection died under the chooser — dial again until a daemon is back
-            // (the retry task re-reads discovery, so a restarted daemon's fresh port is found).
+            // The boot connection died under the chooser — dial the fixed address again until a
+            // daemon is back (a restarted daemon rebinds the same port).
             Message::Notified(None) => {
                 let Some(boot) = &mut self.boot else {
                     return Task::none();
@@ -701,7 +755,10 @@ impl App {
                 let Some(boot) = self.boot.take() else {
                     return Task::none();
                 };
-                let (project, open) = *r;
+                let (project, open, server_started_at) = *r;
+                // First activation on the boot connection establishes the restart-detection
+                // baseline (it was 0/unknown while only the chooser was up).
+                self.server_started_at = server_started_at;
                 // A rootless project (just created from the chooser) has nowhere to open files —
                 // land in settings on the add-root input so the user can give it a root.
                 let rootless = project.paths.is_empty();
@@ -859,7 +916,7 @@ impl App {
                             .await
                             .map_err(|e| e.to_string())?,
                     };
-                    Ok(Box::new((created.project, open)))
+                    Ok(Box::new((created.project, open, created.server_started_at)))
                 },
                 Message::SessionReady,
             );
@@ -885,7 +942,7 @@ impl App {
                 let open = activated
                     .opened
                     .ok_or_else(|| "project/activate returned no landing buffer".to_string())?;
-                Ok(Box::new((activated.project, open)))
+                Ok(Box::new((activated.project, open, activated.server_started_at)))
             },
             Message::SessionReady,
         )
@@ -974,22 +1031,23 @@ impl App {
         }
     }
 
-    /// One paced boot-reconnect attempt: sleep, re-read discovery, dial. Failures loop back
-    /// through [`Message::BootReconnected`] — indefinitely, like the session's retry.
+    /// One paced boot-reconnect attempt: sleep, dial the fixed address. Failures loop back
+    /// through [`Message::BootReconnected`] — indefinitely, like the session's retry. No project
+    /// is active on the boot connection, so there's no instance stamp to learn yet (0); the first
+    /// `project/activate` establishes the baseline (nothing is open to lose in the meantime).
     fn boot_reconnect(&self) -> Task<Message> {
         let version = self.client_version.clone();
         Task::perform(
             async move {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let info = crate::discovery::read().map_err(|e| e.to_string())?;
-                let server_url = format!("ws://127.0.0.1:{}", info.port);
+                let server_url = aether_protocol::default_server_url();
                 let (handle, rx) = crate::connection::connect(&server_url, &version)
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(BootConn {
                     handle,
                     notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
-                    server_started_at: info.started_at_unix_ms,
+                    server_started_at: 0,
                 })
             },
             Message::BootReconnected,
@@ -1000,7 +1058,10 @@ impl App {
     /// re-enter the boot chooser over the fresh connection and fetch the project list, mirroring a
     /// no-args start. Picking a project (the renamed one shows under its new name) builds the
     /// session the usual way.
-    fn reconnect_to_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
+    /// Open the Projects chooser over a fresh connection: install the boot state and start the
+    /// pump + the chooser's first `picker/view`. Shared by the no-args boot (`Booted` → `Choose`),
+    /// the boot-connection reconnect, and [`Self::reconnect_to_chooser`] (project-gone recovery).
+    fn enter_boot_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
         self.boot = Some(Boot {
             handle: handle.clone(),
             notifications: notifications.clone(),
@@ -1034,8 +1095,55 @@ impl App {
                 })
             },
         );
+        Task::batch([pump(notifications), view])
+    }
+
+    fn reconnect_to_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
+        let chooser = self.enter_boot_chooser(handle, notifications);
         let toast = self.toast("project no longer exists — pick another", ToastKind::Warning);
-        Task::batch([pump(notifications), view, toast])
+        Task::batch([chooser, toast])
+    }
+
+    /// Boot-connecting state (`ConnState::Connecting`): the editor chrome is live but there's no
+    /// socket yet. The dial's `Booted` result installs the real session (project on the CLI) or
+    /// chooser (no project), or retries after a short delay (the daemon may still be starting).
+    /// Everything else flows to the normal handler so client-side keys behave as in a reconnect —
+    /// the core drops any RPC while not `Connected`, so the dummy transport is never exercised.
+    fn update_connecting(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Booted(Ok(Bootstrap::Session(b))) => {
+                self.boot_args = None;
+                self.server_started_at = b.server_started_at;
+                self.handle = b.handle;
+                self.notifications = b.notifications.clone();
+                self.session = Session::new(b.project, b.project_paths, b.buffer);
+                // The connecting editor already laid out (recording cell metrics) without
+                // subscribing, so its Layout may not fire again — subscribe explicitly now that
+                // we're Connected. `subscribe_task` is a no-op if no metrics arrived yet, and the
+                // first real Layout then handles it.
+                self.sent_grid = self.current_grid();
+                Task::batch([pump(b.notifications), self.subscribe_task()])
+            }
+            Message::Booted(Ok(Bootstrap::Choose(b))) => {
+                self.boot_args = None;
+                self.server_started_at = b.server_started_at;
+                self.handle = b.handle.clone();
+                self.notifications = b.notifications.clone();
+                self.enter_boot_chooser(b.handle, b.notifications)
+            }
+            // The dial only ever yields Session/Choose; Connecting can't come back.
+            Message::Booted(Ok(Bootstrap::Connecting(_))) => Task::none(),
+            Message::Booted(Err(e)) => {
+                tracing::debug!(error = %e, "boot connect failed; retrying");
+                match &self.boot_args {
+                    Some(args) => spawn_connect_delayed(args.clone()),
+                    None => Task::none(),
+                }
+            }
+            // Client-side input runs against the placeholder session (RPCs dropped while
+            // Connecting), giving the reconnect-style "some keys work" feel.
+            other => self.update_inner(other),
+        }
     }
 
     fn update_inner(&mut self, message: Message) -> Task<Message> {
@@ -1238,8 +1346,9 @@ impl App {
                 let fx = self.session.on_event(CoreEvent::ReconnectFatal(e));
                 self.run_core(fx)
             }
-            // Boot-only message that slipped past a finished boot — nothing to do.
-            Message::BootReconnected(_) => Task::none(),
+            // Boot-only messages that slipped past a finished boot — nothing to do. `Booted` is
+            // handled in `update_connecting`; once a session exists it's a stale dial result.
+            Message::BootReconnected(_) | Message::Booted(_) => Task::none(),
         }
     }
 
@@ -1763,8 +1872,8 @@ impl App {
 
     // ---- RPC helpers ------------------------------------------------------------------------
 
-    /// One reconnect attempt, after `attempt`'s backoff: re-run discovery
-    /// (a restarted daemon gets a fresh port), dial, re-activate the project, and reopen the
+    /// One reconnect attempt, after `attempt`'s backoff: dial the fixed address
+    /// (a restarted daemon rebinds the same port), re-activate the project, and reopen the
     /// buffer — by path when it has one (transient flag preserved, cursor as the jump target),
     /// by id otherwise (recovers a scratch's content when the daemon stayed up), falling back
     /// to a fresh transient scratch. Dial failures retry via [`ReconnectError::NotUp`];
@@ -1783,8 +1892,7 @@ impl App {
         self.task(
             async move {
                 tokio::time::sleep(reconnect_backoff(attempt)).await;
-                let info = crate::discovery::read().map_err(|_| ReconnectError::NotUp)?;
-                let server_url = format!("ws://127.0.0.1:{}", info.port);
+                let server_url = aether_protocol::default_server_url();
                 let (handle, rx) = crate::connection::connect(&server_url, &version)
                     .await
                     .map_err(|_| ReconnectError::NotUp)?;
@@ -1804,7 +1912,10 @@ impl App {
                             notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
                             restore: None,
                             server_url,
-                            server_started_at: info.started_at_unix_ms,
+                            // No project re-activated, so no fresh instance stamp; treat as
+                            // unknown. The chooser is raised over this connection and the next
+                            // activation re-establishes the baseline.
+                            server_started_at: 0,
                         }));
                     }
                 };
@@ -1848,7 +1959,7 @@ impl App {
                     notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
                     restore: Some((activated.project, open)),
                     server_url,
-                    server_started_at: info.started_at_unix_ms,
+                    server_started_at: activated.server_started_at,
                 }))
             },
             Message::Reconnected,
@@ -2183,6 +2294,10 @@ impl App {
         if let Some(boot) = &self.boot {
             return self.boot_view(boot);
         }
+        // Boot-connecting renders the normal editor chrome over a placeholder session (empty editor
+        // + status bar), with the floating "Connecting…" banner — the same familiar feel as a
+        // mid-session reconnect. The editor's Layout fires no RPC while not `Connected`
+        // (`on_editor_event`), and `status_bar` is fully Option-guarded, so the placeholder is safe.
         let editor = editor::editor(
             editor::Content {
                 window: self.session.window.as_ref(),
@@ -2269,6 +2384,8 @@ impl App {
     fn conn_banner(&self) -> Element<'_, Message> {
         let (label, bg, fg) = match self.session.conn {
             ConnState::Failed => ("Disconnected", theme::NORD11, theme::NORD6),
+            // Boot before the daemon is up — distinct copy from a mid-session blip.
+            ConnState::Connecting => ("Connecting…", theme::NORD13, theme::NORD0),
             _ => ("Reconnecting…", theme::NORD13, theme::NORD0),
         };
         let pill = container(text(label).size(12).font(SANS).color(fg))
@@ -3131,7 +3248,11 @@ impl App {
         if let Some(color) = self.buffer_state_color() {
             left = left.push(t("● ".into(), color));
         }
-        left = left.push(t(format!("[{}] ", self.session.project), theme::NORD4));
+        // No project (boot/connecting/chooser) → no `[project]` prefix, so the bar stays blank
+        // rather than showing a stray `[]`.
+        if !self.session.project.is_empty() {
+            left = left.push(t(format!("[{}] ", self.session.project), theme::NORD4));
+        }
         // Segment-elide long labels to roughly half the bar so the filename survives (the
         // web's `truncatePath`; chars approximate px since the bar is sans).
         let budget = ((self.view_size.width * 0.5 / 6.5) as usize).max(12);
@@ -3807,7 +3928,114 @@ fn nord_theme(_app: &App) -> iced::Theme {
     iced::Theme::Nord
 }
 
-/// Run the iced application. Called by `main` once the connection and buffer are bootstrapped.
+/// Dial the daemon and bootstrap once, landing the outcome as [`Message::Booted`]. Used for the
+/// initial boot attempt from the `Connecting` launch state.
+fn spawn_connect(args: ConnectingBootstrap) -> Task<Message> {
+    Task::perform(connect_and_bootstrap(args), Message::Booted)
+}
+
+/// Like [`spawn_connect`] but after a short delay — the retry between failed boot dials (the
+/// daemon may still be coming up). Localhost dials are cheap, so a flat 500ms keeps it responsive
+/// without busy-looping.
+fn spawn_connect_delayed(args: ConnectingBootstrap) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            connect_and_bootstrap(args).await
+        },
+        Message::Booted,
+    )
+}
+
+/// One boot-connect attempt: dial the fixed address, then (with a CLI project) activate it and
+/// open the file / MRU buffer, or (without one) hand back a bare connection for the chooser.
+/// Returns the connected [`Bootstrap`] to install, or an error string to retry / surface.
+async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, String> {
+    let base_url = aether_protocol::default_server_url();
+    let (handle, rx) = crate::connection::connect(&base_url, &args.client_version)
+        .await
+        .map_err(|e| e.to_string())?;
+    let notifications = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
+
+    // No project on the CLI: hand back the bare connection; the chooser browses on it.
+    let Some(project) = args.project.clone() else {
+        return Ok(Bootstrap::Choose(ChooseBootstrap {
+            handle,
+            notifications,
+            client_version: args.client_version,
+            server_started_at: 0,
+        }));
+    };
+
+    let activated = handle
+        .rpc::<ProjectActivate>(ProjectActivateParams {
+            name: project,
+            open_last: false,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let server_started_at = activated.server_started_at;
+    let project_paths = activated.project.paths.clone();
+
+    let open = match &args.file {
+        Some(f) => {
+            let abs = resolve_cli_path(f)?;
+            if abs.is_dir() {
+                return Err(format!(
+                    "{} is a directory — the iced client can't browse yet",
+                    abs.display()
+                ));
+            }
+            let abs_str = abs.display().to_string();
+            let (path_index, relative_path) = strip_longest_root(&abs_str, &project_paths)
+                .ok_or_else(|| format!("{} is outside the project's roots", abs.display()))?;
+            handle
+                .rpc::<BufferOpen>(BufferOpenParams {
+                    path_index: Some(path_index),
+                    relative_path: Some(relative_path),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        // No file: attach to the most recent buffer, or a transient scratch placeholder.
+        None => handle
+            .rpc::<BufferOpen>(BufferOpenParams {
+                buffer_id: activated.last_buffer_id,
+                transient: activated.last_buffer_id.is_none().then_some(true),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+
+    Ok(Bootstrap::Session(Box::new(SessionBootstrap {
+        handle,
+        notifications,
+        client_version: args.client_version,
+        server_started_at,
+        project: activated.project.name,
+        buffer: buffer_info(open, &project_paths),
+        project_paths,
+    })))
+}
+
+/// Resolve a CLI path against the current working directory (shell-conventional).
+fn resolve_cli_path(input: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(input);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(p)
+    };
+    abs.canonicalize()
+        .map_err(|e| format!("resolving {}: {e}", abs.display()))
+}
+
+/// Run the iced application. `main` hands it a `Connecting` bootstrap — the app dials from within
+/// and renders an immersive "Connecting…" state until the daemon answers.
 pub fn run(bootstrap: Bootstrap) -> iced::Result {
     iced::application(move || App::new(bootstrap.clone()), App::update, App::view)
         .title(App::title)

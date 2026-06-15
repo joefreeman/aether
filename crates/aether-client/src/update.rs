@@ -841,6 +841,11 @@ impl Session {
                     attempt: 0,
                     had_unsaved: self.buffer.revision != self.buffer.saved_revision,
                 };
+                // Drop out of Insert: edits can't reach the server while down, and a live insert
+                // cursor with vanishing keystrokes reads as a freeze. We don't restore it on
+                // reconnect (the buffer may have changed under us, or the daemon restarted and lost
+                // it) — the user re-enters insert deliberately.
+                self.mode = Mode::Normal;
                 tracing::warn!(buffer = %self.buffer.label, "connection lost; reconnecting");
                 let mut fx =
                     Effects::toast("server disconnected — reconnecting…", ToastKind::Warning);
@@ -3630,6 +3635,21 @@ impl Session {
     ) -> Effects {
         use Action as A;
         let buffer_id = self.buffer.buffer_id;
+        // While disconnected (boot `Connecting` or a mid-session `Reconnecting`) the buffer is
+        // read-only: the server can't accept edits, so the RPCs are dropped anyway. Entering Insert
+        // would leave the user in a mode where typing silently vanishes — it reads as a hang. Refuse
+        // the insert-entering actions and stay in Normal, with a hint so the inaction is explained.
+        if self.conn != ConnState::Connected
+            && matches!(
+                action,
+                A::EnterInsert(_) | A::OpenLineBelow | A::OpenLineAbove | A::Change
+            )
+        {
+            return Effects::toast(
+                "not connected — editing unavailable",
+                ToastKind::Info,
+            );
+        }
         match action {
             // ---- motions ----
             A::MoveChar(direction) => self.move_motion(Motion::Char { direction, count }, extend),

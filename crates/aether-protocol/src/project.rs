@@ -65,6 +65,13 @@ pub struct ProjectActivateResult {
     /// With `open_last`: the landing buffer, fully opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened: Option<BufferOpenResult>,
+    /// The server instance's start time (unix ms) — its identity for restart detection. A client
+    /// caches it on activation and compares across reconnects: a changed value means the daemon
+    /// restarted (so unsaved buffer state died with it), distinct from a connection that merely
+    /// blipped. Carried on the wire rather than read from a discovery file, so it's authoritative
+    /// for the instance you're actually talking to.
+    #[serde(default)]
+    pub server_started_at: u64,
 }
 
 /// Describes the active project: its name and absolute root paths. Returned by

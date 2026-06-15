@@ -29,6 +29,11 @@ pub(crate) type PendingRpc = Box<
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
     Connected,
+    /// Initial boot: no connection has ever been established yet — the client launched (possibly
+    /// before the daemon) and is dialing. Distinct from [`Self::Reconnecting`] because there's no
+    /// prior session to restore and nothing unsaved to lose, so the UI says "Connecting…" rather
+    /// than "Reconnecting…". The shells render their boot backdrop in this state.
+    Connecting,
     /// The socket died; a backoff retry is in flight. `had_unsaved` remembers whether edits
     /// were pending at disconnect — landing on a *restarted* daemon then means they're gone
     /// (buffers live in daemon memory), which warrants a warning.

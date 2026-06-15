@@ -1,7 +1,6 @@
 mod app;
 mod clipboard;
 mod connection;
-mod discovery;
 mod labels;
 mod overlay_input;
 mod picker;
@@ -59,32 +58,20 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let info = discovery::read()?;
-    let base_url = format!("ws://127.0.0.1:{}", info.port);
-    let (handle, notifications) = connection::connect(&base_url, env!("CARGO_PKG_VERSION")).await?;
-
     let mut terminal = setup_terminal()?;
     install_panic_hook();
 
-    let (cols, rows) = crossterm::terminal::size()?;
-    let (session, state, startup) = match shell::bootstrap(
-        &handle,
-        cli.project.as_deref(),
-        cli.file.as_deref(),
-        cols,
-        rows,
+    // Launch connectionless: the editor chrome comes up immediately in a `Connecting` state
+    // (status row showing "Connecting…", client-side keys live) and `run` dials the fixed loopback
+    // address from within — no discovery file — so the client can start before the daemon and
+    // waits for it without leaving the editor. The boot dial installs the session once it lands.
+    let run_result = shell::run(
+        &mut terminal,
+        cli.project,
+        cli.file,
+        env!("CARGO_PKG_VERSION").to_string(),
     )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            restore_terminal(&mut terminal).ok();
-            return Err(e);
-        }
-    };
-
-    let run_result =
-        shell::run(&mut terminal, handle, notifications, session, state, startup).await;
+    .await;
     restore_terminal(&mut terminal)?;
     run_result
 }

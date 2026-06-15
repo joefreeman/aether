@@ -8,8 +8,9 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Fixed loopback port. Single-instance: only one server can bind it. Clients hard-code this.
-pub const SERVER_PORT: u16 = 2384;
+/// Fixed loopback port. Single-instance: only one server can bind it. The canonical definition
+/// (shared with the clients, which hard-code it) lives in `aether_protocol`.
+pub use aether_protocol::SERVER_PORT;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {

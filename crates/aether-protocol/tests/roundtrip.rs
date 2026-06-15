@@ -977,6 +977,7 @@ fn project_activate_result_wraps_info() {
         },
         last_buffer_id: None,
         opened: None,
+        server_started_at: 0,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["project"]["name"], "aether");
@@ -1138,9 +1139,11 @@ fn project_activate_result_includes_last_buffer_id_when_set() {
         },
         last_buffer_id: Some(7),
         opened: None,
+        server_started_at: 1_700_000_000_000,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["last_buffer_id"], 7);
+    assert_eq!(v["server_started_at"], 1_700_000_000_000_u64);
 }
 
 #[test]

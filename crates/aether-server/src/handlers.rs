@@ -188,6 +188,7 @@ pub async fn project_activate(
         .get(&params.name)
         .map(|p| p.paths.iter().map(|p| p.display().to_string()).collect())
         .unwrap_or_default();
+    let server_started_at = s.started_at_unix_ms;
 
     if let Some(session) = s.clients.get_mut(&client_id) {
         session.active_project = Some(params.name.clone());
@@ -238,6 +239,7 @@ pub async fn project_activate(
         },
         last_buffer_id,
         opened,
+        server_started_at,
     })
 }
 
@@ -310,6 +312,7 @@ pub async fn project_create(
     if let Some(session) = s.clients.get_mut(&client_id) {
         session.active_project = Some(name.clone());
     }
+    let server_started_at = s.started_at_unix_ms;
 
     // Another client's open chooser should gain the new project.
     let pushes = refresh_project_pickers(&mut s);
@@ -326,6 +329,7 @@ pub async fn project_create(
         },
         last_buffer_id: None,
         opened: None,
+        server_started_at,
     })
 }
 

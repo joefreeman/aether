@@ -10,7 +10,6 @@ use crate::watcher;
 use anyhow::{bail, Context};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -24,10 +23,15 @@ pub async fn run() -> anyhow::Result<()> {
 
     let runtime_path = config::runtime_info_path()?;
     handle_existing_runtime_file(&runtime_path)?;
+
+    // The instance's start stamp lives on `ServerState` (it's reported to clients on
+    // `project/activate` for restart detection); the runtime file mirrors the same value, so the
+    // file and the wire never disagree about which instance this is.
+    let state = Arc::new(Mutex::new(ServerState::new()));
     let info = RuntimeInfo {
         pid: std::process::id(),
         port,
-        started_at_unix_ms: now_unix_ms(),
+        started_at_unix_ms: state.lock().await.started_at_unix_ms,
     };
     config::write_runtime_info(&runtime_path, &info)?;
     tracing::info!(
@@ -39,7 +43,6 @@ pub async fn run() -> anyhow::Result<()> {
     // Drop guard to clean up the runtime file regardless of how we exit.
     let _guard = RuntimeFileGuard(runtime_path);
 
-    let state = Arc::new(Mutex::new(ServerState::new()));
     run_with_listener(listener, state).await
 }
 
@@ -200,13 +203,6 @@ fn handle_existing_runtime_file(path: &std::path::Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 struct RuntimeFileGuard(PathBuf);

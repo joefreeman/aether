@@ -188,6 +188,9 @@ fn mode(m: Mode) -> &'static str {
 fn conn(c: &ConnState) -> Value {
     match c {
         ConnState::Connected => json!({ "state": "connected" }),
+        // The browser client is served *by* the daemon, so it never boots before the server —
+        // `Connecting` can't occur there, but it's mapped for completeness.
+        ConnState::Connecting => json!({ "state": "connecting" }),
         ConnState::Reconnecting {
             attempt,
             had_unsaved,
