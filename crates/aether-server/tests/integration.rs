@@ -37,7 +37,8 @@ use aether_protocol::nav::{
     NavStepParams, NavStepResult,
 };
 use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, PickerFilters, PickerGrepNavigate, PickerGrepNavigateParams,
+    BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate,
+    PickerGrepNavigateParams,
     PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
     PickerQueryParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
     PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
@@ -1105,6 +1106,7 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -1160,11 +1162,58 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
     assert_eq!(nav.summary.total, 1);
     assert_eq!(nav.cursor.position, LogicalPosition { line: 0, col: 9 });
+}
+
+#[tokio::test]
+async fn buffer_open_prime_search_carries_options() {
+    // A grep result primes the opened buffer's search with the grep's match options
+    // (`prime_search_options`), so the primed search matches the same way the grep that found the
+    // hit did. "a.c" as a literal must NOT match "abc".
+    let (_server, mut ws, buffer_id) = setup_with_buffer("a.c abc axc\n").await;
+
+    // Regex prime (default options): "a.c" matches all three.
+    let regex: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            buffer_id: Some(buffer_id),
+            prime_search: Some("a.c".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        regex.search_summary.as_ref().map(|s| s.total),
+        Some(3),
+        "regex prime matches a.c / abc / axc"
+    );
+
+    // Literal prime: same query, but `fixed_string` makes it match only the literal "a.c".
+    let literal: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        11,
+        &BufferOpenParams {
+            buffer_id: Some(buffer_id),
+            prime_search: Some("a.c".into()),
+            prime_search_options: MatchOptions {
+                fixed_string: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        literal.search_summary.as_ref().map(|s| s.total),
+        Some(1),
+        "literal prime matches only the exact a.c"
+    );
 }
 
 #[tokio::test]
@@ -1454,6 +1503,7 @@ async fn search_set_from_selection_escapes_and_echoes() {
             anchor: None,
             extend: false,
             from_selection: true,
+            options: Default::default(),
         },
     )
     .await;
@@ -1481,6 +1531,7 @@ async fn search_set_from_selection_escapes_and_echoes() {
             anchor: None,
             extend: false,
             from_selection: true,
+            options: Default::default(),
         },
     )
     .await;
@@ -1501,6 +1552,7 @@ async fn search_nav_count_and_revive() {
             extend: false,
             count: 2,
             set_query: Some("x".into()),
+            options: Default::default(),
         },
     )
     .await;
@@ -1520,6 +1572,7 @@ async fn search_nav_count_and_revive() {
             extend: false,
             count: 1,
             set_query: Some("zzz".into()),
+            options: Default::default(),
         },
     )
     .await;
@@ -8239,6 +8292,7 @@ async fn search_set_returns_summary_and_jumps_to_first_match() {
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8248,6 +8302,54 @@ async fn search_set_returns_summary_and_jumps_to_first_match() {
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 0 });
 
+    drop(server);
+}
+
+#[tokio::test]
+async fn search_set_honours_match_options() {
+    // Helper: set the search and return the total match count for the given options.
+    async fn total(ws: &mut Ws, id: u64, buffer_id: u64, q: &str, options: MatchOptions) -> u32 {
+        let r: SearchSetResult = send_request::<SearchSet>(
+            ws,
+            id,
+            &SearchSetParams {
+                buffer_id,
+                query: q.into(),
+                anchor: None,
+                extend: false,
+                from_selection: false,
+                options,
+            },
+        )
+        .await;
+        r.summary.total
+    }
+
+    // Case: smartcase (lowercase query) matches all three; forced-sensitive matches only the two
+    // lowercase runs; forced-insensitive matches all three again.
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo Foo foo\n").await;
+    assert_eq!(total(&mut ws, 10, buffer_id, "foo", MatchOptions::default()).await, 3);
+    let sensitive = MatchOptions { case: CaseMode::Sensitive, ..Default::default() };
+    assert_eq!(total(&mut ws, 11, buffer_id, "foo", sensitive).await, 2);
+    let insensitive = MatchOptions { case: CaseMode::Insensitive, ..Default::default() };
+    assert_eq!(total(&mut ws, 12, buffer_id, "Foo", insensitive).await, 3);
+    drop(server);
+
+    // Whole-word: "foo" inside "foobar" is excluded once word boundaries are required.
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo foobar foo\n").await;
+    assert_eq!(total(&mut ws, 20, buffer_id, "foo", MatchOptions::default()).await, 3);
+    let word = MatchOptions { whole_word: true, ..Default::default() };
+    assert_eq!(total(&mut ws, 21, buffer_id, "foo", word).await, 2);
+    drop(server);
+
+    // Literal: "a.c" as a regex matches "abc"/"axc" too; as a fixed string it matches only "a.c".
+    let (server, mut ws, buffer_id) = setup_with_buffer("a.c abc axc\n").await;
+    assert_eq!(total(&mut ws, 30, buffer_id, "a.c", MatchOptions::default()).await, 3);
+    let literal = MatchOptions { fixed_string: true, ..Default::default() };
+    assert_eq!(total(&mut ws, 31, buffer_id, "a.c", literal).await, 1);
+    // Literal + whole-word together don't double-escape: "a.c" still matches as a whole word.
+    let literal_word = MatchOptions { fixed_string: true, whole_word: true, ..Default::default() };
+    assert_eq!(total(&mut ws, 32, buffer_id, "a.c", literal_word).await, 1);
     drop(server);
 }
 
@@ -8266,6 +8368,7 @@ async fn search_set_extend_grows_selection_from_anchor_through_match() {
             anchor: Some(LogicalPosition { line: 0, col: 4 }),
             extend: true,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8291,6 +8394,7 @@ async fn search_set_extend_resets_to_match_on_wrap() {
             anchor: Some(LogicalPosition { line: 1, col: 4 }),
             extend: true,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8313,6 +8417,7 @@ async fn search_smartcase_lowercase_is_case_insensitive() {
             anchor: None,
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8333,6 +8438,7 @@ async fn search_smartcase_uppercase_is_case_sensitive() {
             anchor: None,
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8353,6 +8459,7 @@ async fn search_regex_metacharacters() {
             anchor: None,
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8373,6 +8480,7 @@ async fn search_no_matches_returns_zero_summary() {
             anchor: None,
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8395,6 +8503,7 @@ async fn search_empty_query_clears_active_search() {
             anchor: None,
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8407,6 +8516,7 @@ async fn search_empty_query_clears_active_search() {
             anchor: None,
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8427,6 +8537,7 @@ async fn search_next_cycles_forward_and_wraps() {
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8438,6 +8549,7 @@ async fn search_next_cycles_forward_and_wraps() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8451,6 +8563,7 @@ async fn search_next_cycles_forward_and_wraps() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8464,6 +8577,7 @@ async fn search_next_cycles_forward_and_wraps() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8484,6 +8598,7 @@ async fn search_prev_cycles_backward_with_wrap() {
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8496,6 +8611,7 @@ async fn search_prev_cycles_backward_with_wrap() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8517,6 +8633,7 @@ async fn search_prev_orients_backward() {
             anchor: Some(LogicalPosition { line: 0, col: 8 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8530,6 +8647,7 @@ async fn search_prev_orients_backward() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8553,6 +8671,7 @@ async fn search_next_wrap_stays_forward_oriented() {
             anchor: Some(LogicalPosition { line: 1, col: 0 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8567,6 +8686,7 @@ async fn search_next_wrap_stays_forward_oriented() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8590,6 +8710,7 @@ async fn search_prev_wrap_stays_backward_oriented() {
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8604,6 +8725,7 @@ async fn search_prev_wrap_stays_backward_oriented() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8630,6 +8752,7 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
             anchor: Some(LogicalPosition { line: 0, col: 8 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8642,6 +8765,7 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8657,6 +8781,7 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8681,6 +8806,7 @@ async fn search_extend_resets_to_single_match_on_wrap() {
             anchor: Some(LogicalPosition { line: 0, col: 4 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8693,6 +8819,7 @@ async fn search_extend_resets_to_single_match_on_wrap() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8704,6 +8831,7 @@ async fn search_extend_resets_to_single_match_on_wrap() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8719,6 +8847,7 @@ async fn search_extend_resets_to_single_match_on_wrap() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8744,6 +8873,7 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8756,6 +8886,7 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8769,6 +8900,7 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8791,6 +8923,7 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8803,6 +8936,7 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8815,6 +8949,7 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8838,6 +8973,7 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
             anchor: Some(LogicalPosition { line: 0, col: 0 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8851,6 +8987,7 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8869,6 +9006,7 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8891,6 +9029,7 @@ async fn search_prev_extend_keeps_anchor_and_grows_backward() {
             anchor: Some(LogicalPosition { line: 1, col: 0 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8906,6 +9045,7 @@ async fn search_prev_extend_keeps_anchor_and_grows_backward() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8930,6 +9070,7 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
             anchor: Some(LogicalPosition { line: 0, col: 8 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8943,6 +9084,7 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8959,6 +9101,7 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
             extend: true,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -8980,6 +9123,7 @@ async fn search_clear_removes_active_search() {
             anchor: None,
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;
@@ -8993,6 +9137,7 @@ async fn search_clear_removes_active_search() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -12081,6 +12226,7 @@ async fn grep_navigate_open_composite_returns_opened_buffer() {
             extend: false,
             count: 1,
             set_query: None,
+            options: Default::default(),
         },
     )
     .await;
@@ -12391,6 +12537,7 @@ async fn search_set_response_carries_grep_position() {
             anchor: Some(LogicalPosition { line: 1, col: 4 }),
             extend: false,
             from_selection: false,
+            options: Default::default(),
         },
     )
     .await;

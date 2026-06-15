@@ -281,6 +281,33 @@ impl CaseMode {
     }
 }
 
+/// The three pattern-matching options shared by the grep picker ([`PickerFilters`]) and buffer
+/// search (`search/set`): how the pattern treats letter case, whether it matches only at word
+/// boundaries, and whether the query is a literal string rather than a regex. The defaults
+/// (`Smart`, off, off) mean "regex, smartcase" — the long-standing buffer-search behavior — so an
+/// all-default value is a no-op on the wire and equivalent to the field being absent.
+///
+/// Grep derives these from its filter chips; buffer search toggles them in the search prompt
+/// (`Alt-c` / `Alt-w` / `Alt-e`). When a grep result primes a buffer's search the grep options
+/// ride along (`BufferOpenParams::prime_search_options`) so the primed search matches the same
+/// way the grep that found it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MatchOptions {
+    #[serde(default, skip_serializing_if = "CaseMode::is_smart")]
+    pub case: CaseMode,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub whole_word: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fixed_string: bool,
+}
+
+impl MatchOptions {
+    /// True when every option is at its default — used to skip the field on the wire.
+    pub fn is_default(&self) -> bool {
+        *self == MatchOptions::default()
+    }
+}
+
 /// A directory inside one of the project's roots — the `dir:` filter chip. Addressed the same
 /// way picker items are (`path_index` + root-relative path) so it survives root reordering no
 /// worse than everything else does. There is deliberately no separate root filter: scoping to
@@ -354,6 +381,17 @@ impl PickerFilters {
     /// the field on the wire and to short-circuit filter passes server-side.
     pub fn is_default(&self) -> bool {
         *self == PickerFilters::default()
+    }
+
+    /// The pattern-matching subset (case / whole-word / literal) — the options that also apply to
+    /// buffer search. Used when a grep result primes a buffer's search so the primed search
+    /// matches the same way the grep did.
+    pub fn match_options(&self) -> MatchOptions {
+        MatchOptions {
+            case: self.case,
+            whole_word: self.whole_word,
+            fixed_string: self.fixed_string,
+        }
     }
 }
 
@@ -606,6 +644,11 @@ pub struct PickerGrepNavigateTarget {
     /// The grep query the cached hits came from. Echoed so the client can prime the opened
     /// buffer's search state for `n` / `Alt-n` follow-on, the same way picker selection does.
     pub query: String,
+    /// The grep search's match options (case / whole-word / literal). Echoed alongside `query` so
+    /// the client's primed search state matches how the grep that found the hits ran. Defaults
+    /// (regex, smartcase) when absent.
+    #[serde(default, skip_serializing_if = "MatchOptions::is_default")]
+    pub options: MatchOptions,
     /// With `open`: the target, fully opened (transient, at `position`, search primed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened: Option<crate::buffer::BufferOpenResult>,

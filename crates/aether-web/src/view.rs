@@ -261,6 +261,18 @@ fn pending(p: &Pending) -> Value {
 
 fn search(s: &Session) -> Value {
     let q = &s.search;
+    // The active match options as chips (case / whole-word / literal), rendered with the same
+    // styling as the grep picker's filter chips. `flag` marks the chips that render underlined.
+    let chips = q
+        .option_chips()
+        .iter()
+        .map(|c| {
+            json!({
+                "label": c.label,
+                "flag": matches!(&c.id, aether_client::chips::ChipId::Word),
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "query": q.query,
         "active": q.active,
@@ -269,6 +281,8 @@ fn search(s: &Session) -> Value {
         "history_cursor": q.history_cursor,
         "history_draft": q.history_draft,
         "extend_to_cursor": q.extend_to_cursor,
+        "chips": chips,
+        "chip_selected": q.chip_selected,
     })
 }
 

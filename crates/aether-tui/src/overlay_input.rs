@@ -81,10 +81,11 @@ pub fn classify(code: KeyCode, mods: Mods) -> KeyClass {
 ///   tag-input gesture) rather than moving/deleting in an empty-to-the-left field.
 pub fn is_command_override(field: OverlayField, code: KeyCode, cursor: usize) -> bool {
     match field {
-        OverlayField::PickerQuery => match code {
-            // `Left` / `Backspace` at the query start step into the filter-chip row (the browser
-            // tag-input gesture). `Delete` is a plain forward-delete here — trashing a file is
-            // `Ctrl-d` (a deliberate chord), never a bare editing key.
+        // `Left` / `Backspace` at the query start step into the filter-chip row (the browser
+        // tag-input gesture). `Delete` is a plain forward-delete here — trashing a file is
+        // `Ctrl-d` (a deliberate chord), never a bare editing key. The search bar's option chips
+        // use the same gesture.
+        OverlayField::PickerQuery | OverlayField::Search => match code {
             KeyCode::Left | KeyCode::Backspace => cursor == 0,
             _ => false,
         },

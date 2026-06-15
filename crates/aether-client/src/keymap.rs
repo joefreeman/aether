@@ -236,6 +236,12 @@ pub enum Action {
     SearchCommit,
     SearchHistoryPrev,
     SearchHistoryNext,
+    /// `Alt-c` in the search prompt: cycle case mode (smart → sensitive → insensitive → smart).
+    SearchToggleCase,
+    /// `Alt-w` in the search prompt: toggle whole-word matching.
+    SearchToggleWord,
+    /// `Alt-e` in the search prompt: toggle literal (fixed-string) vs. regex matching.
+    SearchToggleRegex,
     /// `>` / `<` — step through cached grep hits from the cursor, cross-file.
     GrepNavigate(Direction),
     /// `Esc` in Normal — drop the active search (clear highlights).
@@ -663,6 +669,10 @@ static SEARCH: &[Binding] = &[
     // Alt-k/j (not Up/Down) browse history — same chord as the TUI / picker inputs.
     bind!(KeyContext::Search, ch('k'), Exact(Mods::ALT), A::SearchHistoryPrev, "Search", "Previous query in history"),
     bind!(KeyContext::Search, ch('j'), Exact(Mods::ALT), A::SearchHistoryNext, "Search", "Next query in history"),
+    // Match-option toggles, mirroring the grep picker's chip chords (Alt-c / Alt-w / Alt-e).
+    bind!(KeyContext::Search, ch('c'), Exact(Mods::ALT), A::SearchToggleCase, "Search", "Cycle case sensitivity"),
+    bind!(KeyContext::Search, ch('w'), Exact(Mods::ALT), A::SearchToggleWord, "Search", "Toggle whole-word match"),
+    bind!(KeyContext::Search, ch('e'), Exact(Mods::ALT), A::SearchToggleRegex, "Search", "Toggle literal/regex"),
     // Text entry (chars, Backspace, Left/Right caret) is owned by each shell's search input, which
     // syncs the value via `search_set_query`; only the command keys above live in this table.
 ];

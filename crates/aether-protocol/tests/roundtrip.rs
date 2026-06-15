@@ -32,6 +32,7 @@ use aether_protocol::lsp::{
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
 };
+use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::{SearchSet, SearchSetParams};
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
@@ -510,13 +511,14 @@ fn search_set_params() {
     use aether_protocol::envelope::RpcMethod;
     assert_eq!(SearchSet::NAME, "search/set");
 
-    // Full shape: anchor present, extend set.
+    // Full shape: anchor present, extend set. Default `options` is skipped on the wire.
     let v = to_value(SearchSetParams {
         buffer_id: 3,
         query: "foo".into(),
         anchor: Some(LogicalPosition { line: 2, col: 5 }),
         extend: true,
         from_selection: false,
+        options: MatchOptions::default(),
     })
     .unwrap();
     assert_eq!(
@@ -530,11 +532,29 @@ fn search_set_params() {
         })
     );
 
-    // `extend` defaults to false when omitted on the wire (back-compat with older clients).
+    // Non-default options serialize as a nested object (case skipped when smart).
+    let v = to_value(SearchSetParams {
+        buffer_id: 3,
+        query: "foo".into(),
+        anchor: None,
+        extend: false,
+        from_selection: false,
+        options: MatchOptions {
+            case: CaseMode::Sensitive,
+            whole_word: true,
+            fixed_string: false,
+        },
+    })
+    .unwrap();
+    assert_eq!(v["options"], json!({"case": "sensitive", "whole_word": true}));
+
+    // `extend` defaults to false and `options` to all-default when omitted on the wire
+    // (back-compat with older clients).
     let p: SearchSetParams =
         from_value(json!({"buffer_id": 3, "query": "foo", "anchor": null})).unwrap();
     assert!(!p.extend);
     assert!(p.anchor.is_none());
+    assert_eq!(p.options, MatchOptions::default());
 }
 
 #[test]

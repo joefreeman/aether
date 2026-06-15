@@ -48,9 +48,10 @@ use aether_protocol::nav::{
 };
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    BufferDirtyState, PickerGrepFileJumpParams, PickerGrepNavigateParams, PickerGrepNavigateTarget,
-    PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerSelectParams,
-    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams, PickerViewResult,
+    BufferDirtyState, CaseMode, MatchOptions, PickerGrepFileJumpParams, PickerGrepNavigateParams,
+    PickerGrepNavigateTarget, PickerHideParams, PickerItem, PickerKind, PickerQueryParams,
+    PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
+    PickerViewResult,
 };
 use aether_protocol::project::{
     ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
@@ -813,12 +814,14 @@ pub async fn buffer_open(
         }
     }
     let prime = params.prime_search.clone();
+    let prime_options = params.prime_search_options;
     let mut result = buffer_open_inner(state, ctx, params).await?;
     // Composite post-step: prime the opened buffer's search, anchored at the just-jumped
     // cursor so the first match at-or-after lands SELECTED (a grep jump selects the match).
     // The result's cursor is patched to the selection so clients adopt it directly.
     if let Some(query) = prime.filter(|q| !q.is_empty()) {
-        if let Some((cursor, summary)) = prime_search_for(state, ctx, result.buffer_id, &query).await
+        if let Some((cursor, summary)) =
+            prime_search_for(state, ctx, result.buffer_id, &query, prime_options).await
         {
             result.cursor = cursor;
             result.search_summary = Some(summary);
@@ -839,6 +842,7 @@ async fn prime_search_for(
     ctx: &mut ConnectionCtx,
     buffer_id: BufferId,
     query: &str,
+    options: MatchOptions,
 ) -> Option<(CursorState, SearchSummary)> {
     let anchor = {
         let s = state.lock().await;
@@ -857,6 +861,7 @@ async fn prime_search_for(
             anchor: Some(anchor),
             extend: false,
             from_selection: false,
+            options,
         },
     )
     .await
@@ -2351,22 +2356,46 @@ pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -
 
 pub const SEARCH_MAX_MATCHES: usize = 10_000;
 
-/// Run `query` against the buffer and produce a fresh `SearchEntry`. Smartcase (case-insensitive
-/// unless the query has any uppercase) and `multi_line: true`. Zero-width matches are skipped so
+/// Run `query` against the buffer and produce a fresh `SearchEntry`, honouring `options`:
+/// `fixed_string` escapes the query to a literal, `whole_word` wraps it in `\b…\b`, and `case`
+/// selects smartcase (case-insensitive unless the query has an uppercase letter), forced-sensitive
+/// or forced-insensitive. `multi_line: true` throughout. Zero-width matches are skipped so
 /// patterns like `^` don't pin the cursor.
-pub fn compute_search_entry(buf: &Buffer, query: &str) -> Result<SearchEntry, RpcError> {
+pub fn compute_search_entry(
+    buf: &Buffer,
+    query: &str,
+    options: &MatchOptions,
+) -> Result<SearchEntry, RpcError> {
     if query.is_empty() {
         return Ok(SearchEntry {
             query: String::new(),
+            options: *options,
             matches: Vec::new(),
             truncated: false,
             last_pushed_index: 0,
         });
     }
     let regex = {
-        let has_upper = query.chars().any(|c| c.is_uppercase());
-        regex::RegexBuilder::new(query)
-            .case_insensitive(!has_upper)
+        // Literal queries are escaped first; whole-word then fences the (escaped or raw) pattern
+        // with word boundaries. Smartcase reads the *original* query's casing, matching grep and
+        // the prior buffer-search behavior.
+        let body = if options.fixed_string {
+            regex::escape(query)
+        } else {
+            query.to_string()
+        };
+        let pattern = if options.whole_word {
+            format!(r"\b(?:{body})\b")
+        } else {
+            body
+        };
+        let case_insensitive = match options.case {
+            CaseMode::Smart => !query.chars().any(|c| c.is_uppercase()),
+            CaseMode::Sensitive => false,
+            CaseMode::Insensitive => true,
+        };
+        regex::RegexBuilder::new(&pattern)
+            .case_insensitive(case_insensitive)
             .multi_line(true)
             .build()
             .map_err(|e| RpcError::new(ErrorCode::INVALID_PARAMS, format!("invalid regex: {e}")))?
@@ -2377,6 +2406,7 @@ pub fn compute_search_entry(buf: &Buffer, query: &str) -> Result<SearchEntry, Rp
     if len_bytes == 0 {
         return Ok(SearchEntry {
             query: query.to_string(),
+            options: *options,
             matches,
             truncated,
             last_pushed_index: 0,
@@ -2398,6 +2428,7 @@ pub fn compute_search_entry(buf: &Buffer, query: &str) -> Result<SearchEntry, Rp
     }
     Ok(SearchEntry {
         query: query.to_string(),
+        options: *options,
         matches,
         truncated,
         last_pushed_index: 0,
@@ -2437,6 +2468,9 @@ pub async fn search_set(
             });
         }
         params.query = regex::escape(&text);
+        // The selection is already regex-escaped to a literal, so a `fixed_string` option would
+        // escape it a second time — clear it (case / whole-word still apply).
+        params.options.fixed_string = false;
         effective_query = Some(params.query.clone());
     }
     let (summary, pushes) = if params.query.is_empty() {
@@ -2450,7 +2484,7 @@ pub async fn search_set(
         let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
         (summary, pushes)
     } else {
-        let mut entry = compute_search_entry(buf, &params.query)?;
+        let mut entry = compute_search_entry(buf, &params.query, &params.options)?;
         // If the caller passed an anchor, jump the cursor to the first match at-or-after it
         // (wrapping to the first match if none). This is how incremental search keeps the cursor
         // anchored at `/`-press time across keystrokes.
@@ -2568,6 +2602,7 @@ async fn search_navigate_counted(
                 anchor: None,
                 extend: false,
                 from_selection: false,
+                options: params.options,
             },
         )
         .await?;
@@ -3013,8 +3048,9 @@ fn refresh_searches_for_buffer(s: &mut ServerState, buffer_id: BufferId) -> Pend
         .collect();
     for key in keys {
         let query = s.searches[&key].query.clone();
+        let options = s.searches[&key].options;
         let buf = &s.buffers[&buffer_id];
-        let mut entry = match compute_search_entry(buf, &query) {
+        let mut entry = match compute_search_entry(buf, &query, &options) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -3252,6 +3288,7 @@ async fn navigate_to(
         transient: Some(true),
         record_nav_from: None,
         prime_search: None,
+        prime_search_options: MatchOptions::default(),
     };
     let mut result = buffer_open(state, ctx, open_params).await?;
 
@@ -9398,6 +9435,7 @@ pub async fn picker_grep_navigate(
         Direction::Backward => find_prev_grep_hit(hits, current_key_ref, min_edge),
     };
     let query = picker.query.clone();
+    let options = picker.filters.match_options();
     let target = target.map(|c| {
         (
             c.path_index,
@@ -9427,6 +9465,7 @@ pub async fn picker_grep_navigate(
                     transient: Some(true),
                     record_nav_from: Some(params.buffer_id),
                     prime_search: Some(query.clone()),
+                    prime_search_options: options,
                     ..Default::default()
                 },
             )
@@ -9439,6 +9478,7 @@ pub async fn picker_grep_navigate(
         path,
         position,
         query,
+        options,
         opened,
     }))
 }

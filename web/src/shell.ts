@@ -138,6 +138,11 @@ interface SearchView {
   query: string;
   active: boolean;
   extend_to_cursor: boolean;
+  /** Active match options as chips (case / whole-word / literal), styled like the grep picker's
+   *  filter chips. `flag` marks the chips rendered underlined. Empty when all options are default. */
+  chips: { label: string; flag: boolean }[];
+  /** The keyboard-selected option chip (index into `chips`), or null when the query owns focus. */
+  chip_selected: number | null;
   summary: { total: number; current_index: number; truncated: boolean } | null;
 }
 
@@ -516,6 +521,7 @@ export class Shell {
   private readonly searchBar: HTMLElement;
   private readonly searchInput: HTMLInputElement;
   private readonly searchPrefixEl: HTMLElement;
+  private readonly searchChipsEl: HTMLElement;
   private readonly searchCountEl: HTMLElement;
   private readonly overlayEl: HTMLElement;
   /** Save-as has its own persistent overlay (with native <input>s); confirm/lsp-info prompts are
@@ -673,12 +679,22 @@ export class Shell {
     this.searchPrefixEl.className = "search-count";
     this.searchInput = document.createElement("input");
     this.searchInput.className = "search-input";
+    this.searchInput.placeholder = "Search";
     this.searchInput.spellcheck = false;
     this.searchInput.autocapitalize = "off";
     this.searchInput.setAttribute("autocomplete", "off");
+    // Match-option chips lead the row (after the `/`), styled exactly like the picker's filter
+    // chips (reusing `.picker-chips` / `.picker-chip`).
+    this.searchChipsEl = document.createElement("div");
+    this.searchChipsEl.className = "picker-chips";
     this.searchCountEl = document.createElement("span");
     this.searchCountEl.className = "search-count";
-    this.searchBar.append(this.searchPrefixEl, this.searchInput, this.searchCountEl);
+    this.searchBar.append(
+      this.searchPrefixEl,
+      this.searchChipsEl,
+      this.searchInput,
+      this.searchCountEl,
+    );
     this.searchInput.addEventListener("input", () => {
       if (this.session) {
         this.runEffects(this.session.search_set_query(this.searchInput.value) as CoreEffect[]);
@@ -1126,7 +1142,9 @@ export class Shell {
     // A selected filter chip owns the keyboard, not the query: park focus on the hidden capture
     // field (the chip-row keys route through the global handler) so the query input shows no caret.
     if (v?.picker) return v.picker.chip_selected !== null ? this.capture : this.pickerInput;
-    if (v?.mode === "search") return this.searchInput;
+    // A selected search option chip parks focus off the query (like the picker's chips), so its
+    // row keys route through the global handler instead of being eaten by the input.
+    if (v?.mode === "search") return v.search.chip_selected !== null ? this.capture : this.searchInput;
     if (v?.prompt?.kind === "saveas") {
       return v.prompt.multi_root && v.prompt.field === "root"
         ? this.saveAsRootInput
@@ -1215,6 +1233,19 @@ export class Shell {
     // deselect-and-type. Mirrors the native clients, which route chip keys with the input unfocused.
     const pk = this.snapshot?.picker;
     if (pk && !pk.chip_editor && pk.chip_selected !== null && this.session) {
+      if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
+        e.preventDefault();
+        this.runEffects(
+          this.session.on_key(e.key, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+        );
+      }
+      return;
+    }
+    // A search option chip is selected: focus is parked off the query input (see `focusTarget`), so
+    // drive the chip-row keys through the core here — Left/Right navigate, Backspace/Delete remove,
+    // Enter cycles, Esc/typing deselect. Mirrors the picker's selected-chip branch above.
+    const sv = this.snapshot;
+    if (sv?.mode === "search" && sv.search.chip_selected !== null && this.session) {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
         e.preventDefault();
         this.runEffects(
@@ -1907,6 +1938,19 @@ export class Shell {
   }
 
   private onSearchInputKey(e: KeyboardEvent): void {
+    // At the very start of the query, Left / Backspace step into the option-chip row, selecting the
+    // rightmost chip (the browser tag-input gesture, mirroring the picker query). Once a chip is
+    // selected, focus parks off the input and its row keys route through the global `onKeyDown`.
+    const s = this.snapshot?.search;
+    if (s && s.chips.length > 0 && this.session) {
+      const atStart = this.searchInput.selectionStart === 0 && this.searchInput.selectionEnd === 0;
+      if (atStart && !e.ctrlKey && !e.altKey && !e.metaKey &&
+          (e.key === "ArrowLeft" || e.key === "Backspace")) {
+        e.preventDefault();
+        this.runEffects(this.session.search_select_last_chip() as CoreEffect[]);
+        return;
+      }
+    }
     this.routeOverlayKey(e);
   }
 
@@ -1957,12 +2001,33 @@ export class Shell {
     }
     const s = v.search;
     this.searchBar.style.display = "flex";
-    this.searchPrefixEl.textContent = s.extend_to_cursor ? "?" : "/";
+    // The `?` extend-to-cursor variant still shows its cue; plain search shows no prefix (the
+    // "Search" placeholder and the bar's styling already signal search mode).
+    this.searchPrefixEl.textContent = s.extend_to_cursor ? "?" : "";
+    this.searchPrefixEl.style.display = s.extend_to_cursor ? "" : "none";
     if (this.searchInput.value !== s.query) this.searchInput.value = s.query;
+    this.searchChipsEl.replaceChildren(
+      ...s.chips.map((c, i) => {
+        const el = document.createElement("span");
+        let cls = "picker-chip";
+        if (c.flag) cls += " flag";
+        if (i === s.chip_selected) cls += " selected";
+        el.className = cls;
+        el.textContent = c.label;
+        return el;
+      }),
+    );
     this.searchCountEl.textContent = s.summary
       ? `${s.summary.current_index}/${s.summary.total}${s.summary.truncated ? "+" : ""}`
       : "";
-    if (document.activeElement !== this.searchInput) this.searchInput.focus();
+    // Focus follows selection: a selected option chip parks focus on the hidden capture field (so
+    // its row keys route through the global handler, like the picker); otherwise the query input
+    // holds focus for native typing.
+    if (s.chip_selected !== null) {
+      if (document.activeElement === this.searchInput) this.capture.focus();
+    } else if (document.activeElement !== this.searchInput) {
+      this.searchInput.focus();
+    }
   }
 
   private renderPrompt(v: CoreView): void {

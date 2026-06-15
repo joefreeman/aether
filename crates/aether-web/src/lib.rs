@@ -233,6 +233,12 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.picker_select_last_chip()))
     }
 
+    /// Select the rightmost search option chip (Left/Backspace at the search query start). Returns
+    /// `Effect[]`.
+    pub fn search_select_last_chip(&mut self) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.search_select_last_chip()))
+    }
+
     /// Replace the search query (native search `<input>` owns editing). Returns `Effect[]`.
     pub fn search_set_query(&mut self, query: String) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.search_set_query(query)))

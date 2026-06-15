@@ -4,6 +4,7 @@
 
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
+use crate::picker::MatchOptions;
 use crate::{BufferId, LogicalPosition};
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,12 @@ pub struct SearchSetParams {
     /// nothing was set.
     #[serde(default)]
     pub from_selection: bool,
+    /// How the pattern matches: case mode, whole-word, and regex-vs-literal. Defaults (regex,
+    /// smartcase) reproduce the long-standing buffer-search behavior, so an absent field is a
+    /// no-op. Toggled in the search prompt (`Alt-c` / `Alt-w` / `Alt-e`) and carried over from a
+    /// grep result that primed the search.
+    #[serde(default, skip_serializing_if = "MatchOptions::is_default")]
+    pub options: MatchOptions,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,6 +108,11 @@ pub struct SearchNavParams {
     /// skipped and the zero-total summary comes back as-is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set_query: Option<String>,
+    /// Match options for the `set_query` revive (ignored without it) — the client's sticky search
+    /// options, so a revived search matches the way it did before it was dropped. Defaults
+    /// (regex, smartcase) when absent.
+    #[serde(default, skip_serializing_if = "MatchOptions::is_default")]
+    pub options: MatchOptions,
 }
 
 fn default_nav_count() -> u32 {

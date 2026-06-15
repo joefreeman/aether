@@ -10,6 +10,7 @@ use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
 use aether_protocol::git::CommitInfo;
 use aether_protocol::input::SurroundTarget;
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus};
+use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, Window, WrapMode};
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
@@ -90,14 +91,46 @@ pub struct SearchState {
     pub history_draft: String,
     /// The `?` variant: grow the selection from the entry point to each incremental match.
     pub extend_to_cursor: bool,
+    /// How the query matches: case mode, whole-word, and regex-vs-literal. Sticky across `/`
+    /// presses within a session (like the grep picker's filters); toggled in the search prompt
+    /// (`Alt-c` / `Alt-w` / `Alt-e`) and adopted from a grep result that primed the search.
+    pub options: MatchOptions,
+    /// Which option chip is "selected" for keyboard editing, mirroring the grep picker's
+    /// `chip_selected`. `Some(i)` indexes [`SearchState::option_chips`]; Left/Right walk the row,
+    /// Backspace/Delete remove, Enter cycles, Esc/typing deselect. `None` while the query input
+    /// owns the keyboard. Reset on every prompt open / commit / abort.
+    pub chip_selected: Option<usize>,
     /// State to restore on Esc, snapshotted when the prompt opens.
     pub snapshot: Option<SearchSnapshot>,
+}
+
+impl SearchState {
+    /// The active match options as filter chips, rendered exactly like the grep picker's
+    /// (`Aa`/`aa` for a forced case mode, `wd` for whole-word, `lit` for a literal query). Empty
+    /// when every option is at its default (regex, smartcase). Each shell renders these with its
+    /// own picker-chip styling, before the query — so search options read the same as grep's.
+    pub fn option_chips(&self) -> Vec<crate::chips::Chip> {
+        let mut values: Vec<crate::chips::ChipValue> = Vec::new();
+        if self.options.case != CaseMode::Smart {
+            values.push(crate::chips::ChipValue::Case(self.options.case));
+        }
+        if self.options.whole_word {
+            values.push(crate::chips::ChipValue::Word);
+        }
+        if self.options.fixed_string {
+            values.push(crate::chips::ChipValue::Lit);
+        }
+        // No Dir chips here, so `project_paths` is irrelevant.
+        crate::chips::derive_chips(&values, &[])
+    }
 }
 
 pub struct SearchSnapshot {
     pub cursor: CursorState,
     pub query: String,
     pub active: bool,
+    /// Options at prompt-open time, restored on Esc so a cancelled search reverts any toggles too.
+    pub options: MatchOptions,
 }
 
 /// A modal dialog owning the keyboard: the `[y/N]`-style confirmation or the save-as path

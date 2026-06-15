@@ -59,10 +59,11 @@ use aether_protocol::nav::NavStepResult;
 use aether_protocol::nav::{NavBack, NavForward, NavStepParams};
 use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    PickerFilters, PickerGrepFileJump, PickerGrepFileJumpParams, PickerGrepNavigate,
-    PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
-    PickerQueryParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
-    PickerUpdateParams, PickerView, PickerViewParams, PickerViewResult, ScopedPath,
+    CaseMode, MatchOptions, PickerFilters, PickerGrepFileJump, PickerGrepFileJumpParams,
+    PickerGrepNavigate, PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem,
+    PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
+    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
+    PickerViewResult, ScopedPath,
 };
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectAddRoot,
@@ -97,8 +98,9 @@ pub enum Event {
     /// A buffer switch resolved (close, new scratch, path opens): rebind to this buffer.
     Switched(Result<BufferOpenResult, String>),
     /// A grep-driven switch: like [`Event::Switched`] but priming the buffer search with the
-    /// grep query so `n`/`Alt-n` step matches. `Ok(None)` = no more hits.
-    SwitchedPrimed(Result<Option<(String, BufferOpenResult)>, String>),
+    /// grep query (and its match options) so `n`/`Alt-n` step matches the way the grep did.
+    /// `Ok(None)` = no more hits.
+    SwitchedPrimed(Result<Option<(String, MatchOptions, BufferOpenResult)>, String>),
     /// The prompt's Yes/Save button (keyboard accept routes through `on_prompt_key`).
     PromptAccept,
     PromptCancel,
@@ -139,8 +141,9 @@ pub enum Event {
         result: Result<PickerViewResult, String>,
     },
     PickerSelected {
-        /// Grep selections prime the opened buffer's search with the picker query.
-        prime: Option<String>,
+        /// Grep selections prime the opened buffer's search with the picker query and its match
+        /// options (derived from the picker's filter chips).
+        prime: Option<(String, MatchOptions)>,
         result: Result<PickerSelectResult, String>,
     },
     /// A picker row was clicked (absolute index) — highlight it and accept.
@@ -267,7 +270,7 @@ impl Session {
             Event::Switched(Ok(open)) => self.adopt_switch(open),
             Event::Switched(Err(e)) => Effects::error(e),
 
-            Event::SwitchedPrimed(Ok(Some((query, open)))) => {
+            Event::SwitchedPrimed(Ok(Some((query, options, open)))) => {
                 // Grab the primed summary before `open` is consumed: the equivalent
                 // `search/state_changed` push races this switch and the client's `buffer_id`
                 // guard drops it if it lands before the switch, so the count rode the response.
@@ -282,9 +285,11 @@ impl Session {
                 } else {
                     self.adopt_switch(open)
                 };
-                // adopt_switch reset the search state; adopt the primed query (the
-                // server-side search was already set in the open chain) and its summary.
+                // adopt_switch reset the search state; adopt the primed query + options (the
+                // server-side search was already set in the open chain) and its summary, so the
+                // search reads and steps exactly as the grep that found the hit did.
                 self.search.query = query.clone();
+                self.search.options = options;
                 self.search.active = true;
                 self.search.summary = summary;
                 self.push_history(query);
@@ -336,6 +341,9 @@ impl Session {
 
             Event::SearchFromSel(Ok(Some((query, r)))) => {
                 self.search.query = query.clone();
+                // The selection was searched as an escaped literal, so the committed search is a
+                // regex of that literal — clear `fixed_string` while keeping case / whole-word.
+                self.search.options.fixed_string = false;
                 self.search.active = true;
                 self.search.summary = Some(r.summary);
                 self.push_history(query);
@@ -936,6 +944,7 @@ impl Session {
                             anchor: None,
                             extend: false,
                             from_selection: false,
+                            options: self.search.options,
                         },
                         move |__r| Event::SearchRestored(__r.map_err(|e| e.to_string())),
                     ));
@@ -1251,13 +1260,15 @@ impl Session {
         &mut self,
         path: String,
         jump_to: Option<LogicalPosition>,
-        prime_search: Option<String>,
+        prime: Option<(String, MatchOptions)>,
     ) -> Effects {
         let Some((path_index, relative_path)) = strip_longest_root(&path, &self.project_paths)
         else {
             return Effects::error(format!("{path} is outside the project's roots"));
         };
-        let prime = prime_search.clone();
+        let prime_search = prime.as_ref().map(|(q, _)| q.clone());
+        let prime_search_options = prime.as_ref().map(|(_, o)| *o).unwrap_or_default();
+        let prime = prime.clone();
         self.request_str::<BufferOpen>(
             BufferOpenParams {
                 path_index: Some(path_index),
@@ -1266,10 +1277,11 @@ impl Session {
                 transient: Some(true),
                 record_nav_from: Some(self.buffer.buffer_id),
                 prime_search,
+                prime_search_options,
                 ..Default::default()
             },
             move |r| match (prime, r) {
-                (Some(q), Ok(open)) => Event::SwitchedPrimed(Ok(Some((q, open)))),
+                (Some((q, o)), Ok(open)) => Event::SwitchedPrimed(Ok(Some((q, o, open)))),
                 (None, Ok(open)) => Event::Switched(Ok(open)),
                 (_, Err(e)) => Event::Switched(Err(e)),
             },
@@ -2285,7 +2297,10 @@ impl Session {
             _ => {}
         }
         let kind = p.kind;
-        let prime = (kind == PickerKind::Grep).then(|| p.query.clone());
+        // Grep selections carry the query *and* the chips' match options, so the opened buffer's
+        // primed search matches the same way the grep did.
+        let prime =
+            (kind == PickerKind::Grep).then(|| (p.query.clone(), p.wire_filters().match_options()));
         let hide = self.close_picker();
 
         hide.and(
@@ -2990,11 +3005,13 @@ impl Session {
             cursor: self.buffer.cursor,
             query: std::mem::take(&mut self.search.query),
             active: self.search.active,
+            options: self.search.options,
         });
         self.search.active = false;
         self.search.summary = None;
         self.search.history_cursor = None;
         self.search.history_draft.clear();
+        self.search.chip_selected = None;
         self.search.extend_to_cursor = extend_to_cursor;
         self.mode = Mode::Search;
 
@@ -3037,6 +3054,7 @@ impl Session {
                     .map(|s| min_pos(s.cursor.position, s.cursor.anchor)),
                 extend: self.search.extend_to_cursor,
                 from_selection: false,
+                options: self.search.options,
             },
             move |__r| Event::SearchApplied(__r.map_err(|e| e.to_string())),
         )
@@ -3130,6 +3148,7 @@ impl Session {
         self.search.extend_to_cursor = false;
         self.search.history_cursor = None;
         self.search.history_draft.clear();
+        self.search.chip_selected = None;
         let Some(snap) = self.search.snapshot.take() else {
             return Effects::none();
         };
@@ -3142,6 +3161,7 @@ impl Session {
                     anchor: None,
                     extend: false,
                     from_selection: false,
+                    options: snap.options,
                 },
                 move |__r| Event::SearchRestored(__r.map_err(|e| e.to_string())),
             )
@@ -3155,6 +3175,7 @@ impl Session {
         };
         self.search.query = snap.query;
         self.search.active = snap.active;
+        self.search.options = snap.options;
 
         fx = fx.and(self.request::<CursorSet>(
             CursorSetParams {
@@ -3183,6 +3204,7 @@ impl Session {
         self.search.history_cursor = None;
         self.search.history_draft.clear();
         self.search.extend_to_cursor = false;
+        self.search.chip_selected = None;
         self.mode = Mode::Normal;
         Effects::none()
     }
@@ -3210,6 +3232,7 @@ impl Session {
             extend,
             count,
             set_query: revive,
+            options: self.search.options,
         };
         match direction {
             Direction::Forward => self.request_str::<SearchNext>(params, Event::SearchNav),
@@ -3227,6 +3250,12 @@ impl Session {
                 anchor: None,
                 extend: false,
                 from_selection: true,
+                // The server regex-escapes the selection itself, so the query is already literal —
+                // forcing `fixed_string` off avoids double-escaping. Case / whole-word stay sticky.
+                options: MatchOptions {
+                    fixed_string: false,
+                    ..self.search.options
+                },
             },
             |r| {
                 Event::SearchFromSel(
@@ -3266,9 +3295,9 @@ impl Session {
                 open: true,
             },
             |r| {
-                Event::SwitchedPrimed(
-                    r.map(|target| target.and_then(|t| t.opened.map(|open| (t.query, open)))),
-                )
+                Event::SwitchedPrimed(r.map(|target| {
+                    target.and_then(|t| t.opened.map(|open| (t.query, t.options, open)))
+                }))
             },
         )
     }
@@ -3614,12 +3643,115 @@ impl Session {
 
     /// Keys in the search prompt. Text entry (insert / delete / caret) is owned by each shell's
     /// search input, which syncs the whole value via [`Self::search_set_query`]; the core handles
-    /// only the Search command keys (commit / abort / history) via the keymap table.
+    /// the Search command keys (commit / abort / history / option toggles) via the keymap table,
+    /// plus the option-chip row gestures (mirroring [`Self::on_picker_key`]): with a chip selected,
+    /// Left/Right walk the row, Backspace/Delete remove, Enter cycles, Esc/typing deselect. A
+    /// forwarded Left/Backspace with no chip selected is the "step into the chips from the query
+    /// start" gesture each shell sends when the caret sits at column 0.
     pub fn on_search_key(&mut self, code: KeyCode, mods: Mods, _text: Option<String>) -> Effects {
+        let no_chord = !mods.ctrl && !mods.alt;
+        if let Some(sel) = self.search.chip_selected {
+            let chips = self.search.option_chips();
+            if chips.is_empty() {
+                self.search.chip_selected = None;
+            } else {
+                let sel = sel.min(chips.len() - 1);
+                match code {
+                    KeyCode::Left if no_chord => {
+                        self.search.chip_selected = Some(sel.saturating_sub(1));
+                        return Effects::none();
+                    }
+                    KeyCode::Right if no_chord => {
+                        self.search.chip_selected =
+                            (sel + 1 < chips.len()).then_some(sel + 1);
+                        return Effects::none();
+                    }
+                    KeyCode::Esc => {
+                        self.search.chip_selected = None;
+                        return Effects::none();
+                    }
+                    KeyCode::Backspace | KeyCode::Delete if no_chord => {
+                        return self.remove_search_chip(sel);
+                    }
+                    KeyCode::Enter if no_chord => {
+                        return self.cycle_search_chip(sel);
+                    }
+                    KeyCode::Char(_) if no_chord => {
+                        // Typing returns to the query (the shell's input takes the char).
+                        self.search.chip_selected = None;
+                    }
+                    _ => {}
+                }
+            }
+        } else if no_chord
+            && matches!(code, KeyCode::Left | KeyCode::Backspace)
+            && !self.search.option_chips().is_empty()
+        {
+            // Forwarded from the query start: step into the chip row, selecting the rightmost.
+            return self.search_select_last_chip();
+        }
         match lookup(KeyContext::Search, code, mods) {
             Some(b) => self.search_action(b.action),
             None => Effects::none(),
         }
+    }
+
+    /// Select the rightmost option chip (the browser tag-input gesture — Left/Backspace at the
+    /// query start steps into the row). No-op when there are no chips. Called directly by the
+    /// rich shells (native `<input>` / `text_input`) and reached via [`Self::on_search_key`] from
+    /// the TUI's forwarded boundary key.
+    pub fn search_select_last_chip(&mut self) -> Effects {
+        let n = self.search.option_chips().len();
+        if n > 0 {
+            self.search.chip_selected = Some(n - 1);
+        }
+        Effects::none()
+    }
+
+    /// Remove the selected option chip — reset the option it stands for to its default — and keep
+    /// the selection on a neighbouring chip (or clear it when the row empties), then re-run search.
+    fn remove_search_chip(&mut self, sel: usize) -> Effects {
+        let Some(chip) = self.search.option_chips().get(sel).map(|c| c.id) else {
+            return Effects::none();
+        };
+        match chip {
+            ChipId::Case => self.search.options.case = CaseMode::Smart,
+            ChipId::Word => self.search.options.whole_word = false,
+            ChipId::Lit => self.search.options.fixed_string = false,
+            _ => {}
+        }
+        let remaining = self.search.option_chips().len();
+        self.search.chip_selected = (remaining > 0).then(|| sel.min(remaining - 1));
+        self.incremental_search()
+    }
+
+    /// Enter on the selected chip: cycle/toggle the option it stands for (case cycles
+    /// smart → sensitive → insensitive → smart; word / literal flip). Keeps the selection on the
+    /// same option while its chip is still present, else clamps into the row, then re-runs search.
+    fn cycle_search_chip(&mut self, sel: usize) -> Effects {
+        let Some(id) = self.search.option_chips().get(sel).map(|c| c.id) else {
+            return Effects::none();
+        };
+        match id {
+            ChipId::Case => self.cycle_search_case(),
+            ChipId::Word => self.search.options.whole_word = !self.search.options.whole_word,
+            ChipId::Lit => self.search.options.fixed_string = !self.search.options.fixed_string,
+            _ => {}
+        }
+        let chips = self.search.option_chips();
+        self.search.chip_selected = chips
+            .iter()
+            .position(|c| c.id == id)
+            .or_else(|| (!chips.is_empty()).then(|| sel.min(chips.len() - 1)));
+        self.incremental_search()
+    }
+
+    fn cycle_search_case(&mut self) {
+        self.search.options.case = match self.search.options.case {
+            CaseMode::Smart => CaseMode::Sensitive,
+            CaseMode::Sensitive => CaseMode::Insensitive,
+            CaseMode::Insensitive => CaseMode::Smart,
+        };
     }
 
     /// The Search-table actions (also reachable from the shell's action dispatch).
@@ -3633,6 +3765,23 @@ impl Session {
             }
             Action::SearchHistoryNext => {
                 self.history_down();
+                self.incremental_search()
+            }
+            // The Alt-chord toggles deselect any chip — they're the "chord" interaction, distinct
+            // from chip-row editing.
+            Action::SearchToggleCase => {
+                self.search.chip_selected = None;
+                self.cycle_search_case();
+                self.incremental_search()
+            }
+            Action::SearchToggleWord => {
+                self.search.chip_selected = None;
+                self.search.options.whole_word = !self.search.options.whole_word;
+                self.incremental_search()
+            }
+            Action::SearchToggleRegex => {
+                self.search.chip_selected = None;
+                self.search.options.fixed_string = !self.search.options.fixed_string;
                 self.incremental_search()
             }
             _ => Effects::none(),
@@ -4209,9 +4358,13 @@ impl Session {
             // `Session::on_search_key`'s table lookup) ----
             A::EnterSearch => self.enter_search(false),
             A::EnterSearchToCursor => self.enter_search(true),
-            A::SearchCommit | A::SearchAbort | A::SearchHistoryPrev | A::SearchHistoryNext => {
-                self.search_action(action)
-            }
+            A::SearchCommit
+            | A::SearchAbort
+            | A::SearchHistoryPrev
+            | A::SearchHistoryNext
+            | A::SearchToggleCase
+            | A::SearchToggleWord
+            | A::SearchToggleRegex => self.search_action(action),
             A::SearchCycle(direction) => self.search_cycle(direction, count, extend),
             A::SearchFromSelection => self.search_from_selection(),
             A::GrepNavigate(direction) => self.grep_navigate(direction),

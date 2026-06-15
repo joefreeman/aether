@@ -57,6 +57,11 @@ pub struct BufferOpenParams {
     /// selection. Fire-and-forget semantics: pattern errors are dropped. Empty = no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prime_search: Option<String>,
+    /// Match options for the primed search (ignored without `prime_search`) — the grep result's
+    /// case / whole-word / literal options, so the primed search matches the same way the grep
+    /// that found the hit did. Defaults (regex, smartcase) when absent.
+    #[serde(default, skip_serializing_if = "crate::picker::MatchOptions::is_default")]
+    pub prime_search_options: crate::picker::MatchOptions,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

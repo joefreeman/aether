@@ -683,6 +683,8 @@ html, body, #app {
   margin-right: 8px;
 }
 .picker-chips:empty { display: none; }
+/* In the search bar the chips sit right against the query — drop the picker row's trailing gap. */
+#searchbar .picker-chips { margin-right: 0; }
 .picker-chip {
   background: var(--nord2);
   color: var(--nord8);

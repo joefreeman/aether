@@ -6,7 +6,7 @@ use crate::syntax::{self, InjectionLayer, LanguageConfig};
 use crate::workspace_index::WorkspaceIndex;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
-use aether_protocol::picker::PickerKind;
+use aether_protocol::picker::{MatchOptions, PickerKind};
 use aether_protocol::viewport::{ScrollPosition, WrapMode};
 use aether_protocol::{BufferId, ClientId, LogicalPosition, Revision, ViewportId};
 use std::time::{Duration, Instant};
@@ -118,6 +118,10 @@ pub struct BlameCache {
 #[derive(Debug, Clone)]
 pub struct SearchEntry {
     pub query: String,
+    /// How the query matches (case / whole-word / literal). Recorded so an after-edit recompute
+    /// ([`crate::handlers::refresh_searches_for_buffer`]) re-runs with the same options the
+    /// search was set with.
+    pub options: MatchOptions,
     /// Sorted by start position. Each match is `(start_inclusive, end_exclusive)` in
     /// buffer-line / byte-col coords.
     pub matches: Vec<(LogicalPosition, LogicalPosition)>,

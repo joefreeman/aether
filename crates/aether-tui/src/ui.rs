@@ -2,7 +2,7 @@
 
 use crate::app::{
     grep_counter_label, search_counter_label, search_match_count_label, AppState, BufferStatusKind,
-    EditorMode, HelpTab, BUFFER_STATUS_DOT,
+    EditorMode, HelpTab, SearchState, BUFFER_STATUS_DOT,
 };
 use aether_client::keymap;
 use aether_client::keymap::KeyCode;
@@ -2249,6 +2249,36 @@ fn chip_budget(total_width: usize, prefix_w: usize) -> usize {
 /// globs (leading `!`) tint red. When the row overflows `max_w`, leftmost chips collapse into
 /// a dim `…+N` marker — but never the selected chip, so chip-row navigation always shows what
 /// it's acting on.
+/// The search prompt's lead segment: the `/` (or `?`) prefix followed by the active match-option
+/// chips, styled like the grep picker's filter chips (NORD8 on NORD2; the whole-word chip
+/// underlined). Returns the spans plus their total display width, so the caret placement can land
+/// just past them and the typed query.
+fn search_prompt_lead(search: &SearchState) -> (Vec<Span<'static>>, u16) {
+    let prefix = if search.extend_to_cursor { "?" } else { "/" };
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(prefix.to_string())];
+    let mut width = prefix.width() as u16;
+    if !search.option_chips.is_empty() {
+        spans.push(Span::raw(" "));
+        width += 1;
+        let chip_style = Style::default().fg(NORD8).bg(NORD2);
+        let selected_style = Style::default().fg(NORD0).bg(NORD8);
+        for (i, (label, underline)) in search.option_chips.iter().enumerate() {
+            let mut style = if search.chip_selected == Some(i) {
+                selected_style
+            } else {
+                chip_style
+            };
+            if *underline {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            spans.push(Span::styled(label.clone(), style));
+            spans.push(Span::raw(" "));
+            width += label.width() as u16 + 1;
+        }
+    }
+    (spans, width)
+}
+
 fn picker_chip_spans(state: &AppState, max_w: usize) -> (Vec<Span<'static>>, usize) {
     let chips = state.picker.chips(&state.project_paths);
     if chips.is_empty() {
@@ -4487,12 +4517,14 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         };
         Line::from(vec![Span::raw(" "), Span::styled(text, style)])
     } else if matches!(state.ed().mode, EditorMode::Search) {
-        let prompt = format!("/{}", state.ed().search.query.text);
-        let text = match search_match_count_label(state) {
-            Some(count) => format!("{prompt}    {count}"),
-            None => prompt,
-        };
-        Line::from(vec![Span::raw(text)])
+        // `/` (or `?`) prefix, then the active match-option chips — styled like the grep picker's
+        // filter chips — then the typed query and the match count.
+        let (mut spans, _) = search_prompt_lead(&state.ed().search);
+        spans.push(Span::raw(state.ed().search.query.text.clone()));
+        if let Some(count) = search_match_count_label(state) {
+            spans.push(Span::raw(format!("    {count}")));
+        }
+        Line::from(spans)
     } else {
         // Project / file / dirty-dot / transient status sit on the left; counter (search and/or
         // grep, in that order) and cursor position sit on the right, with the counter to the
@@ -5115,14 +5147,19 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         return;
     }
     let ed = state.ed();
-    if matches!(ed.mode, EditorMode::Search) && state.save_prompt.is_none() && !state.picker.open {
-        // Park the terminal cursor on the status row, just past `/` + the typed query up
-        // to the input cursor (so Left/Right navigate within the query, not always at the
-        // end).
+    if matches!(ed.mode, EditorMode::Search)
+        && ed.search.chip_selected.is_none()
+        && state.save_prompt.is_none()
+        && !state.picker.open
+    {
+        // Park the terminal cursor on the status row, just past the prefix + option chips + the
+        // typed query up to the input cursor (so Left/Right navigate within the query, not always
+        // at the end).
+        let (_, lead_w) = search_prompt_lead(&ed.search);
         let typed_w = ed.search.query.width_to_cursor() as u16;
         let col = status_area
             .x
-            .saturating_add((1 + typed_w).min(status_area.width.saturating_sub(1)));
+            .saturating_add((lead_w + typed_w).min(status_area.width.saturating_sub(1)));
         f.set_cursor_position((col, status_area.y));
         return;
     }

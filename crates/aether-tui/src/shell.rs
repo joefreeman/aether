@@ -733,7 +733,14 @@ impl Shell {
             };
         }
         if self.session.mode == Mode::Search {
-            return Some(OverlayField::Search);
+            // A selected option chip makes every key a command (chip-row nav / remove / cycle), so
+            // drop the editor and let the core's `on_search_key` own the keyboard.
+            return self
+                .session
+                .search
+                .chip_selected
+                .is_none()
+                .then_some(OverlayField::Search);
         }
         // The picker query owns the keyboard while open — unless the chip editor is open (its own
         // root/path segments take focus) or a chip is selected (all keys are commands then).
@@ -1519,6 +1526,17 @@ impl Shell {
             history_cursor: s.history_cursor,
             history_draft: s.history_draft.clone(),
             extend_to_cursor: s.extend_to_cursor,
+            option_chips: s
+                .option_chips()
+                .iter()
+                .map(|c| {
+                    (
+                        c.label.clone(),
+                        matches!(c.id, aether_client::chips::ChipId::Word),
+                    )
+                })
+                .collect(),
+            chip_selected: s.chip_selected,
         }
     }
 

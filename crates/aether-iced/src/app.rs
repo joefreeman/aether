@@ -644,7 +644,15 @@ impl App {
             return None;
         }
         if self.session.mode == Mode::Search {
-            return Some(OverlayField::Search);
+            // No focus target when an option chip is selected — its row keys (Left/Right/
+            // Backspace/Enter/Esc) must reach the core, but a focused `text_input` would capture
+            // the editing keys among them. Defocusing lets every key bubble (picker parity).
+            return self
+                .session
+                .search
+                .chip_selected
+                .is_none()
+                .then_some(OverlayField::Search);
         }
         None
     }
@@ -2784,13 +2792,72 @@ impl App {
     fn search_bar(&self) -> Element<'_, Message> {
         // The query input is a controlled `text_input` (web parity): its value is the core's
         // search query, edits sync via `search_set_query`, and Enter/Up/Down/Esc bubble to
-        // `on_key` (commit / history nav / cancel) since `on_submit` is unset.
-        let input =
-            overlay_input(OverlayField::Search, "search", &self.session.search.query);
-        let mut bar = row![input, iced::widget::Space::new().width(Length::Fill)]
-            .spacing(6)
+        // `on_key` (commit / history nav / cancel) since `on_submit` is unset. With option chips
+        // present (and none yet selected), Left/Backspace at the query start steps into the chip
+        // row instead of editing — the browser tag-input gesture, mirroring the picker query.
+        let chips = self.session.search.option_chips();
+        let input = {
+            let inner = iced::widget::text_input("Search", &self.session.search.query)
+                .id(OverlayField::Search.id())
+                .on_input(SearchInputMsg::Typed)
+                .font(SANS)
+                .size(13)
+                .padding(0)
+                .width(Length::Fill)
+                .style(|_theme, _status| iced::widget::text_input::Style {
+                    background: iced::Background::Color(iced::Color::TRANSPARENT),
+                    border: iced::Border::default(),
+                    icon: theme::NORD6,
+                    placeholder: theme::NORD3_BRIGHT,
+                    value: theme::NORD6,
+                    selection: theme::NORD8,
+                });
+            let intercept = !chips.is_empty() && self.session.search.chip_selected.is_none();
+            let wrapped = if intercept {
+                crate::alt_filter::alt_passthrough_intercept(
+                    inner,
+                    self.session.search.query.clone(),
+                    move |key, at_start| {
+                        use iced::keyboard::key::Named;
+                        if !at_start {
+                            return None;
+                        }
+                        match key {
+                            iced::keyboard::Key::Named(Named::ArrowLeft) => {
+                                Some(SearchInputMsg::CoreKey(KeyCode::Left))
+                            }
+                            iced::keyboard::Key::Named(Named::Backspace) => {
+                                Some(SearchInputMsg::CoreKey(KeyCode::Backspace))
+                            }
+                            _ => None,
+                        }
+                    },
+                )
+            } else {
+                crate::alt_filter::alt_passthrough(inner)
+            };
+            wrapped.map(|m| match m {
+                SearchInputMsg::Typed(s) => Message::OverlayInput(OverlayField::Search, s),
+                SearchInputMsg::CoreKey(code) => core_key_message(code),
+            })
+        };
+        // Active match options (case / whole-word / literal) lead the row as chips, styled like
+        // the grep picker's filter chips. The chip row is *always* the first child (empty when no
+        // options are set) so the query input keeps a stable tree position — prepending a chip must
+        // not knock focus off the `text_input`.
+        let selected = self.session.search.chip_selected;
+        let mut chips_row = row![].spacing(4).align_y(iced::Alignment::Center);
+        for (i, chip) in chips.iter().enumerate() {
+            chips_row = chips_row.push(option_chip(chip, selected == Some(i)));
+        }
+        if !chips.is_empty() {
+            chips_row = chips_row.push(iced::widget::Space::new().width(6));
+        }
+        let mut bar = row![chips_row, input]
+            .spacing(0)
             .width(Length::Fill)
             .align_y(iced::Alignment::Center);
+        bar = bar.push(iced::widget::Space::new().width(Length::Fill));
         if let Some(count) = self.search_count_label() {
             bar = bar.push(text(count).size(13).font(SANS).color(theme::NORD4));
         }
@@ -3522,6 +3589,35 @@ impl App {
     }
 }
 
+/// A filter chip for the search bar's match options — same look as the grep picker's chips
+/// (`picker::chip_el`): compact label on a raised NORD2 background, NORD8 text, the whole-word chip
+/// underlined; the keyboard-selected chip inverts (NORD8 background, NORD0 text). Chips are
+/// keyboard-driven (Left/Right select, Backspace removes, Enter cycles), so this is non-interactive.
+fn option_chip<'a>(chip: &crate::chips::Chip, selected: bool) -> Element<'a, Message> {
+    let underline = matches!(chip.id, crate::chips::ChipId::Word);
+    let (bg, fg) = if selected {
+        (theme::NORD8, theme::NORD0)
+    } else {
+        (theme::NORD2, theme::NORD8)
+    };
+    let spans: Vec<iced::widget::text::Span<'a>> = vec![iced::widget::span(chip.label.clone())
+        .size(12)
+        .font(SANS)
+        .color(fg)
+        .underline(underline)];
+    container(iced::widget::rich_text(spans))
+        .padding([1, 7])
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..iced::Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// System sans-serif for GUI chrome (status bar, toasts) — the buffer keeps the app-default
 /// monospace; mirrors the web client's `#status` font split.
 const SANS: iced::Font = iced::Font {
@@ -3582,6 +3678,15 @@ fn overlay_input<'a>(
 /// `Clone` message, so [`overlay_input`] builds in this space then maps to `Message`.
 #[derive(Debug, Clone)]
 struct Typed(String);
+
+/// The search query input's `Clone` message space: typed text, or a chip-boundary key intercepted
+/// before the input (Left/Backspace at the query start → step into the option-chip row). Mapped to
+/// `Message` after building (`Message` isn't `Clone`, which `text_input` requires).
+#[derive(Debug, Clone)]
+enum SearchInputMsg {
+    Typed(String),
+    CoreKey(KeyCode),
+}
 
 /// Help-dialog tabs, in display order. Indexes `App::help`.
 const HELP_TABS: [&str; 4] = ["Normal", "Insert", "Search", "Application"];

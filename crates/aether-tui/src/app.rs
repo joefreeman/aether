@@ -89,6 +89,14 @@ pub struct SearchState {
     /// incremental match grows the selection from where `?` was pressed (the snapshot anchor) to the
     /// match. Reset on every entry into search mode and on commit/abort.
     pub extend_to_cursor: bool,
+    /// Active match-option chips synced from the core, as `(label, underline)` pairs — `label` is
+    /// the abbreviation (`Aa`/`aa`/`wd`/`lit`), `underline` marks the whole-word chip. Rendered
+    /// before the query with the same styling as the grep picker's filter chips. Empty when all
+    /// options are at their default (regex, smartcase).
+    pub option_chips: Vec<(String, bool)>,
+    /// The keyboard-selected option chip (index into `option_chips`), or `None` while the query
+    /// owns the keyboard. The selected chip renders inverted and the caret is hidden.
+    pub chip_selected: Option<usize>,
 }
 
 #[derive(Debug)]

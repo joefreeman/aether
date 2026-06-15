@@ -829,6 +829,80 @@ fn search_query_is_value_synced_not_keycode_edited() {
 }
 
 #[test]
+fn search_option_toggles_cycle_and_ride_the_request() {
+    use aether_client::keymap::Mods;
+    use aether_protocol::picker::CaseMode;
+    let mut s = session();
+    let _ = key(&mut s, '/'); // enter search
+    let _ = s.search_set_query("foo".into());
+
+    // Alt-e toggles literal/regex; the new query goes back out with the options in the params.
+    let fx = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS);
+    assert!(s.search.options.fixed_string, "Alt-e enables literal");
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "search/set");
+    assert_eq!(params["options"], json!({"fixed_string": true}));
+
+    // Alt-w toggles whole-word; Alt-c cycles smart -> sensitive -> insensitive -> smart.
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    assert!(s.search.options.whole_word);
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
+    assert_eq!(s.search.options.case, CaseMode::Sensitive);
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
+    assert_eq!(s.search.options.case, CaseMode::Insensitive);
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
+    assert_eq!(s.search.options.case, CaseMode::Smart, "third Alt-c returns to smart");
+
+    // Esc restores the pre-prompt options (a cancelled search reverts its toggles too).
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.options, aether_protocol::picker::MatchOptions::default());
+}
+
+#[test]
+fn search_chip_row_select_navigate_cycle_remove() {
+    use aether_client::keymap::Mods;
+    use aether_protocol::picker::CaseMode;
+    let mut s = session();
+    let _ = key(&mut s, '/');
+    let _ = s.search_set_query("foo".into());
+    // Enable case (sensitive) and whole-word via the Alt-chords → two chips, none selected.
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    assert_eq!(s.search.option_chips().len(), 2);
+    assert_eq!(s.search.chip_selected, None);
+
+    // Left at the query start steps into the row, selecting the rightmost (word) chip; Left again
+    // walks to the case chip; Right walks back.
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.chip_selected, Some(1));
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.chip_selected, Some(0));
+    let _ = s.on_key(KeyCode::Right, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.chip_selected, Some(1));
+
+    // Enter on the word chip toggles it off — the chip vanishes, selection clamps onto the case chip.
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(!s.search.options.whole_word);
+    assert_eq!(s.search.option_chips().len(), 1);
+    assert_eq!(s.search.chip_selected, Some(0));
+
+    // Enter on the case chip cycles it (sensitive → insensitive); it stays present and selected.
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.options.case, CaseMode::Insensitive);
+    assert_eq!(s.search.chip_selected, Some(0));
+
+    // Backspace removes the selected case chip; the row empties and selection clears.
+    let _ = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.options.case, CaseMode::Smart);
+    assert!(s.search.option_chips().is_empty());
+    assert_eq!(s.search.chip_selected, None);
+
+    // Esc with no chip selected aborts search as usual.
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert_eq!(s.mode, aether_client::session::Mode::Normal);
+}
+
+#[test]
 fn count_prefix_rides_the_request() {
     let mut s = session();
     let _ = key(&mut s, '3');
@@ -977,13 +1051,22 @@ fn primed_switch_adopts_summary_from_the_response_not_a_push() {
             current_index: 1,
         }),
     };
-    let _ = s.on_event(Event::SwitchedPrimed(Ok(Some(("needle".into(), open)))));
+    let opts = aether_protocol::picker::MatchOptions {
+        case: aether_protocol::picker::CaseMode::Sensitive,
+        whole_word: true,
+        fixed_string: false,
+    };
+    let _ = s.on_event(Event::SwitchedPrimed(Ok(Some(("needle".into(), opts, open)))));
 
     assert!(
         s.search.active,
         "the primed search is active after the switch"
     );
     assert_eq!(s.search.query, "needle");
+    assert_eq!(
+        s.search.options, opts,
+        "the grep result's match options ride the primed switch"
+    );
     let summary = s
         .search
         .summary
