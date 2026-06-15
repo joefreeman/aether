@@ -24,11 +24,21 @@ const ICONS: Record<IconKind, string> = {
   "lsp-stopped": '<circle cx="8" cy="8" r="4.2"/>',
 };
 
+/** The `status-spin` keyframe period (ms) — must match `.status-icon.spin` in theme.css. */
+const SPIN_PERIOD_MS = 900;
+
 export function statusIcon(kind: IconKind, spin = false): SVGSVGElement {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 16 16");
   svg.setAttribute("class", spin ? "status-icon spin" : "status-icon");
   svg.innerHTML = ICONS[kind];
+  if (spin) {
+    // The spinner is recreated on every re-render (each status / progress push while busy), and a
+    // plain CSS animation would restart from 0° each time and visibly stutter. Anchor it to a
+    // global wall-clock with a negative delay, so a freshly-created element starts mid-cycle in
+    // phase with the same clock — re-renders then look like one continuous spin.
+    svg.style.animationDelay = `${-(performance.now() % SPIN_PERIOD_MS)}ms`;
+  }
   return svg;
 }
 

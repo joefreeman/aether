@@ -2896,12 +2896,6 @@ impl App {
                     }
                     col = col.push(kv("Working", line));
                 }
-                col = col.push(
-                    text("r — restart · Esc — close")
-                        .size(12)
-                        .font(SANS)
-                        .color(theme::NORD3_BRIGHT),
-                );
                 col.spacing(10).into()
             }
             Prompt::Confirm { kind, .. } => column![

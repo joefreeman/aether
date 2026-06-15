@@ -109,7 +109,11 @@ html, body, #app {
   z-index: 5;
   box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.15);
 }
-.status-left { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Flex row of groups (file + git) with a gap between them; the file group shrinks/ellipsises so
+   the git group keeps its space. `min-width: 0` lets the file group truncate below its content. */
+.status-left { display: flex; align-items: baseline; gap: 12px; overflow: hidden; min-width: 0; }
+.status-file { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status-git-group { flex: 0 0 auto; display: flex; align-items: baseline; gap: 5px; white-space: nowrap; }
 /* Buffer-state dot (SVG circle, colour via currentColor). Shared by the status bar and picker. */
 .buffer-status-dot { flex: 0 0 auto; width: 0.7em; height: 0.7em; vertical-align: -0.06em; }
 .status-dot { margin-right: 0.5em; } /* leads the row; a bit of space before the project name. Colour set inline */
@@ -117,8 +121,7 @@ html, body, #app {
 .status-diag-group { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; } /* tight diagnostic cluster on the right, by the position */
 .status-transient { font-style: italic; } /* preview buffer: the status-bar file label slants */
 .picker-italic { font-style: italic; } /* preview buffer rows in the buffers picker */
-.status-git { margin-left: 5px; white-space: nowrap; } /* git change counts, before diagnostics */
-.status-git:first-of-type { margin-left: 18px; } /* clear gap from the buffer name/marker */
+.status-git { white-space: nowrap; } /* git change counts; spacing comes from the group's flex gap */
 .git-added { color: var(--nord14); }
 .git-modified { color: var(--nord13); }
 .git-deleted { color: var(--nord11); }
@@ -470,11 +473,16 @@ html, body, #app {
    above the project-settings dialog (same .overlay z-index, but that overlay sits later in the DOM). */
 .overlay.confirm-overlay { padding-top: 11vh; z-index: 11; }
 
+/* The LSP info dialog drills in *over* the still-open LSP picker, so it needs to sit above
+   `.overlay`'s default z-index (the picker is later in the DOM and would otherwise paint on top).
+   Keeps the shared 8vh picker offset so it aligns over the picker box. */
+.overlay.lsp-info-overlay { z-index: 11; }
+
 /* LSP server info dialog. */
 .modal.lsp-info { width: min(560px, 88vw); }
 /* Title: status dot (picker-row colours) + bold server name. */
 .modal.lsp-info .modal-message { font-weight: 600; }
-.lsp-info-dot { margin-right: 8px; font-size: 1.2em; }
+.lsp-info-icon { margin-right: 8px; display: inline-flex; align-items: center; }
 .lsp-info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; margin-bottom: 16px; }
 .lsp-info-key { color: var(--nord3-brighter); }
 .lsp-info-val { word-break: break-word; } /* sans-serif (inherits the modal's font) */

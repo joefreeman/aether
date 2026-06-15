@@ -1905,7 +1905,13 @@ export class Shell {
       return;
     }
     this.overlayEl.style.display = "";
-    this.overlayEl.className = "overlay" + (p.kind === "confirm" ? " confirm-overlay" : "");
+    // Both confirm and lsp-info can layer *over* an open picker (the LSP dialog drills in without
+    // closing the picker), so they need a z-index above `.overlay`'s default — otherwise the
+    // later-in-DOM picker paints on top. confirm-overlay already bumps it; lsp-info matches.
+    this.overlayEl.className =
+      "overlay" +
+      (p.kind === "confirm" ? " confirm-overlay" : "") +
+      (p.kind === "lspinfo" ? " lsp-info-overlay" : "");
     const modal = document.createElement("div");
     modal.className = "modal" + (p.kind === "lspinfo" ? " lsp-info" : "");
     if (p.kind === "confirm") {
@@ -1933,16 +1939,19 @@ export class Shell {
       buttons.append(cancel, ok);
       modal.append(msg, buttons);
     } else {
-      // lsp-info: full server detail (the status is already projected in the view). `r` restarts and
-      // any other key / Esc closes — both routed through the core's on_prompt_key, so this only paints.
+      // lsp-info: full server detail (the status is already projected in the view). Ctrl-r restarts
+      // and any other key / Esc closes — both routed through the core's on_prompt_key, so this only
+      // paints. The shortcuts aren't advertised in the dialog (kept clean), like the native client.
       const st = p.status;
       const busy = st.status.state === "ready" && (st.progress?.length ?? 0) > 0;
       const header = document.createElement("div");
       header.className = "modal-message";
-      const dot = document.createElement("span");
-      dot.className = `lsp-info-dot ${busy ? "lsp-busy" : lspStateClass(st.status.state)}`;
-      dot.textContent = "●";
-      header.append(dot, document.createTextNode(st.name));
+      // Same SVG icon (spinning when busy/restarting) the LSP picker rows and status bar use.
+      const cls = busy ? "lsp-busy" : lspStateClass(st.status.state);
+      const icon = document.createElement("span");
+      icon.className = `lsp-info-icon ${cls}`;
+      icon.append(statusIcon(cls, cls === "lsp-busy"));
+      header.append(icon, document.createTextNode(st.name));
       const rows = document.createElement("div");
       rows.className = "lsp-info-rows";
       const kv = (k: string, v: string) => {
@@ -1972,10 +1981,7 @@ export class Shell {
         if (pr.percentage != null) line += ` (${pr.percentage}%)`;
         kv("Working", line);
       }
-      const hint = document.createElement("div");
-      hint.className = "lsp-info-hint";
-      hint.textContent = "r — restart · Esc — close";
-      modal.append(header, rows, hint);
+      modal.append(header, rows);
     }
     this.overlayEl.replaceChildren(modal);
   }
@@ -2877,18 +2883,24 @@ export class Shell {
    *  + git cluster; right = search/grep counters + diagnostic glyphs + position + LSP glyph. The mode
    *  is shown by the cursor shape (block/I-beam/underscore), not text. */
   private renderStatus(v: CoreView): void {
+    // The left side is a flexbox of groups with a gap between them: the file group (state dot +
+    // `[project]` + path) and the git group. The gap (not a per-element margin) is what spaces the
+    // path from the git cluster — a prior `.status-git:first-of-type` margin never applied, since
+    // `:first-of-type` keys off the tag (span), and the dot/name spans come first.
     const left = document.createElement("span");
     left.className = "status-left";
+    const fileGroup = document.createElement("span");
+    fileGroup.className = "status-file";
     const color = bufferStateColor(v);
     if (color) {
       const dot = document.createElement("span");
       dot.className = "status-dot";
       dot.style.color = color;
       dot.textContent = "●";
-      left.append(dot);
+      fileGroup.append(dot);
     }
     const proj = v.project ? `[${v.project}] ` : "";
-    left.append(proj);
+    fileGroup.append(proj);
     const name = document.createElement("span");
     if (v.buffer.transient) name.className = "status-transient"; // preview buffers slant
     // The file label takes at most the left half of the bar, segment-elided so the filename
@@ -2900,15 +2912,18 @@ export class Shell {
         [...proj].length,
     );
     name.textContent = truncatePath(v.buffer.label, undefined, labelBudget).display;
-    left.append(name);
-    // Git cluster: `⎇ branch  +u(s) ~u(s) -u(s)` (unstaged then staged-in-parens; zero omitted).
+    fileGroup.append(name);
+    left.append(fileGroup);
+    // Git group: `⎇ branch  +u(s) ~u(s) -u(s)` (unstaged then staged-in-parens; zero omitted).
     const gs = v.window?.git_status;
     if (gs) {
+      const gitGroup = document.createElement("span");
+      gitGroup.className = "status-git-group";
       if (gs.branch) {
         const b = document.createElement("span");
         b.className = "status-git git-branch";
         b.textContent = `⎇  ${gs.branch}`;
-        left.append(b);
+        gitGroup.append(b);
       }
       const u = gs.unstaged;
       const s = gs.staged;
@@ -2925,8 +2940,9 @@ export class Shell {
         const el = document.createElement("span");
         el.className = `status-git ${cls}`;
         el.textContent = tok;
-        left.append(el);
+        gitGroup.append(el);
       }
+      if (gitGroup.childElementCount > 0) left.append(gitGroup);
     }
 
     const right = document.createElement("span");

@@ -254,6 +254,181 @@ fn picker_query_is_value_synced_and_chip_row_gestures_work() {
 }
 
 #[test]
+fn lsp_picker_centers_on_the_current_buffers_server() {
+    use aether_protocol::lsp::LspServerRef;
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    s.buffer.lsp_server = Some(LspServerRef {
+        language: "rust".into(),
+        workspace_root: "/p".into(),
+    });
+    let fx = s.open_picker(PickerKind::LspServers, None, None);
+    let params = find_request(&fx, "picker/view").expect("LSP picker opens via picker/view");
+    // The view is anchored on the active buffer's own server (matched by language + workspace).
+    assert_eq!(params["center_on"]["kind"], "lsp_server");
+    assert_eq!(params["center_on"]["language"], "rust");
+    assert_eq!(params["center_on"]["workspace_root"], "/p");
+}
+
+#[test]
+fn closing_the_lsp_dialog_returns_to_the_picker() {
+    use aether_client::session::Prompt;
+    use aether_protocol::lsp::LspStatus;
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::LspServers, None, None);
+    {
+        let p = s.picker.as_mut().expect("picker open");
+        p.items = vec![PickerItem::LspServer {
+            name: "rust-analyzer".into(),
+            language: "rust".into(),
+            workspace_root: "/p".into(),
+            root_label: String::new(),
+            status: LspStatus::Ready,
+            progress: vec![],
+            match_indices: vec![],
+        }];
+        p.selected = 0;
+    }
+    // Enter drills into the detail dialog, but the picker stays open underneath.
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(matches!(s.prompt, Some(Prompt::LspInfo(_))), "dialog opens");
+    assert!(s.picker.is_some(), "the LSP picker stays open underneath the dialog");
+    // Closing the dialog (Esc) returns to the picker rather than the editor.
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(s.prompt.is_none(), "dialog closed");
+    assert!(s.picker.is_some(), "back at the LSP picker, not the editor");
+}
+
+#[test]
+fn lsp_dialog_working_field_tracks_live_picker_progress() {
+    use aether_client::session::Prompt;
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::lsp::{LspProgress, LspStatus};
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdate, PickerUpdateParams};
+
+    let server = |pct: u32| PickerItem::LspServer {
+        name: "rust-analyzer".into(),
+        language: "rust".into(),
+        workspace_root: "/p".into(),
+        root_label: String::new(),
+        status: LspStatus::Ready,
+        progress: vec![LspProgress {
+            title: "Indexing".into(),
+            message: None,
+            percentage: Some(pct),
+        }],
+        match_indices: vec![],
+    };
+
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::LspServers, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![server(0)];
+        p.selected = 0;
+    }
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+
+    // The LSP picker refreshes with new progress (a `report` — no `lsp/status_changed`); the open
+    // dialog's Working line must follow it, not freeze at the opening 0% snapshot.
+    let generation = s.picker.as_ref().unwrap().generation;
+    let update = PickerUpdateParams {
+        kind: PickerKind::LspServers,
+        generation,
+        offset: 0,
+        items: Some(vec![server(50)]),
+        total_matches: 1,
+        total_candidates: 1,
+        ticking: false,
+        grep_display_offset: None,
+        grep_total_display_rows: None,
+    };
+    let _ = s.on_event(Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: PickerUpdate::NAME.into(),
+        params: serde_json::to_value(&update).unwrap(),
+    }));
+    match &s.prompt {
+        Some(Prompt::LspInfo(info)) => assert_eq!(
+            info.progress.first().and_then(|p| p.percentage),
+            Some(50),
+            "the dialog's Working % tracks the live picker progress"
+        ),
+        other => panic!("expected the LSP dialog still open, got {other:?}"),
+    }
+}
+
+#[test]
+fn lsp_info_restart_is_ctrl_r_not_plain_r() {
+    use aether_client::session::Prompt;
+    use aether_client::update::Event;
+    use aether_protocol::lsp::{LspServerStatus, LspStatus};
+    let status = || {
+        Box::new(LspServerStatus {
+            name: "rust-analyzer".into(),
+            language: "rust".into(),
+            workspace_root: "/p".into(),
+            status: LspStatus::Ready,
+            progress: vec![],
+        })
+    };
+
+    // Plain `r` just closes the dialog — it must NOT restart (that was the old binding).
+    let mut s = session();
+    s.prompt = Some(Prompt::LspInfo(status()));
+    let fx = s.on_key(KeyCode::Char('r'), Mods::NONE, Some("r".into()), ROWS);
+    assert!(s.prompt.is_none(), "any non-Ctrl key closes the dialog");
+    assert!(
+        find_request(&fx, "lsp/restart_server").is_none(),
+        "plain r no longer restarts"
+    );
+
+    // Ctrl-r restarts the server AND keeps the dialog open, showing Restarting immediately.
+    s.prompt = Some(Prompt::LspInfo(status()));
+    let fx = s.on_key(KeyCode::Char('r'), Mods::CTRL, None, ROWS);
+    assert!(
+        find_request(&fx, "lsp/restart_server").is_some(),
+        "Ctrl-r restarts"
+    );
+    match &s.prompt {
+        Some(Prompt::LspInfo(info)) => {
+            assert!(
+                matches!(info.status, LspStatus::Restarting),
+                "the dialog stays open and shows Restarting"
+            );
+        }
+        other => panic!("expected the LSP dialog to stay open, got {other:?}"),
+    }
+
+    // A subsequent `lsp/status_changed` for that server live-updates the open dialog (→ Ready).
+    let ready = LspServerStatus {
+        name: "rust-analyzer".into(),
+        language: "rust".into(),
+        workspace_root: "/p".into(),
+        status: LspStatus::Ready,
+        progress: vec![],
+    };
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::lsp::LspStatusChanged;
+    let _ = s.on_event(Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: LspStatusChanged::NAME.into(),
+        params: serde_json::to_value(&ready).unwrap(),
+    }));
+    match &s.prompt {
+        Some(Prompt::LspInfo(info)) => {
+            assert!(matches!(info.status, LspStatus::Ready), "dialog reflects the live status");
+        }
+        other => panic!("expected the LSP dialog still open, got {other:?}"),
+    }
+}
+
+#[test]
 fn editing_is_refused_while_disconnected_and_insert_drops_on_disconnect() {
     use aether_client::session::{ConnState, Mode};
     use aether_client::update::Event;

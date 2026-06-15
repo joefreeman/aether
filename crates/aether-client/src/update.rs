@@ -1289,9 +1289,9 @@ impl Session {
                     Effects::none()
                 }
             }
-            Prompt::LspInfo(info) => {
-                // `r` restarts; any other key closes the dialog.
-                if code == KeyCode::Char('r') && !mods.ctrl && !mods.alt {
+            Prompt::LspInfo(mut info) => {
+                // `Ctrl-r` restarts (matching the picker list's `Ctrl-r`); any other key closes.
+                if code == KeyCode::Char('r') && mods.ctrl && !mods.alt {
                     let mut fx = self.request::<LspRestartServer>(
                         LspRestartServerParams {
                             language: info.language.clone(),
@@ -1305,6 +1305,12 @@ impl Session {
                         format!("restarting {}", info.name),
                         ToastKind::Info,
                     ));
+                    // Keep the dialog open so the user can watch the lifecycle — show `Restarting`
+                    // at once, then the server's `lsp/status_changed` pushes refresh it through to
+                    // Ready (see the `LspStatusChanged` handler). Esc / any other key still closes.
+                    info.status = aether_protocol::lsp::LspStatus::Restarting;
+                    info.progress.clear();
+                    self.prompt = Some(Prompt::LspInfo(info));
                     return fx;
                 }
                 Effects::none()
@@ -1453,21 +1459,32 @@ impl Session {
         }
         // Explorer: anchor the highlight on the active buffer's filename, so the listing
         // lands on "where you are" (matched by name via the `effective_center_on` echo).
-        let center_on = (kind == PickerKind::Explorer)
-            .then(|| {
-                let path = self.buffer.path.as_deref()?;
-                let name = std::path::Path::new(path)
-                    .file_name()?
-                    .to_str()?
-                    .to_string();
+        // LspServers: anchor on the active buffer's own language server, so the picker opens with
+        // *your* server selected (matched by `language` + `workspace_root` — the LspServer item
+        // key; the other fields are display-only and ignored by the match).
+        let center_on = match kind {
+            PickerKind::Explorer => self.buffer.path.as_deref().and_then(|path| {
+                let name = std::path::Path::new(path).file_name()?.to_str()?.to_string();
                 Some(PickerItem::DirEntry {
                     name,
                     is_dir: false,
                     match_indices: Vec::new(),
                     git_status: None,
                 })
-            })
-            .flatten();
+            }),
+            PickerKind::LspServers => self.buffer.lsp_server.as_ref().map(|r| {
+                PickerItem::LspServer {
+                    name: String::new(),
+                    language: r.language.clone(),
+                    workspace_root: r.workspace_root.clone(),
+                    root_label: String::new(),
+                    status: aether_protocol::lsp::LspStatus::Ready,
+                    progress: Vec::new(),
+                    match_indices: Vec::new(),
+                }
+            }),
+            _ => None,
+        };
 
         let request = self.request::<PickerView>(
             PickerViewParams {
@@ -1860,6 +1877,36 @@ impl Session {
         Effects::none()
     }
 
+    /// Keep an open LSP info dialog in step with the live LSP picker beneath it. LSP progress
+    /// `report`s (Indexing 10% → 20% …) refresh the picker but deliberately *don't* broadcast
+    /// `lsp/status_changed` (which fires only on begin/end busy transitions), so a dialog driven
+    /// solely by `status_changed` would freeze its "Working" line at the opening snapshot. Re-reads
+    /// the matching server's status + progress from the picker's current items.
+    fn sync_lsp_dialog_from_picker(&mut self) {
+        let Some(Prompt::LspInfo(info)) = self.prompt.as_mut() else {
+            return;
+        };
+        let Some(p) = &self.picker else {
+            return;
+        };
+        let matching = p.items.iter().find_map(|it| match it {
+            PickerItem::LspServer {
+                language,
+                workspace_root,
+                status,
+                progress,
+                ..
+            } if *language == info.language && *workspace_root == info.workspace_root => {
+                Some((status.clone(), progress.clone()))
+            }
+            _ => None,
+        });
+        if let Some((status, progress)) = matching {
+            info.status = status;
+            info.progress = progress;
+        }
+    }
+
     /// Push a filter (chip) change. For Grep/Files a filter change *is* a query change (same
     /// generation mechanics); for the Explorer the filters apply when the listing is built,
     /// so re-view the current directory with the replacement set. No-op for kinds that take
@@ -2183,7 +2230,10 @@ impl Session {
                 ..
             } => {
                 // Not a jump target: Enter drills into the detail dialog (restart lives
-                // there and on Ctrl-r in the list).
+                // there and on Ctrl-r in the list). The picker stays open *underneath* — the
+                // dialog is a prompt, which takes key precedence — so closing it (Esc / any
+                // non-Ctrl-r key) returns to the LSP picker with this server still selected,
+                // mirroring the explorer's delete-confirm drawn over its listing.
                 let info = LspServerStatus {
                     name: name.clone(),
                     language: language.clone(),
@@ -2192,9 +2242,8 @@ impl Session {
                     progress: progress.clone(),
                 };
                 let _ = root_label;
-                let hide = self.close_picker();
                 self.prompt = Some(Prompt::LspInfo(Box::new(info)));
-                return hide;
+                return Effects::none();
             }
             _ => {}
         }
@@ -2628,12 +2677,18 @@ impl Session {
             }
             PickerUpdate::NAME => {
                 if let Ok(u) = serde_json::from_value::<PickerUpdateParams>(n.params) {
+                    let mut reveal = None;
                     if let Some(p) = &mut self.picker {
                         if p.apply_update(u) && p.pending_center.is_none() {
-                            if let Some(reveal) = p.reveal_on_update.take() {
-                                return Effects::one(Effect::RevealPickerSelection(reveal));
-                            }
+                            reveal = p.reveal_on_update.take();
                         }
+                    }
+                    // The LSP picker refresh carries live progress (`report`s don't fire
+                    // `lsp/status_changed`); fold it into an open LSP dialog so its "Working" line
+                    // tracks the percentage instead of freezing at the opening snapshot.
+                    self.sync_lsp_dialog_from_picker();
+                    if let Some(reveal) = reveal {
+                        return Effects::one(Effect::RevealPickerSelection(reveal));
                     }
                 }
                 Effects::none()
@@ -2651,10 +2706,21 @@ impl Session {
             }
             LspStatusChanged::NAME => {
                 if let Ok(s) = serde_json::from_value::<LspServerStatus>(n.params) {
-                    let matches = self.buffer.lsp_server.as_ref().is_some_and(|r| {
+                    let matches_current = self.buffer.lsp_server.as_ref().is_some_and(|r| {
                         r.language == s.language && r.workspace_root == s.workspace_root
                     });
-                    if matches {
+                    // Live-update an open LSP info dialog for the same server, so a restart's
+                    // Restarting → Ready transition shows in place without reopening it.
+                    let matches_dialog = matches!(
+                        self.prompt.as_ref(),
+                        Some(Prompt::LspInfo(info))
+                            if info.language == s.language
+                                && info.workspace_root == s.workspace_root
+                    );
+                    if matches_dialog {
+                        self.prompt = Some(Prompt::LspInfo(Box::new(s.clone())));
+                    }
+                    if matches_current {
                         self.lsp = Some(s);
                     }
                 }

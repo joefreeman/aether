@@ -134,7 +134,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // A centered modal dims the content behind it so it stands out. Done once here, before any
     // overlay paints: each overlay `Clear`s and repaints its own box opaquely, so only the area
     // *behind* the dialog ends up dimmed.
-    let modal_open = state.picker.open || state.project_settings.is_some() || state.help.open;
+    let modal_open = state.picker.open
+        || state.project_settings.is_some()
+        || state.help.open
+        || state.picker.lsp_detail.is_some();
     // Status-bar prompts dim the editor too, so attention moves to the prompt: the save-as path
     // input and the y/N confirm prompts. Search is deliberately excluded — it live-highlights
     // matches in the buffer, so the editor must stay legible (and it sets neither flag below).
@@ -150,6 +153,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // Project settings overlay (Space P): centered modal listing the active project's roots.
     if state.project_settings.is_some() {
         draw_project_settings_overlay(f, state, chunks[0]);
+    }
+    // LSP-server detail (Space l → Enter): a top-level overlay — the picker is closed when the
+    // core drills into `Prompt::LspInfo`, so it's not part of the picker box.
+    if let Some(detail) = state.picker.lsp_detail.as_ref() {
+        draw_lsp_detail_overlay(f, detail, chunks[0]);
     }
     if show_status {
         draw_status(f, state, chunks[1]);
@@ -1874,17 +1882,8 @@ pub fn picker_scroll_for_selected(
 }
 
 fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
-    // The LSP drill-down keeps the full-size box (its content is wrapped prose, not result
-    // rows); everything else collapses to its content.
-    let lsp_detail_open = state.picker.kind
-        == Some(aether_protocol::picker::PickerKind::LspServers)
-        && state.picker.lsp_detail.is_some();
     let editor_open = state.picker.chip_editor.is_some();
-    let box_area = if lsp_detail_open {
-        picker_box_rect(area)
-    } else {
-        collapsed_picker_box_rect(area, picker_content_rows(&state.picker), editor_open)
-    };
+    let box_area = collapsed_picker_box_rect(area, picker_content_rows(&state.picker), editor_open);
     if box_area.width < 4 || box_area.height < 3 {
         return; // Too small to draw anything meaningful.
     }
@@ -1917,15 +1916,6 @@ fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(inner);
-    // LSP-servers drill-down: one plain box (no input/separator split — that reads as a filter
-    // field) with the title and the status/error as a single scrollable region. `Esc` returns to
-    // the list.
-    if let (Some(aether_protocol::picker::PickerKind::LspServers), Some(detail)) =
-        (state.picker.kind, state.picker.lsp_detail.as_ref())
-    {
-        draw_lsp_detail(f, detail, pad_horizontal(inner));
-        return;
-    }
     draw_picker_input_row(f, state, pad_horizontal(rows[0]));
     let mut next = 1;
     if editor_open {
@@ -1937,6 +1927,25 @@ fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
         next += 1;
     }
     draw_picker_results(f, state, pad_horizontal(rows[next]));
+}
+
+/// The LSP-server detail screen (`Space l` → Enter on a server): a full-size box rendering the
+/// server's status. It's a modal prompt (`Prompt::LspInfo`), *not* a picker sub-state — the core
+/// closes the picker when drilling in — so it draws as its own top-level overlay rather than
+/// inside the picker box. `Ctrl-r` restarts the server; any other key closes.
+fn draw_lsp_detail_overlay(f: &mut Frame, detail: &crate::picker::LspServerDetail, area: Rect) {
+    let box_area = picker_box_rect(area);
+    if box_area.width < 4 || box_area.height < 3 {
+        return;
+    }
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(NORD4))
+        .style(Style::default().bg(NORD0).fg(NORD4));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    draw_lsp_detail(f, detail, pad_horizontal(inner));
 }
 
 /// The LSP-server detail drill-down: a status dot + bold name title, then labelled rows —
