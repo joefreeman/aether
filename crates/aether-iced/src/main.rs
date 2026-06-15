@@ -3,6 +3,7 @@
 //! tokio runtime before iced takes over the main thread; the WebSocket actor stays on that
 //! runtime for the app's lifetime.
 
+mod alt_filter;
 mod app;
 mod connection;
 mod discovery;

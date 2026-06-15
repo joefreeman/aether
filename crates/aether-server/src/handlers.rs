@@ -55,7 +55,8 @@ use aether_protocol::picker::{
 use aether_protocol::project::{
     ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
     ProjectDeleteParams, ProjectInfo, ProjectListParams, ProjectListResult,
-    ProjectRemoveRootParams, ProjectRemoveRootResult, ProjectRenameParams, ProjectSummary,
+    ProjectRemoveRootParams, ProjectRemoveRootResult, ProjectRenameParams, ProjectRenamed,
+    ProjectRenamedParams, ProjectSummary,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
@@ -310,6 +311,13 @@ pub async fn project_create(
         session.active_project = Some(name.clone());
     }
 
+    // Another client's open chooser should gain the new project.
+    let pushes = refresh_project_pickers(&mut s);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
     tracing::info!(%client_id, project = %name, "client created project");
     Ok(ProjectActivateResult {
         project: ProjectInfo {
@@ -513,7 +521,7 @@ pub async fn project_remove_root(
 /// project; a no-op when the name is unchanged.
 pub async fn project_rename(
     state: &SharedState,
-    _ctx: &mut ConnectionCtx,
+    ctx: &mut ConnectionCtx,
     params: ProjectRenameParams,
 ) -> Result<ProjectInfo, RpcError> {
     let new_name = validate_project_name(&params.new_name)?;
@@ -560,6 +568,37 @@ pub async fn project_rename(
     let entry_paths = s
         .rename_project(&old_name, &new_name)
         .ok_or_else(|| RpcError::internal("project vanished during rename"))?;
+
+    // The re-key above already moved every other connected client on this project to the new name
+    // server-side; push `project/renamed` so each can update its *local* name (display + reconnect
+    // baseline). The initiating client learns the new name from this RPC's result instead.
+    let mut pushes: PendingPushes = s
+        .clients
+        .iter()
+        .filter(|(id, sess)| {
+            **id != ctx.client_id && sess.active_project.as_deref() == Some(new_name.as_str())
+        })
+        .map(|(_, sess)| {
+            (
+                sess.outbound.clone(),
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: ProjectRenamed::NAME.into(),
+                    params: serde_json::to_value(ProjectRenamedParams {
+                        old_name: old_name.clone(),
+                        new_name: new_name.clone(),
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+                },
+            )
+        })
+        .collect();
+    // ...and any open chooser elsewhere should show the new name in its list.
+    pushes.extend(refresh_project_pickers(&mut s));
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
 
     tracing::info!(old = %old_name, new = %new_name, "project renamed");
     Ok(ProjectInfo {
@@ -617,6 +656,16 @@ pub async fn project_delete(
 
     crate::config::delete_project_config(&name)
         .map_err(|e| RpcError::internal(format!("deleting project config: {e}")))?;
+
+    // Re-take the lock to refresh any open chooser — only now is the project gone from disk (the
+    // candidate list is a disk read), so the dropped project disappears from the list.
+    let pushes = {
+        let mut s = state.lock().await;
+        refresh_project_pickers(&mut s)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
 
     tracing::info!(project = %name, closed = closed.len(), "project deleted");
     Ok(())
@@ -8355,6 +8404,61 @@ pub(crate) fn refresh_buffer_pickers(s: &mut ServerState) -> PendingPushes {
             continue;
         };
         picker.candidates = picker_state::PickerCandidates::Buffers(new_candidates);
+        picker.rerank(matcher);
+        if let Some(window) = picker.subscribed.as_mut() {
+            let total = picker.ranked.len() as u32;
+            if window.offset >= total {
+                window.offset = total.saturating_sub(window.limit);
+            }
+        }
+        let Some(update) = picker_state::build_update(picker, matcher) else {
+            continue;
+        };
+        let Some(sender) = clients.get(&client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        pushes.push((sender, picker_update_notif(update)));
+    }
+    pushes
+}
+
+/// Rebuild and re-push every subscribed `Projects` picker. Called after a project is created,
+/// renamed, or deleted (by any client) so an open chooser elsewhere reflects the new set live.
+/// Mirrors [`refresh_buffer_pickers`]; the candidate list is a disk read, so callers must have
+/// already written the config change before invoking this.
+pub(crate) fn refresh_project_pickers(s: &mut ServerState) -> PendingPushes {
+    let client_ids: Vec<ClientId> = s
+        .pickers
+        .iter()
+        .filter_map(|((c, k), p)| {
+            (*k == PickerKind::Projects && p.subscribed.is_some()).then_some(*c)
+        })
+        .collect();
+    if client_ids.is_empty() {
+        return Vec::new();
+    }
+    // One disk read of the projects directory, shared by every subscribed picker.
+    let names = match crate::config::list_project_names() {
+        Ok(n) => n,
+        Err(_) => return Vec::new(), // can't enumerate — leave the pickers as they are
+    };
+    let mut pushes = Vec::new();
+    for client_id in client_ids {
+        let candidates = names
+            .iter()
+            .cloned()
+            .map(|name| picker_state::ProjectCandidate { name })
+            .collect();
+        let ServerState {
+            pickers,
+            matcher,
+            clients,
+            ..
+        } = &mut *s;
+        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Projects)) else {
+            continue;
+        };
+        picker.candidates = picker_state::PickerCandidates::Projects(candidates);
         picker.rerank(matcher);
         if let Some(window) = picker.subscribed.as_mut() {
             let total = picker.ranked.len() as u32;

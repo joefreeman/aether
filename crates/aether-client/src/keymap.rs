@@ -236,9 +236,6 @@ pub enum Action {
     SearchCommit,
     SearchHistoryPrev,
     SearchHistoryNext,
-    SearchCursorLeft,
-    SearchCursorRight,
-    SearchBackspace,
     /// `>` / `<` — step through cached grep hits from the cursor, cross-file.
     GrepNavigate(Direction),
     /// `Esc` in Normal — drop the active search (clear highlights).
@@ -666,9 +663,8 @@ static SEARCH: &[Binding] = &[
     // Alt-k/j (not Up/Down) browse history — same chord as the TUI / picker inputs.
     bind!(KeyContext::Search, ch('k'), Exact(Mods::ALT), A::SearchHistoryPrev, "Search", "Previous query in history"),
     bind!(KeyContext::Search, ch('j'), Exact(Mods::ALT), A::SearchHistoryNext, "Search", "Next query in history"),
-    bind!(KeyContext::Search, KeyCode::Left, Any, A::SearchCursorLeft, "Search", "Move cursor left"),
-    bind!(KeyContext::Search, KeyCode::Right, Any, A::SearchCursorRight, "Search", "Move cursor right"),
-    bind!(KeyContext::Search, KeyCode::Backspace, Any, A::SearchBackspace, "Search", "Delete character"),
+    // Text entry (chars, Backspace, Left/Right caret) is owned by each shell's search input, which
+    // syncs the value via `search_set_query`; only the command keys above live in this table.
 ];
 
 #[rustfmt::skip]

@@ -1474,21 +1474,6 @@ fn draw_settings_rows(
         let text_budget = area_w.saturating_sub(1);
         if i < settings.roots.len() {
             let root = &settings.roots[i];
-            let pending = settings.pending_delete && settings.selected == i + 1;
-            if pending {
-                const PREFIX: &str = "Remove \"";
-                const SUFFIX: &str = "\"? [y/N]";
-                let fixed_w = PREFIX.width() + SUFFIX.width();
-                let path_budget = text_budget.saturating_sub(fixed_w);
-                let path = truncate_middle(root, path_budget);
-                let warn_style = Style::default()
-                    .fg(NORD11)
-                    .bg(NORD0)
-                    .add_modifier(Modifier::BOLD);
-                let body = Span::styled(format!("{PREFIX}{path}{SUFFIX}"), warn_style);
-                lines.push(Line::from(vec![leading, body]));
-                continue;
-            }
             // A colour-coded dot when the active buffer under this root is dirty / changed on
             // disk (` •`), reserving its width so the path truncates to leave room.
             let status = root_buffer_status(state, root);

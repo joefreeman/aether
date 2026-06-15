@@ -3,6 +3,7 @@ mod clipboard;
 mod connection;
 mod discovery;
 mod labels;
+mod overlay_input;
 mod picker;
 mod save_prompt;
 mod scroll;

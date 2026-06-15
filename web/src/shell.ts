@@ -136,21 +136,54 @@ function hoverSevClass(label: string): string {
 
 interface SearchView {
   query: string;
-  cursor: number;
   active: boolean;
   extend_to_cursor: boolean;
   summary: { total: number; current_index: number; truncated: boolean } | null;
 }
 
+/** The structured reason for a confirmation (the core states the reason; the shell composes the
+ *  wording — see `confirmMessage`). Mirrors `ConfirmKind` in the Rust core. */
+type ConfirmKind =
+  | { kind: "overwrite"; path: string | null }
+  | { kind: "overwrite_modified" }
+  | { kind: "recreate_deleted" }
+  | { kind: "discard_reload" }
+  | { kind: "discard_close"; label: string }
+  | { kind: "delete"; noun: string; name: string }
+  | { kind: "remove_root"; path: string }
+  | { kind: "delete_project"; name: string };
+
 type PromptView =
-  | { kind: "confirm"; message: string }
-  | { kind: "saveas"; path_index: number; input: string; cursor: number }
+  | { kind: "confirm"; confirm: ConfirmKind }
+  | { kind: "saveas"; path_index: number; input: string }
   | { kind: "lspinfo"; status: LspServerStatus };
+
+/** The web client's phrasing for each confirmation reason — a presentational choice, matching the
+ *  native/TUI wording. The modal then offers Yes/No (the destructive action in red). */
+function confirmMessage(c: ConfirmKind): string {
+  switch (c.kind) {
+    case "overwrite":
+      return c.path === null ? "overwrite?" : `overwrite ${c.path}?`;
+    case "overwrite_modified":
+      return "file changed on disk — overwrite?";
+    case "recreate_deleted":
+      return "file removed on disk — recreate?";
+    case "discard_reload":
+      return "discard local changes and reload?";
+    case "discard_close":
+      return `discard unsaved changes in ${c.label}?`;
+    case "delete":
+      return `Delete ${c.noun} "${c.name}"?`;
+    case "remove_root":
+      return `Remove root "${c.path}"?`;
+    case "delete_project":
+      return `Delete project "${c.name}"?`;
+  }
+}
 
 interface PickerView {
   kind: PickerKind;
   query: string;
-  cursor: number;
   offset: number;
   selected: number;
   items: PickerItem[];
@@ -171,7 +204,6 @@ interface PickerView {
 
 interface EditorInput {
   text: string;
-  cursor: number;
 }
 
 /** The glob/dir filter-creation editor (view.rs `chip_editor`). The core drives editing; the shell
@@ -244,6 +276,20 @@ interface CoreView {
   search: SearchView;
   prompt: PromptView | null;
   picker: PickerView | null;
+  project_settings: ProjectSettingsView | null;
+}
+
+/** The project-settings overlay (`Space ,`), when open (view.rs `project_settings`). Core-owned
+ *  state + key handling (`on_project_settings_key`); the shell renders this and routes keys through
+ *  the global keydown → `on_key`. Selection: 0 = name field, `1..=roots.length` = root rows,
+ *  `input_index` = the add-root input row. */
+interface ProjectSettingsView {
+  name: EditorInput;
+  roots: string[];
+  selected: number;
+  input_index: number;
+  add: EditorInput;
+  error: string | null;
 }
 
 /** Cumulative visual rows before `line` in the loaded window (phantom rows included), or null when
@@ -537,6 +583,24 @@ export class Shell {
   private helpTab = 0;
   private helpData: { label: string; sections: { title: string; rows: [string, string][] }[] }[] | null = null;
   private helpTabEls: HTMLElement[] = [];
+  /** The project-settings overlay (Space ,). Core-owned state (`session.project_settings`); the
+   *  name + add-root fields are persistent native `<input>`s (real caret/selection/IME) that own
+   *  text editing and sync to the core (`project_settings_set_name` / `_set_add`); nav/commit/cancel
+   *  keys route through their keydown → `on_key`. The labels + root rows are rebuilt each render. */
+  private readonly projectSettingsEl: HTMLElement;
+  private readonly psModalEl: HTMLElement;
+  /** The `<ul>` of existing roots — rebuilt each render. */
+  private readonly psRootsEl: HTMLElement;
+  private readonly psNameInput: HTMLInputElement;
+  private readonly psAddInput: HTMLInputElement;
+  /** The in-dialog error line — persistent, shown/hidden per render. */
+  private readonly psErrorEl: HTMLElement;
+  /** The currently-open project-settings selection, so `focusTarget` knows what to focus: the name
+   *  field, the add-root input, or — for a root row — the capture field (the row's keys route via
+   *  the global handler). */
+  private psSelected = 0;
+  private psInputIndex = 0;
+  private psOpen = false;
   /** Monotonic id for the latest `viewport/subscribe`. Async viewport results (subscribe / fetch /
    *  reveal-scroll) captured at an older epoch are dropped, so a superseded request can't reinstate a
    *  stale window — the robust guard against the reply/push interleaving + concurrent-jump races. */
@@ -794,6 +858,71 @@ export class Shell {
     this.helpEl.addEventListener("mousedown", (e) => {
       if (e.target === this.helpEl) this.closeHelp();
     });
+    // The project-settings overlay (Space ,): a persistent modal whose name + add-root fields are
+    // native <input>s (so they keep focus + caret across re-renders and handle IME); only the
+    // labels + root rows are rebuilt each render. A backdrop click is swallowed (editor stays put).
+    this.projectSettingsEl = document.createElement("div");
+    this.projectSettingsEl.className = "overlay";
+    this.projectSettingsEl.style.display = "none";
+    this.projectSettingsEl.addEventListener("mousedown", (e) => {
+      // Swallow backdrop clicks (no fall-through to the editor); clicks on inputs/buttons proceed.
+      if (e.target === this.projectSettingsEl) e.preventDefault();
+    });
+    this.psModalEl = document.createElement("div");
+    this.psModalEl.className = "modal project-settings";
+    const psTitle = document.createElement("div");
+    psTitle.className = "modal-message";
+    psTitle.textContent = "Project Settings";
+    const psNameLabel = document.createElement("div");
+    psNameLabel.className = "ps-label";
+    psNameLabel.textContent = "Name";
+    this.psNameInput = document.createElement("input");
+    this.psNameInput.className = "ps-input";
+    this.psNameInput.spellcheck = false;
+    this.psNameInput.autocapitalize = "off";
+    this.psNameInput.setAttribute("autocomplete", "off");
+    this.psNameInput.addEventListener("input", () => {
+      if (this.session) this.runEffects(this.session.project_settings_set_name(this.psNameInput.value) as CoreEffect[]);
+    });
+    this.psNameInput.addEventListener("keydown", (e) => this.onProjectSettingsInputKey(e));
+    const psRootsLabel = document.createElement("div");
+    psRootsLabel.className = "ps-label";
+    psRootsLabel.textContent = "Roots";
+    // Existing roots: a semantic `<ul>`, rebuilt each render.
+    this.psRootsEl = document.createElement("ul");
+    this.psRootsEl.className = "ps-roots";
+    // The add-root row sits *outside* the list (it's an action, not a root) but reads as one more
+    // bulleted item. Persistent — so a root-list rebuild never re-parents the input and steals its
+    // caret mid-type. The bullet is a static lead; the input is borderless (the caret is its cue).
+    this.psAddInput = document.createElement("input");
+    this.psAddInput.className = "ps-add-input";
+    this.psAddInput.placeholder = "Add root...";
+    this.psAddInput.spellcheck = false;
+    this.psAddInput.autocapitalize = "off";
+    this.psAddInput.setAttribute("autocomplete", "off");
+    this.psAddInput.addEventListener("input", () => {
+      if (this.session) this.runEffects(this.session.project_settings_set_add(this.psAddInput.value) as CoreEffect[]);
+    });
+    this.psAddInput.addEventListener("keydown", (e) => this.onProjectSettingsInputKey(e));
+    const psAddRow = document.createElement("div");
+    psAddRow.className = "ps-root ps-add";
+    const psAddBullet = document.createElement("span");
+    psAddBullet.className = "ps-bullet";
+    psAddBullet.textContent = "•";
+    psAddRow.append(psAddBullet, this.psAddInput);
+    this.psErrorEl = document.createElement("div");
+    this.psErrorEl.className = "ps-error";
+    this.psErrorEl.style.display = "none";
+    this.psModalEl.append(
+      psTitle,
+      psNameLabel,
+      this.psNameInput,
+      psRootsLabel,
+      this.psRootsEl,
+      psAddRow,
+      this.psErrorEl,
+    );
+    this.projectSettingsEl.append(this.psModalEl);
     root.append(
       this.bufferEl,
       this.capture,
@@ -806,6 +935,7 @@ export class Shell {
       // `hoverEl` is not appended here — it's parented into the buffer's spacer while shown (so it
       // can be `position: sticky` relative to the scrolling buffer) and removed on dismiss.
       this.helpEl,
+      this.projectSettingsEl,
       this.connBanner,
     );
 
@@ -927,7 +1057,10 @@ export class Shell {
    *  Confirm/lsp-info prompts have no input and stay on the window handler. */
   private overlayOwnsKeyboard(): boolean {
     const v = this.snapshot;
-    return !!(v && (v.picker || v.mode === "search" || v.prompt?.kind === "saveas"));
+    return !!(
+      v &&
+      (v.picker || v.mode === "search" || v.prompt?.kind === "saveas" || v.project_settings)
+    );
   }
 
   /** The element that should hold focus for the current state: an open text-overlay's `<input>` (it
@@ -935,11 +1068,26 @@ export class Shell {
    *  hidden capture field (keeping a form field focused is what suppresses the Firefox Alt menu). */
   private focusTarget(): HTMLElement {
     const v = this.snapshot;
+    // A confirm / lsp-info prompt (e.g. remove-root over the settings dialog) owns the keyboard via
+    // the global keydown on `capture` — its y/N keys must not be swallowed as native input editing.
+    if (v?.prompt && v.prompt.kind !== "saveas") return this.capture;
     const ce = v?.picker?.chip_editor;
     if (ce) return ce.is_dir && ce.multi_root && ce.field === "root" ? this.editorRootInput : this.editorPathInput;
-    if (v?.picker) return this.pickerInput;
+    // A selected filter chip owns the keyboard, not the query: park focus on the hidden capture
+    // field (the chip-row keys route through the global handler) so the query input shows no caret.
+    if (v?.picker) return v.picker.chip_selected !== null ? this.capture : this.pickerInput;
     if (v?.mode === "search") return this.searchInput;
     if (v?.prompt?.kind === "saveas") return this.saveAsInput;
+    // The project-settings overlay: focus the input matching the selected row — the name field, or
+    // the add-root input. A selected *root* row has no text field, so park focus on the hidden
+    // capture field (its keys route through the global handler) rather than the add input, which
+    // would otherwise show a stray caret and read as focused.
+    if (v?.project_settings) {
+      const ps = v.project_settings;
+      if (ps.selected === 0) return this.psNameInput;
+      if (ps.selected === ps.input_index) return this.psAddInput;
+      return this.capture;
+    }
     return this.capture;
   }
 
@@ -964,7 +1112,9 @@ export class Shell {
       t === this.editorPathInput ||
       t === this.editorRootInput ||
       t === this.searchInput ||
-      t === this.saveAsInput
+      t === this.saveAsInput ||
+      t === this.psNameInput ||
+      t === this.psAddInput
     ) {
       return;
     }
@@ -1003,6 +1153,32 @@ export class Shell {
           return;
         }
       }
+    }
+    // A filter chip is selected: focus is parked off the query input (see `focusTarget`), so its own
+    // keydown handler won't fire. Drive the chip-row keys through the core here — Left/Right to
+    // navigate, Backspace/Delete to remove, Enter to edit, Esc to deselect, a typed char to
+    // deselect-and-type. Mirrors the native clients, which route chip keys with the input unfocused.
+    const pk = this.snapshot?.picker;
+    if (pk && !pk.chip_editor && pk.chip_selected !== null && this.session) {
+      if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
+        e.preventDefault();
+        this.runEffects(
+          this.session.on_key(e.key, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+        );
+      }
+      return;
+    }
+    // A project-settings root row is selected: like a selected chip, no text field is focused (see
+    // `focusTarget`), so route its keys (Alt-j/k to move, Delete/Ctrl-d to remove, Esc to close).
+    const ps = this.snapshot?.project_settings;
+    if (ps && ps.selected !== 0 && ps.selected !== ps.input_index && this.session) {
+      if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
+        e.preventDefault();
+        this.runEffects(
+          this.session.on_key(e.key, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+        );
+      }
+      return;
     }
     // A native-input overlay owns the keyboard while open; let its own handler take the event.
     if (this.overlayOwnsKeyboard()) return;
@@ -1618,6 +1794,7 @@ export class Shell {
     this.renderSearch(v);
     this.renderPrompt(v);
     this.renderPicker(v);
+    this.renderProjectSettings(v);
     // No project yet (placeholder boot session): the mandatory chooser is the whole UI. Render only
     // a bare backdrop behind it — no buffer, no status bar — and don't sync a bogus `?buffer=0` URL.
     if (v.buffer.buffer_id === 0) {
@@ -1734,15 +1911,25 @@ export class Shell {
     if (p.kind === "confirm") {
       const msg = document.createElement("div");
       msg.className = "modal-message";
-      msg.textContent = p.message;
+      msg.textContent = confirmMessage(p.confirm);
       const buttons = document.createElement("div");
       buttons.className = "modal-buttons";
+      // Clicking drives the core via a synthetic key (matches the keyboard path: Esc declines,
+      // `y` confirms) — focus stays on the capture field, so no extra routing is needed.
+      const sendKey = (key: string) => {
+        if (!this.session) return;
+        this.runEffects(
+          this.session.on_key(key, false, false, false, this.visibleRows()) as CoreEffect[],
+        );
+      };
       const cancel = document.createElement("span");
       cancel.className = "modal-btn";
-      cancel.textContent = "Esc";
+      cancel.textContent = "No";
+      cancel.addEventListener("click", () => sendKey("Escape"));
       const ok = document.createElement("span");
-      ok.className = "modal-btn primary";
-      ok.textContent = "Enter";
+      ok.className = "modal-btn danger";
+      ok.textContent = "Yes";
+      ok.addEventListener("click", () => sendKey("y"));
       buttons.append(cancel, ok);
       modal.append(msg, buttons);
     } else {
@@ -1793,6 +1980,84 @@ export class Shell {
     this.overlayEl.replaceChildren(modal);
   }
 
+  /** The project-settings overlay (`Space ,`): the editable project name, the roots list, and an
+   *  add-root input row — all rendered from the core's `session.project_settings`. Keyboard-driven
+   *  (Alt-j/k navigate, Enter rename/add, Del then y remove, Esc close); keys route through the
+   *  global keydown → `on_key`, so this only paints. Mirrors the TUI/iced overlays. */
+  private renderProjectSettings(v: CoreView): void {
+    const ps = v.project_settings;
+    const wasOpen = this.psOpen;
+    this.psOpen = !!ps;
+    if (!ps) {
+      if (wasOpen) {
+        this.projectSettingsEl.style.display = "none";
+        this.capture.focus();
+      }
+      return;
+    }
+    this.projectSettingsEl.style.display = "";
+    this.psSelected = ps.selected;
+    this.psInputIndex = ps.input_index;
+
+    // The name + add inputs are persistent native fields; only sync their value (never on every
+    // keystroke — that would reset the caret while the user types).
+    if (this.psNameInput.value !== ps.name.text) this.psNameInput.value = ps.name.text;
+    if (this.psAddInput.value !== ps.add.text) this.psAddInput.value = ps.add.text;
+    this.psNameInput.classList.toggle("focused", ps.selected === 0);
+
+    // Rebuild the root list `<li>`s (the persistent add-input + error elements are untouched). Each
+    // row carries a delete button that opens the shared confirm prompt (same path as the Delete key).
+    const items: HTMLElement[] = [];
+    if (ps.roots.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "ps-placeholder";
+      empty.textContent = "(no roots — add one below)";
+      items.push(empty);
+    }
+    ps.roots.forEach((root, i) => {
+      const highlighted = ps.selected === i + 1;
+      const li = document.createElement("li");
+      li.className = "ps-root";
+      const bullet = document.createElement("span");
+      bullet.className = "ps-bullet";
+      bullet.textContent = "•";
+      const path = document.createElement("span");
+      // Selection tints the path text only (not the whole row), like the terminal client.
+      path.className = "ps-root-path" + (highlighted ? " selected" : "");
+      path.textContent = root;
+      const del = document.createElement("button");
+      del.className = "ps-root-delete";
+      del.type = "button";
+      del.textContent = "✕";
+      del.title = "Remove root";
+      del.addEventListener("mousedown", (e) => {
+        e.preventDefault(); // keep focus where it is until the prompt re-targets it
+        if (this.session) this.runEffects(this.session.project_settings_remove_root(i) as CoreEffect[]);
+      });
+      li.append(bullet, path, del);
+      items.push(li);
+    });
+    this.psRootsEl.replaceChildren(...items);
+    this.psErrorEl.textContent = ps.error ?? "";
+    this.psErrorEl.style.display = ps.error ? "" : "none";
+
+    // Drive focus to the input matching the selection (the add input on a root row), unless a
+    // confirm prompt is up — it owns the keyboard via `capture` (focusTarget yields to it).
+    const target = this.focusTarget();
+    if (document.activeElement !== target) target.focus();
+  }
+
+  /** A project-settings input's keydown: text editing stays native (synced via `input` →
+   *  project_settings_set_name / _set_add); nav (Alt-j/k), commit (Enter), cancel (Esc), and — when a
+   *  root row is selected — the Delete-removes-root chord route to the core. On a root row no text
+   *  field is focused, so editing keys (Delete/Backspace/arrows) must go to the core too. */
+  private onProjectSettingsInputKey(e: KeyboardEvent): void {
+    // This only fires while the name or add-root input holds focus — a selected root row parks focus
+    // on `capture` (see `focusTarget`), so its keys route through the global `onKeyDown` instead.
+    // Editing keys stay native; the rest (Alt-j/k, Enter, Esc) go to the core.
+    this.routeOverlayKey(e);
+  }
+
   /** The picker query <input>'s keydown: text-editing stays native (synced via `input` →
    *  picker_set_query); nav/accept/cancel/chord keys route to the core. (When the chip editor is open
    *  its own inputs hold focus and handle keys via onEditorKey, so this only runs for the query.)
@@ -1817,17 +2082,9 @@ export class Shell {
       }
     }
     if (p && !p.chip_editor && this.session) {
-      // A chip is selected: the core owns the editing keys; the native query input is inert until
-      // a Right past the last chip, Esc, or a typed char deselects it.
-      if (p.chip_selected !== null) {
-        e.preventDefault();
-        this.runEffects(
-          this.session.on_key(e.key, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
-        );
-        return;
-      }
       // At the very start of the query (the native caret owns the position), Left / Backspace step
-      // into the chip row, selecting the rightmost chip.
+      // into the chip row, selecting the rightmost chip. (Once selected, focus parks off the input
+      // and the chip-row keys route through the global `onKeyDown` — see `focusTarget`.)
       const atStart = this.pickerInput.selectionStart === 0 && this.pickerInput.selectionEnd === 0;
       if (atStart && p.chips.length > 0 && !e.ctrlKey && !e.altKey && !e.metaKey &&
           (e.key === "ArrowLeft" || e.key === "Backspace")) {
@@ -1875,10 +2132,18 @@ export class Shell {
     this.renderPickerChips(p);
     this.renderChipEditor(p.chip_editor);
     this.renderPickerList(p, v);
-    // Keep the query input focused whenever the picker is open (idempotent — a no-op when already
-    // focused, so it never disturbs the caret), so it's ready to type the moment it opens. While the
-    // chip editor is open one of its own inputs holds focus (syncEditorState), so stand down.
-    if (!p.chip_editor && document.activeElement !== this.pickerInput) this.pickerInput.focus();
+    // Focus management. The chip editor's own inputs hold focus while it's open (syncEditorState).
+    // Otherwise the query input owns focus — except when a filter chip is selected, where the
+    // keyboard acts on the chip row, so focus moves off the query (onto the hidden capture field) to
+    // hide its caret; the chip-row keys then route through the global `onKeyDown`, matching the
+    // native clients (which blur the input rather than render a caretless one).
+    if (!p.chip_editor) {
+      if (p.chip_selected !== null) {
+        if (document.activeElement === this.pickerInput) this.capture.focus();
+      } else if (document.activeElement !== this.pickerInput) {
+        this.pickerInput.focus();
+      }
+    }
   }
 
   /** The active filter chips (display only; toggled/edited via the keyboard → the core). Exclusion
@@ -2392,7 +2657,12 @@ export class Shell {
     row.append(bullet);
     const main = document.createElement("span");
     main.className = "picker-main picker-italic";
-    main.textContent = c.is_dir ? `+ Create directory ${c.name}/` : `+ Create file ${c.name}`;
+    main.textContent =
+      p.kind === "projects"
+        ? `+ Create project ${c.name}`
+        : c.is_dir
+          ? `+ Create directory ${c.name}/`
+          : `+ Create file ${c.name}`;
     row.append(main);
     return row;
   }
@@ -2556,6 +2826,10 @@ export class Shell {
     let createRow: HTMLElement | null = null;
     if (p.create && p.offset + p.items.length >= p.total_matches) {
       createRow = this.makePickerCreateRow(p);
+      // `create` makes it `position: absolute` so the `style.top` below places it after the last
+      // match; without it the row falls into normal flow and overlaps the items (the window is
+      // itself absolute, so an in-flow create row sits at the spacer's top, over row 0).
+      createRow.classList.add("create");
       if (p.selected === p.total_matches) selectedRow = createRow;
       spacer.append(createRow);
     }

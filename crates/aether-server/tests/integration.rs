@@ -42,7 +42,10 @@ use aether_protocol::picker::{
     PickerQueryParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
     PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
 };
-use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectActivateResult};
+use aether_protocol::project::{
+    ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectDelete,
+    ProjectDeleteParams,
+};
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
     SearchSet, SearchSetParams, SearchSetResult,
@@ -226,6 +229,46 @@ async fn hello_then_open_file() {
     )
     .await;
     assert_eq!(open2.buffer_id, open.buffer_id);
+
+    drop(server);
+}
+
+/// `project/delete` refuses to delete a project that's any client's active project — the
+/// rug-pull guard, which runs before any on-disk config is touched.
+#[tokio::test]
+async fn project_delete_refuses_the_active_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test_multi(vec![
+        ("p1".into(), vec![dir.path().to_path_buf()]),
+        ("p2".into(), vec![dir.path().to_path_buf()]),
+    ])
+    .await
+    .unwrap();
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "p1".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    // Deleting the project we're sitting in is refused, with a message that says why.
+    let msg = send_request_expect_err::<ProjectDelete>(
+        &mut ws,
+        2,
+        &ProjectDeleteParams { name: "p1".into() },
+    )
+    .await;
+    assert!(
+        msg.contains("active"),
+        "refusal should explain the project is active, got {msg:?}"
+    );
 
     drop(server);
 }

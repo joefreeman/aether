@@ -1,10 +1,8 @@
 //! Application state and event loop. Modal editing (Normal vs Insert) lives entirely here; the
 //! server has no notion of mode.
 
-use crate::text_input::PromptKeyOutcome;
 use aether_client::keymap::Action;
 use aether_client::session::ConnState;
-use aether_protocol::buffer::BufferClosedParams;
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
 use aether_protocol::git::{BlameInfo, GitBufferStatus};
 use aether_protocol::input::SurroundTarget;
@@ -14,7 +12,7 @@ use aether_protocol::viewport::{DiagnosticSeverity, LogicalLineRender, WrapMode}
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use crossterm::execute;
 use std::io::stdout;
 use std::time::Instant;
@@ -229,11 +227,6 @@ pub struct AppState {
     pub hover: Option<HoverPopup>,
     /// Per-buffer diagnostic counts from `lsp/diagnostics_changed`, for the status-bar summary.
     pub diagnostic_counts: std::collections::HashMap<BufferId, DiagnosticCounts>,
-    /// Set by a `buffer/closed` push — another client (or a path/project deletion) closed the
-    /// buffer we have open. Drained by `flush_pending_external_close` in the main loop, which
-    /// switches us to the indicated next buffer (or a scratch). Can't act here: `apply_notification`
-    /// is synchronous and switching needs an RPC.
-    pub pending_external_close: Option<BufferClosedParams>,
 }
 
 /// One block of hover-popup content. `severity` colors the block to match the gutter dot (for
@@ -340,21 +333,17 @@ impl HelpTab {
     }
 }
 
-/// Project-settings overlay. Shows an editable project-name field, then the active project's
-/// roots, then an always-present "add root" input row at the bottom; `selected` is the focused
-/// field. Source of truth for `roots` (and the committed `project_name`) is the server (synced
-/// via `sync_project_paths` and the rename RPC).
+/// Project-settings overlay view model. A render-only projection of the core's
+/// `Session::project_settings` (which owns the state + key handling): shows an editable
+/// project-name field, then the active project's roots, then an always-present "add root" input
+/// row; `selected` is the focused field. Populated each frame by `Shell::sync_project_settings`.
 ///
 /// Selection model: `selected == 0` is the name field; `1..=roots.len()` are the root rows (root
 /// `i` at index `i + 1`); `roots.len() + 1` is the add-root input row. The input row is always
 /// reachable, which is why we focus it on open — most overlay opens are to add a root.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectSettingsState {
-    /// The project's *committed* name — the key used for root RPCs and the rename source. Updated
-    /// only when a rename succeeds; `name_input` holds the in-progress edit.
-    pub project_name: String,
-    /// Editable buffer for the name field (index 0). Seeded from `project_name` on open;
-    /// committed on blur (focus leaving the field) via `project/rename`.
+    /// Editable buffer for the name field (index 0), mirrored from the core's in-progress edit.
     pub name_input: crate::text_input::TextInput,
     pub roots: Vec<String>,
     pub selected: usize,
@@ -363,12 +352,6 @@ pub struct ProjectSettingsState {
     /// In-dialog error from the last add or remove attempt. Rendered as the bottom line of the
     /// overlay. Cleared when the user edits `add_input` or initiates another action.
     pub error: Option<String>,
-    /// `true` when a delete is awaiting confirmation on the currently-selected root row. The row
-    /// renders as `Remove "<path>"? [y/N]`; key handling is restricted to confirm/cancel until
-    /// resolved (so a stray arrow press can't silently drop the pending state). The pending row
-    /// is always `selected` — there's no separate index because navigation is locked while this
-    /// is set.
-    pub pending_delete: bool,
 }
 
 /// Generic `[y/N]` confirmation overlay. The save-as overwrite confirm and the close-with-
@@ -649,28 +632,6 @@ pub fn apply_cursor_style(state: &AppState) {
     let _ = execute!(stdout(), style);
 }
 
-/// Format `abs` as `"{root_label}: {relative}"` against the longest-matching project root, or
-/// fall back to the raw absolute path when nothing matches. `root_labels` must be aligned by
-/// index with `project_paths`. Single-root projects get a bare relative path — their label is
-/// `""` (see `labels::root_labels`), so the prefix only appears when it disambiguates. Use this
-/// for display — see `project_relative_path` for the typeable-path variant that the save-as
-/// prefill needs.
-fn project_relative_label(abs: &str, project_paths: &[String], root_labels: &[String]) -> String {
-    match strip_longest_root(abs, project_paths) {
-        Some((i, rel)) => {
-            let label = root_labels.get(i).map(String::as_str).unwrap_or("");
-            if rel.is_empty() {
-                label.to_string()
-            } else if label.is_empty() {
-                rel
-            } else {
-                format!("{label}: {rel}")
-            }
-        }
-        None => abs.to_string(),
-    }
-}
-
 /// Resolve a CLI-supplied file/dir argument to an absolute, canonical path. Relative args are
 /// resolved against the *current working directory* (shell convention), then canonicalized so
 /// any `..` / symlinks line up with the project's canonical roots — without that, prefix
@@ -766,28 +727,6 @@ pub fn search_match_count_label(state: &AppState) -> Option<String> {
 // action (`Copy`/`DeleteSelection`/… in Normal, `CopyLine`/`DeleteLine`/… in Insert), so
 // `run_action` dispatches straight to `copy_to_clipboard(Selection)` / `delete_line` / etc.
 
-// ---- project settings -------------------------------------------------------------------------
-
-/// Hydrate the project-settings overlay from the currently-active project's name + roots and open
-/// it. Cheap (just clones); no RPC. Focus lands on the always-present input row at the bottom —
-/// most overlay opens (especially the post-create flow) are to add a root, and this avoids an
-/// extra keypress for that case. The name field sits above the roots and is reached with Alt-k.
-pub fn open_project_settings(state: &mut AppState) {
-    let roots = state.project_paths.clone();
-    // Input row index = roots.len() + 1 (name field is 0, roots are 1..=len).
-    let selected = roots.len() + 1;
-    state.project_settings = Some(ProjectSettingsState {
-        project_name: state.project_name.clone(),
-        name_input: crate::text_input::TextInput::new(state.project_name.clone()),
-        roots,
-        selected,
-        add_input: crate::text_input::TextInput::default(),
-        error: None,
-        pending_delete: false,
-    });
-    apply_cursor_style(state);
-}
-
 /// Key handling for the keyboard-shortcut help overlay (`Space ?`). Read-only: Esc / `?` / `q`
 /// close it; the arrows and PageUp/Down scroll. The render clamps `scroll` to the content height,
 /// so over-scrolling here is harmless.
@@ -823,339 +762,6 @@ pub fn handle_help_mouse(state: &mut AppState, m: MouseEvent) {
         MouseEventKind::ScrollUp => state.help.scroll.scroll_by(-3),
         MouseEventKind::ScrollDown => state.help.scroll.scroll_by(3),
         _ => {}
-    }
-}
-
-/// Selection model: `selected == 0` is the name field, `1..=roots.len()` are root rows (root `i`
-/// at index `i + 1`), and `roots.len() + 1` is the add-root input row. Alt-j/k move between
-/// fields (mirroring the picker's chord, so Alt-j/k means "navigate" everywhere in the app);
-/// Left/Right stay free to move the caret inside a text field. Leaving the name field downward
-/// (Alt-j or Enter) or closing the overlay (Esc) commits a pending rename via `project/rename`;
-/// if the server rejects it the overlay stays open with the error. Delete or Ctrl-d on a root row
-/// stages a remove (which `y`/Enter/Delete/Ctrl-d then confirm); Enter on the input row commits
-/// the add.
-pub async fn handle_project_settings_key(
-    client: &crate::connection::Handle,
-    state: &mut AppState,
-    k: KeyEvent,
-) -> Result<()> {
-    let code = k.code;
-    let mods = k.modifiers;
-    // Ctrl-d is accepted alongside the Delete key for both staging and confirming a removal —
-    // easier to reach on keyboards where Delete is awkward (or absent on small layouts).
-    let is_delete_chord =
-        code == KeyCode::Delete || (code == KeyCode::Char('d') && mods == KeyModifiers::CONTROL);
-
-    // Pending-delete confirmation takes precedence over every other key. While set, only
-    // y/Y/Enter/Delete/Ctrl-d commit and n/N/Esc cancel; everything else is swallowed so the
-    // user can't silently drop the pending state. Esc cancels the pending *first*; a subsequent
-    // Esc then closes the overlay.
-    if state
-        .project_settings
-        .as_ref()
-        .is_some_and(|s| s.pending_delete)
-    {
-        if is_delete_chord
-            || code == KeyCode::Enter
-            || matches!(code, KeyCode::Char('y') | KeyCode::Char('Y'))
-        {
-            let Some(s) = state.project_settings.as_mut() else {
-                return Ok(());
-            };
-            // Root `i` lives at selection index `i + 1`; map back before indexing.
-            let Some(path) = s
-                .selected
-                .checked_sub(1)
-                .and_then(|i| s.roots.get(i))
-                .cloned()
-            else {
-                s.pending_delete = false;
-                return Ok(());
-            };
-            let project_name = s.project_name.clone();
-            s.pending_delete = false;
-            s.error = None;
-            remove_root(client, state, &project_name, &path).await?;
-        } else if matches!(code, KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc) {
-            if let Some(s) = state.project_settings.as_mut() {
-                s.pending_delete = false;
-            }
-        }
-        return Ok(());
-    }
-
-    // Read the focus position via a short borrow — the rename commit below needs `&mut state`,
-    // so we can't hold a borrow of `project_settings` across it.
-    let Some((selected, roots_len)) = state
-        .project_settings
-        .as_ref()
-        .map(|s| (s.selected, s.roots.len()))
-    else {
-        return Ok(());
-    };
-    let on_name = selected == 0;
-    let on_input = selected == roots_len + 1;
-
-    if code == KeyCode::Esc {
-        // Closing blurs the name field — commit any pending rename. A rejected rename keeps the
-        // overlay open so its error stays visible; otherwise close.
-        if on_name && !commit_rename_if_changed(client, state).await? {
-            return Ok(());
-        }
-        state.project_settings = None;
-        apply_cursor_style(state);
-        return Ok(());
-    }
-
-    // Alt-j / Alt-k navigation. Moving *down* off the name field blurs it → commit the rename.
-    if mods == KeyModifiers::ALT {
-        match code {
-            KeyCode::Char('k') => {
-                if let Some(s) = state.project_settings.as_mut() {
-                    s.selected = s.selected.saturating_sub(1);
-                }
-                return Ok(());
-            }
-            KeyCode::Char('j') => {
-                if on_name && !commit_rename_if_changed(client, state).await? {
-                    return Ok(()); // rename rejected — stay on the name field to fix it
-                }
-                if let Some(s) = state.project_settings.as_mut() {
-                    s.selected = (s.selected + 1).min(s.roots.len() + 1);
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-
-    if is_delete_chord && !on_name && !on_input {
-        // Stage the confirm — actual removal happens in the pending-delete branch above.
-        if let Some(s) = state.project_settings.as_mut() {
-            s.pending_delete = true;
-            s.error = None;
-        }
-        return Ok(());
-    }
-
-    if code == KeyCode::Enter {
-        if on_name {
-            // Enter commits the rename and, on success, advances to the next field (index 1 is
-            // the first root, or the input row when there are none).
-            if commit_rename_if_changed(client, state).await? {
-                if let Some(s) = state.project_settings.as_mut() {
-                    s.selected = 1;
-                }
-            }
-        } else if on_input {
-            commit_add_root(client, state).await?;
-        }
-        return Ok(());
-    }
-
-    // Text editing for whichever text field is focused (root rows have none). apply_prompt_key
-    // returns Cancel/Commit only for Esc/Enter — both intercepted above — so we only see Edited.
-    if let Some(s) = state.project_settings.as_mut() {
-        let input = if on_name {
-            Some(&mut s.name_input)
-        } else if on_input {
-            Some(&mut s.add_input)
-        } else {
-            None
-        };
-        if let Some(input) = input {
-            if let PromptKeyOutcome::Edited = crate::text_input::apply_prompt_key(input, k) {
-                s.error = None;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Commit a pending project rename if the name field differs from the committed name. Returns
-/// `Ok(true)` when it's safe to leave the field: the rename succeeded, or there was nothing to do
-/// (the edit was empty or unchanged, in which case the field is normalized back to the current
-/// name). Returns `Ok(false)` only when the server *rejected* the rename (e.g. a name collision)
-/// — the error is stored on the overlay and the typed text is left in place so the user can fix
-/// it without losing what they wrote.
-async fn commit_rename_if_changed(
-    client: &crate::connection::Handle,
-    state: &mut AppState,
-) -> Result<bool> {
-    use aether_protocol::project::{ProjectRename, ProjectRenameParams};
-    let Some((old_name, new_name)) = state
-        .project_settings
-        .as_ref()
-        .map(|s| (s.project_name.clone(), s.name_input.text.trim().to_string()))
-    else {
-        return Ok(true);
-    };
-    if new_name.is_empty() || new_name == old_name {
-        // Nothing to commit — normalize the field back to the committed name so a stray-whitespace
-        // or abandoned-empty edit doesn't linger.
-        if let Some(s) = state.project_settings.as_mut() {
-            s.name_input.set(old_name);
-        }
-        return Ok(true);
-    }
-    let result = client
-        .rpc::<ProjectRename>(ProjectRenameParams {
-            project: old_name.clone(),
-            new_name: new_name.clone(),
-        })
-        .await;
-    match result {
-        Ok(info) => {
-            if state.project_name == old_name {
-                state.project_name = info.name.clone();
-            }
-            if let Some(s) = state.project_settings.as_mut() {
-                s.project_name = info.name.clone();
-                s.name_input.set(info.name);
-                s.error = None;
-            }
-            state.status = StatusMessage::success(format!("renamed project to {new_name}"));
-            apply_cursor_style(state);
-            Ok(true)
-        }
-        Err(e) => {
-            let msg = e.message.clone();
-            if let Some(s) = state.project_settings.as_mut() {
-                s.error = Some(msg);
-            }
-            Ok(false)
-        }
-    }
-}
-
-async fn commit_add_root(client: &crate::connection::Handle, state: &mut AppState) -> Result<()> {
-    use aether_protocol::project::{ProjectAddRoot, ProjectAddRootParams};
-    let Some(settings) = state.project_settings.as_mut() else {
-        return Ok(());
-    };
-    let path = settings.add_input.text.trim().to_string();
-    if path.is_empty() {
-        return Ok(());
-    }
-    let project_name = settings.project_name.clone();
-    settings.error = None;
-    let result = client
-        .rpc::<ProjectAddRoot>(ProjectAddRootParams {
-            project: project_name.clone(),
-            path,
-        })
-        .await;
-    match result {
-        Ok(info) => {
-            sync_project_paths(state, info);
-            if let Some(s) = state.project_settings.as_mut() {
-                s.add_input.clear();
-                s.selected = s.roots.len() + 1;
-            }
-            state.status = StatusMessage::success(format!("added root to {project_name}"));
-        }
-        Err(e) => {
-            if let Some(s) = state.project_settings.as_mut() {
-                s.error = Some(e.message.clone());
-            }
-        }
-    }
-    apply_cursor_style(state);
-    Ok(())
-}
-
-async fn remove_root(
-    client: &crate::connection::Handle,
-    state: &mut AppState,
-    project_name: &str,
-    path: &str,
-) -> Result<()> {
-    use aether_protocol::project::{ProjectRemoveRoot, ProjectRemoveRootParams};
-    let result = client
-        .rpc::<ProjectRemoveRoot>(ProjectRemoveRootParams {
-            project: project_name.to_string(),
-            path: path.to_string(),
-        })
-        .await;
-    match result {
-        Ok(r) => {
-            let closed = r.closed_buffer_ids.clone();
-            sync_project_paths(state, r.project);
-            // If the active editor's buffer just got closed, attach to next_buffer_id or spawn
-            // a scratch so the user lands on something usable.
-            let current_buffer = state.editor.as_ref().map(|e| e.buffer_id);
-            if let Some(cur) = current_buffer {
-                if closed.contains(&cur) {
-                    // The shell drains this and feeds the core the same `buffer/closed`
-                    // shape another client's close would push — one switching path.
-                    state.pending_external_close =
-                        Some(aether_protocol::buffer::BufferClosedParams {
-                            buffer_id: cur,
-                            next_buffer_id: r.next_buffer_id,
-                        });
-                }
-            }
-            state.status = StatusMessage::success(if closed.is_empty() {
-                format!("removed root from {project_name}")
-            } else {
-                format!(
-                    "removed root from {project_name}; closed {} buffer(s)",
-                    closed.len()
-                )
-            });
-        }
-        Err(e) => {
-            // Surface the failure inside the overlay when it's open (the common case — `remove_root`
-            // is only invoked from there today). Fall back to the status line otherwise.
-            let msg = if e.code
-                == aether_protocol::error::ErrorCode::DIRTY_BUFFERS_PREVENT_REMOVE.code()
-            {
-                e.message.clone()
-            } else {
-                format!("remove root failed: {}", e.message)
-            };
-            if let Some(s) = state.project_settings.as_mut() {
-                s.error = Some(msg);
-            } else {
-                state.status = StatusMessage::error(msg);
-            }
-        }
-    }
-    apply_cursor_style(state);
-    Ok(())
-}
-
-/// Recompute `root_labels` from the current `project_paths`, then refresh any cached display
-/// strings derived from them. Called from every site that mutates `project_paths`, so the
-/// cached labels never drift out of sync after add/remove root.
-fn refresh_root_labels(state: &mut AppState) {
-    state.root_labels = crate::labels::root_labels(&state.project_paths);
-    // Re-derive the active editor's `file_label` since it embeds the root label.
-    if let Some(ed) = state.editor.as_mut() {
-        if let Some(path) = ed.file_path.clone() {
-            ed.file_label = project_relative_label(&path, &state.project_paths, &state.root_labels);
-        }
-    }
-}
-
-/// Reflect a server-returned `ProjectInfo` into `AppState`. Updates `project_paths`, and — if
-/// the settings overlay is open for this project — refreshes its visible root list. After a
-/// successful remove the selection can land past the new end of `roots`; snap it to the input
-/// row (`roots.len()`) so focus lands somewhere usable.
-fn sync_project_paths(state: &mut AppState, info: aether_protocol::project::ProjectInfo) {
-    if state.project_name == info.name {
-        state.project_paths = info.paths.clone();
-        refresh_root_labels(state);
-    }
-    if let Some(settings) = state.project_settings.as_mut() {
-        if settings.project_name == info.name {
-            settings.roots = info.paths;
-            // Input row is the last index (`roots.len() + 1`); snap focus there if a remove left
-            // `selected` pointing past the new end.
-            if settings.selected > settings.roots.len() + 1 {
-                settings.selected = settings.roots.len() + 1;
-            }
-        }
     }
 }
 
@@ -1264,8 +870,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-            pending_external_close: None,
-        };
+            };
         assert_eq!(terminal_title(&state), "Aether");
     }
 
@@ -1293,8 +898,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-            pending_external_close: None,
-        };
+            };
         assert_eq!(terminal_title(&state), "[demo]");
         // Once a buffer exists, the title grows to include the file label.
         state.editor = Some(stub_editor_state("(scratch 0)"));
@@ -1325,8 +929,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-            pending_external_close: None,
-        };
+            };
         // Clean buffer → no dot.
         assert_eq!(terminal_title(&state), "[demo] src/main.rs");
         // Local edits → leading dot.

@@ -73,6 +73,207 @@ fn insert_entry_is_one_selection_edge_request() {
 }
 
 #[test]
+fn save_as_prompt_is_value_synced_not_keycode_edited() {
+    use aether_client::session::Prompt;
+    let mut s = session();
+    // The save-as prompt's text is owned by each shell's input; the core only stores the value
+    // and handles command keys. A typed char reaching the core must NOT edit the value.
+    s.prompt = Some(Prompt::SaveAs {
+        path_index: 0,
+        input: "notes".into(),
+    });
+    let _ = key(&mut s, 'x');
+    match &s.prompt {
+        Some(Prompt::SaveAs { input, .. }) => {
+            assert_eq!(input, "notes", "the core must not key-edit the save-as value");
+        }
+        other => panic!("expected the save-as prompt to stay open, got {other:?}"),
+    }
+    // The shell's value-sync entry point is what changes the text.
+    s.prompt_set_input("notes.md".into());
+    match &s.prompt {
+        Some(Prompt::SaveAs { input, .. }) => assert_eq!(input, "notes.md"),
+        other => panic!("expected the save-as prompt, got {other:?}"),
+    }
+    // Esc is a command the core owns: it closes the prompt.
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(s.prompt.is_none(), "Esc closes the save-as prompt");
+}
+
+#[test]
+fn project_renamed_push_adopts_the_new_name() {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::project::{ProjectRenamed, ProjectRenamedParams};
+    let push = |old: &str, new: &str| {
+        Event::ServerPush(Notification {
+            jsonrpc: JsonRpc,
+            method: ProjectRenamed::NAME.into(),
+            params: serde_json::to_value(ProjectRenamedParams {
+                old_name: old.into(),
+                new_name: new.into(),
+            })
+            .unwrap(),
+        })
+    };
+    let mut s = session();
+    s.project = "aether".into();
+    // A rename of our active project is adopted locally (drives display + reconnect baseline).
+    let _ = s.on_event(push("aether", "aether-next"));
+    assert_eq!(s.project, "aether-next");
+    // A push that doesn't match our project (stale / not ours) is ignored.
+    let _ = s.on_event(push("something-else", "whatever"));
+    assert_eq!(s.project, "aether-next");
+}
+
+#[test]
+fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
+    use aether_client::update::Event;
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams, PickerViewResult};
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Grep, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.generation = 5;
+        p.offset = 0;
+        p.items.clear();
+    }
+    let hit = |line: u32| PickerItem::GrepHit {
+        path_index: 0,
+        relative_path: "a.rs".into(),
+        line,
+        col: 0,
+        preview: "x".into(),
+        match_indices: vec![],
+    };
+    let update = |items: Option<Vec<PickerItem>>, matches: u32| PickerUpdateParams {
+        kind: PickerKind::Grep,
+        generation: 5,
+        offset: 0,
+        items,
+        total_matches: matches,
+        total_candidates: matches,
+        ticking: true,
+        grep_display_offset: Some(0),
+        grep_total_display_rows: Some(matches + 1),
+    };
+    // A streaming `picker/update` push lands first with real hits.
+    assert!(s
+        .picker
+        .as_mut()
+        .unwrap()
+        .apply_update(update(Some(vec![hit(1), hit(2)]), 2)));
+    assert_eq!(s.picker.as_ref().unwrap().items.len(), 2);
+    // The `picker/view` response carries a stale, empty snapshot (taken before the hits landed).
+    // It must not wipe the rows the push already delivered.
+    let view = PickerViewResult {
+        query: "foo".into(),
+        generation: 5,
+        total_candidates: 2,
+        effective_offset: 0,
+        effective_center_on: None,
+        directory_path: None,
+        directory_parent: None,
+        filters: Default::default(),
+        update: Some(update(Some(vec![]), 0)),
+    };
+    let _ = s.on_event(Event::PickerViewed {
+        initial: false,
+        result: Ok(view),
+    });
+    assert_eq!(
+        s.picker.as_ref().unwrap().items.len(),
+        2,
+        "an empty view snapshot must not wipe rows a push already delivered"
+    );
+}
+
+#[test]
+fn chip_editor_is_value_synced_not_keycode_edited() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Grep, None, None);
+    // Alt-g opens the glob filter editor (a chip-editor line).
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let glob_open = |s: &Session| -> String {
+        s.picker
+            .as_ref()
+            .unwrap()
+            .chip_editor
+            .as_ref()
+            .expect("glob editor open")
+            .input
+            .text
+            .clone()
+    };
+    assert_eq!(glob_open(&s), "");
+    // A typed char reaching the core must NOT edit the value — that's the shell input's job.
+    let _ = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
+    assert_eq!(glob_open(&s), "", "the core must not key-edit the chip editor");
+    // The shell's value-sync entry point drives it.
+    let _ = s.chip_editor_set_input("*.rs".into());
+    assert_eq!(glob_open(&s), "*.rs");
+    // Esc is a command the core owns: it closes the editor.
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(s.picker.as_ref().unwrap().chip_editor.is_none());
+}
+
+#[test]
+fn picker_query_is_value_synced_and_chip_row_gestures_work() {
+    use aether_client::chips::ChipValue;
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Grep, None, None);
+    // The shell's input owns query typing and syncs the value; the core re-filters on it.
+    let fx = s.picker_set_query("foo".into());
+    assert_eq!(s.picker.as_ref().unwrap().query, "foo");
+    assert!(
+        find_request(&fx, "picker/query").is_some(),
+        "a query change re-filters via picker/query"
+    );
+    // Add a filter chip (Alt-w → whole-word), then drive the chip-row gesture the shell forwards
+    // only from the query start: Left selects the rightmost chip.
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    assert!(s
+        .picker
+        .as_ref()
+        .unwrap()
+        .chips
+        .iter()
+        .any(|c| matches!(c, ChipValue::Word)));
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    assert_eq!(s.picker.as_ref().unwrap().chip_selected, Some(0));
+    // Typing while a chip is selected deselects it and lands the char in the query (append).
+    let _ = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()), ROWS);
+    let p = s.picker.as_ref().unwrap();
+    assert_eq!(p.chip_selected, None, "typing deselects the chip");
+    assert_eq!(p.query, "foox", "the typed char lands in the query");
+}
+
+#[test]
+fn search_query_is_value_synced_not_keycode_edited() {
+    use aether_client::session::Mode;
+    let mut s = session();
+    let _ = key(&mut s, '/'); // enter search
+    assert_eq!(s.mode, Mode::Search);
+    // A typed char reaching the core must NOT edit the query — text is the shell's input's job.
+    let _ = key(&mut s, 'a');
+    assert_eq!(
+        s.search.query, "",
+        "the core must not key-edit the search query"
+    );
+    // The shell's value-sync entry point drives it and re-runs the incremental search.
+    let _ = s.search_set_query("ab".into());
+    assert_eq!(s.search.query, "ab");
+    // Esc is a command the core owns: it aborts search.
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert_eq!(s.mode, Mode::Normal, "Esc aborts search");
+}
+
+#[test]
 fn count_prefix_rides_the_request() {
     let mut s = session();
     let _ = key(&mut s, '3');
@@ -405,7 +606,7 @@ fn find_request<'a>(fx: &'a Effects, method: &str) -> Option<&'a serde_json::Val
 
 #[test]
 fn explorer_delete_confirms_then_trashes_and_relists() {
-    use aether_client::session::Prompt;
+    use aether_client::session::{ConfirmKind, Prompt};
     use aether_protocol::picker::{PickerItem, PickerKind};
 
     let mut s = session();
@@ -427,12 +628,13 @@ fn explorer_delete_confirms_then_trashes_and_relists() {
     let fx = s.picker_stage_delete();
     assert!(fx.0.is_empty(), "delete stages a confirm, sends nothing");
     match &s.prompt {
-        Some(Prompt::Confirm { message, .. }) => {
-            assert!(
-                message.contains("Delete file \"old.rs\""),
-                "got {message:?}"
-            );
-        }
+        Some(Prompt::Confirm { kind, .. }) => match kind {
+            ConfirmKind::Delete { noun, name } => {
+                assert_eq!(*noun, "file");
+                assert_eq!(name, "old.rs");
+            }
+            other => panic!("expected a delete confirm, got {other:?}"),
+        },
         other => panic!("expected a confirm prompt, got {other:?}"),
     }
     // `y` accepts → `path/delete` with the absolute path.
@@ -455,6 +657,85 @@ fn explorer_delete_confirms_then_trashes_and_relists() {
 }
 
 #[test]
+fn projects_delete_confirms_then_deletes_and_guards_active() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_protocol::picker::{PickerItem, PickerKind};
+
+    let mut s = session();
+    s.project = "current".into();
+    let _ = s.open_picker(PickerKind::Projects, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![
+            PickerItem::Project {
+                name: "current".into(),
+                match_indices: vec![],
+            },
+            PickerItem::Project {
+                name: "other".into(),
+                match_indices: vec![],
+            },
+        ];
+        p.selected = 0; // the active project
+        p.offset = 0;
+        p.total_matches = 2;
+    }
+    // Ctrl-d on the *active* project refuses client-side — no confirm, no request.
+    let fx = s.picker_stage_delete();
+    assert!(s.prompt.is_none(), "active project can't be staged");
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Error))),
+        "refusing the active project surfaces an error toast"
+    );
+
+    // Move to a non-active project: Ctrl-d stages a confirm, sends nothing yet.
+    s.picker.as_mut().unwrap().selected = 1;
+    let fx = s.picker_stage_delete();
+    assert!(fx.0.is_empty(), "delete stages a confirm, sends nothing");
+    match &s.prompt {
+        Some(Prompt::Confirm { kind, .. }) => match kind {
+            ConfirmKind::DeleteProject { name } => assert_eq!(name, "other"),
+            other => panic!("expected a delete-project confirm, got {other:?}"),
+        },
+        other => panic!("expected a confirm prompt, got {other:?}"),
+    }
+    // `y` accepts → `project/delete { name }`.
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let del = find_request(&fx, "project/delete").expect("project/delete fired");
+    assert_eq!(del["name"], json!("other"));
+
+    // A server "active in another window" refusal surfaces a clean, tailored toast — not the raw
+    // `RpcError` Display (no "RPC … returned error -32005:" prefix).
+    let token = fx
+        .0
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { token, method, .. } if *method == "project/delete" => Some(*token),
+            _ => None,
+        })
+        .expect("project/delete token");
+    let fx = s.on_rpc_result(
+        token,
+        Err(RpcError {
+            method: "project/delete",
+            code: aether_protocol::error::ErrorCode::ACTIVE_PROJECT_PREVENTS_DELETE.code(),
+            message: "project other is active — switch to another project before deleting it".into(),
+        }),
+    );
+    let msg = fx
+        .0
+        .iter()
+        .find_map(|e| match e {
+            Effect::Toast(m, ToastKind::Error) => Some(m.clone()),
+            _ => None,
+        })
+        .expect("an error toast");
+    assert!(msg.contains("another window"), "tailored message, got {msg:?}");
+    assert!(!msg.contains("RPC"), "no raw RpcError prefix, got {msg:?}");
+}
+
+#[test]
 fn explorer_create_makes_a_file_with_create_if_missing() {
     use aether_protocol::picker::PickerKind;
 
@@ -465,7 +746,6 @@ fn explorer_create_makes_a_file_with_create_if_missing() {
         let p = s.picker.as_mut().unwrap();
         p.directory = Some("/proj/src".into());
         p.query = "new.rs".into();
-        p.cursor = p.query.len();
     }
     let fx = s.explorer_create_from_query();
     let open = find_request(&fx, "buffer/open").expect("buffer/open fired");
@@ -485,7 +765,6 @@ fn explorer_create_with_trailing_slash_makes_a_directory() {
         let p = s.picker.as_mut().unwrap();
         p.directory = Some("/proj/src".into());
         p.query = "sub/".into();
-        p.cursor = p.query.len();
     }
     let fx = s.explorer_create_from_query();
     let mk = find_request(&fx, "directory/create").expect("directory/create fired");
@@ -547,4 +826,288 @@ fn toggle_wrap_flips_between_soft_and_none() {
     assert!(fx.0.is_empty(), "toggle_wrap emits no effects");
     s.toggle_wrap();
     assert_eq!(s.wrap, WrapMode::Soft);
+}
+
+// ---- project creation + settings (docs: project creation + project settings) -----------------
+
+#[test]
+fn project_create_row_appears_for_a_novel_name_in_the_projects_picker() {
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
+
+    let mut s = session();
+    s.project = "aether".into();
+    let _ = s.open_picker(PickerKind::Projects, None, None);
+    let p = s.picker.as_mut().unwrap();
+    p.apply_update(PickerUpdateParams {
+        kind: PickerKind::Projects,
+        generation: p.generation,
+        offset: 0,
+        items: Some(vec![PickerItem::Project {
+            name: "aether".into(),
+            match_indices: vec![],
+        }]),
+        total_matches: 1,
+        total_candidates: 1,
+        ticking: false,
+        grep_display_offset: None,
+        grep_total_display_rows: None,
+    });
+    // An exact match offers no create row.
+    p.query = "aether".into();
+    assert_eq!(p.create_row_index(), None);
+    // A novel name offers the create row, one past the single match.
+    p.query = "scratchpad".into();
+    assert_eq!(p.create_row_index(), Some(1));
+    // Path separators disqualify it (the server forbids them).
+    p.query = "a/b".into();
+    assert_eq!(p.create_row_index(), None);
+}
+
+#[test]
+fn accepting_the_projects_create_row_emits_project_create() {
+    use aether_client::update::Event;
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
+
+    let mut s = session();
+    s.project = "aether".into();
+    let _ = s.open_picker(PickerKind::Projects, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.apply_update(PickerUpdateParams {
+            kind: PickerKind::Projects,
+            generation: p.generation,
+            offset: 0,
+            items: Some(vec![PickerItem::Project {
+                name: "aether".into(),
+                match_indices: vec![],
+            }]),
+            total_matches: 1,
+            total_candidates: 1,
+            ticking: false,
+            grep_display_offset: None,
+            grep_total_display_rows: None,
+        });
+        p.query = "fresh".into();
+        assert_eq!(p.create_row_index(), Some(1));
+    }
+    // Click the create row → project/create with the trimmed name; the picker closes (a hide fires).
+    let fx = s.on_event(Event::PickerClicked(1));
+    let create = find_request(&fx, "project/create").expect("project/create fired");
+    assert_eq!(create["name"], json!("fresh"));
+    assert!(s.picker.is_none(), "the picker closes on create");
+}
+
+#[test]
+fn project_created_with_no_roots_opens_a_scratch_and_settings() {
+    use aether_client::update::Event;
+    use aether_protocol::project::{ProjectActivateResult, ProjectInfo};
+
+    let mut s = session();
+    s.project = "old".into();
+    // A fresh project comes back with no roots and no landing buffer.
+    let fx = s.on_event(Event::ProjectCreated(Ok(ProjectActivateResult {
+        project: ProjectInfo {
+            name: "fresh".into(),
+            paths: vec![],
+        },
+        last_buffer_id: None,
+        opened: None,
+    })));
+    assert_eq!(s.project, "fresh");
+    // Rather than leave the previous project's buffer behind, a scratch is opened (a `buffer/open`
+    // with no buffer_id/path) so the user lands in some editor in the new project.
+    let (_, method, _) = the_request(&fx);
+    assert_eq!(method, "buffer/open", "opens a fresh scratch in the new project");
+    // The settings overlay auto-opens, focused on the add-root input (index = roots.len() + 1 = 1).
+    let ps = s.project_settings.as_ref().expect("settings opened");
+    assert_eq!(ps.project_name, "fresh");
+    assert!(ps.roots.is_empty());
+    assert_eq!(ps.selected, ps.input_index());
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Success))),
+        "a success toast names the new project"
+    );
+}
+
+#[test]
+fn opening_settings_populates_state_from_the_active_project() {
+    let mut s = session();
+    s.project = "aether".into();
+    s.project_paths = vec!["/a".into(), "/b".into()];
+    s.open_project_settings();
+    let ps = s.project_settings.as_ref().unwrap();
+    assert_eq!(ps.project_name, "aether");
+    assert_eq!(ps.name.text, "aether");
+    assert_eq!(ps.roots, vec!["/a".to_string(), "/b".to_string()]);
+    // Focus lands on the project-name field (index 0).
+    assert_eq!(ps.selected, 0);
+    assert!(ps.on_name());
+}
+
+#[test]
+fn settings_add_root_emits_request_and_its_result_updates_state() {
+    use aether_client::update::Event;
+    use aether_protocol::project::ProjectInfo;
+
+    let mut s = session();
+    s.project = "aether".into();
+    s.project_paths = vec!["/a".into()];
+    s.open_project_settings();
+    // Open focuses the name field; move down to the add-root input (Alt-j past the single root).
+    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    assert!(s.project_settings.as_ref().unwrap().on_input());
+    // The shell's input owns text entry and syncs the whole value; the core no longer key-edits.
+    let _ = s.project_settings_set_add("/b".into());
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let add = find_request(&fx, "project/add_root").expect("project/add_root fired");
+    assert_eq!(add["project"], json!("aether"));
+    assert_eq!(add["path"], json!("/b"));
+    // The result updates the session roots + the overlay's roots and clears the input.
+    let _ = s.on_event(Event::ProjectRootAdded(Ok(ProjectInfo {
+        name: "aether".into(),
+        paths: vec!["/a".into(), "/b".into()],
+    })));
+    assert_eq!(s.project_paths, vec!["/a".to_string(), "/b".to_string()]);
+    let ps = s.project_settings.as_ref().unwrap();
+    assert_eq!(ps.roots.len(), 2);
+    assert!(ps.add.text.is_empty(), "the input clears after a successful add");
+}
+
+#[test]
+fn settings_rename_emits_request_and_its_result_updates_the_name() {
+    use aether_client::update::Event;
+    use aether_protocol::project::ProjectInfo;
+
+    let mut s = session();
+    s.project = "old".into();
+    s.project_paths = vec!["/a".into()];
+    s.open_project_settings();
+    // Move up to the name field (Alt-k from the input row to the single root to the name).
+    s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    assert!(s.project_settings.as_ref().unwrap().on_name());
+    // The shell's input owns text entry and syncs the whole value; the core no longer key-edits.
+    let _ = s.project_settings_set_name("oldx".into());
+    // Enter commits the rename.
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let rename = find_request(&fx, "project/rename").expect("project/rename fired");
+    assert_eq!(rename["project"], json!("old"));
+    assert_eq!(rename["new_name"], json!("oldx"));
+    // The result reconciles the committed name in both the session and the overlay.
+    let _ = s.on_event(Event::ProjectRenamed(Ok(ProjectInfo {
+        name: "oldx".into(),
+        paths: vec!["/a".into()],
+    })));
+    assert_eq!(s.project, "oldx");
+    let ps = s.project_settings.as_ref().unwrap();
+    assert_eq!(ps.project_name, "oldx");
+    assert_eq!(ps.name.text, "oldx");
+}
+
+#[test]
+fn settings_remove_root_needs_confirm_then_emits_request() {
+    use aether_client::session::{ConfirmAction, Prompt};
+    use aether_client::update::Event;
+    use aether_protocol::project::{ProjectInfo, ProjectRemoveRootResult};
+
+    let mut s = session();
+    s.project = "aether".into();
+    s.project_paths = vec!["/a".into(), "/b".into()];
+    s.open_project_settings();
+    // Open focuses the name field (index 0); Alt-j down to the first root row (index 1).
+    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    assert_eq!(s.project_settings.as_ref().unwrap().selected, 1);
+    // Delete opens the shared confirm prompt for the highlighted root (no request yet).
+    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
+    assert!(
+        find_request(&fx, "project/remove_root").is_none(),
+        "Delete only raises the confirm prompt"
+    );
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            action: ConfirmAction::RemoveProjectRoot { project, path },
+            ..
+        }) => {
+            assert_eq!(project, "aether");
+            assert_eq!(path, "/a");
+        }
+        other => panic!("expected a RemoveProjectRoot confirm prompt, got {other:?}"),
+    }
+    // The settings overlay stays open behind the prompt.
+    assert!(s.project_settings.is_some());
+    // Accepting the prompt fires the remove request for the staged root.
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let remove = find_request(&fx, "project/remove_root").expect("project/remove_root fired");
+    assert_eq!(remove["project"], json!("aether"));
+    assert_eq!(remove["path"], json!("/a"));
+    assert!(s.prompt.is_none(), "the prompt closes on accept");
+    // The result refreshes the roots.
+    let _ = s.on_event(Event::ProjectRootRemoved(Ok(ProjectRemoveRootResult {
+        project: ProjectInfo {
+            name: "aether".into(),
+            paths: vec!["/b".into()],
+        },
+        closed_buffer_ids: vec![],
+        next_buffer_id: None,
+    })));
+    assert_eq!(s.project_paths, vec!["/b".to_string()]);
+    assert_eq!(s.project_settings.as_ref().unwrap().roots, vec!["/b".to_string()]);
+}
+
+#[test]
+fn settings_remove_root_via_click_event() {
+    use aether_client::session::{ConfirmAction, Prompt};
+    use aether_client::update::Event;
+
+    let mut s = session();
+    s.project = "aether".into();
+    s.project_paths = vec!["/a".into(), "/b".into()];
+    s.open_project_settings();
+    // A clicked delete button (0-based index) opens the same confirm prompt.
+    let fx = s.on_event(Event::ProjectSettingsRemoveRoot(1));
+    assert!(find_request(&fx, "project/remove_root").is_none());
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            action: ConfirmAction::RemoveProjectRoot { path, .. },
+            ..
+        }) => assert_eq!(path, "/b"),
+        other => panic!("expected a RemoveProjectRoot confirm prompt, got {other:?}"),
+    }
+    // Out-of-range index is a no-op.
+    let mut s2 = session();
+    s2.project = "aether".into();
+    s2.project_paths = vec!["/a".into()];
+    s2.open_project_settings();
+    let _ = s2.on_event(Event::ProjectSettingsRemoveRoot(9));
+    assert!(s2.prompt.is_none());
+}
+
+#[test]
+fn settings_set_name_and_add_sync_text() {
+    let mut s = session();
+    s.project = "aether".into();
+    s.project_paths = vec!["/a".into()];
+    s.open_project_settings();
+    // The web set methods write the field text wholesale (native <input> parity).
+    s.project_settings_set_name("renamed".into());
+    s.project_settings_set_add("/new/root".into());
+    let ps = s.project_settings.as_ref().unwrap();
+    assert_eq!(ps.name.text, "renamed");
+    assert_eq!(ps.add.text, "/new/root");
+    // No-op outside the overlay.
+    s.project_settings = None;
+    let fx = s.project_settings_set_name("x".into());
+    assert!(fx.0.is_empty());
+}
+
+#[test]
+fn settings_esc_closes_the_overlay() {
+    let mut s = session();
+    s.project = "aether".into();
+    s.open_project_settings();
+    assert!(s.project_settings.is_some());
+    s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(s.project_settings.is_none());
 }

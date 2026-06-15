@@ -466,8 +466,9 @@ html, body, #app {
 .modal-btn.danger:hover { background: #cf6f77; border-color: #cf6f77; }
 
 /* Pickers + dialogs (save-as, project settings, help) share the picker offset (8vh from .overlay).
-   Only confirmations sit lower, so a confirm over a picker doesn't align with it. */
-.overlay.confirm-overlay { padding-top: 11vh; }
+   Only confirmations sit lower, so a confirm over a picker doesn't align with it; and they layer
+   above the project-settings dialog (same .overlay z-index, but that overlay sits later in the DOM). */
+.overlay.confirm-overlay { padding-top: 11vh; z-index: 11; }
 
 /* LSP server info dialog. */
 .modal.lsp-info { width: min(560px, 88vw); }
@@ -479,22 +480,79 @@ html, body, #app {
 .lsp-info-val { word-break: break-word; } /* sans-serif (inherits the modal's font) */
 .lsp-info-hint { color: var(--nord3-brighter); font-size: 12px; }
 
-/* Project settings. */
+/* Project settings (Space ,). Keyboard-driven — the focused field/row gets a frost-blue accent. */
 .modal.project-settings { width: min(640px, 88vw); }
-.ps-label { color: var(--nord13); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
-.ps-roots { margin-bottom: 12px; max-height: 40vh; overflow: auto; }
-.ps-root { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
-.ps-root-path { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, Consolas, monospace; }
-.ps-root-del {
+.modal.project-settings .modal-message { font-weight: 600; margin-bottom: 10px; }
+/* Small gray labels (matching the native client). Tucked tight above their field (~3px) so each
+   label+field reads as one group, with a wider gap (8px) above it from the previous group. */
+.ps-label { color: var(--nord3-brighter); font-size: 12px; margin: 8px 0 3px; }
+/* Name + add-root native <input> fields: boxed, frost border when focused. */
+.ps-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--nord0);
+  color: var(--nord6);
+  border: 1px solid var(--nord3);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-family: inherit; /* the dialog is sans-serif (`.modal`); inputs don't inherit font by default */
+  font-size: inherit;
+  outline: none;
+}
+.ps-input::placeholder { color: var(--nord3-brighter); }
+.ps-input:focus, .ps-input.focused { border-color: var(--nord8); }
+.ps-placeholder { color: var(--nord3-brighter); }
+/* The existing roots, as a semantic <ul> with custom bullets (native markers don't survive the
+   flex rows). The add-root input + error are siblings below, styled to match. */
+.ps-roots { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+/* The add-root row sits just below the list, one bullet-gap down so it reads as one more item. */
+.ps-add { margin-top: 2px; }
+/* A bulleted list item: `• text [✕]`. No padding/border — selection tints only the text. */
+.ps-root {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* sans-serif, inherited from `.modal` — the dialog isn't code */
+}
+.ps-bullet { flex: 0 0 auto; margin-left: 6px; color: var(--nord6); }
+/* The path hugs its own text (so the selection background does too) and ellipsises when long. */
+.ps-root-path {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Selection tints just the text (terminal-client parity), not the whole row. */
+.ps-root-path.selected { background: var(--nord2); }
+.ps-root-delete {
   flex: 0 0 auto;
-  background: transparent;
-  color: var(--nord11);
+  margin-left: auto; /* the path hugs its text now, so push the delete to the right edge */
+  background: var(--nord3);
+  color: var(--nord6);
   border: none;
+  border-radius: 4px;
+  padding: 2px 8px;
   cursor: pointer;
   font: inherit;
-  padding: 0 6px;
+  line-height: 1.2;
 }
-.ps-root-del:hover { color: #cf6f77; }
+.ps-root-delete:hover { background: var(--nord11); }
+/* The add-root field is a borderless input after its bullet — the caret is the focus cue (like the
+   terminal's input row), not a box. */
+.ps-add-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  padding: 0;
+  color: var(--nord6);
+  font: inherit;
+}
+.ps-add-input::placeholder { color: var(--nord3-brighter); font-style: italic; }
+.ps-error { color: var(--nord11); font-size: 12px; margin-top: 8px; }
 
 /* Help overlay. */
 .modal.help { width: min(760px, 92vw); max-height: 80vh; display: flex; flex-direction: column; }

@@ -1,58 +1,18 @@
-//! Single-line text input with a cursor. Used by every status-bar / overlay prompt: search,
-//! save-as, file-browser new-file/new-directory, picker query. The struct owns the buffer and
-//! the byte-offset cursor; methods keep them in sync and on UTF-8 char boundaries.
+//! Single-line text input with a cursor — the shell-owned editor for overlay inputs (save-as,
+//! search, picker query, project-settings, chip editor). The struct owns the buffer and the
+//! byte-offset cursor; methods keep them in sync and on UTF-8 char boundaries.
+//!
+//! Text editing for overlays lives client-side (docs/client-core.md): the core owns values and
+//! command keys, the shell owns text entry. `crate::overlay_input` drives this type from key
+//! events and syncs the whole value into the core; the renderer reads its caret column.
 //!
 //! Deref<Target=str> makes read-only string ops (`.is_empty()`, `.width()`, `format!("{}", …)`)
 //! work without unwrapping. Mutating callers go through the methods so the cursor never lands
 //! between code units.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::fmt;
 use std::ops::Deref;
 use unicode_width::UnicodeWidthStr;
-
-/// What a single key event meant for a status-bar prompt. The shared keymap (in
-/// `apply_prompt_key`) handles all editing locally; this enum communicates the user-intent keys
-/// (Enter/Esc) back to the caller so each prompt can run its own commit/cancel action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptKeyOutcome {
-    /// Key was an edit (char insert, cursor move, backspace) or an ignored key.
-    Edited,
-    /// Enter pressed — the caller should commit.
-    Commit,
-    /// Esc pressed — the caller should cancel/close.
-    Cancel,
-}
-
-/// Shared keymap for every single-line prompt overlay (save-as, new-file, file-browser
-/// new-file/new-directory). Returns `Commit`/`Cancel` for Enter/Esc; otherwise applies the edit
-/// to `input` and returns `Edited`. Ignores Ctrl-/Alt-modified chars so the caller's parent
-/// keymap can still match those as commands rather than text.
-pub fn apply_prompt_key(input: &mut TextInput, k: KeyEvent) -> PromptKeyOutcome {
-    match (k.code, k.modifiers) {
-        (KeyCode::Esc, _) => PromptKeyOutcome::Cancel,
-        (KeyCode::Enter, _) => PromptKeyOutcome::Commit,
-        (KeyCode::Left, _) => {
-            input.move_left();
-            PromptKeyOutcome::Edited
-        }
-        (KeyCode::Right, _) => {
-            input.move_right();
-            PromptKeyOutcome::Edited
-        }
-        (KeyCode::Backspace, _) => {
-            input.backspace();
-            PromptKeyOutcome::Edited
-        }
-        (KeyCode::Char(c), m)
-            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
-        {
-            input.insert_char(c);
-            PromptKeyOutcome::Edited
-        }
-        _ => PromptKeyOutcome::Edited,
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct TextInput {
@@ -110,16 +70,32 @@ impl TextInput {
         self.cursor = prev;
     }
 
-    /// Insert `c` at the cursor and advance past it.
-    pub fn insert_char(&mut self, c: char) {
-        self.text.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
+    /// Insert `s` at the cursor and advance past it.
+    pub fn insert_str(&mut self, s: &str) {
+        self.text.insert_str(self.cursor, s);
+        self.cursor += s.len();
     }
 
-    /// Wipe text and cursor.
-    pub fn clear(&mut self) {
-        self.text.clear();
+    /// Delete the char immediately after the cursor (Delete key). No-op at the end.
+    pub fn delete_forward(&mut self) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        let mut end = self.cursor + 1;
+        while end < self.text.len() && !self.text.is_char_boundary(end) {
+            end += 1;
+        }
+        self.text.replace_range(self.cursor..end, "");
+    }
+
+    /// Move the cursor to the start of the text.
+    pub fn home(&mut self) {
         self.cursor = 0;
+    }
+
+    /// Move the cursor to the end of the text.
+    pub fn end(&mut self) {
+        self.cursor = self.text.len();
     }
 
     /// Replace contents wholesale; cursor parks at the end. Use when restoring from history or
@@ -173,12 +149,33 @@ mod tests {
     }
 
     #[test]
-    fn insert_char_advances_cursor() {
+    fn insert_str_advances_cursor() {
         let mut t = TextInput::new("abc");
         t.cursor = 1;
-        t.insert_char('X');
-        assert_eq!(t.text, "aXbc");
-        assert_eq!(t.cursor, 2);
+        t.insert_str("XY");
+        assert_eq!(t.text, "aXYbc");
+        assert_eq!(t.cursor, 3);
+    }
+
+    #[test]
+    fn delete_forward_removes_char_after_cursor() {
+        let mut t = TextInput::new("aéb"); // "é" is 2 bytes
+        t.cursor = 1;
+        t.delete_forward(); // removes 'é'
+        assert_eq!(t.text, "ab");
+        assert_eq!(t.cursor, 1);
+        t.cursor = 2;
+        t.delete_forward(); // at end — no-op
+        assert_eq!(t.text, "ab");
+    }
+
+    #[test]
+    fn home_and_end_jump_to_bounds() {
+        let mut t = TextInput::new("abc");
+        t.home();
+        assert_eq!(t.cursor, 0);
+        t.end();
+        assert_eq!(t.cursor, 3);
     }
 
     #[test]
@@ -251,42 +248,4 @@ mod tests {
         assert_eq!(t.cursor, 5);
     }
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    #[test]
-    fn apply_prompt_key_routes_enter_and_esc() {
-        let mut t = TextInput::new("abc");
-        assert_eq!(
-            apply_prompt_key(&mut t, key(KeyCode::Enter)),
-            PromptKeyOutcome::Commit
-        );
-        assert_eq!(
-            apply_prompt_key(&mut t, key(KeyCode::Esc)),
-            PromptKeyOutcome::Cancel
-        );
-        assert_eq!(t.text, "abc"); // untouched on Enter/Esc
-    }
-
-    #[test]
-    fn apply_prompt_key_edits_text() {
-        let mut t = TextInput::new("");
-        apply_prompt_key(&mut t, key(KeyCode::Char('h')));
-        apply_prompt_key(&mut t, key(KeyCode::Char('i')));
-        assert_eq!(t.text, "hi");
-        apply_prompt_key(&mut t, key(KeyCode::Backspace));
-        assert_eq!(t.text, "h");
-        apply_prompt_key(&mut t, key(KeyCode::Left));
-        assert_eq!(t.cursor, 0);
-    }
-
-    #[test]
-    fn apply_prompt_key_ignores_ctrl_chars() {
-        // Ctrl-modified chars are claimed by the surrounding keymap, not the prompt input.
-        let mut t = TextInput::new("");
-        let k = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
-        assert_eq!(apply_prompt_key(&mut t, k), PromptKeyOutcome::Edited);
-        assert_eq!(t.text, "");
-    }
 }

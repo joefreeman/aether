@@ -74,9 +74,9 @@ pub enum Mode {
 /// Client-side search-prompt state; the query/match list itself is server-owned.
 #[derive(Default)]
 pub struct SearchState {
+    /// The query value. Text editing (caret, insert, delete) is owned by each shell's search
+    /// input, which syncs the whole value via [`super::update`]'s `search_set_query`.
     pub query: String,
-    /// Byte cursor within `query`.
-    pub cursor: usize,
     /// A committed search exists (highlights shown, `n`/`Alt-n` cycle it).
     pub active: bool,
     pub summary: Option<SearchSummary>,
@@ -101,16 +101,117 @@ pub struct SearchSnapshot {
 #[derive(Debug)]
 pub enum Prompt {
     Confirm {
-        message: String,
+        /// Why we're asking — structured so each shell composes its own prompt text. The core
+        /// states the reason; wording, punctuation and the `[y/N]` / Yes-No affordance are the
+        /// shell's presentational choice.
+        kind: ConfirmKind,
         action: ConfirmAction,
     },
     SaveAs {
         path_index: u32,
+        /// The typed path value. Text editing (caret, insert, delete) is owned by each shell's
+        /// input — native `text_input`/`<input>` in the rich clients, a shell-local editor in the
+        /// TUI — which syncs the whole value here via [`super::update`]'s `prompt_set_input`. The
+        /// core keeps only the value (for save / root-cycle) and the command keys (Enter/Esc/Tab).
         input: String,
-        cursor: usize,
     },
     /// LSP server detail (from the LspServers picker): info rows + `r` to restart.
     LspInfo(Box<LspServerStatus>),
+}
+
+/// A single editable text field. The project-settings overlay holds two (name + add-root). Text
+/// editing (caret, insert, delete) is owned by each shell's input — native `text_input`/`<input>`
+/// in the rich clients, a shell-local editor in the TUI — which syncs the whole value via
+/// [`super::update`]'s `project_settings_set_name` / `_set_add`. The core keeps only the value.
+#[derive(Debug, Clone, Default)]
+pub struct TextField {
+    pub text: String,
+}
+
+impl TextField {
+    pub fn new(text: String) -> Self {
+        TextField { text }
+    }
+
+    /// Replace the content wholesale.
+    pub fn set(&mut self, text: String) {
+        self.text = text;
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+    }
+}
+
+/// The project-settings overlay state (`Space ,`), migrated from the TUI's shell-local
+/// `ProjectSettingsState` into the core so every shell renders it. Shows an editable
+/// project-name field, then the active project's roots, then an always-present "add root" input
+/// row; `selected` is the focused field.
+///
+/// Selection model: `selected == 0` is the name field; `1..=roots.len()` are the root rows
+/// (root `i` at index `i + 1`); `roots.len() + 1` is the add-root input row. The input row is
+/// always reachable, which is why we focus it on open — most overlay opens are to add a root.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectSettings {
+    /// The project's *committed* name — the key used for root RPCs and the rename source.
+    /// Updated only when a rename succeeds; `name` holds the in-progress edit.
+    pub project_name: String,
+    /// Editable buffer for the name field (index 0). Seeded from `project_name` on open;
+    /// committed on blur (focus leaving the field) via `project/rename`.
+    pub name: TextField,
+    pub roots: Vec<String>,
+    pub selected: usize,
+    /// Text being typed into the add-root input row.
+    pub add: TextField,
+    /// In-dialog error from the last add/remove/rename attempt. Rendered as the bottom line of
+    /// the overlay. Cleared when the user edits a field or initiates another action.
+    pub error: Option<String>,
+}
+
+impl ProjectSettings {
+    /// Selection index of the add-root input row (one past the last root).
+    pub fn input_index(&self) -> usize {
+        self.roots.len() + 1
+    }
+
+    pub fn on_name(&self) -> bool {
+        self.selected == 0
+    }
+
+    pub fn on_input(&self) -> bool {
+        self.selected == self.input_index()
+    }
+
+    /// The root under the current selection, when a root row is focused.
+    pub fn selected_root(&self) -> Option<&String> {
+        self.selected.checked_sub(1).and_then(|i| self.roots.get(i))
+    }
+}
+
+/// Why a confirmation is being asked — the *reason*, carrying the data each shell needs to compose
+/// its own prompt text. Presentation (wording, punctuation, the `[y/N]` vs Yes/No affordance) is
+/// the shell's decision; the core only states the reason. Paired with a [`ConfirmAction`] (what
+/// accepting does) inside [`Prompt::Confirm`].
+#[derive(Debug, Clone)]
+pub enum ConfirmKind {
+    /// Saving would overwrite an existing file. `path` is the save-as relative path (`None` for an
+    /// in-place save).
+    Overwrite { path: Option<String> },
+    /// The file changed on disk since it was loaded; saving overwrites those changes.
+    OverwriteModified,
+    /// The file was removed on disk since it was loaded; saving recreates it.
+    RecreateDeleted,
+    /// Reloading a buffer with unsaved changes.
+    DiscardOnReload,
+    /// Closing a buffer with unsaved changes. `label` is the buffer's display label.
+    DiscardOnClose { label: String },
+    /// Trashing a file/directory from the Files/Explorer picker. `noun` is "file"/"directory".
+    Delete { noun: &'static str, name: String },
+    /// Removing a root from the project-settings overlay.
+    RemoveRoot { path: String },
+    /// Deleting a project (its config) from the project switcher. Forgets the definition, not the
+    /// files under its roots.
+    DeleteProject { name: String },
 }
 
 /// What accepting a confirmation does.
@@ -126,6 +227,13 @@ pub enum ConfirmAction {
     /// Trash a file/directory from the Files/Explorer picker (`path/delete`). `noun` is
     /// "file"/"directory" for the success toast; the still-open picker is re-listed after.
     DeletePath { path: String, noun: &'static str },
+    /// Remove a root from the project-settings overlay (`project/remove_root`). Carries the
+    /// committed project name and the root path so the request is self-contained — the overlay's
+    /// selection may have moved (or the overlay closed) by the time the confirm resolves.
+    RemoveProjectRoot { project: String, path: String },
+    /// Delete a project (`project/delete`) from the switcher. The server refuses if it's active
+    /// anywhere or has dirty buffers; the refreshed picker list rides a `picker/update` push.
+    DeleteProject { name: String },
 }
 
 /// Outcome of a `buffer/save` attempt: saved, or refused pending user confirmation.
@@ -136,7 +244,7 @@ pub enum SaveTry {
         target: Option<(u32, String)>,
     },
     NeedsConfirm {
-        message: String,
+        kind: ConfirmKind,
         action: ConfirmAction,
     },
 }
@@ -221,6 +329,8 @@ pub struct Session {
     pub prompt: Option<Prompt>,
     /// An open picker overlay; owns the keyboard while open.
     pub picker: Option<PickerState>,
+    /// The project-settings overlay (`Space ,`); owns the keyboard while open.
+    pub project_settings: Option<ProjectSettings>,
     pub conn: ConnState,
     /// A content scroll anchor captured before a re-layout (wrap / diff toggle), so the view can be
     /// restored to the same content afterwards. Set by [`Session::capture_scroll_anchor`] and
@@ -258,6 +368,7 @@ impl Session {
             blame_requested: None,
             prompt: None,
             picker: None,
+            project_settings: None,
             conn: ConnState::Connected,
             relayout_anchor: None,
         }

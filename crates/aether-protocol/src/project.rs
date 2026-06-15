@@ -2,7 +2,7 @@
 //! at a time. The client picks one with `project/activate` (also used to switch). `project/list`
 //! enumerates the projects the server has configured on disk.
 
-use crate::envelope::RpcMethod;
+use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::BufferId;
 use crate::buffer::BufferOpenResult;
 use serde::{Deserialize, Serialize};
@@ -193,4 +193,23 @@ impl RpcMethod for ProjectDelete {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectDeleteParams {
     pub name: String,
+}
+
+// ---- project/renamed (notification) -------------------------------------------------------------
+
+/// Pushed to a client when its active project is renamed by *another* client. The server has
+/// already re-keyed the receiver's server-side state (active project, buffers) to the new name; this
+/// tells the client so it can update its local name — which drives both the display and the
+/// reconnect baseline (reconnect is by name). Only sent to clients whose active project was renamed;
+/// the renaming client learns the new name from its `project/rename` RPC result instead.
+pub struct ProjectRenamed;
+impl NotificationMethod for ProjectRenamed {
+    const NAME: &'static str = "project/renamed";
+    type Params = ProjectRenamedParams;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectRenamedParams {
+    pub old_name: String,
+    pub new_name: String,
 }

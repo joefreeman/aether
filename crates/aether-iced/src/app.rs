@@ -28,7 +28,9 @@ use aether_protocol::picker::{
     PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerUpdate, PickerUpdateParams,
     PickerView, PickerViewParams,
 };
-use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectInfo};
+use aether_protocol::project::{
+    ProjectActivate, ProjectActivateParams, ProjectCreate, ProjectCreateParams, ProjectInfo,
+};
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{
     ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams,
@@ -78,8 +80,10 @@ pub struct ChooseBootstrap {
 pub struct Reestablished {
     pub handle: Handle,
     pub notifications: NotifRx,
-    pub project: ProjectInfo,
-    pub open: BufferOpenResult,
+    /// The restored project + landing buffer, or `None` when the project is gone — renamed or
+    /// removed by another client while we were disconnected. The socket is fine, so the shell
+    /// recovers into the boot chooser rather than failing.
+    pub restore: Option<(ProjectInfo, BufferOpenResult)>,
     pub server_url: String,
     pub server_started_at: u64,
 }
@@ -105,6 +109,10 @@ struct Boot {
     handle: Handle,
     notifications: NotifRx,
     picker: PickerState,
+    /// Byte caret into `picker.query`. The boot chooser predates the session, so it drives its own
+    /// keycode editing (fake-caret rendering) rather than the core's value-synced query — hence the
+    /// caret lives here, not on the (now caret-free) `PickerState`.
+    query_cursor: usize,
     /// A project was picked and its activation is in flight — input is parked meanwhile.
     opening: bool,
     /// The connection died; a retry loop is dialling. Input is parked until it lands.
@@ -129,6 +137,51 @@ impl std::fmt::Debug for BootConn {
 enum PromptMsg {
     Accept,
     Cancel,
+}
+
+/// The project-settings overlay's clickable-affordance message space (buttons need `Clone`, the
+/// app `Message` isn't). Mirrors [`PickerMsg`]: the overlay renders in this space, then `.map`s to
+/// `Message::Core`. Today only the per-root delete button.
+#[derive(Debug, Clone, Copy)]
+enum ProjectSettingsMsg {
+    /// The delete button on root row `index` (0-based) was clicked.
+    RemoveRoot(usize),
+}
+
+/// Which overlay text field an [`Message::OverlayInput`] targets. Each maps to a core `*_set_*`
+/// method; the shell renders that field as a controlled `text_input` whose `on_input` carries one
+/// of these (web parity — the browser client syncs native `<input>` values the same way).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayField {
+    /// The picker query input.
+    PickerQuery,
+    /// The search-bar query input.
+    Search,
+    /// The save-as prompt's path input.
+    SaveAs,
+    /// The project-settings name field.
+    ProjectName,
+    /// The project-settings add-root input.
+    ProjectAddRoot,
+    /// The chip editor's root-filter input (multi-root dir editor).
+    ChipRoot,
+    /// The chip editor's path/glob input.
+    ChipPath,
+}
+
+impl OverlayField {
+    /// The stable widget id for this field's `text_input`, for `.id()` + `operation::focus`.
+    fn id(self) -> iced::advanced::widget::Id {
+        iced::advanced::widget::Id::new(match self {
+            OverlayField::PickerQuery => "overlay-picker-query",
+            OverlayField::Search => "overlay-search",
+            OverlayField::SaveAs => "overlay-saveas",
+            OverlayField::ProjectName => "overlay-project-name",
+            OverlayField::ProjectAddRoot => "overlay-project-addroot",
+            OverlayField::ChipRoot => "overlay-chip-root",
+            OverlayField::ChipPath => "overlay-chip-path",
+        })
+    }
 }
 
 /// The hover popover's body: plain severity-coloured blocks (diagnostics, commit details) or
@@ -189,6 +242,9 @@ pub enum Message {
         mods: Mods,
         text: Option<String>,
     },
+    /// A controlled overlay `text_input` produced new text — sync the full value into the core
+    /// via the matching `*_set_*` method (web parity). Carries the field and its new value.
+    OverlayInput(OverlayField, String),
     ToastExpired(u64),
     /// Fire-and-forget RPC completed (e.g. `search/clear`); result ignored.
     /// An RPC outcome for a core-issued `Effect::Request` (the token routes it back to
@@ -280,6 +336,11 @@ pub struct App {
     // convention).
     toasts: Vec<Toast>,
     next_toast: u64,
+    /// The overlay `text_input` that currently *should* hold focus (mirrors the web's
+    /// `focusTarget`). Recomputed after every update; when it changes, the shell issues an
+    /// `operation::focus` so typing lands in the right field the moment an overlay opens (and
+    /// moves between the project-settings name/add inputs as the core's selection changes).
+    focused_field: Option<OverlayField>,
 }
 
 impl App {
@@ -320,6 +381,7 @@ impl App {
             hover_below: std::cell::Cell::new(None),
             toasts: Vec::new(),
             next_toast: 0,
+            focused_field: None,
         };
         match b {
             Bootstrap::Session(b) => {
@@ -372,6 +434,7 @@ impl App {
                     handle: b.handle.clone(),
                     notifications: b.notifications.clone(),
                     picker: PickerState::new(PickerKind::Projects),
+                    query_cursor: 0,
                     opening: false,
                     down: false,
                 };
@@ -399,21 +462,37 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let keys = iced::event::listen_with(|event, _status, _window| match event {
+        let keys = iced::event::listen_with(|event, status, _window| match event {
             Event::Keyboard(keyboard::Event::KeyPressed {
                 modified_key,
                 modifiers,
                 text,
                 ..
             }) => {
-                // `modified_key`, not `key`: the keymap binds the PRODUCED character
-                // (`<` is `ch('<')`, matching the TUI's crossterm chars and the web's
-                // `e.key`), while iced's `key` strips modifiers — Shift+comma arrives
-                // as `,` there, so shifted-punctuation bindings (`<`, `>`, `?`, `{`,
-                // `}`) would never match.
-                crate::input::keycode(&modified_key).map(|code| Message::Key {
+                // Overlay `text_input`s capture editing keys (typing, Backspace/Delete, arrows,
+                // Home/End, clipboard) and report them `Captured`; those must NOT also reach the
+                // core's key handler or it would double-handle them. So forward a key to `on_key`
+                // only when no focused widget consumed it (`Ignored`) — global bindings, plus the
+                // non-editing keys (Enter, Tab, Up/Down, Alt/Ctrl chords) that `text_input` leaves
+                // alone. One exception: `Escape`. A focused `text_input` *captures* Escape (it
+                // unfocuses itself, publishing nothing), which would otherwise swallow every
+                // overlay's Esc-to-close. Forward it regardless so the core still gets it; the
+                // input vanishes with the overlay anyway.
+                let code = crate::input::keycode(&modified_key)?;
+                let mods = crate::input::mods(modifiers);
+                // Forward to the core when no focused widget consumed the key (`Ignored`), PLUS two
+                // forced exceptions a focused `text_input` would otherwise swallow:
+                //   - `Escape` (the input captures it to unfocus itself), and
+                //   - any `Alt`-chord — `Alt-j/k/l` is the app's universal navigation idiom (move
+                //     between picker results / settings fields); `text_input` reports it Captured,
+                //     so force it through. (The `alt_filter::alt_passthrough` wrapper around each
+                //     overlay input also drops the `Alt` press before the input can insert it as
+                //     text, which some platforms' winit delivers — so the field stays clean.)
+                let forward =
+                    status == iced::event::Status::Ignored || code == KeyCode::Esc || mods.alt;
+                forward.then(|| Message::Key {
                     code,
-                    mods: crate::input::mods(modifiers),
+                    mods,
                     text: text.map(|t| t.to_string()),
                 })
             }
@@ -441,10 +520,87 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // Pre-session: the project chooser owns every message; `SessionReady` is the
         // hand-off back to the normal path.
+        let task = if self.boot.is_some() {
+            self.update_boot(message)
+        } else {
+            self.update_inner(message)
+        };
+        // After every update, snap focus to the overlay field that should own the keyboard (web
+        // parity: `ensureFocus`). Only fires a focus operation when the target *changes*, so it
+        // doesn't fight the user (e.g. re-grab focus every keystroke).
+        Task::batch([task, self.sync_focus()])
+    }
+
+    /// The overlay `text_input` that should hold focus right now, given session state. Mirrors the
+    /// web's `focusTarget`. The boot chooser drives the project picker through `update_boot` with
+    /// its own [`Boot::picker`] (no `text_input` — its query stays on the fake-caret path), so it
+    /// has no focus target here. `None` means "no overlay field" (the editor owns the keyboard).
+    fn desired_focus(&self) -> Option<OverlayField> {
         if self.boot.is_some() {
-            return self.update_boot(message);
+            return None;
         }
-        self.update_inner(message)
+        // A confirm / LSP-info prompt has no text field; only the save-as prompt does.
+        match &self.session.prompt {
+            Some(Prompt::SaveAs { .. }) => return Some(OverlayField::SaveAs),
+            Some(_) => return None,
+            None => {}
+        }
+        if let Some(p) = &self.session.picker {
+            // The chip editor (glob/dir filter line) is a controlled `text_input` per segment,
+            // with a ghost-suggestion overlay behind it (web parity). Focus the *active*
+            // segment's input so the caret shows and plain typing flows through `on_input` →
+            // the core's `chip_editor_set_*`; Tab/Enter/Esc/arrows stay uncaptured and Alt is
+            // dropped by `alt_passthrough`, so the bespoke chip-editor key routing still reaches
+            // the core.
+            if let Some(ed) = &p.chip_editor {
+                return Some(if ed.field == crate::chips::ChipEditorField::Root {
+                    OverlayField::ChipRoot
+                } else {
+                    OverlayField::ChipPath
+                });
+            }
+            // No focus target when a filter chip is selected — chip navigation
+            // (Left/Right/Backspace/Enter/Esc) must reach the core, but a focused `text_input`
+            // would capture the editing keys among them. Defocusing lets every key bubble (web
+            // parity: "chip selected → forward all").
+            return p.chip_selected.is_none().then_some(OverlayField::PickerQuery);
+        }
+        if let Some(s) = &self.session.project_settings {
+            // Name field (selection 0) or add-root input (last row) — a highlighted root row in
+            // between has no text field, so nothing to focus there.
+            if s.on_name() {
+                return Some(OverlayField::ProjectName);
+            }
+            if s.on_input() {
+                return Some(OverlayField::ProjectAddRoot);
+            }
+            return None;
+        }
+        if self.session.mode == Mode::Search {
+            return Some(OverlayField::Search);
+        }
+        None
+    }
+
+    // (see `core_key_message` free fn below for the chip-boundary key forwarder)
+
+    /// Move keyboard focus to [`Self::desired_focus`] when it changed since the last update.
+    fn sync_focus(&mut self) -> Task<Message> {
+        let want = self.desired_focus();
+        if want == self.focused_field {
+            return Task::none();
+        }
+        self.focused_field = want;
+        match want {
+            Some(field) => iced::widget::operation::focus(field.id()),
+            // The focus left every overlay field — e.g. a filter chip just got selected, so the
+            // query input must stop owning the keyboard. `focus(None)` is not a thing; actively
+            // *unfocus* the previously-focused widget, otherwise it keeps focus (and its caret).
+            // (We only reach here when `want` changed, so something was focused before.)
+            None => iced::advanced::widget::operate(
+                iced::advanced::widget::operation::focusable::unfocus(),
+            ),
+        }
     }
 
     /// Message handling while the project chooser is up: a reduced picker vocabulary (type to
@@ -546,10 +702,19 @@ impl App {
                     return Task::none();
                 };
                 let (project, open) = *r;
+                // A rootless project (just created from the chooser) has nowhere to open files —
+                // land in settings on the add-root input so the user can give it a root.
+                let rootless = project.paths.is_empty();
                 let buffer = buffer_info(open, &project.paths);
                 self.handle = boot.handle;
                 self.notifications = boot.notifications;
                 self.session = Session::new(project.name, project.paths, buffer);
+                if rootless {
+                    self.session.open_project_settings();
+                    if let Some(s) = self.session.project_settings.as_mut() {
+                        s.selected = s.input_index();
+                    }
+                }
                 // The editor's first Layout event subscribes the viewport (cell metrics are
                 // only published once it renders).
                 Task::none()
@@ -623,24 +788,25 @@ impl App {
             }
             KeyCode::Backspace if no_chord => {
                 let p = &mut boot.picker;
-                if let Some((i, _)) = p.query[..p.cursor].char_indices().last() {
+                if let Some((i, _)) = p.query[..boot.query_cursor].char_indices().last() {
                     p.query.remove(i);
-                    p.cursor = i;
+                    boot.query_cursor = i;
                     return self.boot_query_changed();
                 }
                 return Task::none();
             }
             KeyCode::Left if no_chord => {
-                let p = &mut boot.picker;
-                if let Some((i, _)) = p.query[..p.cursor].char_indices().last() {
-                    p.cursor = i;
+                if let Some((i, _)) = boot.picker.query[..boot.query_cursor]
+                    .char_indices()
+                    .last()
+                {
+                    boot.query_cursor = i;
                 }
                 return Task::none();
             }
             KeyCode::Right if no_chord => {
-                let p = &mut boot.picker;
-                if let Some(c) = p.query[p.cursor..].chars().next() {
-                    p.cursor += c.len_utf8();
+                if let Some(c) = boot.picker.query[boot.query_cursor..].chars().next() {
+                    boot.query_cursor += c.len_utf8();
                 }
                 return Task::none();
             }
@@ -650,10 +816,9 @@ impl App {
             if let Some(t) = text {
                 let t: String = t.chars().filter(|c| !c.is_control()).collect();
                 if !t.is_empty() {
-                    let p = &mut boot.picker;
-                    let at = p.cursor;
-                    p.query.insert_str(at, &t);
-                    p.cursor = at + t.len();
+                    let at = boot.query_cursor;
+                    boot.picker.query.insert_str(at, &t);
+                    boot.query_cursor = at + t.len();
                     return self.boot_query_changed();
                 }
             }
@@ -664,15 +829,48 @@ impl App {
     /// Enter / click in the chooser: activate the picked project over the boot connection
     /// and open its last buffer (or a fresh transient scratch) — the bootstrap convention.
     fn boot_accept(&mut self) -> Task<Message> {
-        let Some(boot) = &mut self.boot else {
+        let Some(boot) = &self.boot else {
             return Task::none();
         };
+        let handle = boot.handle.clone();
+        // The synthetic "+ Create project …" row: create the project named by the query, then land
+        // in it (the session picker reaches this via the core; the boot chooser predates a session,
+        // so it drives the RPCs itself).
+        if boot.picker.selected_is_create() {
+            let name = boot.picker.query.trim().to_string();
+            if name.is_empty() || name.contains('/') || name.contains('\\') {
+                return self.error("project name can't be empty or contain path separators".into());
+            }
+            if let Some(b) = &mut self.boot {
+                b.opening = true;
+            }
+            return Task::perform(
+                async move {
+                    let created = handle
+                        .rpc::<ProjectCreate>(ProjectCreateParams { name })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    // A fresh project has no roots, so `project/create` returns no landing buffer —
+                    // open a scratch so the session lands in *some* editor.
+                    let open = match created.opened {
+                        Some(open) => open,
+                        None => handle
+                            .rpc::<BufferOpen>(BufferOpenParams::default())
+                            .await
+                            .map_err(|e| e.to_string())?,
+                    };
+                    Ok(Box::new((created.project, open)))
+                },
+                Message::SessionReady,
+            );
+        }
         let Some(PickerItem::Project { name, .. }) = boot.picker.selected_item() else {
             return Task::none();
         };
         let name = name.clone();
-        boot.opening = true;
-        let handle = boot.handle.clone();
+        if let Some(b) = &mut self.boot {
+            b.opening = true;
+        }
         Task::perform(
             async move {
                 // One composite: activate + land on the project's MRU buffer (or a fresh
@@ -798,6 +996,48 @@ impl App {
         )
     }
 
+    /// Recovery when a reconnect succeeds but the old project is gone (renamed/removed while away):
+    /// re-enter the boot chooser over the fresh connection and fetch the project list, mirroring a
+    /// no-args start. Picking a project (the renamed one shows under its new name) builds the
+    /// session the usual way.
+    fn reconnect_to_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
+        self.boot = Some(Boot {
+            handle: handle.clone(),
+            notifications: notifications.clone(),
+            picker: PickerState::new(PickerKind::Projects),
+            query_cursor: 0,
+            opening: false,
+            down: false,
+        });
+        let view = Task::perform(
+            async move {
+                handle
+                    .rpc::<PickerView>(PickerViewParams {
+                        kind: PickerKind::Projects,
+                        reset: true,
+                        offset: 0,
+                        limit: FETCH_LIMIT,
+                        center_on: None,
+                        center_on_cursor_grep_hit: None,
+                        directory_path: None,
+                        explorer_roots: false,
+                        buffer_id: None,
+                        filters: None,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            |result| {
+                Message::Core(CoreEvent::PickerViewed {
+                    initial: true,
+                    result,
+                })
+            },
+        );
+        let toast = self.toast("project no longer exists — pick another", ToastKind::Warning);
+        Task::batch([pump(notifications), view, toast])
+    }
+
     fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             // Boot-only message that slipped past a finished boot — nothing to do.
@@ -884,6 +1124,14 @@ impl App {
                 self.run_core(fx)
             }
 
+            // A controlled overlay `text_input` produced new text — sync the whole value into the
+            // core via the matching `*_set_*` method and run its effects (web parity). The core
+            // owns cursor/validity/suggestion state; the widget owns text editing.
+            Message::OverlayInput(field, value) => {
+                let fx = self.overlay_set(field, value);
+                self.run_core(fx)
+            }
+
             Message::PickerHovered(h) => {
                 if let Some(p) = &mut self.session.picker {
                     p.hovered = h;
@@ -967,14 +1215,20 @@ impl App {
                 let restarted = r.server_started_at != self.server_started_at;
                 tracing::info!(restarted, url = %r.server_url, "transport re-established");
                 self.server_started_at = r.server_started_at;
-                self.handle = r.handle;
+                self.handle = r.handle.clone();
                 self.notifications = r.notifications.clone();
-                let fx = self.session.on_event(CoreEvent::Reestablished {
-                    project: r.project,
-                    open: r.open,
-                    restarted,
-                });
-                Task::batch([pump(r.notifications), self.run_core(fx)])
+                match r.restore {
+                    Some((project, open)) => {
+                        let fx = self.session.on_event(CoreEvent::Reestablished {
+                            project,
+                            open,
+                            restarted,
+                        });
+                        Task::batch([pump(r.notifications), self.run_core(fx)])
+                    }
+                    // The project is gone — re-enter the boot chooser over the fresh connection.
+                    None => self.reconnect_to_chooser(r.handle, r.notifications),
+                }
             }
             Message::Reconnected(Err(ReconnectError::NotUp)) => {
                 let fx = self.session.on_event(CoreEvent::ReconnectRetry);
@@ -1076,6 +1330,15 @@ impl App {
                 }
                 Effect::RevealPickerSelection(reveal) => {
                     tasks.push(self.picker_reveal_selected_with(reveal));
+                    // The reveal's `scroll_to` drops the query input's focus, and `sync_focus`
+                    // won't restore it (the desired field is unchanged, so its change-guard skips).
+                    // Re-assert it so the cursor stays — e.g. opening the Explorer in a subdirectory
+                    // centres on the active file, which reveals; the project-root case finds no match
+                    // and never reveals, which is why only the subdir case lost its cursor. Reveals
+                    // fire on open-centring and nav, never on typing, so this can't fight an edit.
+                    if let Some(field) = self.desired_focus() {
+                        tasks.push(iced::widget::operation::focus(field.id()));
+                    }
                 }
                 Effect::PickerScrollReset => {
                     self.picker_scroll_y = 0.0;
@@ -1274,9 +1537,69 @@ impl App {
                 return Task::none();
             }
         }
+        // Snapshot the chip editor's active-field text before the core sees the key. The chip
+        // inputs are controlled `text_input`s, so when the core rewrites the text in response to a
+        // key (Tab-complete, suggestion cycle, switching root↔path) iced leaves the widget's own
+        // caret where it was — mid-string. Detect that out-of-band change and jump the caret to the
+        // end. Scoped to the key path: plain typing flows through `OverlayInput`, so this never
+        // fights a click-to-position-then-type.
+        let chip_before = self.chip_field_snapshot();
+        let chips_before = self.picker_chip_count();
         let visible_rows = self.visible_rows();
         let fx = self.session.on_key(code, mods, text, visible_rows);
-        self.run_core(fx)
+        let mut task = self.run_core(fx);
+        let chip_after = self.chip_field_snapshot();
+        if let Some((field, _)) = &chip_after {
+            // The active field or its text changed out-of-band (the core rewrote it) — snap the
+            // controlled `text_input`'s caret to the end of the new value.
+            if chip_after != chip_before {
+                task = Task::batch([task, iced::widget::operation::move_cursor_to_end(field.id())]);
+            }
+        }
+        // A filter chip was added or removed (an `Alt`-chord toggle, or deleting the last chip):
+        // the chip-row children change under the overlay, and iced drops the focused `text_input`'s
+        // focus when its siblings shift in the tree diff. `desired_focus` is unchanged (still the
+        // query), so `sync_focus` won't restore it — re-assert it here so the input stays the
+        // keyboard owner instead of leaking keys to the core's character path. (`focus()` snaps the
+        // caret to the end, which is harmless for a chip toggle — not an in-query caret action.)
+        if self.picker_chip_count() != chips_before {
+            if let Some(field) = self.desired_focus() {
+                task = Task::batch([task, iced::widget::operation::focus(field.id())]);
+            }
+        }
+        task
+    }
+
+    /// The number of filter chips on the open picker, or `None` when no picker is open. A change in
+    /// this count means the chip row restructured — see the focus re-assertion in `on_key`.
+    fn picker_chip_count(&self) -> Option<usize> {
+        self.session.picker.as_ref().map(|p| p.chips.len())
+    }
+
+    /// The active chip-editor field (the one with a focused `text_input`) and its current text, or
+    /// `None` when no chip editor is open. Used to spot core-driven text changes that need the
+    /// `text_input` caret moved to the end (see `on_key`).
+    fn chip_field_snapshot(&self) -> Option<(OverlayField, String)> {
+        let ed = self.session.picker.as_ref()?.chip_editor.as_ref()?;
+        Some(if ed.field == crate::chips::ChipEditorField::Root {
+            (OverlayField::ChipRoot, ed.root_filter.text.clone())
+        } else {
+            (OverlayField::ChipPath, ed.input.text.clone())
+        })
+    }
+
+    /// Write an overlay field's text into the core — the sink for the controlled `text_input`s'
+    /// `on_input`.
+    fn overlay_set(&mut self, field: OverlayField, value: String) -> Effects {
+        match field {
+            OverlayField::PickerQuery => self.session.picker_set_query(value),
+            OverlayField::Search => self.session.search_set_query(value),
+            OverlayField::SaveAs => self.session.prompt_set_input(value),
+            OverlayField::ProjectName => self.session.project_settings_set_name(value),
+            OverlayField::ProjectAddRoot => self.session.project_settings_set_add(value),
+            OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
+            OverlayField::ChipPath => self.session.chip_editor_set_input(value),
+        }
     }
 
     /// Keyboard handling while the help dialog is open (mirrors the TUI / web help): Esc / `q` / `?`
@@ -1465,13 +1788,26 @@ impl App {
                 let (handle, rx) = crate::connection::connect(&server_url, &version)
                     .await
                     .map_err(|_| ReconnectError::NotUp)?;
-                let activated = handle
+                let activated = match handle
                     .rpc::<ProjectActivate>(ProjectActivateParams {
                         name: project,
                         open_last: false,
                     })
                     .await
-                    .map_err(|e| ReconnectError::Fatal(e.to_string()))?;
+                {
+                    Ok(a) => a,
+                    // The project is gone (renamed/removed while away) — hand back a project-less
+                    // reconnect; the shell raises the chooser over this connection.
+                    Err(_) => {
+                        return Ok(Box::new(Reestablished {
+                            handle,
+                            notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
+                            restore: None,
+                            server_url,
+                            server_started_at: info.started_at_unix_ms,
+                        }));
+                    }
+                };
                 let params = match &path {
                     Some(p) => strip_longest_root(p, &activated.project.paths).map(
                         |(path_index, relative_path)| BufferOpenParams {
@@ -1510,8 +1846,7 @@ impl App {
                 Ok(Box::new(Reestablished {
                     handle,
                     notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
-                    project: activated.project,
-                    open,
+                    restore: Some((activated.project, open)),
                     server_url,
                     server_started_at: info.started_at_unix_ms,
                 }))
@@ -1884,6 +2219,8 @@ impl App {
                     &self.session.project_paths,
                     self.picker_scroll_y,
                     self.spinner_phase,
+                    true,
+                    0,
                 ))
                 .map(|m| match m {
                     PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
@@ -1891,9 +2228,21 @@ impl App {
                     PickerMsg::Hovered(abs) => Message::PickerHovered(Some(abs)),
                     PickerMsg::Unhovered(abs) => Message::PickerUnhovered(abs),
                     PickerMsg::ChipClicked(i) => Message::Core(CoreEvent::PickerChipClicked(i)),
+                    PickerMsg::Query(q) => Message::OverlayInput(OverlayField::PickerQuery, q),
+                    PickerMsg::EditorRoot(s) => {
+                        Message::OverlayInput(OverlayField::ChipRoot, s)
+                    }
+                    PickerMsg::EditorPath(s) => {
+                        Message::OverlayInput(OverlayField::ChipPath, s)
+                    }
+                    PickerMsg::CoreKey(code) => core_key_message(code),
                 }),
             );
         }
+        if self.session.project_settings.is_some() {
+            layers.push(self.project_settings_overlay());
+        }
+        // The confirm prompt (e.g. remove-root) layers *above* the settings dialog.
         if self.session.prompt.is_some() {
             layers.push(self.prompt_overlay());
         }
@@ -2049,6 +2398,206 @@ impl App {
         )
     }
 
+    /// The project-settings dialog (`Space ,`): a centred modal with the editable project name,
+    /// the list of roots, and an add-root input row — rendered from the core's
+    /// `session.project_settings`. Keyboard-driven (keys route through `session.on_key`, which the
+    /// core handles): Alt-j/k navigate, Enter renames / adds, Delete (then y) removes, Esc closes.
+    /// Mirrors `help_overlay`'s NORD modal box + opaque backdrop.
+    fn project_settings_overlay(&self) -> Element<'_, Message> {
+        self.project_settings_body()
+    }
+
+    /// The dialog content. The name + add-root fields are controlled `text_input`s (web parity,
+    /// syncing via `project_settings_set_name` / `_set_add`); the per-root delete buttons carry
+    /// `ProjectSettingsMsg` mapped inline to `Message` (since the inputs already produce `Message`,
+    /// the whole tree is `Message`-typed rather than mapped at the end).
+    fn project_settings_body(&self) -> Element<'_, Message> {
+        let s = self.session.project_settings.as_ref().unwrap();
+
+        // An editable field: a controlled `text_input` keyed to its core setter. Wrapped in a
+        // fixed-height row so the box never resizes between the focused/unfocused states. The
+        // `text_input` itself shows the value (NORD6) or the dim placeholder when empty, and draws
+        // its own caret/selection when focused — the focus follows the dialog's `selected` (the
+        // shell re-focuses on selection change via `sync_focus`).
+        let field = |fieldkind: OverlayField, value: &str, placeholder: &str| -> Element<'_, Message> {
+            // No fixed height: a size-13 `text_input` needs ~17px, so clamping the row to 15 clipped
+            // the text. Both states are the same widget now, so the box height is already consistent.
+            overlay_input(fieldkind, placeholder, value)
+        };
+
+        // A boxed, optionally-highlighted input/row container.
+        fn boxed_row<'a>(
+            content: Element<'a, Message>,
+            highlighted: bool,
+        ) -> Element<'a, Message> {
+            container(content)
+                .padding([5, 8])
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(if highlighted { theme::NORD2 } else { theme::NORD0 }.into()),
+                    border: iced::Border {
+                        color: if highlighted { theme::NORD8 } else { theme::NORD3 },
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..container::Style::default()
+                })
+                .into()
+        }
+
+        let label = |t: &str| {
+            text(t.to_string())
+                .size(12)
+                .font(SANS)
+                .color(theme::NORD3_BRIGHT)
+        };
+
+        // A label tucked tight above its field (~3px), so each label+field reads as one group
+        // while the column's `spacing(8)` keeps groups apart.
+        let name_group = column![
+            label("Name"),
+            boxed_row(
+                field(OverlayField::ProjectName, &s.name.text, ""),
+                s.on_name(),
+            ),
+        ]
+        .spacing(3);
+
+        let mut col = column![
+            text("Project Settings")
+                .size(14)
+                .font(SANS_BOLD_UI)
+                .color(theme::NORD6),
+            name_group,
+        ]
+        .spacing(8);
+
+        // The Roots group: the label, then the root rows (each with a delete button), then the
+        // always-present add-root input row.
+        let mut roots_col = column![label("Roots")].spacing(2);
+        if s.roots.is_empty() {
+            roots_col = roots_col.push(
+                text("(no roots — add one below)")
+                    .size(12)
+                    .font(SANS)
+                    .color(theme::NORD3_BRIGHT),
+            );
+        }
+        // A bulleted row: `• <content> …`, indented one bullet-gap from the label (web parity).
+        // No row box — selection tints only the path text (see below).
+        fn bulleted(inner: Element<'_, Message>) -> Element<'_, Message> {
+            container(
+                row![
+                    text("•").size(13).font(SANS).color(theme::NORD6),
+                    inner
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(6),
+            )
+            .padding(iced::Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 6.0,
+            })
+            .into()
+        }
+
+        for (i, root) in s.roots.iter().enumerate() {
+            let highlighted = s.selected == i + 1;
+            let delete = iced::widget::button(text("✕").size(12).font(SANS).color(theme::NORD6))
+                .padding([2, 8])
+                .style(|_, status| iced::widget::button::Style {
+                    background: Some(
+                        if matches!(status, iced::widget::button::Status::Hovered) {
+                            theme::NORD11
+                        } else {
+                            theme::NORD3
+                        }
+                        .into(),
+                    ),
+                    text_color: theme::NORD6,
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..iced::Border::default()
+                    },
+                    ..iced::widget::button::Style::default()
+                })
+                .on_press(ProjectSettingsMsg::RemoveRoot(i));
+            // The delete button is the only `ProjectSettingsMsg` source; map it inline so this row
+            // joins the `Message`-typed tree (the input fields already produce `Message`).
+            let delete = Element::from(delete).map(|m| match m {
+                ProjectSettingsMsg::RemoveRoot(i) => {
+                    Message::Core(CoreEvent::ProjectSettingsRemoveRoot(i))
+                }
+            });
+            // Selection tints just the path text (web/terminal parity), so the background hugs the
+            // text — no padding, so the text lines up with the borderless add-root input below.
+            let path = container(text(root.clone()).size(13).font(SANS).color(theme::NORD6))
+                .style(move |_| container::Style {
+                    background: highlighted.then(|| theme::NORD2.into()),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        ..iced::Border::default()
+                    },
+                    ..container::Style::default()
+                });
+            let inner = row![
+                path,
+                iced::widget::Space::new().width(Length::Fill),
+                delete,
+            ]
+            .align_y(iced::Alignment::Center)
+            .spacing(6);
+            roots_col = roots_col.push(bulleted(inner.into()));
+        }
+
+        // The always-present add-root input row — a borderless input after its bullet, so the caret
+        // is the focus cue (web/terminal parity), not a box.
+        roots_col = roots_col.push(bulleted(field(
+            OverlayField::ProjectAddRoot,
+            &s.add.text,
+            "Add root...",
+        )));
+        col = col.push(roots_col);
+
+        if let Some(err) = &s.error {
+            col = col.push(text(err.clone()).size(12).font(SANS).color(theme::NORD11));
+        }
+
+        let boxed = container(col.spacing(8))
+            .width(480)
+            .padding(16)
+            .style(|_| container::Style {
+                background: Some(theme::NORD1.into()),
+                border: iced::Border {
+                    color: theme::NORD3,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba8(0, 0, 0, 0.45),
+                    offset: iced::Vector::new(0.0, 12.0),
+                    blur_radius: 40.0,
+                },
+                ..container::Style::default()
+            });
+
+        // Opaque, dimmed backdrop, centred. Clicks on the dialog's delete buttons are handled;
+        // clicks on the backdrop are swallowed (no fall-through to the editor).
+        iced::widget::opaque(
+            container(boxed)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center)
+                .style(|_| container::Style {
+                    background: Some(iced::Color::from_rgba8(20, 24, 30, 0.5).into()),
+                    ..container::Style::default()
+                }),
+        )
+    }
+
     /// The no-args start screen: just the Projects picker over the editor background.
     fn boot_view<'a>(&'a self, boot: &'a Boot) -> Element<'a, Message> {
         let backdrop = container(iced::widget::Space::new())
@@ -2058,11 +2607,16 @@ impl App {
                 background: Some(theme::NORD0.into()),
                 ..container::Style::default()
             });
+        // The boot chooser's picker query lives outside the core session (it's driven by
+        // `on_boot_key` / `boot.picker`), so it keeps the fake-caret rendering: `controlled=false`,
+        // and `PickerMsg::Query` can never fire here.
         let picker = Element::from(crate::picker::overlay(
             &boot.picker,
             &[],
             self.picker_scroll_y,
             self.spinner_phase,
+            false,
+            boot.query_cursor,
         ))
         .map(|m| match m {
             PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
@@ -2070,6 +2624,12 @@ impl App {
             PickerMsg::Hovered(abs) => Message::PickerHovered(Some(abs)),
             PickerMsg::Unhovered(abs) => Message::PickerUnhovered(abs),
             PickerMsg::ChipClicked(i) => Message::Core(CoreEvent::PickerChipClicked(i)),
+            // The boot chooser is the Projects picker — no query sync, no chip editor, no chip-row
+            // boundary keys — so none of the controlled-input / chip messages can fire here.
+            PickerMsg::Query(_)
+            | PickerMsg::EditorRoot(_)
+            | PickerMsg::EditorPath(_)
+            | PickerMsg::CoreKey(_) => Message::Noop,
         });
         let mut layers: Vec<Element<'_, Message>> = vec![backdrop.into(), picker];
         if !self.toasts.is_empty() {
@@ -2081,39 +2641,12 @@ impl App {
     /// The floating search prompt, bottom-left above the status bar — mirrors the web client's
     /// `#searchbar` (query + beam cursor, match count on the right).
     fn search_bar(&self) -> Element<'_, Message> {
-        let q = &self.session.search.query;
-        let mut inner = row![].spacing(0).align_y(iced::Alignment::Center);
-        if q.is_empty() {
-            inner = inner.push(text("search").size(13).font(SANS).color(theme::NORD3));
-        } else {
-            let pre = &q[..self.session.search.cursor];
-            let post = &q[self.session.search.cursor..];
-            if !pre.is_empty() {
-                inner = inner.push(
-                    text(pre.to_string())
-                        .size(13)
-                        .font(SANS)
-                        .color(theme::NORD6),
-                );
-            }
-            inner = inner.push(
-                container(iced::widget::Space::new().width(2).height(15)).style(|_| {
-                    container::Style {
-                        background: Some(theme::NORD8.into()),
-                        ..container::Style::default()
-                    }
-                }),
-            );
-            if !post.is_empty() {
-                inner = inner.push(
-                    text(post.to_string())
-                        .size(13)
-                        .font(SANS)
-                        .color(theme::NORD6),
-                );
-            }
-        }
-        let mut bar = row![inner, iced::widget::Space::new().width(Length::Fill)]
+        // The query input is a controlled `text_input` (web parity): its value is the core's
+        // search query, edits sync via `search_set_query`, and Enter/Up/Down/Esc bubble to
+        // `on_key` (commit / history nav / cancel) since `on_submit` is unset.
+        let input =
+            overlay_input(OverlayField::Search, "search", &self.session.search.query);
+        let mut bar = row![input, iced::widget::Space::new().width(Length::Fill)]
             .spacing(6)
             .width(Length::Fill)
             .align_y(iced::Alignment::Center);
@@ -2156,30 +2689,40 @@ impl App {
     /// [`PromptMsg`] space and mapped.
     fn prompt_overlay(&self) -> Element<'_, Message> {
         let prompt = self.session.prompt.as_ref().unwrap();
-        let btn = |label: &str, primary: bool, msg: PromptMsg| {
-            iced::widget::button(
-                text(label.to_string())
-                    .size(13)
-                    .font(SANS)
-                    .color(theme::NORD6),
+        // The save-as arm embeds a controlled `text_input` (which produces `Message`), so the
+        // whole body is built in `Message` space: the Clone-only buttons map their `PromptMsg`
+        // immediately rather than the whole tree being mapped at the end.
+        let btn = |label: &str, primary: bool, msg: PromptMsg| -> Element<'_, Message> {
+            Element::from(
+                iced::widget::button(
+                    text(label.to_string())
+                        .size(13)
+                        .font(SANS)
+                        .color(theme::NORD6),
+                )
+                .padding([5, 14])
+                .style(move |_, _| iced::widget::button::Style {
+                    background: Some(if primary {
+                        // Red to mark the confirm as destructive (matches the web/TUI `[y/N]`).
+                        theme::NORD11.into()
+                    } else {
+                        theme::NORD3.into()
+                    }),
+                    text_color: theme::NORD6,
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..iced::Border::default()
+                    },
+                    ..iced::widget::button::Style::default()
+                })
+                .on_press(msg),
             )
-            .padding([5, 14])
-            .style(move |_, _| iced::widget::button::Style {
-                background: Some(if primary {
-                    theme::NORD9.into()
-                } else {
-                    theme::NORD3.into()
-                }),
-                text_color: theme::NORD6,
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    ..iced::Border::default()
-                },
-                ..iced::widget::button::Style::default()
+            .map(|m| match m {
+                PromptMsg::Accept => Message::Core(CoreEvent::PromptAccept),
+                PromptMsg::Cancel => Message::Core(CoreEvent::PromptCancel),
             })
-            .on_press(msg)
         };
-        let body: Element<'_, PromptMsg> = match prompt {
+        let body: Element<'_, Message> = match prompt {
             Prompt::LspInfo(info) => {
                 let busy = matches!(info.status, LspStatus::Ready) && !info.progress.is_empty();
                 let dot = if busy {
@@ -2244,8 +2787,8 @@ impl App {
                 );
                 col.spacing(10).into()
             }
-            Prompt::Confirm { message, .. } => column![
-                text(format!("{message}?"))
+            Prompt::Confirm { kind, .. } => column![
+                text(format!("{}?", confirm_phrase(kind)))
                     .size(13)
                     .font(SANS)
                     .color(theme::NORD6),
@@ -2259,10 +2802,7 @@ impl App {
             .spacing(14)
             .into(),
             Prompt::SaveAs {
-                path_index,
-                input,
-                cursor,
-                ..
+                path_index, input, ..
             } => {
                 let root = self
                     .session
@@ -2278,34 +2818,14 @@ impl App {
                         )
                     })
                     .unwrap_or_default();
-                let mut field = row![text(root).size(13).font(SANS).color(theme::NORD3_BRIGHT),]
-                    .align_y(iced::Alignment::Center);
-                let pre = &input[..*cursor];
-                let post = &input[*cursor..];
-                if !pre.is_empty() {
-                    field = field.push(
-                        text(pre.to_string())
-                            .size(13)
-                            .font(SANS)
-                            .color(theme::NORD6),
-                    );
-                }
-                field = field.push(
-                    container(iced::widget::Space::new().width(2).height(15)).style(|_| {
-                        container::Style {
-                            background: Some(theme::NORD8.into()),
-                            ..container::Style::default()
-                        }
-                    }),
-                );
-                if !post.is_empty() {
-                    field = field.push(
-                        text(post.to_string())
-                            .size(13)
-                            .font(SANS)
-                            .color(theme::NORD6),
-                    );
-                }
+                // The root prefix is a dim non-editable lead; the path is a controlled
+                // `text_input` (value = the prompt's `input`, edits sync via `prompt_set_input`).
+                // Enter / Esc bubble to `on_key` (accept / cancel) since `on_submit` is unset.
+                let field = row![
+                    text(root).size(13).font(SANS).color(theme::NORD3_BRIGHT),
+                    overlay_input(OverlayField::SaveAs, "", input),
+                ]
+                .align_y(iced::Alignment::Center);
                 column![
                     text("Save as").size(13).font(SANS).color(theme::NORD6),
                     container(field)
@@ -2350,25 +2870,20 @@ impl App {
                 },
                 ..container::Style::default()
             });
-        Element::from(
-            container(boxed)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(iced::alignment::Horizontal::Center)
-                .align_y(iced::alignment::Vertical::Top)
-                .padding(iced::Padding {
-                    top: 120.0,
-                    ..iced::Padding::ZERO
-                })
-                .style(|_| container::Style {
-                    background: Some(iced::Color::from_rgba8(20, 24, 30, 0.5).into()),
-                    ..container::Style::default()
-                }),
-        )
-        .map(|m| match m {
-            PromptMsg::Accept => Message::Core(CoreEvent::PromptAccept),
-            PromptMsg::Cancel => Message::Core(CoreEvent::PromptCancel),
-        })
+        container(boxed)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Top)
+            .padding(iced::Padding {
+                top: 120.0,
+                ..iced::Padding::ZERO
+            })
+            .style(|_| container::Style {
+                background: Some(iced::Color::from_rgba8(20, 24, 30, 0.5).into()),
+                ..container::Style::default()
+            })
+            .into()
     }
 
     /// The hover popover, anchored at the cursor cell: below it when there's room, above
@@ -2820,6 +3335,50 @@ const SANS_BOLD_UI: iced::Font = iced::Font {
 /// Monospace, for the help dialog's key-chord column.
 const MONO: iced::Font = iced::Font::MONOSPACE;
 
+/// A controlled overlay text field: an `iced::widget::text_input` whose value is the core's
+/// current text (so a core-driven reset — clearing the search query on Esc, seeding save-as —
+/// flows straight into the widget) and whose edits sync back via [`Message::OverlayInput`].
+///
+/// Styled to sit transparently on the overlay panel: NORD6 value, NORD8 caret/selection, a dim
+/// NORD3_BRIGHT placeholder, no border or background of its own (the surrounding container draws
+/// the box). `on_submit` is deliberately left unset so a single-line `text_input` lets Enter
+/// bubble (`Ignored`) to the core's key handler — the picker's Enter-to-select, save-as accept,
+/// and project-settings rename/add all stay on the existing `on_key` path.
+///
+/// `iced::widget::text_input`'s builder requires `Message: Clone`, which the app's `Message` is
+/// not, so it's built in the tiny `Clone` [`Typed`] space and `.map`'d to `Message` (the same
+/// indirection the picker/prompt overlays use for their Clone-only button messages).
+fn overlay_input<'a>(
+    field: OverlayField,
+    placeholder: &str,
+    value: &str,
+) -> Element<'a, Message> {
+    // `alt_passthrough` keeps Alt-chords (the nav idiom) out of the input — winit delivers
+    // `Alt+letter` as text on some platforms, which a focused `text_input` would otherwise insert.
+    crate::alt_filter::alt_passthrough(
+        iced::widget::text_input(placeholder, value)
+            .id(field.id())
+            .on_input(Typed)
+            .font(SANS)
+            .size(13)
+            .padding(0)
+            .style(|_theme, _status| iced::widget::text_input::Style {
+                background: iced::Background::Color(iced::Color::TRANSPARENT),
+                border: iced::Border::default(),
+                icon: theme::NORD6,
+                placeholder: theme::NORD3_BRIGHT,
+                value: theme::NORD6,
+                selection: theme::NORD8,
+            }),
+    )
+    .map(move |Typed(s)| Message::OverlayInput(field, s))
+}
+
+/// The `Clone` carrier for an overlay `text_input`'s typed value — `text_input` requires a
+/// `Clone` message, so [`overlay_input`] builds in this space then maps to `Message`.
+#[derive(Debug, Clone)]
+struct Typed(String);
+
 /// Help-dialog tabs, in display order. Indexes `App::help`.
 const HELP_TABS: [&str; 4] = ["Normal", "Insert", "Search", "Application"];
 
@@ -2828,6 +3387,21 @@ fn pump(notifications: NotifRx) -> Task<Message> {
         async move { notifications.lock().await.recv().await },
         Message::Notified,
     )
+}
+
+/// A chip-editor boundary key (intercepted before its `text_input`, see `picker::PickerMsg::CoreKey`)
+/// reissued as a `Message::Key` so it runs through the core keymap exactly as if the key subscription
+/// had forwarded it. No modifiers; a `Char` carries its text.
+fn core_key_message(code: KeyCode) -> Message {
+    let text = match code {
+        KeyCode::Char(c) => Some(c.to_string()),
+        _ => None,
+    };
+    Message::Key {
+        code,
+        mods: Mods::NONE,
+        text,
+    }
 }
 
 fn loaded_rows(window: &Window) -> u32 {
@@ -3212,6 +3786,23 @@ fn format_total(s: &SearchSummary) -> String {
     }
 }
 
+/// Compose the prompt phrasing for a confirmation. The core supplies the structured reason
+/// ([`ConfirmKind`]); wording is the native client's presentational choice (the dialog then
+/// appends `?` and offers Yes/No).
+fn confirm_phrase(kind: &ConfirmKind) -> String {
+    match kind {
+        ConfirmKind::Overwrite { path: Some(p) } => format!("overwrite {p}"),
+        ConfirmKind::Overwrite { path: None } => "overwrite".into(),
+        ConfirmKind::OverwriteModified => "file changed on disk — overwrite".into(),
+        ConfirmKind::RecreateDeleted => "file removed on disk — recreate".into(),
+        ConfirmKind::DiscardOnReload => "discard local changes and reload".into(),
+        ConfirmKind::DiscardOnClose { label } => format!("discard unsaved changes in {label}"),
+        ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
+        ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
+        ConfirmKind::DeleteProject { name } => format!("Delete project \"{name}\""),
+    }
+}
+
 fn nord_theme(_app: &App) -> iced::Theme {
     iced::Theme::Nord
 }
@@ -3325,5 +3916,43 @@ mod tests {
             reveal_target(&s, scroll, Reveal::Minimal),
             Some(5.0 * ROW_H)
         );
+    }
+
+    /// Every overlay field maps to a distinct, stable widget id — the focus task and the
+    /// `text_input`'s own `.id()` must agree, or focus would never land.
+    #[test]
+    fn overlay_field_ids_are_distinct() {
+        use std::collections::HashSet;
+        let fields = [
+            OverlayField::PickerQuery,
+            OverlayField::Search,
+            OverlayField::SaveAs,
+            OverlayField::ProjectName,
+            OverlayField::ProjectAddRoot,
+            OverlayField::ChipRoot,
+            OverlayField::ChipPath,
+        ];
+        let ids: HashSet<_> = fields.iter().map(|f| f.id()).collect();
+        assert_eq!(ids.len(), fields.len(), "overlay field ids must be unique");
+        // The id is stable across calls (so re-focus targets the same widget).
+        assert_eq!(OverlayField::Search.id(), OverlayField::Search.id());
+    }
+
+    /// The picker query `text_input`'s id (set in `picker.rs`) must equal the shell's focus
+    /// target id, or opening the picker wouldn't focus its query input.
+    #[test]
+    fn picker_query_id_matches_focus_target() {
+        assert_eq!(
+            crate::picker::query_input_id(),
+            OverlayField::PickerQuery.id()
+        );
+    }
+
+    /// The chip-editor inputs' ids (set in `picker.rs`) must equal the shell's focus target ids,
+    /// or `sync_focus` would never land on the active chip-editor segment.
+    #[test]
+    fn chip_editor_ids_match_focus_targets() {
+        assert_eq!(crate::picker::editor_root_id(), OverlayField::ChipRoot.id());
+        assert_eq!(crate::picker::editor_path_id(), OverlayField::ChipPath.id());
     }
 }

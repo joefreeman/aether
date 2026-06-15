@@ -99,6 +99,12 @@ where
 /// Scrollbar width (rail + scroller) — narrower than iced's default chrome.
 const SCROLLBAR_W: f32 = 5.0;
 
+/// Trailing slack (px) reserved past a chip-editor ghost layer's content, so the overlaid
+/// `text_input` has headroom and won't scroll its value to keep the end-of-line caret visible
+/// (iced scrolls once the caret reaches `width - 5.0`). Must exceed that 5px fudge — see
+/// `field_with_ghost`.
+const CARET_SLACK: f32 = 8.0;
+
 /// Every display row (item or group header) is exactly this tall — what makes the
 /// virtual-scroll spacer math exact. Shell geometry: the core speaks display *rows*;
 /// this is where rows become pixels.
@@ -108,7 +114,10 @@ pub const ROW_H: f32 = 24.0;
 /// collapses entirely when there's nothing to list — a reserved blank row would read as a
 /// missing entry).
 pub fn list_height(state: &PickerState) -> f32 {
-    (state.total_display_rows.min(VISIBLE_ROWS as u32) as f32) * ROW_H
+    // The synthetic "+ Create …" row is appended client-side (not in `total_display_rows`), so add a
+    // row for it — otherwise the viewport is one row short and clips it.
+    let rows = state.total_display_rows + state.pending_create().is_some() as u32;
+    (rows.min(VISIBLE_ROWS as u32) as f32) * ROW_H
 }
 
 /// The display row a scroll offset of `y` px puts at the top of the list view — the px→row
@@ -117,8 +126,9 @@ pub fn first_visible_row(y: f32) -> u32 {
     (y / ROW_H).floor().max(0.0) as u32
 }
 
-/// Messages from the rendered panel (buttons/rows need `Clone`; the app maps these).
-#[derive(Debug, Clone, Copy)]
+/// Messages from the rendered panel (buttons/rows need `Clone`; the app maps these). Not `Copy`:
+/// the query `text_input`'s `on_input` carries the new value as a `String` ([`PickerMsg::Query`]).
+#[derive(Debug, Clone)]
 pub enum PickerMsg {
     /// A row was clicked — absolute index into the match list.
     Click(u32),
@@ -129,6 +139,28 @@ pub enum PickerMsg {
     Unhovered(u32),
     /// A filter chip was clicked — row index (selection is virtual, like the keyboard path).
     ChipClicked(usize),
+    /// The query `text_input` produced new text (session picker only — the controlled-input path;
+    /// the boot chooser's picker keeps the fake-caret rendering and never emits this).
+    Query(String),
+    /// The chip editor's root-filter `text_input` produced new text (multi-root dir editor).
+    EditorRoot(String),
+    /// The chip editor's path/glob `text_input` produced new text.
+    EditorPath(String),
+    /// A chip-boundary key a focused `text_input` would otherwise swallow, forwarded to the core's
+    /// keymap (`:` confirm-root, Backspace step-to-root). The app maps it to a `Message::Key`.
+    CoreKey(crate::keymap::KeyCode),
+}
+
+/// Which boundary gesture a chip-editor field forwards to the core (a focused `text_input` captures
+/// these, so the wrapper intercepts them — web/TUI parity).
+#[derive(Clone, Copy)]
+enum Boundary {
+    /// No boundary key (glob field, single-root dir path).
+    None,
+    /// Root segment: `:` confirms the root and moves into the path.
+    ConfirmRoot,
+    /// Multi-root dir path segment: `Backspace` at the start steps back into the root.
+    PathToRoot,
 }
 
 /// Query-input placeholder per picker — kept in sync with the web client's `PLACEHOLDER` map
@@ -154,11 +186,18 @@ const SANS: iced::Font = iced::Font {
 /// Build the picker panel. `roots` are the project root paths (rows show a root label only in
 /// multi-root projects, like the other clients). `scroll_y` is the shell-tracked scroll
 /// offset of the results list (for the sticky-header pin).
+/// `controlled` selects the query-input rendering: `true` (the session picker) draws a real
+/// `text_input` synced to the core via [`PickerMsg::Query`]; `false` (the boot chooser, whose
+/// query lives outside the core session) keeps the fake-caret rendering driven by key events.
 pub fn overlay<'a>(
     state: &'a PickerState,
     roots: &'a [String],
     scroll_y: f32,
     spinner_phase: f32,
+    controlled: bool,
+    // Byte caret into `state.query`, used only by the fake-caret (`!controlled`) boot-chooser path;
+    // the controlled `text_input` owns its own caret, so the session picker passes 0.
+    query_cursor: usize,
 ) -> Element<'a, PickerMsg> {
     let mut panel = column![];
 
@@ -181,7 +220,63 @@ pub fn overlay<'a>(
     if let Some(pfx) = &prefix {
         input = input.push(text(pfx.clone()).size(13).font(SANS).color(theme::NORD8));
     }
-    if state.query.is_empty() {
+    // The breadcrumb / a non-empty chip row already says where typing will act, so the per-kind
+    // placeholder is suppressed there (both the controlled and fake-caret paths honour this).
+    let show_placeholder = prefix.is_none() && chip_row.is_empty();
+    if controlled {
+        // Session picker: a real `text_input` synced to the core (web parity). NORD6 value, NORD8
+        // caret/selection, dim placeholder, no border/background (the input row's NORD0 is the
+        // box). Width::Shrink so it sits flush after any breadcrumb rather than filling the row and
+        // pushing the count off-screen.
+        let ph = if show_placeholder {
+            placeholder(state.kind)
+        } else {
+            ""
+        };
+        // `alt_passthrough` keeps Alt-nav chords (Alt-j/k/l) out of the query input (winit delivers
+        // `Alt+letter` as text on some platforms, which the focused input would otherwise insert).
+        let q_input = iced::widget::text_input(ph, &state.query)
+            .id(query_input_id())
+            .on_input(PickerMsg::Query)
+            .font(SANS)
+            .size(13)
+            .padding(0)
+            // `text_input` has no intrinsic content width — `Shrink` collapses it to nothing
+            // (the typed text wouldn't show). Fill the row up to the count instead (so the
+            // trailing Fill spacer below is skipped for this path).
+            .width(Length::Fill)
+            .style(|_theme, _status| iced::widget::text_input::Style {
+                background: iced::Background::Color(iced::Color::TRANSPARENT),
+                border: iced::Border::default(),
+                icon: theme::NORD6,
+                placeholder: theme::NORD3,
+                value: theme::NORD6,
+                selection: theme::NORD8,
+            });
+        // With chips present — and only while no chip is yet selected (the input still owns focus) —
+        // Left / Backspace at the *start* of the query select the rightmost chip instead of editing
+        // it: the browser tag-input gesture (web parity). Once a chip *is* selected the input is
+        // blurred and the chip-row keys (navigate / remove / deselect) flow to the core directly.
+        let wrapped = if !chip_row.is_empty() && state.chip_selected.is_none() {
+            let last = chip_row.len() - 1;
+            crate::alt_filter::alt_passthrough_intercept(
+                q_input,
+                state.query.clone(),
+                move |key, at_start| {
+                    use iced::keyboard::key::Named;
+                    (at_start
+                        && matches!(
+                            key,
+                            iced::keyboard::Key::Named(Named::ArrowLeft | Named::Backspace)
+                        ))
+                    .then_some(PickerMsg::ChipClicked(last))
+                },
+            )
+        } else {
+            crate::alt_filter::alt_passthrough(q_input)
+        };
+        input = input.push(wrapped);
+    } else if state.query.is_empty() {
         let mut q = row![
             container(iced::widget::Space::new().width(2).height(15)).style(|_| {
                 container::Style {
@@ -192,8 +287,7 @@ pub fn overlay<'a>(
         ]
         .spacing(2)
         .align_y(iced::Alignment::Center);
-        // The breadcrumb / a non-empty chip row already says where typing will act.
-        if prefix.is_none() && chip_row.is_empty() {
+        if show_placeholder {
             q = q.push(
                 text(placeholder(state.kind))
                     .size(13)
@@ -204,8 +298,8 @@ pub fn overlay<'a>(
         input = input.push(q);
     } else {
         let mut query_row = row![].align_y(iced::Alignment::Center);
-        let pre = &state.query[..state.cursor];
-        let post = &state.query[state.cursor..];
+        let pre = &state.query[..query_cursor];
+        let post = &state.query[query_cursor..];
         if !pre.is_empty() {
             query_row = query_row.push(text(pre).size(13).font(SANS).color(theme::NORD6));
         }
@@ -220,7 +314,12 @@ pub fn overlay<'a>(
         }
         input = input.push(query_row);
     }
-    input = input.push(iced::widget::Space::new().width(Length::Fill));
+    // The fake-caret query has intrinsic width, so a Fill spacer pushes the count to the right edge.
+    // The controlled `text_input` is itself Fill, so it already does that — a second Fill would
+    // split the row and shrink the input.
+    if !controlled {
+        input = input.push(iced::widget::Space::new().width(Length::Fill));
+    }
     // A rotating throbber sits to the left of the count while a search is still streaming; the count
     // itself shows progress. The app drives `spinner_phase` from frame ticks for a smooth spin.
     if state.ticking {
@@ -331,7 +430,9 @@ pub fn overlay<'a>(
             }
             DisplayRow::Create { abs, name, is_dir } => {
                 let selected = abs == state.selected;
-                let label = if is_dir {
+                let label = if state.kind == aether_protocol::picker::PickerKind::Projects {
+                    format!("+ Create project {name}")
+                } else if is_dir {
                     format!("+ Create directory {name}/")
                 } else {
                     format!("+ Create file {name}")
@@ -486,6 +587,22 @@ pub fn list_id() -> iced::advanced::widget::Id {
     iced::advanced::widget::Id::new("picker-results")
 }
 
+/// The query `text_input`'s id — must match `OverlayField::PickerQuery::id()` so the shell's
+/// focus task lands on it when the picker opens.
+pub fn query_input_id() -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::new("overlay-picker-query")
+}
+
+/// The chip editor's root-filter `text_input` id — must match `OverlayField::ChipRoot::id()`.
+pub fn editor_root_id() -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::new("overlay-chip-root")
+}
+
+/// The chip editor's path/glob `text_input` id — must match `OverlayField::ChipPath::id()`.
+pub fn editor_path_id() -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::new("overlay-chip-path")
+}
+
 /// One filter chip: compact label on a raised background; selected inverts; exclude globs
 /// (leading `!`) tint red; only the whole-word chip underlines. Clicking selects (selection is
 /// virtual — focus never leaves the query, exactly like the keyboard path).
@@ -521,39 +638,98 @@ fn chip_el<'a>(chip: &Chip, idx: usize, selected: bool) -> Element<'a, PickerMsg
         .into()
 }
 
-/// The query input's beam cursor, reused by the chip editor's focused field.
-fn cursor_bar<'a>() -> Element<'a, PickerMsg> {
-    container(iced::widget::Space::new().width(2).height(15))
-        .style(|_| container::Style {
-            background: Some(theme::NORD8.into()),
-            ..container::Style::default()
-        })
-        .into()
-}
-
-/// An editable field of the chip editor: typed text around the beam cursor, then the gray
-/// ghost (the current suggestion's remainder). `invalid` paints the typed text red — the
-/// visible form of "Enter will refuse this".
+/// An editable field of the chip editor, rendered as a controlled `text_input` over a ghost
+/// layer (web parity — see `editorWrap`/`fillGhost` in `web/src/shell.ts`). The ghost layer is
+/// the FULL suggestion (`typed + ghost suffix`) drawn dim gray; the `text_input` sits on top with
+/// a transparent background and an opaque value colour, so it covers the gray prefix exactly and
+/// only the suffix peeks out past the typed text. The two layers share font/size/padding/alignment,
+/// so the typed glyphs overlap the gray prefix flush and the suffix lands right after the caret.
+///
+/// `invalid` paints the typed value red (the "Enter will refuse this" cue, matching the old
+/// fake-caret rendering). `placeholder` shows only when the field is empty (the glob hint).
+/// `on_input` carries the typed value back to the core via the shell's `OverlayInput` mapping.
+#[allow(clippy::too_many_arguments)]
 fn field_with_ghost<'a>(
     input: &chips::Input,
     ghost: Option<String>,
     invalid: bool,
+    id: iced::advanced::widget::Id,
+    placeholder: &str,
+    on_input: fn(String) -> PickerMsg,
+    hug: bool,
+    boundary: Boundary,
 ) -> Element<'a, PickerMsg> {
     let color = if invalid { theme::NORD11 } else { theme::NORD6 };
-    let mut f = row![].spacing(2).align_y(iced::Alignment::Center);
-    let pre = &input.text[..input.cursor];
-    let post = &input.text[input.cursor..];
-    if !pre.is_empty() {
-        f = f.push(text(pre.to_string()).size(13).font(SANS).color(color));
+    // The gray layer behind: the typed text (its prefix is covered by the opaque input value)
+    // followed by the suggestion suffix (the only part that shows through).
+    let suffix = ghost.filter(|g| !g.is_empty()).unwrap_or_default();
+    // `text_input` hardcodes `Shaping::Advanced`; the bare `text` widget defaults to `Basic`. The
+    // two shapers give different glyph advances, so without matching this the layers drift apart
+    // character by character and the gray prefix leaks out from under the opaque value (and the
+    // suffix lands in the wrong place). Match the shaper so the layers stay glyph-aligned.
+    let ghost_text = text(format!("{}{}", input.text, suffix))
+        .size(13)
+        .font(SANS)
+        .color(theme::NORD3_BRIGHT)
+        .shaping(iced::widget::text::Shaping::Advanced)
+        .wrapping(iced::widget::text::Wrapping::None);
+    // The stack sizes to its base layer (the ghost). `text_input` scrolls its value left to keep
+    // the caret visible once the caret's x reaches `width - 5.0` (iced's hardcoded fudge) — and with
+    // the caret at the end of a box sized exactly to the content, that fires every time, shifting
+    // the opaque value left of the ghost (the gray prefix then leaks out the left, the suffix off
+    // the right). A fixed trailing spacer in the base gives the input ~CARET_SLACK px of headroom so
+    // the offset stays 0 and the layers stay pinned. A `Space` (not trailing text) is immune to the
+    // shaper trimming trailing whitespace out of the measured width.
+    let ghost_layer: Element<'a, PickerMsg> =
+        row![ghost_text, iced::widget::Space::new().width(CARET_SLACK)].into();
+    // The controlled input on top: transparent background so the gray suffix shows through after
+    // the typed text; opaque NORD6 (or red) value covers the gray prefix; NORD8 caret/selection.
+    let field_inner = iced::widget::text_input(placeholder, &input.text)
+        .id(id)
+        .on_input(on_input)
+        .font(SANS)
+        .size(13)
+        .padding(0)
+        .width(Length::Fill)
+        .style(move |_theme, _status| iced::widget::text_input::Style {
+            background: iced::Background::Color(iced::Color::TRANSPARENT),
+            border: iced::Border::default(),
+            icon: color,
+            placeholder: theme::NORD3_BRIGHT,
+            value: color,
+            selection: theme::NORD8,
+        });
+    // Forward the field's boundary key to the core's keymap instead of letting the focused input
+    // swallow it (web/TUI parity).
+    use crate::keymap::KeyCode;
+    use iced::keyboard::key::Named;
+    let field = match boundary {
+        Boundary::None => crate::alt_filter::alt_passthrough(field_inner),
+        Boundary::ConfirmRoot => {
+            crate::alt_filter::alt_passthrough_intercept(field_inner, input.text.clone(), |key, _| {
+                matches!(key.as_ref(), iced::keyboard::Key::Character(":"))
+                    .then_some(PickerMsg::CoreKey(KeyCode::Char(':')))
+            })
+        }
+        Boundary::PathToRoot => crate::alt_filter::alt_passthrough_intercept(
+            field_inner,
+            input.text.clone(),
+            |key, at_start| {
+                (at_start && matches!(key, iced::keyboard::Key::Named(Named::Backspace)))
+                    .then_some(PickerMsg::CoreKey(KeyCode::Backspace))
+            },
+        ),
+    };
+    let stacked = iced::widget::stack![ghost_layer, field];
+    if hug {
+        // The root segment sizes to its content so the `:` separator sits flush after it (web's
+        // `.hug`). The stack's width follows the ghost layer (the real content metric); the
+        // `text_input`'s `Fill` then fills exactly that, rather than the whole row.
+        container(stacked).width(Length::Shrink).into()
+    } else {
+        // The path/glob segment stretches across the rest of the row.
+        stacked.into()
     }
-    f = f.push(cursor_bar());
-    if !post.is_empty() {
-        f = f.push(text(post.to_string()).size(13).font(SANS).color(color));
-    }
-    if let Some(g) = ghost.filter(|g| !g.is_empty()) {
-        f = f.push(text(g).size(13).font(SANS).color(theme::NORD3_BRIGHT));
-    }
-    f.into()
 }
 
 /// The chip-editor line below the input row, or a zero-size placeholder (the slot must always
@@ -571,9 +747,22 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String]) -> Element<'a, P
     line = line.push(text(tag).size(13).font(SANS).color(theme::NORD8));
     if multi_root {
         let invalid = ed.root_invalid(&labels);
+        // Group the root segment with its `:` separator at zero spacing, so the colon sits flush
+        // against the root rather than inheriting the row's 6px gap (the web's `margin-left: -6px`).
+        // The row gap then still separates this group from the path that follows.
+        let mut root_group = row![].spacing(0).align_y(iced::Alignment::Center);
         if ed.field == ChipEditorField::Root {
             let ghost = ed.root_ghost(&labels).map(|(_, suffix)| suffix);
-            line = line.push(field_with_ghost(&ed.root_filter, ghost, invalid));
+            root_group = root_group.push(field_with_ghost(
+                &ed.root_filter,
+                ghost,
+                invalid,
+                editor_root_id(),
+                "",
+                PickerMsg::EditorRoot,
+                true,
+                Boundary::ConfirmRoot,
+            ));
         } else {
             // Unfocused root: the chosen label in the breadcrumb blue — or the raw filter
             // text, red, when it matches nothing (never a fallback the commit would refuse).
@@ -586,25 +775,49 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String]) -> Element<'a, P
                     .unwrap_or_default()
             };
             let color = if invalid { theme::NORD11 } else { theme::NORD8 };
-            line = line.push(text(display).size(13).font(SANS).color(color));
+            root_group = root_group.push(text(display).size(13).font(SANS).color(color));
         }
         // The separator appears once the path is in play (focused, or already holding text) —
         // a fresh root prompt doesn't dangle a `:` off an unentered field.
         if ed.field == ChipEditorField::Path || !ed.input.text.is_empty() {
-            line = line.push(text(":").size(13).font(SANS).color(theme::NORD3_BRIGHT));
+            root_group =
+                root_group.push(text(":").size(13).font(SANS).color(theme::NORD3_BRIGHT));
         }
+        line = line.push(root_group);
     }
     if ed.field == ChipEditorField::Path || !multi_root {
         let ghost = if ed.is_dir() { ed.path_ghost() } else { None };
+        // Only a multi-root dir path can step back into a root; the glob field and a single-root
+        // dir path have no root segment behind them.
+        let path_boundary = if multi_root {
+            Boundary::PathToRoot
+        } else {
+            Boundary::None
+        };
         if !ed.is_dir() && ed.input.text.is_empty() {
-            // Glob placeholder: the syntax by example (web's input placeholder).
+            // Glob: no inline ghost (there's nothing to complete); the syntax-by-example hint
+            // rides as the `text_input`'s placeholder instead (web parity).
             line = line.push(field_with_ghost(
                 &ed.input,
-                Some("*.rs · !*_test.rs · src/**".into()),
+                None,
                 false,
+                editor_path_id(),
+                "*.rs · !*_test.rs · src/**",
+                PickerMsg::EditorPath,
+                false,
+                Boundary::None,
             ));
         } else {
-            line = line.push(field_with_ghost(&ed.input, ghost, ed.path_invalid()));
+            line = line.push(field_with_ghost(
+                &ed.input,
+                ghost,
+                ed.path_invalid(),
+                editor_path_id(),
+                "",
+                PickerMsg::EditorPath,
+                false,
+                path_boundary,
+            ));
         }
     } else if !ed.input.text.is_empty() {
         // Unfocused path: plain text (red when invalid) — no suggestion until it's focused.

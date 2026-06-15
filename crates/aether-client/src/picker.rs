@@ -39,9 +39,11 @@ pub enum Reveal {
 
 pub struct PickerState {
     pub kind: PickerKind,
+    /// The query value. Text editing (caret, insert, delete) is owned by each shell's input —
+    /// native `text_input`/`<input>` in the rich clients, a shell-local editor in the TUI — which
+    /// syncs the whole value via [`crate::update`]'s `picker_set_query`. The core keeps only the
+    /// value plus the chip-row command gestures (`Left`/`Backspace` at the query start, etc.).
     pub query: String,
-    /// Byte cursor within `query`.
-    pub cursor: usize,
     pub generation: u64,
     /// The fetched window starting at `offset` (absolute index into the match list).
     pub items: Vec<PickerItem>,
@@ -99,7 +101,6 @@ impl PickerState {
         PickerState {
             kind,
             query: String::new(),
-            cursor: 0,
             generation: 0,
             items: Vec::new(),
             offset: 0,
@@ -169,15 +170,27 @@ impl PickerState {
             .get(self.selected.saturating_sub(self.offset) as usize)
     }
 
-    /// The Explorer's synthetic "+ Create …" affordance: present when the (trimmed) query names
-    /// something the listing doesn't already contain. A trailing `/` means a directory; otherwise
-    /// a file. Returns `None` outside the Explorer, for an empty/invalid name, or when an entry
-    /// already matches it exactly — so the row appears the moment you type a name that doesn't
-    /// exist and vanishes again once it does. Selecting the row runs `explorer_create_from_query`.
+    /// The synthetic "+ Create …" affordance: present when the (trimmed) query names something
+    /// the listing doesn't already contain. Two pickers offer it:
+    ///
+    /// - **Explorer**: a file (or a directory, when the query ends with `/`) under the current
+    ///   directory. Selecting it runs `explorer_create_from_query`.
+    /// - **Projects**: a fresh project by that name. Selecting it runs `project_create_from_query`.
+    ///   `is_dir` is irrelevant for projects (always `false`); names with path separators are
+    ///   rejected (the server forbids them too).
+    ///
+    /// Returns `None` for any other kind, an empty/invalid name, or when a listed entry already
+    /// matches it exactly — so the row appears the moment you type a novel name and vanishes again
+    /// once the listing contains it.
     pub fn pending_create(&self) -> Option<PendingCreate> {
-        if self.kind != PickerKind::Explorer {
-            return None;
+        match self.kind {
+            PickerKind::Explorer => self.explorer_pending_create(),
+            PickerKind::Projects => self.project_pending_create(),
+            _ => None,
         }
+    }
+
+    fn explorer_pending_create(&self) -> Option<PendingCreate> {
         let q = self.query.trim();
         let (base, is_dir) = match q.strip_suffix('/') {
             Some(stripped) => (stripped, true),
@@ -205,6 +218,28 @@ impl PickerState {
         Some(PendingCreate {
             name: base.to_string(),
             is_dir,
+        })
+    }
+
+    fn project_pending_create(&self) -> Option<PendingCreate> {
+        let name = self.query.trim();
+        // Project names must be a single non-empty segment (the server stores them as a TOML file
+        // stem and refuses path separators).
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            return None;
+        }
+        // Suppress when a listed project already carries this exact name (Enter would activate it).
+        // Case-sensitive, matching the file-stem identity.
+        let exact = self
+            .items
+            .iter()
+            .any(|it| matches!(it, PickerItem::Project { name: n, .. } if n == name));
+        if exact {
+            return None;
+        }
+        Some(PendingCreate {
+            name: name.to_string(),
+            is_dir: false,
         })
     }
 

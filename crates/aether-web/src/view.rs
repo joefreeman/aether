@@ -12,7 +12,7 @@
 
 use aether_client::chips::{ChipEditor, ChipEditorField};
 use aether_client::picker::PickerState;
-use aether_client::session::{ConnState, Mode, Pending, Prompt, Session};
+use aether_client::session::{ConfirmKind, ConnState, Mode, Pending, Prompt, Session};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -48,6 +48,27 @@ pub fn build_view(s: &Session) -> Value {
         "search": search(s),
         "prompt": prompt(&s.prompt),
         "picker": picker(&s.picker, &s.project_paths),
+        "project_settings": project_settings(s),
+    })
+}
+
+/// The project-settings overlay (`Space ,`), when open. Core-owned state + key handling
+/// (`on_project_settings_key`); the shell renders this projection and routes keys through the
+/// global keydown → `on_key`. Selection model: 0 = name field, `1..=roots.len()` = root rows,
+/// `roots.len() + 1` = the add-root input row.
+fn project_settings(s: &Session) -> Value {
+    let Some(ps) = &s.project_settings else {
+        return Value::Null;
+    };
+    let field = |f: &aether_client::session::TextField| json!({ "text": f.text });
+    json!({
+        "name": field(&ps.name),
+        "roots": ps.roots,
+        "selected": ps.selected,
+        // Selection index of the add-root input row, so the shell knows which row is focused.
+        "input_index": ps.input_index(),
+        "add": field(&ps.add),
+        "error": ps.error,
     })
 }
 
@@ -70,7 +91,6 @@ fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
             json!({
                 "kind": jv(&p.kind),
                 "query": p.query,
-                "cursor": p.cursor,
                 "offset": p.offset,
                 "selected": p.selected,
                 "items": p.items.iter().map(jv).collect::<Vec<_>>(),
@@ -107,7 +127,7 @@ fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
 fn chip_editor(ce: &Option<ChipEditor>, project_paths: &[String]) -> Value {
     let Some(ed) = ce else { return Value::Null };
     let labels = aether_client::labels::root_labels(project_paths);
-    let input = |i: &aether_client::chips::Input| json!({ "text": i.text, "cursor": i.cursor });
+    let input = |i: &aether_client::chips::Input| json!({ "text": i.text });
     json!({
         "is_dir": ed.is_dir(),
         "field": match ed.field {
@@ -130,15 +150,30 @@ fn chip_editor(ce: &Option<ChipEditor>, project_paths: &[String]) -> Value {
 fn prompt(p: &Option<Prompt>) -> Value {
     match p {
         None => Value::Null,
-        Some(Prompt::Confirm { message, .. }) => json!({ "kind": "confirm", "message": message }),
-        Some(Prompt::SaveAs {
-            path_index,
-            input,
-            cursor,
-        }) => json!({
-            "kind": "saveas", "path_index": path_index, "input": input, "cursor": cursor,
+        Some(Prompt::Confirm { kind, .. }) => {
+            json!({ "kind": "confirm", "confirm": confirm_kind(kind) })
+        }
+        Some(Prompt::SaveAs { path_index, input }) => json!({
+            "kind": "saveas", "path_index": path_index, "input": input,
         }),
         Some(Prompt::LspInfo(status)) => json!({ "kind": "lspinfo", "status": jv(status) }),
+    }
+}
+
+/// The structured confirmation reason. The shell composes the prompt text from this (see
+/// `shell.ts`'s `confirmMessage`) — wording is the web client's presentational choice.
+fn confirm_kind(k: &ConfirmKind) -> Value {
+    match k {
+        ConfirmKind::Overwrite { path } => json!({ "kind": "overwrite", "path": path }),
+        ConfirmKind::OverwriteModified => json!({ "kind": "overwrite_modified" }),
+        ConfirmKind::RecreateDeleted => json!({ "kind": "recreate_deleted" }),
+        ConfirmKind::DiscardOnReload => json!({ "kind": "discard_reload" }),
+        ConfirmKind::DiscardOnClose { label } => json!({ "kind": "discard_close", "label": label }),
+        ConfirmKind::Delete { noun, name } => {
+            json!({ "kind": "delete", "noun": noun, "name": name })
+        }
+        ConfirmKind::RemoveRoot { path } => json!({ "kind": "remove_root", "path": path }),
+        ConfirmKind::DeleteProject { name } => json!({ "kind": "delete_project", "name": name }),
     }
 }
 
@@ -199,7 +234,6 @@ fn search(s: &Session) -> Value {
     let q = &s.search;
     json!({
         "query": q.query,
-        "cursor": q.cursor,
         "active": q.active,
         "summary": q.summary.as_ref().map(jv),
         "history": q.history,

@@ -21,7 +21,8 @@ use aether_client::keymap::{
     hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
 };
 use aether_client::session::{
-    buffer_info, reconnect_backoff, ConnState, HoverText, Mode, Pending, Prompt, Session,
+    buffer_info, reconnect_backoff, ConfirmKind, ConnState, HoverText, Mode, Pending, Prompt,
+    Session,
 };
 use aether_client::update::Event as CoreEvent;
 use aether_protocol::envelope::Notification;
@@ -83,8 +84,13 @@ const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 struct Reestablished {
     handle: Handle,
     notifications: mpsc::UnboundedReceiver<Notification>,
-    project: aether_protocol::project::ProjectInfo,
-    open: aether_protocol::buffer::BufferOpenResult,
+    /// The restored project + landing buffer, or `None` when the project is gone — renamed or
+    /// removed by another client while we were disconnected. The connection itself is fine, so the
+    /// shell recovers into the project chooser rather than failing.
+    restore: Option<(
+        aether_protocol::project::ProjectInfo,
+        aether_protocol::buffer::BufferOpenResult,
+    )>,
     restarted: bool,
 }
 
@@ -136,6 +142,11 @@ pub struct Shell {
     last_click: Option<(std::time::Instant, u16, u16)>,
     click_streak: u32,
     should_quit: bool,
+    /// Shell-owned text editor for the focused overlay input (save-as, etc.). The terminal has no
+    /// native input widget, so the shell drives the caret + edits here and syncs the whole value
+    /// into the core; command keys still route through `session.on_key`. `None` when no overlay
+    /// text field is focused. See `crate::overlay_input`.
+    overlay_edit: Option<crate::overlay_input::OverlayEdit>,
     /// Terminal size (cols, rows); the text viewport is `rows - 1` (status row).
     term: (u16, u16),
     /// Monotonic id source for floating toasts — each toast's expiry timer carries its id so the
@@ -185,6 +196,7 @@ pub async fn run(
         last_click: None,
         click_streak: 0,
         should_quit: false,
+        overlay_edit: None,
         term,
         next_toast_id: 0,
     };
@@ -481,12 +493,18 @@ impl Shell {
                 Ok(r) => {
                     self.handle = r.handle;
                     self.notifications = r.notifications;
-                    let restarted = r.restarted;
-                    self.dispatch(CoreEvent::Reestablished {
-                        project: r.project,
-                        open: r.open,
-                        restarted,
-                    });
+                    match r.restore {
+                        Some((project, open)) => {
+                            let restarted = r.restarted;
+                            self.dispatch(CoreEvent::Reestablished {
+                                project,
+                                open,
+                                restarted,
+                            });
+                        }
+                        // The project is gone — drop to the chooser over the fresh connection.
+                        None => self.reconnect_to_chooser(),
+                    }
                 }
                 Err(ReconnectError::NotUp) => self.dispatch(CoreEvent::ReconnectRetry),
                 Err(ReconnectError::Fatal(e)) => self.dispatch(CoreEvent::ReconnectFatal(e)),
@@ -549,34 +567,6 @@ impl Shell {
             let _ = crate::app::handle_help_key(&mut self.state, k);
             return;
         }
-        if self.state.project_settings.is_some() {
-            // Fully shell-local: the overlay drives its own RPCs on the live handle.
-            let handle = self.handle.clone();
-            if let Err(e) =
-                crate::app::handle_project_settings_key(&handle, &mut self.state, k).await
-            {
-                self.status(StatusMessage::error(format!("project settings: {e}")));
-            }
-            // The handler reports success by writing `state.status` directly (it has no shell
-            // access to push a toast); drain that into the toast stack here.
-            let drained = std::mem::take(&mut self.state.status);
-            self.push_toast(drained);
-            // Root edits change the project paths server-side; mirror into the session.
-            self.session.project_paths = self.state.project_paths.clone();
-            // A removal that closed the active buffer routes through the same
-            // `buffer/closed` path another client's close would push.
-            if let Some(p) = self.state.pending_external_close.take() {
-                let n = Notification {
-                    jsonrpc: aether_protocol::envelope::JsonRpc,
-                    method: <aether_protocol::buffer::BufferClosed as
-                        aether_protocol::envelope::NotificationMethod>::NAME
-                        .into(),
-                    params: serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
-                };
-                self.dispatch(CoreEvent::ServerPush(n));
-            }
-            return;
-        }
         let Some((code, mods, text)) = translate_key(&k) else {
             return;
         };
@@ -589,8 +579,162 @@ impl Shell {
             return;
         }
         let visible_rows = self.visible_rows();
+        // A focused overlay input (save-as, etc.) is edited shell-side: the shell owns the caret
+        // and text mechanics, syncing the whole value into the core. Command keys (commit / cancel
+        // / nav / chord) still route through the core's keycode dispatch.
+        self.sync_overlay_edit();
+        if let Some(edit) = self.overlay_edit.as_mut() {
+            use crate::overlay_input::{classify, is_command_override, KeyClass};
+            let is_text = matches!(classify(code, mods), KeyClass::Text)
+                && !is_command_override(edit.field, code, edit.input.cursor);
+            if is_text {
+                if crate::overlay_input::apply_text_key(&mut edit.input, code, text) {
+                    let (field, value) = (edit.field, edit.input.text.clone());
+                    let fx = self.set_overlay_field(field, value);
+                    self.run_effects(fx);
+                }
+                return;
+            }
+        }
         let fx = self.session.on_key(code, mods, text, visible_rows);
         self.run_effects(fx);
+    }
+
+    /// Keep the shell-owned overlay editor in step with the focused field. Mirrors iced's
+    /// `desired_focus` + reseed and its post-key caret resync:
+    ///
+    /// - focus moved to a new field → seed the editor from the core's value (caret at end);
+    /// - focus left every field → drop the editor;
+    /// - same field, but the core rewrote the value out-of-band (search history recall,
+    ///   chip-editor tab-complete) → adopt the new value (caret at end). A normal text edit already
+    ///   kept the two equal, so this only fires for core-driven changes, never clobbering a live
+    ///   in-field caret.
+    ///
+    /// Cheap enough to call before every key and every render `sync`.
+    fn sync_overlay_edit(&mut self) {
+        let desired = self.desired_overlay_field();
+        let current = self.overlay_edit.as_ref().map(|e| e.field);
+        match (desired, current) {
+            (Some(f), Some(c)) if f == c => {
+                let value = self.overlay_field_value(f);
+                if let Some(edit) = self.overlay_edit.as_mut() {
+                    if edit.input.text != value {
+                        edit.input.set(value); // adopt the core-driven rewrite, caret to end
+                    }
+                }
+            }
+            (Some(f), _) => {
+                let value = self.overlay_field_value(f);
+                self.overlay_edit = Some(crate::overlay_input::OverlayEdit {
+                    field: f,
+                    input: crate::text_input::TextInput::new(value),
+                });
+            }
+            (None, Some(_)) => self.overlay_edit = None,
+            (None, None) => {}
+        }
+    }
+
+    /// Which overlay text field is focused, if any — the TUI counterpart of iced's `desired_focus`.
+    fn desired_overlay_field(&self) -> Option<crate::overlay_input::OverlayField> {
+        use crate::overlay_input::OverlayField;
+        // A modal prompt owns the keyboard. Save-as has a text field; confirm / lsp-info don't
+        // (their keys are commands), so they suppress any overlay editor behind them.
+        if let Some(prompt) = &self.session.prompt {
+            return match prompt {
+                Prompt::SaveAs { .. } => Some(OverlayField::SaveAs),
+                _ => None,
+            };
+        }
+        if self.session.mode == Mode::Search {
+            return Some(OverlayField::Search);
+        }
+        // The picker query owns the keyboard while open — unless the chip editor is open (its own
+        // root/path segments take focus) or a chip is selected (all keys are commands then).
+        if let Some(p) = &self.session.picker {
+            if let Some(ed) = &p.chip_editor {
+                return Some(match ed.field {
+                    aether_client::chips::ChipEditorField::Root => OverlayField::ChipRoot,
+                    aether_client::chips::ChipEditorField::Path => OverlayField::ChipPath,
+                });
+            }
+            if p.chip_selected.is_none() {
+                return Some(OverlayField::PickerQuery);
+            }
+            return None;
+        }
+        if let Some(ps) = &self.session.project_settings {
+            if ps.on_name() {
+                return Some(OverlayField::ProjectName);
+            }
+            if ps.on_input() {
+                return Some(OverlayField::ProjectAddRoot);
+            }
+        }
+        None
+    }
+
+    /// The core's current value for an overlay field — the seed when (re)focusing it.
+    fn overlay_field_value(&self, field: crate::overlay_input::OverlayField) -> String {
+        use crate::overlay_input::OverlayField;
+        match field {
+            OverlayField::SaveAs => match &self.session.prompt {
+                Some(Prompt::SaveAs { input, .. }) => input.clone(),
+                _ => String::new(),
+            },
+            OverlayField::Search => self.session.search.query.clone(),
+            OverlayField::ProjectName => self
+                .session
+                .project_settings
+                .as_ref()
+                .map(|s| s.name.text.clone())
+                .unwrap_or_default(),
+            OverlayField::ProjectAddRoot => self
+                .session
+                .project_settings
+                .as_ref()
+                .map(|s| s.add.text.clone())
+                .unwrap_or_default(),
+            OverlayField::PickerQuery => self
+                .session
+                .picker
+                .as_ref()
+                .map(|p| p.query.clone())
+                .unwrap_or_default(),
+            OverlayField::ChipRoot => self
+                .session
+                .picker
+                .as_ref()
+                .and_then(|p| p.chip_editor.as_ref())
+                .map(|ed| ed.root_filter.text.clone())
+                .unwrap_or_default(),
+            OverlayField::ChipPath => self
+                .session
+                .picker
+                .as_ref()
+                .and_then(|p| p.chip_editor.as_ref())
+                .map(|ed| ed.input.text.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Sync an overlay field's new value into the core — the sink for the shell-owned editor,
+    /// mirroring iced's `overlay_set`.
+    fn set_overlay_field(
+        &mut self,
+        field: crate::overlay_input::OverlayField,
+        value: String,
+    ) -> Effects {
+        use crate::overlay_input::OverlayField;
+        match field {
+            OverlayField::SaveAs => self.session.prompt_set_input(value),
+            OverlayField::Search => self.session.search_set_query(value),
+            OverlayField::ProjectName => self.session.project_settings_set_name(value),
+            OverlayField::ProjectAddRoot => self.session.project_settings_set_add(value),
+            OverlayField::PickerQuery => self.session.picker_set_query(value),
+            OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
+            OverlayField::ChipPath => self.session.chip_editor_set_input(value),
+        }
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
@@ -757,14 +901,8 @@ impl Shell {
                 self.state.help.open = true;
                 self.state.help.scroll = Default::default();
             }
-            Action::OpenProjectSettings => self.open_project_settings(),
             _ => {}
         }
-    }
-
-    fn open_project_settings(&mut self) {
-        // The view model is synced, so the old opener reads the right state.
-        crate::app::open_project_settings(&mut self.state);
     }
 
     // ---- viewport geometry (iced's px math, in rows) -------------------------------------
@@ -1050,6 +1188,20 @@ impl Shell {
 
     // ---- reconnect (the dial loop; policy lives in the core) ------------------------------
 
+    /// Recovery when a reconnect succeeds but the old project is gone (renamed/removed while we
+    /// were away): reset to a placeholder session over the fresh connection and raise the Projects
+    /// chooser, mirroring a no-args start. Picking a project (the renamed one shows under its new
+    /// name) lands a buffer the usual way.
+    fn reconnect_to_chooser(&mut self) {
+        use aether_protocol::picker::PickerKind;
+        self.session = Session::placeholder(); // conn = Connected, so notifications resume
+        let startup = self.session.open_picker(PickerKind::Projects, None, None);
+        self.run_effects(startup);
+        self.status(StatusMessage::error(
+            "project no longer exists — pick another".to_string(),
+        ));
+    }
+
     fn spawn_reconnect(&mut self, attempt: u32) {
         let project = self.session.project.clone();
         let path = self.session.buffer.path.clone();
@@ -1070,6 +1222,9 @@ impl Shell {
     // ---- view sync (Session → the render model ui::draw reads) ---------------------------
 
     fn sync(&mut self) {
+        // Keep the shell-owned overlay editor in step with the focused field before projecting any
+        // overlay state into the view model below.
+        self.sync_overlay_edit();
         // No editor until a project is picked: the placeholder session renders the no-project
         // view, not a buffer behind the chooser.
         let editor = (!self.session.is_placeholder()).then(|| self.editor_view());
@@ -1108,6 +1263,40 @@ impl Shell {
         st.editor = editor;
         self.sync_picker();
         self.sync_prompts();
+        self.sync_project_settings();
+    }
+
+    /// Mirror the core's project-settings overlay (`session.project_settings`) into the view
+    /// model the renderer reads. The core owns the state and key handling now; this is a pure
+    /// projection into the shell's `TextInput`-based struct (`ProjectSettingsState`).
+    fn sync_project_settings(&mut self) {
+        let Some(core) = &self.session.project_settings else {
+            self.state.project_settings = None;
+            return;
+        };
+        // The caret for the focused field lives in the shell-owned overlay editor (text mechanics
+        // are shell-side now); unfocused fields render with the caret parked at end.
+        use crate::overlay_input::OverlayField;
+        let field_cursor = |want: OverlayField, len: usize| {
+            self.overlay_edit
+                .as_ref()
+                .filter(|e| e.field == want)
+                .map(|e| e.input.cursor)
+                .unwrap_or(len)
+        };
+        let mut name_input = crate::text_input::TextInput::default();
+        name_input.set(core.name.text.clone());
+        name_input.cursor = field_cursor(OverlayField::ProjectName, core.name.text.len());
+        let mut add_input = crate::text_input::TextInput::default();
+        add_input.set(core.add.text.clone());
+        add_input.cursor = field_cursor(OverlayField::ProjectAddRoot, core.add.text.len());
+        self.state.project_settings = Some(crate::app::ProjectSettingsState {
+            name_input,
+            roots: core.roots.clone(),
+            selected: core.selected,
+            add_input,
+            error: core.error.clone(),
+        });
     }
 
     fn editor_view(&self) -> EditorState {
@@ -1209,7 +1398,14 @@ impl Shell {
         let s = &self.session.search;
         let mut query = crate::text_input::TextInput::default();
         query.set(s.query.clone());
-        query.cursor = s.cursor;
+        // The caret lives in the shell-owned overlay editor (text mechanics are shell-side now);
+        // fall back to end-of-text if it hasn't been seeded yet.
+        query.cursor = self
+            .overlay_edit
+            .as_ref()
+            .filter(|e| e.field == crate::overlay_input::OverlayField::Search)
+            .map(|e| e.input.cursor)
+            .unwrap_or(s.query.len());
         TuiSearchState {
             query,
             active: s.active,
@@ -1225,6 +1421,18 @@ impl Shell {
     fn sync_picker(&mut self) {
         let pane_rows =
             crate::ui::picker_result_rows(self.state.viewport_cols, self.state.viewport_rows);
+        // The query / chip-editor carets live in the shell-owned overlay editor (text mechanics are
+        // shell-side now); fall back to end-of-text when the field isn't the focused one.
+        use crate::overlay_input::OverlayField;
+        let overlay_cursor = |want: OverlayField| {
+            self.overlay_edit
+                .as_ref()
+                .filter(|e| e.field == want)
+                .map(|e| e.input.cursor)
+        };
+        let query_cursor = overlay_cursor(OverlayField::PickerQuery);
+        let chip_root_cursor = overlay_cursor(OverlayField::ChipRoot);
+        let chip_path_cursor = overlay_cursor(OverlayField::ChipPath);
         let p = &mut self.state.picker;
         let Some(core) = &self.session.picker else {
             p.open = false;
@@ -1234,7 +1442,7 @@ impl Shell {
         p.pane_rows = pane_rows;
         p.kind = Some(core.kind);
         p.query.set(core.query.clone());
-        p.query.cursor = core.cursor;
+        p.query.cursor = query_cursor.unwrap_or(core.query.len());
         p.generation = core.generation;
         p.offset = core.offset;
         p.items = core.items.clone();
@@ -1252,23 +1460,38 @@ impl Shell {
         p.synthetic_create_idx = None;
         if let Some(pc) = core.pending_create() {
             if core.offset + core.items.len() as u32 >= core.total_matches {
-                let label = if pc.is_dir {
-                    format!("+ Create directory {}/", pc.name)
+                use aether_protocol::picker::PickerItem;
+                let item = if core.kind == aether_protocol::picker::PickerKind::Projects {
+                    // Projects rows carry no leading status-dot cell, so the create row mustn't
+                    // either — render it as a Project, not a DirEntry (which reserves that column
+                    // and would indent it past the real project rows).
+                    PickerItem::Project {
+                        name: format!("+ Create project {}", pc.name),
+                        match_indices: Vec::new(),
+                    }
                 } else {
-                    format!("+ Create file {}", pc.name)
+                    let label = if pc.is_dir {
+                        format!("+ Create directory {}/", pc.name)
+                    } else {
+                        format!("+ Create file {}", pc.name)
+                    };
+                    PickerItem::DirEntry {
+                        name: label,
+                        is_dir: false,
+                        match_indices: Vec::new(),
+                        git_status: None,
+                    }
                 };
-                p.items.push(aether_protocol::picker::PickerItem::DirEntry {
-                    name: label,
-                    is_dir: false,
-                    match_indices: Vec::new(),
-                    git_status: None,
-                });
+                p.items.push(item);
                 p.synthetic_create_idx = Some(p.items.len() - 1);
             }
         }
         p.chips = core.chips.iter().map(chip_value_view).collect();
         p.chip_selected = core.chip_selected;
-        p.chip_editor = core.chip_editor.as_ref().map(chip_editor_view);
+        p.chip_editor = core
+            .chip_editor
+            .as_ref()
+            .map(|e| chip_editor_view(e, chip_root_cursor, chip_path_cursor));
         p.explorer_dir = core.directory.clone();
         p.explorer_parent = core.directory_parent.clone();
         // Keep the highlight on-screen within the fetched slice (the shell half of
@@ -1286,27 +1509,33 @@ impl Shell {
     }
 
     fn sync_prompts(&mut self) {
+        // `sync` has already reconciled the overlay editor with the focused field; read the live
+        // save-as caret from it (the value mechanics are shell-side now).
+        let save_cursor = self
+            .overlay_edit
+            .as_ref()
+            .filter(|e| e.field == crate::overlay_input::OverlayField::SaveAs)
+            .map(|e| e.input.cursor);
         let st = &mut self.state;
         st.confirm_prompt = None;
         st.save_prompt = None;
         st.picker.lsp_detail = None;
         match &self.session.prompt {
-            Some(Prompt::Confirm { message, .. }) => {
+            Some(Prompt::Confirm { kind, .. }) => {
                 st.confirm_prompt = Some(crate::app::ConfirmPrompt {
-                    message: message.clone(),
-                    // The action runs in the core; the render only needs the message. The
-                    // variant here is a placeholder the new shell never executes.
+                    // The core states the reason; the TUI composes the phrasing (the status row
+                    // then appends `? [y/N]`). The action runs in the core, so the variant here is
+                    // a placeholder the new shell never executes.
+                    message: confirm_phrase(kind),
                     action: crate::app::ConfirmAction::OverwriteSaveAs,
                 });
             }
-            Some(Prompt::SaveAs {
-                path_index,
-                input,
-                cursor,
-            }) => {
+            Some(Prompt::SaveAs { path_index, input }) => {
                 let mut text = crate::text_input::TextInput::default();
                 text.set(input.clone());
-                text.cursor = *cursor;
+                // The caret lives in the shell-owned overlay editor (text mechanics are shell-side
+                // now); fall back to end-of-text if it hasn't been seeded yet.
+                text.cursor = save_cursor.unwrap_or(input.len());
                 st.save_prompt = Some(crate::save_prompt::SavePromptState {
                     mode: crate::save_prompt::PromptMode::Editing(
                         crate::save_prompt::EditingState {
@@ -1337,6 +1566,22 @@ impl Shell {
     }
 }
 
+/// Compose the status-row phrasing for a confirmation. The core supplies the structured reason
+/// ([`ConfirmKind`]); this is the TUI's presentational choice. `draw_status` then appends `? [y/N]`.
+fn confirm_phrase(kind: &ConfirmKind) -> String {
+    match kind {
+        ConfirmKind::Overwrite { path: Some(p) } => format!("overwrite {p}"),
+        ConfirmKind::Overwrite { path: None } => "overwrite".into(),
+        ConfirmKind::OverwriteModified => "file changed on disk — overwrite".into(),
+        ConfirmKind::RecreateDeleted => "file removed on disk — recreate".into(),
+        ConfirmKind::DiscardOnReload => "discard local changes and reload".into(),
+        ConfirmKind::DiscardOnClose { label } => format!("discard unsaved changes in {label}"),
+        ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
+        ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
+        ConfirmKind::DeleteProject { name } => format!("Delete project \"{name}\""),
+    }
+}
+
 // ---- chip view conversion (core chips -> the render model's types) --------------------------
 
 fn chip_value_view(v: &aether_client::chips::ChipValue) -> crate::picker::ChipValue {
@@ -1354,13 +1599,20 @@ fn chip_value_view(v: &aether_client::chips::ChipValue) -> crate::picker::ChipVa
     }
 }
 
-fn chip_editor_view(e: &aether_client::chips::ChipEditor) -> crate::picker::ChipEditor {
+/// Project the core's chip editor into the TUI view model. `root_cursor` / `path_cursor` carry the
+/// shell-owned caret for whichever segment is focused (`None` → render that field's caret at end,
+/// the unfocused convention).
+fn chip_editor_view(
+    e: &aether_client::chips::ChipEditor,
+    root_cursor: Option<usize>,
+    path_cursor: Option<usize>,
+) -> crate::picker::ChipEditor {
     use crate::picker as t;
     use aether_client::chips as c;
-    let input = |i: &c::Input| {
+    let input = |i: &c::Input, cursor: Option<usize>| {
         let mut x = crate::text_input::TextInput::default();
         x.set(i.text.clone());
-        x.cursor = i.cursor;
+        x.cursor = cursor.unwrap_or(i.text.len());
         x
     };
     t::ChipEditor {
@@ -1372,8 +1624,8 @@ fn chip_editor_view(e: &aether_client::chips::ChipEditor) -> crate::picker::Chip
             c::ChipEditorField::Root => t::ChipEditorField::Root,
             c::ChipEditorField::Path => t::ChipEditorField::Path,
         },
-        input: input(&e.input),
-        root_filter: input(&e.root_filter),
+        input: input(&e.input, path_cursor),
+        root_filter: input(&e.root_filter, root_cursor),
         root_selected: e.root_selected,
         root_index: e.root_index,
         listing: e.listing.clone(),
@@ -1480,13 +1732,25 @@ async fn dial(
     let (handle, notifications) = crate::connection::connect(&server_url, &version)
         .await
         .map_err(|_| ReconnectError::NotUp)?;
-    let activated = handle
+    let activated = match handle
         .rpc::<ProjectActivate>(ProjectActivateParams {
             name: project,
             open_last: false,
         })
         .await
-        .map_err(|e| ReconnectError::Fatal(e.to_string()))?;
+    {
+        Ok(a) => a,
+        // Couldn't re-activate the project — it was renamed or removed while we were away. The
+        // socket is up, so hand back a project-less reconnect and let the shell raise the chooser.
+        Err(_) => {
+            return Ok(Reestablished {
+                handle,
+                notifications,
+                restore: None,
+                restarted: false,
+            });
+        }
+    };
     let params = match &path {
         Some(p) => aether_client::session::strip_longest_root(p, &activated.project.paths).map(
             |(path_index, relative_path)| BufferOpenParams {
@@ -1519,8 +1783,7 @@ async fn dial(
     Ok(Reestablished {
         handle,
         notifications,
-        project: activated.project,
-        open,
+        restore: Some((activated.project, open)),
         restarted: false,
     })
 }
@@ -1640,7 +1903,6 @@ pub async fn bootstrap(
         lsp_status: Default::default(),
         hover: None,
         diagnostic_counts: Default::default(),
-        pending_external_close: None,
     };
     Ok((session, state, startup))
 }

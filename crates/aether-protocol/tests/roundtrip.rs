@@ -1029,6 +1029,21 @@ fn project_rename_params_round_trip() {
 }
 
 #[test]
+fn project_renamed_notification_round_trip() {
+    use aether_protocol::envelope::NotificationMethod;
+    use aether_protocol::project::{ProjectRenamed, ProjectRenamedParams};
+    assert_eq!(ProjectRenamed::NAME, "project/renamed");
+    let p = ProjectRenamedParams {
+        old_name: "aether".into(),
+        new_name: "aether-next".into(),
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v, json!({"old_name": "aether", "new_name": "aether-next"}));
+    let back: ProjectRenamedParams = serde_json::from_value(v).unwrap();
+    assert_eq!(back.new_name, "aether-next");
+}
+
+#[test]
 fn project_delete_params_round_trip() {
     use aether_protocol::project::{ProjectDelete, ProjectDeleteParams};
     assert_eq!(ProjectDelete::NAME, "project/delete");

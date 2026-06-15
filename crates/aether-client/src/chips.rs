@@ -14,54 +14,29 @@ use aether_protocol::picker::{CaseMode, PickerFilters, PickerKind, ScopedPath};
 /// cursor arithmetic.
 #[derive(Debug, Default, Clone)]
 pub struct Input {
+    /// The field value. Text editing (caret, insert, delete) is owned by each shell's input —
+    /// native `text_input`/`<input>` in the rich clients, a shell-local editor in the TUI — which
+    /// syncs the whole value via [`crate::update`]'s `chip_editor_set_input` /
+    /// `chip_editor_set_root_filter`. The core keeps only the value.
     pub text: String,
-    /// Byte offset within `text`.
-    pub cursor: usize,
 }
 
 impl Input {
     pub fn new(text: String) -> Self {
-        let cursor = text.len();
-        Input { text, cursor }
+        Input { text }
     }
 
     pub fn set(&mut self, text: String) {
-        self.cursor = text.len();
         self.text = text;
     }
 
     pub fn clear(&mut self) {
         self.text.clear();
-        self.cursor = 0;
     }
 
-    pub fn insert_str(&mut self, s: &str) {
-        self.text.insert_str(self.cursor, s);
-        self.cursor += s.len();
-    }
-
-    /// Remove the char before the cursor. Returns whether anything changed.
-    pub fn backspace(&mut self) -> bool {
-        match self.text[..self.cursor].char_indices().last() {
-            Some((i, _)) => {
-                self.text.remove(i);
-                self.cursor = i;
-                true
-            }
-            None => false,
-        }
-    }
-
-    pub fn move_left(&mut self) {
-        if let Some((i, _)) = self.text[..self.cursor].char_indices().last() {
-            self.cursor = i;
-        }
-    }
-
-    pub fn move_right(&mut self) {
-        if let Some(c) = self.text[self.cursor..].chars().next() {
-            self.cursor += c.len_utf8();
-        }
+    /// Append `s` (used by ghost-suggestion accept, which completes the partial leaf at the end).
+    pub fn push_str(&mut self, s: &str) {
+        self.text.push_str(s);
     }
 }
 
@@ -739,10 +714,11 @@ impl ChipEditor {
     }
 
     /// The path field's ghost: the rest of the current directory match beyond the partial
-    /// leaf, plus the `/` that opens the next segment. Visible only with the cursor at the end
-    /// of the input.
+    /// leaf, plus the `/` that opens the next segment. Computed from the value alone; each shell
+    /// suppresses it when its own caret isn't at the end of the input (the core no longer owns the
+    /// caret — see [`Input`]).
     pub fn path_ghost(&self) -> Option<String> {
-        if !self.is_dir() || self.input.cursor != self.input.text.len() {
+        if !self.is_dir() {
             return None;
         }
         let partial = partial_of_input(&self.input.text);
@@ -775,7 +751,7 @@ impl ChipEditor {
         let Some(suffix) = self.path_ghost() else {
             return false;
         };
-        self.input.insert_str(&suffix);
+        self.input.push_str(&suffix);
         self.suggestion_idx = 0;
         self.sync_dir_listing(project_paths)
     }
@@ -912,7 +888,7 @@ mod tests {
             },
         ]);
         assert_eq!(ed.listing.len(), 2); // files dropped
-        ed.input.insert_str("s");
+        ed.input.push_str("s");
         assert!(!ed.path_edited(&roots)); // dir portion unchanged — no refetch due
         assert_eq!(ed.path_ghost(), Some("rc/".into()));
         assert!(ed.path_valid());
@@ -923,7 +899,7 @@ mod tests {
         assert_eq!(ed.listing_dir_abs, "/tmp/root/src");
         // A leaf that prefixes nothing is invalid once the listing loads.
         ed.set_dir_listing(vec![]);
-        ed.input.insert_str("zzz");
+        ed.input.push_str("zzz");
         assert!(ed.path_invalid());
         assert!(!ed.path_valid());
     }

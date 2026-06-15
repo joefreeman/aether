@@ -243,6 +243,25 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.prompt_set_input(text)))
     }
 
+    /// Replace the project-settings name field (native `<input>` owns editing). Returns `Effect[]`.
+    pub fn project_settings_set_name(&mut self, text: String) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.project_settings_set_name(text)))
+    }
+
+    /// Replace the project-settings add-root input (native `<input>` owns editing). Returns `Effect[]`.
+    pub fn project_settings_set_add(&mut self, text: String) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.project_settings_set_add(text)))
+    }
+
+    /// A root row's delete button was clicked (0-based index): open the shared confirm prompt for
+    /// that root (same path as the Delete key). Returns `Effect[]`.
+    pub fn project_settings_remove_root(&mut self, index: u32) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(
+            self.inner
+                .on_event(Event::ProjectSettingsRemoveRoot(index as usize)),
+        ))
+    }
+
     /// Replace the chip editor's path-field text (native `<input>` owns editing). Returns `Effect[]`.
     pub fn chip_editor_set_input(&mut self, text: String) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.chip_editor_set_input(text)))

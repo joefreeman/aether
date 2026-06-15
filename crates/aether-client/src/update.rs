@@ -9,8 +9,9 @@ use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::session::{
     buffer_info, min_pos, severity_label, strip_longest_root, CommitDetails, ConfirmAction,
-    ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending, Prompt, ReloadTry, RepeatTarget,
-    SaveTry, SearchSnapshot, SearchState, Session,
+    ConfirmKind, ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending, ProjectSettings,
+    Prompt, ReloadTry,
+    RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, TextField,
 };
 use super::transport::RpcError;
 use aether_protocol::buffer::{
@@ -62,7 +63,12 @@ use aether_protocol::picker::{
     PickerQueryParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
     PickerUpdateParams, PickerView, PickerViewParams, PickerViewResult, ScopedPath,
 };
-use aether_protocol::project::{ProjectActivate, ProjectActivateParams, ProjectInfo};
+use aether_protocol::project::{
+    ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectAddRoot,
+    ProjectAddRootParams, ProjectCreate, ProjectCreateParams, ProjectDelete, ProjectDeleteParams,
+    ProjectInfo, ProjectRemoveRoot, ProjectRemoveRootParams, ProjectRemoveRootResult,
+    ProjectRename, ProjectRenameParams, ProjectRenamed, ProjectRenamedParams,
+};
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
     SearchSet, SearchSetParams, SearchSetResult, SearchStateChanged, SearchSummary,
@@ -140,6 +146,9 @@ pub enum Event {
     PickerClicked(u32),
     /// A filter chip was clicked — select it (virtual selection, like the keyboard path).
     PickerChipClicked(usize),
+    /// A root row's delete button was clicked in the project-settings overlay — open the shared
+    /// confirm prompt for that root (same path as the Delete key → [`Session::request_remove_root`]).
+    ProjectSettingsRemoveRoot(usize),
     /// `directory/list` for the dir-chip editor resolved; `abs` is the staleness key.
     PickerChipListing {
         abs: String,
@@ -158,6 +167,21 @@ pub enum Event {
     DirCreated(Result<DirectoryCreateResult, String>),
     /// Project switch resolved: the activated project + the buffer to land on.
     ProjectActivated(Result<(ProjectInfo, BufferOpenResult), String>),
+    /// `project/create` resolved: the new project is active. A fresh project has no roots, so
+    /// `opened` may be absent — the handler then keeps the current buffer and opens the settings
+    /// overlay to add a root.
+    ProjectCreated(Result<ProjectActivateResult, String>),
+    /// `project/rename` (from the settings overlay) resolved: update the committed name or set
+    /// the overlay's error.
+    ProjectRenamed(Result<ProjectInfo, String>),
+    /// `project/add_root` (from the settings overlay) resolved: refresh the roots or set the error.
+    ProjectRootAdded(Result<ProjectInfo, String>),
+    /// `project/remove_root` (from the settings overlay) resolved: refresh the roots and, when the
+    /// active buffer was closed, switch to the next one.
+    ProjectRootRemoved(Result<ProjectRemoveRootResult, String>),
+    /// `project/delete` (from the project switcher) resolved: toast success — the refreshed list
+    /// arrives via a `picker/update` push — or surface the refusal (active / dirty).
+    ProjectDeleted(Result<(), String>),
     /// A server notification arrived on the session's stream.
     ServerPush(Notification),
     /// The notification stream ended: the connection is gone.
@@ -254,7 +278,6 @@ impl Session {
                 };
                 // adopt_switch reset the search state; adopt the primed query (the
                 // server-side search was already set in the open chain) and its summary.
-                self.search.cursor = query.len();
                 self.search.query = query.clone();
                 self.search.active = true;
                 self.search.summary = summary;
@@ -309,7 +332,6 @@ impl Session {
             Event::SearchNav(Err(e)) => Effects::error(e),
 
             Event::SearchFromSel(Ok(Some((query, r)))) => {
-                self.search.cursor = query.len();
                 self.search.query = query.clone();
                 self.search.active = true;
                 self.search.summary = Some(r.summary);
@@ -491,7 +513,6 @@ impl Session {
                             // Adopt the resumed query (grep preserves it across opens) and
                             // the persisted filters (seeded opens get their seed echoed).
                             p.generation = r.generation;
-                            p.cursor = r.query.len();
                             p.query = r.query;
                             p.total_candidates = r.total_candidates;
                             p.adopt_filters(&r.filters);
@@ -500,8 +521,21 @@ impl Session {
                         // are set, so a Grep resume renders its rows even when the redundant
                         // `picker/update` push raced ahead of this response and was discarded.
                         // `apply_update` is generation/offset-guarded — a no-op if it doesn't fit.
+                        //
+                        // But the folded window is a point-in-time snapshot: a streaming grep
+                        // computes it right after the search starts, so it often comes back *empty*.
+                        // For a live query (generation matches) the `picker/update` pushes are the
+                        // authority and may already have delivered rows — an empty snapshot must not
+                        // wipe them (the bug: results blank until you edit the query). Only fold the
+                        // window in when it actually carries rows, or we have none yet (resume /
+                        // non-streaming kinds, where it's the sole source).
                         if let Some(update) = r.update {
-                            if p.apply_update(update) && p.pending_center.is_none() {
+                            let window_has_rows =
+                                update.items.as_ref().is_none_or(|it| !it.is_empty());
+                            if (p.items.is_empty() || window_has_rows)
+                                && p.apply_update(update)
+                                && p.pending_center.is_none()
+                            {
                                 if let Some(reveal) = p.reveal_on_update.take() {
                                     return Effects::one(Effect::RevealPickerSelection(reveal));
                                 }
@@ -572,6 +606,132 @@ impl Session {
                 Effects::error(format!("project switch failed: {e}"))
             }
 
+            Event::ProjectCreated(Ok(activate)) => {
+                let ProjectActivateResult {
+                    project, opened, ..
+                } = activate;
+                self.project = project.name.clone();
+                self.project_paths = project.paths;
+                let mut fx = match opened {
+                    // The project came with a landing buffer (it had roots / history). Adopt it.
+                    Some(open) => self.adopt_switch(open),
+                    // A fresh project has no roots and so no landing buffer — open a scratch so the
+                    // user lands in *some* editor (and the previous project's buffer doesn't linger
+                    // behind the new project). `adopt_switch` leaves the settings overlay open.
+                    None => self.request::<BufferOpen>(BufferOpenParams::default(), move |__r| {
+                        Event::Switched(__r.map_err(|e| e.to_string()))
+                    }),
+                };
+                fx.push(Effect::Toast(
+                    format!("created project {}", project.name),
+                    ToastKind::Success,
+                ));
+                // The natural next step for a freshly created (rootless) project is adding a root,
+                // so — unlike the default open, which focuses the name field — land on the add-root
+                // input here.
+                self.open_project_settings();
+                if let Some(s) = self.project_settings.as_mut() {
+                    s.selected = s.input_index();
+                }
+                fx
+            }
+            Event::ProjectCreated(Err(e)) => {
+                Effects::error(format!("create project failed: {e}"))
+            }
+
+            Event::ProjectRenamed(result) => {
+                let Some(s) = self.project_settings.as_mut() else {
+                    return Effects::none();
+                };
+                match result {
+                    Ok(info) => {
+                        if self.project == s.project_name {
+                            self.project = info.name.clone();
+                        }
+                        let new_name = info.name.clone();
+                        s.project_name = info.name.clone();
+                        s.name.set(info.name);
+                        s.error = None;
+                        Effects::toast(format!("renamed project to {new_name}"), ToastKind::Success)
+                    }
+                    Err(e) => {
+                        s.error = Some(e);
+                        Effects::none()
+                    }
+                }
+            }
+
+            Event::ProjectRootAdded(result) => {
+                match result {
+                    Ok(info) => {
+                        let name = info.name.clone();
+                        self.sync_project_info(info);
+                        if let Some(s) = self.project_settings.as_mut() {
+                            s.add.clear();
+                            s.error = None;
+                            // Re-focus the add-root input (now one row further down).
+                            s.selected = s.input_index();
+                        }
+                        Effects::toast(format!("added root to {name}"), ToastKind::Success)
+                    }
+                    Err(e) => {
+                        if let Some(s) = self.project_settings.as_mut() {
+                            s.error = Some(e);
+                        }
+                        Effects::none()
+                    }
+                }
+            }
+
+            Event::ProjectRootRemoved(result) => match result {
+                Ok(r) => {
+                    let name = r.project.name.clone();
+                    let closed = r.closed_buffer_ids.clone();
+                    self.sync_project_info(r.project);
+                    if let Some(s) = self.project_settings.as_mut() {
+                        s.error = None;
+                        // Keep the selection in range (the removed row is gone).
+                        s.selected = s.selected.min(s.input_index());
+                    }
+                    let mut fx = Effects::toast(
+                        if closed.is_empty() {
+                            format!("removed root from {name}")
+                        } else {
+                            format!("removed root from {name}; closed {} buffer(s)", closed.len())
+                        },
+                        ToastKind::Success,
+                    );
+                    // If our current buffer was one of the closed ones, switch to the server-
+                    // indicated next buffer (or a fresh scratch).
+                    if closed.contains(&self.buffer.buffer_id) {
+                        fx = fx.and(self.request::<BufferOpen>(
+                            BufferOpenParams {
+                                buffer_id: r.next_buffer_id,
+                                ..Default::default()
+                            },
+                            move |__r| Event::Switched(__r.map_err(|e| e.to_string())),
+                        ));
+                    }
+                    fx
+                }
+                Err(e) => {
+                    if let Some(s) = self.project_settings.as_mut() {
+                        s.error = Some(e);
+                        Effects::none()
+                    } else {
+                        Effects::error(format!("remove root failed: {e}"))
+                    }
+                }
+            },
+            Event::ProjectDeleted(result) => match result {
+                // The switcher stays open; the refreshed list (sans the deleted row) arrives as a
+                // `picker/update` push from the server's `refresh_project_pickers`.
+                Ok(()) => Effects::toast("deleted project", ToastKind::Success),
+                // Covers the active-project and dirty-buffer refusals — the server messages are
+                // already user-facing.
+                Err(e) => Effects::error(e),
+            },
+
             Event::PickerClicked(abs) => {
                 if let Some(p) = &mut self.picker {
                     p.selected = abs;
@@ -585,6 +745,8 @@ impl Session {
                 }
                 Effects::none()
             }
+
+            Event::ProjectSettingsRemoveRoot(index) => self.request_remove_root(index),
 
             Event::PickerChipListing { abs, result } => {
                 // Stale responses (the editor moved to another directory, or closed) are
@@ -784,8 +946,8 @@ impl Session {
                 };
                 Effects::toast(note, ToastKind::Success)
             }
-            Event::SaveTried(Ok(SaveTry::NeedsConfirm { message, action })) => {
-                self.prompt = Some(Prompt::Confirm { message, action });
+            Event::SaveTried(Ok(SaveTry::NeedsConfirm { kind, action })) => {
+                self.prompt = Some(Prompt::Confirm { kind, action });
                 Effects::none()
             }
             Event::SaveTried(Err(e)) => Effects::error(format!("save failed: {e}")),
@@ -800,7 +962,7 @@ impl Session {
             }
             Event::ReloadTried(Ok(ReloadTry::NeedsConfirm)) => {
                 self.prompt = Some(Prompt::Confirm {
-                    message: "discard local changes and reload".into(),
+                    kind: ConfirmKind::DiscardOnReload,
                     action: ConfirmAction::ReloadDiscard,
                 });
                 Effects::none()
@@ -830,22 +992,21 @@ impl Session {
                     Ok(result) => Ok(SaveTry::Saved { result, target }),
                     Err(e) if e.code == ErrorCode::WOULD_OVERWRITE.code() => {
                         Ok(SaveTry::NeedsConfirm {
-                            message: match &target {
-                                Some((_, p)) => format!("overwrite {p}"),
-                                None => "overwrite".into(),
+                            kind: ConfirmKind::Overwrite {
+                                path: target.as_ref().map(|(_, p)| p.clone()),
                             },
                             action: ConfirmAction::Save { target },
                         })
                     }
                     Err(e) if e.code == ErrorCode::EXTERNALLY_MODIFIED.code() => {
                         Ok(SaveTry::NeedsConfirm {
-                            message: "file changed on disk — overwrite".into(),
+                            kind: ConfirmKind::OverwriteModified,
                             action: ConfirmAction::Save { target },
                         })
                     }
                     Err(e) if e.code == ErrorCode::EXTERNALLY_DELETED.code() => {
                         Ok(SaveTry::NeedsConfirm {
-                            message: "file removed on disk — recreate".into(),
+                            kind: ConfirmKind::RecreateDeleted,
                             action: ConfirmAction::Save { target },
                         })
                     }
@@ -1110,7 +1271,7 @@ impl Session {
             return Effects::none();
         };
         match prompt {
-            Prompt::Confirm { message: _, action } => {
+            Prompt::Confirm { kind: _, action } => {
                 let accepts = !mods.ctrl
                     && !mods.alt
                     && (code == KeyCode::Char('y') || code == KeyCode::Enter);
@@ -1141,31 +1302,26 @@ impl Session {
                 }
                 Effects::none()
             }
-            Prompt::SaveAs {
-                path_index,
-                mut input,
-                mut cursor,
-            } => {
+            Prompt::SaveAs { path_index, input } => {
+                // Text editing (insert / delete / caret) is owned by the shell's input, which syncs
+                // the value via `prompt_set_input`. The core handles only the command keys; any
+                // other key (a stray char that reached here) leaves the prompt unchanged.
+                let _ = text;
                 match code {
-                    KeyCode::Esc => return Effects::none(), // prompt stays closed
+                    KeyCode::Esc => Effects::none(), // prompt stays closed
                     // Tab cycles the target root in multi-root projects.
                     KeyCode::Tab => {
                         let n = self.project_paths.len().max(1) as u32;
                         self.prompt = Some(Prompt::SaveAs {
                             path_index: (path_index + 1) % n,
                             input,
-                            cursor,
                         });
-                        return Effects::none();
+                        Effects::none()
                     }
                     KeyCode::Enter => {
                         let path = input.trim().to_string();
                         if path.is_empty() {
-                            self.prompt = Some(Prompt::SaveAs {
-                                path_index,
-                                input,
-                                cursor,
-                            });
+                            self.prompt = Some(Prompt::SaveAs { path_index, input });
                             return Effects::none();
                         }
                         // An absolute path re-resolves against the project roots.
@@ -1181,40 +1337,13 @@ impl Session {
                         } else {
                             (path_index, path)
                         };
-                        return self.save(Some(target), false);
-                    }
-                    KeyCode::Backspace => {
-                        if let Some((i, _)) = input[..cursor].char_indices().last() {
-                            input.remove(i);
-                            cursor = i;
-                        }
-                    }
-                    KeyCode::Left => {
-                        if let Some((i, _)) = input[..cursor].char_indices().last() {
-                            cursor = i;
-                        }
-                    }
-                    KeyCode::Right => {
-                        if let Some(c) = input[cursor..].chars().next() {
-                            cursor += c.len_utf8();
-                        }
+                        self.save(Some(target), false)
                     }
                     _ => {
-                        if !mods.ctrl && !mods.alt {
-                            if let Some(t) = text {
-                                let t: String = t.chars().filter(|c| !c.is_control()).collect();
-                                input.insert_str(cursor, &t);
-                                cursor += t.len();
-                            }
-                        }
+                        self.prompt = Some(Prompt::SaveAs { path_index, input });
+                        Effects::none()
                     }
                 }
-                self.prompt = Some(Prompt::SaveAs {
-                    path_index,
-                    input,
-                    cursor,
-                });
-                Effects::none()
             }
         }
     }
@@ -1436,7 +1565,6 @@ impl Session {
         };
         p.generation += 1;
         p.query.clear();
-        p.cursor = 0;
         p.selected = 0;
         p.offset = 0;
         p.items.clear();
@@ -1545,6 +1673,14 @@ impl Session {
         p.generation += 1;
         p.selected = 0;
         p.offset = 0;
+        // Clear the stale window now; the fresh one rides `picker/query`'s own `picker/update`
+        // push (the picker is already subscribed from open, so the server pushes the new window to
+        // it). We deliberately do NOT also send a `picker/view` here: it's a redundant round-trip,
+        // and its response carries a point-in-time window *snapshot* that races the streaming-grep
+        // push — an empty snapshot landing after the push would blank the results until the next
+        // keystroke. One request, one source of truth (the push). `picker/view` is still used where
+        // it's the authority: open/resume and scroll (offset changes).
+        p.items.clear();
         // A new query is in flight: mark the picker as searching now, before the first
         // `picker/update` push arrives, so the shell can show progress in the gap (otherwise a slow
         // grep reads as "no matches" until results stream). The server's pushes refine it from here.
@@ -1570,7 +1706,7 @@ impl Session {
             },
         );
         fx.push(Effect::PickerScrollReset);
-        fx.and(self.picker_refetch(0))
+        fx
     }
 
     /// Replace the picker query wholesale and re-filter. A shell whose query field owns text editing
@@ -1583,7 +1719,6 @@ impl Session {
         if p.query == query {
             return Effects::none();
         }
-        p.cursor = query.len();
         p.query = query;
         self.picker_query_changed()
     }
@@ -1596,7 +1731,6 @@ impl Session {
             return Effects::none();
         }
         self.search.query = query;
-        self.search.cursor = self.search.query.len();
         self.search.history_cursor = None;
         self.incremental_search()
     }
@@ -1604,9 +1738,34 @@ impl Session {
     /// Replace the save-as prompt's path input (the web client's native `<input>` owns editing). The
     /// actual save happens on accept; this is pure state. No-op unless a save-as prompt is open.
     pub fn prompt_set_input(&mut self, text: String) -> Effects {
-        if let Some(Prompt::SaveAs { input, cursor, .. }) = &mut self.prompt {
-            *cursor = text.len();
+        if let Some(Prompt::SaveAs { input, .. }) = &mut self.prompt {
             *input = text;
+        }
+        Effects::none()
+    }
+
+    /// Replace the project-settings name-field text wholesale (the web client's native `<input>`
+    /// owns editing and syncs the value here). The native shells edit it key-by-key through
+    /// `on_project_settings_key`; this is the web parity entry point. No-op unless the overlay is
+    /// open. Clears any in-dialog error, matching the key path.
+    pub fn project_settings_set_name(&mut self, text: String) -> Effects {
+        if let Some(s) = self.project_settings.as_mut() {
+            if s.name.text != text {
+                s.name.set(text);
+                s.error = None;
+            }
+        }
+        Effects::none()
+    }
+
+    /// Replace the project-settings add-root input text wholesale (native `<input>` parity, as
+    /// above). No-op unless the overlay is open.
+    pub fn project_settings_set_add(&mut self, text: String) -> Effects {
+        if let Some(s) = self.project_settings.as_mut() {
+            if s.add.text != text {
+                s.add.set(text);
+                s.error = None;
+            }
         }
         Effects::none()
     }
@@ -1916,7 +2075,6 @@ impl Session {
         };
         if !p.query.is_empty() {
             p.query.clear();
-            p.cursor = 0;
             return self.picker_query_changed();
         }
         if let Some(chip) = p.chip_row(&project_paths).last().map(|c| c.id) {
@@ -1955,9 +2113,13 @@ impl Session {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
-        // The Explorer's synthetic "+ Create …" row: confirming it creates the named file/dir.
+        // The synthetic "+ Create …" row: confirming it creates the named file/dir (Explorer) or
+        // a fresh project (Projects).
         if p.selected_is_create() {
-            return self.explorer_create_from_query();
+            return match p.kind {
+                PickerKind::Projects => self.project_create_from_query(),
+                _ => self.explorer_create_from_query(),
+            };
         }
         let Some(item) = p.selected_item().cloned() else {
             return Effects::none();
@@ -2107,14 +2269,17 @@ impl Session {
         match code {
             KeyCode::Esc => return self.close_picker(),
             KeyCode::Enter => return self.picker_accept(),
-            // Delete / Ctrl-d: trash the highlighted entry (Files + Explorer), behind a confirm.
-            KeyCode::Delete if matches!(p.kind, PickerKind::Files | PickerKind::Explorer) => {
-                return self.picker_stage_delete();
-            }
+            // Ctrl-d: trash the highlighted entry (Files + Explorer) or delete the highlighted
+            // project (Projects), behind a confirm. (Not plain `Delete` — that's a forward-delete
+            // in the query input, owned by the shell; deleting is too destructive to ride a bare
+            // editing key.)
             KeyCode::Char('d')
                 if mods.ctrl
                     && !mods.alt
-                    && matches!(p.kind, PickerKind::Files | PickerKind::Explorer) =>
+                    && matches!(
+                        p.kind,
+                        PickerKind::Files | PickerKind::Explorer | PickerKind::Projects
+                    ) =>
             {
                 return self.picker_stage_delete();
             }
@@ -2193,49 +2358,23 @@ impl Session {
                 }
                 return Effects::none();
             }
-            // `Backspace` at the start of the query selects the rightmost chip (a second
-            // press deletes it — two-stage, so holding backspace through a query can't
-            // silently destroy a carefully typed glob).
-            KeyCode::Backspace if no_chord => {
-                if let Some((i, _)) = p.query[..p.cursor].char_indices().last() {
-                    p.query.remove(i);
-                    p.cursor = i;
-                    return self.picker_query_changed();
-                }
-                let n = p.chip_row(&project_paths).len();
-                if n > 0 {
-                    p.chip_selected = Some(n - 1);
-                }
-                return Effects::none();
-            }
-            // `Left` at the start of the query steps into the chip row (rightmost first) —
-            // the browser tag-input gesture.
-            KeyCode::Left if no_chord => {
-                if let Some((i, _)) = p.query[..p.cursor].char_indices().last() {
-                    p.cursor = i;
-                } else {
-                    let n = p.chip_row(&project_paths).len();
-                    if n > 0 {
-                        p.chip_selected = Some(n - 1);
-                    }
-                }
-                return Effects::none();
-            }
-            KeyCode::Right if no_chord => {
-                if let Some(c) = p.query[p.cursor..].chars().next() {
-                    p.cursor += c.len_utf8();
-                }
-                return Effects::none();
+            // `Left` / `Backspace` step into the chip row (rightmost first) — the browser
+            // tag-input gesture. In-query caret moves and deletes are owned by each shell's input
+            // (which only forwards these from the query start), so reaching the core *is* the
+            // boundary: there's nothing to the left but the chips.
+            KeyCode::Left | KeyCode::Backspace if no_chord => {
+                return self.picker_select_last_chip();
             }
             _ => {}
         }
+        // A printable char reaches the core only to land a typed-to-deselect from the chip row (the
+        // chip-selected arm above cleared `chip_selected` and fell through); normal query typing is
+        // owned by each shell's input and synced via `picker_set_query`. Append it to the query.
         if no_chord {
             if let Some(typed) = text {
                 let typed: String = typed.chars().filter(|c| !c.is_control()).collect();
                 if !typed.is_empty() {
-                    let at = p.cursor;
-                    p.query.insert_str(at, &typed);
-                    p.cursor = at + typed.len();
+                    p.query.push_str(&typed);
                     return self.picker_query_changed();
                 }
             }
@@ -2350,50 +2489,12 @@ impl Session {
                     ed.cycle_path_suggestion(down);
                 }
             }
-            KeyCode::Backspace if no_chord => {
-                if in_root {
-                    if ed.root_filter.backspace() {
-                        // The match set changed under the highlight — snap back to the best
-                        // match; the chosen root may have moved under existing path text.
-                        ed.root_selected = 0;
-                        refresh = ed.sync_dir_listing(&project_paths);
-                    }
-                } else if ed.input.backspace() && is_dir {
-                    refresh = ed.path_edited(&project_paths);
-                }
-            }
-            KeyCode::Left if no_chord => {
-                if in_root {
-                    ed.root_filter.move_left();
-                } else {
-                    ed.input.move_left();
-                }
-            }
-            KeyCode::Right if no_chord => {
-                if in_root {
-                    ed.root_filter.move_right();
-                } else {
-                    ed.input.move_right();
-                }
-            }
+            // In-field text entry (chars, plain Backspace, Left/Right caret) is owned by each
+            // shell's input, which syncs the value via `chip_editor_set_input` /
+            // `chip_editor_set_root_filter` (those carry the listing-refresh side effects). The
+            // core handles only the command keys above; anything else here is a no-op.
             _ => {
-                if no_chord {
-                    if let Some(typed) = text {
-                        let typed: String = typed.chars().filter(|c| !c.is_control()).collect();
-                        if !typed.is_empty() {
-                            if in_root {
-                                ed.root_filter.insert_str(&typed);
-                                ed.root_selected = 0;
-                                refresh = ed.sync_dir_listing(&project_paths);
-                            } else {
-                                ed.input.insert_str(&typed);
-                                if is_dir {
-                                    refresh = ed.path_edited(&project_paths);
-                                }
-                            }
-                        }
-                    }
-                }
+                let _ = text;
             }
         }
         if refresh {
@@ -2539,6 +2640,30 @@ impl Session {
                 ));
                 fx
             }
+            ProjectRenamed::NAME => {
+                // Another client renamed our active project. The server already re-keyed our
+                // server-side state; adopt the new name locally so the display and the reconnect
+                // baseline (reconnect is by name) follow.
+                let Ok(p) = serde_json::from_value::<ProjectRenamedParams>(n.params) else {
+                    return Effects::none();
+                };
+                if self.project != p.old_name {
+                    return Effects::none();
+                }
+                self.project = p.new_name.clone();
+                // Keep an open settings overlay's committed name in step too, or its next commit
+                // would target the stale name.
+                if let Some(s) = self.project_settings.as_mut() {
+                    if s.project_name == p.old_name {
+                        s.project_name = p.new_name.clone();
+                        s.name.set(p.new_name.clone());
+                    }
+                }
+                Effects::toast(
+                    format!("project renamed to {}", p.new_name),
+                    ToastKind::Info,
+                )
+            }
             _ => Effects::none(),
         }
     }
@@ -2559,7 +2684,6 @@ impl Session {
         self.search.history_cursor = None;
         self.search.history_draft.clear();
         self.search.extend_to_cursor = extend_to_cursor;
-        self.search.cursor = 0;
         self.mode = Mode::Search;
 
         let mut fx = Effects::one(Effect::SaveScrollAnchor);
@@ -2717,7 +2841,6 @@ impl Session {
                 Event::Noop
             })
         };
-        self.search.cursor = snap.query.len();
         self.search.query = snap.query;
         self.search.active = snap.active;
 
@@ -2760,7 +2883,6 @@ impl Session {
         } else {
             match self.search.history.last().cloned() {
                 Some(q) => {
-                    self.search.cursor = q.len();
                     self.search.query = q.clone();
                     self.search.active = true;
                     Some(q)
@@ -2841,11 +2963,31 @@ impl Session {
 
     // ---- Explorer/Files create + delete --------------------------------------------------
 
-    /// Trash the highlighted Files/Explorer entry, behind a `[y/N]` confirm in the status bar.
-    /// The absolute path comes from the picker's listed directory (Explorer) or the entry's
-    /// project root (Files). The picker stays open under the confirm; on accept the `path/delete`
-    /// fires and the listing re-lists (a close of *our* buffer rides the `buffer/closed` push).
+    /// Stage a delete confirm for the highlighted picker entry: trash a Files/Explorer file or
+    /// directory (`path/delete`), or forget a project (`project/delete`) from the switcher. The
+    /// absolute path comes from the picker's listed directory (Explorer) or the entry's project
+    /// root (Files). The picker stays open under the confirm; the refreshed listing arrives via a
+    /// `buffer/closed` / `picker/update` push.
     pub fn picker_stage_delete(&mut self) -> Effects {
+        // A highlighted project: the server refuses to delete the active one (the rug-pull guard),
+        // so don't even stage a doomed confirm — say why and bail.
+        if let Some(p) = &self.picker {
+            if p.kind == PickerKind::Projects {
+                let Some(PickerItem::Project { name, .. }) = p.selected_item() else {
+                    return Effects::none();
+                };
+                if name == &self.project {
+                    return Effects::error("can't delete the active project — switch away first");
+                }
+                let name = name.clone();
+                self.prompt = Some(Prompt::Confirm {
+                    kind: ConfirmKind::DeleteProject { name: name.clone() },
+                    action: ConfirmAction::DeleteProject { name },
+                });
+                return Effects::none();
+            }
+        }
+
         let staged = {
             let Some(p) = &self.picker else {
                 return Effects::none();
@@ -2880,7 +3022,7 @@ impl Session {
             return Effects::none();
         };
         self.prompt = Some(Prompt::Confirm {
-            message: format!("Delete {noun} \"{name}\"? [y/N]"),
+            kind: ConfirmKind::Delete { noun, name },
             action: ConfirmAction::DeletePath { path, noun },
         });
         Effects::none()
@@ -2942,26 +3084,230 @@ impl Session {
         )
     }
 
-    /// Keys in the search prompt: the Search keymap table first, then printable input.
-    pub fn on_search_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
-        if let Some(b) = lookup(KeyContext::Search, code, mods) {
-            return self.search_action(b.action);
+    /// The Projects picker's synthetic "+ Create project …" row: create a fresh project named by
+    /// the (trimmed) query, then activate it. Mirrors [`explorer_create_from_query`].
+    pub fn project_create_from_query(&mut self) -> Effects {
+        let name = {
+            let Some(p) = &self.picker else {
+                return Effects::none();
+            };
+            if p.kind != PickerKind::Projects {
+                return Effects::none();
+            }
+            p.query.trim().to_string()
+        };
+        if name.is_empty() {
+            return Effects::error("type a name to create");
         }
-        if mods.ctrl || mods.alt {
-            return Effects::none();
+        if name.contains('/') || name.contains('\\') {
+            return Effects::error("project name can't contain path separators");
         }
-        let Some(text) = text else {
+        // Drop the picker first — the create both activates the project and (when it has no roots)
+        // opens the settings overlay, so the picker shouldn't linger underneath.
+        let hide = self.close_picker();
+        hide.and(self.request_str::<ProjectCreate>(
+            ProjectCreateParams { name },
+            Event::ProjectCreated,
+        ))
+    }
+
+    /// Adopt a `ProjectInfo` returned by an add/remove-root RPC: update the session's roots and,
+    /// when the settings overlay is open and for the same project, its roots list too.
+    fn sync_project_info(&mut self, info: ProjectInfo) {
+        if self.project == info.name {
+            self.project_paths = info.paths.clone();
+        }
+        if let Some(s) = self.project_settings.as_mut() {
+            if s.project_name == info.name {
+                s.roots = info.paths;
+            }
+        }
+    }
+
+    /// Open the project-settings overlay (`Space ,`), seeded from the active project's name and
+    /// roots. Cheap — no RPC. Focus lands on the always-present add-root input row at the bottom,
+    /// since most opens (especially the post-create flow) are to add a root; the name field is
+    /// above the roots and reached with Alt-k. Migrated from the TUI's `open_project_settings`.
+    pub fn open_project_settings(&mut self) {
+        let roots = self.project_paths.clone();
+        let project_name = self.project.clone();
+        self.project_settings = Some(ProjectSettings {
+            project_name: project_name.clone(),
+            name: TextField::new(project_name),
+            roots,
+            selected: 0, // the project-name field
+            add: TextField::default(),
+            error: None,
+        });
+    }
+
+    /// Keys while the project-settings overlay is open. Migrated from the TUI's
+    /// `handle_project_settings_key`, made sans-IO: rename / add-root / remove-root each emit an
+    /// `Effect::Request`, whose result event ([`Event::ProjectRenamed`] / `ProjectRootAdded` /
+    /// `ProjectRootRemoved`) updates the overlay. The TUI's "commit-rename-then-advance-only-on-
+    /// success" gate is simplified: Enter / blur emits the rename request and navigation is free;
+    /// the result event reconciles the name (or sets the error).
+    ///
+    /// Selection model: index 0 is the name field, `1..=roots.len()` the root rows, and
+    /// `roots.len() + 1` the add-root input row. Alt-j/k move between fields; Left/Right move the
+    /// caret inside a text field. Delete / Ctrl-d on a root row opens the shared confirm prompt
+    /// (`request_remove_root`); Enter on the input row commits the add.
+    pub fn on_project_settings_key(
+        &mut self,
+        code: KeyCode,
+        mods: Mods,
+        text: Option<String>,
+    ) -> Effects {
+        // Ctrl-d is accepted alongside Delete to remove the selected root.
+        let is_delete_chord =
+            code == KeyCode::Delete || (code == KeyCode::Char('d') && mods.ctrl && !mods.alt);
+
+        let Some((selected, roots_len)) = self
+            .project_settings
+            .as_ref()
+            .map(|s| (s.selected, s.roots.len()))
+        else {
             return Effects::none();
         };
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
-        if text.is_empty() {
+        let on_name = selected == 0;
+        let on_input = selected == roots_len + 1;
+
+        if code == KeyCode::Esc {
+            // Closing blurs the name field — commit any pending rename, then close. Unlike the TUI,
+            // the close isn't gated on the rename succeeding: the request fires and the overlay
+            // closes; a rejected rename surfaces as a toast rather than holding the overlay open.
+            let rename = if on_name {
+                self.commit_rename_if_changed()
+            } else {
+                Effects::none()
+            };
+            self.project_settings = None;
+            return rename;
+        }
+
+        // Alt-j / Alt-k navigation. Moving down off the name field blurs it → commit the rename.
+        if mods.alt && !mods.ctrl {
+            match code {
+                KeyCode::Char('k') => {
+                    if let Some(s) = self.project_settings.as_mut() {
+                        s.selected = s.selected.saturating_sub(1);
+                    }
+                    return Effects::none();
+                }
+                KeyCode::Char('j') => {
+                    let rename = if on_name {
+                        self.commit_rename_if_changed()
+                    } else {
+                        Effects::none()
+                    };
+                    if let Some(s) = self.project_settings.as_mut() {
+                        s.selected = (s.selected + 1).min(s.roots.len() + 1);
+                    }
+                    return rename;
+                }
+                _ => {}
+            }
+        }
+
+        if is_delete_chord && !on_name && !on_input {
+            // Open the shared confirm prompt for the selected root (index `selected - 1`).
+            return self.request_remove_root(selected - 1);
+        }
+
+        if code == KeyCode::Enter {
+            if on_name {
+                return self.commit_rename_if_changed();
+            } else if on_input {
+                return self.commit_add_root();
+            }
             return Effects::none();
         }
-        let at = self.search.cursor;
-        self.search.query.insert_str(at, &text);
-        self.search.cursor = at + text.len();
-        self.search.history_cursor = None;
-        self.incremental_search()
+
+        // Text editing for the focused field (name / add-root) is owned by each shell's input,
+        // which syncs the value via `project_settings_set_name` / `_set_add`. The core handles only
+        // the command keys above; any other key here is a no-op.
+        let _ = text;
+        Effects::none()
+    }
+
+    /// Commit a pending project rename if the name field differs from the committed name. Emits a
+    /// `project/rename` request; [`Event::ProjectRenamed`] reconciles the result. A no-op edit
+    /// (empty or unchanged) just normalizes the field back to the committed name. Migrated from the
+    /// TUI's `commit_rename_if_changed`, minus its success-gating return value (navigation is free
+    /// now — the result event updates the name when it lands).
+    fn commit_rename_if_changed(&mut self) -> Effects {
+        let Some((old_name, new_name)) = self
+            .project_settings
+            .as_ref()
+            .map(|s| (s.project_name.clone(), s.name.text.trim().to_string()))
+        else {
+            return Effects::none();
+        };
+        if new_name.is_empty() || new_name == old_name {
+            if let Some(s) = self.project_settings.as_mut() {
+                s.name.set(old_name);
+            }
+            return Effects::none();
+        }
+        self.request_str::<ProjectRename>(
+            ProjectRenameParams {
+                project: old_name,
+                new_name,
+            },
+            Event::ProjectRenamed,
+        )
+    }
+
+    /// Commit the add-root input row: emit a `project/add_root` request for the trimmed path.
+    /// [`Event::ProjectRootAdded`] reconciles the result. Migrated from the TUI's `commit_add_root`.
+    fn commit_add_root(&mut self) -> Effects {
+        let Some((project, path)) = self
+            .project_settings
+            .as_ref()
+            .map(|s| (s.project_name.clone(), s.add.text.trim().to_string()))
+        else {
+            return Effects::none();
+        };
+        if path.is_empty() {
+            return Effects::none();
+        }
+        if let Some(s) = self.project_settings.as_mut() {
+            s.error = None;
+        }
+        self.request_str::<ProjectAddRoot>(
+            ProjectAddRootParams { project, path },
+            Event::ProjectRootAdded,
+        )
+    }
+
+    /// Open the shared confirm prompt for removing root `index` (the `selected - 1` root row, or a
+    /// clicked delete button). The actual `project/remove_root` request fires when the prompt is
+    /// accepted ([`ConfirmAction::RemoveProjectRoot`] → [`Self::run_confirm`]); the result lands as
+    /// [`Event::ProjectRootRemoved`]. No-op if the overlay is closed or the index is out of range.
+    pub fn request_remove_root(&mut self, index: usize) -> Effects {
+        let Some(s) = self.project_settings.as_mut() else {
+            return Effects::none();
+        };
+        let Some(path) = s.roots.get(index).cloned() else {
+            return Effects::none();
+        };
+        let project = s.project_name.clone();
+        s.error = None;
+        self.prompt = Some(Prompt::Confirm {
+            kind: ConfirmKind::RemoveRoot { path: path.clone() },
+            action: ConfirmAction::RemoveProjectRoot { project, path },
+        });
+        Effects::none()
+    }
+
+    /// Keys in the search prompt. Text entry (insert / delete / caret) is owned by each shell's
+    /// search input, which syncs the whole value via [`Self::search_set_query`]; the core handles
+    /// only the Search command keys (commit / abort / history) via the keymap table.
+    pub fn on_search_key(&mut self, code: KeyCode, mods: Mods, _text: Option<String>) -> Effects {
+        match lookup(KeyContext::Search, code, mods) {
+            Some(b) => self.search_action(b.action),
+            None => Effects::none(),
+        }
     }
 
     /// The Search-table actions (also reachable from the shell's action dispatch).
@@ -2975,33 +3321,6 @@ impl Session {
             }
             Action::SearchHistoryNext => {
                 self.history_down();
-                self.incremental_search()
-            }
-            Action::SearchCursorLeft => {
-                if let Some((i, _)) = self.search.query[..self.search.cursor]
-                    .char_indices()
-                    .last()
-                {
-                    self.search.cursor = i;
-                }
-                Effects::none()
-            }
-            Action::SearchCursorRight => {
-                if let Some(c) = self.search.query[self.search.cursor..].chars().next() {
-                    self.search.cursor += c.len_utf8();
-                }
-                Effects::none()
-            }
-            Action::SearchBackspace => {
-                let Some((i, _)) = self.search.query[..self.search.cursor]
-                    .char_indices()
-                    .last()
-                else {
-                    return Effects::none();
-                };
-                self.search.query.remove(i);
-                self.search.cursor = i;
-                self.search.history_cursor = None;
                 self.incremental_search()
             }
             _ => Effects::none(),
@@ -3022,7 +3341,6 @@ impl Session {
         };
         self.search.history_cursor = Some(idx);
         self.search.query = self.search.history[idx].clone();
-        self.search.cursor = self.search.query.len();
     }
 
     fn history_down(&mut self) {
@@ -3031,12 +3349,10 @@ impl Session {
             Some(i) if i + 1 < self.search.history.len() => {
                 self.search.history_cursor = Some(i + 1);
                 self.search.query = self.search.history[i + 1].clone();
-                self.search.cursor = self.search.query.len();
             }
             Some(_) => {
                 self.search.history_cursor = None;
                 self.search.query = std::mem::take(&mut self.search.history_draft);
-                self.search.cursor = self.search.query.len();
             }
         }
     }
@@ -3050,6 +3366,27 @@ impl Session {
                 .request_str::<PathDelete>(PathDeleteParams { path }, move |result| {
                     Event::PathDeleted { noun, result }
                 }),
+            ConfirmAction::RemoveProjectRoot { project, path } => self
+                .request_str::<ProjectRemoveRoot>(
+                    ProjectRemoveRootParams { project, path },
+                    Event::ProjectRootRemoved,
+                ),
+            ConfirmAction::DeleteProject { name } => {
+                let display = name.clone();
+                self.request::<ProjectDelete>(ProjectDeleteParams { name }, move |r| {
+                    // Surface the server's *message*, not the stringified `RpcError` (which carries
+                    // a "RPC … returned error -32005:" prefix). The locally-active project is
+                    // already guarded in `picker_stage_delete`, so an active-project refusal here
+                    // means it's open in another window — for which "switch away" is wrong advice.
+                    Event::ProjectDeleted(r.map_err(|e| {
+                        if e.code == ErrorCode::ACTIVE_PROJECT_PREVENTS_DELETE.code() {
+                            format!("\"{display}\" is active in another window — close it there first")
+                        } else {
+                            e.message
+                        }
+                    }))
+                })
+            }
         }
     }
 
@@ -3060,11 +3397,7 @@ impl Session {
             target: Some((path_index, input)),
         } = action
         {
-            self.prompt = Some(Prompt::SaveAs {
-                path_index,
-                cursor: input.len(),
-                input,
-            });
+            self.prompt = Some(Prompt::SaveAs { path_index, input });
         }
     }
 
@@ -3128,6 +3461,10 @@ impl Session {
         if self.picker.is_some() {
             let fx = self.on_picker_key(code, mods, text);
             return fx;
+        }
+        // The project-settings overlay likewise owns the keyboard while open.
+        if self.project_settings.is_some() {
+            return self.on_project_settings_key(code, mods, text);
         }
 
         // Search mode owns the keyboard: control keys via its table, anything printable is
@@ -3418,10 +3755,16 @@ impl Session {
                 fx.push(Effect::ShellAction(action));
                 fx
             }
-            A::OpenHelp | A::OpenProjectSettings => {
-                // Shell-local overlays (help cheatsheet, project settings). A shell without
-                // the overlay ignores the action.
+            A::OpenHelp => {
+                // The help cheatsheet is still a shell-local overlay (it renders from the keymap
+                // tables); a shell without it ignores the action.
                 Effects::one(Effect::ShellAction(action))
+            }
+            A::OpenProjectSettings => {
+                // The project-settings overlay now lives in the core (state + key handling); every
+                // shell renders it from `session.project_settings`.
+                self.open_project_settings();
+                Effects::none()
             }
             A::NavBack | A::NavForward => {
                 let forward = matches!(action, A::NavForward);
@@ -3520,13 +3863,9 @@ impl Session {
             // `Session::on_search_key`'s table lookup) ----
             A::EnterSearch => self.enter_search(false),
             A::EnterSearchToCursor => self.enter_search(true),
-            A::SearchCommit
-            | A::SearchAbort
-            | A::SearchHistoryPrev
-            | A::SearchHistoryNext
-            | A::SearchCursorLeft
-            | A::SearchCursorRight
-            | A::SearchBackspace => self.search_action(action),
+            A::SearchCommit | A::SearchAbort | A::SearchHistoryPrev | A::SearchHistoryNext => {
+                self.search_action(action)
+            }
             A::SearchCycle(direction) => self.search_cycle(direction, count, extend),
             A::SearchFromSelection => self.search_from_selection(),
             A::GrepNavigate(direction) => self.grep_navigate(direction),
@@ -3545,11 +3884,7 @@ impl Session {
                     .as_deref()
                     .and_then(|p| strip_longest_root(p, &self.project_paths))
                     .unwrap_or((0, String::new()));
-                self.prompt = Some(Prompt::SaveAs {
-                    path_index,
-                    cursor: input.len(),
-                    input,
-                });
+                self.prompt = Some(Prompt::SaveAs { path_index, input });
                 Effects::none()
             }
             A::Reload => {
@@ -3575,7 +3910,9 @@ impl Session {
             A::CloseBuffer => {
                 if self.buffer.revision != self.buffer.saved_revision {
                     self.prompt = Some(Prompt::Confirm {
-                        message: format!("discard unsaved changes in {}", self.buffer.label),
+                        kind: ConfirmKind::DiscardOnClose {
+                            label: self.buffer.label.clone(),
+                        },
                         action: ConfirmAction::CloseDiscard,
                     });
                     return Effects::none();
