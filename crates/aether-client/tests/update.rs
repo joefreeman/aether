@@ -254,6 +254,123 @@ fn picker_query_is_value_synced_and_chip_row_gestures_work() {
 }
 
 #[test]
+fn glob_editor_live_previews_results_and_reverts_on_cancel() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Files, None, None);
+    // Open the glob editor — no chip committed yet, so nothing narrows.
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    // Typing a glob folds the would-commit value into the live filters → a re-query carrying it,
+    // even though no chip has been committed.
+    let fx = s.chip_editor_set_input("*.rs".into());
+    let params = find_request(&fx, "picker/query").expect("the glob preview re-queries");
+    assert_eq!(params["filters"]["globs"], json!(["*.rs"]));
+    assert!(
+        s.picker.as_ref().unwrap().chips.is_empty(),
+        "the preview is in-flight only — nothing committed"
+    );
+    // Cancelling reverts the results to the committed (empty) set — the glob drops off the wire
+    // (an empty `globs` is omitted by `skip_serializing_if`).
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "picker/query").expect("cancel reverts the preview");
+    assert_eq!(params["filters"]["globs"], json!(null));
+    assert!(s.picker.as_ref().unwrap().chip_editor.is_none());
+}
+
+#[test]
+fn degenerate_glob_preview_does_not_requery() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Files, None, None);
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    // "*" normalizes away (match-everything) → the effective set is unchanged → no wasted
+    // re-query (and no blank-and-refetch flash).
+    let fx = s.chip_editor_set_input("*".into());
+    assert!(
+        find_request(&fx, "picker/query").is_none(),
+        "an effective-no-op edit must not re-query"
+    );
+}
+
+#[test]
+fn dir_editor_holds_while_listing_pending_then_previews_on_load() {
+    use aether_client::update::Event;
+    use aether_protocol::directory::{DirectoryEntry, DirectoryListResult};
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Files, None, None);
+    // Alt-d opens the dir editor and fires a directory/list for the root.
+    let _ = s.on_key(KeyCode::Char('d'), Mods::ALT, None, ROWS);
+    // Type a leaf before the listing lands: the path's validity is unknown, so results are
+    // held — no re-query flapping them wider for a frame.
+    let fx = s.chip_editor_set_input("sr".into());
+    assert!(
+        find_request(&fx, "picker/query").is_none(),
+        "a non-empty path with a pending listing holds the results"
+    );
+    // The listing resolves; "sr" prefixes "src" → the would-commit scope applies live.
+    let fx = s.on_event(Event::PickerChipListing {
+        abs: "/p".into(),
+        result: Ok(DirectoryListResult {
+            path: "/p".into(),
+            parent: None,
+            entries: vec![
+                DirectoryEntry {
+                    name: "src".into(),
+                    is_dir: true,
+                },
+                DirectoryEntry {
+                    name: "docs".into(),
+                    is_dir: true,
+                },
+            ],
+        }),
+    });
+    let params = find_request(&fx, "picker/query").expect("the scope applies once the listing loads");
+    assert_eq!(
+        params["filters"]["directories"],
+        json!([{"path_index": 0, "relative_path": "src"}])
+    );
+    assert!(
+        s.picker.as_ref().unwrap().chips.is_empty(),
+        "still a preview — the dir chip commits on Enter"
+    );
+}
+
+#[test]
+fn invalid_dir_path_preview_contributes_nothing() {
+    use aether_client::update::Event;
+    use aether_protocol::directory::{DirectoryEntry, DirectoryListResult};
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Files, None, None);
+    let _ = s.on_key(KeyCode::Char('d'), Mods::ALT, None, ROWS);
+    let _ = s.chip_editor_set_input("zzz".into());
+    // The listing lands with no directory the leaf prefixes → the path is invalid → the preview
+    // contributes nothing (results show as if the half-typed chip weren't there).
+    let fx = s.on_event(Event::PickerChipListing {
+        abs: "/p".into(),
+        result: Ok(DirectoryListResult {
+            path: "/p".into(),
+            parent: None,
+            entries: vec![DirectoryEntry {
+                name: "src".into(),
+                is_dir: true,
+            }],
+        }),
+    });
+    // Effective set equals the committed (empty) set, which is already running → no re-query.
+    assert!(
+        find_request(&fx, "picker/query").is_none(),
+        "an invalid path leaves the effective filters unchanged"
+    );
+}
+
+#[test]
 fn search_query_is_value_synced_not_keycode_edited() {
     use aether_client::session::Mode;
     let mut s = session();

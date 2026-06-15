@@ -2,7 +2,7 @@
 //! generation staleness, selection and identity, chip/filter state, display-row math. The
 //! rendering half lives in the shell (`src/picker.rs`).
 //!
-use crate::chips::{self, Chip, ChipEditor, ChipValue};
+use crate::chips::{self, Chip, ChipEditor, ChipEditorKind, ChipValue, DirListingState};
 use aether_protocol::picker::{PickerFilters, PickerItem, PickerKind, PickerUpdateParams};
 
 /// Rows the panel shows at once.
@@ -87,6 +87,11 @@ pub struct PickerState {
     pub chip_selected: Option<usize>,
     /// Below-input editor line for valued chips (glob / dir); owns all keys while open.
     pub chip_editor: Option<ChipEditor>,
+    /// The filter set the server is currently running results against — what was last sent on a
+    /// `picker/query`. Lets the live-preview path (an open glob/dir editor folding its
+    /// in-progress value into the filters) skip a redundant re-query when a keystroke leaves the
+    /// effective filters unchanged, so focus moves and no-op edits don't blank + refetch.
+    pub sent_filters: PickerFilters,
     /// Spinner animation frame, advanced once per applied push while `ticking` — so the throttled
     /// streaming-grep ticks (~16/s) drive the throbber without any client-side timer. See
     /// [`PickerState::spinner_glyph`].
@@ -119,6 +124,7 @@ impl PickerState {
             chips: Vec::new(),
             chip_selected: None,
             chip_editor: None,
+            sent_filters: PickerFilters::default(),
             spinner_frame: 0,
         }
     }
@@ -139,6 +145,49 @@ impl PickerState {
     /// The wire filter set the active chips fold into — built per send.
     pub fn wire_filters(&self) -> PickerFilters {
         chips::wire_filters(&self.chips)
+    }
+
+    /// The filter set to send *while a valued-chip editor is open*: the committed chips with the
+    /// editor's in-progress glob/dir value folded in, so results update live as you type
+    /// (docs/picker-filters.md). The in-progress value is exactly what `Enter` would commit
+    /// ([`ChipEditor::preview_scope`] / [`chips::normalize_glob`]) — what-you-see-is-what-you-get.
+    ///
+    /// Returns `None` when the preview is *indeterminate* — a non-empty dir path whose suggestion
+    /// listing is still loading — so the caller holds the current results rather than flapping
+    /// them wider for a frame. An *invalid* in-progress value (a red segment) contributes nothing:
+    /// results show as if the half-typed chip weren't there. With no editor open this is just the
+    /// committed [`Self::wire_filters`].
+    pub fn live_filters(&self, project_paths: &[String]) -> Option<PickerFilters> {
+        let Some(ed) = &self.chip_editor else {
+            return Some(self.wire_filters());
+        };
+        // Base = committed chips minus the one being edited; the in-progress value *replaces*
+        // that chip's contribution rather than doubling it.
+        let edit = ed.edit_index();
+        let mut base: Vec<ChipValue> = self
+            .chips
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != edit)
+            .map(|(_, v)| v.clone())
+            .collect();
+        match ed.kind {
+            ChipEditorKind::Glob { .. } => {
+                if let Some(g) = chips::normalize_glob(&ed.input.text) {
+                    base.push(ChipValue::Glob(g));
+                }
+            }
+            ChipEditorKind::Dir { .. } => {
+                // A non-empty path still listing: validity is unknown — hold, don't flap.
+                if !ed.input.text.is_empty() && ed.listing_state == DirListingState::Pending {
+                    return None;
+                }
+                if let Some(scope) = ed.preview_scope(project_paths) {
+                    base.push(ChipValue::Dir(scope));
+                }
+            }
+        }
+        Some(chips::wire_filters(&base))
     }
 
     /// Adopt a wire filter set (open/resume), replacing the chip list.

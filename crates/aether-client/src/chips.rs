@@ -696,6 +696,44 @@ impl ChipEditor {
         }
     }
 
+    /// The chip-list index this editor edits in place, if any (a re-opened glob / dir chip);
+    /// `None` for a fresh chip. The live preview uses it to *replace* the edited chip's filter
+    /// contribution with the in-progress value rather than doubling it.
+    pub fn edit_index(&self) -> Option<usize> {
+        match self.kind {
+            ChipEditorKind::Glob { edit } | ChipEditorKind::Dir { edit } => edit,
+        }
+    }
+
+    /// The dir scope a commit would adopt *right now*, or `None` when the editor wouldn't commit
+    /// a scope: an invalid root or path, or an empty path in a single-root project (which means
+    /// "no narrowing"). This is the single source of truth shared by the commit path
+    /// ([`crate::session::Session::commit_chip_editor`]) and the live preview, so what the
+    /// results show while you type is exactly what `Enter` would pin (docs/picker-filters.md).
+    pub fn preview_scope(&self, project_paths: &[String]) -> Option<ScopedPath> {
+        if !self.is_dir() || !self.path_valid() {
+            return None;
+        }
+        let multi_root = project_paths.len() > 1;
+        let path_index = if multi_root {
+            let labels = crate::labels::root_labels(project_paths);
+            if self.root_invalid(&labels) {
+                return None;
+            }
+            self.chosen_root(&labels)
+        } else {
+            0
+        };
+        let text = self.committed_path().trim().trim_matches('/').to_string();
+        if text.is_empty() && !multi_root {
+            return None;
+        }
+        Some(ScopedPath {
+            path_index,
+            relative_path: text,
+        })
+    }
+
     /// True when the path is *definitely* wrong — the red-worthy condition: the dir portion
     /// failed to list, or the loaded listing holds no directory the leaf even prefixes. A
     /// `Pending` listing is neither committable nor flagged (unknown ≠ invalid).

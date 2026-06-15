@@ -761,7 +761,9 @@ impl Session {
                         }
                     }
                 }
-                Effects::none()
+                // The listing just resolved a held (Pending) preview — apply the now-validated
+                // scope, or drop it if the path turned out invalid. No-op for a stale response.
+                self.sync_live_filters()
             }
 
             Event::GrepFileJumped(Ok(None)) => Effects::none(), // already at the first/last
@@ -1667,6 +1669,7 @@ impl Session {
     /// A query edit: bump the generation (stale pushes get discarded), restart the window at
     /// the top, and tell the server.
     fn picker_query_changed(&mut self) -> Effects {
+        let project_paths = self.project_paths.clone();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
@@ -1691,7 +1694,14 @@ impl Session {
         p.default_skip = None;
         p.reveal_on_update = None;
         let (kind, query, generation) = (p.kind, p.query.clone(), p.generation);
-        let filters = p.wire_filters();
+        // An open glob/dir editor folds its in-progress value in for a live preview; otherwise
+        // this is the committed chips. `None` (a dir listing mid-flight) can't happen here —
+        // callers that might hold gate on `live_filters` before re-querying — but fall back to
+        // the committed set defensively.
+        let filters = p
+            .live_filters(&project_paths)
+            .unwrap_or_else(|| p.wire_filters());
+        p.sent_filters = filters.clone();
 
         let mut fx = self.request::<PickerQuery>(
             PickerQueryParams {
@@ -1786,11 +1796,13 @@ impl Session {
         }
         ed.input.set(text);
         let refresh = ed.is_dir() && ed.path_edited(&project_paths);
+        let mut fx = Effects::none();
         if refresh {
-            self.refresh_chip_editor_listing()
-        } else {
-            Effects::none()
+            fx = fx.and(self.refresh_chip_editor_listing());
         }
+        // The in-progress value moved — re-run results to match (held while a refetch is in
+        // flight; `live_filters` returns `None` until the listing lands).
+        fx.and(self.sync_live_filters())
     }
 
     /// Replace the multi-root dir editor's root-filter text wholesale (native `<input>` parity).
@@ -1810,11 +1822,12 @@ impl Session {
         ed.root_filter.set(text);
         ed.root_selected = 0;
         let refresh = ed.sync_dir_listing(&project_paths);
+        let mut fx = Effects::none();
         if refresh {
-            self.refresh_chip_editor_listing()
-        } else {
-            Effects::none()
+            fx = fx.and(self.refresh_chip_editor_listing());
         }
+        // The chosen root drives the would-commit scope; re-run results to match.
+        fx.and(self.sync_live_filters())
     }
 
     /// Move focus between the dir editor's root and path segments (the web client lets you click the
@@ -1863,7 +1876,9 @@ impl Session {
                     p.selected = 0;
                     p.offset = 0;
                     p.items.clear();
-                    p.wire_filters()
+                    let f = p.wire_filters();
+                    p.sent_filters = f.clone();
+                    f
                 };
 
                 Effects::one(Effect::PickerScrollReset).and(self.request::<PickerView>(
@@ -1887,6 +1902,30 @@ impl Session {
             }
             _ => Effects::none(),
         }
+    }
+
+    /// Re-run the live query when an open glob/dir editor's in-progress value changes the
+    /// effective filter set, so results update as you type (docs/picker-filters.md). A no-op
+    /// when the editor leaves the effective filters unchanged (focus moves, edits that don't
+    /// move the would-commit value), when a dir listing is still loading (hold — `live_filters`
+    /// returns `None`), or outside the streaming kinds. Also the path back to the committed set
+    /// when the editor closes: with no editor open `live_filters` is the committed `wire_filters`,
+    /// so a cancel that had a preview applied reverts here.
+    fn sync_live_filters(&mut self) -> Effects {
+        let project_paths = self.project_paths.clone();
+        let Some(p) = &self.picker else {
+            return Effects::none();
+        };
+        if !matches!(p.kind, PickerKind::Grep | PickerKind::Files) {
+            return Effects::none();
+        }
+        let Some(eff) = p.live_filters(&project_paths) else {
+            return Effects::none(); // indeterminate — hold the current results
+        };
+        if eff == p.sent_filters {
+            return Effects::none(); // nothing the server isn't already running
+        }
+        self.picker_query_changed()
     }
 
     /// Toggle/cycle the filter a chord (or Enter on a selected chip) names, then push the
@@ -1931,6 +1970,10 @@ impl Session {
             .and_then(|i| p.glob_value(i))
             .map(str::to_string)
             .unwrap_or_default();
+        // Baseline for the live-preview dedup: what the server is showing right now (the
+        // committed chips). A fresh/empty editor leaves the effective set equal to this, so it
+        // takes a real edit before results move.
+        p.sent_filters = p.wire_filters();
         p.chip_editor = Some(ChipEditor::glob(prefill, edit));
         Effects::none()
     }
@@ -1963,6 +2006,8 @@ impl Session {
             edit,
         );
         ed.sync_dir_listing(&project_paths);
+        // Baseline for the live-preview dedup — the currently displayed (committed) set.
+        p.sent_filters = p.wire_filters();
         p.chip_editor = Some(ed);
         self.refresh_chip_editor_listing()
     }
@@ -2012,32 +2057,17 @@ impl Session {
         let Some(ed) = p.chip_editor.take() else {
             return Effects::none();
         };
-        // A partially typed leaf commits as its highlighted completion — `committed_path` is
-        // the typed text for glob editors and whenever there's nothing to complete.
-        let text = ed.committed_path().trim().trim_matches('/').to_string();
         let changed = match ed.kind {
             chips::ChipEditorKind::Glob { edit } => {
                 let normalized = chips::normalize_glob(&ed.input.text);
                 chips::commit_glob_edit(&mut p.chips, normalized, edit)
             }
             chips::ChipEditorKind::Dir { edit } => {
-                // An empty path is a whole-root scope in multi-root projects and clears the
-                // chip in single-root ones (where "the whole root" means "no narrowing").
-                let multi_root = project_paths.len() > 1;
-                let value = if text.is_empty() && !multi_root {
-                    None
-                } else {
-                    let labels = super::labels::root_labels(&project_paths);
-                    let path_index = if multi_root {
-                        ed.chosen_root(&labels)
-                    } else {
-                        0
-                    };
-                    Some(ScopedPath {
-                        path_index,
-                        relative_path: text,
-                    })
-                };
+                // The would-commit scope — `None` for an empty path in a single-root project
+                // ("the whole root" means "no narrowing"). The validity gate above guarantees
+                // `preview_scope` sees a valid root/path, so this is exactly what the live
+                // preview was already showing.
+                let value = ed.preview_scope(&project_paths);
                 chips::commit_dir_edit(&mut p.chips, value, edit)
             }
         };
@@ -2405,9 +2435,10 @@ impl Session {
         let mut refresh = false;
         match code {
             KeyCode::Enter if no_chord => return self.commit_chip_editor(),
+            // Cancel: drop the editor and fall through — `sync_live_filters` reverts the results
+            // to the committed chips if a preview was applied.
             KeyCode::Esc => {
                 p.chip_editor = None;
-                return Effects::none();
             }
             // Tab / Alt-l: accept the focused segment's suggestion. Root — adopt the ghost
             // completion and continue right into the path; path — absorb the ghost directory
@@ -2497,10 +2528,14 @@ impl Session {
                 let _ = text;
             }
         }
+        let mut fx = Effects::none();
         if refresh {
-            return self.refresh_chip_editor_listing();
+            fx = fx.and(self.refresh_chip_editor_listing());
         }
-        Effects::none()
+        // A command key may have moved the would-commit value (suggestion accept, segment pop,
+        // root cycle) or closed the editor (Esc) — re-run results to match. No-op when nothing
+        // changed (focus moves) or while a refetch is mid-flight.
+        fx.and(self.sync_live_filters())
     }
 
     /// Jump the grep picker's selection to the first hit of the next / previous file. The
