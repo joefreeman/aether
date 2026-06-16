@@ -387,6 +387,7 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
         ticking: true,
         grep_display_offset: Some(0),
         grep_total_display_rows: Some(matches + 1),
+        center_on: None,
     };
     // A streaming `picker/update` push lands first with real hits.
     assert!(s
@@ -577,6 +578,7 @@ fn lsp_dialog_working_field_tracks_live_picker_progress() {
         ticking: false,
         grep_display_offset: None,
         grep_total_display_rows: None,
+        center_on: None,
     };
     let _ = s.on_event(Event::ServerPush(Notification {
         jsonrpc: JsonRpc,
@@ -1109,6 +1111,7 @@ fn picker_view_response_renders_items_without_the_push() {
         ticking: false,
         grep_display_offset: None,
         grep_total_display_rows: None,
+        center_on: None,
     };
     let r = PickerViewResult {
         query: "x".into(),
@@ -1443,6 +1446,7 @@ fn selecting_the_create_row_creates_the_file() {
             ticking: false,
             grep_display_offset: None,
             grep_total_display_rows: None,
+            center_on: None,
         });
         assert_eq!(p.create_row_index(), Some(1));
     }
@@ -1489,6 +1493,7 @@ fn project_create_row_appears_for_a_novel_name_in_the_projects_picker() {
         ticking: false,
         grep_display_offset: None,
         grep_total_display_rows: None,
+        center_on: None,
     });
     // An exact match offers no create row.
     p.query = "aether".into();
@@ -1524,6 +1529,7 @@ fn accepting_the_projects_create_row_emits_project_create() {
             ticking: false,
             grep_display_offset: None,
             grep_total_display_rows: None,
+            center_on: None,
         });
         p.query = "fresh".into();
         assert_eq!(p.create_row_index(), Some(1));
@@ -1749,4 +1755,121 @@ fn settings_esc_closes_the_overlay() {
     assert!(s.project_settings.is_some());
     s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
     assert!(s.project_settings.is_none());
+}
+
+#[test]
+fn document_symbols_opens_scoped_to_buffer_with_no_filters() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    // The symbols picker opens unfiltered (the full hierarchy, indented by depth — no top-level
+    // collapse) and scoped to the active buffer so the server can resolve symbols + the cursor.
+    let fx = s.open_picker(PickerKind::DocumentSymbols, None, None);
+    let params = find_request(&fx, "picker/view").expect("symbols picker opens via picker/view");
+    assert!(params.get("filters").is_none(), "no seeded filters: {params}");
+    assert!(params["buffer_id"].is_number());
+}
+
+#[test]
+fn symbol_push_center_on_lands_the_highlight() {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerUpdate, PickerUpdateParams, SymbolKind,
+    };
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::DocumentSymbols, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.generation = 0;
+        p.offset = 0;
+    }
+    let sym = |line: u32, name: &str| PickerItem::Symbol {
+        path: "/p/a.rs".into(),
+        line,
+        col: 0,
+        name: name.into(),
+        symbol_kind: SymbolKind::Function,
+        detail: String::new(),
+        depth: 0,
+        context: false,
+        match_indices: vec![],
+    };
+    // The async fill push tags the cursor-enclosing symbol via `center_on`; the client adopts it
+    // as the highlight (here the second row).
+    let push = Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: PickerUpdate::NAME.into(),
+        params: serde_json::to_value(PickerUpdateParams {
+            kind: PickerKind::DocumentSymbols,
+            generation: 0,
+            offset: 0,
+            items: Some(vec![sym(0, "a"), sym(5, "b"), sym(9, "c")]),
+            total_matches: 3,
+            total_candidates: 3,
+            ticking: false,
+            grep_display_offset: None,
+            grep_total_display_rows: None,
+            center_on: Some(Box::new(sym(5, "b"))),
+        })
+        .unwrap(),
+    });
+    let _ = s.on_event(push);
+    let p = s.picker.as_ref().unwrap();
+    assert_eq!(p.selected, 1, "center_on lands the highlight on the enclosing symbol");
+    assert!(p.pending_center.is_none(), "center matched in-window");
+}
+
+#[test]
+fn symbol_center_on_far_down_adopts_the_framed_window() {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerUpdate, PickerUpdateParams, SymbolKind,
+    };
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::DocumentSymbols, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.generation = 0;
+        p.offset = 0; // the picker opened at the top
+    }
+    let sym = |line: u32, name: &str| PickerItem::Symbol {
+        path: "/p/a.rs".into(),
+        line,
+        col: 0,
+        name: name.into(),
+        symbol_kind: SymbolKind::Field,
+        detail: String::new(),
+        depth: 1,
+        context: false,
+        match_indices: vec![],
+    };
+    // A symbol deep in the file: the server frames the window around its rank (offset 60 here) and
+    // tags the fill push with `center_on`. The client must adopt that offset — otherwise the
+    // offset guard discards the push and the deep symbol never gets selected.
+    let push = Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: PickerUpdate::NAME.into(),
+        params: serde_json::to_value(PickerUpdateParams {
+            kind: PickerKind::DocumentSymbols,
+            generation: 0,
+            offset: 60,
+            items: Some(vec![sym(80, "a"), sym(81, "externally_modified"), sym(82, "c")]),
+            total_matches: 63,
+            total_candidates: 63,
+            ticking: false,
+            grep_display_offset: None,
+            grep_total_display_rows: None,
+            center_on: Some(Box::new(sym(81, "externally_modified"))),
+        })
+        .unwrap(),
+    });
+    let _ = s.on_event(push);
+    let p = s.picker.as_ref().unwrap();
+    assert_eq!(p.offset, 60, "the client adopts the server's framed offset");
+    assert_eq!(p.selected, 61, "the deep symbol (offset 60 + window pos 1) is selected");
+    assert!(p.pending_center.is_none(), "center matched within the framed window");
 }

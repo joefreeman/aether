@@ -124,6 +124,44 @@ fn simple<L: Into<Language>>(
     })
 }
 
+/// TypeScript's bundled `HIGHLIGHTS_QUERY` carries only the TS-specific additions (types, TS
+/// keywords like `interface`/`type`); the base constructs — `const`/`let`/`function`/`return`,
+/// strings, numbers, comments, operators — live in the *JavaScript* query, since the TS grammar
+/// extends JS. The crate ships them separately, so on its own the TS query leaves almost everything
+/// uncoloured. Concatenate the JS base with the TS additions (the JS `highlights.scm` has no JSX
+/// captures, so it compiles cleanly against the non-JSX `typescript` grammar as well as `tsx`).
+/// Built once and cached; the result outlives the process so it satisfies the `&'static` query slot.
+fn typescript_highlights() -> &'static str {
+    static QUERY: OnceLock<String> = OnceLock::new();
+    QUERY
+        .get_or_init(|| {
+            format!(
+                "{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            )
+        })
+        .as_str()
+}
+
+/// Like [`typescript_highlights`] but for `.tsx`: also append the JS crate's JSX query so markup
+/// (tag names, attributes, the `< > />` brackets) is coloured. Those rules reference `jsx_*` node
+/// types that exist only in the `tsx` grammar — appending them to the plain `typescript` query
+/// would fail to compile — so this third piece is kept TSX-only.
+fn tsx_highlights() -> &'static str {
+    static QUERY: OnceLock<String> = OnceLock::new();
+    QUERY
+        .get_or_init(|| {
+            format!(
+                "{}\n{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+            )
+        })
+        .as_str()
+}
+
 /// Resolve a language name (canonical or alias) to its config. Recognises file extensions
 /// (`"rs"`, `"py"`) and common markdown-fence aliases (`"sh"`, `"js"`, `"yml"`) so both the
 /// extension-based detection path and injection-language lookups share one table. Input is
@@ -224,7 +262,7 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
             LanguageSpec {
                 name: "typescript",
                 language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-                highlights: tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                highlights: typescript_highlights(),
                 indents: Some(include_str!("../queries/typescript/indents.scm")),
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("//"),
@@ -247,7 +285,7 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
             LanguageSpec {
                 name: "tsx",
                 language: tree_sitter_typescript::LANGUAGE_TSX,
-                highlights: tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                highlights: tsx_highlights(),
                 indents: Some(include_str!("../queries/tsx/indents.scm")),
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("//"),
@@ -563,7 +601,13 @@ fn overlay_captures(
     per_byte: &mut [Option<&'static str>],
 ) {
     let capture_names = query.capture_names();
-    let mut captures: Vec<(usize, usize, &'static str)> = Vec::new();
+    // (start, end, pattern_index, name). `pattern_index` orders equal-length overlaps so the later
+    // query pattern wins — the standard tree-sitter precedence query authors rely on. Match
+    // *iteration* order can't stand in for it: a capture whose pattern matches on an enclosing node
+    // (e.g. JSX `(jsx_opening_element (identifier) @tag)`, matched at the `<`) is yielded before a
+    // bare `(identifier) @variable` on the same name, so without this the broad rule would overwrite
+    // the specific one.
+    let mut captures: Vec<(usize, usize, usize, &'static str)> = Vec::new();
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(query_range.clone());
     let mut matches = cursor.matches(query, tree.root_node(), bytes_for_query);
@@ -576,19 +620,24 @@ fn overlay_captures(
                 // The underlying string data lives in a `'static` `Query` (held in `OnceLock`);
                 // the borrow checker can't see through `&Query`'s lifetime so we widen here.
                 let name: &'static str = unsafe { std::mem::transmute::<&str, &'static str>(name) };
-                captures.push((s, e, name));
+                captures.push((s, e, m.pattern_index, name));
             }
         }
     }
     if captures.is_empty() {
         return;
     }
+    // Longer captures first (shorter, more-specific ones overwrite); for equal length, the
+    // later-defined pattern wins (written last); `start` is a final stable tiebreak.
     captures.sort_by(|a, b| {
         let len_a = a.1 - a.0;
         let len_b = b.1 - b.0;
-        len_b.cmp(&len_a).then(a.0.cmp(&b.0))
+        len_b
+            .cmp(&len_a)
+            .then(a.2.cmp(&b.2))
+            .then(a.0.cmp(&b.0))
     });
-    for (s, e, name) in &captures {
+    for (s, e, _, name) in &captures {
         for i in *s..*e {
             let idx = (i as isize) + per_byte_offset;
             if idx >= 0 && (idx as usize) < per_byte.len() {
@@ -627,6 +676,65 @@ mod tests {
             .iter()
             .any(|h| h.start <= string_pos && h.end > string_pos && h.kind.contains("string"));
         assert!(has_string, "expected string highlight for \"hi\"");
+    }
+
+    #[test]
+    fn typescript_highlights_base_js_and_ts_constructs() {
+        // The combined JS-base + TS-additions query must compile against the (non-JSX) typescript
+        // grammar and colour the base constructs the bundled TS-only query misses.
+        let cfg = get_config("typescript").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "export const n: number = 42;\nfunction f(s: string) { return s; }\n";
+        let tree = parser.parse(source, None).unwrap();
+        let highlights = highlights_for_range(cfg, &tree, &[], source, 0, source.len());
+        let kind_at = |needle: &str| {
+            let pos = source.find(needle).unwrap() as u32;
+            highlights
+                .iter()
+                .find(|h| h.start <= pos && h.end > pos)
+                .map(|h| h.kind.clone())
+        };
+        // Base JS keywords / literals (previously uncoloured) now get captures.
+        assert!(kind_at("const").is_some_and(|k| k.contains("keyword")), "const → keyword");
+        assert!(kind_at("function").is_some_and(|k| k.contains("keyword")), "function → keyword");
+        assert!(kind_at("return").is_some_and(|k| k.contains("keyword")), "return → keyword");
+        assert!(kind_at("42").is_some_and(|k| k.contains("number")), "42 → number");
+        // A string literal in a separate snippet (the first has none).
+        let src2 = "const greeting = \"hello\";\n";
+        let tree2 = parser.parse(src2, None).unwrap();
+        let hl2 = highlights_for_range(cfg, &tree2, &[], src2, 0, src2.len());
+        let sp = src2.find("\"hello\"").unwrap() as u32;
+        assert!(
+            hl2.iter().any(|h| h.start <= sp && h.end > sp && h.kind.contains("string")),
+            "string literal → string"
+        );
+        // TS-specific additions still work.
+        assert!(kind_at("number").is_some_and(|k| k.contains("type")), "number → type.builtin");
+    }
+
+    #[test]
+    fn tsx_highlights_base_and_jsx_markup() {
+        // The TSX query (JS base + TS additions + JSX) compiles against the JSX-bearing grammar and
+        // colours both ordinary code and the markup the base query leaves plain.
+        let cfg = get_config("tsx").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "const e = <div className=\"x\">{n}</div>;\n";
+        let tree = parser.parse(source, None).unwrap();
+        let hl = highlights_for_range(cfg, &tree, &[], source, 0, source.len());
+        let kind_at = |needle: &str| {
+            let pos = source.find(needle).unwrap() as u32;
+            hl.iter()
+                .find(|h| h.start <= pos && h.end > pos)
+                .map(|h| h.kind.clone())
+        };
+        assert!(kind_at("const").is_some_and(|k| k.contains("keyword")), "base code still works");
+        // The lowercase HTML tag name and the attribute name get JSX captures.
+        assert!(kind_at("div").is_some_and(|k| k.contains("tag")), "<div> → tag, got {:?}", kind_at("div"));
+        assert!(
+            kind_at("className").is_some_and(|k| k.contains("attribute")),
+            "className → attribute, got {:?}",
+            kind_at("className")
+        );
     }
 
     #[test]

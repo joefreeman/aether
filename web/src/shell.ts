@@ -35,6 +35,7 @@ import type {
   ProjectActivateResult,
   ProjectListResult,
   ScrollPosition,
+  SymbolKind,
   ViewportSubscribeResult,
   ViewportWindowResult,
   WrapMode,
@@ -54,6 +55,18 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   diagnostics: "List diagnostics…",
   lsp_servers: "List LSPs…",
   references: "List references…",
+  document_symbols: "Go to symbol…",
+};
+
+/** The kind's full lowercase name, shown as a dim tag on a document-symbol row. Mirrors
+ *  aether-protocol::picker::SymbolKind::label. */
+const SYMBOL_TAG: Record<SymbolKind, string> = {
+  file: "file", module: "module", namespace: "namespace", package: "package", class: "class",
+  method: "method", property: "property", field: "field", constructor: "constructor", enum: "enum",
+  interface: "interface", function: "function", variable: "variable", constant: "constant",
+  string: "string", number: "number", boolean: "boolean", array: "array", object: "object",
+  key: "key", null: "null", enum_member: "enum member", struct: "struct", event: "event",
+  operator: "operator", type_parameter: "type parameter", unknown: "symbol",
 };
 
 interface Config {
@@ -508,6 +521,21 @@ function describePickerItem(
         matches: item.match_indices,
         prefix: `${display}${linePart}`,
         prefixClass: "picker-loc",
+      };
+    }
+    case "symbol": {
+      // The name leads (indented for nesting depth); the dim `detail` (signature) sits
+      // beside it, and the kind tag is right-aligned as the meta. A `context` row (an ancestor
+      // shown for tree context while filtering) dims its name too — a non-selectable header.
+      const indent = (item.depth ?? 0) * 2;
+      return {
+        primary: item.name,
+        matches: item.context ? undefined : item.match_indices,
+        prefix: indent > 0 ? " ".repeat(indent) : undefined,
+        prefixClass: "picker-loc",
+        suffix: item.detail || undefined,
+        meta: SYMBOL_TAG[item.symbol_kind],
+        dim: item.context || undefined,
       };
     }
   }
@@ -2390,14 +2418,17 @@ export class Shell {
     // count itself shows progress. CSS drives the rotation, so it stays smooth regardless of the
     // push cadence.
     this.pickerSpinnerEl.style.display = p.ticking ? "" : "none";
-    // A filtered file/buffer list shows `matched/total`; an unfiltered list — and grep, where every
-    // candidate is a hit — collapses to a single total (rather than the redundant "M/M").
+    // A list narrowed *below* its candidate set shows `matched/total`; an unfiltered list — and
+    // grep, where every candidate is a hit — collapses to a single total. Guarded on `>` rather
+    // than `!==` so a candidate count that isn't a larger superset (e.g. an async picker whose fill
+    // push raced ahead of the view response, leaving a stale 0) reads as just the match count, not
+    // a misleading `106/0`.
     this.pickerCountEl.textContent =
       p.total_matches === 0
         ? ""
-        : p.total_matches === p.total_candidates
-          ? `${p.total_matches}`
-          : `${p.total_matches}/${p.total_candidates}`;
+        : p.total_candidates > p.total_matches
+          ? `${p.total_matches}/${p.total_candidates}`
+          : `${p.total_matches}`;
     this.renderPickerChips(p);
     this.renderChipEditor(p.chip_editor);
     this.renderPickerList(p, v);
@@ -2954,6 +2985,14 @@ export class Shell {
     // refetch momentarily empties the window while results still exist, and collapsing the spacer
     // here would reset scrollTop to the top. That case falls through to the spacer render below.
     if (p.total_matches === 0) {
+      // Consume a pending scroll-reset here too. An async picker (symbols / references) opens empty
+      // and returns early through this branch while loading, so a reset left armed would survive to
+      // the fill push and, in the scroll block below, snap to the top *and* cancel the reveal that
+      // centres the cursor's symbol — leaving the window loaded but scrolled to the top.
+      if (this.pickerScrollReset) {
+        list.scrollTop = 0;
+        this.pickerScrollReset = false;
+      }
       if (p.create) {
         list.classList.add("filled");
         list.replaceChildren(this.makePickerCreateRow(p));
@@ -2963,6 +3002,8 @@ export class Shell {
       let text = "";
       if (p.kind === "references") {
         text = p.ticking ? "Finding references…" : "No references found";
+      } else if (p.kind === "document_symbols") {
+        text = p.ticking ? "Finding symbols…" : "No symbols found";
       } else if (p.ticking) {
         text = "Searching…";
       } else if (p.query.length > 0) {

@@ -58,6 +58,13 @@ pub enum PickerKind {
     /// one-shot LSP snapshot taken on open and preserved across scroll/resume re-views (like
     /// Diagnostics) — it doesn't live-update as the buffer changes.
     References,
+    /// The symbols defined in the current buffer, gathered via the language server's
+    /// `textDocument/documentSymbol` (`PickerViewParams::buffer_id` scopes the request). Buffer-local
+    /// (every symbol lives in the picked buffer), fuzzy-matched on the symbol name. Hierarchical
+    /// responses are flattened depth-first with a `depth` per item so the picker can indent nested
+    /// members; selecting one jumps to its name position (via `FileAt`). Like References/Diagnostics
+    /// it's a one-shot LSP snapshot taken on open and preserved across scroll/resume re-views.
+    DocumentSymbols,
 }
 
 impl PickerKind {
@@ -94,6 +101,111 @@ impl BufferDirtyState {
     /// `true` for the clean state — used to skip the field on the wire.
     pub fn is_clean(&self) -> bool {
         matches!(self, BufferDirtyState::Clean)
+    }
+}
+
+/// The kind of a document symbol, mirroring the LSP `SymbolKind` enumeration. Carried by
+/// [`PickerItem::Symbol`] so the clients can show a short type tag (and, later, a coloured icon)
+/// next to each symbol. `Unknown` covers any value outside the LSP-defined 1..=26 range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolKind {
+    File,
+    Module,
+    Namespace,
+    Package,
+    Class,
+    Method,
+    Property,
+    Field,
+    Constructor,
+    Enum,
+    Interface,
+    Function,
+    Variable,
+    Constant,
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Key,
+    Null,
+    EnumMember,
+    Struct,
+    Event,
+    Operator,
+    TypeParameter,
+    #[default]
+    Unknown,
+}
+
+impl SymbolKind {
+    /// Map an LSP `SymbolKind` integer (1..=26) to its variant. Anything else → `Unknown`.
+    pub fn from_lsp(n: u64) -> SymbolKind {
+        match n {
+            1 => SymbolKind::File,
+            2 => SymbolKind::Module,
+            3 => SymbolKind::Namespace,
+            4 => SymbolKind::Package,
+            5 => SymbolKind::Class,
+            6 => SymbolKind::Method,
+            7 => SymbolKind::Property,
+            8 => SymbolKind::Field,
+            9 => SymbolKind::Constructor,
+            10 => SymbolKind::Enum,
+            11 => SymbolKind::Interface,
+            12 => SymbolKind::Function,
+            13 => SymbolKind::Variable,
+            14 => SymbolKind::Constant,
+            15 => SymbolKind::String,
+            16 => SymbolKind::Number,
+            17 => SymbolKind::Boolean,
+            18 => SymbolKind::Array,
+            19 => SymbolKind::Object,
+            20 => SymbolKind::Key,
+            21 => SymbolKind::Null,
+            22 => SymbolKind::EnumMember,
+            23 => SymbolKind::Struct,
+            24 => SymbolKind::Event,
+            25 => SymbolKind::Operator,
+            26 => SymbolKind::TypeParameter,
+            _ => SymbolKind::Unknown,
+        }
+    }
+
+    /// The kind's full lowercase name, shown as a dim tag on the symbol row (e.g. `function`,
+    /// `interface`, `struct`). Clients render it verbatim.
+    pub fn label(self) -> &'static str {
+        match self {
+            SymbolKind::File => "file",
+            SymbolKind::Module => "module",
+            SymbolKind::Namespace => "namespace",
+            SymbolKind::Package => "package",
+            SymbolKind::Class => "class",
+            SymbolKind::Method => "method",
+            SymbolKind::Property => "property",
+            SymbolKind::Field => "field",
+            SymbolKind::Constructor => "constructor",
+            SymbolKind::Enum => "enum",
+            SymbolKind::Interface => "interface",
+            SymbolKind::Function => "function",
+            SymbolKind::Variable => "variable",
+            SymbolKind::Constant => "constant",
+            SymbolKind::String => "string",
+            SymbolKind::Number => "number",
+            SymbolKind::Boolean => "boolean",
+            SymbolKind::Array => "array",
+            SymbolKind::Object => "object",
+            SymbolKind::Key => "key",
+            SymbolKind::Null => "null",
+            SymbolKind::EnumMember => "enum member",
+            SymbolKind::Struct => "struct",
+            SymbolKind::Event => "event",
+            SymbolKind::Operator => "operator",
+            SymbolKind::TypeParameter => "type parameter",
+            SymbolKind::Unknown => "symbol",
+        }
     }
 }
 
@@ -235,6 +347,39 @@ pub enum PickerItem {
         /// The text of the referenced line, trailing newline trimmed. Fuzzy haystack + preview.
         preview: String,
         /// Char offsets into `preview` covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One symbol from `textDocument/documentSymbol`, scoped to the picked buffer. Identity is
+    /// `(path, line, col)` — the symbol's name position. Carries its own absolute `path` (fed into
+    /// `buffer/open` on select; always the picked buffer, but kept uniform with the other `FileAt`
+    /// kinds). The matcher haystack is `name`; `match_indices` are char offsets into it. `detail`
+    /// is the `DocumentSymbol` signature (shown dim), empty for flat servers; `depth` is the nesting
+    /// level (0 = top-level) so the row can indent members under their container.
+    Symbol {
+        /// Absolute canonical path to the buffer's file.
+        path: String,
+        /// 0-based line of the symbol's name.
+        line: u32,
+        /// 0-based byte offset of the symbol's name within the line.
+        col: u32,
+        /// The symbol name — fuzzy haystack + the row's primary label.
+        name: String,
+        /// LSP symbol kind, for the dim type tag (and future icon).
+        symbol_kind: SymbolKind,
+        /// The `DocumentSymbol` signature, shown dim after the name; empty for flat servers.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
+        /// Nesting depth (0 = top-level), for indenting nested members.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        depth: u32,
+        /// True when this row is shown only as an *ancestor* of a match, to give tree context while
+        /// filtering — not itself a match. Such rows render dim and are non-selectable (the client's
+        /// navigation skips them). Always false on an empty query (the whole tree is shown) and for
+        /// a row that is itself a match. Absent on the wire when false.
+        #[serde(default, skip_serializing_if = "is_false")]
+        context: bool,
+        /// Char offsets into `name` covered by fuzzy matches. Empty for `context` rows.
         #[serde(default)]
         match_indices: Vec<u32>,
     },
@@ -459,6 +604,10 @@ pub struct PickerViewParams {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -717,6 +866,16 @@ pub struct PickerUpdateParams {
     /// reachable. `None` for non-grep kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grep_total_display_rows: Option<u32>,
+    /// A server-resolved highlight to adopt when this push lands — currently the DocumentSymbols
+    /// picker's cursor-enclosing symbol, computed on the async fill (the picker opens before the
+    /// `textDocument/documentSymbol` round-trip returns, so this can't ride the `picker/view`
+    /// response's `effective_center_on` the way the synchronous kinds do). The client treats it
+    /// like `effective_center_on`: sets it as the pending centre and reveals it. `None` on every
+    /// other push (the common case). The item is one of this window's rows, so the client's
+    /// identity match finds it without a refetch. Boxed to keep `PickerUpdateParams` (and the
+    /// `Event`/message enums that embed it) small — `PickerItem` is a large tagged union.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center_on: Option<Box<PickerItem>>,
 }
 
 impl PickerUpdateParams {

@@ -219,6 +219,46 @@ impl PickerState {
             .get(self.selected.saturating_sub(self.offset) as usize)
     }
 
+    /// True when the row at absolute index `abs` is a non-selectable *context* row — a filtered
+    /// DocumentSymbols ancestor shown only for tree context. Only answerable within the fetched
+    /// window (returns false otherwise, so out-of-window rows are treated as selectable).
+    fn is_context_row(&self, abs: u32) -> bool {
+        matches!(
+            self.items.get(abs.saturating_sub(self.offset) as usize),
+            Some(PickerItem::Symbol { context: true, .. })
+        )
+    }
+
+    /// Nudge `selected` off a context row onto the nearest match — scanning `forward` first, then
+    /// the other way. No-op unless the highlight is currently on a context row. A filtered symbol
+    /// list always has at least one match alongside its ancestors, so this terminates on a match.
+    fn skip_context_rows(&mut self, forward: bool, max: u32) {
+        if !self.is_context_row(self.selected) {
+            return;
+        }
+        for &rev in &[false, true] {
+            let fwd = forward ^ rev; // primary pass, then the reverse
+            let mut sel = self.selected;
+            loop {
+                if fwd {
+                    if sel >= max {
+                        break;
+                    }
+                    sel += 1;
+                } else {
+                    if sel == 0 {
+                        break;
+                    }
+                    sel -= 1;
+                }
+                if !self.is_context_row(sel) {
+                    self.selected = sel;
+                    return;
+                }
+            }
+        }
+    }
+
     /// The synthetic "+ Create …" affordance: present when the (trimmed) query names something
     /// the listing doesn't already contain. Two pickers offer it:
     ///
@@ -347,6 +387,9 @@ impl PickerState {
         } else {
             self.selected = 0;
         }
+        // Filtered DocumentSymbols interleave non-selectable ancestor rows for context — never let
+        // the highlight settle on one (e.g. when it lands on row 0 and that's an ancestor header).
+        self.skip_context_rows(true, rows.saturating_sub(1));
         true
     }
 
@@ -361,6 +404,9 @@ impl PickerState {
         }
         let max = rows as i64 - 1;
         self.selected = (self.selected as i64 + delta).clamp(0, max) as u32;
+        // Skip over non-selectable context rows (filtered DocumentSymbols ancestors) in the move's
+        // direction, so `j`/`k` land only on matches.
+        self.skip_context_rows(delta >= 0, max as u32);
         // The create row is virtual — never in the fetched item window, so it can't force a
         // refetch; the move onto the row below it already brought the list's tail into view.
         if create == Some(self.selected) {
@@ -483,6 +529,7 @@ pub enum ItemKey<'a> {
     Project(&'a str),
     LspServer(&'a str, &'a str),
     Reference(&'a str, u32, u32),
+    Symbol(&'a str, u32, u32),
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -512,6 +559,9 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::Reference {
             path, line, col, ..
         } => ItemKey::Reference(path, *line, *col),
+        PickerItem::Symbol {
+            path, line, col, ..
+        } => ItemKey::Symbol(path, *line, *col),
     }
 }
 
@@ -572,6 +622,7 @@ mod tests {
             ticking: false,
             grep_display_offset: None,
             grep_total_display_rows: None,
+            center_on: None,
         }
     }
 
@@ -652,6 +703,7 @@ mod tests {
             // The first item sits at display row 14; its group header occupies 13.
             grep_display_offset: Some(14),
             grep_total_display_rows: Some(18),
+            center_on: None,
         }));
         // Window rows: [13]=hdr a.rs, [14]=hit, [15]=hit, [16]=hdr b.rs, [17]=hit.
         s.selected = 10;
@@ -724,9 +776,44 @@ mod tests {
             ticking: false,
             grep_display_offset: None,
             grep_total_display_rows: None,
+            center_on: None,
         }));
         assert_eq!(s.selected, 1);
         assert!(s.pending_center.is_none());
+    }
+
+    #[test]
+    fn symbol_selection_skips_context_rows() {
+        use aether_protocol::picker::SymbolKind;
+        let sym = |name: &str, context: bool| PickerItem::Symbol {
+            path: "/a".into(),
+            line: 0,
+            col: 0,
+            name: name.into(),
+            symbol_kind: SymbolKind::Struct,
+            detail: String::new(),
+            depth: 0,
+            context,
+            match_indices: vec![],
+        };
+        let mut s = PickerState::new(PickerKind::DocumentSymbols);
+        // [ctx Widget, match parse, ctx Token, match value] — ancestors interleaved with matches.
+        let mut u = update(PickerKind::DocumentSymbols, 0, 0, 0, 4);
+        u.items = Some(vec![
+            sym("Widget", true),
+            sym("parse", false),
+            sym("Token", true),
+            sym("value", false),
+        ]);
+        assert!(s.apply_update(u));
+        // The leading context row (Widget) is skipped — the highlight lands on the first match.
+        assert_eq!(s.selected, 1);
+        // Down skips the context row (Token) onto the next match.
+        s.move_selection(1);
+        assert_eq!(s.selected, 3);
+        // Up skips back over Token onto the previous match.
+        s.move_selection(-1);
+        assert_eq!(s.selected, 1);
     }
 
     #[test]
@@ -766,6 +853,7 @@ mod tests {
             ticking: false,
             grep_display_offset: None,
             grep_total_display_rows: None,
+            center_on: None,
         });
         s
     }

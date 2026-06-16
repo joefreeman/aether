@@ -1731,8 +1731,12 @@ fn picker_box_rect(area: Rect) -> Rect {
 /// "Create …" row isn't counted in `total_matches`.
 fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
     use aether_protocol::picker::PickerKind;
-    if picker.kind == Some(PickerKind::References) && picker.items.is_empty() {
-        return 1; // "Finding references…" / "No references found"
+    if matches!(
+        picker.kind,
+        Some(PickerKind::References | PickerKind::DocumentSymbols)
+    ) && picker.items.is_empty()
+    {
+        return 1; // one-row loading / empty message ("Finding references…", "No symbols found", …)
     }
     if picker.kind == Some(PickerKind::Grep) {
         return picker.total_display_rows.unwrap_or(picker.total_matches);
@@ -2102,13 +2106,15 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         // Initial phase (still searching, no hits yet): the throbber stands alone.
         state.picker.spinner.unwrap_or("").to_string()
     } else {
-        // A filtered file/buffer list shows `matched/total`; an unfiltered list — and grep, where
-        // every candidate is a hit — collapses to a single total. A throbber sits to the left while
-        // results are still streaming.
-        let num = if state.picker.total_matches == state.picker.total_candidates {
-            format!("{}", state.picker.total_matches)
-        } else {
+        // A list narrowed *below* its candidate set shows `matched/total`; an unfiltered list — and
+        // grep, where every candidate is a hit — collapses to a single total. Guarded on `>` rather
+        // than `!=` so a candidate count that isn't a larger superset (e.g. an async picker whose
+        // fill push raced ahead of the view response, leaving a stale 0) reads as just the match
+        // count, not a misleading `106/0`. A throbber sits to the left while results stream.
+        let num = if state.picker.total_candidates > state.picker.total_matches {
             format!("{}/{}", state.picker.total_matches, state.picker.total_candidates)
+        } else {
+            format!("{}", state.picker.total_matches)
         };
         match state.picker.spinner {
             Some(s) => format!("{s} {num}"),
@@ -2412,6 +2418,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Diagnostics) => "List diagnostics…",
         Some(aether_protocol::picker::PickerKind::LspServers) => "List LSPs…",
         Some(aether_protocol::picker::PickerKind::References) => "List references…",
+        Some(aether_protocol::picker::PickerKind::DocumentSymbols) => "Go to symbol…",
         None => "Search…",
     }
 }
@@ -2439,16 +2446,22 @@ fn draw_picker_separator(f: &mut Frame, box_area: Rect, area: Rect) {
 }
 
 fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
-    // References resolves asynchronously (an LSP round-trip), so it opens empty. A blank pane
-    // would read as a broken picker — show progress while it loads, and an explicit "none" once
-    // it finishes empty. (The result-set kinds that are never empty-by-design skip this.)
+    // References / DocumentSymbols resolve asynchronously (an LSP round-trip), so they open empty. A
+    // blank pane would read as a broken picker — show progress while it loads, and an explicit
+    // "none" once it finishes empty. (The result-set kinds that are never empty-by-design skip this.)
+    use aether_protocol::picker::PickerKind;
     if state.picker.items.is_empty()
-        && state.picker.kind == Some(aether_protocol::picker::PickerKind::References)
+        && matches!(
+            state.picker.kind,
+            Some(PickerKind::References | PickerKind::DocumentSymbols)
+        )
     {
-        let msg = if state.picker.ticking {
-            "Finding references…"
-        } else {
-            "No references found"
+        let symbols = state.picker.kind == Some(PickerKind::DocumentSymbols);
+        let msg = match (symbols, state.picker.ticking) {
+            (false, true) => "Finding references…",
+            (false, false) => "No references found",
+            (true, true) => "Finding symbols…",
+            (true, false) => "No symbols found",
         };
         f.render_widget(
             Paragraph::new(msg).style(
@@ -2718,6 +2731,29 @@ fn picker_item_spans(
             max_width,
         );
     }
+    if let PickerItem::Symbol {
+        name,
+        symbol_kind,
+        detail,
+        depth,
+        context,
+        match_indices,
+        ..
+    } = item
+    {
+        return symbol_item_spans(
+            SymbolRow {
+                name,
+                kind: *symbol_kind,
+                detail,
+                depth: *depth,
+                context: *context,
+            },
+            match_indices,
+            highlighted,
+            max_width,
+        );
+    }
 
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
@@ -2749,7 +2785,8 @@ fn picker_item_spans(
         | PickerItem::Root { .. }
         | PickerItem::Diagnostic { .. }
         | PickerItem::LspServer { .. }
-        | PickerItem::Reference { .. } => unreachable!("handled above"),
+        | PickerItem::Reference { .. }
+        | PickerItem::Symbol { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
         (
@@ -3202,6 +3239,102 @@ fn reference_item_spans(
             ));
         }
     }
+    spans
+}
+
+/// The display fields of one document symbol, borrowed from [`PickerItem::Symbol`].
+struct SymbolRow<'a> {
+    name: &'a str,
+    kind: aether_protocol::picker::SymbolKind,
+    detail: &'a str,
+    depth: u32,
+    /// An ancestor shown only for tree context while filtering — rendered dim, non-selectable.
+    context: bool,
+}
+
+/// One document-symbol picker row: an indent for nesting depth, the symbol name (fuzzy-match
+/// highlighted) with its dim `detail` (signature) beside it, and the kind tag
+/// right-aligned at the row's right edge — mirroring the rich clients' alignment.
+fn symbol_item_spans(
+    sym: SymbolRow<'_>,
+    match_indices: &[u32],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let SymbolRow {
+        name,
+        kind: symbol_kind,
+        detail,
+        depth,
+        context,
+    } = sym;
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let base = Style::default().fg(NORD4).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let dim = base.fg(picker_dim_fg(highlighted));
+    // A `context` row is an ancestor shown only for tree context while filtering — render the whole
+    // row (name included) dim, so it reads as a non-selectable header above its matched descendants.
+    let base = if context { dim } else { base };
+
+    // Layout (matches the rich clients): indent (nesting), the name, then the dim `detail`
+    // (signature) beside it, and the kind tag right-aligned at the row's right edge.
+    // The kind tag + a gap are reserved up front; the name takes priority over `detail` for the
+    // remaining left space.
+    let trunc = |s: &str, budget: usize| -> String {
+        s.chars()
+            .scan(0usize, |w, c| {
+                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                if *w + cw > budget {
+                    None
+                } else {
+                    *w += cw;
+                    Some(c)
+                }
+            })
+            .collect()
+    };
+
+    let indent = "  ".repeat(depth as usize);
+    let indent_w = indent.width();
+    let kind = symbol_kind.label();
+    let kind_w = kind.width();
+    const GAP: usize = 2; // minimum gap between the left content and the right-aligned kind
+    let left_budget = max_width.saturating_sub(kind_w + GAP);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if !indent.is_empty() {
+        spans.push(Span::styled(indent.clone(), dim));
+    }
+
+    // Name (highlighted), truncated to the left budget; drop match indices past the cut.
+    let name_shown = trunc(name, left_budget.saturating_sub(indent_w));
+    let name_w = name_shown.width();
+    let kept_char_count = name_shown.chars().count() as u32;
+    let kept_indices: Vec<u32> = match_indices
+        .iter()
+        .copied()
+        .filter(|&i| i < kept_char_count)
+        .collect();
+    push_styled_with_match_indices(&mut spans, &name_shown, &kept_indices, base, match_style);
+
+    // Dim `detail` beside the name (the "parent"/signature), with whatever left space remains.
+    let mut detail_w = 0;
+    let detail_budget = left_budget.saturating_sub(indent_w + name_w + 1);
+    if !detail.is_empty() && detail_budget > 0 {
+        let dshown = trunc(detail, detail_budget);
+        if !dshown.is_empty() {
+            detail_w = 1 + dshown.width();
+            spans.push(Span::styled(format!(" {dshown}"), dim));
+        }
+    }
+
+    // Pad out to right-align the kind tag (≥ GAP by construction).
+    let left_used = indent_w + name_w + detail_w;
+    spans.push(Span::styled(
+        " ".repeat(max_width.saturating_sub(left_used + kind_w)),
+        base,
+    ));
+    spans.push(Span::styled(kind.to_string(), dim));
     spans
 }
 
@@ -3961,7 +4094,7 @@ fn append_eol_blame(spans: &mut Vec<Span<'static>>, blame: Option<&str>) {
 }
 
 /// One-line blame label: `author · 3 days ago`, or a plain marker for a line the user has edited
-/// but not committed. The commit message lives in the `Space o` details popover, not inline.
+/// but not committed. The commit message lives in the `Space y` details popover, not inline.
 fn format_blame(info: &BlameInfo) -> String {
     if info.is_uncommitted {
         return "You · Uncommitted".to_string();
@@ -6210,6 +6343,87 @@ mod tests {
         assert!(text.contains("let x = 1;  "));
         let num = spans.last().expect("line-number span");
         assert_eq!(num.style.fg, Some(NORD3));
+    }
+
+    #[test]
+    fn symbol_row_name_leads_with_detail_then_right_aligned_kind() {
+        use aether_protocol::picker::SymbolKind;
+        let spans =
+            symbol_item_spans(
+                SymbolRow {
+                    name: "buffer_id",
+                    kind: SymbolKind::Field,
+                    detail: "Option<BufferId>",
+                    depth: 0,
+                    context: false,
+                },
+                &[],
+                false,
+                40,
+            );
+        let text = spans_text(&spans);
+        assert!(text.starts_with("buffer_id"), "name leads: {text:?}");
+        assert!(text.contains("Option<BufferId>"), "detail beside name: {text:?}");
+        assert!(text.trim_end().ends_with("field"), "kind right-aligned: {text:?}");
+        assert_eq!(spans_total_width(&spans), 40);
+    }
+
+    #[test]
+    fn symbol_row_shows_name_with_empty_detail() {
+        // Top-level structs/impls come back with an empty `detail`; the name must still render
+        // (regression guard: the row isn't reduced to just the kind tag).
+        use aether_protocol::picker::SymbolKind;
+        let spans = symbol_item_spans(
+            SymbolRow {
+                name: "BufferOpenParams",
+                kind: SymbolKind::Struct,
+                detail: "",
+                depth: 0,
+                context: false,
+            },
+            &[],
+            false,
+            40,
+        );
+        let text = spans_text(&spans);
+        assert!(text.starts_with("BufferOpenParams"), "name renders: {text:?}");
+        assert!(text.trim_end().ends_with("struct"));
+    }
+
+    #[test]
+    fn symbol_context_row_renders_dim() {
+        use aether_protocol::picker::SymbolKind;
+        // A context (ancestor) row dims its name too — the name span is the dim fg, not the bright
+        // NORD4 a normal row uses.
+        let ctx = symbol_item_spans(
+            SymbolRow {
+                name: "Widget",
+                kind: SymbolKind::Struct,
+                detail: "",
+                depth: 0,
+                context: true,
+            },
+            &[],
+            false,
+            40,
+        );
+        let name = ctx.iter().find(|s| s.content.contains("Widget")).unwrap();
+        assert_eq!(name.style.fg, Some(picker_dim_fg(false)));
+        // A normal (match) row keeps the bright name colour.
+        let normal = symbol_item_spans(
+            SymbolRow {
+                name: "Widget",
+                kind: SymbolKind::Struct,
+                detail: "",
+                depth: 0,
+                context: false,
+            },
+            &[],
+            false,
+            40,
+        );
+        let name = normal.iter().find(|s| s.content.contains("Widget")).unwrap();
+        assert_eq!(name.style.fg, Some(NORD4));
     }
 
     #[test]

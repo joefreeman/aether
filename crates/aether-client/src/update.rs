@@ -1403,7 +1403,7 @@ impl Session {
         )))
     }
 
-    /// `Space o` — blame the cursor line and resolve the commit's details, one round-trip
+    /// `Space y` — blame the cursor line and resolve the commit's details, one round-trip
     /// (`include_commit_info`, docs/protocol-composites.md, G).
     pub fn show_commit_info(&mut self) -> Effects {
         self.request_str::<GitBlameLine>(
@@ -1493,8 +1493,11 @@ impl Session {
                 center_on_cursor_grep_hit: (kind == PickerKind::Grep).then_some(buffer_id),
                 directory_path,
                 explorer_roots: false,
-                buffer_id: matches!(kind, PickerKind::Diagnostics | PickerKind::References)
-                    .then_some(buffer_id),
+                buffer_id: matches!(
+                    kind,
+                    PickerKind::Diagnostics | PickerKind::References | PickerKind::DocumentSymbols
+                )
+                .then_some(buffer_id),
                 filters: seed_filters,
             },
             move |__r| Event::PickerViewed {
@@ -2900,6 +2903,17 @@ impl Session {
                 if let Ok(u) = serde_json::from_value::<PickerUpdateParams>(n.params) {
                     let mut reveal = None;
                     if let Some(p) = &mut self.picker {
+                        // A server-resolved highlight (DocumentSymbols' cursor-enclosing symbol on
+                        // the async fill) rides the push — adopt it as the pending centre + reveal,
+                        // exactly like the view response's `effective_center_on`, before applying.
+                        // The server frames the window around it, so adopt that offset too; without
+                        // this the offset guard in `apply_update` would discard a push centred on a
+                        // symbol far down the list (the bug where deep symbols never selected).
+                        if let Some(center) = u.center_on.clone() {
+                            p.offset = u.offset;
+                            p.pending_center = Some(*center);
+                            p.reveal_on_update = Some(Reveal::Minimal);
+                        }
                         if p.apply_update(u) && p.pending_center.is_none() {
                             reveal = p.reveal_on_update.take();
                         }

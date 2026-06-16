@@ -176,6 +176,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::Diagnostics => "List diagnostics…",
         PickerKind::LspServers => "List LSPs…",
         PickerKind::References => "List references…",
+        PickerKind::DocumentSymbols => "Go to symbol…",
     }
 }
 
@@ -335,10 +336,13 @@ pub fn overlay<'a>(
     // candidate is a hit — collapses to a single total (rather than the redundant "M/M").
     let counts = if state.total_matches == 0 {
         String::new()
-    } else if state.total_matches == state.total_candidates {
-        format!("{}", state.total_matches)
-    } else {
+    } else if state.total_candidates > state.total_matches {
+        // `matched/total` only when the candidate set is a genuine larger superset; otherwise just
+        // the count (guards against a stale `total_candidates`, e.g. 0, from an async picker's fill
+        // push racing the view response — which would otherwise read as `106/0`).
         format!("{}/{}", state.total_matches, state.total_candidates)
+    } else {
+        format!("{}", state.total_matches)
     };
     input = input.push(text(counts).size(12).font(SANS).color(theme::NORD3_BRIGHT));
     // An empty grep query means "no search has run" — saying "No matches" there would read
@@ -1140,6 +1144,38 @@ fn render_item<'a>(
             .spacing(6)
             .align_y(iced::Alignment::Center)
             .into()
+        }
+        PickerItem::Symbol {
+            name,
+            symbol_kind,
+            detail,
+            depth,
+            context,
+            match_indices,
+            ..
+        } => {
+            // Nested members indent under their container; the name leads, then the dim
+            // `detail` (signature) beside it, and the kind tag right-aligned. A
+            // `context` row (an ancestor shown for tree context while filtering) renders dim,
+            // like a non-selectable header above its matched descendants.
+            let mut r = iced::widget::Row::new()
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
+            let indent = (*depth as usize) * 2;
+            if indent > 0 {
+                r = r.push(iced::widget::Space::new().width(Length::Fixed((indent * 6) as f32)));
+            }
+            if *context {
+                r = r.push(meta(name.clone())); // dim, non-matching ancestor
+            } else {
+                r = r.push(highlighted(name, match_indices, theme::NORD6, SANS, hovered));
+            }
+            if !detail.is_empty() {
+                r = r.push(meta(truncate_chars(detail, PREVIEW_MAX_CHARS)));
+            }
+            r = r.push(iced::widget::Space::new().width(Length::Fill));
+            r = r.push(meta(symbol_kind.label().to_string()));
+            r.into()
         }
     }
 }

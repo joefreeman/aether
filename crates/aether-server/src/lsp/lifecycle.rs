@@ -59,6 +59,11 @@ pub async fn initialize(
                 // We parse `LocationLink` (its precise `targetSelectionRange`), so let servers send
                 // it for goto-definition instead of the coarser `Location`.
                 "definition": { "linkSupport": true },
+                // We flatten the hierarchical `DocumentSymbol[]` ourselves (tracking nesting depth
+                // for the symbol picker's top-level collapse). Without this, servers (e.g.
+                // rust-analyzer) fall back to the flat `SymbolInformation[]` form — everything depth
+                // 0, so the "top" chip has nothing to hide.
+                "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
             },
             // Let servers report background work (indexing, `cargo check`, …) via `$/progress`,
             // which we surface as the status-bar busy glyph and in the LSP picker.

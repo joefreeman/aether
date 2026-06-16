@@ -2278,6 +2278,136 @@ fn parse_references(
     }
 }
 
+/// Parse an LSP `textDocument/documentSymbol` response into a flat, depth-first list of symbol
+/// candidates for `abs_path`. The response is one of two shapes (server capability dependent):
+///
+/// - `DocumentSymbol[]` — hierarchical: each carries `name`, `kind`, an optional `detail`
+///   (signature), a `selectionRange` (the name span) and `children`. We recurse, recording the
+///   nesting `depth` and jumping to `selectionRange.start`.
+/// - `SymbolInformation[]` — flat: each carries `name`, `kind`, a `location` (range) and an
+///   optional `containerName` (used as `detail`). All at depth 0.
+///
+/// `null` / unexpected shapes yield no symbols; entries missing a name or position are skipped.
+/// Server order is preserved (it's the natural reading / nesting order). Positions convert to byte
+/// columns against `abs_path` (read from disk for non-UTF-8 servers, like `parse_location_entry`).
+fn parse_document_symbols(
+    v: &serde_json::Value,
+    abs_path: &str,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> Vec<picker_state::SymbolCandidate> {
+    let serde_json::Value::Array(items) = v else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        push_symbol(item, abs_path, encoding, 0, &mut out);
+    }
+    // Flat servers (e.g. vscode-html-language-server) return `SymbolInformation[]` with no
+    // `children`, so every symbol lands at depth 0 with the parent merely named in `containerName`.
+    // Rebuild the tree from `range` containment so the outline indents. Gated on "nothing nested
+    // yet": a hierarchical `DocumentSymbol` response already carries real depths, and the LSP spec
+    // warns its `range` needn't reflect the AST — so we trust the explicit `children` tree there and
+    // never second-guess it from ranges.
+    if out.iter().all(|c| c.depth == 0) {
+        assign_depth_by_containment(&mut out);
+    }
+    out
+}
+
+/// Reconstruct nesting depth for a flat symbol list from `range` containment: in document order,
+/// a symbol whose range is enclosed by an ancestor's is one level deeper. Sorts into document order
+/// first (by start, widest-first on ties) so it's robust to a server that returns symbols
+/// out of order, then walks a stack of open ancestors keyed by their end position.
+fn assign_depth_by_containment(cands: &mut [picker_state::SymbolCandidate]) {
+    cands.sort_by(|a, b| {
+        let pos = |p: &LogicalPosition| (p.line, p.col);
+        pos(&a.range_start)
+            .cmp(&pos(&b.range_start))
+            .then(pos(&b.range_end).cmp(&pos(&a.range_end)))
+    });
+    let mut ancestor_ends: Vec<(u32, u32)> = Vec::new();
+    for c in cands.iter_mut() {
+        let start = (c.range_start.line, c.range_start.col);
+        // Pop ancestors that have already closed at or before this symbol starts.
+        while ancestor_ends.last().is_some_and(|&end| start >= end) {
+            ancestor_ends.pop();
+        }
+        c.depth = ancestor_ends.len() as u32;
+        ancestor_ends.push((c.range_end.line, c.range_end.col));
+    }
+}
+
+/// Append one parsed symbol (and, for `DocumentSymbol`, its children) to `out`. Handles both the
+/// hierarchical and the flat response shapes by probing for the fields each carries.
+fn push_symbol(
+    entry: &serde_json::Value,
+    abs_path: &str,
+    encoding: crate::lsp::position::PositionEncoding,
+    depth: u32,
+    out: &mut Vec<picker_state::SymbolCandidate>,
+) {
+    let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let symbol_kind = entry
+        .get("kind")
+        .and_then(|v| v.as_u64())
+        .map(aether_protocol::picker::SymbolKind::from_lsp)
+        .unwrap_or_default();
+    let path = std::path::Path::new(abs_path);
+    let pos_at = |range: &serde_json::Value, edge: &str| -> Option<LogicalPosition> {
+        let p = range.get(edge)?;
+        let line = p.get("line")?.as_u64()? as u32;
+        let character = p.get("character")?.as_u64()? as u32;
+        Some(LogicalPosition {
+            line,
+            col: target_byte_col(path, line, character, encoding),
+        })
+    };
+    // DocumentSymbol: `selectionRange` is the name, `range` the full extent. SymbolInformation:
+    // both live under `location.range`.
+    let name_range = entry
+        .get("selectionRange")
+        .or_else(|| entry.get("range"))
+        .or_else(|| entry.get("location").and_then(|l| l.get("range")));
+    let full_range = entry
+        .get("range")
+        .or_else(|| entry.get("location").and_then(|l| l.get("range")))
+        .or(name_range);
+    let Some(name_pos) = name_range.and_then(|r| pos_at(r, "start")) else {
+        return;
+    };
+    // The enclosing extent for cursor-containment; fall back to a zero-width span at the name.
+    let range_start = full_range
+        .and_then(|r| pos_at(r, "start"))
+        .unwrap_or(name_pos);
+    let range_end = full_range.and_then(|r| pos_at(r, "end")).unwrap_or(name_pos);
+    // Only `DocumentSymbol.detail` (a signature). We deliberately skip `SymbolInformation`'s
+    // `containerName` — it names the enclosing scope, which the reconstructed indentation already
+    // shows, so surfacing it here would just duplicate the parent next to every flat-server symbol.
+    let detail = entry
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    out.push(picker_state::SymbolCandidate {
+        abs_path: abs_path.to_string(),
+        line: name_pos.line,
+        col: name_pos.col,
+        name: name.to_string(),
+        symbol_kind,
+        detail,
+        depth,
+        range_start,
+        range_end,
+    });
+    if let Some(children) = entry.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            push_symbol(child, abs_path, encoding, depth + 1, out);
+        }
+    }
+}
+
 /// Convert a target position's `character` (in the server's encoding) to a byte column. For UTF-8
 /// the character *is* the byte offset; otherwise read the target line from disk to convert
 /// (best-effort — falls back to the raw character if the file can't be read).
@@ -4701,21 +4831,134 @@ async fn build_reference_candidates(
     out
 }
 
-/// Monotonic token minted per References resolve, stored on the picker as `pending_async_load`.
-/// Lets a spawned resolve detect that its picker was reset/reopened (a newer epoch) and drop its
-/// now-stale result instead of populating the wrong cursor's references.
-static REFERENCES_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Build the document-symbols-picker candidates: ask the language server for the picked buffer's
+/// symbols (`textDocument/documentSymbol`), flattening any hierarchy into a depth-tagged list.
+/// Returns the candidates plus the cursor's buffer position (for the initial cursor-enclosing
+/// highlight) — both empty/None when there's no ready server, the buffer isn't file-backed, or the
+/// request fails. Async (off the lock): one LSP round-trip.
+async fn build_symbol_candidates(
+    state: &SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> (Vec<picker_state::SymbolCandidate>, Option<LogicalPosition>) {
+    let (req, abs_path, cursor) = {
+        let s = state.lock().await;
+        let abs_path = s
+            .buffers
+            .get(&buffer_id)
+            .and_then(|b| b.canonical_path.clone());
+        // The cursor's byte position (for centering on the enclosing symbol), in buffer coords —
+        // not the LSP-encoded one in `req`.
+        let cursor = s
+            .cursors
+            .get(&(client_id, buffer_id))
+            .map(|c| c.position);
+        (lsp_cursor_request(&s, client_id, buffer_id), abs_path, cursor)
+    };
+    let (Some(req), Some(abs_path)) = (req, abs_path) else {
+        return (Vec::new(), None);
+    };
+    // documentSymbol is whole-document: only the URI is needed (no cursor position).
+    let params_json = serde_json::json!({
+        "textDocument": { "uri": req.uri },
+    });
+    let candidates = match req
+        .client
+        .request("textDocument/documentSymbol", params_json)
+        .await
+    {
+        Ok(v) => parse_document_symbols(&v, &abs_path.display().to_string(), req.encoding),
+        Err(e) => {
+            tracing::debug!(error = %e, "lsp documentSymbol request failed");
+            Vec::new()
+        }
+    };
+    (candidates, cursor)
+}
 
-fn next_references_epoch() -> u64 {
-    REFERENCES_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+/// Monotonic token minted per async-resolve picker open (References, DocumentSymbols), stored on
+/// the picker as `pending_async_load`. Lets a spawned resolve detect that its picker was
+/// reset/reopened (a newer epoch) and drop its now-stale result instead of clobbering the current
+/// load. Shared across the kinds — they're keyed separately, so the counter just needs uniqueness.
+static ASYNC_LOAD_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_async_load_epoch() -> u64 {
+    ASYNC_LOAD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Apply a freshly-resolved async candidate set to its picker, unless a newer open superseded it
+/// (the `pending_async_load` epoch moved past `epoch`) or the picker was hidden/closed. Reranks
+/// against whatever query the user typed while the resolve was in flight, clamps the window, clears
+/// the loading flag, and pushes the updated window. Shared by the References and DocumentSymbols
+/// background resolves — both open empty + `ticking` and are filled by this.
+async fn apply_async_candidates(
+    state: &SharedState,
+    client_id: ClientId,
+    kind: PickerKind,
+    epoch: u64,
+    candidates: picker_state::PickerCandidates,
+    cursor: Option<LogicalPosition>,
+) {
+    let mut s = state.lock().await;
+    let key = (client_id, kind);
+    let Some(picker) = s.pickers.get_mut(&key) else {
+        return; // picker gone (closed/reset)
+    };
+    if picker.pending_async_load != Some(epoch) {
+        return; // superseded by a newer open, or already applied
+    }
+    picker.pending_async_load = None;
+    picker.candidates = candidates;
+    let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
+    let ServerState {
+        pickers, matcher, ..
+    } = &mut *s;
+    let picker = pickers.get_mut(&key).expect("checked above");
+    // Rank against the current query — the user may have typed a filter while we resolved.
+    picker.rerank(matcher);
+    // DocumentSymbols: highlight the symbol the cursor sits in. Picked among the *visible* (ranked)
+    // symbols and innermost-first (deepest depth, then latest start), so with the top-level chip on
+    // it lands on the enclosing top-level symbol; expanded, on the innermost member. We keep its
+    // *rank* (position in `ranked`) so the window can be framed around it — a symbol far down the
+    // list (e.g. a field near the bottom of a big file, all levels expanded) would otherwise sit
+    // outside the pushed window and never match the client's identity centering.
+    let center: Option<(u32, usize)> = match (&picker.candidates, cursor) {
+        (picker_state::PickerCandidates::Symbols(syms), Some(pos)) => picker
+            .ranked
+            .iter()
+            .enumerate()
+            .filter(|(_, &ci)| syms[ci as usize].contains(pos))
+            .max_by_key(|(_, &ci)| {
+                let c = &syms[ci as usize];
+                (c.depth, c.range_start.line, c.range_start.col)
+            })
+            .map(|(rank, &ci)| (rank as u32, ci as usize)),
+        _ => None,
+    };
+    // Frame the window: around the centered symbol when there is one (it rides the push as
+    // `center_on`, and the client adopts this offset), else clamp a stale offset back into range.
+    if let Some(window) = picker.subscribed.as_mut() {
+        let total = picker.ranked.len() as u32;
+        match center {
+            Some((rank, _)) => window.offset = rank.saturating_sub(window.limit / 2),
+            None if window.offset >= total => window.offset = total.saturating_sub(window.limit),
+            None => {}
+        }
+    }
+    let center_on = center.map(|(_, ci)| Box::new(picker.candidates.make_item(ci, Vec::new())));
+    let mut update = picker_state::build_update(picker, matcher);
+    if let Some(ref mut u) = update {
+        u.ticking = false; // resolve finished
+        u.center_on = center_on;
+    }
+    drop(s);
+    if let (Some(sender), Some(params)) = (outbound, update) {
+        let _ = sender.send(picker_update_notif(params)).await;
+    }
 }
 
 /// Resolve the References picker's candidates in the background (an LSP round-trip + file reads,
-/// off the lock) and push them into the already-open picker. The picker opens empty + `ticking`;
-/// this is what fills it. Detached/fire-and-forget. Drops its result if the picker was hidden,
-/// closed, or reset (the `pending_async_load` epoch moved past `epoch`) while resolving. On a
-/// match it reranks against whatever query the user has typed in the meantime and clears the
-/// loading flag, so a filter entered during the load applies to the arriving results.
+/// off the lock) and push them into the already-open picker. Detached/fire-and-forget.
 pub fn spawn_reference_resolve(
     state: SharedState,
     client_id: ClientId,
@@ -4724,38 +4967,37 @@ pub fn spawn_reference_resolve(
 ) {
     tokio::spawn(async move {
         let candidates = build_reference_candidates(&state, client_id, buffer_id).await;
-        let mut s = state.lock().await;
-        let key = (client_id, PickerKind::References);
-        let Some(picker) = s.pickers.get_mut(&key) else {
-            return; // picker gone (closed/reset)
-        };
-        if picker.pending_async_load != Some(epoch) {
-            return; // superseded by a newer open, or already applied
-        }
-        picker.pending_async_load = None;
-        picker.candidates = picker_state::PickerCandidates::References(candidates);
-        let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
-        let ServerState {
-            pickers, matcher, ..
-        } = &mut *s;
-        let picker = pickers.get_mut(&key).expect("checked above");
-        // Rank against the current query — the user may have typed a filter while we resolved.
-        picker.rerank(matcher);
-        // The pending offset may now be past the end of the (newly non-empty) result set. Clamp.
-        if let Some(window) = picker.subscribed.as_mut() {
-            let total = picker.ranked.len() as u32;
-            if window.offset >= total {
-                window.offset = total.saturating_sub(window.limit);
-            }
-        }
-        let mut update = picker_state::build_update(picker, matcher);
-        if let Some(ref mut u) = update {
-            u.ticking = false; // resolve finished
-        }
-        drop(s);
-        if let (Some(sender), Some(params)) = (outbound, update) {
-            let _ = sender.send(picker_update_notif(params)).await;
-        }
+        apply_async_candidates(
+            &state,
+            client_id,
+            PickerKind::References,
+            epoch,
+            picker_state::PickerCandidates::References(candidates),
+            None, // references open at the top, no cursor centering
+        )
+        .await;
+    });
+}
+
+/// Resolve the DocumentSymbols picker's candidates in the background (one LSP round-trip, off the
+/// lock) and push them into the already-open picker. Detached/fire-and-forget.
+pub fn spawn_symbol_resolve(
+    state: SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    epoch: u64,
+) {
+    tokio::spawn(async move {
+        let (candidates, cursor) = build_symbol_candidates(&state, client_id, buffer_id).await;
+        apply_async_candidates(
+            &state,
+            client_id,
+            PickerKind::DocumentSymbols,
+            epoch,
+            picker_state::PickerCandidates::Symbols(candidates),
+            cursor,
+        )
+        .await;
     });
 }
 
@@ -9034,6 +9276,10 @@ pub async fn picker_view(
         // is set up) fills it. On a fresh open the empty set is installed here; on a resume/scroll
         // re-view `preserve_existing` keeps the prior snapshot.
         PickerKind::References => picker_state::PickerCandidates::References(Vec::new()),
+        // DocumentSymbols also resolves asynchronously (a `textDocument/documentSymbol` round-trip),
+        // so it opens empty and the spawned task (below) fills it; resume/scroll re-views preserve
+        // the prior snapshot via `preserve_existing`.
+        PickerKind::DocumentSymbols => picker_state::PickerCandidates::Symbols(Vec::new()),
     };
 
     let mut s = state.lock().await;
@@ -9112,6 +9358,12 @@ pub async fn picker_view(
                     picker_state::PickerCandidates::References(_),
                     picker_state::PickerCandidates::References(_),
                 ) => true,
+                // DocumentSymbols: keep the one-shot LSP snapshot across scroll/resume re-views, like
+                // References and Diagnostics.
+                (
+                    picker_state::PickerCandidates::Symbols(_),
+                    picker_state::PickerCandidates::Symbols(_),
+                ) => true,
                 _ => false,
             };
             if !preserve_existing {
@@ -9136,15 +9388,15 @@ pub async fn picker_view(
         }
     }
 
-    // References: a fresh open (`buffer_id` present, vs `None` on scroll/resume re-views) kicks
-    // off the async `textDocument/references` resolve. Mint an epoch, mark the picker loading, and
+    // References / DocumentSymbols: a fresh open (`buffer_id` present, vs `None` on scroll/resume
+    // re-views) kicks off the async LSP resolve. Mint an epoch, mark the picker loading, and
     // remember what to spawn once the lock is released — the picker is pushed empty + `ticking`
     // now, and the spawned task fills it.
-    let references_resolve: Option<(BufferId, u64)> = match (params.kind, params.buffer_id) {
-        (PickerKind::References, Some(buffer_id)) => {
-            let epoch = next_references_epoch();
+    let async_resolve: Option<(PickerKind, BufferId, u64)> = match (params.kind, params.buffer_id) {
+        (PickerKind::References | PickerKind::DocumentSymbols, Some(buffer_id)) => {
+            let epoch = next_async_load_epoch();
             picker.pending_async_load = Some(epoch);
-            Some((buffer_id, epoch))
+            Some((params.kind, buffer_id, epoch))
         }
         _ => None,
     };
@@ -9201,9 +9453,9 @@ pub async fn picker_view(
     // Build the initial push so the client doesn't have to wait for an async update to arrive
     // before it can render. Caller will treat the response and the notification as redundant.
     let mut update = picker_state::build_update(picker, matcher);
-    // References opens empty while it resolves — mark the push `ticking` so the client shows the
-    // loading state instead of an empty result set.
-    if references_resolve.is_some() {
+    // References / DocumentSymbols open empty while they resolve — mark the push `ticking` so the
+    // client shows the loading state instead of an empty result set.
+    if async_resolve.is_some() {
         if let Some(ref mut u) = update {
             u.ticking = true;
         }
@@ -9232,9 +9484,17 @@ pub async fn picker_view(
         let _ = sender.send(picker_update_notif(params)).await;
     }
 
-    // Kick off the references resolve now that the empty + loading state is on the wire.
-    if let Some((buffer_id, epoch)) = references_resolve {
-        spawn_reference_resolve(state.clone(), client_id, buffer_id, epoch);
+    // Kick off the async resolve now that the empty + loading state is on the wire.
+    if let Some((kind, buffer_id, epoch)) = async_resolve {
+        match kind {
+            PickerKind::References => {
+                spawn_reference_resolve(state.clone(), client_id, buffer_id, epoch)
+            }
+            PickerKind::DocumentSymbols => {
+                spawn_symbol_resolve(state.clone(), client_id, buffer_id, epoch)
+            }
+            _ => {}
+        }
     }
 
     Ok(result)
@@ -9291,10 +9551,10 @@ pub async fn picker_query(
         }
     }
 
-    // References whose async resolve is still outstanding: a filter typed mid-load reranks the
-    // (still empty) candidates, so without this the push would report "finished, 0 matches" and
-    // the picker would flash "No references found" until the resolve lands. Keep it ticking.
-    let references_loading = picker.pending_async_load.is_some();
+    // References / DocumentSymbols whose async resolve is still outstanding: a filter typed mid-load
+    // reranks the (still empty) candidates, so without this the push would report "finished, 0
+    // matches" and the picker would flash "No results" until the resolve lands. Keep it ticking.
+    let async_loading = picker.pending_async_load.is_some();
     let mut update = picker_state::build_update(picker, matcher);
     let query_for_grep = picker.query.clone();
     let filters_for_grep = picker.filters.clone();
@@ -9306,7 +9566,10 @@ pub async fn picker_query(
     // client would briefly see "0 hits, search finished" between sending the query and the
     // coordinator's first batch landing.
     if will_spawn_grep_search
-        || (matches!(params.kind, PickerKind::References) && references_loading)
+        || (matches!(
+            params.kind,
+            PickerKind::References | PickerKind::DocumentSymbols
+        ) && async_loading)
     {
         if let Some(ref mut u) = update {
             u.ticking = true;
@@ -10167,6 +10430,101 @@ mod lsp_parse_tests {
             {"garbage": true},
         ]);
         assert_eq!(parse_references(&v, PositionEncoding::Utf8).len(), 1);
+    }
+
+    #[test]
+    fn document_symbols_flattens_hierarchy_with_depth() {
+        // DocumentSymbol[]: a struct with two nested members. selectionRange drives the position;
+        // children are flattened depth-first with incrementing depth.
+        let v = json!([
+            {
+                "name": "Parser", "kind": 23, "detail": "struct Parser",
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 1}},
+                "selectionRange": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 13}},
+                "children": [
+                    {
+                        "name": "new", "kind": 6, "detail": "fn() -> Parser",
+                        "range": {"start": {"line": 1, "character": 4}, "end": {"line": 3, "character": 5}},
+                        "selectionRange": {"start": {"line": 1, "character": 11}, "end": {"line": 1, "character": 14}}
+                    }
+                ]
+            }
+        ]);
+        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8);
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "Parser");
+        assert_eq!(syms[0].symbol_kind, aether_protocol::picker::SymbolKind::Struct);
+        assert_eq!(syms[0].depth, 0);
+        assert_eq!((syms[0].line, syms[0].col), (0, 7)); // selectionRange, not range
+        assert_eq!(syms[0].detail, "struct Parser");
+        assert_eq!(syms[1].name, "new");
+        assert_eq!(syms[1].symbol_kind, aether_protocol::picker::SymbolKind::Method);
+        assert_eq!(syms[1].depth, 1);
+        assert_eq!((syms[1].line, syms[1].col), (1, 11));
+        // The full `range` (not selectionRange) is captured for cursor containment: the struct
+        // spans lines 0..9, so a cursor on line 5 falls inside it.
+        assert_eq!(syms[0].range_start, LogicalPosition { line: 0, col: 0 });
+        assert_eq!(syms[0].range_end, LogicalPosition { line: 9, col: 1 });
+        assert!(syms[0].contains(LogicalPosition { line: 5, col: 0 }));
+    }
+
+    #[test]
+    fn document_symbols_parses_flat_symbol_information() {
+        // SymbolInformation[]: no selectionRange/children; position under location.range.
+        // `containerName` is deliberately *not* used as detail (the tree indentation shows the
+        // parent), so detail stays empty here.
+        let v = json!([
+            {
+                "name": "helper", "kind": 12, "containerName": "mymod",
+                "location": {"uri": "file:///p/a.rs", "range": {"start": {"line": 5, "character": 3}, "end": {"line": 5, "character": 9}}}
+            }
+        ]);
+        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "helper");
+        assert_eq!(syms[0].symbol_kind, aether_protocol::picker::SymbolKind::Function);
+        assert_eq!(syms[0].detail, "", "containerName is not surfaced as detail");
+        assert_eq!(syms[0].depth, 0);
+        assert_eq!((syms[0].line, syms[0].col), (5, 3));
+    }
+
+    #[test]
+    fn document_symbols_flat_reconstructs_depth_from_ranges() {
+        // A flat SymbolInformation[] (like vscode-html) with nested ranges — html > head > meta —
+        // gets its tree rebuilt from `range` containment so the outline indents.
+        let loc = |s: (u64, u64), e: (u64, u64)| {
+            json!({"range": {"start": {"line": s.0, "character": s.1}, "end": {"line": e.0, "character": e.1}}})
+        };
+        let v = json!([
+            {"name": "html", "kind": 8, "location": loc((1, 0), (24, 7))},
+            {"name": "head", "kind": 8, "location": loc((2, 2), (6, 9))},
+            {"name": "meta", "kind": 8, "location": loc((3, 4), (3, 28))},
+            {"name": "title", "kind": 8, "location": loc((4, 4), (4, 33))},
+            {"name": "body", "kind": 8, "location": loc((7, 2), (23, 9))},
+            {"name": "h1", "kind": 8, "location": loc((8, 4), (8, 20))},
+        ]);
+        let syms = parse_document_symbols(&v, "/p/a.html", PositionEncoding::Utf8);
+        let depth = |name: &str| syms.iter().find(|c| c.name == name).unwrap().depth;
+        assert_eq!(depth("html"), 0);
+        assert_eq!(depth("head"), 1);
+        assert_eq!(depth("body"), 1);
+        assert_eq!(depth("meta"), 2);
+        assert_eq!(depth("title"), 2);
+        assert_eq!(depth("h1"), 2); // h1 under body
+    }
+
+    #[test]
+    fn document_symbols_null_and_bad_entries_skipped() {
+        // null / non-array → empty; entries missing name or position are skipped, not fatal.
+        assert!(parse_document_symbols(&json!(null), "/p/a.rs", PositionEncoding::Utf8).is_empty());
+        let v = json!([
+            {"name": "ok", "kind": 13, "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}},
+            {"kind": 13, "selectionRange": {"start": {"line": 1, "character": 0}}},
+            {"name": "no_pos", "kind": 13},
+        ]);
+        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "ok");
     }
 
     #[test]

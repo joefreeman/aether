@@ -4298,6 +4298,7 @@ mod tests {
             ticking: false,
             grep_display_offset: Some(0),
             grep_total_display_rows: Some(25),
+            center_on: None,
         }));
         s
     }
@@ -4351,6 +4352,7 @@ mod tests {
             ticking: false,
             grep_display_offset: None,
             grep_total_display_rows: None,
+            center_on: None,
         }));
         let scroll = 6.0 * ROW_H;
         s.selected = 6; // first visible row — visible as-is

@@ -246,7 +246,16 @@ export type PickerKind =
   | "projects"
   | "diagnostics"
   | "lsp_servers"
-  | "references";
+  | "references"
+  | "document_symbols";
+
+/** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
+ *  outside the LSP-defined 1..=26 range. */
+export type SymbolKind =
+  | "file" | "module" | "namespace" | "package" | "class" | "method" | "property" | "field"
+  | "constructor" | "enum" | "interface" | "function" | "variable" | "constant" | "string"
+  | "number" | "boolean" | "array" | "object" | "key" | "null" | "enum_member" | "struct"
+  | "event" | "operator" | "type_parameter" | "unknown";
 
 /** Mirrors aether-protocol::picker::PickerItem (serde tag = "kind", snake_case). `match_indices`
  *  are code-point offsets into the row's display string, covered by the fuzzy match. */
@@ -286,5 +295,23 @@ export type PickerItem =
       col: number;
       /** The referenced line's text; the fuzzy haystack + preview. */
       preview: string;
+      match_indices?: number[];
+    }
+  | {
+      kind: "symbol";
+      /** Absolute path to the buffer's file (fed into buffer/open on select). */
+      path: string;
+      line: number;
+      col: number;
+      /** Symbol name — fuzzy haystack + the row's primary label. */
+      name: string;
+      symbol_kind: SymbolKind;
+      /** The DocumentSymbol signature; empty for flat servers (containerName is not surfaced). */
+      detail?: string;
+      /** Nesting depth (0 = top-level), for indenting members. */
+      depth?: number;
+      /** True when this row is only an ancestor of a match, shown dim for tree context while
+       *  filtering — non-selectable (the core's navigation skips it). Absent when false. */
+      context?: boolean;
       match_indices?: number[];
     };

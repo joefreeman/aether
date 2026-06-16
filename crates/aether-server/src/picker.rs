@@ -120,6 +120,41 @@ pub struct ReferenceCandidate {
     pub preview: String,
 }
 
+/// One document-symbols-picker candidate — a single symbol from `textDocument/documentSymbol`,
+/// scoped to the picked buffer. `name` is the fuzzy haystack; `abs_path` + `(line, col)` drive the
+/// `FileAt` jump on select. Hierarchical responses are flattened depth-first, so `depth` records
+/// the nesting level for indentation.
+#[derive(Debug, Clone)]
+pub struct SymbolCandidate {
+    /// Absolute canonical path of the buffer's file.
+    pub abs_path: String,
+    /// The symbol *name* position (`selectionRange.start`) — the jump target + identity.
+    pub line: u32,
+    pub col: u32,
+    /// Symbol name — haystack + the row's primary label.
+    pub name: String,
+    pub symbol_kind: aether_protocol::picker::SymbolKind,
+    /// Signature (`DocumentSymbol`) or container name (`SymbolInformation`); empty when absent.
+    pub detail: String,
+    /// Nesting depth (0 = top-level).
+    pub depth: u32,
+    /// The symbol's full enclosing extent (`DocumentSymbol.range` / `SymbolInformation.location`),
+    /// used only to find the symbol the cursor sits in for the initial highlight — not sent on the
+    /// wire. Falls back to a zero-width span at the name position when the server omits it.
+    pub range_start: LogicalPosition,
+    pub range_end: LogicalPosition,
+}
+
+impl SymbolCandidate {
+    /// True when `pos` falls within this symbol's enclosing range (start-inclusive, end-inclusive
+    /// so a cursor resting on the closing brace still counts as "inside").
+    pub fn contains(&self, pos: LogicalPosition) -> bool {
+        let p = (pos.line, pos.col);
+        (self.range_start.line, self.range_start.col) <= p
+            && p <= (self.range_end.line, self.range_end.col)
+    }
+}
+
 /// One LSP-servers-picker candidate — a language server for the active project. `name` is the
 /// fuzzy haystack; `language` is the key the client restarts by. Rebuilt on every `picker/view`
 /// and on each `lsp/status_changed` (the list is tiny and the status changes), so the row's
@@ -190,6 +225,10 @@ pub enum PickerCandidates {
     /// snapshot; preserved across non-reset re-views (like Diagnostics) so scrolling doesn't
     /// rebuild against a possibly-changed set.
     References(Vec<ReferenceCandidate>),
+    /// The picked buffer's symbols. Built on open from a one-shot `textDocument/documentSymbol`
+    /// snapshot; preserved across non-reset re-views (like References) so scrolling doesn't rebuild
+    /// against a possibly-changed set.
+    Symbols(Vec<SymbolCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -214,6 +253,7 @@ impl PickerCandidates {
             PickerCandidates::Diagnostics(v) => v.len(),
             PickerCandidates::LspServers(v) => v.len(),
             PickerCandidates::References(v) => v.len(),
+            PickerCandidates::Symbols(v) => v.len(),
         }
     }
 
@@ -228,6 +268,7 @@ impl PickerCandidates {
             PickerCandidates::Diagnostics(_) => PickerKind::Diagnostics,
             PickerCandidates::LspServers(_) => PickerKind::LspServers,
             PickerCandidates::References(_) => PickerKind::References,
+            PickerCandidates::Symbols(_) => PickerKind::DocumentSymbols,
         }
     }
 
@@ -246,6 +287,7 @@ impl PickerCandidates {
             PickerCandidates::Diagnostics(v) => &v[idx].message,
             PickerCandidates::LspServers(v) => &v[idx].name,
             PickerCandidates::References(v) => &v[idx].preview,
+            PickerCandidates::Symbols(v) => &v[idx].name,
         }
     }
 
@@ -335,6 +377,23 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::Symbols(v) => {
+                let c = &v[idx];
+                PickerItem::Symbol {
+                    path: c.abs_path.clone(),
+                    line: c.line,
+                    col: c.col,
+                    name: c.name.clone(),
+                    symbol_kind: c.symbol_kind,
+                    detail: c.detail.clone(),
+                    depth: c.depth,
+                    // `context` is query-dependent (a candidate is "context" only when it's an
+                    // ancestor of a match but not matched itself) — set by `build_window_items`,
+                    // which knows the current match set; here it defaults off.
+                    context: false,
+                    match_indices,
+                }
+            }
         }
     }
 
@@ -405,6 +464,14 @@ impl PickerCandidates {
             ) => v
                 .iter()
                 .position(|c| c.abs_path == *path && c.line == *line && c.col == *col),
+            (
+                PickerCandidates::Symbols(v),
+                PickerItem::Symbol {
+                    path, line, col, ..
+                },
+            ) => v
+                .iter()
+                .position(|c| c.abs_path == *path && c.line == *line && c.col == *col),
             _ => None,
         }
     }
@@ -419,7 +486,8 @@ impl PickerCandidates {
             | PickerCandidates::Projects(_)
             | PickerCandidates::Diagnostics(_)
             | PickerCandidates::LspServers(_)
-            | PickerCandidates::References(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::References(_)
+            | PickerCandidates::Symbols(_) => MatchStrategy::Fuzzy,
             PickerCandidates::Explorer(_) | PickerCandidates::ExplorerRoots(_) => {
                 MatchStrategy::PrefixSmartcase
             }
@@ -482,6 +550,16 @@ impl PickerCandidates {
             // `lsp/restart_server` (Ctrl-r). `select` never fires for this kind.
             PickerCandidates::LspServers(_) => None,
             PickerCandidates::References(v) => {
+                let c = &v[idx];
+                Some(PickerSelectResult::FileAt {
+                    path: c.abs_path.clone(),
+                    position: LogicalPosition {
+                        line: c.line,
+                        col: c.col,
+                    },
+                })
+            }
+            PickerCandidates::Symbols(v) => {
                 let c = &v[idx];
                 Some(PickerSelectResult::FileAt {
                     path: c.abs_path.clone(),
@@ -693,9 +771,32 @@ impl PickerState {
                         scored.push((score, i as u32));
                     }
                 }
-                // Higher score first; ties fall back to candidate order for determinism.
-                scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-                self.ranked.extend(scored.into_iter().map(|(_, i)| i));
+                if let PickerCandidates::Symbols(syms) = &self.candidates {
+                    // DocumentSymbols read as a tree: keep the matches in document order (not score
+                    // order) and pull in each match's ancestor chain so the filtered list shows the
+                    // sub-tree with context. Ancestors are added as plain candidate indices; because
+                    // they don't match the query they get no `match_indices`, which the client/window
+                    // builder reads as a non-selectable `context` row. The BTreeSet both dedups
+                    // shared ancestors and yields document (index) order.
+                    let mut keep: std::collections::BTreeSet<u32> =
+                        scored.iter().map(|(_, i)| *i).collect();
+                    for (_, m) in &scored {
+                        let mut depth = syms[*m as usize].depth;
+                        let mut j = *m;
+                        while depth > 0 && j > 0 {
+                            j -= 1;
+                            if syms[j as usize].depth < depth {
+                                keep.insert(j);
+                                depth = syms[j as usize].depth;
+                            }
+                        }
+                    }
+                    self.ranked = keep.into_iter().collect();
+                } else {
+                    // Higher score first; ties fall back to candidate order for determinism.
+                    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                    self.ranked.extend(scored.into_iter().map(|(_, i)| i));
+                }
             }
             MatchStrategy::PrefixSmartcase => {
                 // Shell-tab-completion style: the typed query is a literal prefix of the entry
@@ -805,7 +906,20 @@ impl PickerState {
             } else {
                 Vec::new()
             };
-            items.push(self.candidates.make_item(idx, match_indices));
+            let mut item = self.candidates.make_item(idx, match_indices);
+            // A symbol in the filtered ranked set that didn't match the query is an ancestor pulled
+            // in for tree context (see `rerank`): flag it so the client renders it dim + skips it.
+            if query_active {
+                if let PickerItem::Symbol {
+                    context,
+                    match_indices,
+                    ..
+                } = &mut item
+                {
+                    *context = match_indices.is_empty();
+                }
+            }
+            items.push(item);
         }
         (start, items)
     }
@@ -864,6 +978,8 @@ pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<Picker
         ticking: false,
         grep_display_offset,
         grep_total_display_rows,
+        // Set by callers that resolve a cursor-based highlight (DocumentSymbols' async fill).
+        center_on: None,
     })
 }
 
@@ -1045,6 +1161,169 @@ mod tests {
             }
             other => panic!("expected FileAt, got {other:?}"),
         }
+    }
+
+    fn symbol_candidates() -> PickerCandidates {
+        use aether_protocol::picker::SymbolKind;
+        PickerCandidates::Symbols(vec![
+            SymbolCandidate {
+                abs_path: "/proj/src/lib.rs".into(),
+                line: 0,
+                col: 3,
+                name: "Parser".into(),
+                symbol_kind: SymbolKind::Struct,
+                detail: String::new(),
+                depth: 0,
+                range_start: LogicalPosition { line: 0, col: 0 },
+                range_end: LogicalPosition { line: 9, col: 1 },
+            },
+            SymbolCandidate {
+                abs_path: "/proj/src/lib.rs".into(),
+                line: 4,
+                col: 7,
+                name: "parse".into(),
+                symbol_kind: SymbolKind::Method,
+                detail: "fn(&self) -> Ast".into(),
+                depth: 1,
+                range_start: LogicalPosition { line: 4, col: 4 },
+                range_end: LogicalPosition { line: 6, col: 5 },
+            },
+        ])
+    }
+
+    #[test]
+    fn symbol_candidates_round_trip_to_items() {
+        use aether_protocol::picker::SymbolKind;
+        let c = symbol_candidates();
+        assert_eq!(c.kind(), PickerKind::DocumentSymbols);
+        assert_eq!(c.len(), 2);
+        // The symbol name is the fuzzy haystack (not a preview line, unlike References).
+        assert_eq!(c.display_at(1), "parse");
+        assert_eq!(c.match_strategy(), MatchStrategy::Fuzzy);
+        match c.make_item(1, vec![0, 1]) {
+            PickerItem::Symbol {
+                path,
+                line,
+                col,
+                name,
+                symbol_kind,
+                detail,
+                depth,
+                context,
+                match_indices,
+            } => {
+                assert!(!context); // make_item defaults context off (set by build_window_items)
+                assert_eq!(path, "/proj/src/lib.rs");
+                assert_eq!(line, 4);
+                assert_eq!(col, 7);
+                assert_eq!(name, "parse");
+                assert_eq!(symbol_kind, SymbolKind::Method);
+                assert_eq!(detail, "fn(&self) -> Ast");
+                assert_eq!(depth, 1);
+                assert_eq!(match_indices, vec![0, 1]);
+            }
+            other => panic!("expected Symbol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn symbol_identity_is_path_line_col() {
+        use aether_protocol::picker::SymbolKind;
+        let c = symbol_candidates();
+        // Round-trips by (path, line, col); name/detail/depth are irrelevant to identity.
+        assert_eq!(c.position_of(&c.make_item(0, vec![])), Some(0));
+        let elsewhere = PickerItem::Symbol {
+            path: "/proj/src/lib.rs".into(),
+            line: 99,
+            col: 0,
+            name: "ignored".into(),
+            symbol_kind: SymbolKind::Function,
+            detail: String::new(),
+            depth: 0,
+            context: false,
+            match_indices: vec![],
+        };
+        // wrong line → no match
+        assert_eq!(c.position_of(&elsewhere), None);
+    }
+
+    #[test]
+    fn symbol_filter_pulls_in_ancestors_as_context() {
+        use aether_protocol::picker::SymbolKind;
+        // A struct `Widget` with a nested method `parse`. Filtering to "parse" keeps `parse` (the
+        // match) and pulls in `Widget` as a non-matching `context` ancestor for tree context, in
+        // document order. (`Widget` doesn't fuzzy-match "parse", so it's purely context.)
+        let cands = PickerCandidates::Symbols(vec![
+            SymbolCandidate {
+                abs_path: "/p/a.rs".into(),
+                line: 0,
+                col: 7,
+                name: "Widget".into(),
+                symbol_kind: SymbolKind::Struct,
+                detail: String::new(),
+                depth: 0,
+                range_start: LogicalPosition { line: 0, col: 0 },
+                range_end: LogicalPosition { line: 9, col: 1 },
+            },
+            SymbolCandidate {
+                abs_path: "/p/a.rs".into(),
+                line: 4,
+                col: 7,
+                name: "parse".into(),
+                symbol_kind: SymbolKind::Method,
+                detail: String::new(),
+                depth: 1,
+                range_start: LogicalPosition { line: 4, col: 4 },
+                range_end: LogicalPosition { line: 6, col: 5 },
+            },
+        ]);
+        let mut s = PickerState::new(cands);
+        let mut m = make_matcher();
+        s.query = "parse".into();
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0, 1], "match (parse, idx 1) + its ancestor (Widget, idx 0)");
+        let (_, items) = s.build_window_items(0, 10, &mut m);
+        match &items[0] {
+            PickerItem::Symbol { name, context, match_indices, .. } => {
+                assert_eq!(name, "Widget");
+                assert!(*context, "the unmatched ancestor is a context row");
+                assert!(match_indices.is_empty());
+            }
+            other => panic!("expected Symbol, got {other:?}"),
+        }
+        match &items[1] {
+            PickerItem::Symbol { name, context, match_indices, .. } => {
+                assert_eq!(name, "parse");
+                assert!(!*context, "the match is selectable, not context");
+                assert!(!match_indices.is_empty(), "the match is highlighted");
+            }
+            other => panic!("expected Symbol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn symbol_selects_to_file_at() {
+        match symbol_candidates().select_result(1) {
+            Some(PickerSelectResult::FileAt { path, position }) => {
+                assert_eq!(path, "/proj/src/lib.rs");
+                assert_eq!(position, LogicalPosition { line: 4, col: 7 });
+            }
+            other => panic!("expected FileAt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn symbol_contains_cursor_is_range_based() {
+        let PickerCandidates::Symbols(v) = symbol_candidates() else {
+            unreachable!()
+        };
+        // A cursor on line 5 is inside both the struct and its nested method (innermost wins when
+        // the caller picks the deepest match).
+        assert!(v[0].contains(LogicalPosition { line: 5, col: 0 }));
+        assert!(v[1].contains(LogicalPosition { line: 5, col: 0 }));
+        // Line 8 is past the method but still inside the struct.
+        assert!(v[0].contains(LogicalPosition { line: 8, col: 0 }));
+        assert!(!v[1].contains(LogicalPosition { line: 8, col: 0 }));
     }
 
     #[test]

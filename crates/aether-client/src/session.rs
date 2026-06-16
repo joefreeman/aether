@@ -557,7 +557,7 @@ pub enum HoverText {
     Markdown(Vec<crate::markdown::Block>),
 }
 
-/// What `Space o`'s blame → commit-info chain resolved to.
+/// What `Space y`'s blame → commit-info chain resolved to.
 #[derive(Debug)]
 pub enum CommitDetails {
     Info(Box<CommitInfo>),

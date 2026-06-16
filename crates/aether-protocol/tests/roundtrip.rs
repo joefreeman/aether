@@ -1386,6 +1386,67 @@ fn picker_item_reference_is_tagged() {
 }
 
 #[test]
+fn picker_item_symbol_is_tagged() {
+    use aether_protocol::picker::{PickerItem, PickerKind, SymbolKind};
+    assert_eq!(
+        to_value(PickerKind::DocumentSymbols).unwrap(),
+        json!("document_symbols")
+    );
+    let item = PickerItem::Symbol {
+        path: "/home/u/proj/src/lib.rs".into(),
+        line: 10,
+        col: 3,
+        name: "parse_header".into(),
+        symbol_kind: SymbolKind::Function,
+        detail: "fn(&[u8]) -> Header".into(),
+        depth: 1,
+        context: false,
+        match_indices: vec![0, 1],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(v["kind"], "symbol");
+    assert_eq!(v["path"], "/home/u/proj/src/lib.rs");
+    assert_eq!(v["line"], 10);
+    assert_eq!(v["col"], 3);
+    assert_eq!(v["name"], "parse_header");
+    assert_eq!(v["symbol_kind"], "function");
+    assert_eq!(v["detail"], "fn(&[u8]) -> Header");
+    assert_eq!(v["depth"], 1);
+    assert!(v.get("context").is_none(), "context absent on the wire when false");
+    assert_eq!(v["match_indices"], json!([0, 1]));
+    let back: PickerItem = from_value(v).unwrap();
+    assert_eq!(back, item);
+
+    // A context (ancestor) row serializes the flag.
+    let ctx = PickerItem::Symbol {
+        path: "/a".into(),
+        line: 0,
+        col: 0,
+        name: "Outer".into(),
+        symbol_kind: SymbolKind::Struct,
+        detail: String::new(),
+        depth: 0,
+        context: true,
+        match_indices: vec![],
+    };
+    assert_eq!(to_value(&ctx).unwrap()["context"], true);
+
+    // detail / depth / context / match_indices all default when omitted.
+    let bare: PickerItem = from_value(json!({
+        "kind": "symbol", "path": "/a", "line": 0, "col": 0, "name": "x", "symbol_kind": "struct"
+    }))
+    .unwrap();
+    assert!(matches!(
+        bare,
+        PickerItem::Symbol { ref detail, depth: 0, context: false, ref match_indices, .. }
+            if detail.is_empty() && match_indices.is_empty()
+    ));
+    // An out-of-range LSP kind degrades to Unknown.
+    assert_eq!(SymbolKind::from_lsp(99), SymbolKind::Unknown);
+    assert_eq!(SymbolKind::from_lsp(12), SymbolKind::Function);
+}
+
+#[test]
 fn picker_item_lsp_server_is_tagged() {
     use aether_protocol::picker::{PickerItem, PickerKind};
     assert_eq!(
@@ -1479,6 +1540,7 @@ fn picker_update_round_trips_through_notification() {
         ticking: false,
         grep_display_offset: None,
         grep_total_display_rows: None,
+        center_on: None,
     };
     let notif = Notification {
         jsonrpc: JsonRpc,
@@ -1491,6 +1553,40 @@ fn picker_update_round_trips_through_notification() {
     assert_eq!(v["params"]["generation"], 7);
     assert_eq!(v["params"]["items"][0]["relative_path"], "a");
     assert_eq!(v["params"]["items"][0]["path_index"], 0);
+    // center_on is absent on the wire when None (the common case).
+    assert!(v["params"].get("center_on").is_none());
+}
+
+#[test]
+fn picker_update_carries_center_on_symbol() {
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams, SymbolKind};
+    let params = PickerUpdateParams {
+        kind: PickerKind::DocumentSymbols,
+        generation: 0,
+        offset: 0,
+        items: Some(vec![]),
+        total_matches: 0,
+        total_candidates: 0,
+        ticking: false,
+        grep_display_offset: None,
+        grep_total_display_rows: None,
+        center_on: Some(Box::new(PickerItem::Symbol {
+            path: "/p/a.rs".into(),
+            line: 3,
+            col: 0,
+            name: "main".into(),
+            symbol_kind: SymbolKind::Function,
+            detail: String::new(),
+            depth: 0,
+            context: false,
+            match_indices: vec![],
+        })),
+    };
+    let v = to_value(&params).unwrap();
+    assert_eq!(v["center_on"]["kind"], "symbol");
+    assert_eq!(v["center_on"]["name"], "main");
+    let back: PickerUpdateParams = from_value(v).unwrap();
+    assert_eq!(back.center_on, params.center_on);
 }
 
 #[test]

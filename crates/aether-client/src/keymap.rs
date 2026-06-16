@@ -690,6 +690,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('t'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics list"),
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
     bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
+    bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),
     bind!(L, ch('?'), Any, A::OpenHelp, "App", "Show keyboard shortcuts"),
     bind!(
@@ -711,7 +712,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('h'), Exact(Mods::NONE), A::NextHunk, "Git", "Next change (hunk)"),
     bind!(L, ch('h'), Exact(Mods::ALT), A::PrevHunk, "Git", "Previous change (hunk)"),
     bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
-    bind!(L, ch('o'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
+    bind!(L, ch('y'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::Format, "Code", "Format document"),
     bind!(L, ch('k'), Exact(Mods::NONE), A::Hover, "Code", "Hover (type & docs)"),
     bind!(L, ch('d'), Exact(Mods::NONE), A::GotoDefinition, "Code", "Go to definition"),

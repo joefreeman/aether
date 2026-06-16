@@ -778,6 +778,13 @@ pub enum ItemKey<'a> {
         line: u32,
         col: u32,
     },
+    /// A document symbol, identified by its name position `(path, line, col)` — stable across
+    /// resume even as the symbol's detail/depth shift after editing.
+    Symbol {
+        path: &'a str,
+        line: u32,
+        col: u32,
+    },
     /// An LSP server, identified by its `(language, workspace_root)` key — stable across the
     /// status changes that drive the picker's live re-pushes.
     LspServer {
@@ -821,6 +828,13 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::Reference {
             path, line, col, ..
         } => ItemKey::Reference {
+            path: path.as_str(),
+            line: *line,
+            col: *col,
+        },
+        PickerItem::Symbol {
+            path, line, col, ..
+        } => ItemKey::Symbol {
             path: path.as_str(),
             line: *line,
             col: *col,
