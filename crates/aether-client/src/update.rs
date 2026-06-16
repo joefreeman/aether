@@ -835,11 +835,13 @@ impl Session {
                     // Any close of *our* buffer rides the `buffer/closed` push (it switches us
                     // to the server's successor). Here we just confirm and re-list the picker.
                     let mut fx = Effects::toast(format!("trashed {noun}"), ToastKind::Success);
-                    if let Some(p) = &self.picker {
-                        if p.kind == PickerKind::Explorer {
-                            let dir = p.directory.clone();
-                            fx = fx.and(self.explorer_navigate(dir, false, None));
-                        } else if p.kind == PickerKind::Files {
+                    if let Some(kind) = self.picker.as_ref().map(|p| p.kind) {
+                        if kind == PickerKind::Explorer {
+                            // Re-list the current directory but keep the query — re-running it
+                            // re-reads the dir server-side (the trashed entry drops out) without
+                            // resetting where the user was filtering.
+                            fx = fx.and(self.picker_query_changed());
+                        } else if kind == PickerKind::Files {
                             fx = fx.and(self.open_picker(PickerKind::Files, None, None));
                         }
                     }
@@ -1637,6 +1639,19 @@ impl Session {
         fx
     }
 
+    /// Tab in the Explorer: adopt the common-prefix completion ghost into the query (extending the
+    /// filter part), then re-query. No-op when there's no completion to apply.
+    fn apply_explorer_completion(&mut self) -> Effects {
+        let suffix = match self.picker.as_ref().and_then(|p| p.explorer_completion()) {
+            Some(s) if !s.is_empty() => s,
+            _ => return Effects::none(),
+        };
+        if let Some(p) = self.picker.as_mut() {
+            p.query.push_str(&suffix);
+        }
+        self.picker_query_changed()
+    }
+
     /// Move the picker highlight, refetching when it leaves the fetched window and revealing
     /// it otherwise (the shell scrolls the native list the minimum to keep it visible).
     /// Wheel scroll over the picker overlay: move the highlight by `delta` rows, like Alt-j/k.
@@ -2190,7 +2205,7 @@ impl Session {
             name, is_dir: true, ..
         }) = p.selected_item()
         {
-            let dir = match &p.directory {
+            let dir = match p.explorer_listing_dir() {
                 Some(d) => format!("{}/{name}", d.trim_end_matches('/')),
                 None => return Effects::none(),
             };
@@ -2199,9 +2214,10 @@ impl Session {
         Effects::none()
     }
 
-    /// Alt-h / Alt-Backspace: progressively unwind — clear the query, then pop the rightmost
-    /// filter chip (one per press), then (explorer) one directory segment per press — landing
-    /// the highlight on the directory just left — then roots mode in multi-root projects.
+    /// Alt-h / Alt-Backspace: progressively unwind — clear the query, then (explorer) pop one
+    /// directory segment per press — landing the highlight on the directory just left — into roots
+    /// mode in multi-root projects, and only then pop the rightmost filter chip. The breadcrumb
+    /// sits closest to the cursor and unwinds first; chips have their own toggle bindings.
     fn picker_back(&mut self) -> Effects {
         let project_paths = self.project_paths.clone();
         let Some(p) = &mut self.picker else {
@@ -2211,34 +2227,35 @@ impl Session {
             p.query.clear();
             return self.picker_query_changed();
         }
+        // Explorer: unwind the breadcrumb one directory segment per press before touching chips.
+        if p.kind == PickerKind::Explorer {
+            match p.directory_parent.clone() {
+                Some(parent) => {
+                    // Pre-select the directory we're leaving in the parent's listing.
+                    let leaving = p.directory.as_deref().and_then(|d| {
+                        std::path::Path::new(d)
+                            .file_name()
+                            .and_then(|os| os.to_str())
+                            .map(str::to_string)
+                    });
+                    return self.explorer_navigate(Some(parent), false, leaving);
+                }
+                // At a root with siblings: step out into Roots mode (the root name is the last
+                // breadcrumb segment).
+                None if p.directory.is_some() && project_paths.len() > 1 => {
+                    return self.explorer_navigate(None, true, None);
+                }
+                // Single-root top, or already in Roots mode: nothing left to unwind — fall through
+                // to chips.
+                _ => {}
+            }
+        }
         if let Some(chip) = p.chip_row(&project_paths).last().map(|c| c.id) {
             chips::remove_chip(&mut p.chips, chip);
             p.chip_selected = None;
             return self.apply_picker_filter_change();
         }
-        if p.kind != PickerKind::Explorer {
-            return Effects::none();
-        }
-        match p.directory_parent.clone() {
-            Some(parent) => {
-                // Pre-select the directory we're leaving in the parent's listing.
-                let leaving = p.directory.as_deref().and_then(|d| {
-                    std::path::Path::new(d)
-                        .file_name()
-                        .and_then(|os| os.to_str())
-                        .map(str::to_string)
-                });
-                self.explorer_navigate(Some(parent), false, leaving)
-            }
-            None if p.directory.is_some() => {
-                if project_paths.len() > 1 {
-                    self.explorer_navigate(None, true, None)
-                } else {
-                    Effects::none()
-                }
-            }
-            None => Effects::none(),
-        }
+        Effects::none()
     }
 
     /// Enter / row click: act on the highlighted item. Directories and roots navigate within
@@ -2262,7 +2279,7 @@ impl Session {
             PickerItem::DirEntry {
                 name, is_dir: true, ..
             } => {
-                let dir = match &p.directory {
+                let dir = match p.explorer_listing_dir() {
                     Some(d) => format!("{}/{name}", d.trim_end_matches('/')),
                     None => return Effects::none(),
                 };
@@ -2496,6 +2513,10 @@ impl Session {
                     return fx;
                 }
                 return Effects::none();
+            }
+            // Tab: adopt the Explorer's common-prefix completion ghost into the query.
+            KeyCode::Tab if no_chord && p.kind == PickerKind::Explorer => {
+                return self.apply_explorer_completion();
             }
             // `Left` / `Backspace` step into the chip row (rightmost first) — the browser
             // tag-input gesture. In-query caret moves and deletes are owned by each shell's input
@@ -3351,14 +3372,16 @@ impl Session {
                 return Effects::none();
             };
             match item {
-                PickerItem::DirEntry { name, is_dir, .. } => p.directory.as_ref().map(|dir| {
-                    let noun = if *is_dir { "directory" } else { "file" };
-                    (
-                        format!("{}/{name}", dir.trim_end_matches('/')),
-                        noun,
-                        name.clone(),
-                    )
-                }),
+                PickerItem::DirEntry { name, is_dir, .. } => {
+                    p.explorer_listing_dir().map(|dir| {
+                        let noun = if *is_dir { "directory" } else { "file" };
+                        (
+                            format!("{}/{name}", dir.trim_end_matches('/')),
+                            noun,
+                            name.clone(),
+                        )
+                    })
+                }
                 PickerItem::File {
                     path_index,
                     relative_path,

@@ -99,6 +99,9 @@ pub struct PickerState {
     /// a project root (Alt-h is then a no-op). Carried alongside `explorer_dir` for the same
     /// reasons.
     pub explorer_parent: Option<String>,
+    /// Explorer only. The tab-completion ghost: the common-prefix suffix `Tab` would append to the
+    /// query, rendered dim after the input. `None` when there's nothing to complete.
+    pub completion: Option<String>,
     /// Projects-picker only. When `Some(idx)`, `items[idx]` is a *synthetic* row added
     /// client-side to offer "create a new project named <query>" — it isn't part of the
     /// server's candidate set. Selecting it routes through `project/create` instead of

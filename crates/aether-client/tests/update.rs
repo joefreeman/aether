@@ -388,6 +388,7 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
         grep_display_offset: Some(0),
         grep_total_display_rows: Some(matches + 1),
         center_on: None,
+        explorer_peek_missing: false,
     };
     // A streaming `picker/update` push lands first with real hits.
     assert!(s
@@ -579,6 +580,7 @@ fn lsp_dialog_working_field_tracks_live_picker_progress() {
         grep_display_offset: None,
         grep_total_display_rows: None,
         center_on: None,
+        explorer_peek_missing: false,
     };
     let _ = s.on_event(Event::ServerPush(Notification {
         jsonrpc: JsonRpc,
@@ -1112,6 +1114,7 @@ fn picker_view_response_renders_items_without_the_push() {
         grep_display_offset: None,
         grep_total_display_rows: None,
         center_on: None,
+        explorer_peek_missing: false,
     };
     let r = PickerViewResult {
         query: "x".into(),
@@ -1246,6 +1249,82 @@ fn find_request<'a>(fx: &'a Effects, method: &str) -> Option<&'a serde_json::Val
 }
 
 #[test]
+fn explorer_tab_applies_common_prefix_completion() {
+    use aether_client::keymap::Mods;
+    use aether_protocol::picker::{PickerItem, PickerKind};
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Explorer, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.directory = Some("/proj".into());
+        p.query = "aet".into();
+        p.items = vec![
+            PickerItem::DirEntry {
+                name: "aether-server".into(),
+                is_dir: true,
+                match_indices: vec![],
+                git_status: None,
+            },
+            PickerItem::DirEntry {
+                name: "aether-tui".into(),
+                is_dir: true,
+                match_indices: vec![],
+                git_status: None,
+            },
+        ];
+        p.total_matches = 2;
+        p.offset = 0;
+    }
+    // Tab extends the query by the shared remainder (`her-`), then re-queries.
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    assert_eq!(s.picker.as_ref().unwrap().query, "aether-");
+    let requery = find_request(&fx, "picker/query").expect("tab re-queries");
+    assert_eq!(requery["query"], json!("aether-"));
+}
+
+#[test]
+fn explorer_alt_backspace_unwinds_breadcrumb_before_chips() {
+    use aether_client::chips::ChipValue;
+    use aether_client::keymap::Mods;
+    use aether_protocol::picker::PickerKind;
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Explorer, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.directory = Some("/proj/src/sub".into());
+        p.directory_parent = Some("/proj/src".into());
+        p.chips = vec![ChipValue::Hidden { hide: true }];
+        p.query.clear();
+    }
+    // With a deeper directory *and* a chip, Alt-Backspace ascends the breadcrumb (closest to the
+    // cursor) and leaves the chip — it has its own toggle binding.
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let view = find_request(&fx, "picker/view").expect("ascends via picker/view");
+    assert_eq!(view["directory_path"], json!("/proj/src"));
+    assert_eq!(
+        s.picker.as_ref().unwrap().chips.len(),
+        1,
+        "the chip survives — the breadcrumb unwinds first"
+    );
+
+    // At a (single) root top — no parent — the breadcrumb is exhausted, so the next press falls
+    // through to popping the chip.
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.directory = Some("/proj".into());
+        p.directory_parent = None;
+        p.query.clear();
+    }
+    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert!(
+        s.picker.as_ref().unwrap().chips.is_empty(),
+        "with no breadcrumb left, Alt-Backspace removes the chip"
+    );
+}
+
+#[test]
 fn explorer_delete_confirms_then_trashes_and_relists() {
     use aether_client::session::{ConfirmKind, Prompt};
     use aether_protocol::picker::{PickerItem, PickerKind};
@@ -1255,6 +1334,7 @@ fn explorer_delete_confirms_then_trashes_and_relists() {
     {
         let p = s.picker.as_mut().unwrap();
         p.directory = Some("/proj/src".into());
+        p.query = "old".into();
         p.items = vec![PickerItem::DirEntry {
             name: "old.rs".into(),
             is_dir: false,
@@ -1289,11 +1369,19 @@ fn explorer_delete_confirms_then_trashes_and_relists() {
         Some(t) => t,
         None => unreachable!(),
     };
-    // The result re-lists the still-open Explorer.
+    // The result re-lists the still-open Explorer via `picker/query`, keeping the query (so the
+    // user stays where they were filtering) — the re-query re-reads the dir server-side.
     let fx = s.on_rpc_result(token, Ok(json!({"closed_buffer_ids": []})));
-    assert!(
-        find_request(&fx, "picker/view").is_some(),
-        "a successful delete re-lists the explorer"
+    let requery = find_request(&fx, "picker/query").expect("a successful delete re-queries");
+    assert_eq!(
+        requery["query"],
+        json!("old"),
+        "the query is preserved across the delete"
+    );
+    assert_eq!(
+        s.picker.as_ref().unwrap().query,
+        "old",
+        "the picker still holds the query"
     );
 }
 
@@ -1447,6 +1535,7 @@ fn selecting_the_create_row_creates_the_file() {
             grep_display_offset: None,
             grep_total_display_rows: None,
             center_on: None,
+            explorer_peek_missing: false,
         });
         assert_eq!(p.create_row_index(), Some(1));
     }
@@ -1494,6 +1583,7 @@ fn project_create_row_appears_for_a_novel_name_in_the_projects_picker() {
         grep_display_offset: None,
         grep_total_display_rows: None,
         center_on: None,
+        explorer_peek_missing: false,
     });
     // An exact match offers no create row.
     p.query = "aether".into();
@@ -1530,6 +1620,7 @@ fn accepting_the_projects_create_row_emits_project_create() {
             grep_display_offset: None,
             grep_total_display_rows: None,
             center_on: None,
+            explorer_peek_missing: false,
         });
         p.query = "fresh".into();
         assert_eq!(p.create_row_index(), Some(1));
@@ -1812,6 +1903,7 @@ fn symbol_push_center_on_lands_the_highlight() {
             grep_display_offset: None,
             grep_total_display_rows: None,
             center_on: Some(Box::new(sym(5, "b"))),
+            explorer_peek_missing: false,
         })
         .unwrap(),
     });
@@ -1864,6 +1956,7 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
             grep_display_offset: None,
             grep_total_display_rows: None,
             center_on: Some(Box::new(sym(81, "externally_modified"))),
+            explorer_peek_missing: false,
         })
         .unwrap(),
     });

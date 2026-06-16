@@ -8831,43 +8831,133 @@ fn maybe_refresh_dirty(s: &mut ServerState, buffer_id: BufferId, was_dirty: bool
     }
 }
 
-/// Build a fresh `ExplorerCandidates` for the requested directory. Honors the same project-
-/// boundary rules as `directory_list`. Used by `picker_view` for `PickerKind::Explorer`. Takes
-/// the requested path *or* falls back to the picker's last directory (when the client omitted
-/// the path on a resume), *or* the first project root (first ever open).
+/// Resolve and validate an Explorer *anchor* — the committed directory the query peeks relative
+/// to. Canonicalizes, enforces the project boundary, requires a directory, and computes the
+/// (in-project) parent for Alt-h ascent. Errors propagate to the client (a bad `directory_path`
+/// is a real navigation error), unlike a bad *peek* path, which just lists nothing.
+fn resolve_explorer_anchor(
+    raw: &std::path::Path,
+    project_paths: &[std::path::PathBuf],
+) -> Result<picker_state::ExplorerAnchorInfo, RpcError> {
+    let in_project =
+        |p: &std::path::Path| project_paths.iter().any(|r| p == r.as_path() || p.starts_with(r));
+    let canonical = std::fs::canonicalize(raw)
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
+    if !in_project(&canonical) {
+        return Err(RpcError::invalid_path(format!(
+            "{} is outside the project's access boundary",
+            canonical.display()
+        )));
+    }
+    if !std::fs::metadata(&canonical)
+        .map_err(RpcError::file_io)?
+        .is_dir()
+    {
+        return Err(RpcError::invalid_path(format!(
+            "{} is not a directory",
+            canonical.display()
+        )));
+    }
+    let parent = canonical
+        .parent()
+        .and_then(|p| in_project(p).then(|| p.display().to_string()));
+    Ok(picker_state::ExplorerAnchorInfo {
+        path: canonical.display().to_string(),
+        parent,
+    })
+}
+
+/// Build the Explorer listing for `query`, relative to the committed `anchor`. The query's path
+/// part (everything up to the last `/`) selects the directory to list — `anchor/<path_part>`, the
+/// "peek"; the filter part (after the last `/`) is applied later by the prefix matcher. Returns
+/// the listing plus `peek_missing`: true when the path part doesn't resolve to an in-project
+/// directory (mid-typing a not-yet-created path — the "+ Create" case), in which case the listing
+/// is empty and `path` still names the intended target so a file-watcher refresh can't bind it to
+/// an unrelated real directory. The client reads `peek_missing` to decide whether `dir/` offers
+/// "+ Create directory" (the listing shows the *contents*, so it can't tell on its own).
+fn build_explorer_peek(
+    anchor: &std::path::Path,
+    query: &str,
+    project_paths: &[std::path::PathBuf],
+    filters: &aether_protocol::picker::PickerFilters,
+) -> (picker_state::ExplorerCandidates, bool) {
+    let (path_part, _filter) = picker_state::explorer_query_split(query);
+    let target = if path_part.is_empty() {
+        anchor.to_path_buf()
+    } else {
+        anchor.join(path_part)
+    };
+    match std::fs::canonicalize(&target)
+        .ok()
+        .and_then(|c| build_explorer_candidates_for_canonical(&c, project_paths, filters).ok())
+    {
+        Some(listing) => (listing, false),
+        None => (empty_explorer_listing(&target), true),
+    }
+}
+
+fn empty_explorer_listing(target: &std::path::Path) -> picker_state::ExplorerCandidates {
+    picker_state::ExplorerCandidates {
+        path: target.display().to_string(),
+        parent: None,
+        entries: Vec::new(),
+    }
+}
+
+/// Build the Explorer's peek listing plus the committed anchor it's relative to. Honors the same
+/// project-boundary rules as `directory_list`. Used by `picker_view` for `PickerKind::Explorer`.
+/// The anchor is the requested path *or* the persisted anchor (when the client omitted the path
+/// on a scroll/resume) *or* the first project root (first ever open); the listing peeks from it
+/// using the persisted query (empty on `reset`, since it's being wiped).
 async fn build_explorer_candidates(
     state: &SharedState,
     client_id: ClientId,
     requested: Option<&str>,
+    reset: bool,
     filters: &aether_protocol::picker::PickerFilters,
-) -> Result<picker_state::ExplorerCandidates, RpcError> {
-    // Grab everything we need from the lock in one pass: project roots + the explorer's
-    // currently-listed path (if any), so we can resolve the fallback without re-locking.
-    let (project_paths, existing_path) = {
+) -> Result<
+    (
+        picker_state::ExplorerCandidates,
+        picker_state::ExplorerAnchorInfo,
+        bool,
+    ),
+    RpcError,
+> {
+    // One lock pass: project roots + the explorer's committed anchor + its current query (which
+    // drives the peek). On `reset` the query is being wiped, so peek from the anchor itself.
+    let (project_paths, existing_anchor, query) = {
         let s = state.lock().await;
-        let existing = s
-            .pickers
-            .get(&(client_id, PickerKind::Explorer))
-            .and_then(|p| match &p.candidates {
-                picker_state::PickerCandidates::Explorer(e) => Some(e.path.clone()),
-                _ => None,
-            });
-        (s.active_project_or_err(client_id)?.paths.clone(), existing)
+        let picker = s.pickers.get(&(client_id, PickerKind::Explorer));
+        let existing_anchor = picker.and_then(|p| p.explorer_anchor.clone());
+        let query = if reset {
+            String::new()
+        } else {
+            picker.map(|p| p.query.clone()).unwrap_or_default()
+        };
+        (
+            s.active_project_or_err(client_id)?.paths.clone(),
+            existing_anchor,
+            query,
+        )
     };
-    let raw_path: std::path::PathBuf = if let Some(p) = requested {
+    let anchor_raw: std::path::PathBuf = if let Some(p) = requested {
         std::path::PathBuf::from(p)
-    } else if let Some(p) = existing_path {
-        std::path::PathBuf::from(p)
+    } else if let Some(a) = &existing_anchor {
+        std::path::PathBuf::from(&a.path)
     } else {
         project_paths
             .first()
             .cloned()
             .ok_or_else(|| RpcError::invalid_path("no project paths configured"))?
     };
-    let canonical = std::fs::canonicalize(&raw_path).map_err(|e| {
-        RpcError::invalid_path(format!("canonicalizing {}: {e}", raw_path.display()))
-    })?;
-    build_explorer_candidates_for_canonical(&canonical, &project_paths, filters)
+    let anchor = resolve_explorer_anchor(&anchor_raw, &project_paths)?;
+    let (listing, peek_missing) = build_explorer_peek(
+        std::path::Path::new(&anchor.path),
+        &query,
+        &project_paths,
+        filters,
+    );
+    Ok((listing, anchor, peek_missing))
 }
 
 /// Build the Roots-mode candidate list — one row per project root, sorted by basename. The
@@ -9189,6 +9279,9 @@ pub async fn picker_view(
         let s = state.lock().await;
         s.active_project_or_err(client_id)?;
     }
+    // Explorer carries its committed anchor (path the query peeks relative to) + whether the peek
+    // resolved, out of the candidate-building phase so the hydration phase below can persist both.
+    let mut explorer_anchor_to_set: Option<(picker_state::ExplorerAnchorInfo, bool)> = None;
     let candidates = match params.kind {
         PickerKind::Files => {
             // Walk the workspace outside the global lock — on first call it can take seconds.
@@ -9230,15 +9323,16 @@ pub async fn picker_view(
                             .unwrap_or_default()
                     }
                 };
-                picker_state::PickerCandidates::Explorer(
-                    build_explorer_candidates(
-                        state,
-                        client_id,
-                        params.directory_path.as_deref(),
-                        &filters,
-                    )
-                    .await?,
+                let (listing, anchor, peek_missing) = build_explorer_candidates(
+                    state,
+                    client_id,
+                    params.directory_path.as_deref(),
+                    params.reset,
+                    &filters,
                 )
+                .await?;
+                explorer_anchor_to_set = Some((anchor, peek_missing));
+                picker_state::PickerCandidates::Explorer(listing)
             }
         }
         PickerKind::Projects => {
@@ -9374,6 +9468,14 @@ pub async fn picker_view(
     }
     let picker = pickers.get_mut(&key).expect("populated above");
 
+    // Commit the resolved Explorer anchor (navigation moved the directory) + the peek-missing flag.
+    // Only set for actual directory listings — Roots mode leaves the prior anchor untouched so
+    // re-entering a root resumes where it was.
+    if let Some((anchor, peek_missing)) = explorer_anchor_to_set {
+        picker.explorer_anchor = Some(anchor);
+        picker.explorer_peek_missing = peek_missing;
+    }
+
     // Replace persisted filters when the caller sent a set (`None` keeps what hide left). A
     // change re-ranks; for Grep it also drops the cached hits — they were produced under the
     // old filters and the client's follow-up `picker/query` will respawn the search.
@@ -9460,8 +9562,13 @@ pub async fn picker_view(
             u.ticking = true;
         }
     }
-    let (directory_path, directory_parent) = match &picker.candidates {
-        picker_state::PickerCandidates::Explorer(e) => (Some(e.path.clone()), e.parent.clone()),
+    // Echo the committed *anchor*, not the (possibly peeked) listing — the client pins its
+    // breadcrumb and "+ Create" base to it while a path-peek query is active. Roots mode (no
+    // Explorer listing) echoes `None`, as before.
+    let (directory_path, directory_parent) = match (&picker.candidates, &picker.explorer_anchor) {
+        (picker_state::PickerCandidates::Explorer(_), Some(a)) => {
+            (Some(a.path.clone()), a.parent.clone())
+        }
         _ => (None, None),
     };
     let result = PickerViewResult {
@@ -9508,6 +9615,13 @@ pub async fn picker_query(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let key = (client_id, params.kind);
+    // Explorer re-lists the query-derived peek directory before reranking; grab the project roots
+    // up front (an immutable borrow of `s`, before the split below hands out `pickers`/`matcher`).
+    let explorer_project_paths = if matches!(params.kind, PickerKind::Explorer) {
+        s.active_project(client_id).map(|p| p.paths.clone())
+    } else {
+        None
+    };
     let ServerState {
         pickers, matcher, ..
     } = &mut *s;
@@ -9539,6 +9653,31 @@ pub async fn picker_query(
                 picker.ranked.clear();
                 picker.last_completed_search = None;
             }
+        }
+        // Explorer: the query is a path. Re-list the directory it peeks into (anchor + the path
+        // part) before reranking, so typing `src/` descends and `src/ma` filters `src`. Skip in
+        // Roots mode (candidates aren't a directory listing) and before the first view (no
+        // anchor) — both just rerank the existing candidates.
+        PickerKind::Explorer => {
+            if let (
+                picker_state::PickerCandidates::Explorer(_),
+                Some(anchor),
+                Some(project_paths),
+            ) = (
+                &picker.candidates,
+                picker.explorer_anchor.clone(),
+                explorer_project_paths.as_ref(),
+            ) {
+                let (listing, peek_missing) = build_explorer_peek(
+                    std::path::Path::new(&anchor.path),
+                    &picker.query,
+                    project_paths,
+                    &picker.filters,
+                );
+                picker.candidates = picker_state::PickerCandidates::Explorer(listing);
+                picker.explorer_peek_missing = peek_missing;
+            }
+            picker.rerank(matcher);
         }
         _ => picker.rerank(matcher),
     }

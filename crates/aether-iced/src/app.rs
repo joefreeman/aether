@@ -1689,6 +1689,11 @@ impl App {
         // fights a click-to-position-then-type.
         let chip_before = self.chip_field_snapshot();
         let chips_before = self.picker_chip_count();
+        // The picker query is a controlled `text_input` too: a command key can rewrite it
+        // out-of-band (Tab-complete extends it, Alt-Backspace clears it), and iced would leave the
+        // caret mid-string. Snapshot it for the same caret-to-end treatment. (Plain typing flows
+        // through `OverlayInput`, not here, so this never fights click-to-position-then-type.)
+        let query_before = self.session.picker.as_ref().map(|p| p.query.clone());
         let visible_rows = self.visible_rows();
         let fx = self.session.on_key(code, mods, text, visible_rows);
         let mut task = self.run_core(fx);
@@ -1699,6 +1704,15 @@ impl App {
             if chip_after != chip_before {
                 task = Task::batch([task, iced::widget::operation::move_cursor_to_end(field.id())]);
             }
+        }
+        // Same for the query input: only when the picker stayed open and its query changed under a
+        // command key (not on open/close, where focus is handled elsewhere).
+        let query_after = self.session.picker.as_ref().map(|p| p.query.clone());
+        if query_before.is_some() && query_after.is_some() && query_after != query_before {
+            task = Task::batch([
+                task,
+                iced::widget::operation::move_cursor_to_end(crate::picker::query_input_id()),
+            ]);
         }
         // A filter chip was added or removed (an `Alt`-chord toggle, or deleting the last chip):
         // the chip-row children change under the overlay, and iced drops the focused `text_input`'s
@@ -4299,6 +4313,7 @@ mod tests {
             grep_display_offset: Some(0),
             grep_total_display_rows: Some(25),
             center_on: None,
+            explorer_peek_missing: false,
         }));
         s
     }
@@ -4353,6 +4368,7 @@ mod tests {
             grep_display_offset: None,
             grep_total_display_rows: None,
             center_on: None,
+            explorer_peek_missing: false,
         }));
         let scroll = 6.0 * ROW_H;
         s.selected = 6; // first visible row — visible as-is

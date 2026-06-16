@@ -58,11 +58,37 @@ pub struct ExplorerEntry {
 /// The directory listing the explorer picker is currently matching against. `path` is the
 /// canonical absolute path of the listing; `parent` is the parent's canonical path *if it's
 /// still inside the project boundary* (otherwise `None`, meaning Alt-h is a no-op).
+///
+/// With path-peeking (a query like `src/foo`), this is the *peeked* directory — `anchor` joined
+/// with the query's path part — not necessarily the committed [`ExplorerAnchorInfo`]. Entries the
+/// user sees (and `select_result` resolves a file against) live here.
 #[derive(Debug, Clone)]
 pub struct ExplorerCandidates {
     pub path: String,
     pub parent: Option<String>,
     pub entries: Vec<ExplorerEntry>,
+}
+
+/// The Explorer's *committed* directory — the one navigation (Enter on a dir, Alt-h, root select)
+/// moves between, distinct from the query-derived peek listing. The query is interpreted relative
+/// to this: `query` up to the last `/` selects which directory under the anchor to list (the
+/// peek), the remainder prefix-filters it. Echoed to the client as `directory_path`/`_parent`, so
+/// the breadcrumb and the client's "+ Create" base stay pinned to the anchor while peeking.
+#[derive(Debug, Clone)]
+pub struct ExplorerAnchorInfo {
+    pub path: String,
+    pub parent: Option<String>,
+}
+
+/// Split an Explorer query into `(path_part, filter_part)` at the last `/`. The path part (no
+/// trailing slash) selects the directory to list relative to the anchor; the filter part
+/// prefix-matches that directory's entries. No `/` → the whole query is the filter, in the
+/// anchor itself. `src/` → list `src`, empty filter; `src/ma` → list `src`, filter `ma`.
+pub fn explorer_query_split(query: &str) -> (&str, &str) {
+    match query.rfind('/') {
+        Some(i) => (&query[..i], &query[i + 1..]),
+        None => ("", query),
+    }
 }
 
 /// One grep-picker candidate. One per *match* (a line with N matches yields N candidates), in
@@ -590,6 +616,15 @@ pub struct PickerState {
     /// `center_on` resolve against the same set the client most recently saw — even if the
     /// underlying source (workspace index, buffer set) is later refreshed.
     pub candidates: PickerCandidates,
+    /// Explorer only: the committed directory the query peeks relative to (see
+    /// [`ExplorerAnchorInfo`]). Set by `picker/view` when navigation moves the directory; left
+    /// untouched by `picker/query` (typing a path peeks without committing). `None` for every
+    /// other kind and until the first Explorer `view`.
+    pub explorer_anchor: Option<ExplorerAnchorInfo>,
+    /// Explorer only: true when the current query's peek directory (anchor + path part) doesn't
+    /// resolve to an in-project directory. Set wherever the peek listing is (re)built; echoed in
+    /// `picker/update` so the client only offers "+ Create directory" when it's actually missing.
+    pub explorer_peek_missing: bool,
     /// `Some` while the client has the picker open and is receiving pushes. `None` after `hide`.
     pub subscribed: Option<SubscribedWindow>,
     /// References only: tracks an in-flight async resolve (the `textDocument/references` round-trip
@@ -713,6 +748,8 @@ impl PickerState {
             generation: 0,
             ranked,
             candidates,
+            explorer_anchor: None,
+            explorer_peek_missing: false,
             subscribed: None,
             pending_async_load: None,
             last_completed_search: None,
@@ -803,31 +840,20 @@ impl PickerState {
                 // name. Natural candidate order preserved (dirs-then-files, alphabetical
                 // within each, as the listing builder produced it).
                 //
-                // Trailing-`/` convention (Explorer only): if the user's query ends with `/`,
-                // they're explicitly looking for a directory. Strip the slash for the prefix
-                // match *and* drop file entries from the result — `foo/` should match only
-                // `foo*` directories, never `foo.txt`. ExplorerRoots is unaffected: roots are
-                // conceptually directories and don't carry an `is_dir` flag.
-                let dir_only_filter = matches!(&self.candidates, PickerCandidates::Explorer(_))
-                    && self.query.ends_with('/');
-                let effective_query: &str = if dir_only_filter {
-                    self.query.trim_end_matches('/')
-                } else {
-                    &self.query
-                };
+                // Explorer path-peeking: the query is a path. Its part *after* the last `/` is the
+                // prefix filter applied here; the part before it selected which directory got
+                // listed (handled when the listing was built, server-side). So `src/ma` matches
+                // entries of the already-listed `src` against `ma`. ExplorerRoots has no path
+                // component — match the whole query against root basenames.
+                let effective_query: &str =
+                    if matches!(&self.candidates, PickerCandidates::Explorer(_)) {
+                        explorer_query_split(&self.query).1
+                    } else {
+                        &self.query
+                    };
                 let (qc, case_insensitive) = smartcase_query(effective_query);
                 let mut buf = String::new();
                 for i in 0..self.candidates.len() {
-                    if dir_only_filter {
-                        // We've already confirmed `Explorer(_)` above; this match is just
-                        // pulling the `is_dir` flag out for the filter.
-                        let PickerCandidates::Explorer(e) = &self.candidates else {
-                            unreachable!("dir_only_filter implies Explorer candidates");
-                        };
-                        if !e.entries[i].is_dir {
-                            continue;
-                        }
-                    }
                     let name = self.candidates.display_at(i);
                     let starts = if case_insensitive {
                         buf.clear();
@@ -873,15 +899,13 @@ impl PickerState {
         let query_active = !self.query.is_empty();
         let pattern = (query_active && strategy == MatchStrategy::Fuzzy)
             .then(|| Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart));
-        // For prefix-match highlighting, count chars in the *effective* query — strip the
-        // trailing `/` for Explorer's dir-only case so we don't highlight one char past the
-        // end of the entry name. (E.g. `foo/` against entry `food` should highlight `foo`,
-        // not `food`.)
+        // For prefix-match highlighting, count chars in the *effective* query — for Explorer
+        // that's only the filter part (after the last `/`), since the path part selected the
+        // listing rather than matching an entry. (E.g. `src/ma` against entry `main.rs` should
+        // highlight `ma`, not 6 chars.)
         let prefix_len: u32 = if query_active && strategy == MatchStrategy::PrefixSmartcase {
-            let effective = if matches!(&self.candidates, PickerCandidates::Explorer(_))
-                && self.query.ends_with('/')
-            {
-                self.query.trim_end_matches('/')
+            let effective = if matches!(&self.candidates, PickerCandidates::Explorer(_)) {
+                explorer_query_split(&self.query).1
             } else {
                 &self.query
             };
@@ -980,6 +1004,9 @@ pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<Picker
         grep_total_display_rows,
         // Set by callers that resolve a cursor-based highlight (DocumentSymbols' async fill).
         center_on: None,
+        // Explorer-only; false (skipped on the wire) for every other kind.
+        explorer_peek_missing: matches!(state.candidates, PickerCandidates::Explorer(_))
+            && state.explorer_peek_missing,
     })
 }
 
@@ -1033,6 +1060,16 @@ mod tests {
                 progress: Vec::new(),
             },
         ])
+    }
+
+    #[test]
+    fn explorer_query_split_partitions_at_last_slash() {
+        assert_eq!(explorer_query_split(""), ("", ""));
+        assert_eq!(explorer_query_split("ma"), ("", "ma"));
+        assert_eq!(explorer_query_split("src/"), ("src", ""));
+        assert_eq!(explorer_query_split("src/ma"), ("src", "ma"));
+        assert_eq!(explorer_query_split("a/b/c"), ("a/b", "c"));
+        assert_eq!(explorer_query_split("a/b/"), ("a/b", ""));
     }
 
     #[test]

@@ -1615,6 +1615,7 @@ impl Shell {
             .as_ref()
             .map(|e| chip_editor_view(e, chip_root_cursor, chip_path_cursor));
         p.explorer_dir = core.directory.clone();
+        p.completion = core.explorer_completion();
         p.explorer_parent = core.directory_parent.clone();
         // Keep the highlight on-screen within the fetched slice (the shell half of
         // RevealPickerSelection). Grep groups each file under a header row, so the visible

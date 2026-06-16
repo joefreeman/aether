@@ -226,6 +226,9 @@ interface PickerView {
   window_base: number;
   directory: string | null;
   directory_parent: string | null;
+  /** Explorer tab-completion ghost: the common-prefix suffix `Tab` would append, shown dim after
+   *  the query. Null when there's nothing to complete. */
+  completion: string | null;
   /** The Explorer's synthetic "+ Create …" affordance (view.rs `create`); null when not offered.
    *  `abs` is its selection index, one past the last match. */
   create: { name: string; is_dir: boolean; abs: number } | null;
@@ -402,6 +405,18 @@ function explorerPrefix(dir: string | null, projectPaths: string[]): string {
   return `${label}${dir.slice(best.length + 1)}/`;
 }
 
+/** The directory whose entries the Explorer is showing: the committed `directory` (anchor)
+ *  descended by the query's path part (everything up to the last `/`). Mirrors the core's
+ *  `explorer_listing_dir`; used to build per-row file links correctly while path-peeking. */
+function explorerListingDir(dir: string, query: string): string {
+  const slash = query.lastIndexOf("/");
+  if (slash < 0) return dir;
+  const pathPart = query.slice(0, slash);
+  if (!pathPart) return dir;
+  const base = dir.endsWith("/") ? dir.slice(0, -1) : dir;
+  return `${base}/${pathPart}`;
+}
+
 /** Bold the fuzzy-matched code points (`indices` are char offsets into `text`). */
 function matched(text: string, indices?: number[]): DocumentFragment {
   const frag = document.createDocumentFragment();
@@ -569,6 +584,7 @@ export class Shell {
   private saveAsStructKey: string | null = null;
   private readonly pickerEl: HTMLElement;
   private readonly pickerInput: HTMLInputElement;
+  private pickerInputGhost: HTMLElement | null = null;
   private readonly pickerPathEl: HTMLElement;
   private readonly pickerCountEl: HTMLElement;
   /** CSS-animated throbber to the left of the count, shown while a search streams. */
@@ -814,10 +830,19 @@ export class Shell {
     // Chips lead the row, left of the breadcrumb + query they prefix (`:empty` hides the box).
     this.pickerChipsEl = document.createElement("div");
     this.pickerChipsEl.className = "picker-chips";
+    // Wrap the query input in the chip-editor's ghost-overlay (transparent input over a gray ghost
+    // layer) so the Explorer's tab-completion suffix sits flush after the caret. The wrap takes the
+    // input's flex role; the ghost is filled per render via `fillGhost`.
+    const pickerInputWrap = document.createElement("span");
+    pickerInputWrap.className = "picker-editor-rootwrap";
+    this.pickerInputGhost = document.createElement("span");
+    this.pickerInputGhost.className = "picker-editor-ghost";
+    this.pickerInput.classList.add("picker-editor-input", "picker-editor-root");
+    pickerInputWrap.append(this.pickerInputGhost, this.pickerInput);
     pickerInputRow.append(
       this.pickerChipsEl,
       this.pickerPathEl,
-      this.pickerInput,
+      pickerInputWrap,
       this.pickerSpinnerEl,
       this.pickerCountEl,
     );
@@ -2418,6 +2443,9 @@ export class Shell {
     // The input is the source of truth for the text while focused; only write when the core changed
     // it out from under us (grep priming, a seeded open) to avoid clobbering the caret mid-type.
     if (this.pickerInput.value !== p.query) this.pickerInput.value = p.query;
+    // Explorer tab-completion: the gray suffix sits flush after the caret (the ghost layer reserves
+    // the typed width invisibly, then shows the suffix). Empty for every other kind / no completion.
+    this.fillGhost(this.pickerInputGhost, p.query, p.completion);
     // A CSS-animated throbber to the left of the count while a search streams (`ticking`); the
     // count itself shows progress. CSS drives the rotation, so it stays smooth regardless of the
     // push cadence.
@@ -2698,9 +2726,14 @@ export class Shell {
         return `${location.pathname}?${params.toString()}`;
       }
       case "dir_entry": {
-        const dir = v.picker?.directory;
-        if (item.is_dir || !dir) return null;
-        const joined = dir.endsWith("/") ? dir + item.name : `${dir}/${item.name}`;
+        const picker = v.picker;
+        if (item.is_dir || !picker?.directory) return null;
+        // While path-peeking the row lives in the peeked dir (anchor + query path part), not the
+        // anchor — match the core's `explorer_listing_dir` so the open-in-new-tab link is right.
+        const listingDir = explorerListingDir(picker.directory, picker.query);
+        const joined = listingDir.endsWith("/")
+          ? listingDir + item.name
+          : `${listingDir}/${item.name}`;
         const r = this.resolvePath(joined, v.project_paths);
         return r ? fromPath(r.path_index, r.relative_path) : null;
       }

@@ -12905,17 +12905,20 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
     drop(server);
 }
 
-/// A trailing `/` on the Explorer query restricts the match to directory entries — a user
-/// typing `foo/` is asking "show me dirs starting with foo", not "match files too". The
-/// stripped prefix (`foo`) is what's matched against entry names.
-#[tokio::test]
-async fn picker_explorer_trailing_slash_filters_to_directories() {
+/// Shared setup for the path-peek tests: a root with a `src/` subdir (two files) and a sibling
+/// `src.txt`, opened to the root. Returns the live server, socket, and canonical root.
+async fn setup_peek_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    std::path::PathBuf,
+) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let canonical_root = std::fs::canonicalize(&root).unwrap();
     std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::create_dir_all(root.join("src-extra")).unwrap();
-    std::fs::write(root.join("src.txt"), "file with src prefix\n").unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+    std::fs::write(root.join("src.txt"), "sibling file\n").unwrap();
     std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![canonical_root.clone()])
         .await
@@ -12932,7 +12935,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
         },
     )
     .await;
-    let _ = send_request::<PickerView>(
+    let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         2,
         &PickerViewParams {
@@ -12949,22 +12952,227 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
         },
     )
     .await;
+    assert_eq!(
+        view.directory_path.as_deref(),
+        Some(canonical_root.to_str().unwrap())
+    );
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    (server, ws, canonical_root)
+}
 
-    // Plain `src` matches both dirs and the file.
+/// Collect the `DirEntry` leaf names from the next `picker/update` push.
+async fn peek_query_names(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    id: u64,
+    query: &str,
+    generation: u64,
+) -> Vec<String> {
+    let _: () = send_request::<PickerQuery>(
+        ws,
+        id,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Explorer,
+            query: query.into(),
+            generation,
+        },
+    )
+    .await;
+    expect_notification::<PickerUpdate>(ws)
+        .await
+        .items()
+        .iter()
+        .map(|i| match i {
+            PickerItem::DirEntry { name, .. } => name.clone(),
+            other => panic!("expected DirEntry, got {other:?}"),
+        })
+        .collect()
+}
+
+/// The Explorer query path-peeks: `dir/` lists `dir`'s contents (relative to the anchor) and
+/// `dir/prefix` filters them. Typing the path descends without committing the anchor, so
+/// backspacing the query walks back out (each step here is one `picker/query`).
+#[tokio::test]
+async fn picker_explorer_query_peeks_into_subdirectory() {
+    let (server, mut ws, _root) = setup_peek_workspace().await;
+
+    // `src` (no slash): prefix-filters the *anchor's* own entries — the `src` dir and `src.txt`.
+    assert_eq!(
+        peek_query_names(&mut ws, 3, "src", 1).await,
+        vec!["src", "src.txt"]
+    );
+    // `src/`: peeks into the `src` directory → its children (dirs-first, then alphabetical).
+    assert_eq!(
+        peek_query_names(&mut ws, 4, "src/", 2).await,
+        vec!["lib.rs", "main.rs"]
+    );
+    // `src/ma`: peek + filter — only `main.rs` survives the `ma` prefix.
+    assert_eq!(
+        peek_query_names(&mut ws, 5, "src/ma", 3).await,
+        vec!["main.rs"]
+    );
+    // Backspacing back to `src` recovers the anchor listing — the peek never moved the anchor.
+    assert_eq!(
+        peek_query_names(&mut ws, 6, "src", 4).await,
+        vec!["src", "src.txt"]
+    );
+    drop(server);
+}
+
+/// `src/ma` highlights only the filter part (`ma`), not the path part — the match indices cover
+/// the leading chars of `main.rs`, since the path selected the listing rather than matching a row.
+#[tokio::test]
+async fn picker_explorer_peek_highlights_filter_part_only() {
+    let (server, mut ws, _root) = setup_peek_workspace().await;
     let _: () = send_request::<PickerQuery>(
         &mut ws,
         3,
         &PickerQueryParams {
             filters: Default::default(),
             kind: PickerKind::Explorer,
-            query: "src".into(),
+            query: "src/ma".into(),
             generation: 1,
         },
     )
     .await;
-    let plain = expect_notification::<PickerUpdate>(&mut ws).await;
-    let names: Vec<String> = plain
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    let indices: Vec<(String, Vec<u32>)> = update
+        .items()
+        .iter()
+        .map(|i| match i {
+            PickerItem::DirEntry {
+                name,
+                match_indices,
+                ..
+            } => (name.clone(), match_indices.clone()),
+            other => panic!("expected DirEntry, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        indices,
+        vec![("main.rs".to_string(), vec![0, 1])],
+        "only the two filter chars (`ma`) are highlighted"
+    );
+    drop(server);
+}
+
+/// Selecting a file while peeked resolves against the *peeked* directory, not the anchor: the
+/// returned absolute path lives in the subdirectory the query descended into.
+#[tokio::test]
+async fn picker_explorer_select_file_under_peek() {
+    let (server, mut ws, root) = setup_peek_workspace().await;
+    let _ = peek_query_names(&mut ws, 3, "src/main", 1).await;
+    let selected: aether_protocol::picker::PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        4,
+        &PickerSelectParams {
+            kind: PickerKind::Explorer,
+            item: PickerItem::DirEntry {
+                name: "main.rs".into(),
+                is_dir: false,
+                match_indices: vec![],
+                git_status: None,
+            },
+        },
+    )
+    .await;
+    match selected {
+        aether_protocol::picker::PickerSelectResult::File { path } => assert_eq!(
+            path,
+            root.join("src/main.rs").to_str().unwrap(),
+            "select resolves against the peeked `src`, not the anchor"
+        ),
+        other => panic!("expected File, got {other:?}"),
+    }
+    drop(server);
+}
+
+/// A peek whose path part doesn't resolve to a directory (a not-yet-created path — the client's
+/// "+ Create" case) lists nothing, leaving the anchor intact so backspacing recovers.
+#[tokio::test]
+async fn picker_explorer_peek_into_missing_dir_is_empty() {
+    let (server, mut ws, _root) = setup_peek_workspace().await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Explorer,
+            query: "nope/leaf".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, 0, "an unresolved peek lists nothing");
+    assert!(update.items().is_empty());
+    assert!(
+        update.explorer_peek_missing,
+        "the peeked dir doesn't exist → client may offer + Create directory"
+    );
+    drop(server);
+}
+
+/// A peek into a directory that *does* exist clears `explorer_peek_missing`, so the client won't
+/// offer to create a directory that's already there (the bug this guards against: the listing
+/// shows the dir's contents, which can't reveal the dir's own existence).
+#[tokio::test]
+async fn picker_explorer_peek_into_existing_dir_clears_missing_flag() {
+    let (server, mut ws, _root) = setup_peek_workspace().await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Explorer,
+            query: "src/".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert!(
+        !update.explorer_peek_missing,
+        "`src` exists → no + Create directory offer"
+    );
+    drop(server);
+}
+
+/// While peeked, a `picker/view` refetch (no `directory_path`, e.g. a scroll) keeps the peek
+/// listing *and* still echoes the committed anchor as `directory_path` — the peek survives the
+/// window move and the breadcrumb stays on the anchor.
+#[tokio::test]
+async fn picker_explorer_peek_survives_refetch_and_keeps_anchor() {
+    let (server, mut ws, root) = setup_peek_workspace().await;
+    assert_eq!(
+        peek_query_names(&mut ws, 3, "src/", 1).await,
+        vec!["lib.rs", "main.rs"]
+    );
+    let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        4,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Explorer,
+            reset: false,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor_grep_hit: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        view.directory_path.as_deref(),
+        Some(root.to_str().unwrap()),
+        "refetch echoes the anchor, not the peeked `src`"
+    );
+    let names: Vec<String> = view
+        .update
+        .expect("view carries the window")
         .items()
         .iter()
         .map(|i| match i {
@@ -12972,34 +13180,7 @@ async fn picker_explorer_trailing_slash_filters_to_directories() {
             other => panic!("expected DirEntry, got {other:?}"),
         })
         .collect();
-    assert_eq!(names, vec!["src", "src-extra", "src.txt"]);
-
-    // `src/` matches only the dirs.
-    let _: () = send_request::<PickerQuery>(
-        &mut ws,
-        4,
-        &PickerQueryParams {
-            filters: Default::default(),
-            kind: PickerKind::Explorer,
-            query: "src/".into(),
-            generation: 2,
-        },
-    )
-    .await;
-    let slashed = expect_notification::<PickerUpdate>(&mut ws).await;
-    let names: Vec<String> = slashed
-        .items()
-        .iter()
-        .map(|i| match i {
-            PickerItem::DirEntry { name, is_dir, .. } => {
-                assert!(*is_dir, "trailing `/` filter must drop non-dir entries");
-                name.clone()
-            }
-            other => panic!("expected DirEntry, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(names, vec!["src", "src-extra"]);
-
+    assert_eq!(names, vec!["lib.rs", "main.rs"], "peek listing preserved");
     drop(server);
 }
 

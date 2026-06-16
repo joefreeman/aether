@@ -230,7 +230,11 @@ pub fn overlay<'a>(
         // caret/selection, dim placeholder, no border/background (the input row's NORD0 is the
         // box). Width::Shrink so it sits flush after any breadcrumb rather than filling the row and
         // pushing the count off-screen.
-        let ph = if show_placeholder {
+        // The Explorer's tab-completion ghost: the common-prefix suffix `Tab` would append.
+        let completion = state.explorer_completion().filter(|s| !s.is_empty());
+        // A completion ghost is itself the "what typing does" hint, so it also suppresses the
+        // placeholder (like the breadcrumb / chip row do).
+        let ph = if show_placeholder && completion.is_none() {
             placeholder(state.kind)
         } else {
             ""
@@ -277,7 +281,26 @@ pub fn overlay<'a>(
         } else {
             crate::alt_filter::alt_passthrough(q_input)
         };
-        input = input.push(wrapped);
+        if state.kind == PickerKind::Explorer {
+            // Always overlay the input on a gray ghost layer — even with no suffix, where it renders
+            // the typed text invisibly under the opaque value and shows nothing. Rendering it
+            // unconditionally keeps the widget-tree shape (and thus the `text_input`'s focus state,
+            // which iced stores by tree position) stable when a suggestion appears or vanishes
+            // mid-type. The ghost layer is Fill-width so the row still lays out like the bare input
+            // (placeholder visible, count pinned right). Mirrors `field_with_ghost`.
+            let suffix = completion.unwrap_or_default();
+            let ghost_text = text(format!("{}{}", state.query, suffix))
+                .size(13)
+                .font(SANS)
+                .color(theme::NORD3_BRIGHT)
+                .shaping(iced::widget::text::Shaping::Advanced)
+                .wrapping(iced::widget::text::Wrapping::None);
+            let ghost_layer: Element<'a, PickerMsg> =
+                row![ghost_text, iced::widget::Space::new().width(Length::Fill)].into();
+            input = input.push(iced::widget::stack![ghost_layer, wrapped]);
+        } else {
+            input = input.push(wrapped);
+        }
     } else if state.query.is_empty() {
         let mut q = row![
             container(iced::widget::Space::new().width(2).height(15)).style(|_| {

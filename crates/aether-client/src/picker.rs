@@ -73,10 +73,17 @@ pub struct PickerState {
     pub reveal_on_update: Option<Reveal>,
     /// The row under the pointer (underlined, web's hover affordance).
     pub hovered: Option<u32>,
-    /// Explorer: the canonical directory being listed, echoed by `picker/view`.
+    /// Explorer: the committed *anchor* directory, echoed by `picker/view`. Navigation (Enter on a
+    /// dir, Alt-h) moves it; typing a path query peeks relative to it without moving it (so
+    /// backspace walks the peek back). The directory whose entries are actually shown is
+    /// [`Self::explorer_listing_dir`] = this joined with the query's path part.
     pub directory: Option<String>,
-    /// Explorer: the listed directory's parent, when still inside the project boundary.
+    /// Explorer: the anchor's parent, when still inside the project boundary.
     pub directory_parent: Option<String>,
+    /// Explorer: true when the query's peek directory (anchor + path part) doesn't exist — pushed
+    /// by the server (the listing shows the peeked dir's *contents*, so the client can't tell on
+    /// its own). Gates whether a trailing-slash query offers "+ Create directory".
+    pub explorer_peek_missing: bool,
     /// The filter set in effect, stored as the ordered chip list — the client's single source
     /// of truth (docs/picker-filters.md). The wire `PickerFilters` is derived per send and
     /// converted back on open/resume; insertion order is session-ephemeral.
@@ -121,6 +128,7 @@ impl PickerState {
             hovered: None,
             directory: None,
             directory_parent: None,
+            explorer_peek_missing: false,
             chips: Vec::new(),
             chip_selected: None,
             chip_editor: None,
@@ -279,6 +287,59 @@ impl PickerState {
         }
     }
 
+    /// The directory whose entries the Explorer is currently showing: the committed anchor
+    /// ([`Self::directory`]) descended by the query's path part (everything up to the last `/`).
+    /// Rows the user sees live here, so Enter-into-a-dir and delete resolve a leaf name against it
+    /// (whereas "+ Create" joins the *whole* query to the anchor, creating intermediates). `None`
+    /// only when there's no anchor yet (no Explorer view has landed).
+    pub fn explorer_listing_dir(&self) -> Option<String> {
+        let dir = self.directory.as_deref()?;
+        let (path_part, _filter) = explorer_query_split(&self.query);
+        if path_part.is_empty() {
+            Some(dir.to_string())
+        } else {
+            Some(format!("{}/{}", dir.trim_end_matches('/'), path_part))
+        }
+    }
+
+    /// Tab-completion ghost for the Explorer input: the longest common prefix shared by *all*
+    /// currently-matched entries, beyond what the query's filter part already spells (so the ghost
+    /// is what `Tab` would append). `None` for non-Explorer kinds, when not every match is in hand
+    /// (the filtered listing overflows the fetched window, so a hidden entry could break the
+    /// prefix), or when there's nothing left to add. An empty filter in a directory whose entries
+    /// all share a prefix still suggests it.
+    pub fn explorer_completion(&self) -> Option<String> {
+        if self.kind != PickerKind::Explorer {
+            return None;
+        }
+        // Only safe when the window holds every match — otherwise the "common" prefix is over a
+        // subset and could run longer than the true one.
+        if self.items.is_empty() || self.items.len() as u32 != self.total_matches {
+            return None;
+        }
+        let filter_len = explorer_query_split(&self.query).1.chars().count();
+        let mut names = self.items.iter().filter_map(|it| match it {
+            PickerItem::DirEntry { name, .. } => Some(name.as_str()),
+            _ => None,
+        });
+        let first = names.next()?;
+        // Longest common prefix length (in chars) across all matched names.
+        let mut lcp_len = first.chars().count();
+        for name in names {
+            let common = first
+                .chars()
+                .zip(name.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            lcp_len = lcp_len.min(common);
+            if lcp_len <= filter_len {
+                return None;
+            }
+        }
+        (lcp_len > filter_len)
+            .then(|| first.chars().skip(filter_len).take(lcp_len - filter_len).collect())
+    }
+
     fn explorer_pending_create(&self) -> Option<PendingCreate> {
         let q = self.query.trim();
         let (base, is_dir) = match q.strip_suffix('/') {
@@ -292,16 +353,24 @@ impl PickerState {
         {
             return None;
         }
-        // Suppress when an entry already carries this exact name. Only single-segment names can be
-        // checked against the listed window (the Explorer lists one directory, fetched whole once a
-        // query has narrowed it); a multi-segment name's leaf lives in a directory we haven't
-        // listed, so we always offer it. Case-sensitive: `Foo` and `foo` are distinct files.
-        let exact = !base.contains('/')
-            && self
-                .items
+        // Suppress when the named thing already exists, keyed off the peek listing (the directory
+        // the query descended into):
+        //  - File (no trailing `/`): the listing *is* the leaf's parent (peek = anchor + path
+        //    part), so suppress when the leaf is already there — you'd open it. `b/c` checks `c`
+        //    against the entries of `b`.
+        //  - Directory (trailing `/`): the query peeks *into* the named dir, so its existence can't
+        //    be read off the listing (that's the dir's *contents*). The server tells us via
+        //    `explorer_peek_missing`; offer create only when the peeked dir is actually missing.
+        // Case-sensitive throughout: `Foo` and `foo` are distinct.
+        let suppress = if is_dir {
+            !self.explorer_peek_missing
+        } else {
+            let leaf = base.rsplit('/').next().unwrap_or(base);
+            self.items
                 .iter()
-                .any(|it| matches!(it, PickerItem::DirEntry { name, .. } if name == base));
-        if exact {
+                .any(|it| matches!(it, PickerItem::DirEntry { name, .. } if name == leaf))
+        };
+        if suppress {
             return None;
         }
         Some(PendingCreate {
@@ -356,6 +425,7 @@ impl PickerState {
         self.total_matches = u.total_matches;
         self.total_candidates = u.total_candidates;
         self.ticking = u.ticking;
+        self.explorer_peek_missing = u.explorer_peek_missing;
         // Advance the throbber each applied push while a search is still running.
         if u.ticking {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
@@ -532,6 +602,16 @@ pub enum ItemKey<'a> {
     Symbol(&'a str, u32, u32),
 }
 
+/// Split an Explorer path-query into `(path_part, filter_part)` at the last `/`, mirroring the
+/// server's `explorer_query_split`. The path part (no trailing slash) is the peek directory under
+/// the anchor; the filter part prefix-matches its entries. No `/` → the whole query is the filter.
+pub fn explorer_query_split(query: &str) -> (&str, &str) {
+    match query.rfind('/') {
+        Some(i) => (&query[..i], &query[i + 1..]),
+        None => ("", query),
+    }
+}
+
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
     match item {
         PickerItem::File {
@@ -623,6 +703,7 @@ mod tests {
             grep_display_offset: None,
             grep_total_display_rows: None,
             center_on: None,
+            explorer_peek_missing: false,
         }
     }
 
@@ -704,6 +785,7 @@ mod tests {
             grep_display_offset: Some(14),
             grep_total_display_rows: Some(18),
             center_on: None,
+            explorer_peek_missing: false,
         }));
         // Window rows: [13]=hdr a.rs, [14]=hit, [15]=hit, [16]=hdr b.rs, [17]=hit.
         s.selected = 10;
@@ -777,6 +859,7 @@ mod tests {
             grep_display_offset: None,
             grep_total_display_rows: None,
             center_on: None,
+            explorer_peek_missing: false,
         }));
         assert_eq!(s.selected, 1);
         assert!(s.pending_center.is_none());
@@ -854,6 +937,7 @@ mod tests {
             grep_display_offset: None,
             grep_total_display_rows: None,
             center_on: None,
+            explorer_peek_missing: false,
         });
         s
     }
@@ -875,8 +959,13 @@ mod tests {
         // A name that exactly matches an existing entry: no create offered (you'd open it).
         s.query = "lib.rs".into();
         assert_eq!(s.pending_create(), None);
-        // Trailing slash means a directory.
+        // Trailing slash peeks into a directory: when it exists (server says not missing) no create
+        // is offered, regardless of whether its listing is empty…
         s.query = "sub/".into();
+        s.explorer_peek_missing = false;
+        assert_eq!(s.pending_create(), None);
+        // …but when the peeked dir is missing, offer to create it.
+        s.explorer_peek_missing = true;
         assert_eq!(
             s.pending_create(),
             Some(PendingCreate {
@@ -893,6 +982,83 @@ mod tests {
         s.kind = PickerKind::Files;
         s.query = "new.rs".into();
         assert_eq!(s.pending_create(), None);
+    }
+
+    #[test]
+    fn explorer_completion_suggests_common_prefix_beyond_the_query() {
+        // A single match → complete the rest of its name.
+        let mut s = explorer_with(&["crates"]);
+        s.query = "cra".into();
+        assert_eq!(s.explorer_completion().as_deref(), Some("tes"));
+
+        // Several matches sharing a prefix, empty query → suggest the whole shared prefix.
+        let mut s = explorer_with(&["aether-protocol", "aether-server", "aether-tui"]);
+        s.query = "".into();
+        assert_eq!(s.explorer_completion().as_deref(), Some("aether-"));
+        // Once the query reaches the shared prefix, the entries diverge → nothing to add.
+        s.query = "aether-".into();
+        assert_eq!(s.explorer_completion(), None);
+        // Partway in, still suggests the remainder up to the divergence.
+        s.query = "aet".into();
+        assert_eq!(s.explorer_completion().as_deref(), Some("her-"));
+    }
+
+    #[test]
+    fn explorer_completion_holds_off_until_all_matches_are_in_hand() {
+        // A windowed listing (more matches than rows shown) can't prove a common prefix.
+        let mut s = explorer_with(&["aether-a", "aether-b"]);
+        s.query = "".into();
+        s.total_matches = 5; // two shown, five total → don't guess
+        assert_eq!(s.explorer_completion(), None);
+        // No matches at all → nothing.
+        let mut s = explorer_with(&[]);
+        s.query = "zzz".into();
+        assert_eq!(s.explorer_completion(), None);
+        // Not the Explorer → never.
+        let mut s = explorer_with(&["aaa", "aab"]);
+        s.kind = PickerKind::Files;
+        assert_eq!(s.explorer_completion(), None);
+    }
+
+    #[test]
+    fn explorer_completion_respects_the_query_path_part() {
+        // The completion applies to the filter part (after the last `/`), not the whole query:
+        // entries `alpha`/`alps` share `alp`, and with filter `al` the suffix is just `p`.
+        let mut s = explorer_with(&["alpha", "alps"]);
+        s.query = "src/al".into();
+        assert_eq!(s.explorer_completion().as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn explorer_listing_dir_descends_by_query_path_part() {
+        let mut s = explorer_with(&["main.rs"]);
+        s.directory = Some("/proj/a".into());
+        // No path part → the anchor itself.
+        s.query = "ma".into();
+        assert_eq!(s.explorer_listing_dir().as_deref(), Some("/proj/a"));
+        // A path part descends; the filter part (after the last `/`) is not part of the dir.
+        s.query = "b/ma".into();
+        assert_eq!(s.explorer_listing_dir().as_deref(), Some("/proj/a/b"));
+        // Trailing slash: the whole thing is the path part.
+        s.query = "b/c/".into();
+        assert_eq!(s.explorer_listing_dir().as_deref(), Some("/proj/a/b/c"));
+    }
+
+    #[test]
+    fn pending_create_for_multi_segment_checks_leaf_against_peek_listing() {
+        // Peeked into `b` (listing shows its entries); `b/c` where `c` is present → no create.
+        let mut s = explorer_with(&["c", "d"]);
+        s.query = "b/c".into();
+        assert_eq!(s.pending_create(), None, "leaf `c` is in the peek listing");
+        // `b/novel` → the leaf isn't listed, so offer to create the (multi-segment) file.
+        s.query = "b/novel".into();
+        assert_eq!(
+            s.pending_create(),
+            Some(PendingCreate {
+                name: "b/novel".into(),
+                is_dir: false
+            })
+        );
     }
 
     #[test]

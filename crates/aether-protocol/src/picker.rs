@@ -33,10 +33,14 @@ pub enum PickerKind {
     /// `hide`/`view` so the user can step through results — they may be stale relative to the
     /// file on disk after editing, and that's accepted (jumps clamp to the current line bounds).
     Grep,
-    /// Filesystem explorer. Entries are the children of one directory (re-listed on each
-    /// `picker/view`). The query fuzzy-matches entry names within that directory. Navigation
-    /// (parent / enter subdirectory) is driven by the client sending `picker/view` with a new
-    /// `directory_path`; the result + push carry the canonical path the listing is for.
+    /// Filesystem explorer. Entries are the children of one directory. The query is a *path*
+    /// relative to the committed *anchor* directory: its part up to the last `/` selects which
+    /// directory under the anchor to list (a "peek" — `src/` lists `src`, `src/ma` lists `src`
+    /// filtered by `ma`), and the server re-lists it on each `picker/query`. The part after the
+    /// last `/` prefix-matches entry names. Committing navigation (Enter on a dir, parent via
+    /// Alt-h, root select) moves the anchor via `picker/view` with a new `directory_path`; the
+    /// result + push carry the anchor's canonical path (not the peeked listing's), so the
+    /// breadcrumb stays put while peeking and backspacing the query walks the peek back.
     Explorer,
     /// Configured projects under `$XDG_CONFIG_HOME/aether/projects/`. Fuzzy-matched on name.
     /// Selecting one triggers the client to send `project/activate`. Distinct from the other
@@ -629,11 +633,12 @@ pub struct PickerViewResult {
     /// `None` when no centering happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_center_on: Option<PickerItem>,
-    /// Explorer only: the canonical absolute path of the directory the picker is listing. `None`
-    /// for the other picker kinds.
+    /// Explorer only: the canonical absolute path of the committed *anchor* directory (the one
+    /// navigation moves between), not the query-derived peek listing. `None` for the other picker
+    /// kinds and in Roots mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_path: Option<String>,
-    /// Explorer only: the canonical absolute path of the parent directory, if it's still inside
+    /// Explorer only: the canonical absolute path of the anchor's parent, if it's still inside
     /// the project's access boundary. `None` when at (or above) a project root, and `None` for
     /// the other picker kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -876,6 +881,14 @@ pub struct PickerUpdateParams {
     /// `Event`/message enums that embed it) small — `PickerItem` is a large tagged union.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center_on: Option<Box<PickerItem>>,
+    /// Explorer only: true when the directory the query *peeks into* (the anchor joined with the
+    /// query's path part) doesn't exist as an in-project directory — e.g. mid-typing a not-yet-
+    /// created path. The client uses it to decide whether a trailing-slash query offers
+    /// "+ Create directory" (offered only when the directory is missing — you can't tell from the
+    /// listing alone, since a peek lists the directory's *contents*). Absent on the wire (and for
+    /// non-Explorer kinds) when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explorer_peek_missing: bool,
 }
 
 impl PickerUpdateParams {

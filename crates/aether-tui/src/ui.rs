@@ -2087,10 +2087,20 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     let (chip_spans, chips_w) = picker_chip_spans(state, chip_budget(total_width, prefix_w));
     let prefix_has_content = prefix_w > 0 || chips_w > 0;
 
+    // The explorer tab-completion ghost: the common-prefix suffix `Tab` would append, dim after
+    // the query (even when the query is empty — a fresh dir whose entries all share a prefix).
+    let ghost = state
+        .picker
+        .completion
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let ghost_style = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+
     let (left_text, left_style, left_w) = if state.picker.query.is_empty() {
-        // Suppress the placeholder when the explorer prefix or a chip row is already telling
-        // the user what's in effect — that *is* the context. Otherwise keep the placeholder.
-        if prefix_has_content {
+        // Suppress the placeholder when the explorer prefix, a chip row, or a completion ghost is
+        // already telling the user what's in effect — that *is* the context. Otherwise keep it.
+        if prefix_has_content || ghost.is_some() {
             (String::new(), base_style, 0)
         } else {
             let ph = picker_placeholder(state.picker.kind);
@@ -2133,7 +2143,11 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         spans.push(Span::styled(path_text, path_style));
     }
     spans.push(Span::styled(left_text, left_style));
-    let used = prefix_w + chips_w + left_w;
+    let ghost_w = ghost.as_deref().map(str::width).unwrap_or(0);
+    if let Some(ghost) = ghost {
+        spans.push(Span::styled(ghost, ghost_style));
+    }
+    let used = prefix_w + chips_w + left_w + ghost_w;
     if !counts.is_empty() && used + counts_w < total_width {
         let pad = total_width.saturating_sub(used + counts_w);
         spans.push(Span::styled(" ".repeat(pad), base_style));

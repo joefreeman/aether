@@ -106,6 +106,9 @@ fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
                 "window_base": p.window_base(),
                 "directory": p.directory,
                 "directory_parent": p.directory_parent,
+                // Explorer tab-completion ghost: the common-prefix suffix `Tab` would append to the
+                // query, shown dim after the input. `null` when there's nothing to complete.
+                "completion": p.explorer_completion(),
                 // The Explorer's synthetic "+ Create …" affordance (core-owned decision). `abs` is
                 // its selection index, one past the last match; the shell appends the row when the
                 // window reaches the list's end and routes a click/Enter through `picker_click`.

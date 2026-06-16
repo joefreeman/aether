@@ -1541,6 +1541,7 @@ fn picker_update_round_trips_through_notification() {
         grep_display_offset: None,
         grep_total_display_rows: None,
         center_on: None,
+        explorer_peek_missing: false,
     };
     let notif = Notification {
         jsonrpc: JsonRpc,
@@ -1581,6 +1582,7 @@ fn picker_update_carries_center_on_symbol() {
             context: false,
             match_indices: vec![],
         })),
+        explorer_peek_missing: false,
     };
     let v = to_value(&params).unwrap();
     assert_eq!(v["center_on"]["kind"], "symbol");
