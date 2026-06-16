@@ -1,6 +1,6 @@
 //! Per-connection task: WebSocket framing, JSON-RPC frame dispatch.
 //!
-//! Authentication: the client passes `?token=<>&client_version=<>` on the WebSocket URL.
+//! Authentication: the client passes `?token=<>&version=<>` on the WebSocket URL.
 //! Token mismatch fails the upgrade with HTTP 401 *before* any JSON-RPC traffic flows; valid
 //! tokens get an allocated `ClientId` immediately, so handlers can rely on it being set.
 //!
@@ -72,11 +72,11 @@ const REPLY_CHANNEL_CAPACITY: usize = 8;
 /// Extracted from the WebSocket upgrade request's query string.
 #[derive(Default)]
 struct ConnectQuery {
-    client_version: Option<String>,
+    version: Option<String>,
 }
 
 impl ConnectQuery {
-    /// Parse `?client_version=...` (and tolerate missing/extra params). URL-decoding is
+    /// Parse `?version=...` (and tolerate missing/extra params). URL-decoding is
     /// intentionally minimal — this value is produced by our own clients.
     fn parse(query: &str) -> Self {
         let mut out = Self::default();
@@ -84,8 +84,8 @@ impl ConnectQuery {
             let Some((k, v)) = kv.split_once('=') else {
                 continue;
             };
-            if k == "client_version" {
-                out.client_version = Some(v.to_string());
+            if k == "version" {
+                out.version = Some(v.to_string());
             }
         }
         out
@@ -115,9 +115,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
                 None => true,
                 Some(o) => o.to_str().is_ok_and(crate::http::is_loopback_authority),
             };
-            if host_ok && origin_ok {
-                Ok(resp)
-            } else {
+            if !(host_ok && origin_ok) {
                 tracing::warn!(
                     ?peer,
                     host_ok,
@@ -126,13 +124,36 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
                 );
                 let mut err = HsErr::new(Some("forbidden".into()));
                 *err.status_mut() = StatusCode::FORBIDDEN;
-                Err(err)
+                return Err(err);
             }
+            // Version gate: a non-empty client version that differs from ours means a newer (or
+            // older) client binary is talking to a stale daemon still holding the port. Reject the
+            // upgrade with 426 so the client surfaces "restart the server" instead of failing later
+            // on a drifted wire format. An absent/empty version (the web dev shell, ad-hoc tooling)
+            // is allowed through — only a declared mismatch is fatal, and native clients always send
+            // their version, so this still covers the release-skew case it exists for.
+            let server_version = aether_protocol::PROTOCOL_VERSION;
+            if let Some(v) = query.version.as_deref() {
+                if !v.is_empty() && v != server_version {
+                    tracing::warn!(
+                        ?peer,
+                        client = %v,
+                        server = %server_version,
+                        "rejecting connection: version mismatch"
+                    );
+                    let mut err = HsErr::new(Some(format!(
+                        "version mismatch: server {server_version}, client {v} — restart the server"
+                    )));
+                    *err.status_mut() = StatusCode::UPGRADE_REQUIRED;
+                    return Err(err);
+                }
+            }
+            Ok(resp)
         },
     )
     .await
     .with_context(|| format!("WebSocket handshake from {peer:?}"))?;
-    let client_version = query.client_version.clone().unwrap_or_default();
+    let client_version = query.version.clone().unwrap_or_default();
     tracing::debug!(?peer, %client_version, "WebSocket established");
 
     let (mut writer, mut reader) = ws.split();

@@ -1055,7 +1055,11 @@ export class Shell {
   private async boot(cfg: Config): Promise<void> {
     await init(); // instantiate the wasm module
 
-    const url = `${cfg.wsBase}/?client_version=web-core-0.1`;
+    // No client_version: the server's version gate only rejects a *declared* mismatch, and the
+    // browser is inherently version-locked to its serving daemon (it loads this bundle from the same
+    // build it then connects to), so it can never be skewed. Sending a fixed string would just get
+    // us rejected the moment the release version moves.
+    const url = `${cfg.wsBase}/`;
     this.client = new RpcClient(url, (m, p) => this.onNotification(m, p), {
       onConnState: (s) => this.onConnState(s),
       onReconnect: () => void this.reestablish(),

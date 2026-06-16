@@ -32,10 +32,18 @@ pub type ClientId = uuid::Uuid;
 pub const SERVER_PORT: u16 = 2384;
 
 /// The default loopback WebSocket URL clients connect to ([`SERVER_PORT`]). The connection layer
-/// appends its own `?client_version=` query string.
+/// appends its own `?version=` query string.
 pub fn default_server_url() -> String {
     format!("ws://127.0.0.1:{SERVER_PORT}")
 }
+
+/// The build version a client announces on connect (`?version=`); the server requires an
+/// exact match against its own copy of this string. Server and all clients ship in one binary, so
+/// "same release" always means identical versions — any difference means a freshly-installed binary
+/// is talking to a stale daemon still holding [`SERVER_PORT`], whose wire format may have drifted.
+/// Sourced from the workspace version (every crate sets `version.workspace = true`), so this and the
+/// server's/native clients' `CARGO_PKG_VERSION` are guaranteed equal within a build.
+pub const PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalPosition {

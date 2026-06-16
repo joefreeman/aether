@@ -94,11 +94,16 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
-    /// WebSocket URL with a dummy client_version in the query string. Tests connect via this — the
-    /// production flow does the same in the TUI client. No token: auth is by loopback `Host`/`Origin`
-    /// (see `http::is_loopback_authority`), and connecting via `127.0.0.1` satisfies it.
+    /// WebSocket URL carrying our own build version in the query string — the server's handshake
+    /// requires it to match (see `connection`'s version gate), so tests connect with the real
+    /// `PROTOCOL_VERSION` exactly as the native clients do. No token: auth is by loopback
+    /// `Host`/`Origin` (see `http::is_loopback_authority`), and connecting via `127.0.0.1` satisfies it.
     pub fn ws_url(&self) -> String {
-        format!("ws://127.0.0.1:{}/?client_version=test", self.port)
+        format!(
+            "ws://127.0.0.1:{}/?version={}",
+            self.port,
+            aether_protocol::PROTOCOL_VERSION
+        )
     }
 }
 

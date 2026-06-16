@@ -99,7 +99,7 @@ pub async fn connect(
     base_url: &str,
     client_version: &str,
 ) -> anyhow::Result<(Handle, mpsc::UnboundedReceiver<Notification>)> {
-    let url = format!("{base_url}/?client_version={client_version}");
+    let url = format!("{base_url}/?version={client_version}");
     let (ws, _) = tokio_tungstenite::connect_async(&url).await?;
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let (notif_tx, notif_rx) = mpsc::unbounded_channel();

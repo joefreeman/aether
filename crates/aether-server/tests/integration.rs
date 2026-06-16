@@ -690,6 +690,41 @@ async fn connects_with_no_origin() {
     assert!(result.is_ok(), "TUI (no Origin) should connect");
 }
 
+/// A client announcing a different build version is rejected at the handshake: this is the
+/// stale-daemon guard (a freshly-installed binary must not talk to an old daemon on a drifted wire
+/// format). The matching-version case is covered by every other test, which connects via `ws_url`.
+#[tokio::test]
+async fn ws_rejects_version_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+
+    let url = format!("ws://127.0.0.1:{}/?version=9.9.9-stale", server.port);
+    let result = tokio_tungstenite::connect_async(url).await;
+    assert!(
+        result.is_err(),
+        "connect should fail when the client version differs from the server"
+    );
+}
+
+/// A client that announces no version at all is allowed through — the gate only fires on a
+/// *declared* mismatch, so the web dev shell and ad-hoc tooling keep working.
+#[tokio::test]
+async fn ws_accepts_absent_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+
+    let url = format!("ws://127.0.0.1:{}/", server.port);
+    let result = tokio_tungstenite::connect_async(url).await;
+    assert!(
+        result.is_ok(),
+        "connect should succeed when no client_version is sent"
+    );
+}
+
 #[tokio::test]
 async fn rejects_path_outside_project() {
     let dir = tempfile::tempdir().unwrap();
