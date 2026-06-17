@@ -3,6 +3,9 @@
 //! - Durable config: `$XDG_CONFIG_HOME/aether/projects/<name>.toml`
 //! - Runtime info:   `$XDG_RUNTIME_DIR/aether/server.json` (one file per running server, not per
 //!   project — a single server now hosts many projects, picked per-client via `project/activate`).
+//!   `$XDG_RUNTIME_DIR` only exists on Linux/BSD; on macOS (and anywhere it's unset) we fall back
+//!   to the user cache dir (`~/Library/Caches/aether/` on macOS), which is the right home for
+//!   per-machine-session bookkeeping that needn't survive a reboot.
 
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -185,10 +188,10 @@ fn match_project(target: &Path, projects: &[(String, Vec<PathBuf>)]) -> ProjectM
 pub fn runtime_info_path() -> anyhow::Result<PathBuf> {
     let base = directories::BaseDirs::new()
         .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
-    let runtime = base
-        .runtime_dir()
-        .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is not set"))?;
-    Ok(runtime.join("aether").join("server.json"))
+    // `runtime_dir()` is `Some` only where `$XDG_RUNTIME_DIR` is set (Linux/BSD). Elsewhere
+    // (notably macOS) fall back to the cache dir — the runtime file is disposable session state.
+    let dir = base.runtime_dir().unwrap_or_else(|| base.cache_dir());
+    Ok(dir.join("aether").join("server.json"))
 }
 
 pub fn write_runtime_info(path: &Path, info: &RuntimeInfo) -> anyhow::Result<()> {
@@ -215,8 +218,17 @@ pub fn read_runtime_info(path: &Path) -> anyhow::Result<RuntimeInfo> {
     Ok(serde_json::from_str(&content)?)
 }
 
+/// Whether a process with the given pid is currently alive. Portable across Linux and macOS:
+/// `kill(pid, 0)` sends no signal but performs the existence/permission check. It returns 0 when
+/// the process exists, or fails with `EPERM` when it exists but we can't signal it — either way
+/// it's alive. Only `ESRCH` (no such process) means dead.
 pub fn pid_is_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    // SAFETY: `kill` with signal 0 has no side effects beyond the existence check.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Expand a leading `~/` or bare `~` to the user's home directory. Leaves the path unchanged
@@ -376,5 +388,27 @@ mod tests {
             match_project(Path::new("/home/joe/work/file.rs"), &projects),
             ProjectMatch::One("beta".to_string())
         );
+    }
+
+    #[test]
+    fn runtime_info_path_resolves_without_xdg_runtime_dir() {
+        // The whole point of the macOS fix: this must not error when `$XDG_RUNTIME_DIR` is unset.
+        // We can't reliably unset it here (other tests/threads share the env), so just assert the
+        // path resolves and lands under our `aether/server.json` regardless of which base was used.
+        let path = runtime_info_path().expect("runtime_info_path should never fail on a fallback");
+        assert!(path.ends_with("aether/server.json"), "unexpected path: {}", path.display());
+    }
+
+    #[test]
+    fn current_process_is_alive() {
+        assert!(pid_is_alive(std::process::id()));
+    }
+
+    #[test]
+    fn nonexistent_pid_is_dead() {
+        // pid 0 is the process group / scheduler — `kill(0, 0)` would signal our own group, not a
+        // real liveness probe, so use a pid that cannot exist instead. `i32::MAX` as a pid is far
+        // above any real allocation on Linux or macOS, so `kill` returns ESRCH.
+        assert!(!pid_is_alive(i32::MAX as u32));
     }
 }

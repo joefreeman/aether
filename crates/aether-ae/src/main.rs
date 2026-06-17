@@ -126,8 +126,8 @@ fn resolve_project(edit: &EditArgs) -> anyhow::Result<Option<String>> {
 
 /// Decide whether to launch the GUI when the user didn't force a client. `--gui`/`--tui` win
 /// outright. Otherwise infer from the environment: a terminal on stdout means we were launched
-/// from a shell (terminal client), while no terminal plus a display set means a desktop launcher
-/// (GUI). With neither — no terminal and no display — fall back to the terminal client.
+/// from a shell (terminal client), while no terminal plus a desktop GUI session means a desktop
+/// launcher (GUI). With neither — no terminal and no GUI session — fall back to the terminal client.
 fn want_gui(edit: &EditArgs) -> bool {
     if edit.gui {
         return true;
@@ -139,7 +139,18 @@ fn want_gui(edit: &EditArgs) -> bool {
     if std::io::stdout().is_terminal() {
         return false;
     }
-    std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
+    has_gui_display()
+}
+
+/// Whether a desktop GUI session is available for a no-terminal launch. macOS and Windows always
+/// have a windowing server present (Quartz / the Desktop Window Manager), so a launch with no
+/// controlling terminal is a desktop-launcher start → GUI. On Linux/BSD that only holds when an
+/// X11 or Wayland display is configured — `DISPLAY`/`WAYLAND_DISPLAY` are X11/Wayland-specific and
+/// are never set on macOS, so they must not gate the decision there.
+fn has_gui_display() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("DISPLAY").is_some()
 }
 
 fn run_server(args: ServerArgs) -> anyhow::Result<()> {
