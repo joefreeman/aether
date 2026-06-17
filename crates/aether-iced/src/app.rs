@@ -522,6 +522,7 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         let keys = iced::event::listen_with(|event, status, _window| match event {
             Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
                 modified_key,
                 modifiers,
                 text,
@@ -536,8 +537,11 @@ impl App {
                 // unfocuses itself, publishing nothing), which would otherwise swallow every
                 // overlay's Esc-to-close. Forward it regardless so the core still gets it; the
                 // input vanishes with the overlay anyway.
-                let code = crate::input::keycode(&modified_key)?;
                 let mods = crate::input::mods(modifiers);
+                // macOS composes Option(Alt)-chords into glyphs (Option-f → `ƒ`); resolve Alt
+                // bindings against the unmodified base key so they still match. See
+                // `input::keycode_for_binding`.
+                let code = crate::input::keycode_for_binding(&key, &modified_key, mods.alt)?;
                 // Forward to the core when no focused widget consumed the key (`Ignored`), PLUS two
                 // forced exceptions a focused `text_input` would otherwise swallow:
                 //   - `Escape` (the input captures it to unfocus itself), and
