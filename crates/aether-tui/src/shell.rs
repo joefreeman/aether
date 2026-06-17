@@ -370,12 +370,11 @@ impl Shell {
                     },
                 }),
                 Effect::WriteClipboard(text) => {
-                    let len = text.len();
-                    match clipboard::copy(&mut self.state.clipboard, text) {
-                        Ok(()) => {
-                            self.status(StatusMessage::success(format!("copied {len} bytes")))
-                        }
-                        Err(e) => self.status(StatusMessage::error(format!("copy failed: {e}"))),
+                    // The core already emits a "copied N bytes" success toast alongside
+                    // this effect (see update.rs CopyDone handler), so only report failures
+                    // here to avoid a duplicate success message.
+                    if let Err(e) = clipboard::copy(&mut self.state.clipboard, text) {
+                        self.status(StatusMessage::error(format!("copy failed: {e}")));
                     }
                 }
                 Effect::ReadClipboard(kind) => {
