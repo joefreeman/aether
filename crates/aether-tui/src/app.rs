@@ -4,7 +4,7 @@
 use aether_client::keymap::Action;
 use aether_client::session::ConnState;
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
-use aether_protocol::git::{BlameInfo, GitBufferStatus};
+use aether_protocol::git::GitBufferStatus;
 use aether_protocol::input::SurroundTarget;
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus};
 use aether_protocol::search::SearchSummary;
@@ -501,8 +501,11 @@ pub struct EditorState {
 /// when nothing relevant changed.
 #[derive(Default)]
 pub struct BlameState {
-    pub key: Option<(u32, u64)>,
-    pub info: Option<BlameInfo>,
+    /// Buffer line the cached blame was fetched for, so a stale entry is never shown for the
+    /// wrong line.
+    pub line: Option<u32>,
+    /// Pre-formatted end-of-line label (e.g. `author · 3 days ago`), supplied by the core.
+    pub text: Option<String>,
 }
 
 pub use crate::save_prompt::SavePromptState;

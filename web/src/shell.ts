@@ -11,8 +11,9 @@
 //! §"Two kinds of RPC".)
 //!
 //! Milestone (a) scope: bootstrap, keyboard editing, native virtual scroll, server pushes. Search,
-//! pickers, prompts, hover, blame refresh, mouse, clipboard, and core-driven reconnect are later
-//! milestones — `view().has_picker`/`has_prompt` and a few effects are intentionally stubbed below.
+//! pickers, prompts, hover, mouse, clipboard, and core-driven reconnect are later milestones —
+//! `view().has_picker`/`has_prompt` and a few effects are intentionally stubbed below. (Cursor-line
+//! blame is wired — see `maybeBlame`.)
 
 import "./theme.css";
 import init, { WasmSession, hover_key } from "./wasm/aether_web";
@@ -28,6 +29,7 @@ import type {
   BufferWindow,
   CursorState,
   DiagnosticCounts,
+  GitBlameLineResult,
   LogicalPosition,
   LspServerStatus,
   PickerItem,
@@ -45,6 +47,22 @@ const GUTTER_COLS = 1;
 const TAB_WIDTH = 4;
 const CONTINUATION_MARKER_WIDTH = 2;
 const BUFFER_PAD = 8; // px of breathing room above the first line / below the last (virtual)
+
+/** Coarse "N{unit} ago" rendering of an author timestamp (Unix seconds) for the inline blame label.
+ *  Ports aether-tui/src/shell.rs::time_ago — the last minute and any future (clock-skew) time read
+ *  as "just now". */
+function timeAgo(unixSecs: number): string {
+  const now = Math.floor(Date.now() / 1000);
+  const secs = Math.max(0, now - unixSecs);
+  if (secs < 60) return "just now";
+  let n: number, unit: string;
+  if (secs < 3600) [n, unit] = [secs / 60, "m"];
+  else if (secs < 86_400) [n, unit] = [secs / 3600, "h"];
+  else if (secs < 604_800) [n, unit] = [secs / 86_400, "d"];
+  else if (secs < 31_536_000) [n, unit] = [secs / 604_800, "w"];
+  else [n, unit] = [secs / 31_536_000, "y"];
+  return `${Math.floor(n)}${unit} ago`;
+}
 
 const PLACEHOLDER: Record<PickerKind, string> = {
   files: "Find files…",
@@ -680,6 +698,11 @@ export class Shell {
    *  stale window — the robust guard against the reply/push interleaving + concurrent-jump races. */
   private viewportEpoch = 0;
   private fetchInFlight = false;
+  /** Dedupe for the cursor-line blame request — `(buffer, line, revision)` it last fired for, so a
+   *  re-render with the cursor on the same line (and buffer unedited) doesn't re-fetch. Includes the
+   *  buffer id because the core (and our blame state) reset on a buffer switch, which the TUI/iced
+   *  shells get for free by sharing the core's `blame_requested`. */
+  private blameRequested: { bufferId: number; line: number; revision: number } | null = null;
   /** Socket up? Gates scroll-driven window prefetches — while down, a smooth-scroll animation fires
    *  ~60 scroll events/sec and each `viewport/scroll_to_row` rejects instantly, spinning the CPU. */
   private connected = true;
@@ -1948,6 +1971,7 @@ export class Shell {
     this.syncUrl(v); // keep the address bar in sync with the current buffer + cursor
     this.renderStatus(v);
     if (!v.window) return;
+    this.maybeBlame(v); // fire-and-forget; updates the core + re-renders when the label lands
     this.bufferEl.classList.toggle("hscroll", v.wrap === "none");
     renderBuffer(this.bufferEl, {
       window: v.window,
@@ -1960,6 +1984,35 @@ export class Shell {
       blame: v.blame && v.mode === "normal" ? v.blame.text : null,
       diffView: v.diff_view,
     });
+  }
+
+  /** End-of-line git blame for the cursor line, mirroring the TUI/iced shells' `maybe_blame`:
+   *  only in Normal mode and only for a file with a path, deduped by `(buffer, line, revision)`.
+   *  The label is formatted here — "author · 3w ago" needs a wall clock, which the sans-IO core
+   *  deliberately lacks — then handed to the core via `set_blame`, which keeps it only while it
+   *  still matches the cursor line. Best-effort: a failed/declined blame just leaves the line bare. */
+  private maybeBlame(v: CoreView): void {
+    if (v.mode !== "normal" || v.buffer.path === null) return;
+    const bufferId = v.buffer.buffer_id;
+    const line = v.buffer.cursor.position.line;
+    const revision = v.buffer.revision;
+    const prev = this.blameRequested;
+    if (prev && prev.bufferId === bufferId && prev.line === line && prev.revision === revision) return;
+    this.blameRequested = { bufferId, line, revision };
+    this.client
+      .rpc<GitBlameLineResult>("git/blame_line", { buffer_id: bufferId, line, include_commit_info: false })
+      .then(
+        (res) => {
+          const b = res.blame;
+          const text = !b
+            ? undefined
+            : b.is_uncommitted
+              ? "uncommitted"
+              : `${b.author} · ${timeAgo(b.timestamp)}`;
+          this.runEffects(this.session.set_blame(bufferId, line, text) as CoreEffect[]);
+        },
+        () => {}, // blame is non-essential; swallow failures (no repo, RPC error, disconnect)
+      );
   }
 
   /** Whether a keydown is plain text-editing (the native <input> should handle it and sync via its

@@ -236,6 +236,23 @@ export interface ViewportWindowResult {
   window: BufferWindow;
 }
 
+/** Mirrors aether-protocol::git::BlameInfo (serde snake_case). */
+export interface BlameInfo {
+  /** Abbreviated (7-char) commit hash; empty when `is_uncommitted`. */
+  commit: string;
+  author: string;
+  /** Author time as Unix seconds; `0` when `is_uncommitted`. */
+  timestamp: number;
+  /** A local, not-yet-committed edit (or a brand-new working-tree line). */
+  is_uncommitted: boolean;
+}
+
+/** Result of `git/blame_line`. `blame` is null when the line has no blame (no repo, untracked,
+ *  or past end-of-file); an uncommitted line is present with `is_uncommitted = true`. */
+export interface GitBlameLineResult {
+  blame: BlameInfo | null;
+}
+
 // ---- picker rows (embedded in the View) ---------------------------------------------------------
 
 export type PickerKind =

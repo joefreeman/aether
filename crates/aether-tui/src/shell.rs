@@ -1495,7 +1495,10 @@ impl Shell {
             },
             last_repeat: None,
             search: self.search_view(),
-            blame: BlameState::default(),
+            blame: BlameState {
+                line: s.blame.as_ref().map(|(l, _)| *l),
+                text: s.blame.as_ref().map(|(_, t)| t.clone()),
+            },
             transient: s.buffer.transient,
             file_path: s.buffer.path.clone(),
             file_label: s.buffer.label.clone(),

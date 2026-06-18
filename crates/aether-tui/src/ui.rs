@@ -9,7 +9,7 @@ use aether_client::keymap::KeyCode;
 use aether_client::session::ConnState;
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_protocol::cursor::CursorState;
-use aether_protocol::git::{BlameInfo, GitStatus};
+use aether_protocol::git::GitStatus;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{BufferDirtyState, PickerItem};
 use aether_protocol::search::SearchMatchRange;
@@ -3707,9 +3707,9 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     // against a one-frame mismatch right after the cursor moves).
     let cursor_line = state.ed().cursor.position.line;
     let blame_text: Option<String> = if matches!(state.ed().mode, EditorMode::Normal)
-        && state.ed().blame.key.map(|(l, _)| l) == Some(cursor_line)
+        && state.ed().blame.line == Some(cursor_line)
     {
-        state.ed().blame.info.as_ref().map(format_blame)
+        state.ed().blame.text.clone()
     } else {
         None
     };
@@ -4105,50 +4105,6 @@ fn append_eol_blame(spans: &mut Vec<Span<'static>>, blame: Option<&str>) {
             Style::default().fg(NORD3).add_modifier(Modifier::ITALIC),
         ));
     }
-}
-
-/// One-line blame label: `author · 3 days ago`, or a plain marker for a line the user has edited
-/// but not committed. The commit message lives in the `Space y` details popover, not inline.
-fn format_blame(info: &BlameInfo) -> String {
-    if info.is_uncommitted {
-        return "You · Uncommitted".to_string();
-    }
-    format!("{} · {}", info.author, relative_time(info.timestamp))
-}
-
-/// Coarse "N units ago" rendering of a Unix timestamp against the wall clock. Future timestamps
-/// (clock skew) and the last minute both read as "just now".
-fn relative_time(timestamp: i64) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let secs = (now - timestamp).max(0);
-
-    const MIN: i64 = 60;
-    const HOUR: i64 = 60 * MIN;
-    const DAY: i64 = 24 * HOUR;
-    const WEEK: i64 = 7 * DAY;
-    const MONTH: i64 = 30 * DAY;
-    const YEAR: i64 = 365 * DAY;
-
-    let (n, unit) = if secs < MIN {
-        return "just now".to_string();
-    } else if secs < HOUR {
-        (secs / MIN, "minute")
-    } else if secs < DAY {
-        (secs / HOUR, "hour")
-    } else if secs < WEEK {
-        (secs / DAY, "day")
-    } else if secs < MONTH {
-        (secs / WEEK, "week")
-    } else if secs < YEAR {
-        (secs / MONTH, "month")
-    } else {
-        (secs / YEAR, "year")
-    };
-    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
 /// Drop the first `scroll_col` bytes of the row's text, then shift highlight + selection + match

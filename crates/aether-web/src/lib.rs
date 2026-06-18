@@ -314,6 +314,19 @@ impl WasmSession {
         let kind = parse_paste(&paste)?;
         to_js(&effects_to_json(self.inner.on_event(Event::ClipboardRead(kind, text))))
     }
+
+    /// Deliver the cursor-line blame the shell fetched and formatted. Like the TUI/iced shells'
+    /// `maybe_blame`, the label ("author · 3w ago") is built shell-side because the sans-IO core
+    /// deliberately lacks a clock (docs/protocol-composites.md, G); `text` is `null`/absent when the
+    /// line has no blame. `buffer_id` is a JS number (`BufferId` ids stay well within f64). The core
+    /// keeps it only if it still matches the current buffer + cursor line. Returns `Effect[]`.
+    pub fn set_blame(&mut self, buffer_id: f64, line: u32, text: Option<String>) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.on_event(Event::BlameLine {
+            buffer_id: buffer_id as u64,
+            line,
+            text,
+        })))
+    }
 }
 
 /// Rebuild a [`PasteKind`] from the JSON descriptor `paste_value` emitted with `Effect::ReadClipboard`.
@@ -661,6 +674,34 @@ mod tests {
         let mut s = WasmSession::new();
         let fx = s.server_push("nonsense/event".into(), json!({}));
         assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn set_blame_surfaces_on_the_cursor_line() {
+        // A fresh session sits on buffer 0, line 0 — the blame the shell hands over matches the
+        // cursor line, so the core keeps it and the view exposes it for the renderer. Proves the
+        // `set_blame` boundary (shell-formatted label → core → view) end to end.
+        let mut s = WasmSession::new();
+        s.inner.on_event(Event::BlameLine {
+            buffer_id: s.inner.buffer.buffer_id,
+            line: 0,
+            text: Some("ada · 3w ago".into()),
+        });
+        let v = view::build_view(&s.inner);
+        assert_eq!(v["blame"]["line"], 0);
+        assert_eq!(v["blame"]["text"], "ada · 3w ago");
+    }
+
+    #[test]
+    fn set_blame_for_another_line_is_dropped() {
+        // Blame fetched for a line the cursor has since left is discarded, never shown stale.
+        let mut s = WasmSession::new();
+        s.inner.on_event(Event::BlameLine {
+            buffer_id: s.inner.buffer.buffer_id,
+            line: 7,
+            text: Some("grace · 1d ago".into()),
+        });
+        assert!(view::build_view(&s.inner)["blame"].is_null());
     }
 
     #[test]
