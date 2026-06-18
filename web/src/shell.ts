@@ -330,6 +330,7 @@ interface CoreView {
   prompt: PromptView | null;
   picker: PickerView | null;
   project_settings: ProjectSettingsView | null;
+  app_settings: AppSettingsView | null;
 }
 
 /** The project-settings overlay (`Space ,`), when open (view.rs `project_settings`). Core-owned
@@ -343,6 +344,15 @@ interface ProjectSettingsView {
   input_index: number;
   add: EditorInput;
   error: string | null;
+}
+
+/** The application-settings overlay (`Space .`), when open (view.rs `app_settings`). Core-owned
+ *  state + key handling (`on_app_settings_key`); the shell renders grouped checkboxes and routes
+ *  keys through the global keydown → `on_key`, plus checkbox clicks via `app_settings_toggle`.
+ *  `selected` is the flat row index across all groups. */
+interface AppSettingsView {
+  selected: number;
+  groups: { title: string; rows: { label: string; value: boolean; hint: string }[] }[];
 }
 
 /** Cumulative visual rows before `line` in the loaded window (phantom rows included), or null when
@@ -693,6 +703,12 @@ export class Shell {
   private psSelected = 0;
   private psInputIndex = 0;
   private psOpen = false;
+  /** The application-settings overlay (Space .). Core-owned state (`session.app_settings`);
+   *  toggle-only, so there are no inputs — keys route through the global keydown → `on_key`. The
+   *  modal body (rows + hint) is rebuilt each render. */
+  private readonly appSettingsEl: HTMLElement;
+  private readonly asModalEl: HTMLElement;
+  private asOpen = false;
   /** Monotonic id for the latest `viewport/subscribe`. Async viewport results (subscribe / fetch /
    *  reveal-scroll) captured at an older epoch are dropped, so a superseded request can't reinstate a
    *  stale window — the robust guard against the reply/push interleaving + concurrent-jump races. */
@@ -1014,7 +1030,7 @@ export class Shell {
     this.psModalEl.className = "modal project-settings";
     const psTitle = document.createElement("div");
     psTitle.className = "modal-message";
-    psTitle.textContent = "Project Settings";
+    psTitle.textContent = "Project settings";
     const psNameLabel = document.createElement("div");
     psNameLabel.className = "ps-label";
     psNameLabel.textContent = "Name";
@@ -1065,6 +1081,19 @@ export class Shell {
       this.psErrorEl,
     );
     this.projectSettingsEl.append(this.psModalEl);
+
+    // The application-settings overlay (Space .): a toggle-only modal — its body (rows + hint)
+    // is rebuilt each render by `renderAppSettings`. A backdrop click is swallowed (editor stays).
+    this.appSettingsEl = document.createElement("div");
+    this.appSettingsEl.className = "overlay";
+    this.appSettingsEl.style.display = "none";
+    this.appSettingsEl.addEventListener("mousedown", (e) => {
+      if (e.target === this.appSettingsEl) e.preventDefault();
+    });
+    this.asModalEl = document.createElement("div");
+    this.asModalEl.className = "modal app-settings";
+    this.appSettingsEl.append(this.asModalEl);
+
     root.append(
       this.bufferEl,
       this.capture,
@@ -1078,6 +1107,7 @@ export class Shell {
       // can be `position: sticky` relative to the scrolling buffer) and removed on dismiss.
       this.helpEl,
       this.projectSettingsEl,
+      this.appSettingsEl,
       this.connBanner,
     );
 
@@ -1186,6 +1216,8 @@ export class Shell {
 
       this.session = WasmSession.bootstrap(activated.project.name, activated.project.paths, open);
       await this.subscribe(); // derives its scroll from the buffer (open.scroll / cursor)
+      // Fetch the persisted app settings (e.g. the soft-wrap default) now that the session is live.
+      this.runEffects(this.session.startup() as CoreEffect[]);
       this.capture.focus(); // ensure the menu-suppressing field has focus once we're live
     } catch (e) {
       this.toast(`bootstrap failed: ${String(e)}`, "error");
@@ -1471,6 +1503,8 @@ export class Shell {
       this.session = WasmSession.bootstrap(activated.project.name, activated.project.paths, open);
       this.connBanner.style.display = "none";
       await this.subscribe();
+      // The session was rebuilt on the fresh connection — re-fetch the persisted app settings.
+      this.runEffects(this.session.startup() as CoreEffect[]);
       this.capture.focus();
     } catch (e) {
       this.toast(`reconnect failed: ${String(e)}`, "error");
@@ -1961,6 +1995,7 @@ export class Shell {
     this.renderPrompt(v);
     this.renderPicker(v);
     this.renderProjectSettings(v);
+    this.renderAppSettings(v);
     // No project yet (placeholder boot session): the mandatory chooser is the whole UI. Render only
     // a bare backdrop behind it — no buffer, no status bar — and don't sync a bogus `?buffer=0` URL.
     if (v.buffer.buffer_id === 0) {
@@ -2424,6 +2459,83 @@ export class Shell {
     // confirm prompt is up — it owns the keyboard via `capture` (focusTarget yields to it).
     const target = this.focusTarget();
     if (document.activeElement !== target) target.focus();
+  }
+
+  /** Render the application-settings overlay (`Space .`) from `view.app_settings`: grouped rows,
+   *  each a left-aligned label with a native checkbox on the right. Clicking a checkbox toggles that
+   *  setting (`app_settings_toggle`); keyboard nav/toggle routes through the global keydown →
+   *  `on_key` (the checkboxes aren't focused), so on open we park focus on `capture`. The flat row
+   *  index (across groups) drives both the highlight and the toggle. */
+  private renderAppSettings(v: CoreView): void {
+    const as = v.app_settings;
+    const wasOpen = this.asOpen;
+    this.asOpen = !!as;
+    if (!as) {
+      if (wasOpen) {
+        this.appSettingsEl.style.display = "none";
+        this.capture.focus();
+      }
+      return;
+    }
+    this.appSettingsEl.style.display = "";
+    if (!wasOpen) this.capture.focus();
+
+    const title = document.createElement("div");
+    title.className = "modal-message";
+    title.textContent = "Application settings";
+    const children: HTMLElement[] = [title];
+
+    // Walk groups, tracking the running flat row index (the index `app_settings_toggle` / `selected`
+    // use). Each group is a titled section; each setting is a label + right-aligned native checkbox,
+    // with its description grouped on the line below. Only the focused setting's checkbox is ringed.
+    let flat = 0;
+    for (const group of as.groups) {
+      const section = document.createElement("div");
+      section.className = "as-group";
+      const heading = document.createElement("div");
+      heading.className = "as-group-title";
+      heading.textContent = group.title;
+      section.append(heading);
+
+      for (const r of group.rows) {
+        const i = flat++;
+        const selected = i === as.selected;
+        const setting = document.createElement("div");
+        setting.className = "as-setting" + (selected ? " selected" : "");
+
+        const head = document.createElement("div");
+        head.className = "as-row";
+        const label = document.createElement("label");
+        label.className = "as-label";
+        label.textContent = r.label;
+        label.addEventListener("mousedown", (e) => e.preventDefault()); // keep focus on `capture`
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.className = "as-check";
+        box.checked = r.value;
+        // Keep focus on `capture` (so the global keydown keeps driving the overlay), and toggle the
+        // setting through the core by flat index.
+        box.addEventListener("mousedown", (e) => e.preventDefault());
+        box.addEventListener("change", () => {
+          if (this.session) this.runEffects(this.session.app_settings_toggle(i) as CoreEffect[]);
+        });
+        // Associate the label with the checkbox so clicking the label toggles too.
+        const id = `as-check-${i}`;
+        box.id = id;
+        label.setAttribute("for", id);
+        head.append(label, box);
+
+        const desc = document.createElement("div");
+        desc.className = "as-desc";
+        desc.textContent = r.hint;
+
+        setting.append(head, desc);
+        section.append(setting);
+      }
+      children.push(section);
+    }
+
+    this.asModalEl.replaceChildren(...children);
   }
 
   /** A project-settings input's keydown: text editing stays native (synced via `input` →

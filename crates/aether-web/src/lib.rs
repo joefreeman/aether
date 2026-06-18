@@ -301,6 +301,21 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.toggle_wrap()))
     }
 
+    /// Toggle the app-settings checkbox at flat row `index` (a click in the overlay). Returns
+    /// `Effect[]`.
+    pub fn app_settings_toggle(&mut self, index: u32) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(
+            self.inner.app_settings_toggle(index as usize),
+        ))
+    }
+
+    /// Fetch the persisted application settings (`settings/get`) — the soft-wrap default, etc. The
+    /// shell calls this once the session is live (at boot, and after a reconnect rebuilds it) and
+    /// runs the returned effects. Returns `Effect[]`.
+    pub fn startup(&mut self) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.startup()))
+    }
+
     /// Insert literal text at the cursor (an IME composition commit). Returns `Effect[]`.
     pub fn insert_text(&mut self, text: String) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.insert_text(text)))

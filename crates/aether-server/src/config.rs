@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 /// (shared with the clients, which hard-code it) lives in `aether_protocol`.
 pub use aether_protocol::SERVER_PORT;
 
+pub use aether_protocol::settings::AppSettings;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     /// Project name. Derived from the config *filename* (`<name>.toml`), which is authoritative —
@@ -51,6 +53,51 @@ pub fn project_config_path(name: &str) -> anyhow::Result<PathBuf> {
         .join("aether")
         .join("projects")
         .join(format!("{name}.toml")))
+}
+
+/// Path to the global application-settings file (`$XDG_CONFIG_HOME/aether/settings.toml`). One file
+/// per machine, independent of which project is active — see `aether_protocol::settings`.
+pub fn app_settings_path() -> anyhow::Result<PathBuf> {
+    let base = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
+    Ok(base.config_dir().join("aether").join("settings.toml"))
+}
+
+/// Load the application settings. A missing file is not an error — a fresh install has no
+/// `settings.toml`, so we return [`AppSettings::default`]. Every field carries a serde default, so
+/// a file written by an older build (missing newer keys) still parses.
+pub fn load_app_settings() -> anyhow::Result<AppSettings> {
+    load_app_settings_at(&app_settings_path()?)
+}
+
+/// Write (or overwrite) the application settings. Creates the config directory if needed.
+pub fn write_app_settings(settings: &AppSettings) -> anyhow::Result<()> {
+    write_app_settings_at(&app_settings_path()?, settings)
+}
+
+/// Path-parameterized core of [`load_app_settings`], kept free of XDG resolution so it can be
+/// unit-tested against a tempdir without clobbering the developer's real settings.
+fn load_app_settings_at(path: &Path) -> anyhow::Result<AppSettings> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AppSettings::default()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading app settings at {}", path.display()))
+        }
+    };
+    toml::from_str(&content).with_context(|| format!("parsing app settings at {}", path.display()))
+}
+
+/// Path-parameterized core of [`write_app_settings`]. See [`load_app_settings_at`].
+fn write_app_settings_at(path: &Path, settings: &AppSettings) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+    let body = toml::to_string_pretty(settings).context("serializing app settings")?;
+    std::fs::write(path, body)
+        .with_context(|| format!("writing app settings at {}", path.display()))?;
+    Ok(())
 }
 
 /// Directory containing the per-project `.toml` configs. Used by `list_project_names`.
@@ -397,6 +444,36 @@ mod tests {
         // path resolves and lands under our `aether/server.json` regardless of which base was used.
         let path = runtime_info_path().expect("runtime_info_path should never fail on a fallback");
         assert!(path.ends_with("aether/server.json"), "unexpected path: {}", path.display());
+    }
+
+    #[test]
+    fn app_settings_missing_file_is_default() {
+        use aether_protocol::viewport::WrapMode;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        // No file yet → defaults, not an error.
+        let s = load_app_settings_at(&path).unwrap();
+        assert_eq!(s.wrap, WrapMode::Soft);
+    }
+
+    #[test]
+    fn app_settings_round_trip_through_disk() {
+        use aether_protocol::viewport::WrapMode;
+        let dir = tempfile::tempdir().unwrap();
+        // Nested path exercises the create-parent branch.
+        let path = dir.path().join("aether").join("settings.toml");
+        write_app_settings_at(&path, &AppSettings { wrap: WrapMode::None }).unwrap();
+        let s = load_app_settings_at(&path).unwrap();
+        assert_eq!(s.wrap, WrapMode::None);
+    }
+
+    #[test]
+    fn app_settings_partial_file_fills_defaults() {
+        // An empty (or older) file with no keys reads back as all-defaults rather than failing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(load_app_settings_at(&path).unwrap(), AppSettings::default());
     }
 
     #[test]

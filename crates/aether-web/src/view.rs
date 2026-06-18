@@ -50,6 +50,32 @@ pub fn build_view(s: &Session) -> Value {
         "prompt": prompt(&s.prompt, &s.project_paths),
         "picker": picker(&s.picker, &s.project_paths),
         "project_settings": project_settings(s),
+        "app_settings": app_settings(s),
+    })
+}
+
+/// The application-settings overlay (`Space .`), when open. Core-owned state + key handling
+/// (`on_app_settings_key`); the shell renders grouped checkboxes and routes keys through the global
+/// keydown → `on_key`, plus checkbox clicks via `app_settings_toggle`. `selected` is the flat row
+/// index across all groups (group headers aren't part of it).
+fn app_settings(s: &Session) -> Value {
+    let Some(a) = &s.app_settings else {
+        return Value::Null;
+    };
+    json!({
+        "selected": a.selected,
+        "groups": s
+            .app_setting_groups()
+            .iter()
+            .map(|g| json!({
+                "title": g.title,
+                "rows": g
+                    .rows
+                    .iter()
+                    .map(|r| json!({ "label": r.label, "value": r.value, "hint": r.hint }))
+                    .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
     })
 }
 

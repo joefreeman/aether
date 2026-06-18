@@ -1559,6 +1559,144 @@ fn toggle_wrap_flips_between_soft_and_none() {
     assert_eq!(s.wrap, WrapMode::Soft);
 }
 
+// ---- application settings (Space .) -----------------------------------------------------------
+
+#[test]
+fn app_settings_overlay_opens_via_leader_dot() {
+    let mut s = session();
+    let _ = key(&mut s, ' '); // leader
+    s.on_key(KeyCode::Char('.'), Mods::NONE, Some('.'.to_string()), ROWS);
+    assert!(
+        s.app_settings.is_some(),
+        "Space . opens the app-settings overlay"
+    );
+    // The project-settings overlay (Space ,) is a distinct chord.
+    assert!(s.project_settings.is_none());
+}
+
+#[test]
+fn app_settings_esc_closes_the_overlay() {
+    let mut s = session();
+    s.open_app_settings();
+    assert!(s.app_settings.is_some());
+    s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(s.app_settings.is_none());
+}
+
+#[test]
+fn app_settings_toggle_persists_and_reflows() {
+    use aether_client::keymap::Action;
+    use aether_protocol::viewport::WrapMode;
+
+    let mut s = session();
+    assert_eq!(s.wrap, WrapMode::Soft);
+    s.open_app_settings();
+    // Enter on the (single) soft-wrap row.
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+
+    // Persists the *post-flip* value (off) so disk matches the wrap the shell is about to apply.
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["wrap"], json!("none"));
+
+    // Reflow: capture an anchor, then hand the shell the existing wrap-toggle action.
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)),
+        "captures a content anchor before the reflow"
+    );
+    assert!(
+        fx.0
+            .iter()
+            .any(|e| matches!(e, Effect::ShellAction(Action::ToggleWrap))),
+        "delegates the reflow to the shell's wrap path"
+    );
+}
+
+#[test]
+fn app_settings_click_toggles_row_and_moves_focus() {
+    let mut s = session();
+    s.open_app_settings();
+    // A click on row 0's checkbox toggles it and parks the selection there (so a later keypress
+    // agrees on the row), persisting + reflowing exactly like the keyboard path.
+    let fx = s.app_settings_toggle(0);
+    assert_eq!(s.app_settings.as_ref().unwrap().selected, 0);
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["wrap"], json!("none"));
+
+    // Out-of-range clicks (and clicks with the overlay closed) no-op.
+    assert!(s.app_settings_toggle(99).0.is_empty());
+    let mut closed = session();
+    assert!(closed.app_settings_toggle(0).0.is_empty());
+}
+
+#[test]
+fn settings_changed_push_applies_wrap_live() {
+    use aether_client::keymap::Action;
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::settings::SettingsChanged;
+
+    let push = |wrap: &str| Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: SettingsChanged::NAME.into(),
+        params: json!({ "wrap": wrap }),
+    });
+
+    // Another client turned wrap off (differs from the Soft default) → reflow live, plus a toast.
+    let mut s = session();
+    let fx = s.on_event(push("none"));
+    assert!(fx
+        .0
+        .iter()
+        .any(|e| matches!(e, Effect::ShellAction(Action::ToggleWrap))));
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
+    assert!(fx
+        .0
+        .iter()
+        .any(|e| matches!(e, Effect::Toast(_, ToastKind::Info))));
+
+    // A push matching the current wrap doesn't reflow (still toasts).
+    let mut s = session();
+    let fx = s.on_event(push("soft"));
+    assert!(!fx
+        .0
+        .iter()
+        .any(|e| matches!(e, Effect::ShellAction(Action::ToggleWrap))));
+}
+
+#[test]
+fn startup_fetches_persisted_settings() {
+    let mut s = session();
+    let fx = s.startup();
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "settings/get");
+}
+
+#[test]
+fn app_settings_loaded_applies_persisted_wrap_only_when_it_differs() {
+    use aether_client::keymap::Action;
+    use aether_client::update::Event;
+    use aether_protocol::settings::AppSettings;
+    use aether_protocol::viewport::WrapMode;
+
+    // Persisted `none` differs from the `Soft` default → reflow to apply it.
+    let mut s = session();
+    let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
+        wrap: WrapMode::None,
+    })));
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
+    assert!(fx
+        .0
+        .iter()
+        .any(|e| matches!(e, Effect::ShellAction(Action::ToggleWrap))));
+
+    // Persisted `soft` already matches the default → nothing to do.
+    let mut s = session();
+    let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
+        wrap: WrapMode::Soft,
+    })));
+    assert!(fx.0.is_empty(), "matching wrap is a no-op");
+}
+
 // ---- project creation + settings (docs: project creation + project settings) -----------------
 
 #[test]

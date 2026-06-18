@@ -574,6 +574,24 @@ html, body, #app {
 .ps-add-input::placeholder { color: var(--nord3-brighter); font-style: italic; }
 .ps-error { color: var(--nord11); font-size: 12px; margin-top: 8px; }
 
+/* Application-settings overlay (Space .). Grouped checkbox settings: a frost-accent group header,
+   then per-setting blocks of a label-left / native-checkbox-right row with the description grouped
+   directly beneath. Only the focused setting's checkbox is ringed (not the whole row). Keyboard nav
+   routes through the core; clicking a checkbox toggles it. */
+.modal.app-settings { width: min(440px, 80vw); }
+.modal.app-settings .modal-message { font-weight: 600; margin-bottom: 14px; }
+.as-group { margin-bottom: 16px; }
+.as-group:last-of-type { margin-bottom: 0; }
+.as-group-title { color: var(--nord8); font-size: 12px; font-weight: 600; margin: 0 0 10px; }
+.as-setting { margin-bottom: 12px; }
+.as-setting:last-child { margin-bottom: 0; }
+.as-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.as-label { color: var(--nord6); flex: 1 1 auto; cursor: pointer; }
+.as-check { accent-color: var(--nord8); cursor: pointer; margin: 0; flex: 0 0 auto; }
+/* Focus rings just the checkbox — a future setting may pair several controls in one row. */
+.as-setting.selected .as-check { outline: 2px solid var(--nord8); outline-offset: 2px; border-radius: 2px; }
+.as-desc { color: var(--nord3-brighter); font-size: 12px; margin-top: 2px; }
+
 /* Help overlay. */
 .modal.help { width: min(760px, 92vw); max-height: 80vh; display: flex; flex-direction: column; }
 /* Tab bar across the top; the content below scrolls so switching tabs keeps the bar in place. */

@@ -63,6 +63,7 @@ use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
     SearchSetResult, SearchStateChanged, SearchSummary,
 };
+use aether_protocol::settings::{AppSettings, SettingsChanged, SettingsGetParams};
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSpan, DiffMarker, DiffStage, LogicalLineRange,
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
@@ -107,6 +108,54 @@ pub async fn project_list(
             .map(|name| ProjectSummary { name })
             .collect(),
     })
+}
+
+/// Read the global application settings (`$XDG_CONFIG_HOME/aether/settings.toml`). Returns defaults
+/// when no settings file exists yet. App-wide, so it ignores the caller's active project.
+pub async fn settings_get(
+    _state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    _params: SettingsGetParams,
+) -> Result<AppSettings, RpcError> {
+    crate::config::load_app_settings()
+        .map_err(|e| RpcError::internal(format!("loading app settings: {e}")))
+}
+
+/// Replace the global application settings and persist them. Echoes the stored settings back, so
+/// the caller reconciles against exactly what landed on disk, and pushes `settings/changed` to every
+/// *other* connected client (settings are app-wide, so this ignores active projects) so the change
+/// applies live everywhere rather than only at the next reconnect.
+pub async fn settings_set(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: AppSettings,
+) -> Result<AppSettings, RpcError> {
+    crate::config::write_app_settings(&params)
+        .map_err(|e| RpcError::internal(format!("writing app settings: {e}")))?;
+
+    let changed = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
+    let pushes: PendingPushes = {
+        let s = state.lock().await;
+        s.clients
+            .iter()
+            .filter(|(id, _)| **id != ctx.client_id)
+            .map(|(_, sess)| {
+                (
+                    sess.outbound.clone(),
+                    Notification {
+                        jsonrpc: JsonRpc,
+                        method: SettingsChanged::NAME.into(),
+                        params: changed.clone(),
+                    },
+                )
+            })
+            .collect()
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    Ok(params)
 }
 
 /// Activate a project for this client. Loads the project's config from disk if no client has it

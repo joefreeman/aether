@@ -447,18 +447,19 @@ impl App {
             }
             Bootstrap::Session(b) => {
                 let pump = pump(b.notifications.clone());
-                let session = Session::new(b.project, b.project_paths, b.buffer);
-                (
-                    shell(
-                        None,
-                        session,
-                        b.handle,
-                        b.notifications,
-                        b.client_version,
-                        b.server_started_at,
-                    ),
-                    pump,
-                )
+                let mut session = Session::new(b.project, b.project_paths, b.buffer);
+                // Fetch persisted app settings (e.g. the soft-wrap default) as the session comes up.
+                let startup = session.startup();
+                let mut app = shell(
+                    None,
+                    session,
+                    b.handle,
+                    b.notifications,
+                    b.client_version,
+                    b.server_started_at,
+                );
+                let startup_task = app.run_core(startup);
+                (app, Task::batch([pump, startup_task]))
             }
             Bootstrap::Choose(b) => {
                 // Open the Projects picker on the boot connection; the session is built over
@@ -801,8 +802,9 @@ impl App {
                     }
                 }
                 // The editor's first Layout event subscribes the viewport (cell metrics are
-                // only published once it renders).
-                Task::none()
+                // only published once it renders). Fetch the persisted app settings now.
+                let startup = self.session.startup();
+                self.run_core(startup)
             }
             Message::SessionReady(Err(e)) => {
                 if let Some(boot) = &mut self.boot {
@@ -1157,6 +1159,8 @@ impl App {
                         .open_picker(PickerKind::Explorer, Some(dir), None),
                     None => Effects::none(),
                 };
+                // Fetch the persisted app settings (e.g. the soft-wrap default) on this connection.
+                let startup = startup.and(self.session.startup());
                 Task::batch([
                     pump(b.notifications),
                     self.subscribe_task(),
@@ -2421,6 +2425,9 @@ impl App {
         if self.session.project_settings.is_some() {
             layers.push(self.project_settings_overlay());
         }
+        if self.session.app_settings.is_some() {
+            layers.push(self.app_settings_overlay());
+        }
         // The confirm prompt (e.g. remove-root) layers *above* the settings dialog.
         if self.session.prompt.is_some() {
             layers.push(self.prompt_overlay());
@@ -2645,7 +2652,7 @@ impl App {
         .spacing(3);
 
         let mut col = column![
-            text("Project Settings")
+            text("Project settings")
                 .size(14)
                 .font(SANS_BOLD_UI)
                 .color(theme::NORD6),
@@ -2766,6 +2773,104 @@ impl App {
 
         // Opaque, dimmed backdrop, centred. Clicks on the dialog's delete buttons are handled;
         // clicks on the backdrop are swallowed (no fall-through to the editor).
+        iced::widget::opaque(
+            container(boxed)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center)
+                .style(|_| container::Style {
+                    background: Some(iced::Color::from_rgba8(20, 24, 30, 0.5).into()),
+                    ..container::Style::default()
+                }),
+        )
+    }
+
+    /// The application-settings overlay (`Space .`). Grouped checkbox settings: a frost-accent group
+    /// header, then each setting as a left-aligned label + native checkbox on the right, with its
+    /// description grouped on the line directly below. Clicking a checkbox toggles that setting
+    /// (`AppSettingToggle`); keys also work (Alt-j/k or Up/Down move, Enter/Space toggles, Esc
+    /// closes). Only the focused setting's *checkbox* is ringed (not the whole row). Mirrors the
+    /// project-settings modal box + dimmed backdrop.
+    fn app_settings_overlay(&self) -> Element<'_, Message> {
+        let s = self.session.app_settings.as_ref().unwrap();
+        let groups = self.session.app_setting_groups();
+
+        let mut col = column![text("Application settings")
+            .size(14)
+            .font(SANS_BOLD_UI)
+            .color(theme::NORD6)]
+        .spacing(14);
+
+        // Running flat row index across groups (the index `AppSettingToggle` / `selected` use).
+        let mut flat = 0usize;
+        for group in &groups {
+            let mut gcol = column![text(group.title.to_string())
+                .size(12)
+                .font(SANS_BOLD_UI)
+                .color(theme::NORD8)]
+            .spacing(10);
+            for r in &group.rows {
+                let i = flat;
+                flat += 1;
+                let focused = s.selected == i;
+                // The focus ring sits on just the checkbox (a future row may carry several
+                // controls, so highlighting the whole row would be ambiguous).
+                let check = container(
+                    iced::widget::checkbox(r.value)
+                        .size(16)
+                        .on_toggle(move |_| Message::Core(CoreEvent::AppSettingToggle(i))),
+                )
+                .padding(2)
+                .style(move |_| container::Style {
+                    border: iced::Border {
+                        color: if focused { theme::NORD8 } else { iced::Color::TRANSPARENT },
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..container::Style::default()
+                });
+                // Label + checkbox, then the description grouped tight beneath the label.
+                let field = column![
+                    row![
+                        text(r.label.to_string())
+                            .size(13)
+                            .font(SANS)
+                            .color(theme::NORD6),
+                        iced::widget::Space::new().width(Length::Fill),
+                        check,
+                    ]
+                    .align_y(iced::Alignment::Center)
+                    .spacing(6),
+                    text(r.hint.to_string())
+                        .size(12)
+                        .font(SANS)
+                        .color(theme::NORD3_BRIGHT),
+                ]
+                .spacing(2);
+                gcol = gcol.push(field);
+            }
+            col = col.push(gcol);
+        }
+
+        let boxed = container(col.spacing(14))
+            .width(420)
+            .padding(16)
+            .style(|_| container::Style {
+                background: Some(theme::NORD1.into()),
+                border: iced::Border {
+                    color: theme::NORD3,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba8(0, 0, 0, 0.45),
+                    offset: iced::Vector::new(0.0, 12.0),
+                    blur_radius: 40.0,
+                },
+                ..container::Style::default()
+            });
+
         iced::widget::opaque(
             container(boxed)
                 .width(Length::Fill)

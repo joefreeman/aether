@@ -224,6 +224,48 @@ impl ProjectSettings {
     }
 }
 
+/// The application-settings overlay (`Space .`): global preferences (not per-project),
+/// rendered by every shell from `session.app_settings`. Distinct from [`ProjectSettings`], which
+/// edits the active project's name and roots.
+///
+/// The setting *values* live on the session (soft wrap is [`Session::wrap`], persisted server-side
+/// via `settings/set`); this overlay holds only the open state and the focused-row cursor. Settings
+/// are presented as labelled checkboxes arranged into [`AppSettingGroup`]s; `selected` indexes the
+/// flat row list ([`Session::app_setting_rows`]) for keyboard navigation.
+#[derive(Debug, Clone, Default)]
+pub struct AppSettingsOverlay {
+    /// Focused row index into [`Session::app_setting_rows`] (the groups flattened in order).
+    pub selected: usize,
+}
+
+/// Stable identity of a setting, so toggling is keyed by *which* setting rather than a flat index
+/// that shifts as groups/rows are reordered. The shells never see this — they toggle by row index,
+/// which [`Session::toggle_app_setting`] resolves to an id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppSettingId {
+    SoftWrap,
+}
+
+/// One checkbox row of the application-settings overlay: its identity, label, current on/off state,
+/// and a hint describing what it does. Built by [`Session::app_setting_groups`] so every shell shows
+/// the same rows in the same order.
+#[derive(Debug, Clone)]
+pub struct AppSettingRow {
+    pub id: AppSettingId,
+    pub label: &'static str,
+    /// The checkbox state — `true` is "on" / checked.
+    pub value: bool,
+    pub hint: &'static str,
+}
+
+/// A titled group of related settings, for display. Groups are purely presentational — keyboard
+/// navigation and toggling run over the flattened row list ([`Session::app_setting_rows`]).
+#[derive(Debug, Clone)]
+pub struct AppSettingGroup {
+    pub title: &'static str,
+    pub rows: Vec<AppSettingRow>,
+}
+
 /// Why a confirmation is being asked — the *reason*, carrying the data each shell needs to compose
 /// its own prompt text. Presentation (wording, punctuation, the `[y/N]` vs Yes/No affordance) is
 /// the shell's decision; the core only states the reason. Paired with a [`ConfirmAction`] (what
@@ -367,6 +409,8 @@ pub struct Session {
     pub picker: Option<PickerState>,
     /// The project-settings overlay (`Space ,`); owns the keyboard while open.
     pub project_settings: Option<ProjectSettings>,
+    /// The application-settings overlay (`Space .`); owns the keyboard while open.
+    pub app_settings: Option<AppSettingsOverlay>,
     pub conn: ConnState,
     /// A content scroll anchor captured before a re-layout (wrap / diff toggle), so the view can be
     /// restored to the same content afterwards. Set by [`Session::capture_scroll_anchor`] and
@@ -405,9 +449,35 @@ impl Session {
             prompt: None,
             picker: None,
             project_settings: None,
+            app_settings: None,
             conn: ConnState::Connected,
             relayout_anchor: None,
         }
+    }
+
+    /// The application-settings groups for the overlay, in display order. Built against the live
+    /// session so every shell renders identical groups/labels/states. Adding a setting means adding a
+    /// row here (and a toggle arm in [`crate::update`]'s `toggle_app_setting`, keyed by
+    /// [`AppSettingId`]).
+    pub fn app_setting_groups(&self) -> Vec<AppSettingGroup> {
+        vec![AppSettingGroup {
+            title: "View",
+            rows: vec![AppSettingRow {
+                id: AppSettingId::SoftWrap,
+                label: "Soft wrap",
+                value: self.wrap == WrapMode::Soft,
+                hint: "Wrap long lines to the viewport width",
+            }],
+        }]
+    }
+
+    /// The settings rows flattened across all groups, in display order — the index space keyboard
+    /// navigation and toggling run over (group headers aren't selectable).
+    pub fn app_setting_rows(&self) -> Vec<AppSettingRow> {
+        self.app_setting_groups()
+            .into_iter()
+            .flat_map(|g| g.rows)
+            .collect()
     }
 
     /// Capture a content scroll anchor for the current view, ahead of a wrap/diff re-layout. The

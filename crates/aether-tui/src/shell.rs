@@ -1374,6 +1374,21 @@ impl Shell {
         self.sync_picker();
         self.sync_prompts();
         self.sync_project_settings();
+        self.sync_app_settings();
+    }
+
+    /// Mirror the core's app-settings overlay (`session.app_settings`) into the view model. A pure
+    /// projection — the core owns the state, key handling, and the grouped settings
+    /// (`app_setting_groups`).
+    fn sync_app_settings(&mut self) {
+        self.state.app_settings =
+            self.session
+                .app_settings
+                .as_ref()
+                .map(|core| crate::app::AppSettingsState {
+                    groups: self.session.app_setting_groups(),
+                    selected: core.selected,
+                });
     }
 
     /// Mirror the core's project-settings overlay (`session.project_settings`) into the view
@@ -2019,7 +2034,7 @@ pub async fn bootstrap(
     // chooser. Nothing is rendered behind it; picking a project activates it and lands the first
     // buffer (`PickerSelected` → `ProjectActivated` → `adopt_switch`), which is when the editor
     // first appears. Its `picker/view` request rides the returned effects, run once the shell is up.
-    let (session, project_name, project_paths, startup) = match project {
+    let (mut session, project_name, project_paths, startup) = match project {
         None => {
             let mut session = Session::placeholder();
             let startup = session.open_picker(PickerKind::Projects, None, None);
@@ -2089,6 +2104,8 @@ pub async fn bootstrap(
         }
     };
 
+    // Fetch the persisted app settings (e.g. the soft-wrap default) alongside the boot effects.
+    let startup = startup.and(session.startup());
     let state = make_state(project_name, project_paths, cols, rows, ConnState::Connected);
     Ok((session, state, startup))
 }
@@ -2122,6 +2139,7 @@ fn make_state(
         confirm_prompt: None,
         editor: None,
         project_settings: None,
+        app_settings: None,
         help: Default::default(),
         lsp_status: Default::default(),
         hover: None,

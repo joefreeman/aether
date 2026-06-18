@@ -136,6 +136,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // *behind* the dialog ends up dimmed.
     let modal_open = state.picker.open
         || state.project_settings.is_some()
+        || state.app_settings.is_some()
         || state.help.open
         || state.picker.lsp_detail.is_some();
     // Status-bar prompts dim the editor too, so attention moves to the prompt: the save-as path
@@ -153,6 +154,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // Project settings overlay (Space P): centered modal listing the active project's roots.
     if state.project_settings.is_some() {
         draw_project_settings_overlay(f, state, chunks[0]);
+    }
+    // Application settings overlay (Space .): centered modal listing global settings.
+    if state.app_settings.is_some() {
+        draw_app_settings_overlay(f, state, chunks[0]);
     }
     // LSP-server detail (Space l → Enter): a top-level overlay — the picker is closed when the
     // core drills into `Prompt::LspInfo`, so it's not part of the picker box.
@@ -197,7 +202,7 @@ fn dim_backdrop(buf: &mut Buffer, area: Rect) {
 }
 
 /// Project-settings overlay. A bordered modal (no border title) holding, top-to-bottom:
-/// a `Project Settings (<name>)` heading, a blank row, a `Project roots:` section label, the
+/// a `Project settings (<name>)` heading, a blank row, a `Project roots:` section label, the
 /// list of roots, an always-present "Add root..." input row, and — when the last add/remove
 /// attempt failed — a red error footer. Selection highlights the path text (bold + accent) on
 /// root rows only; the input row carries no highlight (its terminal caret is the focus cue).
@@ -223,6 +228,92 @@ fn draw_project_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
         let text = truncate_right(msg, err_area.width as usize);
         f.render_widget(Paragraph::new(Span::styled(text, style)), err_area);
     }
+}
+
+/// Application-settings overlay (`Space .`): a small bordered modal of grouped checkbox settings.
+/// Each group has a frost-accent header; each setting is a flush-left white label with its
+/// `[✓]`/`[ ]` checkbox on the right, and its description on the line directly below (no gap). A
+/// blank line separates the group header and each setting. Only the focused setting's *checkbox* is
+/// highlighted (a NORD2 cell), not the whole row. Toggle-only — no caret to place.
+fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+    let Some(settings) = state.app_settings.as_ref() else {
+        return;
+    };
+    let box_area = picker_box_rect(area);
+    if box_area.width < 4 || box_area.height < 3 {
+        return;
+    }
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(NORD4))
+        .style(Style::default().bg(NORD0).fg(NORD4));
+    f.render_widget(block, box_area);
+
+    let inner = Rect {
+        x: box_area.x + 1,
+        y: box_area.y + 1,
+        width: box_area.width - 2,
+        height: box_area.height - 2,
+    };
+    let content = pad_horizontal(inner);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+    let w = content.width as usize;
+
+    const CHECK_W: usize = 3; // "[✓]" / "[ ]"
+    let title_style = Style::default()
+        .fg(NORD6)
+        .bg(NORD0)
+        .add_modifier(Modifier::BOLD);
+    let group_style = Style::default().fg(NORD8).bg(NORD0);
+    let desc_style = Style::default().fg(NORD3).bg(NORD0);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        truncate_right("Application settings", w),
+        title_style,
+    )));
+
+    // Walk the groups, tracking the running flat row index so the focus lands on the right
+    // checkbox (group headers aren't part of the index space).
+    let mut flat = 0usize;
+    for group in &settings.groups {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(truncate_right(group.title, w), group_style)));
+        for row in &group.rows {
+            let selected = flat == settings.selected;
+            // A gap before each setting (separating it from the header / the previous setting).
+            lines.push(Line::from(""));
+            // Label flush-left, checkbox right-aligned. Only the checkbox carries the focus
+            // highlight (a NORD2 background), so a future row with multiple controls can highlight
+            // just the focused one.
+            let check = if row.value { "[\u{2713}]" } else { "[ ]" };
+            // Checked uses the frost accent; unchecked stays white so the empty box reads clearly
+            // over the focus cell's NORD2 background.
+            let check_fg = if row.value { NORD8 } else { NORD6 };
+            let check_bg = if selected { NORD2 } else { NORD0 };
+            let label_budget = w.saturating_sub(CHECK_W + 1);
+            let label = truncate_right(row.label, label_budget);
+            let pad = w.saturating_sub(CHECK_W).saturating_sub(label.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}{}", label, " ".repeat(pad)),
+                    Style::default().fg(NORD6).bg(NORD0),
+                ),
+                Span::styled(check, Style::default().fg(check_fg).bg(check_bg)),
+            ]));
+            // Description on the very next line — grouped tight under the label.
+            lines.push(Line::from(Span::styled(truncate_right(row.hint, w), desc_style)));
+            flat += 1;
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(NORD4).bg(NORD0)),
+        content,
+    );
 }
 
 /// Keyboard-shortcut help overlay (`Space ?`). A bordered, centered modal — same geometry as the
@@ -1346,7 +1437,7 @@ fn factor_common<'a, T: PartialEq>(a: &'a [T], b: &'a [T]) -> (&'a [T], &'a [T],
 /// Label above the editable project-name field.
 const NAME_LABEL: &str = "Name:";
 
-/// Header block: `Project Settings` heading, a blank spacer, the editable name field (a `Name:`
+/// Header block: `Project settings` heading, a blank spacer, the editable name field (a `Name:`
 /// label with the value on the indented line below it), another blank, and the `Project roots:`
 /// label. Degrades gracefully when the header area is shorter than its 6 rows. The value renders
 /// in plain (white) text like the add-root input row; its terminal caret — placed separately — is
@@ -1356,7 +1447,7 @@ fn draw_settings_header(f: &mut Frame, settings: &crate::app::ProjectSettingsSta
         return;
     }
     let heading_style = Style::default()
-        .fg(NORD8)
+        .fg(NORD6)
         .bg(NORD0)
         .add_modifier(Modifier::BOLD);
     let label_style = Style::default()
@@ -1367,7 +1458,7 @@ fn draw_settings_header(f: &mut Frame, settings: &crate::app::ProjectSettingsSta
     let area_w = area.width as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(6);
     if area.height >= 1 {
-        let heading = truncate_right("Project Settings", area_w);
+        let heading = truncate_right("Project settings", area_w);
         lines.push(Line::from(Span::styled(heading, heading_style)));
     }
     if area.height >= 2 {
@@ -5249,6 +5340,11 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         }
         return;
     }
+    // The app-settings overlay is toggle-only (no text field): returning without placing a caret
+    // hides the terminal cursor for this frame, so none blinks in the buffer behind it.
+    if state.app_settings.is_some() {
+        return;
+    }
     let ed = state.ed();
     if matches!(ed.mode, EditorMode::Search)
         && ed.search.chip_selected.is_none()
@@ -5655,7 +5751,7 @@ mod tests {
     #[test]
     fn help_lines_render_expected_rows() {
         // Concatenate every tab (wide enough that nothing wraps); the expected rows are spread
-        // across them — `Toggle soft wrap` on Normal/Insert, the grep pair on Normal, etc.
+        // across them — `Application settings` on the leader tab, the grep pair on Normal, etc.
         let rendered: String = HelpTab::ALL
             .iter()
             .flat_map(|t| help_lines(*t, 100))
@@ -5664,7 +5760,7 @@ mod tests {
             .collect();
         // Unpaired bindings appear verbatim (key + description).
         for needle in [
-            "Toggle soft wrap",
+            "Application settings",
             "Clear the active search",
             "Show keyboard shortcuts",
             "Center cursor in window",

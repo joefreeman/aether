@@ -287,6 +287,8 @@ pub enum Action {
     OpenHelp,
     /// `Space ,` — the project-settings overlay (roots + rename). TUI-only today.
     OpenProjectSettings,
+    /// `Space .` — the application-settings overlay (global preferences, e.g. soft wrap).
+    OpenAppSettings,
 }
 
 impl Action {
@@ -701,12 +703,19 @@ static LEADER: &[Binding] = &[
         "Project",
         "Project settings"
     ),
+    bind!(
+        L,
+        ch('.'),
+        Exact(Mods::NONE),
+        A::OpenAppSettings,
+        "App",
+        "Application settings"
+    ),
     bind!(L, ch('c'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
     bind!(L, ch('r'), Exact(Mods::NONE), A::Reload, "App", "Reload from disk"),
     bind!(L, ch('n'), Exact(Mods::NONE), A::NewScratch, "App", "New scratch buffer"),
-    bind!(L, ch('w'), Exact(Mods::NONE), A::ToggleWrap, "View", "Toggle soft wrap"),
     bind!(L, ch('a'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
     bind!(L, ch('v'), Exact(Mods::NONE), A::RevertHunk, "Git", "Revert change"),
     bind!(L, ch('h'), Exact(Mods::NONE), A::NextHunk, "Git", "Next change (hunk)"),

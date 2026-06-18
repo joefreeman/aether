@@ -45,6 +45,7 @@ use aether_protocol::project::{
     ProjectRename,
 };
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
+use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
     ViewportUnsubscribe,
@@ -358,6 +359,8 @@ async fn dispatch(
 
     match method {
         ProjectList::NAME => run!(ProjectList, handlers::project_list),
+        SettingsGet::NAME => run!(SettingsGet, handlers::settings_get),
+        SettingsSet::NAME => run!(SettingsSet, handlers::settings_set),
         ProjectActivate::NAME => run!(ProjectActivate, handlers::project_activate),
         ProjectCreate::NAME => run!(ProjectCreate, handlers::project_create),
         ProjectAddRoot::NAME => run!(ProjectAddRoot, handlers::project_add_root),

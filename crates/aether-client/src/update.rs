@@ -9,7 +9,8 @@ use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
 use super::session::{
-    buffer_info, min_pos, severity_label, strip_longest_root, CommitDetails, ConfirmAction,
+    buffer_info, min_pos, severity_label, strip_longest_root, AppSettingId, AppSettingsOverlay,
+    CommitDetails, ConfirmAction,
     ConfirmKind, ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending, ProjectSettings,
     Prompt, ReloadTry,
     RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, TextField,
@@ -74,6 +75,9 @@ use aether_protocol::project::{
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
     SearchSet, SearchSetParams, SearchSetResult, SearchStateChanged, SearchSummary,
+};
+use aether_protocol::settings::{
+    AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
 };
 use aether_protocol::viewport::{
     DiagnosticSeverity, ViewportLinesChanged, ViewportLinesChangedParams, ViewportSubscribeResult,
@@ -153,6 +157,9 @@ pub enum Event {
     /// A root row's delete button was clicked in the project-settings overlay — open the shared
     /// confirm prompt for that root (same path as the Delete key → [`Session::request_remove_root`]).
     ProjectSettingsRemoveRoot(usize),
+    /// A setting's checkbox was clicked in the app-settings overlay (flat row index) — toggle it.
+    /// The keyboard path (Enter/Space) doesn't use this; it toggles the focused row directly.
+    AppSettingToggle(usize),
     /// `directory/list` for the dir-chip editor resolved; `abs` is the staleness key.
     PickerChipListing {
         abs: String,
@@ -191,6 +198,12 @@ pub enum Event {
     /// `project/delete` (from the project switcher) resolved: toast success — the refreshed list
     /// arrives via a `picker/update` push — or surface the refusal (active / dirty).
     ProjectDeleted(Result<(), String>),
+    /// `settings/get` resolved at boot: seed the session from the persisted app settings (notably
+    /// the soft-wrap default). A failure is non-fatal — we keep the defaults.
+    AppSettingsLoaded(Result<AppSettings, String>),
+    /// `settings/set` (from the app-settings overlay) resolved: a failure surfaces as a toast (the
+    /// optimistic local change already applied; this only reports persistence trouble).
+    AppSettingsSaved(Result<AppSettings, String>),
     /// A server notification arrived on the session's stream.
     ServerPush(Notification),
     /// The notification stream ended: the connection is gone.
@@ -758,6 +771,20 @@ impl Session {
             }
 
             Event::ProjectSettingsRemoveRoot(index) => self.request_remove_root(index),
+
+            Event::AppSettingToggle(index) => self.app_settings_toggle(index),
+
+            Event::AppSettingsLoaded(result) => match result {
+                // Apply the persisted settings at boot.
+                Ok(settings) => self.apply_app_settings(settings),
+                // Non-fatal: keep the defaults already in place. Don't toast at boot.
+                Err(_) => Effects::none(),
+            },
+
+            Event::AppSettingsSaved(result) => match result {
+                Ok(_) => Effects::none(),
+                Err(e) => Effects::error(format!("couldn't save settings: {e}")),
+            },
 
             Event::PickerChipListing { abs, result } => {
                 // Stale responses (the editor moved to another directory, or closed) are
@@ -3026,6 +3053,20 @@ impl Session {
                     ToastKind::Info,
                 )
             }
+            SettingsChanged::NAME => {
+                // Another client changed the global app settings. Apply them live (the same reflow
+                // path the boot fetch uses); an open app-settings overlay re-renders from the new
+                // `Session` state. A quiet toast explains the otherwise-spontaneous reflow.
+                let Ok(settings) = serde_json::from_value::<AppSettings>(n.params) else {
+                    return Effects::none();
+                };
+                let mut fx = self.apply_app_settings(settings);
+                fx.push(Effect::Toast(
+                    "settings updated".to_string(),
+                    ToastKind::Info,
+                ));
+                fx
+            }
             _ => Effects::none(),
         }
     }
@@ -3678,6 +3719,117 @@ impl Session {
         Effects::none()
     }
 
+    /// Fetch the persisted application settings (`settings/get`) and seed the session from them once
+    /// they arrive ([`Event::AppSettingsLoaded`]) — notably the soft-wrap default. Shells call this
+    /// once their live session is established (at boot, and again after a reconnect rebuilds the
+    /// session) and run the returned effect like any other.
+    pub fn startup(&mut self) -> Effects {
+        self.request_str::<SettingsGet>(SettingsGetParams {}, Event::AppSettingsLoaded)
+    }
+
+    /// Open the application-settings overlay (`Space .`). Cheap — no RPC; the values it shows
+    /// already live on the session. Focus lands on the first row.
+    pub fn open_app_settings(&mut self) {
+        self.app_settings = Some(AppSettingsOverlay { selected: 0 });
+    }
+
+    /// Keys while the app-settings overlay is open (it owns the keyboard, like the project-settings
+    /// overlay). Esc closes; Alt-j/k or Up/Down move between rows; Enter/Space activates the focused
+    /// row's toggle. The overlay has no text entry, so any other key is a no-op.
+    pub fn on_app_settings_key(
+        &mut self,
+        code: KeyCode,
+        mods: Mods,
+        _text: Option<String>,
+    ) -> Effects {
+        let row_count = self.app_setting_rows().len();
+        let Some(selected) = self.app_settings.as_ref().map(|s| s.selected) else {
+            return Effects::none();
+        };
+
+        if code == KeyCode::Esc {
+            self.app_settings = None;
+            return Effects::none();
+        }
+
+        let up = code == KeyCode::Up || (mods.alt && code == KeyCode::Char('k'));
+        let down = code == KeyCode::Down || (mods.alt && code == KeyCode::Char('j'));
+        if up {
+            if let Some(s) = self.app_settings.as_mut() {
+                s.selected = s.selected.saturating_sub(1);
+            }
+            return Effects::none();
+        }
+        if down {
+            if let Some(s) = self.app_settings.as_mut() {
+                s.selected = (s.selected + 1).min(row_count.saturating_sub(1));
+            }
+            return Effects::none();
+        }
+
+        if code == KeyCode::Enter || code == KeyCode::Char(' ') {
+            return self.toggle_app_setting(selected);
+        }
+        Effects::none()
+    }
+
+    /// Toggle the setting at flat row `index` from a shell-side click on its checkbox (native/web).
+    /// Moves the focus there too, so a click and a subsequent keypress agree on the row. The
+    /// keyboard path (Enter/Space) calls [`Self::toggle_app_setting`] directly with the current
+    /// selection. No-op if the overlay is closed or the index is out of range.
+    pub fn app_settings_toggle(&mut self, index: usize) -> Effects {
+        if self.app_settings.is_none() || index >= self.app_setting_rows().len() {
+            return Effects::none();
+        }
+        if let Some(s) = self.app_settings.as_mut() {
+            s.selected = index;
+        }
+        self.toggle_app_setting(index)
+    }
+
+    /// Apply app settings to the live session, reflowing only what changed. Shared by the boot fetch
+    /// ([`Event::AppSettingsLoaded`]) and the live cross-client push (`settings/changed`). `Session.wrap`
+    /// has exactly two values, so a value that differs from the current is its opposite — flipping via
+    /// the existing wrap reflow path (anchor + `ToggleWrap`) lands on it; a matching value is a no-op.
+    /// The shell ignores `ToggleWrap` until it has a viewport, so this is safe even at boot.
+    fn apply_app_settings(&mut self, settings: AppSettings) -> Effects {
+        if settings.wrap != self.wrap {
+            let mut fx = Effects::one(Effect::SaveContentAnchor);
+            fx.push(Effect::ShellAction(Action::ToggleWrap));
+            fx
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Flip the setting at flat row `index`: persist the new value and apply it live, keyed by the
+    /// row's stable [`AppSettingId`] (not the raw index). Out-of-range indices no-op.
+    fn toggle_app_setting(&mut self, index: usize) -> Effects {
+        let Some(row) = self.app_setting_rows().into_iter().nth(index) else {
+            return Effects::none();
+        };
+        match row.id {
+            // Soft wrap. The persisted value is the *post-flip* wrap: the shell flips `Session.wrap`
+            // when it runs the `ToggleWrap` shell action below, so compute the new value here to keep
+            // disk and session agreeing. The reflow reuses the existing wrap path — the shell flips
+            // `Session.wrap` and re-renders on [`Action::ToggleWrap`], with a content anchor captured
+            // first so the viewport stays on the same content across the reflow.
+            AppSettingId::SoftWrap => {
+                let new_wrap = match self.wrap {
+                    WrapMode::Soft => WrapMode::None,
+                    WrapMode::None => WrapMode::Soft,
+                };
+                let mut fx = self.request_str::<SettingsSet>(
+                    AppSettings { wrap: new_wrap },
+                    Event::AppSettingsSaved,
+                );
+                fx.push(Effect::SaveContentAnchor);
+                fx.push(Effect::ShellAction(Action::ToggleWrap));
+                fx
+            }
+        }
+    }
+
     /// Keys in the search prompt. Text entry (insert / delete / caret) is owned by each shell's
     /// search input, which syncs the whole value via [`Self::search_set_query`]; the core handles
     /// the Search command keys (commit / abort / history / option toggles) via the keymap table,
@@ -3982,6 +4134,10 @@ impl Session {
         // The project-settings overlay likewise owns the keyboard while open.
         if self.project_settings.is_some() {
             return self.on_project_settings_key(code, mods, text);
+        }
+        // As does the application-settings overlay.
+        if self.app_settings.is_some() {
+            return self.on_app_settings_key(code, mods, text);
         }
 
         // Search mode owns the keyboard: control keys via its table, anything printable is
@@ -4296,6 +4452,12 @@ impl Session {
                 // The project-settings overlay now lives in the core (state + key handling); every
                 // shell renders it from `session.project_settings`.
                 self.open_project_settings();
+                Effects::none()
+            }
+            A::OpenAppSettings => {
+                // Like the project-settings overlay, the app-settings overlay lives in the core;
+                // shells render it from `session.app_settings`.
+                self.open_app_settings();
                 Effects::none()
             }
             A::NavBack | A::NavForward => {

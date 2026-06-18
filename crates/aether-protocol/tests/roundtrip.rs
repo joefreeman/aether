@@ -2214,3 +2214,25 @@ fn external_change_error_codes_distinct() {
     let unique: std::collections::HashSet<_> = codes.iter().collect();
     assert_eq!(unique.len(), codes.len());
 }
+
+#[test]
+fn app_settings_wire_shape_and_defaults() {
+    use aether_protocol::settings::AppSettings;
+    use aether_protocol::viewport::WrapMode;
+
+    // Default settings: soft wrap.
+    assert_eq!(AppSettings::default().wrap, WrapMode::Soft);
+
+    // Wire shape: `wrap` serializes as the lowercase WrapMode tag.
+    let s = AppSettings { wrap: WrapMode::None };
+    assert_eq!(to_value(s).unwrap(), json!({ "wrap": "none" }));
+
+    // An empty object (a fresh / older settings.toml with no keys) reads back as defaults — every
+    // field carries a serde default so settings can be added without breaking old files.
+    let parsed: AppSettings = from_value(json!({})).unwrap();
+    assert_eq!(parsed, AppSettings::default());
+
+    // Full round-trip.
+    let back: AppSettings = from_value(to_value(s).unwrap()).unwrap();
+    assert_eq!(back, s);
+}

@@ -222,6 +222,9 @@ pub struct AppState {
     /// Active project-settings overlay (`Space ,`). When `Some`, draws a centered modal listing
     /// the project's roots, with a permanent add-root input row at the bottom. Closed by Esc.
     pub project_settings: Option<ProjectSettingsState>,
+    /// Active application-settings overlay (`Space .`). When `Some`, draws a centered modal
+    /// listing the global settings (e.g. soft wrap). Closed by Esc.
+    pub app_settings: Option<AppSettingsState>,
     /// Keyboard-shortcut help overlay (`Space ?`). A read-only, client-local cheatsheet generated
     /// from the `keymap` tables — no server round-trip. Closed by Esc.
     pub help: HelpState,
@@ -360,6 +363,15 @@ pub struct ProjectSettingsState {
     /// In-dialog error from the last add or remove attempt. Rendered as the bottom line of the
     /// overlay. Cleared when the user edits `add_input` or initiates another action.
     pub error: Option<String>,
+}
+
+/// Application-settings overlay view model. A render-only projection of the core's
+/// `Session::app_settings` + `Session::app_setting_groups`: the grouped checkbox settings and the
+/// focused *flat* row index (across all groups). Populated each frame by `Shell::sync_app_settings`.
+#[derive(Debug, Clone, Default)]
+pub struct AppSettingsState {
+    pub groups: Vec<aether_client::session::AppSettingGroup>,
+    pub selected: usize,
 }
 
 /// Generic `[y/N]` confirmation overlay. The save-as overwrite confirm and the close-with-
@@ -876,6 +888,7 @@ mod tests {
             confirm_prompt: None,
             editor: None,
             project_settings: None,
+            app_settings: None,
             help: HelpState::default(),
             lsp_status: std::collections::HashMap::new(),
             hover: None,
@@ -904,6 +917,7 @@ mod tests {
             confirm_prompt: None,
             editor: None,
             project_settings: None,
+            app_settings: None,
             help: HelpState::default(),
             lsp_status: std::collections::HashMap::new(),
             hover: None,
@@ -935,6 +949,7 @@ mod tests {
             confirm_prompt: None,
             editor: Some(stub_editor_state("src/main.rs")),
             project_settings: None,
+            app_settings: None,
             help: HelpState::default(),
             lsp_status: std::collections::HashMap::new(),
             hover: None,
