@@ -152,6 +152,22 @@ identical in both.
 | `Space l` | LSP servers (status, restart) |
 | `Ctrl-f` | Format document |
 
+## Install
+
+Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to each
+[release](https://github.com/joefreeman/aether/releases), in two variants per platform:
+
+- `aether-<version>-<target>.tar.gz` — the **GUI** build (native window + server + terminal/web
+  clients); needs a graphical environment at runtime.
+- `aether-<version>-<target>-no-gui.tar.gz` — same editor minus the desktop window: server,
+  terminal client, and embedded web client, with no graphics libraries required (headless boxes,
+  SSH).
+
+Each archive holds the single `ae` binary; unpack it and put `ae` on your `PATH`.
+
+> **macOS:** binaries are unsigned, so clear the quarantine flag once after unpacking:
+> `xattr -d com.apple.quarantine ./ae`.
+
 ## Building
 
 Aether is a standard Cargo workspace.
@@ -163,9 +179,9 @@ cargo build --release
 This produces a single binary:
 
 - `ae` — runs the server daemon, the terminal client, and (when built with the `gui` feature, on
-  by default) the native GUI client. The build that ships the GUI is the default; a headless build
-  for a box with no display libraries drops it with `cargo build --release -p aether-ae
-  --no-default-features` (then `iced`/`winit`/`wgpu` never enter the dependency graph).
+  by default) the native GUI client. The build that ships the GUI is the default; dropping it with
+  `cargo build --release -p aether-ae --no-default-features` (so `iced`/`winit`/`wgpu` never enter
+  the dependency graph) is exactly the `-no-gui` release artifact, for a box with no display libraries.
 
 ## Running
 

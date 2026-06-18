@@ -1,0 +1,119 @@
+name: Release
+
+# Push a vX.Y.Z tag (see scripts/release.sh) to build and publish a release.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # wasm-bindgen-cli must match the wasm-bindgen crate in Cargo.lock (mismatch fails at runtime).
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Install wasm tooling
+        shell: bash
+        run: |
+          cargo binstall -y wasm-bindgen-cli@0.2.104
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install binaryen
+          else
+            sudo apt-get update && sudo apt-get install -y binaryen
+          fi
+
+      # System libraries the GUI build (iced/winit/wgpu) links against; macOS ships its own.
+      - name: Install GUI build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y \
+            libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libfontconfig1-dev libasound2-dev libudev-dev
+
+      # Cargo.toml is the source of truth for the version (it drives CARGO_PKG_VERSION and the
+      # client–server handshake); refuse to publish a tag that disagrees with it.
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          VER=$(cargo metadata --format-version=1 --no-deps \
+            | jq -r '.packages[] | select(.name == "aether-ae") | .version')
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$VER" != "$TAG" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $VER"
+            exit 1
+          fi
+          echo "VER=$VER" >> "$GITHUB_ENV"
+
+      # Release builds embed web/dist via include_bytes!, so the bundle must exist before cargo build.
+      - name: Build web bundle
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      # Both variants emit target/<triple>/release/ae, so stage each before building the next.
+      - name: Build + package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="${{ matrix.target }}"
+          mkdir -p dist pkg
+
+          stage() {  # $1 = variant suffix ("" for GUI, "-no-gui" otherwise)
+            local name="aether-${VER}-${T}${1}"
+            mkdir -p "pkg/$name"
+            cp "target/$T/release/ae" LICENSE README.md "pkg/$name/"
+            tar -C pkg -czf "dist/$name.tar.gz" "$name"
+          }
+
+          cargo build --release -p aether-ae --target "$T"
+          stage ""
+
+          cargo build --release -p aether-ae --target "$T" --no-default-features
+          stage "-no-gui"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aether-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
