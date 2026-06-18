@@ -71,8 +71,14 @@ mod tests {
 
     #[test]
     fn keycode_normalises_letters_and_named_keys() {
-        assert_eq!(keycode(&Key::Character("H".into())), Some(KeyCode::Char('h')));
-        assert_eq!(keycode(&Key::Character("?".into())), Some(KeyCode::Char('?')));
+        assert_eq!(
+            keycode(&Key::Character("H".into())),
+            Some(KeyCode::Char('h'))
+        );
+        assert_eq!(
+            keycode(&Key::Character("?".into())),
+            Some(KeyCode::Char('?'))
+        );
         assert_eq!(keycode(&Key::Named(Named::Space)), Some(KeyCode::Char(' ')));
         assert_eq!(keycode(&Key::Named(Named::Escape)), Some(KeyCode::Esc));
         assert_eq!(keycode(&Key::Named(Named::Shift)), None);

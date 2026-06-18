@@ -10,10 +10,9 @@ use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VIS
 use super::save_as::SaveAsEditor;
 use super::session::{
     buffer_info, min_pos, severity_label, strip_longest_root, AppSettingId, AppSettingsOverlay,
-    CommitDetails, ConfirmAction,
-    ConfirmKind, ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending, ProjectSettings,
-    Prompt, ReloadTry,
-    RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, TextField,
+    CommitDetails, ConfirmAction, ConfirmKind, ConnState, HoverBlock, HoverText, Mode, PasteKind,
+    Pending, ProjectSettings, Prompt, ReloadTry, RepeatTarget, SaveTry, SearchSnapshot,
+    SearchState, Session, TextField,
 };
 use super::transport::RpcError;
 use aether_protocol::buffer::{
@@ -25,10 +24,9 @@ use aether_protocol::buffer::{
 use aether_protocol::cursor::Direction;
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams, CursorRedo,
-    CursorSelectAll, CursorSelectAllParams,
-    CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
-    CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
-    Granularity, Motion, SelectionEdge,
+    CursorSelectAll, CursorSelectAllParams, CursorSelectLine, CursorSelectLineParams, CursorSet,
+    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
+    CursorUndoParams, CursorUndoResult, Granularity, Motion, SelectionEdge,
 };
 use aether_protocol::directory::{
     DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryList,
@@ -402,13 +400,15 @@ impl Session {
             Event::HoverInfo(Ok(r)) => match r.contents {
                 // Render per the server-reported kind: Markdown as Markdown, plaintext literally
                 // (a single block) so its `*`/`_`/`#`/backticks aren't misinterpreted as Markdown.
-                Some(text) if r.markdown => Effects::one(Effect::ShowHover(
-                    HoverText::Markdown(crate::markdown::parse(&text)),
-                )),
-                Some(text) => Effects::one(Effect::ShowHover(HoverText::Blocks(vec![HoverBlock {
-                    severity: None,
-                    text,
-                }]))),
+                Some(text) if r.markdown => Effects::one(Effect::ShowHover(HoverText::Markdown(
+                    crate::markdown::parse(&text),
+                ))),
+                Some(text) => {
+                    Effects::one(Effect::ShowHover(HoverText::Blocks(vec![HoverBlock {
+                        severity: None,
+                        text,
+                    }])))
+                }
                 None => {
                     let mut fx = Effects::one(Effect::DismissHover);
                     fx.push(Effect::Toast("No hover info".into(), ToastKind::Info));
@@ -660,9 +660,7 @@ impl Session {
                 }
                 fx
             }
-            Event::ProjectCreated(Err(e)) => {
-                Effects::error(format!("create project failed: {e}"))
-            }
+            Event::ProjectCreated(Err(e)) => Effects::error(format!("create project failed: {e}")),
 
             Event::ProjectRenamed(result) => {
                 let Some(s) = self.project_settings.as_mut() else {
@@ -722,7 +720,10 @@ impl Session {
                         if closed.is_empty() {
                             format!("removed root from {name}")
                         } else {
-                            format!("removed root from {name}; closed {} buffer(s)", closed.len())
+                            format!(
+                                "removed root from {name}; closed {} buffer(s)",
+                                closed.len()
+                            )
                         },
                         ToastKind::Success,
                     );
@@ -1491,7 +1492,10 @@ impl Session {
         // key; the other fields are display-only and ignored by the match).
         let center_on = match kind {
             PickerKind::Explorer => self.buffer.path.as_deref().and_then(|path| {
-                let name = std::path::Path::new(path).file_name()?.to_str()?.to_string();
+                let name = std::path::Path::new(path)
+                    .file_name()?
+                    .to_str()?
+                    .to_string();
                 Some(PickerItem::DirEntry {
                     name,
                     is_dir: false,
@@ -1499,17 +1503,20 @@ impl Session {
                     git_status: None,
                 })
             }),
-            PickerKind::LspServers => self.buffer.lsp_server.as_ref().map(|r| {
-                PickerItem::LspServer {
-                    name: String::new(),
-                    language: r.language.clone(),
-                    workspace_root: r.workspace_root.clone(),
-                    root_label: String::new(),
-                    status: aether_protocol::lsp::LspStatus::Ready,
-                    progress: Vec::new(),
-                    match_indices: Vec::new(),
-                }
-            }),
+            PickerKind::LspServers => {
+                self.buffer
+                    .lsp_server
+                    .as_ref()
+                    .map(|r| PickerItem::LspServer {
+                        name: String::new(),
+                        language: r.language.clone(),
+                        workspace_root: r.workspace_root.clone(),
+                        root_label: String::new(),
+                        status: aether_protocol::lsp::LspStatus::Ready,
+                        progress: Vec::new(),
+                        match_indices: Vec::new(),
+                    })
+            }
             _ => None,
         };
 
@@ -2783,7 +2790,11 @@ impl Session {
                     let n = chips::root_candidates(&labels, &ed.root_filter.text).len();
                     if n > 0 {
                         let sel = ed.root_selected.min(n - 1);
-                        ed.root_selected = if down { (sel + 1) % n } else { (sel + n - 1) % n };
+                        ed.root_selected = if down {
+                            (sel + 1) % n
+                        } else {
+                            (sel + n - 1) % n
+                        };
                         refresh = ed.sync_dir_listing(&project_paths);
                     }
                 } else {
@@ -3414,16 +3425,14 @@ impl Session {
                 return Effects::none();
             };
             match item {
-                PickerItem::DirEntry { name, is_dir, .. } => {
-                    p.explorer_listing_dir().map(|dir| {
-                        let noun = if *is_dir { "directory" } else { "file" };
-                        (
-                            format!("{}/{name}", dir.trim_end_matches('/')),
-                            noun,
-                            name.clone(),
-                        )
-                    })
-                }
+                PickerItem::DirEntry { name, is_dir, .. } => p.explorer_listing_dir().map(|dir| {
+                    let noun = if *is_dir { "directory" } else { "file" };
+                    (
+                        format!("{}/{name}", dir.trim_end_matches('/')),
+                        noun,
+                        name.clone(),
+                    )
+                }),
                 PickerItem::File {
                     path_index,
                     relative_path,
@@ -3525,10 +3534,9 @@ impl Session {
         // Drop the picker first — the create both activates the project and (when it has no roots)
         // opens the settings overlay, so the picker shouldn't linger underneath.
         let hide = self.close_picker();
-        hide.and(self.request_str::<ProjectCreate>(
-            ProjectCreateParams { name },
-            Event::ProjectCreated,
-        ))
+        hide.and(
+            self.request_str::<ProjectCreate>(ProjectCreateParams { name }, Event::ProjectCreated),
+        )
     }
 
     /// Adopt a `ProjectInfo` returned by an add/remove-root RPC: update the session's roots and,
@@ -3852,8 +3860,7 @@ impl Session {
                         return Effects::none();
                     }
                     KeyCode::Right if no_chord => {
-                        self.search.chip_selected =
-                            (sel + 1 < chips.len()).then_some(sel + 1);
+                        self.search.chip_selected = (sel + 1 < chips.len()).then_some(sel + 1);
                         return Effects::none();
                     }
                     KeyCode::Esc => {
@@ -4031,7 +4038,9 @@ impl Session {
                     // means it's open in another window — for which "switch away" is wrong advice.
                     Event::ProjectDeleted(r.map_err(|e| {
                         if e.code == ErrorCode::ACTIVE_PROJECT_PREVENTS_DELETE.code() {
-                            format!("\"{display}\" is active in another window — close it there first")
+                            format!(
+                                "\"{display}\" is active in another window — close it there first"
+                            )
                         } else {
                             e.message
                         }
@@ -4286,10 +4295,7 @@ impl Session {
                 A::EnterInsert(_) | A::OpenLineBelow | A::OpenLineAbove | A::Change
             )
         {
-            return Effects::toast(
-                "not connected — editing unavailable",
-                ToastKind::Info,
-            );
+            return Effects::toast("not connected — editing unavailable", ToastKind::Info);
         }
         match action {
             // ---- motions ----

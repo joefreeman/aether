@@ -665,10 +665,7 @@ pub fn dir_statuses(dir: &Path) -> HashMap<String, GitStatus> {
             // libgit2 also reports untracked *empty* directories as IGNORED (git can't track
             // them), which would grey a bare empty folder. Keep an Ignored child only when
             // an actual ignore rule matches its path.
-            if !repo
-                .is_path_ignored(Path::new(path))
-                .unwrap_or(true)
-            {
+            if !repo.is_path_ignored(Path::new(path)).unwrap_or(true) {
                 continue;
             }
         }

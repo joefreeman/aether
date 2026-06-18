@@ -632,10 +632,7 @@ fn overlay_captures(
     captures.sort_by(|a, b| {
         let len_a = a.1 - a.0;
         let len_b = b.1 - b.0;
-        len_b
-            .cmp(&len_a)
-            .then(a.2.cmp(&b.2))
-            .then(a.0.cmp(&b.0))
+        len_b.cmp(&len_a).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0))
     });
     for (s, e, _, name) in &captures {
         for i in *s..*e {
@@ -695,21 +692,37 @@ mod tests {
                 .map(|h| h.kind.clone())
         };
         // Base JS keywords / literals (previously uncoloured) now get captures.
-        assert!(kind_at("const").is_some_and(|k| k.contains("keyword")), "const → keyword");
-        assert!(kind_at("function").is_some_and(|k| k.contains("keyword")), "function → keyword");
-        assert!(kind_at("return").is_some_and(|k| k.contains("keyword")), "return → keyword");
-        assert!(kind_at("42").is_some_and(|k| k.contains("number")), "42 → number");
+        assert!(
+            kind_at("const").is_some_and(|k| k.contains("keyword")),
+            "const → keyword"
+        );
+        assert!(
+            kind_at("function").is_some_and(|k| k.contains("keyword")),
+            "function → keyword"
+        );
+        assert!(
+            kind_at("return").is_some_and(|k| k.contains("keyword")),
+            "return → keyword"
+        );
+        assert!(
+            kind_at("42").is_some_and(|k| k.contains("number")),
+            "42 → number"
+        );
         // A string literal in a separate snippet (the first has none).
         let src2 = "const greeting = \"hello\";\n";
         let tree2 = parser.parse(src2, None).unwrap();
         let hl2 = highlights_for_range(cfg, &tree2, &[], src2, 0, src2.len());
         let sp = src2.find("\"hello\"").unwrap() as u32;
         assert!(
-            hl2.iter().any(|h| h.start <= sp && h.end > sp && h.kind.contains("string")),
+            hl2.iter()
+                .any(|h| h.start <= sp && h.end > sp && h.kind.contains("string")),
             "string literal → string"
         );
         // TS-specific additions still work.
-        assert!(kind_at("number").is_some_and(|k| k.contains("type")), "number → type.builtin");
+        assert!(
+            kind_at("number").is_some_and(|k| k.contains("type")),
+            "number → type.builtin"
+        );
     }
 
     #[test]
@@ -727,9 +740,16 @@ mod tests {
                 .find(|h| h.start <= pos && h.end > pos)
                 .map(|h| h.kind.clone())
         };
-        assert!(kind_at("const").is_some_and(|k| k.contains("keyword")), "base code still works");
+        assert!(
+            kind_at("const").is_some_and(|k| k.contains("keyword")),
+            "base code still works"
+        );
         // The lowercase HTML tag name and the attribute name get JSX captures.
-        assert!(kind_at("div").is_some_and(|k| k.contains("tag")), "<div> → tag, got {:?}", kind_at("div"));
+        assert!(
+            kind_at("div").is_some_and(|k| k.contains("tag")),
+            "<div> → tag, got {:?}",
+            kind_at("div")
+        );
         assert!(
             kind_at("className").is_some_and(|k| k.contains("attribute")),
             "className → attribute, got {:?}",

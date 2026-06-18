@@ -144,7 +144,11 @@ fn save_as_completes_dir_and_files_then_saves_the_literal_path() {
         Some(Prompt::SaveAs(ed)) => ed.path_ghost(),
         other => panic!("expected save-as, got {other:?}"),
     };
-    assert_eq!(ghost.as_deref(), Some("rc/"), "directory ghost keeps the slash");
+    assert_eq!(
+        ghost.as_deref(),
+        Some("rc/"),
+        "directory ghost keeps the slash"
+    );
     let _ = s.save_as_set_input("m".into());
     let ghost = match &s.prompt {
         Some(Prompt::SaveAs(ed)) => ed.path_ghost(),
@@ -283,7 +287,10 @@ fn confirm_enter_declines_and_only_y_accepts() {
     // `Y` (shifted) accepts too.
     stage(&mut s);
     let fx = s.on_key(KeyCode::Char('Y'), Mods::NONE, Some("Y".into()), ROWS);
-    assert!(find_request(&fx, "buffer/reload").is_some(), "`Y` also accepts");
+    assert!(
+        find_request(&fx, "buffer/reload").is_some(),
+        "`Y` also accepts"
+    );
 }
 
 /// A `buffer/state` push carrying a *new* path (a save-as on the shared buffer from another
@@ -443,7 +450,11 @@ fn chip_editor_is_value_synced_not_keycode_edited() {
     assert_eq!(glob_open(&s), "");
     // A typed char reaching the core must NOT edit the value — that's the shell input's job.
     let _ = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
-    assert_eq!(glob_open(&s), "", "the core must not key-edit the chip editor");
+    assert_eq!(
+        glob_open(&s),
+        "",
+        "the core must not key-edit the chip editor"
+    );
     // The shell's value-sync entry point drives it.
     let _ = s.chip_editor_set_input("*.rs".into());
     assert_eq!(glob_open(&s), "*.rs");
@@ -527,7 +538,10 @@ fn closing_the_lsp_dialog_returns_to_the_picker() {
     // Enter drills into the detail dialog, but the picker stays open underneath.
     let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
     assert!(matches!(s.prompt, Some(Prompt::LspInfo(_))), "dialog opens");
-    assert!(s.picker.is_some(), "the LSP picker stays open underneath the dialog");
+    assert!(
+        s.picker.is_some(),
+        "the LSP picker stays open underneath the dialog"
+    );
     // Closing the dialog (Esc) returns to the picker rather than the editor.
     let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
     assert!(s.prompt.is_none(), "dialog closed");
@@ -656,7 +670,10 @@ fn lsp_info_restart_is_ctrl_r_not_plain_r() {
     }));
     match &s.prompt {
         Some(Prompt::LspInfo(info)) => {
-            assert!(matches!(info.status, LspStatus::Ready), "dialog reflects the live status");
+            assert!(
+                matches!(info.status, LspStatus::Ready),
+                "dialog reflects the live status"
+            );
         }
         other => panic!("expected the LSP dialog still open, got {other:?}"),
     }
@@ -674,7 +691,8 @@ fn editing_is_refused_while_disconnected_and_insert_drops_on_disconnect() {
     let fx = key(&mut s, 'i');
     assert_eq!(s.mode, Mode::Normal, "insert is refused while connecting");
     assert!(
-        fx.0.iter().any(|e| matches!(e, Effect::Toast(_, ToastKind::Info))),
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Info))),
         "a hint explains why nothing happened"
     );
     assert!(
@@ -771,7 +789,8 @@ fn dir_editor_holds_while_listing_pending_then_previews_on_load() {
             ],
         }),
     });
-    let params = find_request(&fx, "picker/query").expect("the scope applies once the listing loads");
+    let params =
+        find_request(&fx, "picker/query").expect("the scope applies once the listing loads");
     assert_eq!(
         params["filters"]["directories"],
         json!([{"path_index": 0, "relative_path": "src"}])
@@ -855,11 +874,18 @@ fn search_option_toggles_cycle_and_ride_the_request() {
     let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
     assert_eq!(s.search.options.case, CaseMode::Insensitive);
     let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
-    assert_eq!(s.search.options.case, CaseMode::Smart, "third Alt-c returns to smart");
+    assert_eq!(
+        s.search.options.case,
+        CaseMode::Smart,
+        "third Alt-c returns to smart"
+    );
 
     // Esc restores the pre-prompt options (a cancelled search reverts its toggles too).
     let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
-    assert_eq!(s.search.options, aether_protocol::picker::MatchOptions::default());
+    assert_eq!(
+        s.search.options,
+        aether_protocol::picker::MatchOptions::default()
+    );
 }
 
 #[test]
@@ -1060,7 +1086,11 @@ fn primed_switch_adopts_summary_from_the_response_not_a_push() {
         whole_word: true,
         fixed_string: false,
     };
-    let _ = s.on_event(Event::SwitchedPrimed(Ok(Some(("needle".into(), opts, open)))));
+    let _ = s.on_event(Event::SwitchedPrimed(Ok(Some((
+        "needle".into(),
+        opts,
+        open,
+    )))));
 
     assert!(
         s.search.active,
@@ -1449,18 +1479,21 @@ fn projects_delete_confirms_then_deletes_and_guards_active() {
         Err(RpcError {
             method: "project/delete",
             code: aether_protocol::error::ErrorCode::ACTIVE_PROJECT_PREVENTS_DELETE.code(),
-            message: "project other is active — switch to another project before deleting it".into(),
+            message: "project other is active — switch to another project before deleting it"
+                .into(),
         }),
     );
-    let msg = fx
-        .0
-        .iter()
-        .find_map(|e| match e {
-            Effect::Toast(m, ToastKind::Error) => Some(m.clone()),
-            _ => None,
-        })
-        .expect("an error toast");
-    assert!(msg.contains("another window"), "tailored message, got {msg:?}");
+    let msg =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Toast(m, ToastKind::Error) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("an error toast");
+    assert!(
+        msg.contains("another window"),
+        "tailored message, got {msg:?}"
+    );
     assert!(!msg.contains("RPC"), "no raw RpcError prefix, got {msg:?}");
 }
 
@@ -1631,8 +1664,7 @@ fn app_settings_toggle_persists_and_reflows() {
         "captures a content anchor before the reflow"
     );
     assert!(
-        fx.0
-            .iter()
+        fx.0.iter()
             .any(|e| matches!(e, Effect::ShellAction(Action::ToggleWrap))),
         "delegates the reflow to the shell's wrap path"
     );
@@ -1662,11 +1694,13 @@ fn settings_changed_push_applies_wrap_live() {
     use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
     use aether_protocol::settings::SettingsChanged;
 
-    let push = |wrap: &str| Event::ServerPush(Notification {
-        jsonrpc: JsonRpc,
-        method: SettingsChanged::NAME.into(),
-        params: json!({ "wrap": wrap }),
-    });
+    let push = |wrap: &str| {
+        Event::ServerPush(Notification {
+            jsonrpc: JsonRpc,
+            method: SettingsChanged::NAME.into(),
+            params: json!({ "wrap": wrap }),
+        })
+    };
 
     // Another client turned wrap off (differs from the Soft default) → reflow live, plus a toast.
     let mut s = session();
@@ -1818,7 +1852,10 @@ fn project_created_with_no_roots_opens_a_scratch_and_settings() {
     // Rather than leave the previous project's buffer behind, a scratch is opened (a `buffer/open`
     // with no buffer_id/path) so the user lands in some editor in the new project.
     let (_, method, _) = the_request(&fx);
-    assert_eq!(method, "buffer/open", "opens a fresh scratch in the new project");
+    assert_eq!(
+        method, "buffer/open",
+        "opens a fresh scratch in the new project"
+    );
     // The settings overlay auto-opens, focused on the add-root input (index = roots.len() + 1 = 1).
     let ps = s.project_settings.as_ref().expect("settings opened");
     assert_eq!(ps.project_name, "fresh");
@@ -1873,7 +1910,10 @@ fn settings_add_root_emits_request_and_its_result_updates_state() {
     assert_eq!(s.project_paths, vec!["/a".to_string(), "/b".to_string()]);
     let ps = s.project_settings.as_ref().unwrap();
     assert_eq!(ps.roots.len(), 2);
-    assert!(ps.add.text.is_empty(), "the input clears after a successful add");
+    assert!(
+        ps.add.text.is_empty(),
+        "the input clears after a successful add"
+    );
 }
 
 #[test]
@@ -1954,7 +1994,10 @@ fn settings_remove_root_needs_confirm_then_emits_request() {
         next_buffer_id: None,
     })));
     assert_eq!(s.project_paths, vec!["/b".to_string()]);
-    assert_eq!(s.project_settings.as_ref().unwrap().roots, vec!["/b".to_string()]);
+    assert_eq!(
+        s.project_settings.as_ref().unwrap().roots,
+        vec!["/b".to_string()]
+    );
 }
 
 #[test]
@@ -2022,7 +2065,10 @@ fn document_symbols_opens_scoped_to_buffer_with_no_filters() {
     // collapse) and scoped to the active buffer so the server can resolve symbols + the cursor.
     let fx = s.open_picker(PickerKind::DocumentSymbols, None, None);
     let params = find_request(&fx, "picker/view").expect("symbols picker opens via picker/view");
-    assert!(params.get("filters").is_none(), "no seeded filters: {params}");
+    assert!(
+        params.get("filters").is_none(),
+        "no seeded filters: {params}"
+    );
     assert!(params["buffer_id"].is_number());
 }
 
@@ -2074,7 +2120,10 @@ fn symbol_push_center_on_lands_the_highlight() {
     });
     let _ = s.on_event(push);
     let p = s.picker.as_ref().unwrap();
-    assert_eq!(p.selected, 1, "center_on lands the highlight on the enclosing symbol");
+    assert_eq!(
+        p.selected, 1,
+        "center_on lands the highlight on the enclosing symbol"
+    );
     assert!(p.pending_center.is_none(), "center matched in-window");
 }
 
@@ -2114,7 +2163,11 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
             kind: PickerKind::DocumentSymbols,
             generation: 0,
             offset: 60,
-            items: Some(vec![sym(80, "a"), sym(81, "externally_modified"), sym(82, "c")]),
+            items: Some(vec![
+                sym(80, "a"),
+                sym(81, "externally_modified"),
+                sym(82, "c"),
+            ]),
             total_matches: 63,
             total_candidates: 63,
             ticking: false,
@@ -2128,6 +2181,12 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
     let _ = s.on_event(push);
     let p = s.picker.as_ref().unwrap();
     assert_eq!(p.offset, 60, "the client adopts the server's framed offset");
-    assert_eq!(p.selected, 61, "the deep symbol (offset 60 + window pos 1) is selected");
-    assert!(p.pending_center.is_none(), "center matched within the framed window");
+    assert_eq!(
+        p.selected, 61,
+        "the deep symbol (offset 60 + window pos 1) is selected"
+    );
+    assert!(
+        p.pending_center.is_none(),
+        "center matched within the framed window"
+    );
 }

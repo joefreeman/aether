@@ -66,7 +66,10 @@ pub struct CountedEditParams {
     pub buffer_id: BufferId,
     /// Apply the edit this many times (`0` = `1`). Undo/redo stop early when the stack is
     /// exhausted; the structural edits stop on the first error (prior repeats stand).
-    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    #[serde(
+        default = "crate::count_one",
+        skip_serializing_if = "crate::count_is_one"
+    )]
     pub count: u32,
 }
 
@@ -201,7 +204,10 @@ pub struct InputMoveLinesParams {
     pub buffer_id: BufferId,
     pub direction: VerticalDirection,
     /// Move this many lines (`0` = `1`) — the repeat loop lives server-side.
-    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    #[serde(
+        default = "crate::count_one",
+        skip_serializing_if = "crate::count_is_one"
+    )]
     pub count: u32,
 }
 

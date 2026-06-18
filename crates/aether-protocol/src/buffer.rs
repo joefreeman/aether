@@ -60,7 +60,10 @@ pub struct BufferOpenParams {
     /// Match options for the primed search (ignored without `prime_search`) — the grep result's
     /// case / whole-word / literal options, so the primed search matches the same way the grep
     /// that found the hit did. Defaults (regex, smartcase) when absent.
-    #[serde(default, skip_serializing_if = "crate::picker::MatchOptions::is_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::picker::MatchOptions::is_default"
+    )]
     pub prime_search_options: crate::picker::MatchOptions,
 }
 

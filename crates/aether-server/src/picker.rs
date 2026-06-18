@@ -1318,10 +1318,19 @@ mod tests {
         let mut m = make_matcher();
         s.query = "parse".into();
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![0, 1], "match (parse, idx 1) + its ancestor (Widget, idx 0)");
+        assert_eq!(
+            s.ranked,
+            vec![0, 1],
+            "match (parse, idx 1) + its ancestor (Widget, idx 0)"
+        );
         let (_, items) = s.build_window_items(0, 10, &mut m);
         match &items[0] {
-            PickerItem::Symbol { name, context, match_indices, .. } => {
+            PickerItem::Symbol {
+                name,
+                context,
+                match_indices,
+                ..
+            } => {
                 assert_eq!(name, "Widget");
                 assert!(*context, "the unmatched ancestor is a context row");
                 assert!(match_indices.is_empty());
@@ -1329,7 +1338,12 @@ mod tests {
             other => panic!("expected Symbol, got {other:?}"),
         }
         match &items[1] {
-            PickerItem::Symbol { name, context, match_indices, .. } => {
+            PickerItem::Symbol {
+                name,
+                context,
+                match_indices,
+                ..
+            } => {
                 assert_eq!(name, "parse");
                 assert!(!*context, "the match is selectable, not context");
                 assert!(!match_indices.is_empty(), "the match is highlighted");

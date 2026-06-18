@@ -1679,8 +1679,12 @@ impl Shell {
                 });
             }
             Some(Prompt::SaveAs(ed)) => {
-                st.save_prompt =
-                    Some(save_as_view(ed, multi_root, save_root_cursor, save_path_cursor));
+                st.save_prompt = Some(save_as_view(
+                    ed,
+                    multi_root,
+                    save_root_cursor,
+                    save_path_cursor,
+                ));
             }
             Some(Prompt::LspInfo(status)) => {
                 // The dedicated detail pane the LSP-servers picker renders. Scroll is
@@ -2094,11 +2098,9 @@ pub async fn bootstrap(
                 buffer_info(open, &project_paths),
             );
             let startup = match &resolved {
-                Some(abs) if abs.is_dir() => session.open_picker(
-                    PickerKind::Explorer,
-                    Some(abs.display().to_string()),
-                    None,
-                ),
+                Some(abs) if abs.is_dir() => {
+                    session.open_picker(PickerKind::Explorer, Some(abs.display().to_string()), None)
+                }
                 _ => Effects::none(),
             };
             (session, activated.project.name, project_paths, startup)
@@ -2107,7 +2109,13 @@ pub async fn bootstrap(
 
     // Fetch the persisted app settings (e.g. the soft-wrap default) alongside the boot effects.
     let startup = startup.and(session.startup());
-    let state = make_state(project_name, project_paths, cols, rows, ConnState::Connected);
+    let state = make_state(
+        project_name,
+        project_paths,
+        cols,
+        rows,
+        ConnState::Connected,
+    );
     Ok((session, state, startup))
 }
 

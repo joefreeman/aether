@@ -9,10 +9,10 @@
 use crate::connection::Handle;
 use crate::connection::NotifRx;
 pub use crate::core::effect::{Effect, Effects, ToastKind};
+use crate::core::markdown::{Block as MdBlock, Inline as MdInline};
 pub use crate::core::session::*;
 use crate::core::update::Event as CoreEvent;
 use crate::editor::{self, ClickKind, EditorEvent, GUTTER_COLS, PAD};
-use crate::core::markdown::{Block as MdBlock, Inline as MdInline};
 use crate::grid;
 use crate::keymap::{hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit};
 use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
@@ -611,11 +611,13 @@ impl App {
         match &self.session.prompt {
             Some(Prompt::SaveAs(ed)) => {
                 let multi_root = self.session.project_paths.len() > 1;
-                return Some(if multi_root && ed.field == crate::chips::ChipEditorField::Root {
-                    OverlayField::SaveAsRoot
-                } else {
-                    OverlayField::SaveAs
-                });
+                return Some(
+                    if multi_root && ed.field == crate::chips::ChipEditorField::Root {
+                        OverlayField::SaveAsRoot
+                    } else {
+                        OverlayField::SaveAs
+                    },
+                );
             }
             Some(_) => return None,
             None => {}
@@ -638,7 +640,10 @@ impl App {
             // (Left/Right/Backspace/Enter/Esc) must reach the core, but a focused `text_input`
             // would capture the editing keys among them. Defocusing lets every key bubble (web
             // parity: "chip selected → forward all").
-            return p.chip_selected.is_none().then_some(OverlayField::PickerQuery);
+            return p
+                .chip_selected
+                .is_none()
+                .then_some(OverlayField::PickerQuery);
         }
         if let Some(s) = &self.session.project_settings {
             // Name field (selection 0) or add-root input (last row) — a highlighted root row in
@@ -883,10 +888,7 @@ impl App {
                 return Task::none();
             }
             KeyCode::Left if no_chord => {
-                if let Some((i, _)) = boot.picker.query[..boot.query_cursor]
-                    .char_indices()
-                    .last()
-                {
+                if let Some((i, _)) = boot.picker.query[..boot.query_cursor].char_indices().last() {
                     boot.query_cursor = i;
                 }
                 return Task::none();
@@ -972,7 +974,11 @@ impl App {
                 let open = activated
                     .opened
                     .ok_or_else(|| "project/activate returned no landing buffer".to_string())?;
-                Ok(Box::new((activated.project, open, activated.server_started_at)))
+                Ok(Box::new((
+                    activated.project,
+                    open,
+                    activated.server_started_at,
+                )))
             },
             Message::SessionReady,
         )
@@ -1130,7 +1136,10 @@ impl App {
 
     fn reconnect_to_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
         let chooser = self.enter_boot_chooser(handle, notifications);
-        let toast = self.toast("project no longer exists — pick another", ToastKind::Warning);
+        let toast = self.toast(
+            "project no longer exists — pick another",
+            ToastKind::Warning,
+        );
         Task::batch([chooser, toast])
     }
 
@@ -1443,7 +1452,8 @@ impl App {
                 Effect::SaveContentAnchor => {
                     if let Some(cell) = self.cell {
                         let top_row = (self.scroll_px / cell.height).round().max(0.0) as u32;
-                        self.session.capture_scroll_anchor(top_row, self.visible_rows());
+                        self.session
+                            .capture_scroll_anchor(top_row, self.visible_rows());
                     }
                 }
                 Effect::ShowHover(content) => {
@@ -1710,7 +1720,10 @@ impl App {
             // The active field or its text changed out-of-band (the core rewrote it) — snap the
             // controlled `text_input`'s caret to the end of the new value.
             if chip_after != chip_before {
-                task = Task::batch([task, iced::widget::operation::move_cursor_to_end(field.id())]);
+                task = Task::batch([
+                    task,
+                    iced::widget::operation::move_cursor_to_end(field.id()),
+                ]);
             }
         }
         // Same for the query input: only when the picker stayed open and its query changed under a
@@ -1750,11 +1763,13 @@ impl App {
     fn chip_field_snapshot(&self) -> Option<(OverlayField, String)> {
         if let Some(Prompt::SaveAs(ed)) = &self.session.prompt {
             let multi_root = self.session.project_paths.len() > 1;
-            return Some(if multi_root && ed.field == crate::chips::ChipEditorField::Root {
-                (OverlayField::SaveAsRoot, ed.root_filter.text.clone())
-            } else {
-                (OverlayField::SaveAs, ed.input.text.clone())
-            });
+            return Some(
+                if multi_root && ed.field == crate::chips::ChipEditorField::Root {
+                    (OverlayField::SaveAsRoot, ed.root_filter.text.clone())
+                } else {
+                    (OverlayField::SaveAs, ed.input.text.clone())
+                },
+            );
         }
         let ed = self.session.picker.as_ref()?.chip_editor.as_ref()?;
         Some(if ed.field == crate::chips::ChipEditorField::Root {
@@ -1813,7 +1828,11 @@ impl App {
                 scroll_to_top()
             }
             KeyCode::Tab => {
-                self.help = Some(if mods.shift { (tab + n - 1) % n } else { (tab + 1) % n });
+                self.help = Some(if mods.shift {
+                    (tab + n - 1) % n
+                } else {
+                    (tab + 1) % n
+                });
                 scroll_to_top()
             }
             KeyCode::Char(c @ '1'..='4') => {
@@ -2412,12 +2431,8 @@ impl App {
                     PickerMsg::Unhovered(abs) => Message::PickerUnhovered(abs),
                     PickerMsg::ChipClicked(i) => Message::Core(CoreEvent::PickerChipClicked(i)),
                     PickerMsg::Query(q) => Message::OverlayInput(OverlayField::PickerQuery, q),
-                    PickerMsg::EditorRoot(s) => {
-                        Message::OverlayInput(OverlayField::ChipRoot, s)
-                    }
-                    PickerMsg::EditorPath(s) => {
-                        Message::OverlayInput(OverlayField::ChipPath, s)
-                    }
+                    PickerMsg::EditorRoot(s) => Message::OverlayInput(OverlayField::ChipRoot, s),
+                    PickerMsg::EditorPath(s) => Message::OverlayInput(OverlayField::ChipPath, s),
                     PickerMsg::CoreKey(code) => core_key_message(code),
                 }),
             );
@@ -2607,24 +2622,33 @@ impl App {
         // `text_input` itself shows the value (NORD6) or the dim placeholder when empty, and draws
         // its own caret/selection when focused — the focus follows the dialog's `selected` (the
         // shell re-focuses on selection change via `sync_focus`).
-        let field = |fieldkind: OverlayField, value: &str, placeholder: &str| -> Element<'_, Message> {
-            // No fixed height: a size-13 `text_input` needs ~17px, so clamping the row to 15 clipped
-            // the text. Both states are the same widget now, so the box height is already consistent.
-            overlay_input(fieldkind, placeholder, value)
-        };
+        let field =
+            |fieldkind: OverlayField, value: &str, placeholder: &str| -> Element<'_, Message> {
+                // No fixed height: a size-13 `text_input` needs ~17px, so clamping the row to 15 clipped
+                // the text. Both states are the same widget now, so the box height is already consistent.
+                overlay_input(fieldkind, placeholder, value)
+            };
 
         // A boxed, optionally-highlighted input/row container.
-        fn boxed_row<'a>(
-            content: Element<'a, Message>,
-            highlighted: bool,
-        ) -> Element<'a, Message> {
+        fn boxed_row<'a>(content: Element<'a, Message>, highlighted: bool) -> Element<'a, Message> {
             container(content)
                 .padding([5, 8])
                 .width(Length::Fill)
                 .style(move |_| container::Style {
-                    background: Some(if highlighted { theme::NORD2 } else { theme::NORD0 }.into()),
+                    background: Some(
+                        if highlighted {
+                            theme::NORD2
+                        } else {
+                            theme::NORD0
+                        }
+                        .into(),
+                    ),
                     border: iced::Border {
-                        color: if highlighted { theme::NORD8 } else { theme::NORD3 },
+                        color: if highlighted {
+                            theme::NORD8
+                        } else {
+                            theme::NORD3
+                        },
                         width: 1.0,
                         radius: 4.0.into(),
                     },
@@ -2675,12 +2699,9 @@ impl App {
         // No row box — selection tints only the path text (see below).
         fn bulleted(inner: Element<'_, Message>) -> Element<'_, Message> {
             container(
-                row![
-                    text("•").size(13).font(SANS).color(theme::NORD6),
-                    inner
-                ]
-                .align_y(iced::Alignment::Center)
-                .spacing(6),
+                row![text("•").size(13).font(SANS).color(theme::NORD6), inner]
+                    .align_y(iced::Alignment::Center)
+                    .spacing(6),
             )
             .padding(iced::Padding {
                 top: 0.0,
@@ -2721,22 +2742,19 @@ impl App {
             });
             // Selection tints just the path text (web/terminal parity), so the background hugs the
             // text — no padding, so the text lines up with the borderless add-root input below.
-            let path = container(text(root.clone()).size(13).font(SANS).color(theme::NORD6))
-                .style(move |_| container::Style {
+            let path = container(text(root.clone()).size(13).font(SANS).color(theme::NORD6)).style(
+                move |_| container::Style {
                     background: highlighted.then(|| theme::NORD2.into()),
                     border: iced::Border {
                         radius: 3.0.into(),
                         ..iced::Border::default()
                     },
                     ..container::Style::default()
-                });
-            let inner = row![
-                path,
-                iced::widget::Space::new().width(Length::Fill),
-                delete,
-            ]
-            .align_y(iced::Alignment::Center)
-            .spacing(6);
+                },
+            );
+            let inner = row![path, iced::widget::Space::new().width(Length::Fill), delete,]
+                .align_y(iced::Alignment::Center)
+                .spacing(6);
             roots_col = roots_col.push(bulleted(inner.into()));
         }
 
@@ -2824,7 +2842,11 @@ impl App {
                 .padding(2)
                 .style(move |_| container::Style {
                     border: iced::Border {
-                        color: if focused { theme::NORD8 } else { iced::Color::TRANSPARENT },
+                        color: if focused {
+                            theme::NORD8
+                        } else {
+                            iced::Color::TRANSPARENT
+                        },
                         width: 1.0,
                         radius: 4.0.into(),
                     },
@@ -3222,9 +3244,7 @@ impl App {
                     path_boundary,
                 ));
                 let field: Element<'_, Message> = Element::from(field).map(|m| match m {
-                    PickerMsg::EditorRoot(s) => {
-                        Message::OverlayInput(OverlayField::SaveAsRoot, s)
-                    }
+                    PickerMsg::EditorRoot(s) => Message::OverlayInput(OverlayField::SaveAsRoot, s),
                     PickerMsg::EditorPath(s) => Message::OverlayInput(OverlayField::SaveAs, s),
                     PickerMsg::CoreKey(code) => core_key_message(code),
                     // The save-as segments never emit row/scroll/chip messages.
@@ -3310,7 +3330,10 @@ impl App {
                     // matching the status-bar count and picker.
                     let line: Element<'_, Message> = match b.severity {
                         Some(sev) => row![
-                            text(theme::diag_glyph(sev)).size(13).font(SANS).color(color),
+                            text(theme::diag_glyph(sev))
+                                .size(13)
+                                .font(SANS)
+                                .color(color),
                             text(b.text.clone()).size(13).font(SANS).color(color),
                         ]
                         .spacing(6)
@@ -3785,11 +3808,7 @@ const MONO: iced::Font = iced::Font::MONOSPACE;
 /// `iced::widget::text_input`'s builder requires `Message: Clone`, which the app's `Message` is
 /// not, so it's built in the tiny `Clone` [`Typed`] space and `.map`'d to `Message` (the same
 /// indirection the picker/prompt overlays use for their Clone-only button messages).
-fn overlay_input<'a>(
-    field: OverlayField,
-    placeholder: &str,
-    value: &str,
-) -> Element<'a, Message> {
+fn overlay_input<'a>(field: OverlayField, placeholder: &str, value: &str) -> Element<'a, Message> {
     // `alt_passthrough` keeps Alt-chords (the nav idiom) out of the input — winit delivers
     // `Alt+letter` as text on some platforms, which a focused `text_input` would otherwise insert.
     crate::alt_filter::alt_passthrough(
@@ -3920,11 +3939,7 @@ fn md_block(b: &MdBlock) -> Element<'static, Message> {
                     "•".to_string()
                 };
                 col = col.push(
-                    row![
-                        text(marker).size(MD_TEXT).color(theme::NORD4),
-                        md_doc(item),
-                    ]
-                    .spacing(6),
+                    row![text(marker).size(MD_TEXT).color(theme::NORD4), md_doc(item),].spacing(6),
                 );
             }
             col.into()
@@ -3956,7 +3971,12 @@ fn md_bar_style(_: &iced::Theme) -> container::Style {
 
 /// A `rich_text` of the inline AST. `bold`/`base_color` seed the styling (headings pass bold +
 /// white); code and link spans override colour, and links also get an underline + click handler.
-fn md_rich(inlines: &[MdInline], bold: bool, base_color: iced::Color, size: f32) -> Element<'static, Message> {
+fn md_rich(
+    inlines: &[MdInline],
+    bold: bool,
+    base_color: iced::Color,
+    size: f32,
+) -> Element<'static, Message> {
     let mut spans = Vec::new();
     md_spans(inlines, bold, false, None, base_color, &mut spans);
     iced::widget::rich_text(spans)
@@ -4365,9 +4385,7 @@ fn resolve_cli_path(input: &str) -> Result<std::path::PathBuf, String> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .join(p)
+        std::env::current_dir().map_err(|e| e.to_string())?.join(p)
     };
     abs.canonicalize()
         .map_err(|e| format!("resolving {}: {e}", abs.display()))

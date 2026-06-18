@@ -29,10 +29,10 @@ use aether_protocol::lsp::{
     LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServer, LspServerStatus,
     LspServerStatusList, LspStatus, LspStatusChanged,
 };
+use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
 };
-use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::{SearchSet, SearchSetParams};
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
@@ -546,7 +546,10 @@ fn search_set_params() {
         },
     })
     .unwrap();
-    assert_eq!(v["options"], json!({"case": "sensitive", "whole_word": true}));
+    assert_eq!(
+        v["options"],
+        json!({"case": "sensitive", "whole_word": true})
+    );
 
     // `extend` defaults to false and `options` to all-default when omitted on the wire
     // (back-compat with older clients).
@@ -1412,7 +1415,10 @@ fn picker_item_symbol_is_tagged() {
     assert_eq!(v["symbol_kind"], "function");
     assert_eq!(v["detail"], "fn(&[u8]) -> Header");
     assert_eq!(v["depth"], 1);
-    assert!(v.get("context").is_none(), "context absent on the wire when false");
+    assert!(
+        v.get("context").is_none(),
+        "context absent on the wire when false"
+    );
     assert_eq!(v["match_indices"], json!([0, 1]));
     let back: PickerItem = from_value(v).unwrap();
     assert_eq!(back, item);
@@ -2234,7 +2240,9 @@ fn app_settings_wire_shape_and_defaults() {
     assert_eq!(AppSettings::default().wrap, WrapMode::Soft);
 
     // Wire shape: `wrap` serializes as the lowercase WrapMode tag.
-    let s = AppSettings { wrap: WrapMode::None };
+    let s = AppSettings {
+        wrap: WrapMode::None,
+    };
     assert_eq!(to_value(s).unwrap(), json!({ "wrap": "none" }));
 
     // An empty object (a fresh / older settings.toml with no keys) reads back as defaults — every

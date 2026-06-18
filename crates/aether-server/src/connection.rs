@@ -28,8 +28,7 @@ use aether_protocol::git::{
 use aether_protocol::input::{
     InputBackspace, InputChangeLine, InputDedent, InputDelete, InputDeleteLine, InputIndent,
     InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputOpenLine, InputRedo,
-    InputReplaceLine,
-    InputSurround, InputText, InputToggleComment, InputUndo, InputUnsurround,
+    InputReplaceLine, InputSurround, InputText, InputToggleComment, InputUndo, InputUnsurround,
 };
 use aether_protocol::lsp::{
     LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic, LspRestartServer,

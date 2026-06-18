@@ -630,7 +630,7 @@ mod tests {
         assert_eq!(line_at_row(&w, 101), (5, 1)); // 2nd row of line 5
         assert_eq!(line_at_row(&w, 102), (6, 0));
         assert_eq!(line_at_row(&w, 104), (7, 1)); // 2nd row of line 7
-        // Past the loaded window clamps to the last line's last row.
+                                                  // Past the loaded window clamps to the last line's last row.
         assert_eq!(line_at_row(&w, 999), (7, 2));
     }
 
@@ -670,10 +670,7 @@ mod tests {
             5,
             100,
             vec![
-                line(
-                    5,
-                    vec![row(0, 0, "a"), row(1, 0, "a"), row(2, 0, "a")],
-                ),
+                line(5, vec![row(0, 0, "a"), row(1, 0, "a"), row(2, 0, "a")]),
                 line(6, vec![row(0, 0, "cccc")]),
                 line(7, vec![row(0, 0, "d")]),
             ],

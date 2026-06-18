@@ -16,11 +16,24 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Block {
-    Heading { level: u8, content: Vec<Inline> },
-    Paragraph { content: Vec<Inline> },
-    Code { language: Option<String>, code: String },
-    List { ordered: bool, items: Vec<Vec<Block>> },
-    Quote { content: Vec<Block> },
+    Heading {
+        level: u8,
+        content: Vec<Inline>,
+    },
+    Paragraph {
+        content: Vec<Inline>,
+    },
+    Code {
+        language: Option<String>,
+        code: String,
+    },
+    List {
+        ordered: bool,
+        items: Vec<Vec<Block>>,
+    },
+    Quote {
+        content: Vec<Block>,
+    },
     Rule,
 }
 
@@ -43,7 +56,9 @@ pub fn parse(md: &str) -> Vec<Block> {
             Event::Start(tag) => b.start(tag),
             Event::End(_) => b.end(),
             Event::Text(s) => b.text(&s),
-            Event::Code(s) => b.push_inline(Inline::Code { text: s.to_string() }),
+            Event::Code(s) => b.push_inline(Inline::Code {
+                text: s.to_string(),
+            }),
             // A soft or hard break inside a paragraph just separates words for our wrapped layout.
             Event::SoftBreak | Event::HardBreak => b.text(" "),
             Event::Rule => b.push_block(Block::Rule),
@@ -64,7 +79,10 @@ enum Frame {
     /// Transparent inline container — strikethrough, image alt, or any unmodelled inline tag. Its
     /// children flow into the parent on close.
     Span(Vec<Inline>),
-    List { ordered: bool, items: Vec<Vec<Block>> },
+    List {
+        ordered: bool,
+        items: Vec<Vec<Block>>,
+    },
     Item(Vec<Block>),
     Quote(Vec<Block>),
     Code(Option<String>, String),
@@ -149,7 +167,9 @@ impl Builder {
         if let Some(Frame::Code(_, code)) = self.stack.last_mut() {
             code.push_str(s);
         } else {
-            self.push_inline(Inline::Text { text: s.to_string() });
+            self.push_inline(Inline::Text {
+                text: s.to_string(),
+            });
         }
     }
 
@@ -363,7 +383,8 @@ mod tests {
 
     #[test]
     fn to_plain_flattens_headings_lists_and_code() {
-        let md = "# Title\n\nSome `inline` and [docs](https://x.y).\n\n- one\n- two\n\n```\ncode\n```\n";
+        let md =
+            "# Title\n\nSome `inline` and [docs](https://x.y).\n\n- one\n- two\n\n```\ncode\n```\n";
         let plain = to_plain(&parse(md));
         assert_eq!(
             plain,

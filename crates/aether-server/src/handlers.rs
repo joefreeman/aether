@@ -2430,7 +2430,9 @@ fn push_symbol(
     let range_start = full_range
         .and_then(|r| pos_at(r, "start"))
         .unwrap_or(name_pos);
-    let range_end = full_range.and_then(|r| pos_at(r, "end")).unwrap_or(name_pos);
+    let range_end = full_range
+        .and_then(|r| pos_at(r, "end"))
+        .unwrap_or(name_pos);
     // Only `DocumentSymbol.detail` (a signature). We deliberately skip `SymbolInformation`'s
     // `containerName` — it names the enclosing scope, which the reconstructed indentation already
     // shows, so surfacing it here would just duplicate the parent next to every flat-server symbol.
@@ -3153,10 +3155,7 @@ pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) 
         externally_deleted: buf.externally_deleted,
         transient: buf.transient,
         // Lets a save-as rename follow to every other client viewing this shared buffer.
-        path: buf
-            .canonical_path
-            .as_ref()
-            .map(|p| p.display().to_string()),
+        path: buf.canonical_path.as_ref().map(|p| p.display().to_string()),
     };
     let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
     let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
@@ -4898,11 +4897,12 @@ async fn build_symbol_candidates(
             .and_then(|b| b.canonical_path.clone());
         // The cursor's byte position (for centering on the enclosing symbol), in buffer coords —
         // not the LSP-encoded one in `req`.
-        let cursor = s
-            .cursors
-            .get(&(client_id, buffer_id))
-            .map(|c| c.position);
-        (lsp_cursor_request(&s, client_id, buffer_id), abs_path, cursor)
+        let cursor = s.cursors.get(&(client_id, buffer_id)).map(|c| c.position);
+        (
+            lsp_cursor_request(&s, client_id, buffer_id),
+            abs_path,
+            cursor,
+        )
     };
     let (Some(req), Some(abs_path)) = (req, abs_path) else {
         return (Vec::new(), None);
@@ -6242,8 +6242,15 @@ pub async fn input_delete(
     let client_id = ctx.client_id;
     let mut last = None;
     for _ in 0..params.count.max(1) {
-        last =
-            Some(apply_edit(state, client_id, params.buffer_id, EditKind::DeleteSelection).await?);
+        last = Some(
+            apply_edit(
+                state,
+                client_id,
+                params.buffer_id,
+                EditKind::DeleteSelection,
+            )
+            .await?,
+        );
     }
     Ok(last.expect("count.max(1) iterations"))
 }
@@ -6393,7 +6400,8 @@ pub async fn input_indent(
 ) -> Result<EditResult, RpcError> {
     let mut last = None;
     for _ in 0..params.count.max(1) {
-        last = Some(apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Indent).await?);
+        last =
+            Some(apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Indent).await?);
     }
     Ok(last.expect("count.max(1) iterations"))
 }
@@ -7335,7 +7343,8 @@ pub async fn input_dedent(
 ) -> Result<EditResult, RpcError> {
     let mut last = None;
     for _ in 0..params.count.max(1) {
-        last = Some(apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Dedent).await?);
+        last =
+            Some(apply_indent_or_dedent(state, ctx, params.buffer_id, IndentKind::Dedent).await?);
     }
     Ok(last.expect("count.max(1) iterations"))
 }
@@ -8930,8 +8939,11 @@ fn resolve_explorer_anchor(
     raw: &std::path::Path,
     project_paths: &[std::path::PathBuf],
 ) -> Result<picker_state::ExplorerAnchorInfo, RpcError> {
-    let in_project =
-        |p: &std::path::Path| project_paths.iter().any(|r| p == r.as_path() || p.starts_with(r));
+    let in_project = |p: &std::path::Path| {
+        project_paths
+            .iter()
+            .any(|r| p == r.as_path() || p.starts_with(r))
+    };
     let canonical = std::fs::canonicalize(raw)
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
     if !in_project(&canonical) {
@@ -10683,12 +10695,18 @@ mod lsp_parse_tests {
         let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8);
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0].name, "Parser");
-        assert_eq!(syms[0].symbol_kind, aether_protocol::picker::SymbolKind::Struct);
+        assert_eq!(
+            syms[0].symbol_kind,
+            aether_protocol::picker::SymbolKind::Struct
+        );
         assert_eq!(syms[0].depth, 0);
         assert_eq!((syms[0].line, syms[0].col), (0, 7)); // selectionRange, not range
         assert_eq!(syms[0].detail, "struct Parser");
         assert_eq!(syms[1].name, "new");
-        assert_eq!(syms[1].symbol_kind, aether_protocol::picker::SymbolKind::Method);
+        assert_eq!(
+            syms[1].symbol_kind,
+            aether_protocol::picker::SymbolKind::Method
+        );
         assert_eq!(syms[1].depth, 1);
         assert_eq!((syms[1].line, syms[1].col), (1, 11));
         // The full `range` (not selectionRange) is captured for cursor containment: the struct
@@ -10712,8 +10730,14 @@ mod lsp_parse_tests {
         let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8);
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "helper");
-        assert_eq!(syms[0].symbol_kind, aether_protocol::picker::SymbolKind::Function);
-        assert_eq!(syms[0].detail, "", "containerName is not surfaced as detail");
+        assert_eq!(
+            syms[0].symbol_kind,
+            aether_protocol::picker::SymbolKind::Function
+        );
+        assert_eq!(
+            syms[0].detail, "",
+            "containerName is not surfaced as detail"
+        );
         assert_eq!(syms[0].depth, 0);
         assert_eq!((syms[0].line, syms[0].col), (5, 3));
     }
@@ -10722,9 +10746,7 @@ mod lsp_parse_tests {
     fn document_symbols_flat_reconstructs_depth_from_ranges() {
         // A flat SymbolInformation[] (like vscode-html) with nested ranges — html > head > meta —
         // gets its tree rebuilt from `range` containment so the outline indents.
-        let loc = |s: (u64, u64), e: (u64, u64)| {
-            json!({"range": {"start": {"line": s.0, "character": s.1}, "end": {"line": e.0, "character": e.1}}})
-        };
+        let loc = |s: (u64, u64), e: (u64, u64)| json!({"range": {"start": {"line": s.0, "character": s.1}, "end": {"line": e.0, "character": e.1}}});
         let v = json!([
             {"name": "html", "kind": 8, "location": loc((1, 0), (24, 7))},
             {"name": "head", "kind": 8, "location": loc((2, 2), (6, 9))},

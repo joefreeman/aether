@@ -15,7 +15,13 @@
 /// The math: the thumb covers the same fraction of the track as the viewport covers of the
 /// content (`viewport / total`), positioned proportionally to the scroll offset
 /// (`offset / total`), then clamped so it never spills past the track end.
-pub fn thumb(track: f64, total: f64, viewport: f64, offset: f64, min_len: f64) -> Option<(f64, f64)> {
+pub fn thumb(
+    track: f64,
+    total: f64,
+    viewport: f64,
+    offset: f64,
+    min_len: f64,
+) -> Option<(f64, f64)> {
     if track <= 0.0 || total <= 0.0 || viewport >= total {
         return None;
     }

@@ -136,7 +136,10 @@ mod tests {
         assert_eq!(title_body("", ""), None);
         // With a project, the `[project] label` body gains the " - Aether" suffix.
         assert_eq!(window_title("demo", ""), "[demo] - Aether");
-        assert_eq!(window_title("demo", "src/main.rs"), "[demo] src/main.rs - Aether");
+        assert_eq!(
+            window_title("demo", "src/main.rs"),
+            "[demo] src/main.rs - Aether"
+        );
     }
 
     #[test]

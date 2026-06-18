@@ -6,8 +6,8 @@ use crate::app::{
 };
 use aether_client::keymap;
 use aether_client::keymap::KeyCode;
-use aether_client::session::ConnState;
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
+use aether_client::session::ConnState;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::GitStatus;
 use aether_protocol::lsp::{LspProgress, LspStatus};
@@ -281,7 +281,10 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     let mut flat = 0usize;
     for group in &settings.groups {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(truncate_right(group.title, w), group_style)));
+        lines.push(Line::from(Span::styled(
+            truncate_right(group.title, w),
+            group_style,
+        )));
         for row in &group.rows {
             let selected = flat == settings.selected;
             // A gap before each setting (separating it from the header / the previous setting).
@@ -296,7 +299,9 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
             let check_bg = if selected { NORD2 } else { NORD0 };
             let label_budget = w.saturating_sub(CHECK_W + 1);
             let label = truncate_right(row.label, label_budget);
-            let pad = w.saturating_sub(CHECK_W).saturating_sub(label.chars().count());
+            let pad = w
+                .saturating_sub(CHECK_W)
+                .saturating_sub(label.chars().count());
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{}{}", label, " ".repeat(pad)),
@@ -305,7 +310,10 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
                 Span::styled(check, Style::default().fg(check_fg).bg(check_bg)),
             ]));
             // Description on the very next line — grouped tight under the label.
-            lines.push(Line::from(Span::styled(truncate_right(row.hint, w), desc_style)));
+            lines.push(Line::from(Span::styled(
+                truncate_right(row.hint, w),
+                desc_style,
+            )));
             flat += 1;
         }
     }
@@ -553,7 +561,11 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
                 for (j, line) in item_lines.into_iter().enumerate() {
                     // First line of the item carries the bullet/number; continuation lines hang under
                     // the text with a matching indent.
-                    let prefix = if j == 0 { marker.clone() } else { indent.clone() };
+                    let prefix = if j == 0 {
+                        marker.clone()
+                    } else {
+                        indent.clone()
+                    };
                     let mut spans = vec![Span::styled(prefix, Style::default().fg(NORD4))];
                     spans.extend(line.spans);
                     out.push(Line::from(spans));
@@ -823,7 +835,13 @@ fn draw_help_overlay(f: &mut Frame, state: &AppState, area: Rect) {
 /// A 1-column vertical scrollbar over `total` lines with `visible` rows shown from `offset`.
 /// Thin wrapper over [`render_scrollbar`] for static overlays (help, search popover).
 fn draw_vertical_scrollbar(f: &mut Frame, area: Rect, offset: u16, total: u16, visible: u16) {
-    render_scrollbar(f, area, u64::from(offset), u64::from(total), u64::from(visible));
+    render_scrollbar(
+        f,
+        area,
+        u64::from(offset),
+        u64::from(total),
+        u64::from(visible),
+    );
 }
 
 /// The one TUI scrollbar renderer: a 1-column track in the leftmost column of `area`, with a
@@ -2216,7 +2234,10 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         // fill push raced ahead of the view response, leaving a stale 0) reads as just the match
         // count, not a misleading `106/0`. A throbber sits to the left while results stream.
         let num = if state.picker.total_candidates > state.picker.total_matches {
-            format!("{}/{}", state.picker.total_matches, state.picker.total_candidates)
+            format!(
+                "{}/{}",
+                state.picker.total_matches, state.picker.total_candidates
+            )
         } else {
             format!("{}", state.picker.total_matches)
         };
@@ -4710,7 +4731,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 }),
             )
         } else {
-            (state.status.text.clone(), status_message_style(&state.status))
+            (
+                state.status.text.clone(),
+                status_message_style(&state.status),
+            )
         };
         Line::from(vec![Span::raw(" "), Span::styled(text, style)])
     } else if matches!(state.ed().mode, EditorMode::Search) {
@@ -4836,8 +4860,7 @@ fn draw_toast_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     if state.toasts.is_empty() || area.height <= MARGIN_Y {
         return;
     }
-    let max_text =
-        (area.width as usize).saturating_sub((BAR_W + PAD * 2 + MARGIN_X * 2) as usize);
+    let max_text = (area.width as usize).saturating_sub((BAR_W + PAD * 2 + MARGIN_X * 2) as usize);
     if max_text == 0 {
         return;
     }
@@ -4934,7 +4957,12 @@ fn draw_save_prompt_spans(
                 invalid_style,
             );
         } else {
-            push(&mut spans, &mut w, prompt.root_display(&labels), prefix_style);
+            push(
+                &mut spans,
+                &mut w,
+                prompt.root_display(&labels),
+                prefix_style,
+            );
         }
         // The separator appears once the path is in play (focused, or already holding text).
         if prompt.field == ChipEditorField::Path || !prompt.input.text.is_empty() {
@@ -6049,7 +6077,9 @@ mod tests {
         let l1: String = lines[1].iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(l0, "hello world");
         assert_eq!(l1, "foo");
-        assert!(lines[0].iter().all(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(lines[0]
+            .iter()
+            .all(|s| s.style.add_modifier.contains(Modifier::BOLD)));
     }
 
     #[test]
@@ -6110,7 +6140,10 @@ mod tests {
             severity,
         };
         // Plain (severity-less) diagnostic block → frost blue.
-        assert_eq!(hover_border_color(&HoverBody::Blocks(vec![blk(None)])), NORD8);
+        assert_eq!(
+            hover_border_color(&HoverBody::Blocks(vec![blk(None)])),
+            NORD8
+        );
         // Markdown hover → frost blue.
         assert_eq!(hover_border_color(&HoverBody::Markdown(vec![])), NORD8);
         // Worst severity wins.
@@ -6413,23 +6446,28 @@ mod tests {
     #[test]
     fn symbol_row_name_leads_with_detail_then_right_aligned_kind() {
         use aether_protocol::picker::SymbolKind;
-        let spans =
-            symbol_item_spans(
-                SymbolRow {
-                    name: "buffer_id",
-                    kind: SymbolKind::Field,
-                    detail: "Option<BufferId>",
-                    depth: 0,
-                    context: false,
-                },
-                &[],
-                false,
-                40,
-            );
+        let spans = symbol_item_spans(
+            SymbolRow {
+                name: "buffer_id",
+                kind: SymbolKind::Field,
+                detail: "Option<BufferId>",
+                depth: 0,
+                context: false,
+            },
+            &[],
+            false,
+            40,
+        );
         let text = spans_text(&spans);
         assert!(text.starts_with("buffer_id"), "name leads: {text:?}");
-        assert!(text.contains("Option<BufferId>"), "detail beside name: {text:?}");
-        assert!(text.trim_end().ends_with("field"), "kind right-aligned: {text:?}");
+        assert!(
+            text.contains("Option<BufferId>"),
+            "detail beside name: {text:?}"
+        );
+        assert!(
+            text.trim_end().ends_with("field"),
+            "kind right-aligned: {text:?}"
+        );
         assert_eq!(spans_total_width(&spans), 40);
     }
 
@@ -6451,7 +6489,10 @@ mod tests {
             40,
         );
         let text = spans_text(&spans);
-        assert!(text.starts_with("BufferOpenParams"), "name renders: {text:?}");
+        assert!(
+            text.starts_with("BufferOpenParams"),
+            "name renders: {text:?}"
+        );
         assert!(text.trim_end().ends_with("struct"));
     }
 
@@ -6487,7 +6528,10 @@ mod tests {
             false,
             40,
         );
-        let name = normal.iter().find(|s| s.content.contains("Widget")).unwrap();
+        let name = normal
+            .iter()
+            .find(|s| s.content.contains("Widget"))
+            .unwrap();
         assert_eq!(name.style.fg, Some(NORD4));
     }
 

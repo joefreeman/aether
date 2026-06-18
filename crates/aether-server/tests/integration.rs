@@ -9,10 +9,9 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
-    CursorSelectLine, CursorSelectLineParams, CursorSet,
-    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
-    CursorUndoParams, CursorUndoResult, Direction, Granularity, Motion, SelectionEdge,
-    VerticalDirection, WordBoundary,
+    CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
+    CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
+    Direction, Granularity, Motion, SelectionEdge, VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
@@ -39,10 +38,9 @@ use aether_protocol::nav::{
 };
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate,
-    PickerGrepNavigateParams,
-    PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
-    PickerQueryParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
-    PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
+    PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem,
+    PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
+    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
 };
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectDelete,
@@ -3859,7 +3857,10 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     assert_eq!(state_push.buffer_id, open.buffer_id);
     assert_eq!(state_push.saved_revision, save.revision);
     // In-place save: the path is unchanged (the client treats a same-path push as a no-op).
-    assert!(state_push.path.as_deref().is_some_and(|p| p.ends_with("greet.txt")));
+    assert!(state_push
+        .path
+        .as_deref()
+        .is_some_and(|p| p.ends_with("greet.txt")));
 
     drop(server);
 }
@@ -3929,7 +3930,9 @@ async fn save_as_broadcasts_new_path_to_other_viewers() {
     let push: BufferStateParams = expect_notification::<BufferState>(&mut ws2).await;
     assert_eq!(push.buffer_id, a.buffer_id);
     assert!(
-        push.path.as_deref().is_some_and(|p| p.ends_with("renamed.txt")),
+        push.path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("renamed.txt")),
         "save-as broadcasts the new path, got {:?}",
         push.path
     );
@@ -8378,27 +8381,52 @@ async fn search_set_honours_match_options() {
     // Case: smartcase (lowercase query) matches all three; forced-sensitive matches only the two
     // lowercase runs; forced-insensitive matches all three again.
     let (server, mut ws, buffer_id) = setup_with_buffer("foo Foo foo\n").await;
-    assert_eq!(total(&mut ws, 10, buffer_id, "foo", MatchOptions::default()).await, 3);
-    let sensitive = MatchOptions { case: CaseMode::Sensitive, ..Default::default() };
+    assert_eq!(
+        total(&mut ws, 10, buffer_id, "foo", MatchOptions::default()).await,
+        3
+    );
+    let sensitive = MatchOptions {
+        case: CaseMode::Sensitive,
+        ..Default::default()
+    };
     assert_eq!(total(&mut ws, 11, buffer_id, "foo", sensitive).await, 2);
-    let insensitive = MatchOptions { case: CaseMode::Insensitive, ..Default::default() };
+    let insensitive = MatchOptions {
+        case: CaseMode::Insensitive,
+        ..Default::default()
+    };
     assert_eq!(total(&mut ws, 12, buffer_id, "Foo", insensitive).await, 3);
     drop(server);
 
     // Whole-word: "foo" inside "foobar" is excluded once word boundaries are required.
     let (server, mut ws, buffer_id) = setup_with_buffer("foo foobar foo\n").await;
-    assert_eq!(total(&mut ws, 20, buffer_id, "foo", MatchOptions::default()).await, 3);
-    let word = MatchOptions { whole_word: true, ..Default::default() };
+    assert_eq!(
+        total(&mut ws, 20, buffer_id, "foo", MatchOptions::default()).await,
+        3
+    );
+    let word = MatchOptions {
+        whole_word: true,
+        ..Default::default()
+    };
     assert_eq!(total(&mut ws, 21, buffer_id, "foo", word).await, 2);
     drop(server);
 
     // Literal: "a.c" as a regex matches "abc"/"axc" too; as a fixed string it matches only "a.c".
     let (server, mut ws, buffer_id) = setup_with_buffer("a.c abc axc\n").await;
-    assert_eq!(total(&mut ws, 30, buffer_id, "a.c", MatchOptions::default()).await, 3);
-    let literal = MatchOptions { fixed_string: true, ..Default::default() };
+    assert_eq!(
+        total(&mut ws, 30, buffer_id, "a.c", MatchOptions::default()).await,
+        3
+    );
+    let literal = MatchOptions {
+        fixed_string: true,
+        ..Default::default()
+    };
     assert_eq!(total(&mut ws, 31, buffer_id, "a.c", literal).await, 1);
     // Literal + whole-word together don't double-escape: "a.c" still matches as a whole word.
-    let literal_word = MatchOptions { fixed_string: true, whole_word: true, ..Default::default() };
+    let literal_word = MatchOptions {
+        fixed_string: true,
+        whole_word: true,
+        ..Default::default()
+    };
     assert_eq!(total(&mut ws, 32, buffer_id, "a.c", literal_word).await, 1);
     drop(server);
 }
@@ -12977,7 +13005,9 @@ async fn setup_peek_workspace() -> (
 
 /// Collect the `DirEntry` leaf names from the next `picker/update` push.
 async fn peek_query_names(
-    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
     id: u64,
     query: &str,
     generation: u64,

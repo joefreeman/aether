@@ -733,12 +733,14 @@ pub(crate) fn field_with_ghost<'a>(
     use iced::keyboard::key::Named;
     let field = match boundary {
         Boundary::None => crate::alt_filter::alt_passthrough(field_inner),
-        Boundary::ConfirmRoot => {
-            crate::alt_filter::alt_passthrough_intercept(field_inner, input.text.clone(), |key, _| {
+        Boundary::ConfirmRoot => crate::alt_filter::alt_passthrough_intercept(
+            field_inner,
+            input.text.clone(),
+            |key, _| {
                 matches!(key.as_ref(), iced::keyboard::Key::Character(":"))
                     .then_some(PickerMsg::CoreKey(KeyCode::Char(':')))
-            })
-        }
+            },
+        ),
         Boundary::PathToRoot => crate::alt_filter::alt_passthrough_intercept(
             field_inner,
             input.text.clone(),
@@ -808,8 +810,7 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String]) -> Element<'a, P
         // The separator appears once the path is in play (focused, or already holding text) —
         // a fresh root prompt doesn't dangle a `:` off an unentered field.
         if ed.field == ChipEditorField::Path || !ed.input.text.is_empty() {
-            root_group =
-                root_group.push(text(":").size(13).font(SANS).color(theme::NORD3_BRIGHT));
+            root_group = root_group.push(text(":").size(13).font(SANS).color(theme::NORD3_BRIGHT));
         }
         line = line.push(root_group);
     }
@@ -1019,7 +1020,10 @@ fn render_item<'a>(
             message,
             match_indices,
         } => row![
-            glyph_cell(theme::diag_glyph(*severity), theme::diagnostic_color(*severity)),
+            glyph_cell(
+                theme::diag_glyph(*severity),
+                theme::diagnostic_color(*severity)
+            ),
             highlighted(
                 message.split('\n').next().unwrap_or(message),
                 match_indices,
@@ -1191,7 +1195,13 @@ fn render_item<'a>(
             if *context {
                 r = r.push(meta(name.clone())); // dim, non-matching ancestor
             } else {
-                r = r.push(highlighted(name, match_indices, theme::NORD6, SANS, hovered));
+                r = r.push(highlighted(
+                    name,
+                    match_indices,
+                    theme::NORD6,
+                    SANS,
+                    hovered,
+                ));
             }
             if !detail.is_empty() {
                 r = r.push(meta(truncate_chars(detail, PREVIEW_MAX_CHARS)));

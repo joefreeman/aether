@@ -377,7 +377,10 @@ mod tests {
 
     #[test]
     fn single_project_match() {
-        let projects = [proj("work", &["/home/joe/work"]), proj("dots", &["/home/joe/.config"])];
+        let projects = [
+            proj("work", &["/home/joe/work"]),
+            proj("dots", &["/home/joe/.config"]),
+        ];
         assert_eq!(
             match_project(Path::new("/home/joe/work/src/main.rs"), &projects),
             ProjectMatch::One("work".to_string())
@@ -443,7 +446,11 @@ mod tests {
         // We can't reliably unset it here (other tests/threads share the env), so just assert the
         // path resolves and lands under our `aether/server.json` regardless of which base was used.
         let path = runtime_info_path().expect("runtime_info_path should never fail on a fallback");
-        assert!(path.ends_with("aether/server.json"), "unexpected path: {}", path.display());
+        assert!(
+            path.ends_with("aether/server.json"),
+            "unexpected path: {}",
+            path.display()
+        );
     }
 
     #[test]
@@ -462,7 +469,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Nested path exercises the create-parent branch.
         let path = dir.path().join("aether").join("settings.toml");
-        write_app_settings_at(&path, &AppSettings { wrap: WrapMode::None }).unwrap();
+        write_app_settings_at(
+            &path,
+            &AppSettings {
+                wrap: WrapMode::None,
+            },
+        )
+        .unwrap();
         let s = load_app_settings_at(&path).unwrap();
         assert_eq!(s.wrap, WrapMode::None);
     }

@@ -15,8 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// The notification stream's shared receiver — the shell's pump locks it per recv.
-pub type NotifRx =
-    std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Notification>>>;
+pub type NotifRx = std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Notification>>>;
 
 pub use crate::core::transport::RpcError;
 
@@ -95,7 +94,6 @@ impl Handle {
         }
     }
 }
-
 
 /// Connect to the server and spawn the actor on the *current* tokio runtime. Returns the RPC
 /// handle and the notification stream; the receiver yields `None` when the connection dies.

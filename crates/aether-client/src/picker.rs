@@ -336,8 +336,13 @@ impl PickerState {
                 return None;
             }
         }
-        (lcp_len > filter_len)
-            .then(|| first.chars().skip(filter_len).take(lcp_len - filter_len).collect())
+        (lcp_len > filter_len).then(|| {
+            first
+                .chars()
+                .skip(filter_len)
+                .take(lcp_len - filter_len)
+                .collect()
+        })
     }
 
     fn explorer_pending_create(&self) -> Option<PendingCreate> {

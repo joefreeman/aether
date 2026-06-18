@@ -349,6 +349,9 @@ mod tests {
         assert_eq!(ed.field, ChipEditorField::Path);
         assert!(refetch);
         assert_eq!(ed.chosen_root(&labels), 1);
-        assert!(ed.dir_listing_path(&roots).unwrap().starts_with("/personal/web"));
+        assert!(ed
+            .dir_listing_path(&roots)
+            .unwrap()
+            .starts_with("/personal/web"));
     }
 }

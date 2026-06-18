@@ -133,7 +133,10 @@ mod tests {
     #[test]
     fn fallback_strips_dotted_suffixes() {
         // "function.method.call" isn't listed; it should fall back to "function".
-        assert_eq!(highlight_color("function.method.call"), highlight_color("function"));
+        assert_eq!(
+            highlight_color("function.method.call"),
+            highlight_color("function")
+        );
         assert!(highlight_color("function").is_some());
         // Unknown kinds resolve to the default foreground.
         assert_eq!(highlight_color("nonsense"), None);

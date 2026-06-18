@@ -2,9 +2,9 @@
 //! at a time. The client picks one with `project/activate` (also used to switch). `project/list`
 //! enumerates the projects the server has configured on disk.
 
+use crate::buffer::BufferOpenResult;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::BufferId;
-use crate::buffer::BufferOpenResult;
 use serde::{Deserialize, Serialize};
 
 /// Enumerate configured projects (the `*.toml` files under `$XDG_CONFIG_HOME/aether/projects/`).

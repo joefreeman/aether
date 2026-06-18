@@ -247,5 +247,4 @@ mod tests {
         assert_eq!(t.text, "xyzzy");
         assert_eq!(t.cursor, 5);
     }
-
 }

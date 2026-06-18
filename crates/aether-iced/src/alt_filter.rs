@@ -150,10 +150,7 @@ where
         // Swallow `Alt`-modified key presses (the app's command/nav chords): don't delegate to the
         // inner widget, and don't capture — leaving the event `Ignored` so it bubbles to the key
         // subscription. Everything else passes through untouched.
-        if let Event::Keyboard(iced::keyboard::Event::KeyPressed {
-            key, modifiers, ..
-        }) = event
-        {
+        if let Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
             if modifiers.alt() {
                 return;
             }

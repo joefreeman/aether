@@ -894,7 +894,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-            };
+        };
         assert_eq!(terminal_title(&state), "Aether");
     }
 
@@ -923,7 +923,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-            };
+        };
         assert_eq!(terminal_title(&state), "[demo] - Aether");
         // Once a buffer exists, the title grows to include the file label.
         state.editor = Some(stub_editor_state("(scratch 0)"));
@@ -955,7 +955,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-            };
+        };
         // Clean buffer → no dot.
         assert_eq!(terminal_title(&state), "[demo] src/main.rs - Aether");
         // Local edits → leading dot.

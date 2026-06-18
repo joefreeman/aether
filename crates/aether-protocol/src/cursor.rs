@@ -264,7 +264,10 @@ pub struct CursorSelectLineParams {
     pub direction: Direction,
     pub extend: bool,
     /// Select this many lines (`0` = `1`) — the repeat loop lives server-side.
-    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    #[serde(
+        default = "crate::count_one",
+        skip_serializing_if = "crate::count_is_one"
+    )]
     pub count: u32,
 }
 
@@ -292,7 +295,10 @@ pub struct CursorUndoParams {
     pub buffer_id: BufferId,
     /// Step the motion history this many times (`0` = `1`), stopping early once it's
     /// exhausted — the repeat loop lives server-side.
-    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    #[serde(
+        default = "crate::count_one",
+        skip_serializing_if = "crate::count_is_one"
+    )]
     pub count: u32,
 }
 
@@ -329,7 +335,10 @@ pub struct CursorBufferOnlyParams {
     pub buffer_id: BufferId,
     /// Repeat the expand/contract this many times (`0` = `1`), stopping early once the
     /// cursor stops changing — the repeat loop lives server-side.
-    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    #[serde(
+        default = "crate::count_one",
+        skip_serializing_if = "crate::count_is_one"
+    )]
     pub count: u32,
 }
 

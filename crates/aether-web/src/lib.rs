@@ -130,7 +130,9 @@ impl WasmSession {
             "line" => Granularity::Line,
             _ => Granularity::Char,
         };
-        let fx = self.inner.pointer_press(LogicalPosition { line, col }, g, extend);
+        let fx = self
+            .inner
+            .pointer_press(LogicalPosition { line, col }, g, extend);
         to_js(&effects_to_json(fx))
     }
 
@@ -188,7 +190,9 @@ impl WasmSession {
 
     /// A picker row was clicked (absolute index): highlight it and accept. Returns `Effect[]`.
     pub fn picker_click(&mut self, index: u32) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.on_event(Event::PickerClicked(index))))
+        to_js(&effects_to_json(
+            self.inner.on_event(Event::PickerClicked(index)),
+        ))
     }
 
     /// Dismiss the whole picker (chip editor included) — the shell's click-outside-the-panel gesture.
@@ -288,7 +292,9 @@ impl WasmSession {
 
     /// Replace the multi-root dir editor's root-filter text (native `<input>`). Returns `Effect[]`.
     pub fn chip_editor_set_root_filter(&mut self, text: String) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.chip_editor_set_root_filter(text)))
+        to_js(&effects_to_json(
+            self.inner.chip_editor_set_root_filter(text),
+        ))
     }
 
     /// Click an unfocused dir-editor segment to focus it (`root: true` for the root). Returns `Effect[]`.
@@ -324,10 +330,16 @@ impl WasmSession {
     /// Deliver the system clipboard text the shell read in response to an `Effect::ReadClipboard`.
     /// `paste` is that effect's paste descriptor (round-tripped back so the core knows the gesture);
     /// `text` is the clipboard contents, or `null` if the read failed/was denied. Returns `Effect[]`.
-    pub fn clipboard_read(&mut self, paste: JsValue, text: Option<String>) -> Result<JsValue, JsValue> {
+    pub fn clipboard_read(
+        &mut self,
+        paste: JsValue,
+        text: Option<String>,
+    ) -> Result<JsValue, JsValue> {
         let paste: Value = from_js(paste)?;
         let kind = parse_paste(&paste)?;
-        to_js(&effects_to_json(self.inner.on_event(Event::ClipboardRead(kind, text))))
+        to_js(&effects_to_json(
+            self.inner.on_event(Event::ClipboardRead(kind, text)),
+        ))
     }
 
     /// Deliver the cursor-line blame the shell fetched and formatted. Like the TUI/iced shells'
@@ -335,7 +347,12 @@ impl WasmSession {
     /// deliberately lacks a clock (docs/protocol-composites.md, G); `text` is `null`/absent when the
     /// line has no blame. `buffer_id` is a JS number (`BufferId` ids stay well within f64). The core
     /// keeps it only if it still matches the current buffer + cursor line. Returns `Effect[]`.
-    pub fn set_blame(&mut self, buffer_id: f64, line: u32, text: Option<String>) -> Result<JsValue, JsValue> {
+    pub fn set_blame(
+        &mut self,
+        buffer_id: f64,
+        line: u32,
+        text: Option<String>,
+    ) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.on_event(Event::BlameLine {
             buffer_id: buffer_id as u64,
             line,
@@ -606,7 +623,8 @@ fn to_js<T: serde::Serialize>(v: &T) -> Result<JsValue, JsValue> {
     let ser = serde_wasm_bindgen::Serializer::new()
         .serialize_maps_as_objects(true)
         .serialize_missing_as_null(true);
-    v.serialize(&ser).map_err(|e| JsValue::from_str(&e.to_string()))
+    v.serialize(&ser)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 fn from_js<T: serde::de::DeserializeOwned>(v: JsValue) -> Result<T, JsValue> {
