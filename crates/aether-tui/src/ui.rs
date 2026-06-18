@@ -5776,12 +5776,6 @@ mod tests {
             "Character left / right",
             "j / k",
             "Logical line down / up",
-            "[ / ]",
-            "Previous / Next navigation unit",
-            "{ / }",
-            "Select to start / end of unit",
-            "< / >",
-            "Previous / Next grep hit",
             "↑ / ↓",
             "Scroll up / down one line",
             "← / →",
@@ -5827,25 +5821,27 @@ mod tests {
             ls.iter().any(|l| l.contains(key) && l.contains(desc))
         };
 
-        // Normal: selection-scoped wording; Insert: line-scoped wording.
-        assert!(row(&normal, "Ctrl-c", "Change selection"));
+        // Normal: selection-scoped wording; Insert: line-scoped wording, on the matching keys.
+        assert!(row(&normal, "Ctrl-a", "Change selection"));
+        assert!(row(&insert, "Ctrl-a", "Change line"));
         assert!(row(&insert, "Ctrl-d", "Delete line"));
-        assert!(row(&insert, "Ctrl-c", "Change line"));
-        assert!(row(&insert, "Ctrl-y", "Copy line"));
+        assert!(row(&insert, "Ctrl-c", "Copy line"));
+        // Mode-agnostic Ctrl keys (from GLOBAL) appear on the Insert tab too.
+        assert!(row(&insert, "Ctrl-y", "Toggle comment"));
 
         // Normal collapses the two keys for "delete selection" (the Delete key and Ctrl-d) into one
         // aliased row, comma-separated; Insert keeps them apart (different commands there).
         assert!(row(&normal, "Delete, Ctrl-d", "Delete selection"));
         assert!(!insert.iter().any(|l| l.contains("Delete, Ctrl-d")));
 
-        // The fold bug: `Ctrl-c` must not be glued onto the bare-`c` Collapse row.
+        // The fold bug: a Ctrl- chord must not be glued onto the bare-key Collapse row (now `,`).
         let collapse = normal
             .iter()
             .find(|l| l.contains("Collapse selection"))
             .expect("Collapse row present");
         assert!(
-            !collapse.contains("Ctrl-c"),
-            "Ctrl-c must not fold onto the bare `c` row: {collapse:?}"
+            !collapse.contains("Ctrl-"),
+            "no Ctrl- chord should fold onto the Collapse row: {collapse:?}"
         );
     }
 

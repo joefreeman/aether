@@ -920,7 +920,7 @@ fn count_prefix_rides_the_request() {
 #[test]
 fn undo_result_updates_revision_and_cursor() {
     let mut s = session();
-    let fx = ctrl(&mut s, 'z');
+    let fx = ctrl(&mut s, 'u');
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "input/undo");
     assert!(params.get("count").is_none(), "count 1 stays off the wire");
@@ -940,7 +940,7 @@ fn undo_result_updates_revision_and_cursor() {
 #[test]
 fn rpc_error_surfaces_as_an_error_toast() {
     let mut s = session();
-    let fx = ctrl(&mut s, 'z');
+    let fx = ctrl(&mut s, 'u');
     let (token, _, _) = the_request(&fx);
     let fx = s.on_rpc_result(
         token,
@@ -963,7 +963,7 @@ fn unknown_token_is_ignored() {
 #[test]
 fn connection_loss_drops_in_flight_results() {
     let mut s = session();
-    let fx = ctrl(&mut s, 'z');
+    let fx = ctrl(&mut s, 'u');
     let (token, _, _) = the_request(&fx);
 
     let fx = s.on_event(aether_client::update::Event::ConnectionLost);
@@ -1018,7 +1018,7 @@ fn requests_are_emitted_in_dispatch_order() {
     let fx = key(&mut s, 'i'); // one request
     let (t1, _, _) = the_request(&fx);
     s.mode = aether_client::session::Mode::Normal; // back out without a round-trip
-    let fx = ctrl(&mut s, 'z');
+    let fx = ctrl(&mut s, 'u');
     let (t2, _, _) = the_request(&fx);
     assert!(t2 > t1, "tokens are allocated in emission order");
 }

@@ -25,7 +25,8 @@ buffer, see each other's cursors, and share a single undo stack.
 ## Keybindings
 
 Type `Space ?` for the in-app overlay. Holding the Shift key extends the selection (e.g., `Shift-w`); a leading
-**count** repeats a motion (e.g., `3w`).
+**count** repeats a motion (e.g., `3w`). There are two leader keys: `Space` for app/file/git/code commands, and
+`Tab` for revealing information at the cursor.
 
 ### Motions (normal mode)
 
@@ -41,26 +42,25 @@ Type `Space ?` for the in-app overlay. Holding the Shift key extends the selecti
 | `Alt-l`, `End` | Logical line end |
 | `Alt-h` | First non-blank of line |
 | `g`/`Alt-g` | Go to line (count, default 1)/last line |
-| `d`/`Alt-d` | Cursor down a page/half page |
-| `u`/`Alt-u` | Cursor up a page/half page |
+| `v`/`Alt-v` | Cursor down/up half a page |
 | `f`/`Alt-f` | Find character forward/backward (next key is the target) |
 | `t`/`Alt-t` | Till character forward/backward |
 | `m`/`Alt-m` | Matching bracket/inner matching bracket |
-| `]`/`[` | Next/previous navigation unit |
-| `}`/`{` | Select to end/start of unit |
-| `Alt-Left`/`Alt-Right` | Jump back/forward (cross-file history) |
+| `p`/`Alt-p` | Next/previous navigation unit |
+| `Shift-p`/`Shift-Alt-p` | Select to end/start of unit |
+| `Backspace`/`Alt-Backspace` | Jump back/forward (cross-file history) |
 
 ### Selection & history (normal mode)
 
 | Key | Action |
 | --- | --- |
-| `c` | Collapse selection |
+| `,` | Collapse selection |
 | `o` | Swap cursor and anchor |
 | `y`/`Alt-y` | Expand/contract selection to syntax node |
 | `x`/`Alt-x` | Select line downward/upward |
-| `z`/`Alt-z` | Undo/redo cursor motion |
-| `r` | Repeat last motion |
-| `-` | Center cursor in window |
+| `u`/`Alt-u` | Undo/redo cursor motion |
+| `.` | Repeat last motion |
+| `;` | Center cursor in window |
 
 ### Search & grep (normal mode)
 
@@ -70,29 +70,31 @@ Type `Space ?` for the in-app overlay. Holding the Shift key extends the selecti
 | `?` | Search, selecting from the cursor to the match |
 | `Alt-/` | Search for current selection |
 | `n`/`Alt-n` | Next/previous match |
-| `>`/`<` | Next/previous grep result |
+| `Space n`/`Space Alt-n` | Next/previous grep result |
 | `Esc` | Clear the active search |
 
 ### Editing (Ctrl — shared by normal and insert)
 
-Most Ctrl edits operate in both modes. The clipboard/edit keys are selection-scoped in
-normal and line-scoped in insert (since insert has no selection).
+Every Ctrl edit works in both modes. The clipboard/edit keys are selection-scoped in
+normal and line-scoped in insert (since insert has no selection), on the same key; the rest are
+identical in both.
 
 | Key | Normal | Insert |
 | --- | --- | --- |
-| `Ctrl-c` | Change selection | Change line |
+| `Ctrl-a` | Change selection | Change line |
 | `Ctrl-d` | Delete selection | Delete line |
-| `Ctrl-y` | Copy selection | Copy line |
+| `Ctrl-c` | Copy selection | Copy line |
 | `Ctrl-x` | Cut selection | Cut line |
 | `Ctrl-v` | Paste before selection | Paste at cursor |
-| `Ctrl-r` | Replace selection with clipboard | Replace line with clipboard |
+| `Ctrl-Alt-v` | Replace selection with clipboard | Replace line with clipboard |
 | `Ctrl-s` | Surround selection (next key = delimiter) | Surround line |
 | `Ctrl-Alt-s` | Unsurround selection | Unsurround line |
-| `Ctrl-z`/`Ctrl-Alt-z` | Undo/redo | Undo/redo |
+| `Ctrl-u`/`Ctrl-Alt-u` | Undo/redo | Undo/redo |
 | `Ctrl-l`/`Ctrl-h` | Indent/dedent | Indent/dedent |
 | `Ctrl-j`/`Ctrl-k` | Move line(s) down/up | Move line(s) down/up |
 | `Ctrl-g` | Join lines | Join lines |
-| `Ctrl-t` | Toggle comment | Toggle comment |
+| `Ctrl-y` | Toggle comment | Toggle comment |
+| `Ctrl-f` | Format document | Format document |
 | `Ctrl-o`/`Ctrl-Alt-o` | Open line below/above | Open line below/above |
 
 ### Mode transitions
@@ -103,50 +105,51 @@ normal and line-scoped in insert (since insert has no selection).
 | `Alt-i`/`Alt-a` | Insert at first non-blank of line/last line end |
 | `Esc` | Leave insert mode |
 
+### Reveal (`Tab` leader)
+
+| Chord | Action |
+| --- | --- |
+| `Tab h` | Hover (type & docs) |
+| `Tab d` | Diagnostic at cursor |
+| `Tab c` | Blame commit details for the cursor line |
+
 ### Application
 
 | Chord | Action |
 | --- | --- |
-| `Space f` | Find files |
+| `Space f`/`Space Alt-f` | Find files / in buffer's directory |
 | `Space b` | Switch buffer |
-| `Space g` | Grep workspace |
-| `Space e` | File explorer |
+| `Space Alt-b` | New scratch buffer |
+| `Space g`/`Space Alt-g` | Grep workspace / buffer's directory |
+| `Space e`/`Space Alt-e` | File explorer / at project root |
 | `Space p` | Switch project |
 | `Space ,` | Project settings |
+| `Space .` | Application settings (soft wrap, …) |
 | `Space s`/`Space Alt-s` | Save/save as |
-| `Space r` | Reload from disk |
-| `Space n` | New scratch buffer |
-| `Space c` | Close buffer |
+| `Space a` | Reload from disk |
+| `Space w` | Close buffer |
 | `Space q` | Quit |
 | `Space ?` | Show keyboard shortcuts |
-
-### View
-
-| Chord | Action |
-| --- | --- |
-| `Space w` | Toggle soft wrap |
 
 ### Git
 
 | Chord | Action |
 | --- | --- |
-| `Space a` | Stage/unstage the change under the cursor (or selected lines) |
-| `Space v` | Revert the change under the cursor (or selected lines) |
-| `Space h`/`Space Alt-h` | Next/previous hunk |
+| `c`/`Alt-c` | Next/previous change (hunk) |
+| `Space y`/`Space Alt-y` | Stage-unstage / revert the change under the cursor (or selected lines) |
 | `Space i` | Toggle inline diff |
-| `Space o` | Blame commit details for the cursor line |
 
 ### Code / LSP
 
 | Chord | Action |
 | --- | --- |
-| `Space d`/`Space Alt-d` | Go to definition/references |
-| `Space k` | Hover (type & docs) |
-| `Space j` | Show diagnostic at cursor |
-| `Space x`/`Space Alt-x` | Next/previous diagnostic |
-| `Space t` | Diagnostics list |
-| `Space m` | Format document |
+| `Enter` | Go to definition |
+| `Space r` | Go to references |
+| `d`/`Alt-d` | Next/previous diagnostic |
+| `Space d` | Diagnostics list |
+| `Space o` | Document symbols |
 | `Space l` | LSP servers (status, restart) |
+| `Ctrl-f` | Format document |
 
 ## Building
 
