@@ -338,6 +338,8 @@ pub enum ReloadTry {
 pub enum Pending {
     None,
     Leader,
+    /// `Tab` armed: the next keystroke is looked up in the `Reveal` key context.
+    Reveal,
     Find {
         dir: Direction,
         till: bool,

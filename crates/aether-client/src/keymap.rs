@@ -78,6 +78,9 @@ pub enum KeyContext {
     Insert,
     Search,
     Leader,
+    /// The `Tab`-leader chords for *revealing* information at the cursor (hover, diagnostic, blame
+    /// commit) — a second leader, distinct from the `Space` [`Leader`](KeyContext::Leader) chords.
+    Reveal,
     Global,
 }
 
@@ -194,6 +197,8 @@ pub enum Action {
     EnterInsert(InsertWhere),
     LeaveInsert,
     BeginLeader,
+    /// `Tab` — arm the reveal-leader chord (next key looked up in [`KeyContext::Reveal`]).
+    BeginReveal,
 
     // ---- edits ----
     Backspace,
@@ -361,8 +366,10 @@ impl Binding {
     /// keystroke is expected.
     pub fn key_label(&self) -> String {
         let mut s = String::new();
-        if self.ctx == KeyContext::Leader {
-            s.push_str("Space ");
+        match self.ctx {
+            KeyContext::Leader => s.push_str("Space "),
+            KeyContext::Reveal => s.push_str("Tab "),
+            _ => {}
         }
         let m = self.mods.display_mods();
         if m.ctrl {
@@ -408,6 +415,7 @@ pub fn all() -> impl Iterator<Item = &'static Binding> {
         KeyContext::Insert,
         KeyContext::Search,
         KeyContext::Leader,
+        KeyContext::Reveal,
     ]
     .into_iter()
     .flat_map(|cx| table(cx).iter())
@@ -421,6 +429,7 @@ pub fn table(ctx: KeyContext) -> &'static [Binding] {
         KeyContext::Insert => INSERT,
         KeyContext::Search => SEARCH,
         KeyContext::Leader => LEADER,
+        KeyContext::Reveal => REVEAL,
         KeyContext::Global => GLOBAL,
     }
 }
@@ -451,13 +460,15 @@ pub fn help_entries() -> Vec<HelpEntry> {
         ("Normal", &[KeyContext::Normal, KeyContext::Global]),
         ("Insert", &[KeyContext::Insert, KeyContext::Global]),
         ("Search", &[KeyContext::Search]),
-        ("Application", &[KeyContext::Leader]),
+        ("Application", &[KeyContext::Leader, KeyContext::Reveal]),
     ];
     let mut entries = Vec::new();
     for (tab, contexts) in TABS {
         for &cx in contexts {
             for b in table(cx) {
-                if !b.group.is_empty() && !matches!(b.action, Action::BeginLeader) {
+                if !b.group.is_empty()
+                    && !matches!(b.action, Action::BeginLeader | Action::BeginReveal)
+                {
                     entries.push(HelpEntry {
                         tab,
                         group: b.group,
@@ -625,8 +636,9 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Selection), "Edit", "Unsurround selection"),
     bind!(N, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Selection), "Edit", "Surround selection"),
 
-    // ---- leader ----
+    // ---- leaders ----
     bind!(N, ch(' '), Exact(Mods::NONE), A::BeginLeader, "Leader", "Space leader chord"),
+    bind!(N, KeyCode::Tab, Exact(Mods::NONE), A::BeginReveal, "Reveal", "Tab reveal chord"),
 ];
 
 #[rustfmt::skip]
@@ -721,13 +733,20 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('h'), Exact(Mods::NONE), A::NextHunk, "Git", "Next change (hunk)"),
     bind!(L, ch('h'), Exact(Mods::ALT), A::PrevHunk, "Git", "Previous change (hunk)"),
     bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
-    bind!(L, ch('y'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::Format, "Code", "Format document"),
-    bind!(L, ch('k'), Exact(Mods::NONE), A::Hover, "Code", "Hover (type & docs)"),
     bind!(L, ch('d'), Exact(Mods::NONE), A::GotoDefinition, "Code", "Go to definition"),
-    bind!(L, ch('j'), Exact(Mods::NONE), A::ShowDiagnostic, "Code", "Show diagnostic at cursor"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::NextDiagnostic, "Code", "Next diagnostic"),
     bind!(L, ch('x'), Exact(Mods::ALT), A::PrevDiagnostic, "Code", "Previous diagnostic"),
+];
+
+/// The `Tab`-leader chords: reveal information at the cursor. A second leader keeps these
+/// transient, look-here gestures (hover card, diagnostic, blame commit) off the crowded `Space`
+/// map and together under one mnemonic.
+#[rustfmt::skip]
+static REVEAL: &[Binding] = &[
+    bind!(KeyContext::Reveal, ch('h'), Exact(Mods::NONE), A::Hover, "Reveal", "Hover (type & docs)"),
+    bind!(KeyContext::Reveal, ch('d'), Exact(Mods::NONE), A::ShowDiagnostic, "Reveal", "Diagnostic at cursor"),
+    bind!(KeyContext::Reveal, ch('c'), Exact(Mods::NONE), A::ShowCommitInfo, "Reveal", "Blame commit details"),
 ];
 
 #[cfg(test)]
@@ -744,11 +763,16 @@ mod tests {
         // "Space", action BeginLeader) is filtered out.
         assert!(entries.iter().all(|e| !e.group.is_empty()));
         assert!(entries.iter().all(|e| e.keys != "Space"));
-        // The Application tab is the leader chords — every chord is `Space …`.
+        // The Application tab carries both leaders: every chord is either a `Space …` (the Space
+        // leader) or a `Tab …` (the reveal leader).
         assert!(entries
             .iter()
             .filter(|e| e.tab == "Application")
-            .all(|e| e.keys.starts_with("Space ")));
+            .all(|e| e.keys.starts_with("Space ") || e.keys.starts_with("Tab ")));
+        // The reveal chords show up there with their `Tab …` labels.
+        assert!(entries
+            .iter()
+            .any(|e| e.keys == "Tab h" && e.desc == "Hover (type & docs)"));
         // Global (shared Ctrl-editing) keys fold into both Normal and Insert: at least one
         // description shows up under both tabs.
         let in_tab = |t: &str| {
@@ -794,6 +818,36 @@ mod tests {
         // Horizontal scrolls and unrelated keys aren't popover actions (→ dismiss).
         assert_eq!(hover_action(KeyCode::Left, Mods::NONE), None);
         assert_eq!(hover_action(ch('a'), Mods::NONE), None);
+    }
+
+    #[test]
+    fn tab_reveal_leader_replaces_the_space_bindings() {
+        // Tab arms the reveal leader from Normal.
+        assert!(matches!(
+            lookup(KeyContext::Normal, KeyCode::Tab, Mods::NONE).map(|b| b.action),
+            Some(Action::BeginReveal)
+        ));
+        // The reveal context maps h/d/c to the cursor-reveal actions.
+        assert!(matches!(
+            lookup(KeyContext::Reveal, ch('h'), Mods::NONE).map(|b| b.action),
+            Some(Action::Hover)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Reveal, ch('d'), Mods::NONE).map(|b| b.action),
+            Some(Action::ShowDiagnostic)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Reveal, ch('c'), Mods::NONE).map(|b| b.action),
+            Some(Action::ShowCommitInfo)
+        ));
+        // The old Space bindings for these three are gone (and `Space d` is still GotoDefinition).
+        assert!(lookup(KeyContext::Leader, ch('k'), Mods::NONE).is_none());
+        assert!(lookup(KeyContext::Leader, ch('j'), Mods::NONE).is_none());
+        assert!(lookup(KeyContext::Leader, ch('y'), Mods::NONE).is_none());
+        assert!(matches!(
+            lookup(KeyContext::Leader, ch('d'), Mods::NONE).map(|b| b.action),
+            Some(Action::GotoDefinition)
+        ));
     }
 
     #[test]

@@ -892,7 +892,10 @@ fn tab_bar_line(active: HelpTab) -> Line<'static> {
 ///
 /// [`BeginLeader`]: keymap::Action::BeginLeader
 fn help_hidden(b: &keymap::Binding) -> bool {
-    matches!(b.action, keymap::Action::BeginLeader)
+    matches!(
+        b.action,
+        keymap::Action::BeginLeader | keymap::Action::BeginReveal
+    )
 }
 
 /// The keymap contexts shown on `tab`, in render order. The Normal and Insert tabs append the
@@ -903,7 +906,7 @@ fn tab_contexts(tab: HelpTab) -> &'static [keymap::KeyContext] {
         HelpTab::Normal => &[C::Normal, C::Global],
         HelpTab::Insert => &[C::Insert, C::Global],
         HelpTab::Search => &[C::Search],
-        HelpTab::Application => &[C::Leader],
+        HelpTab::Application => &[C::Leader, C::Reveal],
     }
 }
 

@@ -1559,6 +1559,18 @@ fn toggle_wrap_flips_between_soft_and_none() {
     assert_eq!(s.wrap, WrapMode::Soft);
 }
 
+#[test]
+fn tab_reveal_chord_triggers_hover() {
+    let mut s = session();
+    // Tab arms the reveal leader (no effects yet)...
+    let armed = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    assert!(armed.0.is_empty(), "arming the reveal leader emits nothing");
+    // ...then `h` dispatches Hover, firing the LSP hover RPC.
+    let fx = s.on_key(KeyCode::Char('h'), Mods::NONE, Some("h".to_string()), ROWS);
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "lsp/hover");
+}
+
 // ---- application settings (Space .) -----------------------------------------------------------
 
 #[test]

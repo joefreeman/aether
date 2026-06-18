@@ -27,12 +27,13 @@ pub enum EditorMode {
     Search,
 }
 
-/// Multi-key prefixes the next keystroke completes. `Space` is the only one for now (used by
-/// the `Space f` / `Space b` picker bindings) — adding more is "add a variant and a match arm
-/// in `handle_leader_key`".
+/// Multi-key prefixes the next keystroke completes: `Space` (the picker / app chords) and `Tab`
+/// (the reveal chords). Drives the underline cursor that signals "waiting for one more key"; the
+/// actual second-key dispatch lives in the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingLeader {
     Space,
+    Tab,
 }
 
 /// Captured state for a pending `f`/`t` keystroke — the next char the user types becomes the
