@@ -17,9 +17,9 @@ use aether_protocol::buffer::{
     BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
-    CursorBufferOnlyParams, CursorMoveParams, CursorSelectLineParams, CursorSetParams, CursorState,
-    CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult, Direction, Granularity,
-    GrepPosition, Motion, VerticalDirection,
+    CursorBufferOnlyParams, CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams,
+    CursorSetParams, CursorState, CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult,
+    Direction, Granularity, GrepPosition, Motion, VerticalDirection,
 };
 use aether_protocol::directory::{
     DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryListParams,
@@ -5776,6 +5776,48 @@ pub async fn cursor_swap_anchor(
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
     let response = wrap_for_response(&s, client_id, params.buffer_id, new_state);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
+    Ok(response)
+}
+
+pub async fn cursor_select_all(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CursorSelectAllParams,
+) -> Result<CursorState, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let key = (client_id, params.buffer_id);
+    let current = s.cursors.get(&key).copied().unwrap_or_default();
+    // Anchor at the buffer start, cursor at the end of the last line — clamping an out-of-range
+    // position resolves the buffer end in the system's column units (the whole-line / forward
+    // normal form, per CLAUDE.md).
+    let position = motion::clamp_position(
+        buf,
+        LogicalPosition {
+            line: u32::MAX,
+            col: u32::MAX,
+        },
+    );
+    let result = CursorState {
+        position,
+        anchor: LogicalPosition { line: 0, col: 0 },
+        match_bracket: None,
+        grep_position: None,
+    };
+    s.cursors.insert(key, result);
+    s.record_motion(key, current, result);
+    s.virtual_col.remove(&key);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let response = wrap_for_response(&s, client_id, params.buffer_id, result);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;

@@ -8,7 +8,8 @@ use aether_protocol::buffer::{
     BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
-    CursorMove, CursorMoveParams, CursorRedo, CursorSelectLine, CursorSelectLineParams, CursorSet,
+    CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
+    CursorSelectLine, CursorSelectLineParams, CursorSet,
     CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
     CursorUndoParams, CursorUndoResult, Direction, Granularity, Motion, SelectionEdge,
     VerticalDirection, WordBoundary,
@@ -1097,6 +1098,20 @@ async fn cursor_starts_at_origin_and_moves_by_char() {
     // After "hel" + 5 chars we cross the newline: starts at (0,3), char 3. +5 -> char 8 -> "world" middle.
     // "hello\n" = 6 chars, so char 8 = 'r' in "world" => line 1, col 2.
     assert_eq!(st.position, LogicalPosition { line: 1, col: 2 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_all_spans_the_whole_buffer() {
+    // Three lines, no trailing newline → anchor at the very start, cursor at the end of the last
+    // line (the whole-line / forward normal form).
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma").await;
+
+    let st: CursorState =
+        send_request::<CursorSelectAll>(&mut ws, 10, &CursorSelectAllParams { buffer_id }).await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 2, col: 5 }); // end of "gamma"
 
     drop(server);
 }

@@ -347,6 +347,22 @@ pub struct CursorSwapAnchorParams {
     pub buffer_id: BufferId,
 }
 
+// ---- cursor/select_all --------------------------------------------------------------------------
+
+/// Select the whole buffer: anchor at the start `(0, 0)`, cursor at the end of the last line —
+/// the whole-line, forward-direction normal form. Returns the new cursor state.
+pub struct CursorSelectAll;
+impl RpcMethod for CursorSelectAll {
+    const NAME: &'static str = "cursor/select_all";
+    type Params = CursorSelectAllParams;
+    type Result = CursorState;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CursorSelectAllParams {
+    pub buffer_id: BufferId,
+}
+
 // ---- cursor/update (notification) ---------------------------------------------------------------
 
 pub struct CursorUpdate;

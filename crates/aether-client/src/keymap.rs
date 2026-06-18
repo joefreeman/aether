@@ -185,6 +185,7 @@ pub enum Action {
 
     // ---- selection ----
     SelectLine(Direction),
+    SelectAll,
     SwapAnchor,
     CollapseSelection,
     TreeExpand,
@@ -607,6 +608,9 @@ static NORMAL: &[Binding] = &[
     // ---- line selection ----
     bind!(N, ch('x'), IgnoreShift(Mods::NONE), A::SelectLine(Direction::Forward), "Selection", "Select line downward"),
     bind!(N, ch('x'), IgnoreShift(Mods::ALT), A::SelectLine(Direction::Backward), "Selection", "Select line upward"),
+    // `%` is Shift-5, so the Shift modifier rides along (like `?`); IgnoreShift matches it in all
+    // three clients (iced/web report `shift: true`, some terminals do too).
+    bind!(N, ch('%'), IgnoreShift(Mods::NONE), A::SelectAll, "Selection", "Select whole buffer"),
 
     // ---- mode transitions ----
     bind!(N, ch('i'), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionStart), "Mode", "Insert at selection start"),

@@ -1547,6 +1547,21 @@ fn selecting_the_create_row_creates_the_file() {
 }
 
 #[test]
+fn percent_selects_whole_buffer() {
+    // `%` is Shift-5: iced and the web report it with `shift: true`, so the binding must tolerate
+    // Shift (IgnoreShift), not require exact no-mods — otherwise it'd only work in the terminal.
+    let mut s = session();
+    let shifted = Mods {
+        shift: true,
+        ..Mods::NONE
+    };
+    let fx = s.on_key(KeyCode::Char('%'), shifted, Some("%".to_string()), ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/select_all");
+    assert!(params["buffer_id"].is_number());
+}
+
+#[test]
 fn toggle_wrap_flips_between_soft_and_none() {
     use aether_protocol::viewport::WrapMode;
     let mut s = session();

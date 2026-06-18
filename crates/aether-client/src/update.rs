@@ -25,6 +25,7 @@ use aether_protocol::buffer::{
 use aether_protocol::cursor::Direction;
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams, CursorRedo,
+    CursorSelectAll, CursorSelectAllParams,
     CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
     CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
     Granularity, Motion, SelectionEdge,
@@ -4392,6 +4393,10 @@ impl Session {
                     extend,
                     count,
                 },
+                Event::CursorMsg,
+            ),
+            A::SelectAll => self.request_str::<CursorSelectAll>(
+                CursorSelectAllParams { buffer_id },
                 Event::CursorMsg,
             ),
             A::SwapAnchor => self.request_str::<CursorSwapAnchor>(

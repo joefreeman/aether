@@ -55,6 +55,7 @@ Type `Space ?` for the in-app overlay. Holding the Shift key extends the selecti
 | Key | Action |
 | --- | --- |
 | `,` | Collapse selection |
+| `%` | Select whole buffer |
 | `o` | Swap cursor and anchor |
 | `y`/`Alt-y` | Expand/contract selection to syntax node |
 | `x`/`Alt-x` | Select line downward/upward |

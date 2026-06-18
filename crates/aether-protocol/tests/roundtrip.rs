@@ -2216,6 +2216,16 @@ fn external_change_error_codes_distinct() {
 }
 
 #[test]
+fn cursor_select_all_params_wire_shape() {
+    use aether_protocol::cursor::{CursorSelectAll, CursorSelectAllParams};
+    assert_eq!(CursorSelectAll::NAME, "cursor/select_all");
+    let p = CursorSelectAllParams { buffer_id: 7 };
+    assert_eq!(to_value(&p).unwrap(), json!({ "buffer_id": 7 }));
+    let back: CursorSelectAllParams = from_value(json!({ "buffer_id": 7 })).unwrap();
+    assert_eq!(back.buffer_id, 7);
+}
+
+#[test]
 fn app_settings_wire_shape_and_defaults() {
     use aether_protocol::settings::AppSettings;
     use aether_protocol::viewport::WrapMode;
