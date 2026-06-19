@@ -2252,6 +2252,11 @@ impl Session {
             };
             return self.explorer_navigate(Some(dir), false, None);
         }
+        // In the roots view (multi-root), descend into the selected root — mirrors Enter.
+        if let Some(PickerItem::Root { path_index, .. }) = p.selected_item() {
+            let dir = self.project_paths.get(*path_index as usize).cloned();
+            return self.explorer_navigate(dir, false, None);
+        }
         Effects::none()
     }
 
