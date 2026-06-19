@@ -30,8 +30,15 @@ jobs:
       - uses: cargo-bins/cargo-binstall@main
       - name: Install wasm tooling
         run: |
+          set -euo pipefail
           cargo binstall -y wasm-bindgen-cli@0.2.104
-          sudo apt-get update && sudo apt-get install -y binaryen
+          # Pin Binaryen (wasm-opt) to a known-good upstream release; the distro package is too
+          # old and miscompiles wasm-bindgen's reference-types output (see release.yml for why).
+          BINARYEN_VERSION=120
+          curl -fsSL -o /tmp/binaryen.tar.gz \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          tar -xzf /tmp/binaryen.tar.gz -C /tmp
+          echo "/tmp/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
 
       # System libraries the GUI build (iced/winit/wgpu) links against.
       - name: Install GUI build deps
