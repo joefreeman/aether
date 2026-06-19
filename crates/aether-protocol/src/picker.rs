@@ -721,6 +721,12 @@ pub enum PickerSelectResult {
         /// Position to land the cursor on. Coordinates may be stale if the file changed since the
         /// hit was recorded; the server clamps in `buffer/open` when applying.
         position: LogicalPosition,
+        /// When `Some`, the *other* end of a selection to establish on open — anchor at this
+        /// position, cursor at `position`. The client forwards it as `buffer/open { jump_to_anchor }`.
+        /// `None` (the default) lands a plain point cursor. The outline picker uses it to land a
+        /// symbol's identifier selected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<LogicalPosition>,
     },
     /// A project was selected. The client follows up with `project/activate` to switch.
     Project {
@@ -808,23 +814,26 @@ pub struct PickerGrepNavigateTarget {
     pub opened: Option<crate::buffer::BufferOpenResult>,
 }
 
-/// Move the open grep picker's selection to the first hit of the next or previous *file* (grep
-/// hits are grouped into contiguous per-file runs). Computed server-side against the full result
-/// list, so it works even when the target file is past the client's over-fetched window — the
-/// client then frames the returned hit via `picker/view { center_on }`.
+/// Move a picker's selection to the next/previous *section* boundary — the grouping is per-kind:
+/// Grep groups hits into contiguous per-file runs (jump to the next/previous file's first hit);
+/// DocumentSymbols groups by top-level unit (jump to the next/previous depth-0 symbol). Computed
+/// server-side against the full result list, so it works even when the target is past the client's
+/// over-fetched window — the client then frames the returned item via `picker/view { center_on }`.
 ///
-/// `Forward` → first hit of the next file. `Backward` → first hit of the *current* file, or, if
-/// the selection is already on it, the first hit of the previous file (vim-`{` feel). Returns
-/// `None` when there's no further file in that direction (already at the first / last file).
-pub struct PickerGrepFileJump;
-impl RpcMethod for PickerGrepFileJump {
-    const NAME: &'static str = "picker/grep_file_jump";
-    type Params = PickerGrepFileJumpParams;
+/// `Forward` → the next section. `Backward` → the start of the *current* section, or, if the
+/// selection is already there, the start of the previous section (vim-`{` feel). Returns `None`
+/// when there's no further section in that direction (already at the first / last).
+pub struct PickerSectionJump;
+impl RpcMethod for PickerSectionJump {
+    const NAME: &'static str = "picker/section_jump";
+    type Params = PickerSectionJumpParams;
     type Result = Option<PickerItem>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PickerGrepFileJumpParams {
+pub struct PickerSectionJumpParams {
+    /// Which picker to act on (the client's open one).
+    pub kind: PickerKind,
     /// The selection's current absolute index in the result list (`offset + selected`).
     pub from_index: u32,
     pub direction: Direction,

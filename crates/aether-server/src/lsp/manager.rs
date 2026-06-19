@@ -597,7 +597,7 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
     };
     let diags_json = params.get("diagnostics").cloned().unwrap_or(Value::Null);
 
-    let pushes = {
+    let (pushes, buffer_id) = {
         let mut guard = state.lock().await;
         let s = &mut *guard;
         let Some(buffer_id) = s.buffers.iter().find_map(|(id, b)| {
@@ -615,8 +615,15 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
             let buf = &s.buffers[&buffer_id];
             super::diagnostics::from_lsp(&diags_json, &buf.text, encoding)
         };
-        crate::handlers::set_diagnostics_and_refresh(s, buffer_id, diags)
+        (
+            crate::handlers::set_diagnostics_and_refresh(s, buffer_id, diags),
+            buffer_id,
+        )
     };
+    // A fresh diagnostics publish means the server just re-analyzed the document, so its symbol
+    // outline may have changed too — re-fetch it (naturally debounced by the analysis cycle). This
+    // keeps the `o` symbol-navigation motion and the `Space o` outline in sync with edits.
+    crate::handlers::spawn_document_symbol_refresh(state.clone(), buffer_id);
     send_all(pushes).await;
 }
 

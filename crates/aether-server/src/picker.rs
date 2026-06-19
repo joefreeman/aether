@@ -147,16 +147,20 @@ pub struct ReferenceCandidate {
 }
 
 /// One document-symbols-picker candidate — a single symbol from `textDocument/documentSymbol`,
-/// scoped to the picked buffer. `name` is the fuzzy haystack; `abs_path` + `(line, col)` drive the
-/// `FileAt` jump on select. Hierarchical responses are flattened depth-first, so `depth` records
-/// the nesting level for indentation.
+/// scoped to the picked buffer. `name` is the fuzzy haystack; `start` (the name position) drives
+/// the `FileAt` jump on select. Hierarchical responses are flattened depth-first, so `depth`
+/// records the nesting level for indentation.
 #[derive(Debug, Clone)]
 pub struct SymbolCandidate {
     /// Absolute canonical path of the buffer's file.
     pub abs_path: String,
-    /// The symbol *name* position (`selectionRange.start`) — the jump target + identity.
-    pub line: u32,
-    pub col: u32,
+    /// The identifier (name) span. `start` is `selectionRange.start` — the jump target + identity;
+    /// `end` is its inclusive last char (`selectionRange.end` stepped back one char, same line).
+    /// `o` / picker-select land this span *selected*; `end` falls back to `start` (a point) for
+    /// empty/multi-line ranges or flat servers without a distinct name range. Distinct from the
+    /// `range_*` full extent below.
+    pub start: LogicalPosition,
+    pub end: LogicalPosition,
     /// Symbol name — haystack + the row's primary label.
     pub name: String,
     pub symbol_kind: aether_protocol::picker::SymbolKind,
@@ -407,8 +411,8 @@ impl PickerCandidates {
                 let c = &v[idx];
                 PickerItem::Symbol {
                     path: c.abs_path.clone(),
-                    line: c.line,
-                    col: c.col,
+                    line: c.start.line,
+                    col: c.start.col,
                     name: c.name.clone(),
                     symbol_kind: c.symbol_kind,
                     detail: c.detail.clone(),
@@ -497,7 +501,7 @@ impl PickerCandidates {
                 },
             ) => v
                 .iter()
-                .position(|c| c.abs_path == *path && c.line == *line && c.col == *col),
+                .position(|c| c.abs_path == *path && c.start.line == *line && c.start.col == *col),
             _ => None,
         }
     }
@@ -542,6 +546,7 @@ impl PickerCandidates {
                         line: c.line,
                         col: c.col,
                     },
+                    anchor: None,
                 })
             }
             PickerCandidates::Explorer(e) => {
@@ -570,6 +575,7 @@ impl PickerCandidates {
                         line: c.line,
                         col: c.col,
                     },
+                    anchor: None,
                 })
             }
             // LSP servers aren't a jump target — the client restarts the highlighted server via
@@ -583,16 +589,17 @@ impl PickerCandidates {
                         line: c.line,
                         col: c.col,
                     },
+                    anchor: None,
                 })
             }
             PickerCandidates::Symbols(v) => {
                 let c = &v[idx];
+                // Land the identifier *selected*: cursor on the name's last char, anchor at its
+                // start (matches `o`/`Alt-o`). A point when there's no distinct name span.
                 Some(PickerSelectResult::FileAt {
                     path: c.abs_path.clone(),
-                    position: LogicalPosition {
-                        line: c.line,
-                        col: c.col,
-                    },
+                    position: c.end,
+                    anchor: (c.end != c.start).then_some(c.start),
                 })
             }
         }
@@ -1192,9 +1199,14 @@ mod tests {
     fn reference_selects_to_file_at() {
         // Selecting a reference jumps to its location (path + start position).
         match reference_candidates().select_result(1) {
-            Some(PickerSelectResult::FileAt { path, position }) => {
+            Some(PickerSelectResult::FileAt {
+                path,
+                position,
+                anchor,
+            }) => {
                 assert_eq!(path, "/proj/src/main.rs");
                 assert_eq!(position, LogicalPosition { line: 0, col: 3 });
+                assert_eq!(anchor, None); // a reference lands a point, not a selection
             }
             other => panic!("expected FileAt, got {other:?}"),
         }
@@ -1205,8 +1217,8 @@ mod tests {
         PickerCandidates::Symbols(vec![
             SymbolCandidate {
                 abs_path: "/proj/src/lib.rs".into(),
-                line: 0,
-                col: 3,
+                start: LogicalPosition { line: 0, col: 3 },
+                end: LogicalPosition { line: 0, col: 8 },
                 name: "Parser".into(),
                 symbol_kind: SymbolKind::Struct,
                 detail: String::new(),
@@ -1216,8 +1228,8 @@ mod tests {
             },
             SymbolCandidate {
                 abs_path: "/proj/src/lib.rs".into(),
-                line: 4,
-                col: 7,
+                start: LogicalPosition { line: 4, col: 7 },
+                end: LogicalPosition { line: 4, col: 11 },
                 name: "parse".into(),
                 symbol_kind: SymbolKind::Method,
                 detail: "fn(&self) -> Ast".into(),
@@ -1293,8 +1305,8 @@ mod tests {
         let cands = PickerCandidates::Symbols(vec![
             SymbolCandidate {
                 abs_path: "/p/a.rs".into(),
-                line: 0,
-                col: 7,
+                start: LogicalPosition { line: 0, col: 7 },
+                end: LogicalPosition { line: 0, col: 12 },
                 name: "Widget".into(),
                 symbol_kind: SymbolKind::Struct,
                 detail: String::new(),
@@ -1304,8 +1316,8 @@ mod tests {
             },
             SymbolCandidate {
                 abs_path: "/p/a.rs".into(),
-                line: 4,
-                col: 7,
+                start: LogicalPosition { line: 4, col: 7 },
+                end: LogicalPosition { line: 4, col: 11 },
                 name: "parse".into(),
                 symbol_kind: SymbolKind::Method,
                 detail: String::new(),
@@ -1353,11 +1365,18 @@ mod tests {
     }
 
     #[test]
-    fn symbol_selects_to_file_at() {
+    fn symbol_selects_to_file_at_with_name_selected() {
+        // Selecting a symbol lands its identifier selected: cursor on the name's last char
+        // (`end`), anchor at its start (`start`).
         match symbol_candidates().select_result(1) {
-            Some(PickerSelectResult::FileAt { path, position }) => {
+            Some(PickerSelectResult::FileAt {
+                path,
+                position,
+                anchor,
+            }) => {
                 assert_eq!(path, "/proj/src/lib.rs");
-                assert_eq!(position, LogicalPosition { line: 4, col: 7 });
+                assert_eq!(position, LogicalPosition { line: 4, col: 11 });
+                assert_eq!(anchor, Some(LogicalPosition { line: 4, col: 7 }));
             }
             other => panic!("expected FileAt, got {other:?}"),
         }

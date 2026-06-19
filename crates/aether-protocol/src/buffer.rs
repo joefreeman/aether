@@ -38,6 +38,11 @@ pub struct BufferOpenParams {
     /// col to the line's end). Used by the grep picker to open + jump in one round trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump_to: Option<LogicalPosition>,
+    /// When set together with `jump_to`, the cursor opens as a *selection* — anchor here, cursor at
+    /// `jump_to` — instead of a point. Same coordinate conventions / clamping as `jump_to`. Used by
+    /// the outline picker to land a symbol's identifier selected. Ignored without `jump_to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_to_anchor: Option<LogicalPosition>,
     /// Transient-buffer intent. `Some(true)`: if this open *creates* the buffer, mark it
     /// transient — the server closes it automatically once no viewport shows it anymore, unless
     /// it's been promoted first (an existing buffer is never demoted). `Some(false)`: promote the

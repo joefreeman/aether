@@ -28,12 +28,6 @@ pub struct LanguageConfig {
     /// block form (python, bash, toml, yaml, elixir, erlang, json). Drives mid-line-selection
     /// comment toggling and provides a fallback for languages without `line_comment`.
     pub block_comment: Option<(&'static str, &'static str)>,
-    /// Tree-sitter node kinds that `[` / `]` treat as "navigation units" — the structural
-    /// chunks the user wants to skip between (functions, type declarations, HTML elements,
-    /// CSS rule sets, etc.). The motion walks up the tree from the cursor until it finds an
-    /// ancestor with a child of one of these kinds past (or before) the cursor. Languages
-    /// with an empty list have no `[` / `]` navigation.
-    pub navigation_kinds: &'static [&'static str],
 }
 
 /// Shared `indents.scm` bodies referenced from per-language `; inherits` directives. Loaded
@@ -96,7 +90,6 @@ struct LanguageSpec<L> {
     default_indent: IndentStyle,
     line_comment: Option<&'static str>,
     block_comment: Option<(&'static str, &'static str)>,
-    navigation_kinds: &'static [&'static str],
 }
 
 fn simple<L: Into<Language>>(
@@ -119,7 +112,6 @@ fn simple<L: Into<Language>>(
             default_indent: spec.default_indent,
             line_comment: spec.line_comment,
             block_comment: spec.block_comment,
-            navigation_kinds: spec.navigation_kinds,
         }
     })
 }
@@ -179,18 +171,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(4),
                 line_comment: Some("//"),
                 block_comment: Some(("/*", "*/")),
-                navigation_kinds: &[
-                    "function_item",
-                    "struct_item",
-                    "enum_item",
-                    "impl_item",
-                    "trait_item",
-                    "mod_item",
-                    "const_item",
-                    "static_item",
-                    "type_item",
-                    "macro_definition",
-                ],
             },
         )),
         "markdown" | "md" => Some(MARKDOWN.get_or_init(|| {
@@ -208,7 +188,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: None,
                 block_comment: Some(("<!--", "-->")),
-                navigation_kinds: &["section", "fenced_code_block"],
             }
         })),
         "toml" => Some(simple(
@@ -221,7 +200,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("#"),
                 block_comment: None,
-                navigation_kinds: &["table", "table_array_element"],
             },
         )),
         "html" | "htm" => Some(simple(
@@ -234,7 +212,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: None,
                 block_comment: Some(("<!--", "-->")),
-                navigation_kinds: &["element", "script_element", "style_element"],
             },
         )),
         "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(simple(
@@ -247,14 +224,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("//"),
                 block_comment: Some(("/*", "*/")),
-                navigation_kinds: &[
-                    "function_declaration",
-                    "class_declaration",
-                    "export_statement",
-                    "lexical_declaration",
-                    "variable_declaration",
-                    "method_definition",
-                ],
             },
         )),
         "typescript" | "ts" => Some(simple(
@@ -267,17 +236,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("//"),
                 block_comment: Some(("/*", "*/")),
-                navigation_kinds: &[
-                    "function_declaration",
-                    "class_declaration",
-                    "export_statement",
-                    "lexical_declaration",
-                    "variable_declaration",
-                    "method_definition",
-                    "interface_declaration",
-                    "type_alias_declaration",
-                    "enum_declaration",
-                ],
             },
         )),
         "tsx" => Some(simple(
@@ -290,19 +248,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("//"),
                 block_comment: Some(("/*", "*/")),
-                navigation_kinds: &[
-                    "function_declaration",
-                    "class_declaration",
-                    "export_statement",
-                    "lexical_declaration",
-                    "variable_declaration",
-                    "method_definition",
-                    "interface_declaration",
-                    "type_alias_declaration",
-                    "enum_declaration",
-                    "jsx_element",
-                    "jsx_self_closing_element",
-                ],
             },
         )),
         "python" | "py" => Some(simple(
@@ -315,11 +260,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(4),
                 line_comment: Some("#"),
                 block_comment: None,
-                navigation_kinds: &[
-                    "function_definition",
-                    "class_definition",
-                    "decorated_definition",
-                ],
             },
         )),
         "go" | "golang" => Some(simple(
@@ -332,13 +272,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Tab,
                 line_comment: Some("//"),
                 block_comment: Some(("/*", "*/")),
-                navigation_kinds: &[
-                    "function_declaration",
-                    "method_declaration",
-                    "type_declaration",
-                    "var_declaration",
-                    "const_declaration",
-                ],
             },
         )),
         "elixir" | "ex" | "exs" => Some(simple(
@@ -351,9 +284,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("#"),
                 block_comment: None,
-                // Elixir's grammar wraps everything (incl. `def`, `defmodule`, `defp`) in `call`
-                // nodes. Coarse but matches reality — refine later by filtering on call name.
-                navigation_kinds: &["call"],
             },
         )),
         "erlang" | "erl" | "hrl" => Some(simple(
@@ -366,7 +296,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(4),
                 line_comment: Some("%"),
                 block_comment: None,
-                navigation_kinds: &["fun_decl", "attribute"],
             },
         )),
         "css" => Some(simple(
@@ -379,13 +308,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: None,
                 block_comment: Some(("/*", "*/")),
-                navigation_kinds: &[
-                    "rule_set",
-                    "at_rule",
-                    "media_statement",
-                    "keyframes_statement",
-                    "supports_statement",
-                ],
             },
         )),
         "bash" | "sh" | "shell" | "zsh" => Some(simple(
@@ -398,13 +320,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("#"),
                 block_comment: None,
-                navigation_kinds: &[
-                    "function_definition",
-                    "if_statement",
-                    "while_statement",
-                    "for_statement",
-                    "case_statement",
-                ],
             },
         )),
         "json" => Some(simple(
@@ -417,7 +332,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: None,
                 block_comment: None,
-                navigation_kinds: &["pair"],
             },
         )),
         "yaml" | "yml" => Some(simple(
@@ -430,7 +344,6 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("#"),
                 block_comment: None,
-                navigation_kinds: &["block_mapping_pair", "block_sequence_item"],
             },
         )),
         _ => None,

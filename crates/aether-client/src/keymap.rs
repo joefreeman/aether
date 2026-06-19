@@ -555,7 +555,7 @@ static NORMAL: &[Binding] = &[
     // ---- meta / selection ----
     bind!(N, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
     bind!(N, ch(','), Exact(Mods::NONE), A::CollapseSelection, "Selection", "Collapse selection"),
-    bind!(N, ch('o'), Exact(Mods::NONE), A::SwapAnchor, "Selection", "Swap cursor and anchor"),
+    bind!(N, ch('q'), Exact(Mods::NONE), A::SwapAnchor, "Selection", "Swap cursor and anchor"),
     bind!(N, ch('y'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
     bind!(N, ch('y'), Exact(Mods::ALT), A::TreeContract, "Selection", "Contract selection to child syntax node"),
     bind!(N, ch('u'), Exact(Mods::ALT), A::MotionRedo, "Selection", "Redo cursor/selection motion"),
@@ -596,10 +596,10 @@ static NORMAL: &[Binding] = &[
     // ---- motions: brackets / nav units / goto ----
     bind!(N, ch('m'), IgnoreShift(Mods::NONE), A::MatchBracket { inner: false }, "Motion", "Matching bracket"),
     bind!(N, ch('m'), IgnoreShift(Mods::ALT), A::MatchBracket { inner: true }, "Motion", "Inner matching bracket"),
-    bind!(N, ch('p'), Exact(Mods::NONE), A::NavUnit(Direction::Forward), "Navigation", "Next navigation unit"),
-    bind!(N, ch('p'), Exact(Mods::ALT), A::NavUnit(Direction::Backward), "Navigation", "Previous navigation unit"),
-    bind!(N, ch('p'), Exact(Mods::SHIFT), A::NavUnitEdge { start: false }, "Navigation", "Select to end of unit"),
-    bind!(N, ch('p'), Exact(Mods::SHIFT_ALT), A::NavUnitEdge { start: true }, "Navigation", "Select to start of unit"),
+    bind!(N, ch('o'), Exact(Mods::NONE), A::NavUnit(Direction::Forward), "Navigation", "Next symbol"),
+    bind!(N, ch('o'), Exact(Mods::ALT), A::NavUnit(Direction::Backward), "Navigation", "Previous symbol"),
+    bind!(N, ch('o'), Exact(Mods::SHIFT), A::NavUnitEdge { start: false }, "Navigation", "Select to end of unit"),
+    bind!(N, ch('o'), Exact(Mods::SHIFT_ALT), A::NavUnitEdge { start: true }, "Navigation", "Select to start of unit"),
     bind!(N, ch('g'), IgnoreShift(Mods::ALT), A::GotoLine { last: true }, "Motion", "Go to last line"),
     bind!(N, ch('g'), IgnoreShift(Mods::NONE), A::GotoLine { last: false }, "Motion", "Go to line (count, default 1)"),
     bind!(N, KeyCode::Enter, Exact(Mods::NONE), A::GotoDefinition, "Code", "Go to definition"),

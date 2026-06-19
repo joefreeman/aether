@@ -102,14 +102,13 @@ pub enum Motion {
     MatchBracket {
         inner: bool,
     },
-    /// Jump to the next per-language "navigation unit" past the cursor (functions, structs,
-    /// HTML elements, CSS rule sets, etc. — see `LanguageConfig::navigation_kinds` on the
-    /// server). The cursor's position implicitly determines the level: inside a method, `]`
-    /// skips to the next method in the same class; on a class header, `]` skips to the next
-    /// top-level item; at the last unit in a container, `]` is a no-op rather than
-    /// crossing the scope boundary. Depth is preserved across presses.
+    /// Step to the next symbol after the cursor in the buffer's LSP document-symbol outline — the
+    /// same flat list (document order) the `Space o` picker shows, landing on the symbol's name.
+    /// A plain linear walk: nesting doesn't gate it (it freely crosses in and out of containers),
+    /// resolved by `cursor::resolve_navigation_motion`. LSP-only — a no-op when the outline hasn't
+    /// loaded or the buffer has no language server.
     NextNavigationUnit,
-    /// Mirror of [`NextNavigationUnit`].
+    /// Mirror of [`NextNavigationUnit`] — step to the previous symbol before the cursor.
     PrevNavigationUnit,
     /// Jump to the last char of the smallest navigation unit containing the cursor. Paired
     /// with shift-extend on the TUI, this is "select to end of current function / element /

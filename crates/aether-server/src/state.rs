@@ -99,6 +99,13 @@ pub struct ServerState {
     /// Latest diagnostics per buffer, in buffer coordinates (byte columns). Replaced wholesale on
     /// each `publishDiagnostics`; cleared on close. Empty/absent when a buffer has none.
     pub diagnostics: HashMap<BufferId, Vec<crate::lsp::diagnostics::BufferDiagnostic>>,
+    /// Latest LSP `textDocument/documentSymbol` outline per buffer, flattened depth-first (the
+    /// same shape the `Space o` picker shows). Refreshed asynchronously after the language server
+    /// re-analyzes (on `publishDiagnostics`) and on buffer open. Drives the `o` symbol-navigation
+    /// motion so it walks the same items as the outline. Absent until the first fetch lands; the
+    /// `o` motion no-ops (rather than falling back to tree-sitter) while it's absent for a buffer
+    /// whose language has a server — see `cursor::resolve_navigation_motion`.
+    pub document_symbols: HashMap<BufferId, Vec<crate::picker::SymbolCandidate>>,
     /// This server instance's start time (unix ms) — its identity, reported to clients on
     /// `project/activate` so they can detect a daemon restart across a reconnect. Set once at
     /// construction; the same value is written to the runtime file.
@@ -251,6 +258,7 @@ impl ServerState {
             matcher: picker_state::make_matcher(),
             lsp: crate::lsp::manager::LspManager::default(),
             diagnostics: HashMap::new(),
+            document_symbols: HashMap::new(),
             started_at_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -395,6 +403,7 @@ impl ServerState {
         self.git_baseline.remove(&id);
         self.git_blame.remove(&id);
         self.diagnostics.remove(&id);
+        self.document_symbols.remove(&id);
         self.drop_buffer_from_mru(id);
         stopped_server
     }

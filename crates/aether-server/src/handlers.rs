@@ -48,8 +48,8 @@ use aether_protocol::nav::{
 };
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, MatchOptions, PickerGrepFileJumpParams, PickerGrepNavigateParams,
-    PickerGrepNavigateTarget, PickerHideParams, PickerItem, PickerKind, PickerQueryParams,
+    BufferDirtyState, CaseMode, MatchOptions, PickerGrepNavigateParams, PickerGrepNavigateTarget,
+    PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerSectionJumpParams,
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
     PickerViewResult,
 };
@@ -819,19 +819,21 @@ pub async fn path_delete(
 
 // ---- buffer/open --------------------------------------------------------------------------------
 
-/// Pick the cursor to return from `buffer/open`. When `clamped_jump` is set, build a fresh
-/// point-cursor at that position and persist it into `s.cursors` (overriding any prior state for
-/// this `(client, buffer)`). Otherwise return the previously-persisted cursor or default.
+/// Pick the cursor to return from `buffer/open`. When `clamped_jump` is set, build a fresh cursor
+/// at that position and persist it into `s.cursors` (overriding any prior state for this
+/// `(client, buffer)`); `clamped_anchor` makes it a *selection* (anchor there, cursor at the jump)
+/// rather than a point. Otherwise return the previously-persisted cursor or default.
 fn resolve_open_cursor(
     s: &mut ServerState,
     client_id: Option<ClientId>,
     buffer_id: BufferId,
     clamped_jump: Option<LogicalPosition>,
+    clamped_anchor: Option<LogicalPosition>,
 ) -> CursorState {
     if let Some(clamped) = clamped_jump {
         let new = CursorState {
             position: clamped,
-            anchor: clamped,
+            anchor: clamped_anchor.unwrap_or(clamped),
             match_bracket: None,
             grep_position: None,
         };
@@ -983,7 +985,11 @@ async fn buffer_open_inner(
         let path = buf.canonical_path.as_ref().map(|p| p.display().to_string());
         let scratch_number = buf.scratch_number;
         let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
-        let cursor = resolve_open_cursor(&mut s, client_id, buffer_id, clamped_jump);
+        let clamped_anchor = params
+            .jump_to_anchor
+            .map(|a| motion::clamp_position(buf, a));
+        let cursor =
+            resolve_open_cursor(&mut s, client_id, buffer_id, clamped_jump, clamped_anchor);
         let scroll = open_scroll(&s, client_id, buffer_id, params.jump_to);
         let mut pushes = pin_buffer_if_requested(&mut s, buffer_id, params.transient);
         let result = BufferOpenResult {
@@ -1018,7 +1024,10 @@ async fn buffer_open_inner(
             let mut buf = Buffer::scratch(id, params.language.clone(), scratch_number);
             buf.transient = params.transient == Some(true);
             let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
-            let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump);
+            let clamped_anchor = params
+                .jump_to_anchor
+                .map(|a| motion::clamp_position(&buf, a));
+            let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
             let scroll = open_scroll(&s, client_id, id, params.jump_to);
             let result = BufferOpenResult {
                 buffer_id: id,
@@ -1112,7 +1121,11 @@ async fn buffer_open_inner(
             let revision = buf.revision;
             let saved_revision = buf.saved_revision();
             let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
-            let cursor = resolve_open_cursor(&mut s, client_id, existing, clamped_jump);
+            let clamped_anchor = params
+                .jump_to_anchor
+                .map(|a| motion::clamp_position(buf, a));
+            let cursor =
+                resolve_open_cursor(&mut s, client_id, existing, clamped_jump, clamped_anchor);
             let cursor = match client_id {
                 Some(c) => wrap_for_response(&s, c, existing, cursor),
                 None => cursor,
@@ -1154,10 +1167,13 @@ async fn buffer_open_inner(
     };
     buf.transient = params.transient == Some(true);
     let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
+    let clamped_anchor = params
+        .jump_to_anchor
+        .map(|a| motion::clamp_position(&buf, a));
     // First-time open of this buffer: no prior cursor or scroll to surface — but the client could
     // already have one if a previous server-side session allocated state. Look it up anyway for
     // consistency with the reopen path.
-    let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump);
+    let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
     // Resolve the Git baseline once (repo discovery + reading the committed blob) and diff the
     // buffer against it, so git-aware views have hunks from the first frame and later edits can
     // re-diff cheaply without touching the repo. Best-effort; untracked / no-repo → empty.
@@ -1239,6 +1255,9 @@ async fn buffer_open_inner(
             generation,
         ));
     }
+    // Warm the document-symbol outline so `o` and `Space o` work as soon as possible. A no-op if
+    // the server isn't ready yet — the `publishDiagnostics` hook refreshes once it is.
+    spawn_document_symbol_refresh(state.clone(), id);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
@@ -2426,6 +2445,23 @@ fn push_symbol(
     let Some(name_pos) = name_range.and_then(|r| pos_at(r, "start")) else {
         return;
     };
+    // Inclusive last char of the name — `selectionRange.end` is exclusive, so step back one
+    // LSP-char (names are single-line, so this stays on the name line and is encoding-correct via
+    // `target_byte_col`). Empty / multi-line / missing ranges fall back to the name start (point).
+    let name_end = name_range
+        .and_then(|r| {
+            let start = r.get("start")?;
+            let end = r.get("end")?;
+            let line = start.get("line")?.as_u64()? as u32;
+            let start_char = start.get("character")?.as_u64()? as u32;
+            let end_char = end.get("character")?.as_u64()? as u32;
+            let same_line = end.get("line")?.as_u64()? as u32 == line;
+            (same_line && end_char > start_char).then(|| LogicalPosition {
+                line,
+                col: target_byte_col(path, line, end_char - 1, encoding),
+            })
+        })
+        .unwrap_or(name_pos);
     // The enclosing extent for cursor-containment; fall back to a zero-width span at the name.
     let range_start = full_range
         .and_then(|r| pos_at(r, "start"))
@@ -2443,8 +2479,8 @@ fn push_symbol(
         .to_string();
     out.push(picker_state::SymbolCandidate {
         abs_path: abs_path.to_string(),
-        line: name_pos.line,
-        col: name_pos.col,
+        start: name_pos,
+        end: name_end,
         name: name.to_string(),
         symbol_kind,
         detail,
@@ -3460,6 +3496,7 @@ async fn navigate_to(
         language: None,
         create_if_missing: false,
         jump_to: None,
+        jump_to_anchor: None,
         // Stepping history through a since-closed file is a revisit, not a keep: reopen it
         // transient so walking the jump list doesn't re-accumulate buffers. No effect when the
         // buffer is still open (an open never demotes).
@@ -4925,6 +4962,69 @@ async fn build_symbol_candidates(
     (candidates, cursor)
 }
 
+/// Everything needed to ask a buffer's language server for its document-symbol outline, resolved
+/// under the lock so the caller can drop it before the (awaited) LSP round-trip. Unlike
+/// [`LspCursorRequest`] this is client-agnostic — `documentSymbol` is whole-document — so it can be
+/// driven by background refreshes (e.g. the `publishDiagnostics` hook) that have no client.
+struct LspDocSymbolRequest {
+    client: crate::lsp::client::LspClient,
+    uri: String,
+    encoding: crate::lsp::position::PositionEncoding,
+    abs_path: String,
+}
+
+fn lsp_doc_symbol_request(s: &ServerState, buffer_id: BufferId) -> Option<LspDocSymbolRequest> {
+    let buf = s.buffers.get(&buffer_id)?;
+    let path = buf.canonical_path.as_deref()?;
+    let key = s.lsp.doc_server.get(&buffer_id)?;
+    let handle = s.lsp.servers.get(key)?;
+    if !matches!(handle.status, LspStatus::Ready) {
+        return None;
+    }
+    Some(LspDocSymbolRequest {
+        client: handle.client.clone()?,
+        uri: crate::lsp::uri::path_to_uri(path),
+        encoding: handle.position_encoding,
+        abs_path: path.display().to_string(),
+    })
+}
+
+/// Re-fetch a buffer's document-symbol outline and store it in `state.document_symbols`, keyed by
+/// the revision it was requested against. A no-op when the buffer has no ready server. Drives both
+/// the `Space o` picker warmth and the `o` symbol-navigation motion. Off-lock for the LSP
+/// round-trip; re-locks only to read the request and to store the result.
+pub async fn refresh_document_symbols(state: &SharedState, buffer_id: BufferId) {
+    let req = {
+        let s = state.lock().await;
+        lsp_doc_symbol_request(&s, buffer_id)
+    };
+    let Some(req) = req else { return };
+    let params_json = serde_json::json!({ "textDocument": { "uri": req.uri } });
+    let symbols = match req
+        .client
+        .request("textDocument/documentSymbol", params_json)
+        .await
+    {
+        Ok(v) => parse_document_symbols(&v, &req.abs_path, req.encoding),
+        Err(e) => {
+            tracing::debug!(error = %e, "lsp documentSymbol refresh failed");
+            return; // keep any previous cache rather than blanking it on a transient failure
+        }
+    };
+    let mut s = state.lock().await;
+    if s.buffers.contains_key(&buffer_id) {
+        s.document_symbols.insert(buffer_id, symbols);
+    }
+}
+
+/// Fire-and-forget [`refresh_document_symbols`] on the runtime — for callers holding the lock or in
+/// a sync context (buffer open, the `publishDiagnostics` hook).
+pub fn spawn_document_symbol_refresh(state: SharedState, buffer_id: BufferId) {
+    tokio::spawn(async move {
+        refresh_document_symbols(&state, buffer_id).await;
+    });
+}
+
 /// Monotonic token minted per async-resolve picker open (References, DocumentSymbols), stored on
 /// the picker as `pending_async_load`. Lets a spawned resolve detect that its picker was
 /// reset/reopened (a newer epoch) and drop its now-stale result instead of clobbering the current
@@ -5514,6 +5614,8 @@ pub async fn cursor_move(
     let virtual_col_in = s.virtual_col.get(&key).copied();
     // `Some(col)` → set virtual col to `col`; `None` → clear it. Only `VisualLine` preserves it.
     let mut new_virtual_col: Option<u32> = None;
+    // Set by `o`/`Alt-o` to land the target's identifier selected (anchor at the name start).
+    let mut nav_anchor: Option<LogicalPosition> = None;
     let new_pos = match &params.motion {
         Motion::VisualLine {
             viewport_id,
@@ -5586,15 +5688,40 @@ pub async fn cursor_move(
         Motion::SelectionEdge { edge } => {
             motion::resolve_selection_edge(buf, current.position, current.anchor, *edge)
         }
+        // Navigation-unit motions (`o`) walk only the LSP document-symbol outline (the same tree
+        // `Space o` shows). With no outline yet — still loading, or no language server — the slice
+        // is empty and the motion is a no-op; it never falls back to a different source, so `o`
+        // behaves the same before and after symbols load. `Next`/`Prev` also return an anchor so
+        // the target's identifier lands *selected* (see `nav_anchor`).
+        Motion::NextNavigationUnit
+        | Motion::PrevNavigationUnit
+        | Motion::EndOfNavigationUnit
+        | Motion::StartOfNavigationUnit => {
+            let symbols = s
+                .document_symbols
+                .get(&params.buffer_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let (pos, anchor) = motion::resolve_navigation_motion(
+                buf,
+                symbols,
+                current.position,
+                current.anchor,
+                &params.motion,
+            );
+            nav_anchor = anchor;
+            pos
+        }
         _ => motion::resolve_motion(buf, current.position, &params.motion),
     };
     // Extending: keep the current anchor (which may already equal position, i.e. a point).
-    // Not extending: collapse to a 1-char point at the new position. The data model always
-    // has an anchor, so "no selection" means `anchor == position`.
+    // A navigation motion that selected its target (`o`/`Alt-o` → the identifier) supplies its own
+    // anchor. Otherwise: collapse to a 1-char point at the new position. The data model always has
+    // an anchor, so "no selection" means `anchor == position`.
     let new_anchor = if params.extend_selection {
         current.anchor
     } else {
-        new_pos
+        nav_anchor.unwrap_or(new_pos)
     };
 
     let new_state = CursorState {
@@ -10079,38 +10206,142 @@ fn grep_file_boundary(
     }
 }
 
-/// Move the grep picker's selection to the first hit of the next / previous file. Computed against
-/// the full cached hit list so it works past the client's over-fetch window; the client frames the
-/// returned hit via `picker/view { center_on }`. `None` when there's no further file that way.
-pub async fn picker_grep_file_jump(
+/// Move a picker's selection to the next / previous *section* — per-kind grouping (Grep: by file;
+/// DocumentSymbols: by top-level unit). Computed against the full cached result list so it works
+/// past the client's over-fetch window; the client frames the returned item via
+/// `picker/view { center_on }`. `None` when there's no further section that way.
+pub async fn picker_section_jump(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: PickerGrepFileJumpParams,
+    params: PickerSectionJumpParams,
 ) -> Result<Option<PickerItem>, RpcError> {
     let client_id = ctx.client_id;
     let s = state.lock().await;
-    let Some(picker) = s.pickers.get(&(client_id, PickerKind::Grep)) else {
+    let Some(picker) = s.pickers.get(&(client_id, params.kind)) else {
         return Ok(None);
     };
-    let picker_state::PickerCandidates::Grep(ref hits) = picker.candidates else {
-        return Ok(None);
-    };
-    if hits.is_empty() {
-        return Ok(None);
+    match &picker.candidates {
+        picker_state::PickerCandidates::Grep(hits) => {
+            if hits.is_empty() {
+                return Ok(None);
+            }
+            let from = (params.from_index as usize).min(hits.len() - 1);
+            let Some(target) = grep_file_boundary(hits, from, params.direction) else {
+                return Ok(None);
+            };
+            let h = &hits[target];
+            Ok(Some(PickerItem::GrepHit {
+                path_index: h.path_index,
+                relative_path: h.relative_path.clone(),
+                line: h.line,
+                col: h.col,
+                preview: h.preview.clone(),
+                match_indices: h.match_indices.clone(),
+            }))
+        }
+        // Top-level units are the depth-0 rows of the (ranked, display-order) outline. Work in
+        // ranked-position space so a query filter is respected; map back to a candidate index for
+        // the returned item.
+        picker_state::PickerCandidates::Symbols(syms) => {
+            let ranked = &picker.ranked;
+            if ranked.is_empty() {
+                return Ok(None);
+            }
+            let from = (params.from_index as usize).min(ranked.len() - 1);
+            let Some(pos) = symbol_unit_boundary(syms, ranked, from, params.direction) else {
+                return Ok(None);
+            };
+            Ok(Some(
+                picker
+                    .candidates
+                    .make_item(ranked[pos] as usize, Vec::new()),
+            ))
+        }
+        _ => Ok(None),
     }
-    let from = (params.from_index as usize).min(hits.len() - 1);
-    let Some(target) = grep_file_boundary(hits, from, params.direction) else {
-        return Ok(None);
-    };
-    let h = &hits[target];
-    Ok(Some(PickerItem::GrepHit {
-        path_index: h.path_index,
-        relative_path: h.relative_path.clone(),
-        line: h.line,
-        col: h.col,
-        preview: h.preview.clone(),
-        match_indices: h.match_indices.clone(),
-    }))
+}
+
+/// Ranked position of the next / previous top-level (depth-0) symbol, mirroring
+/// [`grep_file_boundary`]'s feel. `Forward` → the next depth-0 row. `Backward` → this unit's own
+/// header (the nearest depth-0 row at or before `from`) when the selection sits below it, else the
+/// previous unit's header. `None` when there's no further unit that way.
+fn symbol_unit_boundary(
+    syms: &[picker_state::SymbolCandidate],
+    ranked: &[u32],
+    from: usize,
+    direction: Direction,
+) -> Option<usize> {
+    let is_top = |pos: usize| syms[ranked[pos] as usize].depth == 0;
+    match direction {
+        Direction::Forward => (from + 1..ranked.len()).find(|&j| is_top(j)),
+        Direction::Backward => {
+            // Walk back to this unit's header (nearest depth-0 at or before `from`).
+            let mut start = from;
+            while start > 0 && !is_top(start) {
+                start -= 1;
+            }
+            if is_top(start) && start < from {
+                return Some(start); // below the header → jump up to it
+            }
+            // Already on the header (or none above) → the previous unit's header.
+            (0..start).rev().find(|&j| is_top(j))
+        }
+    }
+}
+
+#[cfg(test)]
+mod symbol_unit_boundary_tests {
+    use super::*;
+    use aether_protocol::LogicalPosition;
+
+    // Outline (depth): A(0) a1(1) a2(1) B(0) b1(1) C(0). Ranked is identity (no query filter).
+    fn sym(depth: u32) -> picker_state::SymbolCandidate {
+        picker_state::SymbolCandidate {
+            abs_path: String::new(),
+            start: LogicalPosition { line: 0, col: 0 },
+            end: LogicalPosition { line: 0, col: 0 },
+            name: String::new(),
+            symbol_kind: aether_protocol::picker::SymbolKind::Function,
+            detail: String::new(),
+            depth,
+            range_start: LogicalPosition { line: 0, col: 0 },
+            range_end: LogicalPosition { line: 0, col: 0 },
+        }
+    }
+
+    fn fixture() -> (Vec<picker_state::SymbolCandidate>, Vec<u32>) {
+        let syms = vec![sym(0), sym(1), sym(1), sym(0), sym(1), sym(0)];
+        let ranked = (0..syms.len() as u32).collect();
+        (syms, ranked)
+    }
+
+    #[test]
+    fn forward_jumps_to_the_next_top_level_unit() {
+        let (s, r) = fixture();
+        // From the `A` header → next top-level is `B` (idx 3).
+        assert_eq!(symbol_unit_boundary(&s, &r, 0, Direction::Forward), Some(3));
+        // From inside `A` (a child) → still `B`, skipping `A`'s children.
+        assert_eq!(symbol_unit_boundary(&s, &r, 1, Direction::Forward), Some(3));
+        // From the last unit `C` → nothing further.
+        assert_eq!(symbol_unit_boundary(&s, &r, 5, Direction::Forward), None);
+    }
+
+    #[test]
+    fn backward_snaps_to_the_unit_header_then_to_the_previous_unit() {
+        let (s, r) = fixture();
+        // From inside `B` (child idx 4) → jump up to `B`'s header (idx 3).
+        assert_eq!(
+            symbol_unit_boundary(&s, &r, 4, Direction::Backward),
+            Some(3)
+        );
+        // Already on `B`'s header (idx 3) → the previous unit `A` (idx 0).
+        assert_eq!(
+            symbol_unit_boundary(&s, &r, 3, Direction::Backward),
+            Some(0)
+        );
+        // On the first unit's header → nothing before it.
+        assert_eq!(symbol_unit_boundary(&s, &r, 0, Direction::Backward), None);
+    }
 }
 
 /// First grep hit "after" the cursor. Within the same file: the first hit whose `(line, col)` is
@@ -10749,7 +10980,9 @@ mod lsp_parse_tests {
             aether_protocol::picker::SymbolKind::Struct
         );
         assert_eq!(syms[0].depth, 0);
-        assert_eq!((syms[0].line, syms[0].col), (0, 7)); // selectionRange, not range
+        // The name span is `selectionRange`, not `range`: start (0,7), inclusive last char (0,12).
+        assert_eq!(syms[0].start, LogicalPosition { line: 0, col: 7 });
+        assert_eq!(syms[0].end, LogicalPosition { line: 0, col: 12 });
         assert_eq!(syms[0].detail, "struct Parser");
         assert_eq!(syms[1].name, "new");
         assert_eq!(
@@ -10757,7 +10990,8 @@ mod lsp_parse_tests {
             aether_protocol::picker::SymbolKind::Method
         );
         assert_eq!(syms[1].depth, 1);
-        assert_eq!((syms[1].line, syms[1].col), (1, 11));
+        assert_eq!(syms[1].start, LogicalPosition { line: 1, col: 11 });
+        assert_eq!(syms[1].end, LogicalPosition { line: 1, col: 13 });
         // The full `range` (not selectionRange) is captured for cursor containment: the struct
         // spans lines 0..9, so a cursor on line 5 falls inside it.
         assert_eq!(syms[0].range_start, LogicalPosition { line: 0, col: 0 });
@@ -10788,7 +11022,10 @@ mod lsp_parse_tests {
             "containerName is not surfaced as detail"
         );
         assert_eq!(syms[0].depth, 0);
-        assert_eq!((syms[0].line, syms[0].col), (5, 3));
+        assert_eq!(syms[0].start, LogicalPosition { line: 5, col: 3 });
+        // Flat servers have no distinct name range → `end` falls back to the location range's
+        // inclusive last char (5,8).
+        assert_eq!(syms[0].end, LogicalPosition { line: 5, col: 8 });
     }
 
     #[test]

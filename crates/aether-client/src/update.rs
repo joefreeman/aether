@@ -60,9 +60,9 @@ use aether_protocol::nav::NavStepResult;
 use aether_protocol::nav::{NavBack, NavForward, NavStepParams};
 use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    CaseMode, MatchOptions, PickerFilters, PickerGrepFileJump, PickerGrepFileJumpParams,
-    PickerGrepNavigate, PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem,
-    PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
+    CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate, PickerGrepNavigateParams,
+    PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,
+    PickerSectionJump, PickerSectionJumpParams, PickerSelect, PickerSelectParams,
     PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
     PickerViewResult, ScopedPath,
 };
@@ -170,8 +170,9 @@ pub enum Event {
         abs: String,
         result: Result<DirectoryListResult, String>,
     },
-    /// `picker/grep_file_jump` resolved: the next/prev file's first hit (None at the ends).
-    GrepFileJumped(Result<Option<PickerItem>, String>),
+    /// `picker/section_jump` resolved: the next/prev section start (None at the ends) — the
+    /// next file's first hit (Grep) or the next top-level symbol (DocumentSymbols).
+    SectionJumped(Result<Option<PickerItem>, String>),
     /// `path/delete` (Explorer/Files trash) resolved. `noun` labels the success toast; the
     /// open picker re-lists. Buffer closes for the deleted path arrive via the `buffer/closed`
     /// push, which already switches us off a deleted current buffer.
@@ -380,7 +381,7 @@ impl Session {
 
             Event::Definition(Ok(r)) => match r.location {
                 Some(location) => {
-                    self.open_path_primed(location.path, Some(location.position), None)
+                    self.open_path_primed(location.path, Some(location.position), None, None)
                 }
                 None => Effects::toast("No definition found", ToastKind::Info),
             },
@@ -583,10 +584,12 @@ impl Session {
                 prime,
                 result: Ok(result),
             } => match result {
-                PickerSelectResult::File { path } => self.open_path_primed(path, None, prime),
-                PickerSelectResult::FileAt { path, position } => {
-                    self.open_path_primed(path, Some(position), prime)
-                }
+                PickerSelectResult::File { path } => self.open_path_primed(path, None, None, prime),
+                PickerSelectResult::FileAt {
+                    path,
+                    position,
+                    anchor,
+                } => self.open_path_primed(path, Some(position), anchor, prime),
                 PickerSelectResult::Buffer { buffer_id } => {
                     if buffer_id == self.buffer.buffer_id {
                         return Effects::none(); // already showing it
@@ -822,8 +825,8 @@ impl Session {
                 Effects::none()
             }
 
-            Event::GrepFileJumped(Ok(None)) => Effects::none(), // already at the first/last
-            Event::GrepFileJumped(Ok(Some(target))) => {
+            Event::SectionJumped(Ok(None)) => Effects::none(), // already at the first/last
+            Event::SectionJumped(Ok(Some(target))) => {
                 let Some(p) = &mut self.picker else {
                     return Effects::none();
                 };
@@ -857,7 +860,7 @@ impl Session {
                     },
                 )
             }
-            Event::GrepFileJumped(Err(e)) => Effects::error(format!("file jump failed: {e}")),
+            Event::SectionJumped(Err(e)) => Effects::error(format!("file jump failed: {e}")),
 
             Event::PathDeleted { noun, result } => match result {
                 Err(e) => Effects::error(format!("delete failed: {e}")),
@@ -1292,6 +1295,7 @@ impl Session {
         &mut self,
         path: String,
         jump_to: Option<LogicalPosition>,
+        jump_to_anchor: Option<LogicalPosition>,
         prime: Option<(String, MatchOptions)>,
     ) -> Effects {
         let Some((path_index, relative_path)) = strip_longest_root(&path, &self.project_paths)
@@ -1306,6 +1310,7 @@ impl Session {
                 path_index: Some(path_index),
                 relative_path: Some(relative_path),
                 jump_to,
+                jump_to_anchor,
                 transient: Some(true),
                 record_nav_from: Some(self.buffer.buffer_id),
                 prime_search,
@@ -2486,16 +2491,25 @@ impl Session {
             KeyCode::Char('f') if mods.ctrl && !mods.alt && p.kind == PickerKind::Explorer => {
                 return self.switch_explorer_picker(PickerKind::Files);
             }
-            // Alt-l/h are per-kind: Explorer descends / ascends; Grep jumps the selection to
-            // the next / previous file's first hit; elsewhere Alt-h clears (via picker_back).
+            // Alt-l/h are per-kind: Explorer descends / ascends; Grep jumps the selection to the
+            // next / previous file's first hit; DocumentSymbols jumps to the next / previous
+            // top-level unit; elsewhere Alt-h clears (via picker_back).
             KeyCode::Char('l') if mods.alt && !mods.ctrl && p.kind == PickerKind::Explorer => {
                 return self.explorer_enter_selected();
             }
-            KeyCode::Char('l') if mods.alt && !mods.ctrl && p.kind == PickerKind::Grep => {
-                return self.grep_jump_file(Direction::Forward);
+            KeyCode::Char('l')
+                if mods.alt
+                    && !mods.ctrl
+                    && matches!(p.kind, PickerKind::Grep | PickerKind::DocumentSymbols) =>
+            {
+                return self.picker_section_jump(Direction::Forward);
             }
-            KeyCode::Char('h') if mods.alt && !mods.ctrl && p.kind == PickerKind::Grep => {
-                return self.grep_jump_file(Direction::Backward);
+            KeyCode::Char('h')
+                if mods.alt
+                    && !mods.ctrl
+                    && matches!(p.kind, PickerKind::Grep | PickerKind::DocumentSymbols) =>
+            {
+                return self.picker_section_jump(Direction::Backward);
             }
             // Alt-h / Alt-Backspace unwind: clear the query first, then pop chips, then step
             // to the parent (one segment per press), then roots mode (multi-root only).
@@ -2867,23 +2881,25 @@ impl Session {
         self.save(Some(target), false)
     }
 
-    /// Jump the grep picker's selection to the first hit of the next / previous file. The
-    /// server finds the boundary across the *whole* result list (so it works past the
-    /// over-fetch window); the result lands as [`Event::GrepFileJumped`].
-    fn grep_jump_file(&mut self, direction: Direction) -> Effects {
+    /// Jump the open picker's selection to the next / previous section boundary — the next/prev
+    /// file's first hit (Grep) or top-level symbol (DocumentSymbols). The server finds the boundary
+    /// across the *whole* result list (so it works past the over-fetch window); the result lands as
+    /// [`Event::SectionJumped`].
+    fn picker_section_jump(&mut self, direction: Direction) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
-        if p.kind != PickerKind::Grep || p.items.is_empty() {
+        if !matches!(p.kind, PickerKind::Grep | PickerKind::DocumentSymbols) || p.items.is_empty() {
             return Effects::none();
         }
-
-        self.request::<PickerGrepFileJump>(
-            PickerGrepFileJumpParams {
+        let kind = p.kind;
+        self.request::<PickerSectionJump>(
+            PickerSectionJumpParams {
+                kind,
                 from_index: p.selected,
                 direction,
             },
-            move |__r| Event::GrepFileJumped(__r.map_err(|e| e.to_string())),
+            move |__r| Event::SectionJumped(__r.map_err(|e| e.to_string())),
         )
     }
 

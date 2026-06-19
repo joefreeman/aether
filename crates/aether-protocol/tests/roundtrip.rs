@@ -1119,18 +1119,20 @@ fn project_delete_params_round_trip() {
 }
 
 #[test]
-fn picker_grep_file_jump_round_trips() {
+fn picker_section_jump_round_trips() {
     use aether_protocol::cursor::Direction;
-    use aether_protocol::picker::{PickerGrepFileJump, PickerGrepFileJumpParams};
-    assert_eq!(PickerGrepFileJump::NAME, "picker/grep_file_jump");
-    let p = PickerGrepFileJumpParams {
+    use aether_protocol::picker::{PickerKind, PickerSectionJump, PickerSectionJumpParams};
+    assert_eq!(PickerSectionJump::NAME, "picker/section_jump");
+    let p = PickerSectionJumpParams {
+        kind: PickerKind::DocumentSymbols,
         from_index: 7,
         direction: Direction::Backward,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["from_index"], 7);
-    let back: PickerGrepFileJumpParams = serde_json::from_value(v).unwrap();
+    let back: PickerSectionJumpParams = serde_json::from_value(v).unwrap();
     assert_eq!(back.from_index, 7);
+    assert!(matches!(back.kind, PickerKind::DocumentSymbols));
     assert!(matches!(back.direction, Direction::Backward));
 }
 
@@ -1765,9 +1767,11 @@ fn picker_item_grep_hit_is_tagged() {
 #[test]
 fn picker_select_result_file_at_is_tagged() {
     use aether_protocol::picker::PickerSelectResult;
+    // No anchor → a point; the optional field is omitted on the wire.
     let r = PickerSelectResult::FileAt {
         path: "/abs/x.rs".into(),
         position: LogicalPosition { line: 3, col: 7 },
+        anchor: None,
     };
     assert_eq!(
         to_value(&r).unwrap(),
@@ -1775,6 +1779,21 @@ fn picker_select_result_file_at_is_tagged() {
             "kind": "file_at",
             "path": "/abs/x.rs",
             "position": {"line": 3, "col": 7},
+        })
+    );
+    // With an anchor → a selection (anchor..position); the field rides along.
+    let r = PickerSelectResult::FileAt {
+        path: "/abs/x.rs".into(),
+        position: LogicalPosition { line: 3, col: 7 },
+        anchor: Some(LogicalPosition { line: 3, col: 4 }),
+    };
+    assert_eq!(
+        to_value(&r).unwrap(),
+        json!({
+            "kind": "file_at",
+            "path": "/abs/x.rs",
+            "position": {"line": 3, "col": 7},
+            "anchor": {"line": 3, "col": 4},
         })
     );
 }

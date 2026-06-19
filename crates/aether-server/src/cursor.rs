@@ -4,6 +4,7 @@
 //! char offsets for arithmetic. `count` in motions is in chars (Unicode scalars) for phase 1; a
 //! grapheme-aware revision can come later.
 
+use crate::picker::SymbolCandidate;
 use crate::state::Buffer;
 use crate::wrap::{self, RowInfo};
 use aether_protocol::cursor::{
@@ -264,56 +265,13 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             };
             char_to_pos(buf, buf.text.byte_to_char(target_byte))
         }
-        Motion::NextNavigationUnit | Motion::PrevNavigationUnit => {
-            let forward = matches!(motion, Motion::NextNavigationUnit);
-            let Some(syntax) = buf.syntax.as_ref() else {
-                return current;
-            };
-            let cursor_byte = buf.text.char_to_byte(pos_to_char(buf, current));
-            let nav_kinds = syntax.config.navigation_kinds;
-            if nav_kinds.is_empty() {
-                return current;
-            }
-            match find_navigation_target(&syntax.tree, cursor_byte, nav_kinds, forward) {
-                Some(target) => char_to_pos(buf, buf.text.byte_to_char(target.start_byte())),
-                None => current,
-            }
-        }
-        Motion::EndOfNavigationUnit | Motion::StartOfNavigationUnit => {
-            let to_end = matches!(motion, Motion::EndOfNavigationUnit);
-            let Some(syntax) = buf.syntax.as_ref() else {
-                return current;
-            };
-            let cursor_byte = buf.text.char_to_byte(pos_to_char(buf, current));
-            let nav_kinds = syntax.config.navigation_kinds;
-            if nav_kinds.is_empty() {
-                return current;
-            }
-            // First press from inside a unit jumps to that unit's boundary. A repeat press,
-            // where the cursor already sits at the boundary (or where the cursor isn't inside
-            // any unit), falls through to the next/prev sibling — so `}}}` walks through
-            // adjacent units, growing the selection one unit at a time.
-            let enclosing = enclosing_navigation_unit(&syntax.tree, cursor_byte, nav_kinds);
-            let already_at_boundary = match enclosing {
-                Some(u) if to_end => cursor_byte >= u.end_byte().saturating_sub(1),
-                Some(u) => cursor_byte <= u.start_byte(),
-                None => true,
-            };
-            let target = if already_at_boundary {
-                find_navigation_target(&syntax.tree, cursor_byte, nav_kinds, to_end)
-            } else {
-                enclosing
-            };
-            let Some(target) = target else { return current };
-            let target_byte = if to_end {
-                // Tree-sitter end byte is exclusive — back up one to land on the unit's last
-                // *char*, so an inclusive selection ends exactly at the unit's boundary.
-                target.end_byte().saturating_sub(1).max(target.start_byte())
-            } else {
-                target.start_byte()
-            };
-            char_to_pos(buf, buf.text.byte_to_char(target_byte))
-        }
+        // Navigation-unit motions (`o`) are resolved by `resolve_navigation_motion` against the
+        // LSP document-symbol outline, never here — `resolve_motion` only sees them if the handler
+        // routing changes, so keep them a no-op rather than reintroducing a tree-sitter walk.
+        Motion::NextNavigationUnit
+        | Motion::PrevNavigationUnit
+        | Motion::EndOfNavigationUnit
+        | Motion::StartOfNavigationUnit => current,
         Motion::FindChar {
             ch,
             direction,
@@ -338,81 +296,6 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
                 None => current,
             }
         }
-    }
-}
-
-/// Smallest navigation-kind ancestor of the cursor — the unit the cursor is "inside" or "on".
-/// Walks up from the cursor's deepest descendant, returning the first ancestor whose kind is
-/// in `nav_kinds`. `None` when the cursor isn't inside any navigation unit (e.g. on a blank
-/// line between top-level items).
-fn enclosing_navigation_unit<'tree>(
-    tree: &'tree tree_sitter::Tree,
-    cursor_byte: usize,
-    nav_kinds: &[&str],
-) -> Option<tree_sitter::Node<'tree>> {
-    let is_nav = |kind: &str| nav_kinds.contains(&kind);
-    let root = tree.root_node();
-    let mut node = root
-        .descendant_for_byte_range(cursor_byte, cursor_byte)
-        .unwrap_or(root);
-    loop {
-        if is_nav(node.kind()) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
-
-/// Walk up the tree from the cursor looking for the closest navigation-kind node past (or
-/// before) `cursor_byte`, at the cursor's *own* depth — the motion never crosses scope
-/// boundaries. The walk-up has two steps:
-///
-/// 1. **Skip nav-kind ancestors anchored at the cursor** — i.e. if the cursor sits at the
-///    exact start of a nav-kind, that nav-kind is the cursor's *self*, not its container; we
-///    keep walking so navigation happens among its siblings.
-/// 2. **Stop at the first ancestor with any nav-kind children.** That ancestor *is* the
-///    cursor's level; pick the next/prev qualifying child or no-op. We never walk past this
-///    level even when there's no hit, so a cursor on the last method of a class can't fall
-///    out of the class into top-level items.
-fn find_navigation_target<'tree>(
-    tree: &'tree tree_sitter::Tree,
-    cursor_byte: usize,
-    nav_kinds: &[&str],
-    forward: bool,
-) -> Option<tree_sitter::Node<'tree>> {
-    let is_nav = |kind: &str| nav_kinds.contains(&kind);
-    let root = tree.root_node();
-    let mut node = root
-        .descendant_for_byte_range(cursor_byte, cursor_byte)
-        .unwrap_or(root);
-
-    loop {
-        let on_self = is_nav(node.kind()) && node.start_byte() == cursor_byte;
-        if !on_self {
-            // Tree-sitter children iterate in source order, so for forward search the first
-            // qualifying child is the answer; for backward search the *last* qualifying child
-            // wins, which we get by overwriting `best` on every hit.
-            let mut walker = node.walk();
-            let mut best: Option<tree_sitter::Node<'tree>> = None;
-            let mut any_nav_child = false;
-            for child in node.children(&mut walker) {
-                if !is_nav(child.kind()) {
-                    continue;
-                }
-                any_nav_child = true;
-                if forward {
-                    if child.start_byte() > cursor_byte {
-                        return Some(child);
-                    }
-                } else if child.start_byte() < cursor_byte {
-                    best = Some(child);
-                }
-            }
-            if any_nav_child {
-                return best;
-            }
-        }
-        node = node.parent()?;
     }
 }
 
@@ -1027,5 +910,262 @@ pub fn snap_selection(
         (lo, hi)
     } else {
         (hi, lo)
+    }
+}
+
+// ---- symbol-driven navigation units (`o`) -------------------------------------------------------
+//
+// `o`/`Alt-o` step linearly down/up the buffer's LSP document-symbol outline — the same flat list
+// (in document order) the `Space o` picker shows — landing on each symbol's name. `Shift-o`/
+// `Shift-Alt-o` select to the end/start of the symbol the cursor is in. It's LSP-only: with no
+// outline (still loading, or the buffer has no language server) every motion is a no-op, never
+// falling back to a different source, so behaviour is identical before and after symbols load.
+
+/// Resolve a navigation-unit motion against the document-symbol outline, returning
+/// `(cursor, anchor_override)`. `o`/`Alt-o` (`Next`/`Prev`) land the target symbol's *identifier
+/// selected* — cursor on the name's last char, anchor at its start (`Some(start)`). The `Shift-o`
+/// edge motions return `None` for the anchor (the handler keeps the existing one, i.e. extends).
+/// `symbols` is the buffer's cached outline; empty (still loading / no server) makes it a no-op.
+pub fn resolve_navigation_motion(
+    buf: &Buffer,
+    symbols: &[SymbolCandidate],
+    position: LogicalPosition,
+    anchor: LogicalPosition,
+    motion: &Motion,
+) -> (LogicalPosition, Option<LogicalPosition>) {
+    // A no-op leaves the selection exactly as it was (no-symbols, or no further unit).
+    let unchanged = (position, Some(anchor));
+    if symbols.is_empty() {
+        return unchanged;
+    }
+    match motion {
+        Motion::NextNavigationUnit | Motion::PrevNavigationUnit => {
+            // Navigate relative to the *start* of the current selection, not the cursor: after a
+            // previous `o` the cursor sits at the symbol's name end, so keying off the cursor would
+            // let `Alt-o` re-find the current symbol (whose own start precedes its end).
+            let from = ordered(position, anchor).0;
+            let target = if matches!(motion, Motion::NextNavigationUnit) {
+                next_symbol(symbols, from)
+            } else {
+                prev_symbol(symbols, from)
+            };
+            match target {
+                // Select the identifier: anchor at the name start, cursor on its last char.
+                Some(i) => (symbols[i].end, Some(symbols[i].start)),
+                None => unchanged,
+            }
+        }
+        Motion::StartOfNavigationUnit | Motion::EndOfNavigationUnit => {
+            let to_end = matches!(motion, Motion::EndOfNavigationUnit);
+            (symbol_edge(buf, symbols, position, to_end), None)
+        }
+        // Not a navigation motion — kept total; the handler only routes the nav motions here.
+        _ => unchanged,
+    }
+}
+
+fn lc(p: LogicalPosition) -> (u32, u32) {
+    (p.line, p.col)
+}
+
+/// The next symbol after the cursor in document (picker) order — the one with the smallest name
+/// position strictly greater than `pos`. `None` once the cursor is past the last symbol.
+fn next_symbol(symbols: &[SymbolCandidate], pos: LogicalPosition) -> Option<usize> {
+    symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| lc(s.start) > lc(pos))
+        .min_by_key(|(_, s)| lc(s.start))
+        .map(|(i, _)| i)
+}
+
+/// The previous symbol before the cursor — the one with the largest name position strictly less
+/// than `pos`. `None` once the cursor is before the first symbol.
+fn prev_symbol(symbols: &[SymbolCandidate], pos: LogicalPosition) -> Option<usize> {
+    symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| lc(s.start) < lc(pos))
+        .max_by_key(|(_, s)| lc(s.start))
+        .map(|(i, _)| i)
+}
+
+/// Index of the innermost symbol whose range contains `pos` — deepest depth, then latest start,
+/// matching the picker's cursor-highlight rule. Used by [`symbol_edge`].
+fn enclosing_symbol(symbols: &[SymbolCandidate], pos: LogicalPosition) -> Option<usize> {
+    symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.contains(pos))
+        .max_by_key(|(_, s)| (s.depth, s.range_start.line, s.range_start.col))
+        .map(|(i, _)| i)
+}
+
+/// Resolve `StartOfNavigationUnit` / `EndOfNavigationUnit` against the outline: land on the
+/// enclosing symbol's start (or last char) and — when the cursor is already at that boundary —
+/// fall through to the next/previous symbol in the list, so repeated `Shift-o` grows the selection
+/// symbol by symbol.
+fn symbol_edge(
+    buf: &Buffer,
+    symbols: &[SymbolCandidate],
+    pos: LogicalPosition,
+    to_end: bool,
+) -> LogicalPosition {
+    let enclosing = enclosing_symbol(symbols, pos);
+    let already_at_boundary = match enclosing {
+        Some(i) if to_end => lc(pos) >= lc(symbol_last_char(buf, &symbols[i])),
+        Some(i) => lc(pos) <= lc(symbols[i].range_start),
+        None => true,
+    };
+    let target = if already_at_boundary {
+        if to_end {
+            next_symbol(symbols, pos)
+        } else {
+            prev_symbol(symbols, pos)
+        }
+    } else {
+        enclosing
+    };
+    let Some(i) = target else { return pos };
+    if to_end {
+        symbol_last_char(buf, &symbols[i])
+    } else {
+        symbols[i].range_start
+    }
+}
+
+/// A symbol's last char: its `range_end` (an exclusive end position) stepped back one char,
+/// clamped so it never precedes the symbol's start.
+fn symbol_last_char(buf: &Buffer, sym: &SymbolCandidate) -> LogicalPosition {
+    let start = pos_to_char(buf, sym.range_start);
+    let end = pos_to_char(buf, sym.range_end);
+    char_to_pos(buf, end.saturating_sub(1).max(start))
+}
+
+#[cfg(test)]
+mod symbol_nav_tests {
+    use super::*;
+
+    // Outline (depth-first preorder, source order):
+    //   0  struct S   d0  name@0   range 0..2
+    //   1  impl S     d0  name@4   range 4..20
+    //   2    fn a     d1  name@5   range 5..9
+    //   3    fn b     d1  name@10  range 10..14
+    //   4    fn c     d1  name@15  range 15..19
+    //   5  fn top     d0  name@22  range 22..30
+    fn sym(depth: u32, name_line: u32, start_line: u32, end_line: u32) -> SymbolCandidate {
+        SymbolCandidate {
+            abs_path: String::new(),
+            start: LogicalPosition {
+                line: name_line,
+                col: 0,
+            },
+            // A 5-char name (cols 0..=4) so the selection span is non-degenerate in tests.
+            end: LogicalPosition {
+                line: name_line,
+                col: 4,
+            },
+            name: String::new(),
+            symbol_kind: aether_protocol::picker::SymbolKind::Function,
+            detail: String::new(),
+            depth,
+            range_start: LogicalPosition {
+                line: start_line,
+                col: 0,
+            },
+            range_end: LogicalPosition {
+                line: end_line,
+                col: 0,
+            },
+        }
+    }
+
+    fn outline() -> Vec<SymbolCandidate> {
+        vec![
+            sym(0, 0, 0, 2),
+            sym(0, 4, 4, 20),
+            sym(1, 5, 5, 9),
+            sym(1, 10, 10, 14),
+            sym(1, 15, 15, 19),
+            sym(0, 22, 22, 30),
+        ]
+    }
+
+    fn at(line: u32) -> LogicalPosition {
+        LogicalPosition { line, col: 0 }
+    }
+
+    #[test]
+    fn steps_down_the_flat_list() {
+        let o = outline();
+        // Standing on `struct S`'s name → next is `impl S` (idx 1).
+        assert_eq!(next_symbol(&o, at(0)), Some(1));
+        // On the `impl S` header → the next list row is `fn a` (idx 2), not the next top-level
+        // item — it's a plain linear walk, nesting doesn't gate it.
+        assert_eq!(next_symbol(&o, at(4)), Some(2));
+        // Standing on `fn b`'s name → `fn c` (idx 4).
+        assert_eq!(next_symbol(&o, at(10)), Some(4));
+        // From inside `fn c` (line 16, the last method) → crosses out of `impl S` to `fn top`
+        // (idx 5); there's no scope fence.
+        assert_eq!(next_symbol(&o, at(16)), Some(5));
+        // Past the last symbol → nothing.
+        assert_eq!(next_symbol(&o, at(40)), None);
+    }
+
+    #[test]
+    fn steps_up_the_flat_list() {
+        let o = outline();
+        // Standing on `fn c`'s name (line 15) → previous is `fn b` (idx 3).
+        assert_eq!(prev_symbol(&o, at(15)), Some(3));
+        // On the `impl S` header (line 4) → `struct S` (idx 0).
+        assert_eq!(prev_symbol(&o, at(4)), Some(0));
+        // Before the first symbol → nothing.
+        assert_eq!(prev_symbol(&o, at(0)), None);
+        // Past everything → the last symbol `fn top` (idx 5).
+        assert_eq!(prev_symbol(&o, at(40)), Some(5));
+    }
+
+    #[test]
+    fn from_inside_a_body_up_snaps_to_the_enclosing_header() {
+        let o = outline();
+        // Inside `fn b`'s body (line 11): up snaps to `fn b`'s own name (idx 3, the nearest symbol
+        // before the cursor); down steps to the next symbol `fn c` (idx 4).
+        assert_eq!(prev_symbol(&o, at(11)), Some(3));
+        assert_eq!(next_symbol(&o, at(11)), Some(4));
+    }
+
+    #[test]
+    fn next_and_prev_select_the_identifier() {
+        let o = outline();
+        let buf = Buffer::scratch(1, None, 1); // Next/Prev don't touch the buffer
+        let next = |pos, anchor| {
+            resolve_navigation_motion(&buf, &o, pos, anchor, &Motion::NextNavigationUnit)
+        };
+        let prev = |pos, anchor| {
+            resolve_navigation_motion(&buf, &o, pos, anchor, &Motion::PrevNavigationUnit)
+        };
+        // `o` from the top (point cursor) lands the first reachable symbol's identifier
+        // *selected*: anchor at its name start, cursor on its last char (`end`).
+        assert_eq!(next(at(0), at(0)), (o[1].end, Some(o[1].start))); // idx 1 (impl S)
+
+        // Now standing on that selection (anchor = impl S start, cursor = its name end): `Alt-o`
+        // must step to the *previous* symbol, not re-find impl S — the regression this guards.
+        // Navigation keys off the selection start, so it lands `struct S` (idx 0).
+        assert_eq!(prev(o[1].end, o[1].start), (o[0].end, Some(o[0].start)));
+        // And `o` from the same selection advances to the next list row, `fn a` (idx 2).
+        assert_eq!(next(o[1].end, o[1].start), (o[2].end, Some(o[2].start)));
+
+        // No further unit → a no-op that *preserves* the current selection (doesn't collapse it).
+        assert_eq!(next(o[5].end, o[5].start), (o[5].end, Some(o[5].start)));
+        assert_eq!(prev(o[0].end, o[0].start), (o[0].end, Some(o[0].start)));
+    }
+
+    #[test]
+    fn enclosing_prefers_the_innermost_symbol() {
+        let o = outline();
+        // Line 11 is inside both `impl S` (4..20) and `fn b` (10..14) → the deeper one wins.
+        assert_eq!(enclosing_symbol(&o, at(11)), Some(3));
+        // Line 4 is only inside `impl S`.
+        assert_eq!(enclosing_symbol(&o, at(4)), Some(1));
     }
 }
