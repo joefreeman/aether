@@ -555,9 +555,9 @@ static NORMAL: &[Binding] = &[
     // ---- meta / selection ----
     bind!(N, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
     bind!(N, ch(','), Exact(Mods::NONE), A::CollapseSelection, "Selection", "Collapse selection"),
-    bind!(N, ch('q'), Exact(Mods::NONE), A::SwapAnchor, "Selection", "Swap cursor and anchor"),
-    bind!(N, ch('y'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
-    bind!(N, ch('y'), Exact(Mods::ALT), A::TreeContract, "Selection", "Contract selection to child syntax node"),
+    bind!(N, ch(','), Exact(Mods::ALT), A::SwapAnchor, "Selection", "Swap cursor and anchor"),
+    bind!(N, ch('p'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
+    bind!(N, ch('p'), Exact(Mods::ALT), A::TreeContract, "Selection", "Contract selection to child syntax node"),
     bind!(N, ch('u'), Exact(Mods::ALT), A::MotionRedo, "Selection", "Redo cursor/selection motion"),
     bind!(N, ch('u'), Exact(Mods::NONE), A::MotionUndo, "Selection", "Undo cursor/selection motion"),
     bind!(N, ch('.'), Exact(Mods::NONE), A::RepeatMotion, "Selection", "Repeat last motion"),
