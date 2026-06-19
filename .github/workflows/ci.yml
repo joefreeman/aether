@@ -32,6 +32,10 @@ jobs:
         run: |
           set -euo pipefail
           cargo binstall -y wasm-bindgen-cli@0.2.104
+          # binstall drops wasm-bindgen in the cargo bin dir — put it on PATH for the later
+          # "Build web bundle" step, and fail loudly here if the install didn't actually land.
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          "${CARGO_HOME:-$HOME/.cargo}/bin/wasm-bindgen" --version
           # Pin Binaryen (wasm-opt) to a known-good upstream release; the distro package is too
           # old and miscompiles wasm-bindgen's reference-types output (see release.yml for why).
           BINARYEN_VERSION=120
