@@ -42,6 +42,9 @@ pub struct BufferCandidate {
 #[derive(Debug, Clone)]
 pub struct ProjectCandidate {
     pub name: String,
+    /// Open buffers in this project with unsaved edits, counted when the candidate is built.
+    /// `0` for a project with no loaded/dirty buffers.
+    pub unsaved_buffers: u32,
 }
 
 /// One explorer-picker entry. Children of the picker's `current_path` directory; rebuilt by
@@ -519,6 +522,7 @@ impl PickerCandidates {
             },
             PickerCandidates::Projects(v) => PickerItem::Project {
                 name: v[idx].name.clone(),
+                unsaved_buffers: v[idx].unsaved_buffers,
                 match_indices,
             },
             PickerCandidates::Diagnostics(v) => {

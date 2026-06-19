@@ -711,6 +711,7 @@ mod tests {
                 (0..n)
                     .map(|i| PickerItem::Project {
                         name: format!("p{i}"),
+                        unsaved_buffers: 0,
                         match_indices: vec![],
                     })
                     .collect(),
@@ -922,6 +923,7 @@ mod tests {
         let mut s = PickerState::new(PickerKind::Grep);
         s.pending_center = Some(PickerItem::Project {
             name: "p7".into(),
+            unsaved_buffers: 0,
             match_indices: vec![],
         });
         assert!(s.apply_update(update(PickerKind::Grep, 0, 0, 10, 10)));

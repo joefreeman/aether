@@ -8990,7 +8990,10 @@ pub(crate) fn refresh_project_pickers(s: &mut ServerState) -> PendingPushes {
         let candidates = names
             .iter()
             .cloned()
-            .map(|name| picker_state::ProjectCandidate { name })
+            .map(|name| picker_state::ProjectCandidate {
+                unsaved_buffers: s.unsaved_buffer_count(&name),
+                name,
+            })
             .collect();
         let ServerState {
             pickers,
@@ -9742,10 +9745,14 @@ pub async fn picker_view(
             // `$XDG_CONFIG_HOME/aether/projects/`. No active-project check; works pre-activation.
             let names = crate::config::list_project_names()
                 .map_err(|e| RpcError::internal(format!("listing projects: {e}")))?;
+            let s = state.lock().await;
             picker_state::PickerCandidates::Projects(
                 names
                     .into_iter()
-                    .map(|name| picker_state::ProjectCandidate { name })
+                    .map(|name| picker_state::ProjectCandidate {
+                        unsaved_buffers: s.unsaved_buffer_count(&name),
+                        name,
+                    })
                     .collect(),
             )
         }

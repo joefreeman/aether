@@ -1876,13 +1876,33 @@ fn picker_item_project_is_tagged() {
     use aether_protocol::picker::PickerItem;
     let item = PickerItem::Project {
         name: "aether".into(),
+        unsaved_buffers: 0,
         match_indices: vec![0, 4],
     };
     let v = to_value(&item).unwrap();
+    // `unsaved_buffers` is omitted when zero.
     assert_eq!(
         v,
         json!({"kind": "project", "name": "aether", "match_indices": [0, 4]})
     );
+}
+
+#[test]
+fn picker_item_project_carries_unsaved_count() {
+    use aether_protocol::picker::PickerItem;
+    let item = PickerItem::Project {
+        name: "aether".into(),
+        unsaved_buffers: 3,
+        match_indices: vec![],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(
+        v,
+        json!({"kind": "project", "name": "aether", "unsaved_buffers": 3, "match_indices": []})
+    );
+    // Round-trips back to the same value.
+    let back: PickerItem = serde_json::from_value(v).unwrap();
+    assert_eq!(back, item);
 }
 
 #[test]

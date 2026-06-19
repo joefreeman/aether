@@ -1607,6 +1607,7 @@ impl Shell {
                     // and would indent it past the real project rows).
                     PickerItem::Project {
                         name: format!("+ Create project {}", pc.name),
+                        unsaved_buffers: 0,
                         match_indices: Vec::new(),
                     }
                 } else {

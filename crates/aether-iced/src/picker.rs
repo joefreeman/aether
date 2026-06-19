@@ -1208,16 +1208,22 @@ fn render_item<'a>(
         }
         PickerItem::Project {
             name,
+            unsaved_buffers,
             match_indices,
-        } => row![highlighted(
-            name,
-            match_indices,
-            theme::NORD6,
-            SANS,
-            hovered
-        )]
-        .align_y(iced::Alignment::Center)
-        .into(),
+        } => {
+            // Trailing frost-blue dot when the project has unsaved buffers — the same right-aligned
+            // dot the buffer picker shows, so the two pickers read alike.
+            let mut r = row![
+                highlighted(name, match_indices, theme::NORD6, SANS, hovered),
+                iced::widget::Space::new().width(Length::Fill),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            if *unsaved_buffers > 0 {
+                r = r.push(text("●").size(9).color(theme::NORD9));
+            }
+            r.into()
+        }
         PickerItem::LspServer {
             name,
             language,

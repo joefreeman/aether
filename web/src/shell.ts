@@ -563,7 +563,13 @@ function describePickerItem(
       return { primary: `${p ? basename(p) : `root ${item.path_index}`}/`, matches: item.match_indices, dir: true };
     }
     case "project":
-      return { primary: item.name, matches: item.match_indices };
+      // Trailing frost-blue dot when the project has unsaved buffers — the same dirty indicator
+      // the buffer picker shows, so the two pickers read alike.
+      return {
+        primary: item.name,
+        matches: item.match_indices,
+        dirty: (item.unsaved_buffers ?? 0) > 0 ? "unsaved" : undefined,
+      };
     case "lsp_server": {
       // The status bar's SVG icon in the leading cell (spinning when busy); language as the meta.
       const busy = item.status.state === "ready" && (item.progress?.length ?? 0) > 0;

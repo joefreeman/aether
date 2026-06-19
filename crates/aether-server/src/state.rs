@@ -344,6 +344,19 @@ impl ServerState {
             .collect()
     }
 
+    /// How many open buffers in `project` have unsaved edits (`Buffer::dirty`). Drives the
+    /// unsaved-count shown on each row of the project picker. `0` for a project with no loaded
+    /// buffers (the common case for a configured-but-unvisited project).
+    pub fn unsaved_buffer_count(&self, project: &str) -> u32 {
+        self.buffer_projects
+            .iter()
+            .filter(|(id, p)| {
+                p.as_str() == project
+                    && self.buffers.get(id).map(|b| b.dirty).unwrap_or(false)
+            })
+            .count() as u32
+    }
+
     /// The display number to assign a *new* scratch buffer in `project`: the lowest positive
     /// integer not already in use by another scratch there. Keeps `(scratch N)` numbers small and
     /// stable, reusing one once its buffer closes. Call before inserting the new buffer.
@@ -1470,5 +1483,39 @@ mod project_state_tests {
 
         // A different project numbers independently.
         assert_eq!(s.next_scratch_number("other"), 1);
+    }
+
+    /// `unsaved_buffer_count` counts only the dirty buffers belonging to the named project — the
+    /// number the project picker shows. Clean buffers, buffers in other projects, and dangling
+    /// associations (no buffer entry) don't count.
+    #[test]
+    fn unsaved_buffer_count_counts_dirty_buffers_per_project() {
+        let mut s = ServerState::new();
+
+        let add = |s: &mut ServerState, project: &str, dirty: bool| -> BufferId {
+            let id = s.allocate_buffer_id();
+            let mut buf = Buffer::scratch(id, None, 1);
+            buf.dirty = dirty;
+            s.buffers.insert(id, buf);
+            s.buffer_projects.insert(id, project.to_string());
+            id
+        };
+
+        add(&mut s, "alpha", true);
+        add(&mut s, "alpha", true);
+        add(&mut s, "alpha", false); // clean — not counted
+        add(&mut s, "beta", true); // other project — not counted for alpha
+
+        // A buffer_projects association with no live buffer (defensive: shouldn't panic / count).
+        let dangling = s.allocate_buffer_id();
+        s.buffer_projects.insert(dangling, "alpha".to_string());
+
+        assert_eq!(s.unsaved_buffer_count("alpha"), 2);
+        assert_eq!(s.unsaved_buffer_count("beta"), 1);
+        assert_eq!(
+            s.unsaved_buffer_count("never-loaded"),
+            0,
+            "a project with no buffers reports zero"
+        );
     }
 }

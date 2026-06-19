@@ -892,9 +892,10 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-bullet-modified { color: var(--nord13); }
 .picker-bullet-deleted,
 .picker-bullet-conflicted { color: var(--nord11); }
-/* Right-aligned buffer-state dot (buffer rows): `margin-left: auto` pushes it to the far edge.
-   Colours match the editor status bar / favicon. Sizing comes from `.buffer-status-dot`. */
-.picker-dirty-dot { margin-left: auto; }
+/* Right-aligned buffer-state dot (buffer + project rows): `margin-left: auto` pushes it to the far
+   edge. Colours match the editor status bar / favicon. Enlarged to match the status bar's `●`; the
+   `line-height: 0` keeps the bigger glyph from growing the row (same trick as `.picker-bullet`). */
+.picker-dirty-dot { margin-left: auto; font-size: 1.4em; line-height: 0; }
 .picker-dirty-unsaved { color: var(--nord9); }
 .picker-dirty-externally_modified { color: var(--nord12); }
 .picker-dirty-externally_deleted { color: var(--nord11); }

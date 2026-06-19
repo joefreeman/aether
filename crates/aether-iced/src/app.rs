@@ -4487,6 +4487,7 @@ mod tests {
                 (0..30)
                     .map(|i| PickerItem::Project {
                         name: format!("p{i}"),
+                        unsaved_buffers: 0,
                         match_indices: vec![],
                     })
                     .collect(),

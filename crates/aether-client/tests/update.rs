@@ -1444,10 +1444,12 @@ fn projects_delete_confirms_then_deletes_and_guards_active() {
         p.items = vec![
             PickerItem::Project {
                 name: "current".into(),
+                unsaved_buffers: 0,
                 match_indices: vec![],
             },
             PickerItem::Project {
                 name: "other".into(),
+                unsaved_buffers: 0,
                 match_indices: vec![],
             },
         ];
@@ -1790,6 +1792,7 @@ fn project_create_row_appears_for_a_novel_name_in_the_projects_picker() {
         offset: 0,
         items: Some(vec![PickerItem::Project {
             name: "aether".into(),
+            unsaved_buffers: 0,
             match_indices: vec![],
         }]),
         total_matches: 1,
@@ -1827,6 +1830,7 @@ fn accepting_the_projects_create_row_emits_project_create() {
             offset: 0,
             items: Some(vec![PickerItem::Project {
                 name: "aether".into(),
+                unsaved_buffers: 0,
                 match_indices: vec![],
             }]),
             total_matches: 1,

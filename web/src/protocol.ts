@@ -307,7 +307,7 @@ export type PickerItem =
       match_indices?: number[];
     }
   | { kind: "diagnostic"; line: number; col: number; end_line?: number; end_col?: number; severity: DiagnosticSeverity; message: string; match_indices?: number[] }
-  | { kind: "project"; name: string; match_indices?: number[] }
+  | { kind: "project"; name: string; unsaved_buffers?: number; match_indices?: number[] }
   | { kind: "dir_entry"; name: string; is_dir: boolean; match_indices?: number[]; git_status?: GitStatus }
   | { kind: "root"; path_index: number; match_indices?: number[] }
   | {

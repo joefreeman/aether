@@ -2920,8 +2920,10 @@ fn picker_item_spans(
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
 
-    // Trailing buffer-state dot — matches the status bar's colour-coded indicator. Goes after the
-    // display so it doesn't shift `match_indices` (which index into the display). `None` = clean.
+    // Right-aligned buffer-state dot — matches the status bar's colour-coded indicator and the
+    // rich clients' trailing dot. Rendered after the display so it doesn't shift `match_indices`
+    // (which index into the display). `None` = clean. The project picker reuses the same dot to
+    // flag projects with unsaved buffers, so the two pickers read alike.
     let (display_raw, match_indices, dot_color, italic) = match item {
         PickerItem::Buffer {
             display,
@@ -2938,8 +2940,16 @@ fn picker_item_spans(
         ),
         PickerItem::Project {
             name,
+            unsaved_buffers,
             match_indices,
-        } => (name.as_str(), match_indices.as_slice(), None, false),
+        } => (
+            name.as_str(),
+            match_indices.as_slice(),
+            // Frost-blue dot when the project has unsaved buffers, matching the unsaved buffer-dot
+            // colour; nothing when clean.
+            (*unsaved_buffers > 0).then_some(NORD9),
+            false,
+        ),
         PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
         | PickerItem::GitChange { .. }
@@ -2961,9 +2971,11 @@ fn picker_item_spans(
 
     // The dot renders as ` •` (leading space + glyph) — reserve its width so the path truncates
     // to leave room for it.
-    let dot_w = if dot_color.is_some() { 2 } else { 0 };
+    // Reserve 3 cols for the dot region: ≥1 separating space, the glyph, and a trailing space.
+    let dot_w = if dot_color.is_some() { 3 } else { 0 };
     let text_budget = max_width.saturating_sub(dot_w);
     let (display, indices) = truncate_path_with_indices(display_raw, match_indices, text_budget);
+    let display_w = display.width();
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     if indices.is_empty() {
@@ -2996,8 +3008,14 @@ fn picker_item_spans(
         }
     }
     if let Some(color) = dot_color {
-        spans.push(Span::styled(" ".to_string(), base));
+        // Pad out to the right so the dot floats flush-right, like the rich clients (iced's
+        // `Space::Fill`, the web's `margin-left:auto`). The `●` glyph is ambiguous-width — many
+        // terminals draw it two cells wide — so reserve a trailing space to keep it off the very
+        // edge. `text_budget` guarantees ≥1 col of separating padding remains.
+        let pad = max_width.saturating_sub(display_w + 2).max(1);
+        spans.push(Span::styled(" ".repeat(pad), base));
         spans.push(Span::styled(BUFFER_STATUS_DOT.to_string(), base.fg(color)));
+        spans.push(Span::styled(" ".to_string(), base));
     }
     spans
 }

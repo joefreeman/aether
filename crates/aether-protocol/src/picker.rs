@@ -359,6 +359,10 @@ pub enum PickerItem {
     /// with `project/activate`.
     Project {
         name: String,
+        /// Number of open buffers in this project with unsaved edits (`revision != saved_revision`).
+        /// `0` when the project has no dirty buffers (or isn't loaded). Absent on the wire when `0`.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        unsaved_buffers: u32,
         /// Char offsets into `name` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
