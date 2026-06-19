@@ -150,8 +150,9 @@ pub enum InsertWhere {
 pub enum Action {
     // ---- motions (extend = Shift) ----
     MoveChar(Direction),
-    MoveWord {
-        dir: Direction,
+    /// `b` / `Alt-b` — move to the previous word start. (`w` selects words via
+    /// [`Action::SelectWord`], so this is backward-only.)
+    MoveWordBack {
         boundary: WordBoundary,
     },
     MoveWordEnd {
@@ -184,6 +185,9 @@ pub enum Action {
     },
 
     // ---- selection ----
+    SelectWord {
+        boundary: WordBoundary,
+    },
     SelectLine(Direction),
     SelectAll,
     SwapAnchor,
@@ -320,7 +324,7 @@ impl Action {
         matches!(
             self,
             Action::MoveChar(_)
-                | Action::MoveWord { .. }
+                | Action::MoveWordBack { .. }
                 | Action::MoveWordEnd { .. }
                 | Action::MoveVisualLine(_)
                 | Action::MoveLogicalLine(_)
@@ -333,6 +337,7 @@ impl Action {
                 | Action::PageMotion { .. }
                 | Action::NavUnit(_)
                 | Action::NavUnitEdge { .. }
+                | Action::SelectWord { .. }
                 | Action::SelectLine(_)
                 | Action::TreeExpand
                 | Action::TreeContract
@@ -575,10 +580,10 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('v'), IgnoreShift(Mods::ALT), A::PageMotion { dir: VerticalDirection::Up, half: true }, "Motion", "Cursor up half a page"),
 
     // ---- motions: words ----
-    bind!(N, ch('w'), IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word forward"),
-    bind!(N, ch('w'), IgnoreShift(Mods::NONE), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word forward"),
-    bind!(N, ch('b'), IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::BigWord }, "Motion", "Big word backward"),
-    bind!(N, ch('b'), IgnoreShift(Mods::NONE), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::Word }, "Motion", "Small word backward"),
+    bind!(N, ch('w'), IgnoreShift(Mods::ALT), A::SelectWord { boundary: WordBoundary::BigWord }, "Selection", "Select big word"),
+    bind!(N, ch('w'), IgnoreShift(Mods::NONE), A::SelectWord { boundary: WordBoundary::Word }, "Selection", "Select word"),
+    bind!(N, ch('b'), IgnoreShift(Mods::ALT), A::MoveWordBack { boundary: WordBoundary::BigWord }, "Motion", "Big word backward"),
+    bind!(N, ch('b'), IgnoreShift(Mods::NONE), A::MoveWordBack { boundary: WordBoundary::Word }, "Motion", "Small word backward"),
     bind!(N, ch('e'), IgnoreShift(Mods::ALT), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word end"),
     bind!(N, ch('e'), Any, A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word end"),
 

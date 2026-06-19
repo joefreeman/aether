@@ -24,9 +24,10 @@ use aether_protocol::buffer::{
 use aether_protocol::cursor::Direction;
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams, CursorRedo,
-    CursorSelectAll, CursorSelectAllParams, CursorSelectLine, CursorSelectLineParams, CursorSet,
-    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
-    CursorUndoParams, CursorUndoResult, Granularity, Motion, SelectionEdge,
+    CursorSelectAll, CursorSelectAllParams, CursorSelectLine, CursorSelectLineParams,
+    CursorSelectWord, CursorSelectWordParams, CursorSet, CursorSetParams, CursorState,
+    CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
+    Granularity, Motion, SelectionEdge,
 };
 use aether_protocol::directory::{
     DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryList,
@@ -4300,12 +4301,13 @@ impl Session {
         match action {
             // ---- motions ----
             A::MoveChar(direction) => self.move_motion(Motion::Char { direction, count }, extend),
-            A::MoveWord { dir, boundary } => self.move_motion(
+            // `b` / `Alt-b` — `w` now selects words (`CursorSelectWord`), so the only word *motion*
+            // left in the keymap is the backward one.
+            A::MoveWordBack { boundary } => self.move_motion(
                 Motion::Word {
-                    direction: dir,
+                    direction: Direction::Backward,
                     count,
                     boundary,
-                    exclusive: dir == Direction::Forward && extend,
                 },
                 extend,
             ),
@@ -4392,6 +4394,15 @@ impl Session {
             }
 
             // ---- selection ----
+            A::SelectWord { boundary } => self.request_str::<CursorSelectWord>(
+                CursorSelectWordParams {
+                    buffer_id,
+                    boundary,
+                    extend,
+                    count,
+                },
+                Event::CursorMsg,
+            ),
             A::SelectLine(direction) => self.request_str::<CursorSelectLine>(
                 CursorSelectLineParams {
                     buffer_id,

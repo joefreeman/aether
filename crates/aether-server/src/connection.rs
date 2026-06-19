@@ -16,7 +16,7 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorContract, CursorExpand, CursorMove, CursorRedo, CursorSelectAll, CursorSelectLine,
-    CursorSet, CursorSwapAnchor, CursorUndo,
+    CursorSelectWord, CursorSet, CursorSwapAnchor, CursorUndo,
 };
 use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::envelope::{
@@ -391,6 +391,7 @@ async fn dispatch(
         CursorSet::NAME => run!(CursorSet, handlers::cursor_set),
         CursorSelectLine::NAME => run!(CursorSelectLine, handlers::cursor_select_line),
         CursorSelectAll::NAME => run!(CursorSelectAll, handlers::cursor_select_all),
+        CursorSelectWord::NAME => run!(CursorSelectWord, handlers::cursor_select_word),
         CursorSwapAnchor::NAME => run!(CursorSwapAnchor, handlers::cursor_swap_anchor),
         CursorUndo::NAME => run!(CursorUndo, handlers::cursor_undo),
         CursorExpand::NAME => run!(CursorExpand, handlers::cursor_expand),

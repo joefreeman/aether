@@ -43,11 +43,6 @@ pub enum Motion {
         direction: Direction,
         count: u32,
         boundary: WordBoundary,
-        /// When `true`, a `Forward` motion stops one character before the start of the next word
-        /// (so a selection built from this motion doesn't include the next word's first char).
-        /// Ignored for `Backward` — the analogous "stop just past the previous word" position is
-        /// already what `WordEnd { Backward }` returns.
-        exclusive: bool,
     },
     /// Word *end* — moves to the last char of the word (vim's `e`).
     WordEnd {
@@ -264,6 +259,35 @@ pub struct CursorSelectLineParams {
     pub direction: Direction,
     pub extend: bool,
     /// Select this many lines (`0` = `1`) — the repeat loop lives server-side.
+    #[serde(
+        default = "crate::count_one",
+        skip_serializing_if = "crate::count_is_one"
+    )]
+    pub count: u32,
+}
+
+// ---- cursor/select_word -------------------------------------------------------------------------
+
+/// `w` / `Alt-w` — select a word. The first press grabs the word under the cursor (anchor to its
+/// start, cursor to its end); a repeat press advances to the next word. With `extend` the advance
+/// keeps the existing anchor, growing the selection by a word instead of replacing it. Single-char
+/// words are stepped over rather than dwelt on (a point cursor on a one-char word is
+/// indistinguishable from that word already being selected, so the gesture keeps moving forward).
+/// Returns the new cursor state. See `resolve_select_word` server-side for the exact rule.
+pub struct CursorSelectWord;
+impl RpcMethod for CursorSelectWord {
+    const NAME: &'static str = "cursor/select_word";
+    type Params = CursorSelectWordParams;
+    type Result = CursorState;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CursorSelectWordParams {
+    pub buffer_id: BufferId,
+    pub boundary: WordBoundary,
+    pub extend: bool,
+    /// Repeat the select this many times (`0` = `1`) — the repeat loop lives server-side, so
+    /// `3w` selects the third word (or, with `extend`, grows the selection by three words).
     #[serde(
         default = "crate::count_one",
         skip_serializing_if = "crate::count_is_one"

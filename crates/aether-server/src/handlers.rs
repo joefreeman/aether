@@ -18,8 +18,8 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams,
-    CursorSetParams, CursorState, CursorSwapAnchorParams, CursorUndoParams, CursorUndoResult,
-    Direction, Granularity, GrepPosition, Motion, VerticalDirection,
+    CursorSelectWordParams, CursorSetParams, CursorState, CursorSwapAnchorParams, CursorUndoParams,
+    CursorUndoResult, Direction, Granularity, GrepPosition, Motion, VerticalDirection,
 };
 use aether_protocol::directory::{
     DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryListParams,
@@ -5614,6 +5614,55 @@ pub async fn cursor_move(
             s.virtual_col.remove(&key);
         }
     }
+    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
+    let response = wrap_for_response(&s, client_id, params.buffer_id, new_state);
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
+    Ok(response)
+}
+
+/// `w` / `Alt-w` — select a word. Sets both anchor and cursor (so it can't go through
+/// `cursor/move`, which only moves the cursor and derives the anchor); the per-press logic and
+/// the `count` repeat loop live in [`motion::resolve_select_word`] and here respectively.
+pub async fn cursor_select_word(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CursorSelectWordParams,
+) -> Result<CursorState, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let key = (client_id, params.buffer_id);
+    let original = s.cursors.get(&key).copied().unwrap_or_default();
+
+    // The repeat loop lives server-side (`3w` = one round-trip).
+    let mut working = original;
+    for _ in 0..params.count.max(1) {
+        let (position, anchor) = motion::resolve_select_word(
+            buf,
+            working.position,
+            working.anchor,
+            params.boundary,
+            params.extend,
+        );
+        working = CursorState {
+            position,
+            anchor,
+            match_bracket: None,
+            grep_position: None,
+        };
+    }
+    let new_state = working;
+
+    s.cursors.insert(key, new_state);
+    s.record_motion(key, original, new_state);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
+    s.virtual_col.remove(&key);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
     let response = wrap_for_response(&s, client_id, params.buffer_id, new_state);
     drop(s);

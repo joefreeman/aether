@@ -4,8 +4,8 @@
 
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::{
-    CursorMove, CursorMoveParams, CursorSet, CursorSetParams, CursorState, Direction, Granularity,
-    Motion, SelectionEdge, WordBoundary,
+    CursorMove, CursorMoveParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
+    CursorSetParams, CursorState, Direction, Granularity, Motion, SelectionEdge, WordBoundary,
 };
 use aether_protocol::directory::{
     DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryList,
@@ -417,12 +417,11 @@ fn motion_is_internally_tagged() {
         direction: Direction::Forward,
         count: 2,
         boundary: WordBoundary::BigWord,
-        exclusive: false,
     };
     let v = to_value(&m).unwrap();
     assert_eq!(
         v,
-        json!({"kind": "word", "direction": "forward", "count": 2, "boundary": "WORD", "exclusive": false})
+        json!({"kind": "word", "direction": "forward", "count": 2, "boundary": "WORD"})
     );
 
     let m = Motion::Goto {
@@ -454,6 +453,47 @@ fn cursor_move_params_use_motion() {
             "extend_selection": true,
         })
     );
+}
+
+#[test]
+fn cursor_select_word_params_shape() {
+    use aether_protocol::envelope::RpcMethod;
+    assert_eq!(CursorSelectWord::NAME, "cursor/select_word");
+
+    // count == 1 (the default) is omitted on the wire.
+    let v = to_value(CursorSelectWordParams {
+        buffer_id: 3,
+        boundary: WordBoundary::Word,
+        extend: true,
+        count: 1,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 3, "boundary": "word", "extend": true})
+    );
+
+    // A non-default count rides along; BigWord serialises as "WORD".
+    let v = to_value(CursorSelectWordParams {
+        buffer_id: 3,
+        boundary: WordBoundary::BigWord,
+        extend: false,
+        count: 4,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 3, "boundary": "WORD", "extend": false, "count": 4})
+    );
+
+    // Omitted count defaults to 1.
+    let p: CursorSelectWordParams = from_value(json!({
+        "buffer_id": 3,
+        "boundary": "word",
+        "extend": false,
+    }))
+    .unwrap();
+    assert_eq!(p.count, 1);
 }
 
 #[test]

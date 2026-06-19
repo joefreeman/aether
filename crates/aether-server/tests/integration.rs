@@ -9,9 +9,10 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
-    CursorSelectLine, CursorSelectLineParams, CursorSet, CursorSetParams, CursorState,
-    CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
-    Direction, Granularity, Motion, SelectionEdge, VerticalDirection, WordBoundary,
+    CursorSelectLine, CursorSelectLineParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
+    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo,
+    CursorUndoParams, CursorUndoResult, Direction, Granularity, Motion, SelectionEdge,
+    VerticalDirection, WordBoundary,
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
@@ -1110,6 +1111,236 @@ async fn select_all_spans_the_whole_buffer() {
         send_request::<CursorSelectAll>(&mut ws, 10, &CursorSelectAllParams { buffer_id }).await;
     assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 2, col: 5 }); // end of "gamma"
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_word_snaps_then_walks_word_by_word() {
+    // "alpha beta gamma": cols 0..4 / 6..9 / 11..15.
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta gamma\n").await;
+
+    let select_word = |extend| CursorSelectWordParams {
+        buffer_id,
+        boundary: WordBoundary::Word,
+        extend,
+        count: 1,
+    };
+
+    // Put a point cursor in the middle of "alpha".
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        9,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+            granularity: Granularity::Char,
+        },
+    )
+    .await;
+
+    // First press: anchor (col 2) is after the word start, so the selection snaps onto "alpha".
+    let st: CursorState = send_request::<CursorSelectWord>(&mut ws, 10, &select_word(false)).await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 4 });
+
+    // Word already selected from its start → advance to "beta".
+    let st: CursorState = send_request::<CursorSelectWord>(&mut ws, 11, &select_word(false)).await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 6 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 9 });
+
+    // Repeated press keeps making progress → "gamma".
+    let st: CursorState = send_request::<CursorSelectWord>(&mut ws, 12, &select_word(false)).await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 11 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 15 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_word_extend_grows_the_selection() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta gamma\n").await;
+
+    let select_word = |extend| CursorSelectWordParams {
+        buffer_id,
+        boundary: WordBoundary::Word,
+        extend,
+        count: 1,
+    };
+
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        9,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+            granularity: Granularity::Char,
+        },
+    )
+    .await;
+
+    // Shift + first press: anchor after word start → same as non-extend, select "alpha".
+    let st: CursorState = send_request::<CursorSelectWord>(&mut ws, 10, &select_word(true)).await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 4 });
+
+    // Shift + again: anchor stays at the start, cursor grows to include "beta".
+    let st: CursorState = send_request::<CursorSelectWord>(&mut ws, 11, &select_word(true)).await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 9 });
+
+    // And once more to include "gamma".
+    let st: CursorState = send_request::<CursorSelectWord>(&mut ws, 12, &select_word(true)).await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 15 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_big_word_spans_punctuation() {
+    // "foo.bar baz": as a small word, "foo" / "." / "bar"; as a WORD, "foo.bar" is one run.
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo.bar baz\n").await;
+
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        9,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+            granularity: Granularity::Char,
+        },
+    )
+    .await;
+
+    let st: CursorState = send_request::<CursorSelectWord>(
+        &mut ws,
+        10,
+        &CursorSelectWordParams {
+            buffer_id,
+            boundary: WordBoundary::BigWord,
+            extend: false,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 6 }); // last char of "foo.bar"
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_word_first_press_grabs_word_even_at_its_start() {
+    // A point cursor sitting on the *first* char of "alpha" still grabs the whole word — the
+    // first press never skips the word under the cursor.
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta\n").await;
+
+    // The cursor starts at the origin, i.e. col 0 of "alpha".
+    let st: CursorState = send_request::<CursorSelectWord>(
+        &mut ws,
+        10,
+        &CursorSelectWordParams {
+            buffer_id,
+            boundary: WordBoundary::Word,
+            extend: false,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 4 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_word_steps_over_single_char_words() {
+    // "a bb cc": 'a' is a one-char word. A point cursor on it is indistinguishable from "a"
+    // already being selected, so `w` keeps moving forward — landing on "bb" — rather than
+    // dwelling and getting stuck.
+    let (server, mut ws, buffer_id) = setup_with_buffer("a bb cc\n").await;
+
+    let select = || CursorSelectWordParams {
+        buffer_id,
+        boundary: WordBoundary::Word,
+        extend: false,
+        count: 1,
+    };
+
+    // Cursor starts at the origin, on the one-char word "a".
+    let st: CursorState = send_request::<CursorSelectWord>(&mut ws, 10, &select()).await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 2 }); // "bb"
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
+
+    // And again → "cc".
+    let st: CursorState = send_request::<CursorSelectWord>(&mut ws, 11, &select()).await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 5 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 6 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_word_count_selects_the_nth_word() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta gamma\n").await;
+
+    // The cursor starts at the origin — inside "alpha". The first step grabs "alpha", the second
+    // advances to "beta". So `count: 2` lands the selection on "beta" in a single round-trip.
+    let st: CursorState = send_request::<CursorSelectWord>(
+        &mut ws,
+        10,
+        &CursorSelectWordParams {
+            buffer_id,
+            boundary: WordBoundary::Word,
+            extend: false,
+            count: 2,
+        },
+    )
+    .await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 6 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 9 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_word_on_last_word_is_a_stable_end_state() {
+    // Single word, then end-of-buffer: pressing `w` from the start selects it and stays put
+    // rather than collapsing to a point or panicking past the buffer end.
+    let (server, mut ws, buffer_id) = setup_with_buffer("hi\n").await;
+
+    let st: CursorState = send_request::<CursorSelectWord>(
+        &mut ws,
+        10,
+        &CursorSelectWordParams {
+            buffer_id,
+            boundary: WordBoundary::Word,
+            extend: false,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 1 });
+
+    // A second press has nowhere to advance to → selection is unchanged.
+    let st: CursorState = send_request::<CursorSelectWord>(
+        &mut ws,
+        11,
+        &CursorSelectWordParams {
+            buffer_id,
+            boundary: WordBoundary::Word,
+            extend: false,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 1 });
 
     drop(server);
 }
@@ -4457,7 +4688,6 @@ async fn word_motion_forward_and_back() {
                 direction: Direction::Forward,
                 count: 1,
                 boundary: WordBoundary::Word,
-                exclusive: false,
             },
             extend_selection: false,
         },
@@ -4475,7 +4705,6 @@ async fn word_motion_forward_and_back() {
                 direction: Direction::Forward,
                 count: 1,
                 boundary: WordBoundary::Word,
-                exclusive: false,
             },
             extend_selection: false,
         },
@@ -4504,7 +4733,6 @@ async fn word_motion_forward_and_back() {
                 direction: Direction::Forward,
                 count: 1,
                 boundary: WordBoundary::BigWord,
-                exclusive: false,
             },
             extend_selection: false,
         },
@@ -4521,7 +4749,6 @@ async fn word_motion_forward_and_back() {
                 direction: Direction::Forward,
                 count: 1,
                 boundary: WordBoundary::BigWord,
-                exclusive: false,
             },
             extend_selection: false,
         },
@@ -4539,7 +4766,6 @@ async fn word_motion_forward_and_back() {
                 direction: Direction::Backward,
                 count: 1,
                 boundary: WordBoundary::Word,
-                exclusive: false,
             },
             extend_selection: false,
         },
@@ -5432,53 +5658,6 @@ async fn swap_anchor_with_no_selection_is_noop() {
     drop(server);
 }
 
-// ---- Motion::Word { exclusive: true } -----------------------------------------------------------
-
-#[tokio::test]
-async fn word_motion_exclusive_progresses_across_boundaries() {
-    let (server, mut ws, buffer_id) = setup_with_buffer("hello world foo\n").await;
-
-    // From 'h' (col 0), exclusive forward Word — lands on space before "world".
-    let st: CursorState = send_request::<CursorMove>(
-        &mut ws,
-        10,
-        &CursorMoveParams {
-            buffer_id,
-            motion: Motion::Word {
-                direction: Direction::Forward,
-                count: 1,
-                boundary: WordBoundary::Word,
-                exclusive: true,
-            },
-            extend_selection: true,
-        },
-    )
-    .await;
-    assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
-    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
-
-    // Repeated press from the space — pre-advance kicks in so we skip "world" entirely and
-    // land on the space before "foo" (col 11), rather than getting stuck.
-    let st: CursorState = send_request::<CursorMove>(
-        &mut ws,
-        11,
-        &CursorMoveParams {
-            buffer_id,
-            motion: Motion::Word {
-                direction: Direction::Forward,
-                count: 1,
-                boundary: WordBoundary::Word,
-                exclusive: true,
-            },
-            extend_selection: true,
-        },
-    )
-    .await;
-    assert_eq!(st.position, LogicalPosition { line: 0, col: 11 });
-
-    drop(server);
-}
-
 // ---- cursor/undo and cursor/redo --------------------------------------------------------------
 
 #[tokio::test]
@@ -5771,42 +5950,6 @@ async fn motion_undo_records_select_line_and_swap() {
     assert!(r.applied);
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
     assert_eq!(r.cursor.anchor, r.cursor.position);
-
-    drop(server);
-}
-
-#[tokio::test]
-async fn word_motion_exclusive_at_buffer_end_does_not_move_past() {
-    let (server, mut ws, buffer_id) = setup_with_buffer("hello").await;
-
-    // Cursor on last char.
-    send_request::<CursorSet>(
-        &mut ws,
-        10,
-        &CursorSetParams {
-            granularity: Granularity::Char,
-            buffer_id,
-            position: LogicalPosition { line: 0, col: 4 },
-            anchor: LogicalPosition { line: 0, col: 4 },
-        },
-    )
-    .await;
-    let st: CursorState = send_request::<CursorMove>(
-        &mut ws,
-        11,
-        &CursorMoveParams {
-            buffer_id,
-            motion: Motion::Word {
-                direction: Direction::Forward,
-                count: 1,
-                boundary: WordBoundary::Word,
-                exclusive: true,
-            },
-            extend_selection: false,
-        },
-    )
-    .await;
-    assert_eq!(st.position, LogicalPosition { line: 0, col: 4 });
 
     drop(server);
 }

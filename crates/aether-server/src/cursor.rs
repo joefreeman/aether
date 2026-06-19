@@ -199,33 +199,12 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
             direction,
             count,
             boundary,
-            exclusive,
         } => {
-            let orig_start = pos_to_char(buf, current);
-            let mut end = match direction {
-                Direction::Forward => {
-                    // For exclusive forward, advance start by one char before computing. Without
-                    // this, sitting right before a word boundary (the natural resting place of a
-                    // previous exclusive press) would degenerate to a no-op: the naive
-                    // `word_forward_start` would advance by exactly 1, then the exclusive
-                    // subtraction below would undo it. The pre-advance ensures repeated presses
-                    // keep making progress.
-                    let s = if *exclusive {
-                        (orig_start + 1).min(buf.text.len_chars())
-                    } else {
-                        orig_start
-                    };
-                    word_forward_start(&buf.text, s, *boundary, *count)
-                }
-                Direction::Backward => {
-                    word_backward_start(&buf.text, orig_start, *boundary, *count)
-                }
+            let start = pos_to_char(buf, current);
+            let end = match direction {
+                Direction::Forward => word_forward_start(&buf.text, start, *boundary, *count),
+                Direction::Backward => word_backward_start(&buf.text, start, *boundary, *count),
             };
-            // Exclusive forward stops one char before the destination word boundary, provided
-            // the motion actually advanced.
-            if *exclusive && matches!(direction, Direction::Forward) && end > orig_start {
-                end -= 1;
-            }
             char_to_pos(buf, end)
         }
         Motion::WordEnd {
@@ -930,25 +909,20 @@ fn word_backward_end(
     i
 }
 
-/// Inclusive (start, end) of the same-category char run containing `pos` — the "word" a
-/// double-click selects. Runs follow `WordBoundary::Word` categories (word chars / symbols /
-/// whitespace), except a newline never joins a run: clicking at end-of-line selects just the
-/// line-end position rather than a whitespace run spilling into the next line's indentation.
-pub fn word_run(buf: &Buffer, pos: LogicalPosition) -> (LogicalPosition, LogicalPosition) {
-    let rope = &buf.text;
+/// Inclusive `(start, end)` char indices of the same-category run containing char `i`. Runs
+/// follow `boundary`'s categories (word chars / symbols / whitespace), except a newline never
+/// joins a run: it's always its own one-char unit. `i >= total` returns `(i, i)`.
+fn word_run_bounds(rope: &ropey::Rope, i: usize, boundary: WordBoundary) -> (usize, usize) {
     let total = rope.len_chars();
-    let i = pos_to_char(buf, pos);
     if i >= total {
-        let p = char_to_pos(buf, i);
-        return (p, p);
+        return (i, i);
     }
     let c = rope.char(i);
     if c == '\n' {
-        let p = char_to_pos(buf, i);
-        return (p, p);
+        return (i, i);
     }
-    let cat = char_cat(c, WordBoundary::Word);
-    let joins = |c: char| c != '\n' && char_cat(c, WordBoundary::Word) == cat;
+    let cat = char_cat(c, boundary);
+    let joins = |c: char| c != '\n' && char_cat(c, boundary) == cat;
     let mut start = i;
     while start > 0 && joins(rope.char(start - 1)) {
         start -= 1;
@@ -957,7 +931,70 @@ pub fn word_run(buf: &Buffer, pos: LogicalPosition) -> (LogicalPosition, Logical
     while end + 1 < total && joins(rope.char(end + 1)) {
         end += 1;
     }
+    (start, end)
+}
+
+/// Inclusive (start, end) of the same-category char run containing `pos` — the "word" a
+/// double-click selects. Runs follow `WordBoundary::Word` categories (word chars / symbols /
+/// whitespace), except a newline never joins a run: clicking at end-of-line selects just the
+/// line-end position rather than a whitespace run spilling into the next line's indentation.
+pub fn word_run(buf: &Buffer, pos: LogicalPosition) -> (LogicalPosition, LogicalPosition) {
+    let (start, end) = word_run_bounds(&buf.text, pos_to_char(buf, pos), WordBoundary::Word);
     (char_to_pos(buf, start), char_to_pos(buf, end))
+}
+
+/// Resolve the `w` / `Alt-w` "select word" gesture, returning the new `(position, anchor)`.
+///
+/// "The word" is the run containing the cursor (`word_run_bounds` under `boundary`). The first
+/// press *grabs* that word — anchor to its start, cursor to its end — and a repeat press advances
+/// to the next word. Whether a press grabs or advances is decided by where the selection already
+/// sits:
+///
+/// - **Hop** (`!extend`): advance only once the selection already covers exactly the current word,
+///   forward-oriented (`anchor == start && cursor == end`). A bare point cursor satisfies this
+///   only on a *single-char* word (`start == end`), so multi-char words are grabbed first and
+///   single-char words are stepped over — there's no way to tell a point resting on a one-char
+///   word apart from that word already being selected, so we keep moving to guarantee progress.
+/// - **Grow** (`extend`): advance once the cursor sits on its word's last char (`cursor == end`),
+///   keeping the anchor put so the selection grows by a word. A point on a single-char word is
+///   already on that edge, which is what keeps repeated `Shift-w` presses making progress.
+///
+/// On advance, a hop moves the anchor to the next word's start; a grow leaves it. When there is no
+/// next word the selection stays put (a stable end state rather than a destructive no-op).
+pub fn resolve_select_word(
+    buf: &Buffer,
+    position: LogicalPosition,
+    anchor: LogicalPosition,
+    boundary: WordBoundary,
+    extend: bool,
+) -> (LogicalPosition, LogicalPosition) {
+    let rope = &buf.text;
+    let total = rope.len_chars();
+    let cursor = pos_to_char(buf, position);
+    let anchor_char = pos_to_char(buf, anchor);
+    let (word_start, word_end) = word_run_bounds(rope, cursor, boundary);
+
+    let advance = if extend {
+        cursor == word_end
+    } else {
+        anchor_char == word_start && cursor == word_end
+    };
+
+    if !advance {
+        // Grab the whole word under the cursor: anchor to its start, cursor to its end.
+        (char_to_pos(buf, word_end), char_to_pos(buf, word_start))
+    } else {
+        let next_start = word_forward_start(rope, cursor, boundary, 1);
+        if next_start >= total {
+            // No next word: leave the selection on the current word.
+            let new_anchor = if extend { anchor_char } else { word_start };
+            (char_to_pos(buf, word_end), char_to_pos(buf, new_anchor))
+        } else {
+            let (_, next_end) = word_run_bounds(rope, next_start, boundary);
+            let new_anchor = if extend { anchor_char } else { next_start };
+            (char_to_pos(buf, next_end), char_to_pos(buf, new_anchor))
+        }
+    }
 }
 
 /// Expand a `(position, anchor)` pair outward to `granularity` boundaries, preserving which end
