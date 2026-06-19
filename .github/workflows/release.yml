@@ -31,21 +31,21 @@ jobs:
         with:
           node-version: "20"
 
-      # wasm-bindgen-cli must match the wasm-bindgen crate in Cargo.lock (mismatch fails at runtime).
-      - uses: cargo-bins/cargo-binstall@main
-      - name: Install wasm tooling
+      # wasm-bindgen-cli — pinned to match the wasm-bindgen crate in Cargo.lock (a mismatch fails
+      # at runtime). install-action is cache-aware and doesn't go through cargo's install ledger,
+      # so it can't desync from rust-cache the way `cargo binstall` did.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.104
+
+      # Binaryen (wasm-opt) — no first-class pinned installer exists, and the distro/brew package
+      # is too old: it miscompiles wasm-bindgen's reference-types output (mis-points the
+      # externref-table export → "failed to grow table" in the web client at boot). Fetch a pinned
+      # official release; keep BINARYEN_VERSION in sync with ci.yml.
+      - name: Install wasm-opt (binaryen)
         shell: bash
         run: |
           set -euo pipefail
-          cargo binstall -y wasm-bindgen-cli@0.2.104
-          # binstall drops wasm-bindgen in the cargo bin dir — put it on PATH for the later
-          # "Build web bundle" step, and fail loudly here if the install didn't actually land.
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
-          "${CARGO_HOME:-$HOME/.cargo}/bin/wasm-bindgen" --version
-          # Pin Binaryen (wasm-opt) to a known-good upstream release. The distro/brew package
-          # lags, and an older wasm-opt miscompiles wasm-bindgen's reference-types output —
-          # it mis-points the externref-table export, so the web client throws
-          # "failed to grow table" at boot. Keep this in sync with ci.yml.
           BINARYEN_VERSION=120
           if [ "$RUNNER_OS" = "macOS" ]; then
             asset="binaryen-version_${BINARYEN_VERSION}-arm64-macos.tar.gz"
