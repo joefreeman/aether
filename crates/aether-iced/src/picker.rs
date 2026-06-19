@@ -945,12 +945,7 @@ fn git_change_summary<'a>(stage: DiffStage, added: u32, removed: u32) -> Element
         theme::GIT_DELETED
     };
     let mut spans: Vec<iced::widget::text::Span<'a>> = Vec::new();
-    let count = |text: String, color| {
-        iced::widget::span(text)
-            .size(12)
-            .font(SANS)
-            .color(color)
-    };
+    let count = |text: String, color| iced::widget::span(text).size(12).font(SANS).color(color);
     // `-R` then `+A`, so additions sit flush against the right edge (diffstat-style).
     if removed > 0 {
         spans.push(count(format!("-{removed}"), removed_color));

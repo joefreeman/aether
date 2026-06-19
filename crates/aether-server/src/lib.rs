@@ -11,6 +11,7 @@ mod handlers;
 mod http;
 mod indent;
 mod lsp;
+mod number;
 mod picker;
 mod server;
 mod state;

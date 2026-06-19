@@ -42,12 +42,12 @@ use aether_protocol::git::{
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CountedEditParams, EditResult, InputBackspace, InputChangeLine, InputDedent,
-    InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
-    InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams, InputRedo,
-    InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams, InputText,
-    InputTextParams, InputToggleComment, InputUndo, InputUnsurround, InputUnsurroundParams,
-    LineSide, UndoResult,
+    BufferOnlyParams, CountedEditParams, EditResult, InputBackspace, InputChangeLine,
+    InputDecrementNumber, InputDedent, InputDelete, InputDeleteLine, InputIncrementNumber,
+    InputIndent, InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent,
+    InputOpenLine, InputOpenLineParams, InputRedo, InputReplaceLine, InputReplaceLineParams,
+    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
+    InputUnsurround, InputUnsurroundParams, LineSide, UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -4585,6 +4585,8 @@ impl Session {
             A::JoinLines => self.repeat_edit::<InputJoinLines>(count),
             A::Indent => self.repeat_edit::<InputIndent>(count),
             A::Dedent => self.repeat_edit::<InputDedent>(count),
+            A::IncrementNumber => self.repeat_edit::<InputIncrementNumber>(count),
+            A::DecrementNumber => self.repeat_edit::<InputDecrementNumber>(count),
             A::ToggleComment => self.edit::<InputToggleComment>(BufferOnlyParams { buffer_id }),
             A::OpenLineBelow | A::OpenLineAbove => {
                 // Vim's `o`/`O` as one server-side edit (park, open, land — smart indent

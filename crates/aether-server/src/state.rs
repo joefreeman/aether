@@ -351,8 +351,7 @@ impl ServerState {
         self.buffer_projects
             .iter()
             .filter(|(id, p)| {
-                p.as_str() == project
-                    && self.buffers.get(id).map(|b| b.dirty).unwrap_or(false)
+                p.as_str() == project && self.buffers.get(id).map(|b| b.dirty).unwrap_or(false)
             })
             .count() as u32
     }

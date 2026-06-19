@@ -1638,7 +1638,7 @@ mod tests {
         let root = dir.path();
         repo_with_files(root, &[("a.rs", "one\ntwo\nthree\n"), ("clean.rs", "x\n")]);
         std::fs::write(root.join("a.rs"), "one\nTWO\nthree\n").unwrap(); // a modification
-        // A wholly-new directory with several files (must collapse), plus a lone new file.
+                                                                         // A wholly-new directory with several files (must collapse), plus a lone new file.
         std::fs::create_dir_all(root.join("junk")).unwrap();
         std::fs::write(root.join("junk/x.rs"), "x\n").unwrap();
         std::fs::write(root.join("junk/y.rs"), "y\n").unwrap();

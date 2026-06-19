@@ -22,11 +22,11 @@ use aether_protocol::git::{
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CountedEditParams, EditResult, InputBackspace, InputDedent, InputIndent,
-    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine,
-    InputOpenLineParams, InputRedo, InputSurround, InputSurroundParams, InputText, InputTextParams,
-    InputToggleComment, InputUndo, InputUnsurround, InputUnsurroundParams, LineSide,
-    SurroundTarget, UndoResult,
+    BufferOnlyParams, CountedEditParams, EditResult, InputBackspace, InputDecrementNumber,
+    InputDedent, InputIncrementNumber, InputIndent, InputJoinLines, InputMoveLines,
+    InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams, InputRedo,
+    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
+    InputUnsurround, InputUnsurroundParams, LineSide, SurroundTarget, UndoResult,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -5937,6 +5937,305 @@ async fn dedent_strips_two_spaces() {
 }
 
 #[tokio::test]
+async fn increment_number_selects_the_result() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo 42 bar\n123\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 4 },
+            anchor: LogicalPosition { line: 0, col: 4 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 12, buffer_id).await,
+        "foo 43 bar\n123\n"
+    );
+    // The whole result is selected: anchor on the first digit, cursor on the last.
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 4 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn increment_selection_grows_with_digit_count() {
+    // `9` → `10`: a single-char selection becomes a two-char one covering the wider number, and a
+    // second increment keeps tracking it (`10` → `11`).
+    let (server, mut ws, buffer_id) = setup_with_buffer("x 9\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "x 10\n");
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 3 });
+
+    // The maintained selection lets a follow-up press operate on the same number.
+    let r: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        13,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 14, buffer_id).await, "x 11\n");
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 3 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn decrement_selection_shrinks_with_digit_count() {
+    // `100` → `99`: the three-char number narrows to a two-char selection.
+    let (server, mut ws, buffer_id) = setup_with_buffer("x 100\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 4 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputDecrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "x 99\n");
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 3 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn increment_partial_selection_adjusts_only_selected_digits() {
+    // Select `23` out of `1234`; only that part increments → `1244`, with `24` left selected.
+    let (server, mut ws, buffer_id) = setup_with_buffer("1234\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            anchor: LogicalPosition { line: 0, col: 1 },
+            position: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "1244\n");
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 1 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn increment_non_integer_selection_is_a_noop() {
+    // The selection spans a non-numeric run (`12b`); it stays untouched even though a valid number
+    // (`5`) sits later on the line — the selection path never falls back to scanning.
+    let (server, mut ws, buffer_id) = setup_with_buffer("a12b 5\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            anchor: LogicalPosition { line: 0, col: 1 },
+            position: LogicalPosition { line: 0, col: 3 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "a12b 5\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn increment_scans_forward_to_first_number_on_line() {
+    // Cursor sits before the number; the scan finds it later on the same line.
+    let (server, mut ws, buffer_id) = setup_with_buffer("count = 9\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "count = 10\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn decrement_crosses_zero_into_negative() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("x 0\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputDecrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "x -1\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn increment_count_applies_in_one_step() {
+    // `5 Ctrl-e` adds 5 in a single undoable edit; one undo restores the original.
+    let (server, mut ws, buffer_id) = setup_with_buffer("v 10\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 5,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "v 15\n");
+    let _: aether_protocol::input::UndoResult = send_request::<InputUndo>(
+        &mut ws,
+        13,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 14, buffer_id).await, "v 10\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn increment_with_no_number_is_a_noop() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("no digits here\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 12, buffer_id).await,
+        "no digits here\n"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn indent_multi_line_selection() {
     let (server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\n").await;
     send_request::<CursorSet>(
@@ -8486,7 +8785,9 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
 
-    let server = spawn_for_test("changes-proj", vec![dir_path]).await.unwrap();
+    let server = spawn_for_test("changes-proj", vec![dir_path])
+        .await
+        .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -8690,7 +8991,11 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
     .await;
     let update = view.update.expect("window rides the response");
     let items = update.items();
-    assert_eq!(items.len(), 1, "the unsaved buffer edit shows, got {items:?}");
+    assert_eq!(
+        items.len(),
+        1,
+        "the unsaved buffer edit shows, got {items:?}"
+    );
     let PickerItem::GitChange {
         relative_path,
         preview,
@@ -8700,7 +9005,10 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
         panic!("expected GitChange, got {:?}", items[0]);
     };
     assert_eq!(relative_path, "a.rs");
-    assert_eq!(preview, "one!", "preview reflects the live buffer, not disk");
+    assert_eq!(
+        preview, "one!",
+        "preview reflects the live buffer, not disk"
+    );
 
     drop(server);
 }
@@ -8816,7 +9124,11 @@ async fn git_changes_picker_query_greps_diff_content() {
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.generation, 1);
     let items = update.items();
-    assert_eq!(items.len(), 1, "only the hunk whose content matches, got {items:?}");
+    assert_eq!(
+        items.len(),
+        1,
+        "only the hunk whose content matches, got {items:?}"
+    );
     let PickerItem::GitChange {
         relative_path,
         preview,
@@ -8827,8 +9139,14 @@ async fn git_changes_picker_query_greps_diff_content() {
         panic!("expected GitChange, got {:?}", items[0]);
     };
     assert_eq!(relative_path, "a.rs");
-    assert_eq!(preview, "beta MARKER", "previews the matched line, not the first changed line");
-    assert!(!match_indices.is_empty(), "the match within the preview is highlighted");
+    assert_eq!(
+        preview, "beta MARKER",
+        "previews the matched line, not the first changed line"
+    );
+    assert!(
+        !match_indices.is_empty(),
+        "the match within the preview is highlighted"
+    );
 
     drop(server);
 }
@@ -8839,7 +9157,11 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "a.rs", "l0\nl1\nl2\n");
     // Insert two lines after l0; the MARKER is on the *second* inserted line.
-    std::fs::write(dir.path().join("a.rs"), "l0\nadded one\nadded two MARKER\nl1\nl2\n").unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "l0\nadded one\nadded two MARKER\nl1\nl2\n",
+    )
+    .unwrap();
     let dir_path = dir.path().to_path_buf();
     std::mem::forget(dir);
 
@@ -8901,7 +9223,10 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
         panic!("expected FileAt, got {result:?}");
     };
     // The hunk anchors at line 1 (first inserted line); the match is on line 2 (second).
-    assert_eq!(position.line, 2, "lands on the matched line, not the hunk anchor");
+    assert_eq!(
+        position.line, 2,
+        "lands on the matched line, not the hunk anchor"
+    );
 
     drop(server);
 }
@@ -8960,17 +9285,28 @@ async fn git_changes_picker_persists_query_across_reopen() {
     )
     .await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
-    let _: () = send_request::<PickerHide>(&mut ws, 4, &PickerHideParams {
-        kind: PickerKind::GitChanges,
-    })
+    let _: () = send_request::<PickerHide>(
+        &mut ws,
+        4,
+        &PickerHideParams {
+            kind: PickerKind::GitChanges,
+        },
+    )
     .await;
 
     // Reopen with reset:false — the server kept the query, so the picker comes back filtered.
     let view = send_request::<PickerView>(&mut ws, 5, &open(1)).await;
-    assert_eq!(view.query, "marker", "the content query is restored on reopen");
+    assert_eq!(
+        view.query, "marker",
+        "the content query is restored on reopen"
+    );
     let update = view.update.expect("window rides the response");
     let items = update.items();
-    assert_eq!(items.len(), 1, "still filtered to the matching hunk, got {items:?}");
+    assert_eq!(
+        items.len(),
+        1,
+        "still filtered to the matching hunk, got {items:?}"
+    );
     let PickerItem::GitChange {
         relative_path,
         preview,
@@ -9040,7 +9376,11 @@ async fn git_changes_picker_query_is_a_regex() {
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let items = update.items();
-    assert_eq!(items.len(), 1, "the regex matches the changed line, got {items:?}");
+    assert_eq!(
+        items.len(),
+        1,
+        "the regex matches the changed line, got {items:?}"
+    );
     let PickerItem::GitChange { preview, .. } = &items[0] else {
         panic!("expected GitChange, got {:?}", items[0]);
     };

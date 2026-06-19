@@ -185,9 +185,10 @@ impl GitChangeCandidate {
         let default = || (self.lines.first().cloned().unwrap_or_default(), Vec::new());
         let Some(re) = re else { return default() };
         match regex_line_match(&self.lines, re) {
-            Some((i, start, len)) => {
-                (self.lines[i].clone(), (start as u32..(start + len) as u32).collect())
-            }
+            Some((i, start, len)) => (
+                self.lines[i].clone(),
+                (start as u32..(start + len) as u32).collect(),
+            ),
             None => default(),
         }
     }
@@ -231,7 +232,10 @@ fn regex_line_match(lines: &[String], re: &regex::Regex) -> Option<(usize, usize
 /// ([`crate::handlers::compute_search_entry`]) and the Git-changes picker so their query semantics
 /// stay in lock-step. `Err` for an unparseable pattern (a half-typed regex), which callers surface
 /// as "no matches".
-pub fn build_match_regex(query: &str, options: &MatchOptions) -> Result<regex::Regex, regex::Error> {
+pub fn build_match_regex(
+    query: &str,
+    options: &MatchOptions,
+) -> Result<regex::Regex, regex::Error> {
     // Literal queries are escaped first; whole-word then fences the (escaped or raw) pattern with
     // word boundaries. Smartcase reads the *original* query's casing.
     let body = if options.fixed_string {
@@ -1835,7 +1839,11 @@ mod tests {
             ..Default::default()
         };
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![2], "only docs/b.md survives the exclude glob");
+        assert_eq!(
+            s.ranked,
+            vec![2],
+            "only docs/b.md survives the exclude glob"
+        );
     }
 
     #[test]
@@ -1871,8 +1879,15 @@ mod tests {
                 match_indices,
                 ..
             } => {
-                assert_eq!(preview, "let TODO = 1", "previews the matched line, not the first");
-                assert_eq!(match_indices, &vec![4, 5, 6, 7], "highlights the matched span");
+                assert_eq!(
+                    preview, "let TODO = 1",
+                    "previews the matched line, not the first"
+                );
+                assert_eq!(
+                    match_indices,
+                    &vec![4, 5, 6, 7],
+                    "highlights the matched span"
+                );
             }
             other => panic!("expected GitChange, got {other:?}"),
         }
@@ -1938,16 +1953,27 @@ mod tests {
         let mut s = PickerState::new(cands.clone());
         s.query = r"\d+".into();
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![0], "only the line with digits matches `\\d+`");
+        assert_eq!(
+            s.ranked,
+            vec![0],
+            "only the line with digits matches `\\d+`"
+        );
 
         // Whole-word: a substring matches by default, but not as a whole word with the chip.
         let mut s = PickerState::new(cands.clone());
         s.query = "ount".into();
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![0], "substring 'ount' matches 'count' without the chip");
+        assert_eq!(
+            s.ranked,
+            vec![0],
+            "substring 'ount' matches 'count' without the chip"
+        );
         s.filters.whole_word = true;
         s.rerank(&mut m);
-        assert!(s.ranked.is_empty(), "whole-word: 'ount' isn't a whole word in 'count'");
+        assert!(
+            s.ranked.is_empty(),
+            "whole-word: 'ount' isn't a whole word in 'count'"
+        );
 
         // Fixed-string: `a.b` is a regex (`.` = any char) without the chip, a literal with it.
         let mut s = PickerState::new(cands.clone());
@@ -1956,7 +1982,11 @@ mod tests {
         assert_eq!(s.ranked, vec![1, 2], "regex `a.b` matches 'axb' and 'a.b'");
         s.filters.fixed_string = true;
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![2], "literal 'a.b' matches only 'a.b literal'");
+        assert_eq!(
+            s.ranked,
+            vec![2],
+            "literal 'a.b' matches only 'a.b literal'"
+        );
 
         // An unparseable pattern matches nothing (the picker shows no results until it's valid).
         let mut s = PickerState::new(cands);
@@ -1981,9 +2011,21 @@ mod tests {
         );
         let re = |q: &str| build_match_regex(q, &MatchOptions::default()).unwrap();
         assert_eq!(c.select_line(None), 10, "no query → the anchor line");
-        assert_eq!(c.select_line(Some(&re("todo"))), 11, "the 2nd new-side line is buffer line 11");
-        assert_eq!(c.select_line(Some(&re("zero"))), 10, "the 1st new-side line is the anchor");
-        assert_eq!(c.select_line(Some(&re("nope"))), 10, "no match → the anchor");
+        assert_eq!(
+            c.select_line(Some(&re("todo"))),
+            11,
+            "the 2nd new-side line is buffer line 11"
+        );
+        assert_eq!(
+            c.select_line(Some(&re("zero"))),
+            10,
+            "the 1st new-side line is the anchor"
+        );
+        assert_eq!(
+            c.select_line(Some(&re("nope"))),
+            10,
+            "no match → the anchor"
+        );
 
         // A match only on a removed line (no buffer position) falls back to the anchor.
         let d = GitChangeCandidate::new(
@@ -1997,7 +2039,11 @@ mod tests {
             1,
             vec!["kept".into(), "REMOVED gone".into()],
         );
-        assert_eq!(d.select_line(Some(&re("gone"))), 5, "a removed-line match anchors");
+        assert_eq!(
+            d.select_line(Some(&re("gone"))),
+            5,
+            "a removed-line match anchors"
+        );
     }
 
     #[test]

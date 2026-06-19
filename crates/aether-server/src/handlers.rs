@@ -7504,6 +7504,90 @@ pub async fn input_dedent(
     Ok(last.expect("count.max(1) iterations"))
 }
 
+/// Resolve what an `AdjustNumber` by `delta` targets: `(start_char, end_char, line, new_text)` in
+/// absolute char offsets, or `None` for a no-op. A point cursor scans the whole number at/after the
+/// cursor (Vim `Ctrl-A`); an active selection adjusts only the selected text, and only when it's a
+/// strictly valid integer (so a partial number shifts just the selected part). Shared by the
+/// no-op precheck in `adjust_number` and the edit itself in `apply_edit`.
+fn resolve_number_edit(
+    buf: &Buffer,
+    cursor: &CursorState,
+    delta: i64,
+) -> Option<(usize, usize, u32, String)> {
+    if cursor.is_point() {
+        let line = cursor.position.line as usize;
+        let line_start = buf.text.line_to_char(line);
+        let scan_char = motion::pos_to_char(buf, cursor.position);
+        let line_text: String = buf.text.line(line).chars().collect();
+        crate::number::adjust(&line_text, scan_char.saturating_sub(line_start), delta).map(|ne| {
+            (
+                line_start + ne.start,
+                line_start + ne.end,
+                cursor.position.line,
+                ne.text,
+            )
+        })
+    } else {
+        let (sc, ec) = current_selection_char_range(buf, cursor);
+        let selected: String = buf.text.slice(sc..ec).chars().collect();
+        crate::number::adjust_exact(&selected, delta)
+            .map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
+    }
+}
+
+pub async fn input_increment_number(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CountedEditParams,
+) -> Result<EditResult, RpcError> {
+    adjust_number(state, ctx, params, 1).await
+}
+
+pub async fn input_decrement_number(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CountedEditParams,
+) -> Result<EditResult, RpcError> {
+    adjust_number(state, ctx, params, -1).await
+}
+
+/// `Ctrl-e` / `Ctrl-Alt-e`: shift the cursor's number by `step * count` in a single edit (so `3` +
+/// `Ctrl-e` is one undo step). Prechecks for a number at/after the cursor so a miss is a clean
+/// no-op rather than an empty undo entry, mirroring `input_unsurround`.
+async fn adjust_number(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CountedEditParams,
+    step: i64,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.client_id;
+    let delta = step * i64::from(params.count.max(1));
+    {
+        let s = state.lock().await;
+        let buf = s
+            .buffers
+            .get(&params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let cursor = s
+            .cursors
+            .get(&(client_id, params.buffer_id))
+            .copied()
+            .unwrap_or_default();
+        if resolve_number_edit(buf, &cursor, delta).is_none() {
+            let revision = buf.revision;
+            let cursor = wrap_for_response(&s, client_id, params.buffer_id, cursor);
+            return Ok(EditResult { revision, cursor });
+        }
+    }
+    apply_edit(
+        state,
+        client_id,
+        params.buffer_id,
+        EditKind::AdjustNumber { delta },
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum IndentKind {
     Indent,
@@ -8384,6 +8468,12 @@ enum EditKind {
     /// with the inner text. `line` matches `Surround`. `input_unsurround` guarantees a valid pair
     /// exists before issuing this — the no-op case never reaches here.
     Unsurround { line: bool },
+    /// Shift the integer at/after the cursor by `delta` (`Ctrl-e` / `Ctrl-Alt-e`). The number is
+    /// scanned from the selection's leading edge (or the point cursor) within its line and replaced
+    /// in place; the post-edit cursor selects the whole result, so the selection tracks the digit
+    /// count and repeated presses stay on the number. `input_increment_number` guarantees a number
+    /// exists before issuing this — the no-op case never reaches here.
+    AdjustNumber { delta: i64 },
 }
 
 /// Where the cursor lands after an edit.
@@ -8418,6 +8508,15 @@ async fn apply_edit(
         .get(&(client_id, buffer_id))
         .copied()
         .unwrap_or_default();
+
+    // Resolve the target number once for `AdjustNumber` so the range and the replacement text below
+    // agree. `(start_char, end_char, line, new_text)` — absolute char offsets. `input_*_number`
+    // prechecks that a number exists, so this is `Some` in practice; the `None` arms below are a
+    // defensive no-op.
+    let number_edit = match &edit {
+        EditKind::AdjustNumber { delta } => resolve_number_edit(buf, &cursor, *delta),
+        _ => None,
+    };
 
     // Compute the char range to replace and the affected line range. The range_is_inclusive
     // flag (selection mode) extends end_char by 1 to cover the cursor's char under the block.
@@ -8573,6 +8672,23 @@ async fn apply_edit(
                 }
             }
         }
+        EditKind::AdjustNumber { .. } => match &number_edit {
+            Some((sc, ec, line, _)) => EditRange {
+                start_char: *sc,
+                end_char: *ec,
+                first_line: *line,
+                last_line: *line,
+            },
+            None => {
+                let c = motion::pos_to_char(buf, cursor.position);
+                EditRange {
+                    start_char: c,
+                    end_char: c,
+                    first_line: cursor.position.line,
+                    last_line: cursor.position.line,
+                }
+            }
+        },
     };
     // `insert_text` is what gets written over `[start_char, end_char)`; `post_edit` decides where
     // the cursor lands (see `PostEdit`).
@@ -8632,6 +8748,16 @@ async fn apply_edit(
             };
             (Cow::Owned(inner), post)
         }
+        EditKind::AdjustNumber { .. } => match &number_edit {
+            // Keep the whole re-rendered number selected. `Select` spans the entire replacement, so
+            // the selection tracks the digit count automatically (`9` → `10` grows, `100` → `99`
+            // shrinks) and repeated presses stay on the number.
+            Some((_, _, _, text)) => (
+                Cow::Owned(text.clone()),
+                PostEdit::Select { lead: 0, trail: 0 },
+            ),
+            None => (Cow::Borrowed(""), PostEdit::PointAfter),
+        },
     };
 
     let start_char = range.start_char;
@@ -8639,7 +8765,9 @@ async fn apply_edit(
     let old_first_line = range.first_line;
     let old_last_line = range.last_line;
     let kind_tag = match &edit {
-        EditKind::ReplaceWith { .. } | EditKind::ReplaceLine { .. } => EditKindTag::Text,
+        EditKind::ReplaceWith { .. }
+        | EditKind::ReplaceLine { .. }
+        | EditKind::AdjustNumber { .. } => EditKindTag::Text,
         EditKind::DeleteSelection
         | EditKind::Backspace
         | EditKind::DeleteLine
@@ -9981,12 +10109,15 @@ pub async fn picker_view(
             // GitChanges: land on the hunk in the buffer's own file nearest the cursor line. No
             // fall-through to "some other file" — if the active file has no changes, leave the
             // highlight at the top rather than jumping to an unrelated file.
-            (Some((leading_edge, Some(current_key))), picker_state::PickerCandidates::GitChanges(c))
-                if !c.is_empty() =>
-            {
-                find_nearest_git_change(c, (current_key.0, current_key.1.as_str()), leading_edge.line)
-                    .map(|idx| picker.candidates.make_item(idx, Vec::new()))
-            }
+            (
+                Some((leading_edge, Some(current_key))),
+                picker_state::PickerCandidates::GitChanges(c),
+            ) if !c.is_empty() => find_nearest_git_change(
+                c,
+                (current_key.0, current_key.1.as_str()),
+                leading_edge.line,
+            )
+            .map(|idx| picker.candidates.make_item(idx, Vec::new())),
             _ => None,
         };
 
@@ -10716,7 +10847,10 @@ mod find_nearest_git_change_tests {
         let cands = [cand("a.rs", 0, 4), cand("b.rs", 0, 2)];
         // The active file isn't in the change set → None (the picker opens at the top, not on an
         // unrelated file).
-        assert_eq!(find_nearest_git_change(&cands, (0, "untouched.rs"), 0), None);
+        assert_eq!(
+            find_nearest_git_change(&cands, (0, "untouched.rs"), 0),
+            None
+        );
     }
 }
 

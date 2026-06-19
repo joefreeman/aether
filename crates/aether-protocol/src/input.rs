@@ -138,6 +138,28 @@ impl RpcMethod for InputDedent {
     type Result = EditResult;
 }
 
+// ---- input/increment_number, input/decrement_number ---------------------------------------------
+
+/// Adjust the integer the cursor sits on (or the first one after it on the cursor's line) by
+/// `+count`. With a selection, the number scan starts at the selection's leading edge. An
+/// immediately-preceding `-` is part of the number, and a zero-padded number keeps its width
+/// (`007` → `008`). The post-edit cursor selects the whole result, so the selection tracks the
+/// digit count. No-op when there's no number at or after the cursor on its line. `Ctrl-e`.
+pub struct InputIncrementNumber;
+impl RpcMethod for InputIncrementNumber {
+    const NAME: &'static str = "input/increment_number";
+    type Params = CountedEditParams;
+    type Result = EditResult;
+}
+
+/// Adjust the cursor's number by `-count` — the inverse of [`InputIncrementNumber`]. `Ctrl-Alt-e`.
+pub struct InputDecrementNumber;
+impl RpcMethod for InputDecrementNumber {
+    const NAME: &'static str = "input/decrement_number";
+    type Params = CountedEditParams;
+    type Result = EditResult;
+}
+
 // ---- input/newline_and_indent -------------------------------------------------------------------
 
 pub struct InputNewlineAndIndent;

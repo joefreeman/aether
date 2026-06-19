@@ -26,9 +26,10 @@ use aether_protocol::git::{
     GitApplyHunk, GitBlameLine, GitCommitInfo, GitNavigateHunk, GitSetDiffView,
 };
 use aether_protocol::input::{
-    InputBackspace, InputChangeLine, InputDedent, InputDelete, InputDeleteLine, InputIndent,
-    InputJoinLines, InputMoveLines, InputNewlineAndIndent, InputOpenLine, InputRedo,
-    InputReplaceLine, InputSurround, InputText, InputToggleComment, InputUndo, InputUnsurround,
+    InputBackspace, InputChangeLine, InputDecrementNumber, InputDedent, InputDelete,
+    InputDeleteLine, InputIncrementNumber, InputIndent, InputJoinLines, InputMoveLines,
+    InputNewlineAndIndent, InputOpenLine, InputRedo, InputReplaceLine, InputSurround, InputText,
+    InputToggleComment, InputUndo, InputUnsurround,
 };
 use aether_protocol::lsp::{
     LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic, LspRestartServer,
@@ -409,6 +410,12 @@ async fn dispatch(
         InputMoveLines::NAME => run!(InputMoveLines, handlers::input_move_lines),
         InputIndent::NAME => run!(InputIndent, handlers::input_indent),
         InputDedent::NAME => run!(InputDedent, handlers::input_dedent),
+        InputIncrementNumber::NAME => {
+            run!(InputIncrementNumber, handlers::input_increment_number)
+        }
+        InputDecrementNumber::NAME => {
+            run!(InputDecrementNumber, handlers::input_decrement_number)
+        }
         InputOpenLine::NAME => {
             run!(InputOpenLine, handlers::input_open_line)
         }

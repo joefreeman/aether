@@ -21,7 +21,10 @@ use aether_protocol::git::{
     GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams,
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
-use aether_protocol::input::{InputSurround, InputSurroundParams, InputText, InputTextParams};
+use aether_protocol::input::{
+    CountedEditParams, InputDecrementNumber, InputIncrementNumber, InputSurround,
+    InputSurroundParams, InputText, InputTextParams,
+};
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -643,6 +646,32 @@ fn input_surround_params() {
     let defaulted: InputSurroundParams =
         serde_json::from_value(json!({"buffer_id": 1, "delimiter": "{"})).unwrap();
     assert_eq!(defaulted.target, SurroundTarget::Selection);
+}
+
+#[test]
+fn input_adjust_number_methods() {
+    use aether_protocol::envelope::RpcMethod;
+    assert_eq!(InputIncrementNumber::NAME, "input/increment_number");
+    assert_eq!(InputDecrementNumber::NAME, "input/decrement_number");
+
+    // The shared counted-edit shape omits `count` when it's 1, and carries it otherwise.
+    let one = to_value(CountedEditParams {
+        buffer_id: 3,
+        count: 1,
+    })
+    .unwrap();
+    assert_eq!(one, json!({"buffer_id": 3}));
+
+    let many = to_value(CountedEditParams {
+        buffer_id: 3,
+        count: 4,
+    })
+    .unwrap();
+    assert_eq!(many, json!({"buffer_id": 3, "count": 4}));
+
+    // `count` defaults to 1 when omitted on the wire.
+    let back: CountedEditParams = serde_json::from_value(json!({"buffer_id": 3})).unwrap();
+    assert_eq!(back.count, 1);
 }
 
 #[test]
@@ -1356,7 +1385,10 @@ fn picker_item_file_carries_git_status() {
 fn picker_item_git_change_is_tagged() {
     use aether_protocol::picker::{PickerItem, PickerKind};
     use aether_protocol::viewport::DiffStage;
-    assert_eq!(to_value(PickerKind::GitChanges).unwrap(), json!("git_changes"));
+    assert_eq!(
+        to_value(PickerKind::GitChanges).unwrap(),
+        json!("git_changes")
+    );
 
     // An unstaged hunk: the default stage is omitted from the wire.
     let item = PickerItem::GitChange {

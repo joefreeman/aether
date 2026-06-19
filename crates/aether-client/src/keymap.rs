@@ -227,6 +227,8 @@ pub enum Action {
     JoinLines,
     Indent,
     Dedent,
+    IncrementNumber,
+    DecrementNumber,
     ToggleComment,
     OpenLineBelow,
     OpenLineAbove,
@@ -670,6 +672,9 @@ static GLOBAL: &[Binding] = &[
     bind!(G, ch('g'), Exact(Mods::CTRL), A::JoinLines, "Edit", "Join lines"),
     bind!(G, ch('l'), Exact(Mods::CTRL), A::Indent, "Edit", "Indent"),
     bind!(G, ch('h'), Exact(Mods::CTRL), A::Dedent, "Edit", "Dedent"),
+    // Global (checked before the Normal table) so these win over the `e` word-end motion there.
+    bind!(G, ch('e'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Increment number"),
+    bind!(G, ch('e'), Exact(Mods::CTRL_ALT), A::DecrementNumber, "Edit", "Decrement number"),
     bind!(G, ch('o'), Exact(Mods::CTRL), A::OpenLineBelow, "Edit", "Open line below"),
     bind!(G, ch('o'), Exact(Mods::CTRL_ALT), A::OpenLineAbove, "Edit", "Open line above"),
     // Mode-agnostic edits (same action in Normal and Insert) live here rather than being split
