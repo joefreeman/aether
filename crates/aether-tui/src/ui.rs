@@ -1850,7 +1850,7 @@ fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
     {
         return 1; // one-row loading / empty message ("Finding references…", "No symbols found", …)
     }
-    if picker.kind == Some(PickerKind::Grep) {
+    if picker.kind.is_some_and(|k| k.groups_by_file()) {
         return picker.total_display_rows.unwrap_or(picker.total_matches);
     }
     picker.total_matches + picker.synthetic_create_idx.is_some() as u32
@@ -1900,8 +1900,33 @@ pub fn picker_result_rows(buffer_area_cols: u32, buffer_area_rows: u32) -> u32 {
     (box_rect.height as u32).saturating_sub(4)
 }
 
-/// Count how many items starting at `start` fit when rendered with the grep picker's
-/// file-grouped layout (one non-selectable header row per distinct file path). Used by both the
+/// The `(path_index, relative_path)` file-group key of a picker item, for the file-grouped kinds
+/// (Grep hits and Git changes — both render a header above each file's first row). `None` for the
+/// flat kinds.
+fn picker_group_key(item: &PickerItem) -> Option<(u32, &str)> {
+    match item {
+        PickerItem::GrepHit {
+            path_index,
+            relative_path,
+            ..
+        }
+        | PickerItem::GitChange {
+            path_index,
+            relative_path,
+            ..
+        } => Some((*path_index, relative_path.as_str())),
+        _ => None,
+    }
+}
+
+/// Whether a picker kind uses the file-grouped layout (a non-selectable header row per file).
+/// Delegates to the protocol's single source of truth so a new grouped kind needs no edit here.
+fn is_file_grouped(kind: Option<aether_protocol::picker::PickerKind>) -> bool {
+    kind.is_some_and(|k| k.groups_by_file())
+}
+
+/// Count how many items starting at `start` fit when rendered with the file-grouped layout (one
+/// non-selectable header row per distinct file path — grep hits and Git changes). Used by both the
 /// scroll math (where it caps the visible window inside the over-fetched cache) and the
 /// renderer (where it bounds the slice it draws).
 pub fn grep_visible_item_count_from(
@@ -1916,14 +1941,7 @@ pub fn grep_visible_item_count_from(
     let mut prev_key: Option<(u32, &str)> = None;
     let mut visible: usize = 0;
     for item in &items[start..] {
-        let cur_key = match item {
-            PickerItem::GrepHit {
-                path_index,
-                relative_path,
-                ..
-            } => Some((*path_index, relative_path.as_str())),
-            _ => None,
-        };
+        let cur_key = picker_group_key(item);
         let needs_header = match cur_key {
             Some(k) => prev_key != Some(k),
             None => false,
@@ -1950,7 +1968,7 @@ pub fn picker_visible_item_count_from(
     pane_height: usize,
     kind: Option<aether_protocol::picker::PickerKind>,
 ) -> usize {
-    if matches!(kind, Some(aether_protocol::picker::PickerKind::Grep)) {
+    if is_file_grouped(kind) {
         grep_visible_item_count_from(items, start, pane_height)
     } else {
         items.len().saturating_sub(start).min(pane_height)
@@ -1982,7 +2000,7 @@ pub fn picker_scroll_for_selected(
         return current;
     }
     // Below the window: bottom-align so `selected` is the last visible row.
-    if !matches!(kind, Some(aether_protocol::picker::PickerKind::Grep)) {
+    if !is_file_grouped(kind) {
         return (selected + 1).saturating_sub(pane);
     }
     let mut start = selected;
@@ -2548,6 +2566,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::LspServers) => "List LSPs…",
         Some(aether_protocol::picker::PickerKind::References) => "List references…",
         Some(aether_protocol::picker::PickerKind::DocumentSymbols) => "Go to symbol…",
+        Some(aether_protocol::picker::PickerKind::GitChanges) => "Search changes…",
         None => "Search…",
     }
 }
@@ -2639,21 +2658,15 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         .enumerate()
     {
         let i = visible_start + offset_in_slice;
-        if let PickerItem::GrepHit {
-            path_index,
-            relative_path,
-            ..
-        } = item
-        {
-            let key = (*path_index, relative_path.as_str());
-            if prev_grep_key != Some(key) {
+        if let Some((path_index, relative_path)) = picker_group_key(item) {
+            if prev_grep_key != Some((path_index, relative_path)) {
                 lines.push(Line::from(grep_file_header_spans(
-                    *path_index,
+                    path_index,
                     relative_path,
                     &state.root_labels,
                     text_width as usize,
                 )));
-                prev_grep_key = Some(key);
+                prev_grep_key = Some((path_index, relative_path));
             }
         }
         // A staged delete renders its [y/N] confirmation *over* the target row — in the same
@@ -2746,6 +2759,25 @@ fn picker_item_spans(
     } = item
     {
         return grep_hit_spans(*line, preview, match_indices, highlighted, max_width);
+    }
+    if let PickerItem::GitChange {
+        preview,
+        match_indices,
+        stage,
+        added,
+        removed,
+        ..
+    } = item
+    {
+        return git_change_row_spans(
+            preview,
+            match_indices,
+            *stage,
+            *added,
+            *removed,
+            highlighted,
+            max_width,
+        );
     }
     if let PickerItem::DirEntry {
         name,
@@ -2910,6 +2942,7 @@ fn picker_item_spans(
         } => (name.as_str(), match_indices.as_slice(), None, false),
         PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
+        | PickerItem::GitChange { .. }
         | PickerItem::DirEntry { .. }
         | PickerItem::Root { .. }
         | PickerItem::Diagnostic { .. }
@@ -3186,6 +3219,92 @@ fn grep_hit_spans(
         base,
     ));
     spans.push(Span::styled(line_str, dim_style));
+    spans
+}
+
+/// One Git-changes hunk row: the changed line on the left — the query match highlighted, like a
+/// grep hit — then a right-aligned coloured `+added -removed` summary (green adds, red removes).
+/// Staged hunks render dim (the inline-diff convention: bright = unstaged, dim = staged), so a
+/// file's staged and unstaged hunks are tellable apart. `match_indices` are char offsets into
+/// `preview`.
+fn git_change_row_spans(
+    preview: &str,
+    match_indices: &[u32],
+    stage: DiffStage,
+    added: u32,
+    removed: u32,
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let base = Style::default().fg(NORD4).bg(bg);
+    let dim_style = base.fg(picker_dim_fg(highlighted));
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    // Count colours follow the gutter: bright green/red for unstaged, the dimmed shades for staged.
+    let added_style = base.fg(stage_color(stage, NORD14, GIT_STAGED_ADDED));
+    let removed_style = base.fg(stage_color(stage, NORD11, GIT_STAGED_DELETED));
+    let gap = 2; // minimum gap between the preview and the summary
+
+    // The summary: `-R` then `+A` (additions flush right, diffstat-style), omitting a zero side
+    // (a pure add/delete shows one number).
+    let summary = match (added, removed) {
+        (0, 0) => String::new(),
+        (a, 0) => format!("+{a}"),
+        (0, r) => format!("-{r}"),
+        (a, r) => format!("-{r} +{a}"),
+    };
+    let trimmed = preview.trim_start();
+    let preview_budget = max_width.saturating_sub(gap + summary.width());
+
+    let (shown, ellipsis) = if trimmed.width() <= preview_budget {
+        (trimmed.to_string(), false)
+    } else {
+        let text_budget = preview_budget.saturating_sub(1);
+        let cut: String = trimmed
+            .chars()
+            .scan(0usize, |w, c| {
+                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                if *w + cw > text_budget {
+                    None
+                } else {
+                    *w += cw;
+                    Some(c)
+                }
+            })
+            .collect();
+        (cut, true)
+    };
+
+    // Highlight the query match within the shown text. Indices are into the (already server-
+    // trimmed) preview; shift by any leading whitespace we stripped and drop any past the cut.
+    let lead_chars = (preview.chars().count() - trimmed.chars().count()) as u32;
+    let kept_char_count = shown.chars().count() as u32;
+    let kept_indices: Vec<u32> = match_indices
+        .iter()
+        .filter_map(|i| i.checked_sub(lead_chars))
+        .filter(|&i| i < kept_char_count)
+        .collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    push_styled_with_match_indices(&mut spans, &shown, &kept_indices, base, match_style);
+    if ellipsis {
+        spans.push(Span::styled("…".to_string(), dim_style));
+    }
+    // Pad to the right edge so summaries align down the column, then the coloured counts.
+    let used = shown.width() + usize::from(ellipsis) + summary.width();
+    spans.push(Span::styled(
+        " ".repeat(max_width.saturating_sub(used)),
+        base,
+    ));
+    match (added, removed) {
+        (0, 0) => {}
+        (a, 0) => spans.push(Span::styled(format!("+{a}"), added_style)),
+        (0, r) => spans.push(Span::styled(format!("-{r}"), removed_style)),
+        (a, r) => {
+            spans.push(Span::styled(format!("-{r}"), removed_style));
+            spans.push(Span::styled(" ".to_string(), base));
+            spans.push(Span::styled(format!("+{a}"), added_style));
+        }
+    }
     spans
 }
 

@@ -13,7 +13,7 @@ use crate::cursor::Direction;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::git::GitStatus;
 use crate::lsp::{LspProgress, LspStatus};
-use crate::viewport::DiagnosticSeverity;
+use crate::viewport::{DiagnosticSeverity, DiffStage};
 use crate::{BufferId, LogicalPosition};
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +69,13 @@ pub enum PickerKind {
     /// members; selecting one jumps to its name position (via `FileAt`). Like References/Diagnostics
     /// it's a one-shot LSP snapshot taken on open and preserved across scroll/resume re-views.
     DocumentSymbols,
+    /// The working-tree changes of the active project's repos, one row per hunk grouped by file
+    /// (like Grep). Combined staged+unstaged vs HEAD: each hunk carries its [`DiffStage`] so the
+    /// row colours like the inline diff. The candidate set is a one-shot snapshot taken on open —
+    /// computed from disk + index, but using the *live buffer* text for any file currently open,
+    /// so unsaved edits are reflected. Untracked files appear as a single whole-file addition.
+    /// Selecting a hunk jumps to its anchor line (via `FileAt`). Reset on each open (not preserved).
+    GitChanges,
 }
 
 impl PickerKind {
@@ -80,7 +87,20 @@ impl PickerKind {
     /// directory so it acts like "show me where I am" rather than a persistent file-manager
     /// session.
     pub fn preserves_state(self) -> bool {
-        matches!(self, PickerKind::Grep)
+        // Grep keeps its (expensive) search results; GitChanges keeps its query + filters so a
+        // re-open resumes the same content search and scope. Both rebuild their candidate set on
+        // re-view regardless (GitChanges re-snapshots the working tree), and the server wipes a
+        // client's pickers on project switch, so persisted scope never leaks across projects.
+        matches!(self, PickerKind::Grep | PickerKind::GitChanges)
+    }
+
+    /// Whether this picker groups its rows into per-file sections, rendering a non-selectable file
+    /// header above each file's first row (Grep hits and Git changes). The single source of truth
+    /// for the file-grouped layout: clients gate their header rendering, sticky-header pin, header
+    /// clearance when revealing a row, and virtual-scroll row math on it, so adding another grouped
+    /// picker is one edit here rather than a hunt across the shells.
+    pub fn groups_by_file(self) -> bool {
+        matches!(self, PickerKind::Grep | PickerKind::GitChanges)
     }
 }
 
@@ -282,6 +302,42 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
+    /// One hunk from the Git-changes picker. Identity is `(path_index, relative_path, hunk_index)`.
+    /// Rows are grouped by file like grep hits: the client renders one per-file header (carrying a
+    /// `-removed +added ~modified` summary it sums from the group) and, on each hunk row, the
+    /// hunk's own `+added -removed` counts. The *change class* is read off the counts — both
+    /// non-zero → modified, added-only → added, removed-only → deletion — so no separate kind rides
+    /// the wire. `line` is the 0-based buffer line the hunk anchors to (the `FileAt` jump target).
+    GitChange {
+        /// Index into the project's root list — pairs with `relative_path` for the absolute path.
+        path_index: u32,
+        /// Path relative to root `path_index` (forward-slash separated). The fuzzy haystack + the
+        /// group key the client renders a file header for.
+        relative_path: String,
+        /// 0-based index of this hunk within its file's change list — the identity tiebreak (the
+        /// list is a snapshot, so positional identity is stable for the picker's lifetime).
+        hunk_index: u32,
+        /// 0-based buffer line the hunk anchors to: the first changed line for an add/modify, or
+        /// the line a pure deletion sits above. The jump target.
+        line: u32,
+        /// Staged vs unstaged, mirroring the inline diff's bright/dim. A file can contribute hunks
+        /// of both stages.
+        #[serde(default, skip_serializing_if = "DiffStage::is_unstaged")]
+        stage: DiffStage,
+        /// New-side lines this hunk adds (`0` for a pure deletion).
+        added: u32,
+        /// Baseline lines this hunk removes (`0` for a pure addition).
+        removed: u32,
+        /// The changed line shown on the row: with no query, the hunk's first changed line; with a
+        /// query, the first of the hunk's changed lines that contains it. Trimmed; the client
+        /// truncates to fit.
+        preview: String,
+        /// Char offsets into `preview` covered by the query match. The query greps the hunk's diff
+        /// *content* (substring, smartcase), not the file path — so this highlights the match within
+        /// the previewed line, like a grep hit. Empty when there's no query.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
     /// One diagnostic in the current buffer. Identity is `(line, col, message)`. The matcher
     /// haystack is `message`; `match_indices` are char offsets into it. Selecting jumps to
     /// `(line, col)`. `(line, col)` is the range start; `(end_line, end_col)` the (exclusive) end —
@@ -476,9 +532,9 @@ pub struct ScopedPath {
 /// all-default struct is equivalent to the field being absent on the wire.
 ///
 /// Which fields apply depends on the picker kind: Grep reads everything; Files reads
-/// `globs`/`directories`/`changed_only`; Explorer reads `hide_ignored`/`hide_hidden`/
-/// `changed_only`. Inapplicable fields are ignored, not errors — clients only offer the chips
-/// that apply.
+/// `globs`/`directories`/`changed_only`; GitChanges reads `globs`/`directories` (it's inherently
+/// changed-only); Explorer reads `hide_ignored`/`hide_hidden`/`changed_only`. Inapplicable fields
+/// are ignored, not errors — clients only offer the chips that apply.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PickerFilters {
     /// Grep: how the search pattern treats case.
@@ -574,16 +630,16 @@ pub struct PickerViewParams {
     /// in the results, the server falls back to `offset: 0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center_on: Option<PickerItem>,
-    /// Grep-only convenience: when set, the server resolves the buffer's cursor to the
-    /// nearest cached hit (at-or-after the cursor's leading selection edge, walker order,
-    /// wrapping to the first hit) and uses that as the effective `center_on` — overriding any
-    /// explicit `center_on` the client passed. The resolved item is echoed back in
-    /// `effective_center_on` so the client can use it as its resume highlight. This is what
-    /// makes `Space g` open with the picker landing on "where you are" in the result list
-    /// even when the cursor isn't sitting on a match exactly. No-op when there are no cached
-    /// hits or `kind != Grep`.
+    /// Cursor-anchored open: when set, the server resolves this buffer's cursor to the nearest
+    /// candidate and uses it as the effective `center_on`, overriding any explicit `center_on` the
+    /// client passed. The resolution is per-kind: **Grep** picks the nearest cached hit (at-or-after
+    /// the cursor's leading selection edge in walker order, wrapping to the first hit); **GitChanges**
+    /// picks the hunk in the buffer's own file nearest at-or-after the cursor line (else that file's
+    /// last hunk). The resolved item is echoed back in `effective_center_on` so the client can use it
+    /// as its highlight. This is what makes `Space g` / `Space c` land on "where you are" in the
+    /// result list. No-op for the other kinds, and when the buffer has no matching candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub center_on_cursor_grep_hit: Option<BufferId>,
+    pub center_on_cursor: Option<BufferId>,
     /// Explorer only: absolute path of the directory to list. `None` means "keep whatever
     /// directory the picker last listed; default to the first project root on first open".
     /// Ignored when `explorer_roots` is set, and for other kinds.
@@ -628,7 +684,7 @@ pub struct PickerViewResult {
     /// follow-up `picker/update` push carries the same offset.
     pub effective_offset: u32,
     /// The item the server framed `effective_offset` around. Equals what the client passed in
-    /// `center_on` unless `center_on_cursor_grep_hit` resolved (and overrode it) — in which
+    /// `center_on` unless `center_on_cursor` resolved (and overrode it) — in which
     /// case this is the resolved hit, so the client can set its local highlight to match.
     /// `None` when no centering happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]

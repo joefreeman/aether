@@ -9,6 +9,7 @@ use crate::chips::{self, Chip, ChipEditorField, ChipId};
 use crate::theme;
 use aether_protocol::git::GitStatus;
 use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
+use aether_protocol::viewport::DiffStage;
 use iced::advanced::widget::Tree;
 use iced::advanced::{layout, mouse, renderer, Layout, Widget};
 use iced::widget::{column, container, row, text};
@@ -177,6 +178,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::LspServers => "List LSPs…",
         PickerKind::References => "List references…",
         PickerKind::DocumentSymbols => "Go to symbol…",
+        PickerKind::GitChanges => "Search changes…",
     }
 }
 
@@ -522,7 +524,13 @@ pub fn overlay<'a>(
                 .nth(rel as usize)
                 .and_then(|r| match r {
                     DisplayRow::Item { item, .. } => match item {
+                        // Both file-grouped kinds (grep hits and Git changes) carry the group key.
                         PickerItem::GrepHit {
+                            path_index,
+                            relative_path,
+                            ..
+                        }
+                        | PickerItem::GitChange {
                             path_index,
                             relative_path,
                             ..
@@ -920,6 +928,44 @@ fn meta<'a>(s: String) -> Element<'a, PickerMsg> {
         .into()
 }
 
+/// The Git-changes row's right-aligned `+added -removed` count — the diff-count analogue of the
+/// grep row's line number. Omits a zero side (pure add/delete shows one number); colours follow
+/// the inline-diff convention — bright green/red for unstaged, the dimmed shades for staged — so a
+/// file's staged and unstaged hunks are tellable apart. Never wraps (rows are one [`ROW_H`] line).
+fn git_change_summary<'a>(stage: DiffStage, added: u32, removed: u32) -> Element<'a, PickerMsg> {
+    let staged = stage == DiffStage::Staged;
+    let added_color = if staged {
+        theme::GIT_STAGED_ADDED
+    } else {
+        theme::GIT_ADDED
+    };
+    let removed_color = if staged {
+        theme::GIT_STAGED_DELETED
+    } else {
+        theme::GIT_DELETED
+    };
+    let mut spans: Vec<iced::widget::text::Span<'a>> = Vec::new();
+    let count = |text: String, color| {
+        iced::widget::span(text)
+            .size(12)
+            .font(SANS)
+            .color(color)
+    };
+    // `-R` then `+A`, so additions sit flush against the right edge (diffstat-style).
+    if removed > 0 {
+        spans.push(count(format!("-{removed}"), removed_color));
+    }
+    if added > 0 {
+        if removed > 0 {
+            spans.push(count(" ".to_string(), theme::NORD4));
+        }
+        spans.push(count(format!("+{added}"), added_color));
+    }
+    iced::widget::rich_text(spans)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .into()
+}
+
 /// One row's content per item kind. Layout mirrors the web client's row model: optional
 /// fixed-width bullet, primary text with match tinting, right-aligned meta.
 fn render_item<'a>(
@@ -1006,6 +1052,41 @@ fn render_item<'a>(
                 ),
                 iced::widget::Space::new().width(Length::Fill),
                 meta(format!("{}", line + 1)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+        }
+        PickerItem::GitChange {
+            preview,
+            stage,
+            added,
+            removed,
+            match_indices,
+            ..
+        } => {
+            // The file lives in the group header; the row is the change's first line (leading
+            // whitespace stripped, truncated to one line) plus a right-aligned coloured
+            // `+added -removed` summary — the grep row with the line number swapped for a diff
+            // count. The query now greps the diff content, so `match_indices` index the preview
+            // and get highlighted exactly like a grep hit (shifted by the stripped whitespace).
+            let trimmed = preview.trim_start();
+            let lead = (preview.chars().count() - trimmed.chars().count()) as u32;
+            let shifted: Vec<u32> = match_indices
+                .iter()
+                .filter_map(|i| i.checked_sub(lead))
+                .filter(|i| (*i as usize) < PREVIEW_MAX_CHARS)
+                .collect();
+            row![
+                highlighted_owned(
+                    truncate_chars(trimmed.trim_end(), PREVIEW_MAX_CHARS),
+                    shifted,
+                    theme::NORD4,
+                    iced::Font::MONOSPACE,
+                    hovered,
+                ),
+                iced::widget::Space::new().width(Length::Fill),
+                git_change_summary(*stage, *added, *removed),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)

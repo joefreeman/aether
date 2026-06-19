@@ -125,6 +125,9 @@ html, body, #app {
 .git-added { color: var(--nord14); }
 .git-modified { color: var(--nord13); }
 .git-deleted { color: var(--nord11); }
+/* Dimmed (in-index) shades for a staged change summary, mirroring the inline-diff convention. */
+.git-staged-added { color: var(--git-staged-added); }
+.git-staged-deleted { color: var(--git-staged-deleted); }
 .git-branch { color: var(--nord9); }  /* Frost blue — secondary, distinct from the nord4 path */
 .git-base { color: var(--nord9); }    /* Frost blue — current diff base [HEAD]/[index] */
 .status-icon {

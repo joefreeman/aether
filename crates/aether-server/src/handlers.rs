@@ -48,7 +48,7 @@ use aether_protocol::nav::{
 };
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, MatchOptions, PickerGrepNavigateParams, PickerGrepNavigateTarget,
+    BufferDirtyState, MatchOptions, PickerGrepNavigateParams, PickerGrepNavigateTarget,
     PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerSectionJumpParams,
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
     PickerViewResult,
@@ -2592,31 +2592,10 @@ pub fn compute_search_entry(
             last_pushed_index: 0,
         });
     }
-    let regex = {
-        // Literal queries are escaped first; whole-word then fences the (escaped or raw) pattern
-        // with word boundaries. Smartcase reads the *original* query's casing, matching grep and
-        // the prior buffer-search behavior.
-        let body = if options.fixed_string {
-            regex::escape(query)
-        } else {
-            query.to_string()
-        };
-        let pattern = if options.whole_word {
-            format!(r"\b(?:{body})\b")
-        } else {
-            body
-        };
-        let case_insensitive = match options.case {
-            CaseMode::Smart => !query.chars().any(|c| c.is_uppercase()),
-            CaseMode::Sensitive => false,
-            CaseMode::Insensitive => true,
-        };
-        regex::RegexBuilder::new(&pattern)
-            .case_insensitive(case_insensitive)
-            .multi_line(true)
-            .build()
-            .map_err(|e| RpcError::new(ErrorCode::INVALID_PARAMS, format!("invalid regex: {e}")))?
-    };
+    // Shared with the Git-changes picker so query semantics (fixed-string, whole-word, smartcase)
+    // stay in lock-step across content searches.
+    let regex = picker_state::build_match_regex(query, options)
+        .map_err(|e| RpcError::new(ErrorCode::INVALID_PARAMS, format!("invalid regex: {e}")))?;
     let mut matches: Vec<(LogicalPosition, LogicalPosition)> = Vec::new();
     let mut truncated = false;
     let len_bytes = buf.text.len_bytes();
@@ -9539,6 +9518,150 @@ fn build_file_git_status(
         .collect()
 }
 
+/// One open buffer's contribution to the Git-changes picker, snapshotted under the lock so the
+/// disk walk that follows runs lock-free. The combined HEAD→buffer hunks are the very list the
+/// gutter renders, so the picker agrees with what the editor shows; `text` (a cheap rope clone)
+/// supplies each add/modify hunk's preview line.
+struct OpenChange {
+    path_index: u32,
+    relative_path: String,
+    abs_path: String,
+    hunks: Vec<crate::git::DiffHunk>,
+    text: ropey::Rope,
+}
+
+/// One changed file's hunks, gathered before flattening into candidates with a stable file order.
+struct FileChanges {
+    path_index: u32,
+    relative_path: String,
+    abs_path: String,
+    hunks: Vec<HunkInfo>,
+}
+
+/// The per-hunk facts the Git-changes picker needs, reduced from a [`crate::git::DiffHunk`].
+struct HunkInfo {
+    line: u32,
+    stage: aether_protocol::viewport::DiffStage,
+    added: u32,
+    removed: u32,
+    /// The hunk's changed lines (trimmed) the query greps over and the row previews: new-side
+    /// (added/modified) lines first, then the removed baseline lines. `lines[0]` is the default
+    /// preview (= the old first-changed-line behaviour).
+    lines: Vec<String>,
+}
+
+/// Reduce a hunk to its picker facts, pulling each new-side line from `line_at`.
+fn hunk_info(h: &crate::git::DiffHunk, line_at: impl Fn(u32) -> String) -> HunkInfo {
+    let mut lines: Vec<String> = (h.anchor_line..h.anchor_line + h.new_lines)
+        .map(line_at)
+        .collect();
+    lines.extend(h.deleted.iter().map(|s| s.trim().to_string()));
+    HunkInfo {
+        line: h.anchor_line,
+        stage: h.stage,
+        added: h.new_lines,
+        removed: h.deleted.len() as u32,
+        lines,
+    }
+}
+
+/// The 0-based `line` of a rope, trimmed; empty past the end.
+fn rope_line_trimmed(text: &ropey::Rope, line: u32) -> String {
+    if (line as usize) >= text.len_lines() {
+        return String::new();
+    }
+    text.line(line as usize).to_string().trim().to_string()
+}
+
+/// Build the Git-changes picker's candidate list: one entry per hunk of every changed file in the
+/// project's roots, grouped by file. Open buffers drive their own files (live combined hunks +
+/// text); the rest are diffed off disk (combined staged+unstaged vs HEAD, untracked = whole-file
+/// add). Runs entirely off the lock — `repo_status_for_root` walks the worktree and each file is
+/// re-diffed, so it must not sit on the keystroke path's mutex. Best-effort: a root outside a repo
+/// contributes nothing.
+fn build_git_change_candidates(
+    roots: &[std::path::PathBuf],
+    open: Vec<OpenChange>,
+) -> Vec<picker_state::GitChangeCandidate> {
+    // Every file with a live buffer is driven by that buffer — even one that's currently clean —
+    // so the disk pass never double-lists it or surfaces on-disk changes the buffer has reverted.
+    let open_keys: std::collections::HashSet<(u32, String)> = open
+        .iter()
+        .map(|o| (o.path_index, o.relative_path.clone()))
+        .collect();
+
+    let mut files: Vec<FileChanges> = Vec::new();
+
+    for o in &open {
+        let infos: Vec<HunkInfo> = o
+            .hunks
+            .iter()
+            .map(|h| hunk_info(h, |l| rope_line_trimmed(&o.text, l)))
+            .collect();
+        if !infos.is_empty() {
+            files.push(FileChanges {
+                path_index: o.path_index,
+                relative_path: o.relative_path.clone(),
+                abs_path: o.abs_path.clone(),
+                hunks: infos,
+            });
+        }
+    }
+
+    for (pi, root) in roots.iter().enumerate() {
+        // One repo discovery per root (not per file): `changed_files_with_hunks` opens the repo
+        // once and diffs every changed file against the shared HEAD tree + index. Untracked
+        // directories collapse to a single entry there and are dropped, so a big new directory
+        // doesn't flood the list.
+        for changed in crate::git::changed_files_with_hunks(root) {
+            if open_keys.contains(&(pi as u32, changed.rel_path.clone())) {
+                continue; // a live buffer drives this file instead
+            }
+            let working_lines: Vec<&[u8]> = changed.working.split(|&b| b == b'\n').collect();
+            let infos: Vec<HunkInfo> = changed
+                .hunks
+                .iter()
+                .map(|h| {
+                    hunk_info(h, |l| {
+                        working_lines
+                            .get(l as usize)
+                            .map(|b| String::from_utf8_lossy(b).trim().to_string())
+                            .unwrap_or_default()
+                    })
+                })
+                .collect();
+            files.push(FileChanges {
+                path_index: pi as u32,
+                abs_path: root.join(&changed.rel_path).to_string_lossy().into_owned(),
+                relative_path: changed.rel_path,
+                hunks: infos,
+            });
+        }
+    }
+
+    // Stable file order (root index, then path); hunks within a file keep their anchor order.
+    files.sort_by(|a, b| {
+        (a.path_index, a.relative_path.as_str()).cmp(&(b.path_index, b.relative_path.as_str()))
+    });
+    let mut out = Vec::new();
+    for f in files {
+        for (i, info) in f.hunks.into_iter().enumerate() {
+            out.push(picker_state::GitChangeCandidate::new(
+                f.path_index,
+                f.relative_path.clone(),
+                f.abs_path.clone(),
+                i as u32,
+                info.line,
+                info.stage,
+                info.added,
+                info.removed,
+                info.lines,
+            ));
+        }
+    }
+    out
+}
+
 pub async fn picker_view(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -9653,16 +9776,59 @@ pub async fn picker_view(
         // so it opens empty and the spawned task (below) fills it; resume/scroll re-views preserve
         // the prior snapshot via `preserve_existing`.
         PickerKind::DocumentSymbols => picker_state::PickerCandidates::Symbols(Vec::new()),
+        PickerKind::GitChanges => {
+            // Snapshot the roots + every in-root open buffer (live combined hunks + text) under a
+            // brief lock, then build off-lock — the repo walk + per-file diffs must not block the
+            // keystroke path. Rebuilt fresh on every view (a snapshot of the repo at open).
+            let (roots, open) = {
+                let s = state.lock().await;
+                let p = s.active_project_or_err(client_id)?;
+                let roots = p.paths.clone();
+                let open: Vec<OpenChange> = s
+                    .buffers
+                    .iter()
+                    .filter_map(|(id, b)| {
+                        let abs = b.canonical_path.as_deref()?;
+                        let (path_index, relative_path) =
+                            crate::workspace_index::project_relative_parts(abs, &roots)?;
+                        // Combined staged+unstaged hunks from the cached baseline + the LIVE buffer
+                        // text — recomputed here rather than read from `git_both_hunks`, which only
+                        // refreshes while the inline diff view is on, so unsaved edits always show.
+                        // Same shape as the disk path: a `None` index blob (untracked) diffs the
+                        // whole buffer as an addition.
+                        let (index, staged) = s
+                            .git_baseline
+                            .get(id)
+                            .map(|base| (base.index_blob.clone(), base.staged_hunks.clone()))
+                            .unwrap_or((None, Vec::new()));
+                        let unstaged = crate::git::hunks_from_buffers(
+                            index.as_deref().unwrap_or(b""),
+                            b.text.to_string().as_bytes(),
+                        );
+                        Some(OpenChange {
+                            path_index,
+                            relative_path,
+                            abs_path: abs.to_string_lossy().into_owned(),
+                            hunks: crate::git::compose_both(&staged, &unstaged),
+                            text: b.text.clone(),
+                        })
+                    })
+                    .collect();
+                (roots, open)
+            };
+            picker_state::PickerCandidates::GitChanges(build_git_change_candidates(&roots, open))
+        }
     };
 
     let mut s = state.lock().await;
     let key = (client_id, params.kind);
 
-    // Pre-resolve cursor info if we'll use it for Grep centering. Done before borrowing
-    // `pickers` out of `s` so we don't have to juggle conflicting borrows after the split.
+    // Pre-resolve cursor info if we'll use it for cursor-anchored centering (Grep / GitChanges).
+    // Done before borrowing `pickers` out of `s` so we don't juggle conflicting borrows after the
+    // split.
     let cursor_centering_info: Option<(LogicalPosition, Option<(u32, String)>)> =
-        match (params.kind, params.center_on_cursor_grep_hit) {
-            (PickerKind::Grep, Some(buffer_id)) => {
+        match (params.kind, params.center_on_cursor) {
+            (kind, Some(buffer_id)) if kind.groups_by_file() => {
                 let cursor = s
                     .cursors
                     .get(&(client_id, buffer_id))
@@ -9782,11 +9948,10 @@ pub async fn picker_view(
         _ => None,
     };
 
-    // Cursor-derived centering for Grep: resolve the nearest cached hit at-or-after the
-    // cursor's leading selection edge and use it as the effective center_on (overriding any
-    // client-passed item). Lets `Space g` land on the user's spot in the result list even when
-    // the cursor isn't sitting on a hit exactly. The resolution is echoed back via
-    // `effective_center_on` so the client knows what to highlight.
+    // Cursor-derived centering: resolve the candidate nearest the buffer's cursor and use it as
+    // the effective center_on (overriding any client-passed item). Lets `Space g` / `Space c` land
+    // on the user's spot in the result list even when the cursor isn't sitting on a match exactly.
+    // The resolution is echoed back via `effective_center_on` so the client knows what to highlight.
     let cursor_resolved_item: Option<PickerItem> =
         match (cursor_centering_info.as_ref(), &picker.candidates) {
             (Some((leading_edge, current_key)), picker_state::PickerCandidates::Grep(hits))
@@ -9805,6 +9970,15 @@ pub async fn picker_view(
                     preview: c.preview.clone(),
                     match_indices: c.match_indices.clone(),
                 })
+            }
+            // GitChanges: land on the hunk in the buffer's own file nearest the cursor line. No
+            // fall-through to "some other file" — if the active file has no changes, leave the
+            // highlight at the top rather than jumping to an unrelated file.
+            (Some((leading_edge, Some(current_key))), picker_state::PickerCandidates::GitChanges(c))
+                if !c.is_empty() =>
+            {
+                find_nearest_git_change(c, (current_key.0, current_key.1.as_str()), leading_edge.line)
+                    .map(|idx| picker.candidates.make_item(idx, Vec::new()))
             }
             _ => None,
         };
@@ -10257,7 +10431,62 @@ pub async fn picker_section_jump(
                     .make_item(ranked[pos] as usize, Vec::new()),
             ))
         }
+        // Git changes group by file like grep, but the ranked list is a fuzzy-filtered subset (in
+        // document order), so work in ranked space and map back — like the symbols arm above.
+        picker_state::PickerCandidates::GitChanges(cands) => {
+            let ranked = &picker.ranked;
+            if ranked.is_empty() {
+                return Ok(None);
+            }
+            let from = (params.from_index as usize).min(ranked.len() - 1);
+            let key = |pos: usize| {
+                let c = &cands[ranked[pos] as usize];
+                (c.path_index, c.relative_path.as_str())
+            };
+            let Some(pos) = file_group_boundary(ranked.len(), from, params.direction, key) else {
+                return Ok(None);
+            };
+            Ok(Some(
+                picker
+                    .candidates
+                    .make_item(ranked[pos] as usize, Vec::new()),
+            ))
+        }
         _ => Ok(None),
+    }
+}
+
+/// Position of the next / previous file-group boundary in a list whose rows carry the group key
+/// `key(pos)`, mirroring [`grep_file_boundary`]'s feel but generic over the key source (so it
+/// serves the ranked-space Git-changes list). `Forward` → the first row of the next file;
+/// `Backward` → this file's first row, or the previous file's first row when already there.
+fn file_group_boundary<'a>(
+    len: usize,
+    from: usize,
+    direction: Direction,
+    key: impl Fn(usize) -> (u32, &'a str),
+) -> Option<usize> {
+    let cur = key(from);
+    match direction {
+        Direction::Forward => (from + 1..len).find(|&j| key(j) != cur),
+        Direction::Backward => {
+            let mut run_start = from;
+            while run_start > 0 && key(run_start - 1) == cur {
+                run_start -= 1;
+            }
+            if from != run_start {
+                return Some(run_start);
+            }
+            if run_start == 0 {
+                return None;
+            }
+            let prev = key(run_start - 1);
+            let mut p = run_start - 1;
+            while p > 0 && key(p - 1) == prev {
+                p -= 1;
+            }
+            Some(p)
+        }
     }
 }
 
@@ -10389,7 +10618,7 @@ fn find_prev_grep_hit<'a>(
 }
 
 /// First grep hit "at or after" the cursor in walker order, wrapping to the first hit overall
-/// when nothing matches. Used by `picker/view`'s `center_on_cursor_grep_hit` to land the picker
+/// when nothing matches. Used by `picker/view`'s `center_on_cursor` to land the picker
 /// on "where you are" in the result list even when the cursor isn't sitting on a match
 /// exactly. Inclusive (a hit at exactly the cursor's position is the answer), unlike
 /// `find_next_grep_hit` which is strict (`>` skips past the current).
@@ -10411,6 +10640,77 @@ fn find_nearest_grep_hit<'a>(
             },
         )
         .or_else(|| hits.first())
+}
+
+/// Candidate index of the hunk in `current`'s file nearest at-or-after `cursor_line`, falling back
+/// to that file's last hunk when the cursor sits past them all. `None` when the file has no changes
+/// (the picker then opens at the top rather than jumping to an unrelated file). Used by
+/// `picker/view`'s `center_on_cursor` to land the Git-changes picker on "where you are".
+fn find_nearest_git_change(
+    cands: &[picker_state::GitChangeCandidate],
+    current: (u32, &str),
+    cursor_line: u32,
+) -> Option<usize> {
+    // The file's hunks are a contiguous run in anchor order. Pick the first at-or-after the cursor;
+    // if none, the last hunk of the file (the cursor is below every change).
+    let mut last_in_file: Option<usize> = None;
+    for (i, c) in cands.iter().enumerate() {
+        if (c.path_index, c.relative_path.as_str()) != current {
+            continue;
+        }
+        if c.line >= cursor_line {
+            return Some(i);
+        }
+        last_in_file = Some(i);
+    }
+    last_in_file
+}
+
+#[cfg(test)]
+mod find_nearest_git_change_tests {
+    use super::*;
+    use aether_protocol::viewport::DiffStage;
+
+    fn cand(rel: &str, hunk_index: u32, line: u32) -> picker_state::GitChangeCandidate {
+        picker_state::GitChangeCandidate::new(
+            0,
+            rel.into(),
+            format!("/p/{rel}"),
+            hunk_index,
+            line,
+            DiffStage::Unstaged,
+            1,
+            0,
+            vec!["x".into()],
+        )
+    }
+
+    #[test]
+    fn picks_first_hunk_at_or_after_the_cursor_in_the_active_file() {
+        // a.rs has hunks at lines 4 and 20; b.rs at line 2.
+        let cands = [cand("a.rs", 0, 4), cand("a.rs", 1, 20), cand("b.rs", 0, 2)];
+        // Cursor on a.rs line 10 → the next hunk at or after it (line 20, index 1).
+        assert_eq!(find_nearest_git_change(&cands, (0, "a.rs"), 10), Some(1));
+        // Cursor exactly on a hunk line is inclusive.
+        assert_eq!(find_nearest_git_change(&cands, (0, "a.rs"), 4), Some(0));
+        // Cursor before every hunk → the file's first hunk.
+        assert_eq!(find_nearest_git_change(&cands, (0, "a.rs"), 0), Some(0));
+    }
+
+    #[test]
+    fn falls_back_to_the_files_last_hunk_past_the_end() {
+        let cands = [cand("a.rs", 0, 4), cand("a.rs", 1, 20), cand("b.rs", 0, 2)];
+        // Cursor past every a.rs hunk → that file's last hunk (index 1), not b.rs.
+        assert_eq!(find_nearest_git_change(&cands, (0, "a.rs"), 99), Some(1));
+    }
+
+    #[test]
+    fn no_match_when_the_active_file_has_no_changes() {
+        let cands = [cand("a.rs", 0, 4), cand("b.rs", 0, 2)];
+        // The active file isn't in the change set → None (the picker opens at the top, not on an
+        // unrelated file).
+        assert_eq!(find_nearest_git_change(&cands, (0, "untouched.rs"), 0), None);
+    }
 }
 
 #[cfg(test)]

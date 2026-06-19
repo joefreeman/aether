@@ -259,6 +259,7 @@ export type PickerKind =
   | "files"
   | "buffers"
   | "grep"
+  | "git_changes"
   | "explorer"
   | "projects"
   | "diagnostics"
@@ -285,6 +286,23 @@ export type PickerItem =
       relative_path: string;
       line: number;
       col: number;
+      preview: string;
+      match_indices?: number[];
+    }
+  | {
+      kind: "git_change";
+      path_index: number;
+      relative_path: string;
+      hunk_index: number;
+      line: number;
+      /** Side of the index the hunk sits on; omitted on the wire (→ `unstaged`). */
+      stage?: DiffStage;
+      /** New-side lines added (0 for a pure deletion). */
+      added: number;
+      /** Baseline lines removed (0 for a pure addition). */
+      removed: number;
+      /** First changed line of the hunk, already trimmed. The fuzzy match is on the path, so
+       *  `match_indices` index `relative_path` (shown in the file header), not this preview. */
       preview: string;
       match_indices?: number[];
     }

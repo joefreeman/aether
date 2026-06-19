@@ -503,7 +503,14 @@ impl PickerState {
         let mut rows = Vec::with_capacity(self.items.len() + 8);
         let mut last_file: Option<(u32, &str)> = None;
         for (i, item) in self.items.iter().enumerate() {
+            // Grep hits and Git changes both group by file: emit one header before each file's
+            // first row.
             if let PickerItem::GrepHit {
+                path_index,
+                relative_path,
+                ..
+            }
+            | PickerItem::GitChange {
                 path_index,
                 relative_path,
                 ..
@@ -544,10 +551,9 @@ impl PickerState {
     /// a mid-file window start, it stands in for the hit row the spacer would otherwise
     /// cover), so the window starts one row earlier.
     pub fn window_base(&self) -> u32 {
-        let leads_with_header = self
-            .items
-            .first()
-            .is_some_and(|i| matches!(i, PickerItem::GrepHit { .. }));
+        let leads_with_header = self.items.first().is_some_and(|i| {
+            matches!(i, PickerItem::GrepHit { .. } | PickerItem::GitChange { .. })
+        });
         self.display_offset.saturating_sub(leads_with_header as u32)
     }
 
@@ -598,6 +604,7 @@ pub enum ItemKey<'a> {
     File(u32, &'a str),
     Buffer(aether_protocol::BufferId),
     Grep(u32, &'a str, u32, u32),
+    GitChange(u32, &'a str, u32),
     Diagnostic(u32, u32),
     DirEntry(&'a str),
     Root(u32),
@@ -632,6 +639,12 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             col,
             ..
         } => ItemKey::Grep(*path_index, relative_path, *line, *col),
+        PickerItem::GitChange {
+            path_index,
+            relative_path,
+            hunk_index,
+            ..
+        } => ItemKey::GitChange(*path_index, relative_path, *hunk_index),
         PickerItem::Diagnostic { line, col, .. } => ItemKey::Diagnostic(*line, *col),
         PickerItem::DirEntry { name, .. } => ItemKey::DirEntry(name),
         PickerItem::Root { path_index, .. } => ItemKey::Root(*path_index),

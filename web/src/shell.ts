@@ -68,6 +68,7 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   files: "Find files…",
   buffers: "Switch buffer…",
   grep: "Grep workspace…",
+  git_changes: "Search changes…",
   explorer: "Explore files…",
   projects: "Select project…",
   diagnostics: "List diagnostics…",
@@ -280,6 +281,9 @@ interface RowDesc {
   primary: string;
   matches?: number[];
   meta?: string;
+  /** Coloured right-aligned meta (e.g. a git change's `+A -R` summary), rendered as separate spans
+   *  in place of the plain `meta` text. Mutually exclusive with `meta`. */
+  metaParts?: { text: string; cls: string }[];
   prefix?: string;
   prefixClass?: string;
   dir?: boolean;
@@ -512,6 +516,25 @@ function describePickerItem(
         primary: trimmed.trimEnd(),
         matches: item.match_indices?.map((i) => i - lead).filter((i) => i >= 0),
         meta: `${item.line + 1}`,
+      };
+    }
+    case "git_change": {
+      // Mirrors a grep hit: trimmed code preview on the left with match_indices (which index the
+      // preview) highlighted, shifted by the stripped leading whitespace. The right-aligned meta is
+      // the hunk's `-removed +added` summary (additions flush right, diffstat-style), a zero side
+      // omitted, coloured bright (unstaged) or dim (staged).
+      const staged = item.stage === "staged";
+      const addCls = staged ? "git-staged-added" : "git-added";
+      const remCls = staged ? "git-staged-deleted" : "git-deleted";
+      const metaParts: { text: string; cls: string }[] = [];
+      if (item.removed > 0) metaParts.push({ text: `-${item.removed}`, cls: remCls });
+      if (item.added > 0) metaParts.push({ text: `+${item.added}`, cls: addCls });
+      const trimmed = item.preview.trimStart();
+      const lead = [...item.preview].length - [...trimmed].length;
+      return {
+        primary: trimmed.trimEnd(),
+        matches: item.match_indices?.map((i) => i - lead).filter((i) => i >= 0),
+        metaParts,
       };
     }
     case "diagnostic":
@@ -3240,8 +3263,9 @@ export class Shell {
     let prevGrepKey: string | null = null;
     let section: HTMLElement | null = null;
     p.items.forEach((item, i) => {
-      // Grep: a non-selectable file header before the first hit of each file in the window.
-      if (item.kind === "grep_hit") {
+      // Grep and git-changes are grouped per file: a non-selectable, sticky file header before the
+      // first row of each file in the window (the core emits matching display-row offsets/counts).
+      if (item.kind === "grep_hit" || item.kind === "git_change") {
         const key = `${item.path_index}\0${item.relative_path}`;
         if (key !== prevGrepKey) {
           prevGrepKey = key;
@@ -3266,7 +3290,7 @@ export class Shell {
       const row: HTMLElement = document.createElement(href ? "a" : "div");
       if (href) (row as HTMLAnchorElement).href = href;
       row.className = i === localSel ? "picker-row selected" : "picker-row";
-      if (item.kind === "grep_hit") row.classList.add("grep-hit");
+      if (item.kind === "grep_hit" || item.kind === "git_change") row.classList.add("grep-hit");
       if (i === localSel) selectedRow = row;
       row.addEventListener("mousedown", (e: MouseEvent) => {
         // New-tab gesture on an anchor row: let the browser open the <a> itself.
@@ -3315,7 +3339,17 @@ export class Shell {
         s.textContent = d.suffix;
         row.append(s);
       }
-      if (d.meta) {
+      if (d.metaParts) {
+        const m = document.createElement("span");
+        m.className = "picker-meta";
+        d.metaParts.forEach((part, idx) => {
+          const s = document.createElement("span");
+          s.className = part.cls;
+          s.textContent = (idx > 0 ? " " : "") + part.text;
+          m.append(s);
+        });
+        row.append(m);
+      } else if (d.meta) {
         const m = document.createElement("span");
         m.className = "picker-meta";
         m.textContent = d.meta;

@@ -526,9 +526,10 @@ impl Session {
                         p.offset = r.effective_offset;
                         if let Some(center) = r.effective_center_on {
                             p.pending_center = Some(center);
-                            // Grep centering (cursor-hit opens, file jumps) aligns the
-                            // target to the top — there's context below to read.
-                            p.reveal_on_update = Some(if p.kind == PickerKind::Grep {
+                            // File-grouped centering (cursor-hit opens, file jumps) aligns the
+                            // target to the top — its file header sits just above and there's
+                            // context below to read.
+                            p.reveal_on_update = Some(if p.kind.groups_by_file() {
                                 Reveal::Top
                             } else {
                                 Reveal::Minimal
@@ -848,7 +849,7 @@ impl Session {
                         offset: 0,
                         limit: FETCH_LIMIT,
                         center_on: Some(target),
-                        center_on_cursor_grep_hit: None,
+                        center_on_cursor: None,
                         directory_path: None,
                         explorer_roots: false,
                         buffer_id: None,
@@ -1533,7 +1534,7 @@ impl Session {
                 offset: 0,
                 limit: FETCH_LIMIT,
                 center_on,
-                center_on_cursor_grep_hit: (kind == PickerKind::Grep).then_some(buffer_id),
+                center_on_cursor: kind.groups_by_file().then_some(buffer_id),
                 directory_path,
                 explorer_roots: false,
                 buffer_id: matches!(
@@ -1666,7 +1667,7 @@ impl Session {
                 offset: 0,
                 limit: FETCH_LIMIT,
                 center_on,
-                center_on_cursor_grep_hit: None,
+                center_on_cursor: None,
                 directory_path,
                 explorer_roots: roots,
                 buffer_id: None,
@@ -1731,7 +1732,7 @@ impl Session {
                 offset,
                 limit: FETCH_LIMIT,
                 center_on: None,
-                center_on_cursor_grep_hit: None,
+                center_on_cursor: None,
                 directory_path: None,
                 explorer_roots: false,
                 buffer_id: None,
@@ -2024,7 +2025,9 @@ impl Session {
             return Effects::none();
         };
         match kind {
-            PickerKind::Grep | PickerKind::Files => self.picker_query_changed(),
+            PickerKind::Grep | PickerKind::Files | PickerKind::GitChanges => {
+                self.picker_query_changed()
+            }
             PickerKind::Explorer => {
                 let filters = {
                     let Some(p) = &mut self.picker else {
@@ -2048,7 +2051,7 @@ impl Session {
                         offset: 0,
                         limit: FETCH_LIMIT,
                         center_on: None,
-                        center_on_cursor_grep_hit: None,
+                        center_on_cursor: None,
                         directory_path: None,
                         explorer_roots: false,
                         buffer_id: None,
@@ -2076,7 +2079,10 @@ impl Session {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
-        if !matches!(p.kind, PickerKind::Grep | PickerKind::Files) {
+        if !matches!(
+            p.kind,
+            PickerKind::Grep | PickerKind::Files | PickerKind::GitChanges
+        ) {
             return Effects::none();
         }
         let Some(eff) = p.live_filters(&project_paths) else {
@@ -2496,23 +2502,29 @@ impl Session {
             KeyCode::Char('f') if mods.ctrl && !mods.alt && p.kind == PickerKind::Explorer => {
                 return self.switch_explorer_picker(PickerKind::Files);
             }
-            // Alt-l/h are per-kind: Explorer descends / ascends; Grep jumps the selection to the
-            // next / previous file's first hit; DocumentSymbols jumps to the next / previous
-            // top-level unit; elsewhere Alt-h clears (via picker_back).
+            // Alt-l/h are per-kind: Explorer descends / ascends; Grep / Git-changes jump the
+            // selection to the next / previous file's first row; DocumentSymbols jumps to the next /
+            // previous top-level unit; elsewhere Alt-h clears (via picker_back).
             KeyCode::Char('l') if mods.alt && !mods.ctrl && p.kind == PickerKind::Explorer => {
                 return self.explorer_enter_selected();
             }
             KeyCode::Char('l')
                 if mods.alt
                     && !mods.ctrl
-                    && matches!(p.kind, PickerKind::Grep | PickerKind::DocumentSymbols) =>
+                    && matches!(
+                        p.kind,
+                        PickerKind::Grep | PickerKind::DocumentSymbols | PickerKind::GitChanges
+                    ) =>
             {
                 return self.picker_section_jump(Direction::Forward);
             }
             KeyCode::Char('h')
                 if mods.alt
                     && !mods.ctrl
-                    && matches!(p.kind, PickerKind::Grep | PickerKind::DocumentSymbols) =>
+                    && matches!(
+                        p.kind,
+                        PickerKind::Grep | PickerKind::DocumentSymbols | PickerKind::GitChanges
+                    ) =>
             {
                 return self.picker_section_jump(Direction::Backward);
             }
@@ -2894,7 +2906,11 @@ impl Session {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
-        if !matches!(p.kind, PickerKind::Grep | PickerKind::DocumentSymbols) || p.items.is_empty() {
+        if !matches!(
+            p.kind,
+            PickerKind::Grep | PickerKind::DocumentSymbols | PickerKind::GitChanges
+        ) || p.items.is_empty()
+        {
             return Effects::none();
         }
         let kind = p.kind;

@@ -10,9 +10,10 @@
 use crate::workspace_index::CachedFile;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{
-    BufferDirtyState, PickerFilters, PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams,
+    BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerItem, PickerKind,
+    PickerSelectResult, PickerUpdateParams,
 };
-use aether_protocol::viewport::DiagnosticSeverity;
+use aether_protocol::viewport::{DiagnosticSeverity, DiffStage};
 use aether_protocol::{BufferId, LogicalPosition};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -117,6 +118,140 @@ pub struct GrepHitCandidate {
     pub match_indices: Vec<u32>,
 }
 
+/// One Git-changes-picker candidate — a single hunk of one changed file. The candidates are
+/// grouped by file (contiguous runs, like grep), in `(path_index, relative_path)` order with the
+/// hunks of each file in anchor-line order; `hunk_index` is that position within the file. Built
+/// once on `picker/view` from the project's working-tree changes (combined staged+unstaged vs
+/// HEAD), so positional identity is stable for the picker's lifetime.
+#[derive(Debug, Clone)]
+pub struct GitChangeCandidate {
+    /// Index into the project's root list this file lives under.
+    pub path_index: u32,
+    /// Path relative to `roots[path_index]` (forward-slash). The file-group key.
+    pub relative_path: String,
+    /// Absolute path, returned via `PickerSelectResult::FileAt` for `buffer/open`.
+    pub abs_path: String,
+    /// Position of this hunk within its file's change list (0-based, anchor order).
+    pub hunk_index: u32,
+    /// 0-based buffer line the hunk anchors to — the jump target.
+    pub line: u32,
+    /// Staged vs unstaged, for the row's colour.
+    pub stage: DiffStage,
+    /// New-side lines added (`0` for a pure deletion).
+    pub added: u32,
+    /// Baseline lines removed (`0` for a pure addition).
+    pub removed: u32,
+    /// The hunk's changed lines, trimmed — new-side (added/modified) lines first, then the removed
+    /// baseline lines. The query regex-matches against these line-by-line (grep-style, content not
+    /// path), and the row previews `lines[0]` by default or the first line that matches the query.
+    pub lines: Vec<String>,
+}
+
+impl GitChangeCandidate {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        path_index: u32,
+        relative_path: String,
+        abs_path: String,
+        hunk_index: u32,
+        line: u32,
+        stage: DiffStage,
+        added: u32,
+        removed: u32,
+        lines: Vec<String>,
+    ) -> Self {
+        GitChangeCandidate {
+            path_index,
+            relative_path,
+            abs_path,
+            hunk_index,
+            line,
+            stage,
+            added,
+            removed,
+            lines,
+        }
+    }
+
+    /// The line to show on the row, and the char offsets of the regex match within it. With no
+    /// query (`re` is `None`), the hunk's first changed line and no highlight. With one, the first
+    /// changed line the regex matches (which is why the candidate was ranked) and the match's char
+    /// span. Only ever called for the fetched window's rows (a handful). Falls back to the first
+    /// line if nothing matches.
+    pub fn preview(&self, re: Option<&regex::Regex>) -> (String, Vec<u32>) {
+        let default = || (self.lines.first().cloned().unwrap_or_default(), Vec::new());
+        let Some(re) = re else { return default() };
+        match regex_line_match(&self.lines, re) {
+            Some((i, start, len)) => {
+                (self.lines[i].clone(), (start as u32..(start + len) as u32).collect())
+            }
+            None => default(),
+        }
+    }
+
+    /// The buffer line to jump to on select. With no query (`re` is `None`), the hunk's anchor
+    /// line. With one, the buffer line of the first changed line the regex matches (the previewed
+    /// line) — so accepting a result lands on the match, not the top of the hunk. A match on a
+    /// *removed* line has no buffer position, so it falls back to the anchor (the line the deletion
+    /// sits above). The hunk's new-side lines are `lines[0..added]` at buffer lines `line..line+added`.
+    pub fn select_line(&self, re: Option<&regex::Regex>) -> u32 {
+        let Some(re) = re else { return self.line };
+        match regex_line_match(&self.lines, re) {
+            Some((i, _, _)) if (i as u32) < self.added => self.line + i as u32,
+            _ => self.line,
+        }
+    }
+
+    /// Whether the regex matches any of the hunk's changed lines — the hot path, run over every
+    /// candidate on each keystroke. Line-oriented like grep; the compiled regex matches the original
+    /// bytes (no per-call allocation or case folding — case is baked into `re`).
+    pub fn matches(&self, re: &regex::Regex) -> bool {
+        self.lines.iter().any(|line| re.is_match(line))
+    }
+}
+
+/// The first line `re` matches, as `(line_index, char_start, char_len)` — the char-offset span so
+/// the result is a valid `match_indices` range (the regex works in bytes; we convert). `None` when
+/// no line matches.
+fn regex_line_match(lines: &[String], re: &regex::Regex) -> Option<(usize, usize, usize)> {
+    lines.iter().enumerate().find_map(|(i, line)| {
+        re.find(line).map(|m| {
+            let start = line[..m.start()].chars().count();
+            let len = line[m.start()..m.end()].chars().count();
+            (i, start, len)
+        })
+    })
+}
+
+/// Build the content-search regex from a query + match options — fixed-string escaping, whole-word
+/// fencing, and smartcase — identical to grep / buffer search. Shared by buffer search
+/// ([`crate::handlers::compute_search_entry`]) and the Git-changes picker so their query semantics
+/// stay in lock-step. `Err` for an unparseable pattern (a half-typed regex), which callers surface
+/// as "no matches".
+pub fn build_match_regex(query: &str, options: &MatchOptions) -> Result<regex::Regex, regex::Error> {
+    // Literal queries are escaped first; whole-word then fences the (escaped or raw) pattern with
+    // word boundaries. Smartcase reads the *original* query's casing.
+    let body = if options.fixed_string {
+        regex::escape(query)
+    } else {
+        query.to_string()
+    };
+    let pattern = if options.whole_word {
+        format!(r"\b(?:{body})\b")
+    } else {
+        body
+    };
+    let case_insensitive = match options.case {
+        CaseMode::Smart => !query.chars().any(|c| c.is_uppercase()),
+        CaseMode::Sensitive => false,
+        CaseMode::Insensitive => true,
+    };
+    regex::RegexBuilder::new(&pattern)
+        .case_insensitive(case_insensitive)
+        .multi_line(true)
+        .build()
+}
+
 /// One diagnostics-picker candidate — a single diagnostic in the scoped buffer. `message` is the
 /// fuzzy haystack; `abs_path` + `(line, col)` drive the `FileAt` jump on select.
 #[derive(Debug, Clone)]
@@ -215,6 +350,11 @@ pub enum MatchStrategy {
     /// No client-driven filter — the candidate set itself *is* the match set, in whatever
     /// order it was assembled. Used by Grep, where ripgrep filters server-side.
     Preserved,
+    /// Regex (grep-style: smartcase, whole-word, fixed-string) over each candidate's content lines
+    /// (not its path), natural order preserved. Used by GitChanges: the query greps the diff
+    /// content, and the matched line becomes the row's preview. Glob/dir chips still scope by path
+    /// alongside it.
+    RegexContent,
 }
 
 /// The candidate set a `PickerState` is matching against. Per-kind variant keeps the candidate
@@ -259,6 +399,10 @@ pub enum PickerCandidates {
     /// snapshot; preserved across non-reset re-views (like References) so scrolling doesn't rebuild
     /// against a possibly-changed set.
     Symbols(Vec<SymbolCandidate>),
+    /// The project's working-tree hunks, grouped by file. Built fresh on every `picker/view`
+    /// (a snapshot of the repo state at open); the query fuzzy-filters the file path while keeping
+    /// the file grouping (document order, like the symbols outline).
+    GitChanges(Vec<GitChangeCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -284,6 +428,7 @@ impl PickerCandidates {
             PickerCandidates::LspServers(v) => v.len(),
             PickerCandidates::References(v) => v.len(),
             PickerCandidates::Symbols(v) => v.len(),
+            PickerCandidates::GitChanges(v) => v.len(),
         }
     }
 
@@ -299,6 +444,7 @@ impl PickerCandidates {
             PickerCandidates::LspServers(_) => PickerKind::LspServers,
             PickerCandidates::References(_) => PickerKind::References,
             PickerCandidates::Symbols(_) => PickerKind::DocumentSymbols,
+            PickerCandidates::GitChanges(_) => PickerKind::GitChanges,
         }
     }
 
@@ -318,6 +464,9 @@ impl PickerCandidates {
             PickerCandidates::LspServers(v) => &v[idx].name,
             PickerCandidates::References(v) => &v[idx].preview,
             PickerCandidates::Symbols(v) => &v[idx].name,
+            // Not used as a match haystack (GitChanges greps content via SubstringContent, not
+            // `display_at`); kept defined for completeness.
+            PickerCandidates::GitChanges(v) => &v[idx].relative_path,
         }
     }
 
@@ -424,6 +573,24 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            // Default preview (first changed line, no highlight). The window builder constructs the
+            // query-matched variant directly via `GitChangeCandidate::preview`; the center-on /
+            // section-jump callers reach here with empty `match_indices` and only use the item for
+            // identity, so the default preview suffices.
+            PickerCandidates::GitChanges(v) => {
+                let c = &v[idx];
+                PickerItem::GitChange {
+                    path_index: c.path_index,
+                    relative_path: c.relative_path.clone(),
+                    hunk_index: c.hunk_index,
+                    line: c.line,
+                    stage: c.stage,
+                    added: c.added,
+                    removed: c.removed,
+                    preview: c.lines.first().cloned().unwrap_or_default(),
+                    match_indices,
+                }
+            }
         }
     }
 
@@ -502,6 +669,19 @@ impl PickerCandidates {
             ) => v
                 .iter()
                 .position(|c| c.abs_path == *path && c.start.line == *line && c.start.col == *col),
+            (
+                PickerCandidates::GitChanges(v),
+                PickerItem::GitChange {
+                    path_index,
+                    relative_path,
+                    hunk_index,
+                    ..
+                },
+            ) => v.iter().position(|c| {
+                c.path_index == *path_index
+                    && c.relative_path == *relative_path
+                    && c.hunk_index == *hunk_index
+            }),
             _ => None,
         }
     }
@@ -518,6 +698,9 @@ impl PickerCandidates {
             | PickerCandidates::LspServers(_)
             | PickerCandidates::References(_)
             | PickerCandidates::Symbols(_) => MatchStrategy::Fuzzy,
+            // GitChanges greps the diff content (regex, not path); document order is kept so the
+            // per-file grouping stays contiguous, like the symbols outline.
+            PickerCandidates::GitChanges(_) => MatchStrategy::RegexContent,
             PickerCandidates::Explorer(_) | PickerCandidates::ExplorerRoots(_) => {
                 MatchStrategy::PrefixSmartcase
             }
@@ -602,7 +785,24 @@ impl PickerCandidates {
                     anchor: (c.end != c.start).then_some(c.start),
                 })
             }
+            // Query-less default (anchor line). The query-aware variant — landing on the matched
+            // line — is applied by `resolve_select`, which has the picker's query.
+            PickerCandidates::GitChanges(v) => Some(git_change_select(&v[idx], None)),
         }
+    }
+}
+
+/// The `FileAt` result for a Git-changes hunk, landing on the line the `re` (the query regex)
+/// matched, or the anchor with no query. Factored out so `select_result` (query-less) and
+/// `resolve_select` (query-aware) share one construction.
+fn git_change_select(c: &GitChangeCandidate, re: Option<&regex::Regex>) -> PickerSelectResult {
+    PickerSelectResult::FileAt {
+        path: c.abs_path.clone(),
+        position: LogicalPosition {
+            line: c.select_line(re),
+            col: 0,
+        },
+        anchor: None,
     }
 }
 
@@ -673,9 +873,11 @@ pub fn build_overrides(
     builder.build().map(Some)
 }
 
-/// The Files picker's filter-chip predicate, applied during `rerank` before fuzzy matching.
-/// Cheap to rebuild per rerank (a handful of globs at most); the git statuses ride alongside
-/// the candidate snapshot, so `changed` is a lookup, not a repo walk.
+/// A path-scope filter-chip predicate (globs + directory scopes + the `changed_only` flag),
+/// applied during `rerank` before fuzzy matching. Cheap to rebuild per rerank (a handful of globs
+/// at most). The Files picker uses the full predicate; the Git-changes picker uses only the
+/// path-scope half ([`FilesFilter::passes_path`]) — it's inherently changed-only and has no status
+/// vector — via the glob/dir chips it shares.
 struct FilesFilter {
     overrides: Option<ignore::overrides::Override>,
     /// An invalid glob rejects everything — mirrors grep's invalid-pattern behavior (the chip
@@ -720,21 +922,31 @@ impl FilesFilter {
         }
     }
 
-    fn passes(&self, file: &CachedFile, status: Option<aether_protocol::git::GitStatus>) -> bool {
+    /// The path-scope half: reject-all (invalid glob), directory scopes, and include/exclude globs,
+    /// all keyed only on `(path_index, relative_path)`. Shared by Files and Git changes.
+    fn passes_path(&self, path_index: u32, relative_path: &str) -> bool {
         if self.reject_all {
             return false;
         }
         if !self.directories.is_empty()
-            && !self.directories.iter().any(|(path_index, rel)| {
-                under_scope(file.path_index, &file.relative_path, *path_index, rel)
-            })
+            && !self
+                .directories
+                .iter()
+                .any(|(pi, rel)| under_scope(path_index, relative_path, *pi, rel))
         {
             return false;
         }
         if let Some(ov) = &self.overrides {
-            if ov.matched(&file.relative_path, false).is_ignore() {
+            if ov.matched(relative_path, false).is_ignore() {
                 return false;
             }
+        }
+        true
+    }
+
+    fn passes(&self, file: &CachedFile, status: Option<aether_protocol::git::GitStatus>) -> bool {
+        if !self.passes_path(file.path_index, &file.relative_path) {
+            return false;
         }
         // The workspace walk never yields ignored files, so any status here is a real change.
         if self.changed_only && status.is_none() {
@@ -771,8 +983,14 @@ impl PickerState {
         // Files: filter chips narrow the candidate set before (and independently of) the fuzzy
         // match. The other kinds filter elsewhere — Grep in the search worker, Explorer when
         // the listing is built — so their predicate is always "pass".
+        // Files and Git changes both narrow by glob/dir chips before fuzzy matching (Git changes
+        // shares the path-scope half — it's inherently changed-only). The other kinds filter
+        // elsewhere (Grep in the search worker, Explorer when the listing is built), so their
+        // predicate is always "pass".
         let files_filter = match &self.candidates {
-            PickerCandidates::Files { .. } if !self.filters.is_default() => {
+            PickerCandidates::Files { .. } | PickerCandidates::GitChanges(_)
+                if !self.filters.is_default() =>
+            {
                 Some(FilesFilter::new(&self.filters))
             }
             _ => None,
@@ -781,10 +999,15 @@ impl PickerState {
             let Some(ff) = files_filter.as_ref() else {
                 return true;
             };
-            let PickerCandidates::Files { files, git_status } = candidates else {
-                return true;
-            };
-            ff.passes(&files[i], git_status.get(i).copied().flatten())
+            match candidates {
+                PickerCandidates::Files { files, git_status } => {
+                    ff.passes(&files[i], git_status.get(i).copied().flatten())
+                }
+                PickerCandidates::GitChanges(v) => {
+                    ff.passes_path(v[i].path_index, &v[i].relative_path)
+                }
+                _ => true,
+            }
         };
         // Two paths converge on "preserve natural order": Grep's strategy is always Preserved,
         // and the other strategies short-circuit to natural order on an empty query.
@@ -836,6 +1059,13 @@ impl PickerState {
                         }
                     }
                     self.ranked = keep.into_iter().collect();
+                } else if matches!(&self.candidates, PickerCandidates::GitChanges(_)) {
+                    // Git changes group by file: keep matches in document (candidate) order, not
+                    // score order, so each file's hunks stay a contiguous run the client can put a
+                    // single header above. The fuzzy score only decides which rows survive.
+                    let mut keep: Vec<u32> = scored.into_iter().map(|(_, i)| i).collect();
+                    keep.sort_unstable();
+                    self.ranked = keep;
                 } else {
                     // Higher score first; ties fall back to candidate order for determinism.
                     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -874,8 +1104,37 @@ impl PickerState {
                     }
                 }
             }
+            MatchStrategy::RegexContent => {
+                // GitChanges: keep every candidate (in document order) whose diff content the query
+                // regex matches, after the path-scope chip filter (`passes`). The empty-query case
+                // is handled by the natural-order short-circuit above, so the query is non-empty
+                // here — a `None` regex therefore means an unparseable pattern, which matches
+                // nothing (the picker shows no results until the regex is valid).
+                let PickerCandidates::GitChanges(v) = &self.candidates else {
+                    return;
+                };
+                let Some(re) = self.content_regex() else {
+                    return;
+                };
+                for (i, c) in v.iter().enumerate() {
+                    if passes(&self.candidates, i) && c.matches(&re) {
+                        self.ranked.push(i as u32);
+                    }
+                }
+            }
             MatchStrategy::Preserved => unreachable!("handled above"),
         }
+    }
+
+    /// The compiled content-search regex for the current query + filter options (GitChanges).
+    /// `None` for an empty query *or* an unparseable pattern — callers distinguish: the empty case
+    /// is handled before this is reached (natural order / default preview), so a `None` here during
+    /// matching means "invalid regex → no matches".
+    fn content_regex(&self) -> Option<regex::Regex> {
+        if self.query.is_empty() {
+            return None;
+        }
+        build_match_regex(&self.query, &self.filters.match_options()).ok()
     }
 
     /// Locate a ranked index for `item` (used by `view { center_on }`). Returns `None` if the
@@ -899,6 +1158,30 @@ impl PickerState {
         let total = self.ranked.len() as u32;
         let start = offset.min(total);
         let end = start.saturating_add(limit).min(total);
+        // GitChanges previews the query-matched line (not the path), so it builds its items
+        // directly rather than going through the path/name match-index machinery below.
+        if let PickerCandidates::GitChanges(v) = &self.candidates {
+            let re = self.content_regex();
+            let items = self.ranked[start as usize..end as usize]
+                .iter()
+                .map(|&ci| {
+                    let c = &v[ci as usize];
+                    let (preview, match_indices) = c.preview(re.as_ref());
+                    PickerItem::GitChange {
+                        path_index: c.path_index,
+                        relative_path: c.relative_path.clone(),
+                        hunk_index: c.hunk_index,
+                        line: c.line,
+                        stage: c.stage,
+                        added: c.added,
+                        removed: c.removed,
+                        preview,
+                        match_indices,
+                    }
+                })
+                .collect();
+            return (start, items);
+        }
         // Match-indices source depends on the strategy: fuzzy → nucleo's `indices` helper;
         // prefix → the leading N chars of the name; preserved → none (Grep candidates carry
         // their own ripgrep-computed indices, applied inside `make_item`).
@@ -960,24 +1243,31 @@ impl PickerState {
         self.candidates.len() as u32
     }
 
-    /// Grep display-row metrics for a window starting at ranked index `offset`: the display-row
-    /// index of that item (one section header per file group is interleaved above the hits) and the
-    /// total display rows (`ranked.len()` hits + the number of file groups). `None` for non-grep
-    /// pickers. Mirrors the client's header-per-file rendering so its virtual-scroll spacer +
-    /// positioning are exact.
-    fn grep_display_metrics(&self, offset: u32) -> Option<(u32, u32)> {
-        let PickerCandidates::Grep(hits) = &self.candidates else {
-            return None;
+    /// Grouped display-row metrics for a window starting at ranked index `offset`: the display-row
+    /// index of that item (one section header per file group is interleaved above the rows) and the
+    /// total display rows (`ranked.len()` rows + the number of file groups). `None` for pickers
+    /// that don't group by file (everything but Grep and GitChanges). Mirrors the client's
+    /// header-per-file rendering so its virtual-scroll spacer + positioning are exact.
+    fn grouped_display_metrics(&self, offset: u32) -> Option<(u32, u32)> {
+        // The `(path_index, relative_path)` group key of ranked row `ci`, for the grouped kinds.
+        let key_at = |ci: usize| -> Option<(u32, &str)> {
+            match &self.candidates {
+                PickerCandidates::Grep(v) => Some((v[ci].path_index, v[ci].relative_path.as_str())),
+                PickerCandidates::GitChanges(v) => {
+                    Some((v[ci].path_index, v[ci].relative_path.as_str()))
+                }
+                _ => None,
+            }
         };
+        key_at(*self.ranked.first()? as usize)?; // bail for non-grouped kinds (and empty sets)
         let mut total_files = 0u32;
         let mut headers_at_or_before = 0u32;
         let mut prev: Option<(u32, &str)> = None;
         for (rank, &ci) in self.ranked.iter().enumerate() {
-            let h = &hits[ci as usize];
-            let key = (h.path_index, h.relative_path.as_str());
-            if prev != Some(key) {
+            let key = key_at(ci as usize);
+            if prev != key {
                 total_files += 1;
-                prev = Some(key);
+                prev = key;
                 if (rank as u32) <= offset {
                     headers_at_or_before += 1;
                 }
@@ -995,7 +1285,8 @@ impl PickerState {
 pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<PickerUpdateParams> {
     let window = state.subscribed?;
     let (offset, items) = state.build_window_items(window.offset, window.limit, matcher);
-    let (grep_display_offset, grep_total_display_rows) = match state.grep_display_metrics(offset) {
+    let (grep_display_offset, grep_total_display_rows) = match state.grouped_display_metrics(offset)
+    {
         Some((d, t)) => (Some(d), Some(t)),
         None => (None, None),
     };
@@ -1041,6 +1332,11 @@ fn smartcase_query(query: &str) -> (String, bool) {
 /// isn't selectable (e.g. an Explorer directory entry — those navigate via `picker/view`).
 pub fn resolve_select(state: &PickerState, item: &PickerItem) -> Option<PickerSelectResult> {
     let idx = state.candidates.position_of(item)?;
+    // GitChanges lands on the line that matched the active query (the previewed line), not the
+    // hunk's anchor — so accepting a content search jumps to the match.
+    if let PickerCandidates::GitChanges(v) = &state.candidates {
+        return Some(git_change_select(&v[idx], state.content_regex().as_ref()));
+    }
     state.candidates.select_result(idx)
 }
 
@@ -1394,6 +1690,340 @@ mod tests {
         // Line 8 is past the method but still inside the struct.
         assert!(v[0].contains(LogicalPosition { line: 8, col: 0 }));
         assert!(!v[1].contains(LogicalPosition { line: 8, col: 0 }));
+    }
+
+    fn git_change_candidates() -> PickerCandidates {
+        PickerCandidates::GitChanges(vec![
+            GitChangeCandidate::new(
+                0,
+                "src/a.rs".into(),
+                "/proj/src/a.rs".into(),
+                0,
+                4,
+                DiffStage::Unstaged,
+                2,
+                1,
+                vec!["let x = 1;".into()],
+            ),
+            GitChangeCandidate::new(
+                0,
+                "src/a.rs".into(),
+                "/proj/src/a.rs".into(),
+                1,
+                20,
+                DiffStage::Staged,
+                0,
+                3,
+                vec!["old".into()],
+            ),
+        ])
+    }
+
+    #[test]
+    fn git_change_candidates_round_trip_to_items() {
+        let c = git_change_candidates();
+        assert_eq!(c.kind(), PickerKind::GitChanges);
+        assert_eq!(c.len(), 2);
+        // The query greps content, not the path — regex over each candidate's `lines`.
+        assert_eq!(c.match_strategy(), MatchStrategy::RegexContent);
+        match c.make_item(1, vec![0, 1]) {
+            PickerItem::GitChange {
+                path_index,
+                relative_path,
+                hunk_index,
+                line,
+                stage,
+                added,
+                removed,
+                preview,
+                match_indices,
+            } => {
+                assert_eq!(path_index, 0);
+                assert_eq!(relative_path, "src/a.rs");
+                assert_eq!(hunk_index, 1);
+                assert_eq!(line, 20);
+                assert_eq!(stage, DiffStage::Staged);
+                assert_eq!((added, removed), (0, 3));
+                assert_eq!(preview, "old");
+                assert_eq!(match_indices, vec![0, 1]);
+            }
+            other => panic!("expected GitChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_change_identity_is_path_and_hunk_index() {
+        let c = git_change_candidates();
+        // Two hunks of the same file are distinguished by hunk_index.
+        assert_eq!(c.position_of(&c.make_item(0, vec![])), Some(0));
+        assert_eq!(c.position_of(&c.make_item(1, vec![])), Some(1));
+        // A hunk_index past the file's change list doesn't match.
+        let elsewhere = PickerItem::GitChange {
+            path_index: 0,
+            relative_path: "src/a.rs".into(),
+            hunk_index: 9,
+            line: 0,
+            stage: DiffStage::Unstaged,
+            added: 1,
+            removed: 0,
+            preview: "x".into(),
+            match_indices: vec![],
+        };
+        assert_eq!(c.position_of(&elsewhere), None);
+    }
+
+    #[test]
+    fn git_change_rerank_filters_by_dir_and_glob_keeping_grouping() {
+        use aether_protocol::picker::{PickerFilters, ScopedPath};
+        let cands = PickerCandidates::GitChanges(vec![
+            GitChangeCandidate::new(
+                0,
+                "src/a.rs".into(),
+                "/p/src/a.rs".into(),
+                0,
+                1,
+                DiffStage::Unstaged,
+                1,
+                0,
+                vec!["a".into()],
+            ),
+            GitChangeCandidate::new(
+                0,
+                "src/a.rs".into(),
+                "/p/src/a.rs".into(),
+                1,
+                9,
+                DiffStage::Unstaged,
+                1,
+                0,
+                vec!["a2".into()],
+            ),
+            GitChangeCandidate::new(
+                0,
+                "docs/b.md".into(),
+                "/p/docs/b.md".into(),
+                0,
+                2,
+                DiffStage::Unstaged,
+                1,
+                0,
+                vec!["b".into()],
+            ),
+        ]);
+        let mut m = make_matcher();
+
+        // A directory scope keeps both src/a.rs hunks (contiguous) and drops docs/b.md.
+        let mut s = PickerState::new(cands.clone());
+        s.filters = PickerFilters {
+            directories: vec![ScopedPath {
+                path_index: 0,
+                relative_path: "src".into(),
+            }],
+            ..Default::default()
+        };
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0, 1], "both src/a.rs hunks, no docs/b.md");
+
+        // An exclude glob drops src and leaves docs.
+        let mut s = PickerState::new(cands);
+        s.filters = PickerFilters {
+            globs: vec!["!src/**".into()],
+            ..Default::default()
+        };
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![2], "only docs/b.md survives the exclude glob");
+    }
+
+    #[test]
+    fn git_change_query_greps_content_and_previews_the_matched_line() {
+        let cand = |rel: &str, lines: Vec<&str>| {
+            GitChangeCandidate::new(
+                0,
+                rel.into(),
+                format!("/{rel}"),
+                0,
+                0,
+                DiffStage::Unstaged,
+                lines.len() as u32,
+                0,
+                lines.into_iter().map(String::from).collect(),
+            )
+        };
+        let cands = PickerCandidates::GitChanges(vec![
+            cand("a.rs", vec!["fn one()", "let TODO = 1", "return"]),
+            cand("b.rs", vec!["nothing here"]),
+        ]);
+        let mut s = PickerState::new(cands);
+        let mut m = make_matcher();
+
+        // Smartcase substring over content: "todo" matches "TODO" in a.rs, not b.rs.
+        s.query = "todo".into();
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0], "only the hunk whose content matches");
+        let (_, items) = s.build_window_items(0, 10, &mut m);
+        match &items[0] {
+            PickerItem::GitChange {
+                preview,
+                match_indices,
+                ..
+            } => {
+                assert_eq!(preview, "let TODO = 1", "previews the matched line, not the first");
+                assert_eq!(match_indices, &vec![4, 5, 6, 7], "highlights the matched span");
+            }
+            other => panic!("expected GitChange, got {other:?}"),
+        }
+
+        // Empty query → every hunk, previewing its first changed line with no highlight.
+        s.query = String::new();
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0, 1]);
+        let (_, items) = s.build_window_items(0, 10, &mut m);
+        match &items[0] {
+            PickerItem::GitChange {
+                preview,
+                match_indices,
+                ..
+            } => {
+                assert_eq!(preview, "fn one()");
+                assert!(match_indices.is_empty());
+            }
+            other => panic!("expected GitChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_change_selects_to_file_at_anchor_line() {
+        // Selecting a hunk jumps to the start of its anchor line (a point, not a selection).
+        match git_change_candidates().select_result(0) {
+            Some(PickerSelectResult::FileAt {
+                path,
+                position,
+                anchor,
+            }) => {
+                assert_eq!(path, "/proj/src/a.rs");
+                assert_eq!(position, LogicalPosition { line: 4, col: 0 });
+                assert_eq!(anchor, None);
+            }
+            other => panic!("expected FileAt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_change_query_supports_regex_and_match_options() {
+        let cand = |rel: &str, line: &str| {
+            GitChangeCandidate::new(
+                0,
+                rel.into(),
+                format!("/{rel}"),
+                0,
+                0,
+                DiffStage::Unstaged,
+                1,
+                0,
+                vec![line.into()],
+            )
+        };
+        let cands = PickerCandidates::GitChanges(vec![
+            cand("a.rs", "let count = 42;"),
+            cand("b.rs", "axb pattern"), // regex `a.b` matches; literal `a.b` does not
+            cand("c.rs", "a.b literal"), // both match
+        ]);
+        let mut m = make_matcher();
+
+        // A real regex pattern.
+        let mut s = PickerState::new(cands.clone());
+        s.query = r"\d+".into();
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0], "only the line with digits matches `\\d+`");
+
+        // Whole-word: a substring matches by default, but not as a whole word with the chip.
+        let mut s = PickerState::new(cands.clone());
+        s.query = "ount".into();
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0], "substring 'ount' matches 'count' without the chip");
+        s.filters.whole_word = true;
+        s.rerank(&mut m);
+        assert!(s.ranked.is_empty(), "whole-word: 'ount' isn't a whole word in 'count'");
+
+        // Fixed-string: `a.b` is a regex (`.` = any char) without the chip, a literal with it.
+        let mut s = PickerState::new(cands.clone());
+        s.query = "a.b".into();
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![1, 2], "regex `a.b` matches 'axb' and 'a.b'");
+        s.filters.fixed_string = true;
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![2], "literal 'a.b' matches only 'a.b literal'");
+
+        // An unparseable pattern matches nothing (the picker shows no results until it's valid).
+        let mut s = PickerState::new(cands);
+        s.query = "(".into();
+        s.rerank(&mut m);
+        assert!(s.ranked.is_empty(), "an invalid regex matches nothing");
+    }
+
+    #[test]
+    fn git_change_select_line_lands_on_the_matched_line() {
+        // A hunk anchored at buffer line 10 adding three lines.
+        let c = GitChangeCandidate::new(
+            0,
+            "a.rs".into(),
+            "/a.rs".into(),
+            0,
+            10,
+            DiffStage::Unstaged,
+            3,
+            0,
+            vec!["zero".into(), "one TODO".into(), "two".into()],
+        );
+        let re = |q: &str| build_match_regex(q, &MatchOptions::default()).unwrap();
+        assert_eq!(c.select_line(None), 10, "no query → the anchor line");
+        assert_eq!(c.select_line(Some(&re("todo"))), 11, "the 2nd new-side line is buffer line 11");
+        assert_eq!(c.select_line(Some(&re("zero"))), 10, "the 1st new-side line is the anchor");
+        assert_eq!(c.select_line(Some(&re("nope"))), 10, "no match → the anchor");
+
+        // A match only on a removed line (no buffer position) falls back to the anchor.
+        let d = GitChangeCandidate::new(
+            0,
+            "b.rs".into(),
+            "/b.rs".into(),
+            0,
+            5,
+            DiffStage::Unstaged,
+            1,
+            1,
+            vec!["kept".into(), "REMOVED gone".into()],
+        );
+        assert_eq!(d.select_line(Some(&re("gone"))), 5, "a removed-line match anchors");
+    }
+
+    #[test]
+    fn git_change_resolve_select_jumps_to_the_query_match() {
+        let cands = PickerCandidates::GitChanges(vec![GitChangeCandidate::new(
+            0,
+            "a.rs".into(),
+            "/a.rs".into(),
+            0,
+            10,
+            DiffStage::Unstaged,
+            2,
+            0,
+            vec!["fn foo".into(), "let MATCH = 1".into()],
+        )]);
+        let mut s = PickerState::new(cands);
+        let item = s.candidates.make_item(0, vec![]);
+
+        // With a content query, select lands on the matched line (anchor 10 + new-side index 1).
+        s.query = "match".into();
+        match resolve_select(&s, &item) {
+            Some(PickerSelectResult::FileAt { position, .. }) => assert_eq!(position.line, 11),
+            other => panic!("expected FileAt, got {other:?}"),
+        }
+        // With no query, it lands on the anchor.
+        s.query = String::new();
+        match resolve_select(&s, &item) {
+            Some(PickerSelectResult::FileAt { position, .. }) => assert_eq!(position.line, 10),
+            other => panic!("expected FileAt, got {other:?}"),
+        }
     }
 
     #[test]

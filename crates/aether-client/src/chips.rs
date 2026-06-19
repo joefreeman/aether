@@ -99,6 +99,12 @@ pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
     match kind {
         PickerKind::Grep => true,
         PickerKind::Files => matches!(id, ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Changed),
+        // The Git-changes picker greps content like Grep, so it offers the regex options
+        // (case/word/literal) plus the path-scope chips. It's inherently changed-only.
+        PickerKind::GitChanges => matches!(
+            id,
+            ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Case | ChipId::Word | ChipId::Lit
+        ),
         PickerKind::Explorer => matches!(id, ChipId::Ignored | ChipId::Hidden | ChipId::Changed),
         _ => false,
     }

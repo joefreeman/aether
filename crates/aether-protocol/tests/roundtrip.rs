@@ -1353,6 +1353,59 @@ fn picker_item_file_carries_git_status() {
 }
 
 #[test]
+fn picker_item_git_change_is_tagged() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    use aether_protocol::viewport::DiffStage;
+    assert_eq!(to_value(PickerKind::GitChanges).unwrap(), json!("git_changes"));
+
+    // An unstaged hunk: the default stage is omitted from the wire.
+    let item = PickerItem::GitChange {
+        path_index: 0,
+        relative_path: "src/main.rs".into(),
+        hunk_index: 2,
+        line: 41,
+        stage: DiffStage::Unstaged,
+        added: 3,
+        removed: 1,
+        preview: "    let x = 1;".into(),
+        match_indices: vec![0, 1],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "kind": "git_change",
+            "path_index": 0,
+            "relative_path": "src/main.rs",
+            "hunk_index": 2,
+            "line": 41,
+            "added": 3,
+            "removed": 1,
+            "preview": "    let x = 1;",
+            "match_indices": [0, 1],
+        }),
+        "the default Unstaged stage is skipped on the wire"
+    );
+    assert_eq!(from_value::<PickerItem>(v).unwrap(), item);
+
+    // A staged hunk carries its stage explicitly.
+    let staged = PickerItem::GitChange {
+        path_index: 1,
+        relative_path: "lib.rs".into(),
+        hunk_index: 0,
+        line: 0,
+        stage: DiffStage::Staged,
+        added: 0,
+        removed: 4,
+        preview: "gone".into(),
+        match_indices: vec![],
+    };
+    let v = to_value(&staged).unwrap();
+    assert_eq!(v["stage"], "staged");
+    assert_eq!(from_value::<PickerItem>(v).unwrap(), staged);
+}
+
+#[test]
 fn picker_item_diagnostic_is_tagged() {
     use aether_protocol::picker::{PickerItem, PickerKind};
     assert_eq!(
@@ -1529,7 +1582,7 @@ fn picker_view_params_omit_center_on_when_none() {
         offset: 0,
         limit: 30,
         center_on: None,
-        center_on_cursor_grep_hit: None,
+        center_on_cursor: None,
         directory_path: None,
         buffer_id: None,
         explorer_roots: false,
@@ -1558,7 +1611,7 @@ fn picker_view_params_center_on_serialized() {
             match_indices: vec![],
             git_status: None,
         }),
-        center_on_cursor_grep_hit: None,
+        center_on_cursor: None,
         directory_path: None,
         buffer_id: None,
         explorer_roots: false,
@@ -1901,7 +1954,7 @@ fn picker_view_params_directory_path_skipped_when_none() {
         offset: 0,
         limit: 30,
         center_on: None,
-        center_on_cursor_grep_hit: None,
+        center_on_cursor: None,
         directory_path: None,
         buffer_id: None,
         explorer_roots: false,
@@ -1923,7 +1976,7 @@ fn picker_view_params_directory_path_serialized() {
         offset: 0,
         limit: 30,
         center_on: None,
-        center_on_cursor_grep_hit: None,
+        center_on_cursor: None,
         directory_path: Some("/home/x/proj/src".into()),
         buffer_id: None,
         explorer_roots: false,

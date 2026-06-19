@@ -8423,7 +8423,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -8474,6 +8474,658 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
 }
 
 #[tokio::test]
+async fn git_changes_picker_lists_hunks_grouped_by_file() {
+    use aether_protocol::viewport::DiffStage;
+
+    // A committed file, modified on disk (a one-line modification), plus a brand-new untracked
+    // file. Neither is opened in a buffer, so both go through the disk-diff path.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "one\ntwo\nthree\n");
+    std::fs::write(dir.path().join("a.rs"), "one\nTWO\nthree\n").unwrap();
+    std::fs::write(dir.path().join("new.rs"), "hello\nworld\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("changes-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "changes-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let update = view.update.expect("the view carries its initial window");
+    assert_eq!(update.kind, PickerKind::GitChanges);
+
+    // Two hunks across two files: the modification in a.rs, the whole-file add of new.rs. Sorted
+    // by path, so a.rs precedes new.rs.
+    let items = update.items();
+    assert_eq!(items.len(), 2, "two hunks, got {items:?}");
+    assert_eq!(update.total_matches, 2);
+
+    let PickerItem::GitChange {
+        relative_path,
+        line,
+        stage,
+        added,
+        removed,
+        preview,
+        hunk_index,
+        ..
+    } = &items[0]
+    else {
+        panic!("expected GitChange, got {:?}", items[0]);
+    };
+    assert_eq!(relative_path, "a.rs");
+    assert_eq!(*line, 1, "modification anchors on the changed line");
+    assert_eq!((*added, *removed), (1, 1), "one line replaced");
+    assert_eq!(preview, "TWO", "preview is the new-side line");
+    assert_eq!(*stage, DiffStage::Unstaged);
+    assert_eq!(*hunk_index, 0);
+
+    let PickerItem::GitChange {
+        relative_path,
+        line,
+        added,
+        removed,
+        preview,
+        ..
+    } = &items[1]
+    else {
+        panic!("expected GitChange, got {:?}", items[1]);
+    };
+    assert_eq!(relative_path, "new.rs");
+    assert_eq!(*line, 0);
+    assert_eq!((*added, *removed), (2, 0), "untracked = whole-file add");
+    assert_eq!(preview, "hello");
+
+    // Grouped display rows: 2 hunks + one header per file = 4.
+    assert_eq!(update.grep_total_display_rows, Some(4));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_changes_picker_collapses_untracked_directories() {
+    // A wholly-new directory full of files must not flood the list — only individual new files
+    // (and tracked changes) show; the new directory collapses to nothing diffable.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "one\n");
+    std::fs::write(dir.path().join("a.rs"), "ONE\n").unwrap(); // a tracked modification
+    std::fs::create_dir_all(dir.path().join("junk")).unwrap();
+    for n in 0..5 {
+        std::fs::write(dir.path().join(format!("junk/f{n}.rs")), "x\n").unwrap();
+    }
+    std::fs::write(dir.path().join("loose.rs"), "loose\n").unwrap(); // a lone new file
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("collapse-proj", vec![dir_path])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "collapse-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let update = view.update.expect("window rides the response");
+    let paths: Vec<&str> = update
+        .items()
+        .iter()
+        .map(|i| {
+            let PickerItem::GitChange { relative_path, .. } = i else {
+                panic!("expected GitChange, got {i:?}");
+            };
+            relative_path.as_str()
+        })
+        .collect();
+    // The modification + the loose new file, but none of the five files inside `junk/`.
+    assert_eq!(paths, vec!["a.rs", "loose.rs"], "got {paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.starts_with("junk/")),
+        "untracked directory must not expand into the list"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_changes_picker_reflects_unsaved_buffer_edits() {
+    // A file clean on disk but edited in an open buffer must show the *buffer's* change — the
+    // picker prefers live buffer text over disk for open files.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "one\ntwo\n");
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let (server, mut ws, buffer_id) = setup_git_apply(&dir_path, "buf-changes", "a.rs").await;
+    // Type at the end of line 0 so the buffer differs from HEAD while the disk file does not.
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: LogicalPosition { line: 0, col: 3 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id,
+            text: "!".into(),
+            select_pasted: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        5,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let update = view.update.expect("window rides the response");
+    let items = update.items();
+    assert_eq!(items.len(), 1, "the unsaved buffer edit shows, got {items:?}");
+    let PickerItem::GitChange {
+        relative_path,
+        preview,
+        ..
+    } = &items[0]
+    else {
+        panic!("expected GitChange, got {:?}", items[0]);
+    };
+    assert_eq!(relative_path, "a.rs");
+    assert_eq!(preview, "one!", "preview reflects the live buffer, not disk");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_changes_picker_centers_on_the_cursor_hunk() {
+    // Two hunks in the active file, far apart. Opening the picker with the cursor near the second
+    // should land the highlight on that hunk (the `Space c` "where you are" behaviour).
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "l0\nl1\nl2\nl3\nl4\nl5\n");
+    // Modify line 1 and line 4 → two disjoint hunks.
+    std::fs::write(dir.path().join("a.rs"), "l0\nONE\nl2\nl3\nFOUR\nl5\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let (server, mut ws, buffer_id) = setup_git_apply(&dir_path, "center-proj", "a.rs").await;
+    // Put the cursor on line 4 (the second hunk).
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 4, col: 0 },
+            anchor: LogicalPosition { line: 4, col: 0 },
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        4,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: Some(buffer_id),
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let centered = view
+        .effective_center_on
+        .expect("the cursor resolved to a hunk");
+    let PickerItem::GitChange { line, .. } = centered else {
+        panic!("expected GitChange, got {centered:?}");
+    };
+    assert_eq!(line, 4, "centered on the hunk at the cursor line");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_changes_picker_query_greps_diff_content() {
+    // The query searches the changed lines (not the path) and the row previews the matched line.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "alpha\nbeta\ngamma\n");
+    // Modify two lines; only the second contains "MARKER".
+    std::fs::write(dir.path().join("a.rs"), "ALPHA\nbeta MARKER\ngamma\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "untouched line\n").unwrap(); // untracked, no marker
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("grep-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "grep-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await; // drain the initial (unfiltered) push
+
+    // Search the content for "marker" (smartcase → matches "MARKER").
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::GitChanges,
+            query: "marker".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.generation, 1);
+    let items = update.items();
+    assert_eq!(items.len(), 1, "only the hunk whose content matches, got {items:?}");
+    let PickerItem::GitChange {
+        relative_path,
+        preview,
+        match_indices,
+        ..
+    } = &items[0]
+    else {
+        panic!("expected GitChange, got {:?}", items[0]);
+    };
+    assert_eq!(relative_path, "a.rs");
+    assert_eq!(preview, "beta MARKER", "previews the matched line, not the first changed line");
+    assert!(!match_indices.is_empty(), "the match within the preview is highlighted");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_changes_picker_select_jumps_to_the_matched_line() {
+    // Accepting a result during a content search lands on the matched line, not the hunk anchor.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "l0\nl1\nl2\n");
+    // Insert two lines after l0; the MARKER is on the *second* inserted line.
+    std::fs::write(dir.path().join("a.rs"), "l0\nadded one\nadded two MARKER\nl1\nl2\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("jump-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "jump-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::GitChanges,
+            query: "marker".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let item = update.items().first().expect("a match").clone();
+
+    let result: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        4,
+        &PickerSelectParams {
+            kind: PickerKind::GitChanges,
+            item,
+        },
+    )
+    .await;
+    let PickerSelectResult::FileAt { position, .. } = result else {
+        panic!("expected FileAt, got {result:?}");
+    };
+    // The hunk anchors at line 1 (first inserted line); the match is on line 2 (second).
+    assert_eq!(position.line, 2, "lands on the matched line, not the hunk anchor");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_changes_picker_persists_query_across_reopen() {
+    // The content query survives hide → reopen (server-side, like Grep): the picker reopens still
+    // filtered, with the query echoed back, even though candidates are re-snapshotted.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "alpha\n");
+    std::fs::write(dir.path().join("a.rs"), "alpha MARKER\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "no match here\n").unwrap(); // untracked, no marker
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("persist-proj", vec![dir_path])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "persist-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    // Open (fresh), search "marker", then hide.
+    let open = |id| PickerViewParams {
+        filters: None,
+        kind: PickerKind::GitChanges,
+        reset: id == 0, // first open resets; the reopen below resumes
+        offset: 0,
+        limit: 30,
+        center_on: None,
+        center_on_cursor: None,
+        directory_path: None,
+        buffer_id: None,
+        explorer_roots: false,
+    };
+    let _ = send_request::<PickerView>(&mut ws, 2, &open(0)).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::GitChanges,
+            query: "marker".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerHide>(&mut ws, 4, &PickerHideParams {
+        kind: PickerKind::GitChanges,
+    })
+    .await;
+
+    // Reopen with reset:false — the server kept the query, so the picker comes back filtered.
+    let view = send_request::<PickerView>(&mut ws, 5, &open(1)).await;
+    assert_eq!(view.query, "marker", "the content query is restored on reopen");
+    let update = view.update.expect("window rides the response");
+    let items = update.items();
+    assert_eq!(items.len(), 1, "still filtered to the matching hunk, got {items:?}");
+    let PickerItem::GitChange {
+        relative_path,
+        preview,
+        ..
+    } = &items[0]
+    else {
+        panic!("expected GitChange, got {:?}", items[0]);
+    };
+    assert_eq!(relative_path, "a.rs");
+    assert_eq!(preview, "alpha MARKER");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_changes_picker_query_is_a_regex() {
+    // The query is a regex (like grep), so a metacharacter pattern matches by regex semantics.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "x\n");
+    std::fs::write(dir.path().join("a.rs"), "x\nlet count = 1\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("regex-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "regex-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    // `c.unt` (with `.` as any-char) matches "count" via regex, not as a literal.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::GitChanges,
+            query: "c.unt".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let items = update.items();
+    assert_eq!(items.len(), 1, "the regex matches the changed line, got {items:?}");
+    let PickerItem::GitChange { preview, .. } = &items[0] else {
+        panic!("expected GitChange, got {:?}", items[0]);
+    };
+    assert_eq!(preview, "let count = 1");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_changes_picker_filters_by_directory() {
+    // Two changed files in different directories; a `dir:src` scope narrows the list to one.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "one\n").unwrap();
+    std::fs::write(dir.path().join("docs/b.md"), "one\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("src/a.rs")).unwrap();
+    index.add_path(std::path::Path::new("docs/b.md")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+    // Modify both.
+    std::fs::write(dir.path().join("src/a.rs"), "ONE\n").unwrap();
+    std::fs::write(dir.path().join("docs/b.md"), "ONE\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("filter-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "filter-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: Some(PickerFilters {
+                directories: vec![ScopedPath {
+                    path_index: 0,
+                    relative_path: "src".into(),
+                }],
+                ..Default::default()
+            }),
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let update = view.update.expect("window rides the response");
+    let paths: Vec<&str> = update
+        .items()
+        .iter()
+        .map(|i| {
+            let PickerItem::GitChange { relative_path, .. } = i else {
+                panic!("expected GitChange, got {i:?}");
+            };
+            relative_path.as_str()
+        })
+        .collect();
+    assert_eq!(paths, vec!["src/a.rs"], "the dir scope drops docs/b.md");
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn picker_query_ranks_matches_and_carries_indices() {
     let (server, mut ws) = setup_picker_workspace().await;
     let _ = send_request::<PickerView>(
@@ -8486,7 +9138,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -8543,7 +9195,7 @@ async fn picker_select_returns_absolute_path() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -8610,7 +9262,7 @@ async fn picker_resume_centers_on_remembered_item() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -8656,7 +9308,7 @@ async fn picker_resume_centers_on_remembered_item() {
                 match_indices: vec![],
                 git_status: None,
             }),
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -8688,7 +9340,7 @@ async fn picker_reset_wipes_persisted_query() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -8728,7 +9380,7 @@ async fn picker_reset_wipes_persisted_query() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -8833,7 +9485,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -8912,7 +9564,7 @@ async fn buffers_picker_select_returns_buffer_id() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -9030,7 +9682,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -9152,7 +9804,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -9248,7 +9900,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -9360,7 +10012,7 @@ async fn buffers_picker_pushes_on_save() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -9441,7 +10093,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -9535,7 +10187,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11025,7 +11677,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11102,7 +11754,7 @@ async fn picker_grep_short_query_yields_empty_result() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11148,7 +11800,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11192,7 +11844,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11224,7 +11876,7 @@ async fn picker_grep_treats_query_as_regex() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11270,7 +11922,7 @@ async fn picker_grep_caches_completed_query() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11362,7 +12014,7 @@ async fn setup_grep_with_needle_query() -> (
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11670,7 +12322,7 @@ async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
     drop(server);
 }
 
-/// `picker/view`'s `center_on_cursor_grep_hit` resolves to the nearest cached hit at-or-after
+/// `picker/view`'s `center_on_cursor` resolves to the nearest cached hit at-or-after
 /// the cursor — not just exact-on-a-match like `cursor.grep_position`. Lets `Space g` open on
 /// "where you are" in the result list even when the cursor is between matches.
 #[tokio::test]
@@ -11692,7 +12344,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: Some(buffer_id),
+            center_on_cursor: Some(buffer_id),
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11721,7 +12373,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: Some(buffer_id),
+            center_on_cursor: Some(buffer_id),
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11916,7 +12568,7 @@ async fn picker_explorer_default_lists_project_root() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -11966,7 +12618,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: Some(target.display().to_string()),
             buffer_id: None,
             explorer_roots: false,
@@ -12010,7 +12662,7 @@ async fn picker_explorer_query_filters_by_prefix() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -12072,7 +12724,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -12141,7 +12793,7 @@ async fn setup_peek_workspace() -> (
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -12356,7 +13008,7 @@ async fn picker_explorer_peek_survives_refetch_and_keeps_anchor() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -12398,7 +13050,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -12462,7 +13114,7 @@ async fn picker_explorer_query_is_smartcase() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -12527,7 +13179,7 @@ async fn picker_explorer_select_file_returns_absolute_path() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: Some(target.display().to_string()),
             buffer_id: None,
             explorer_roots: false,
@@ -12577,7 +13229,7 @@ async fn picker_explorer_select_directory_errors() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -12622,7 +13274,7 @@ async fn picker_explorer_rejects_path_outside_project() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: Some("/etc".into()),
             buffer_id: None,
             explorer_roots: false,
@@ -12835,7 +13487,7 @@ async fn picker_explorer_resumes_last_directory() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: Some(target.display().to_string()),
             buffer_id: None,
             explorer_roots: false,
@@ -12863,7 +13515,7 @@ async fn picker_explorer_resumes_last_directory() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -12950,7 +13602,7 @@ async fn picker_explorer_tags_entries_with_git_status() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -13005,7 +13657,7 @@ async fn picker_files_tags_entries_with_git_status() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -13068,7 +13720,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -16253,7 +16905,7 @@ async fn references_picker_lists_all_uses() {
                     offset: 0,
                     limit: 30,
                     center_on: None,
-                    center_on_cursor_grep_hit: None,
+                    center_on_cursor: None,
                     directory_path: None,
                     buffer_id: Some(buffer_id),
                     explorer_roots: false,
@@ -16506,7 +17158,7 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: Some(buffer_id),
             explorer_roots: false,
@@ -17134,7 +17786,7 @@ async fn setup_grep_filter_workspace() -> (
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -17367,7 +18019,7 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -17447,7 +18099,7 @@ async fn grep_flood_does_not_deadlock_request_dispatch() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -17598,7 +18250,7 @@ async fn grep_filters_persist_across_hide_and_reset_wipes() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -17620,7 +18272,7 @@ async fn grep_filters_persist_across_hide_and_reset_wipes() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -17657,7 +18309,7 @@ async fn grep_view_with_filters_replaces_and_drops_stale_hits() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -17713,7 +18365,7 @@ async fn grep_filter_root_scope() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -17811,7 +18463,7 @@ async fn files_picker_filters_narrow_candidates() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -17914,7 +18566,7 @@ async fn explorer_filters_hide_and_changed_only() {
                 offset: 0,
                 limit: 50,
                 center_on: None,
-                center_on_cursor_grep_hit: None,
+                center_on_cursor: None,
                 directory_path: None,
                 buffer_id: None,
                 explorer_roots: false,
@@ -17987,7 +18639,7 @@ async fn explorer_filters_hide_and_changed_only() {
             offset: 0,
             limit: 50,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
@@ -18460,7 +19112,7 @@ async fn buffers_picker_reports_transient_flag() {
             offset: 0,
             limit: 30,
             center_on: None,
-            center_on_cursor_grep_hit: None,
+            center_on_cursor: None,
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,

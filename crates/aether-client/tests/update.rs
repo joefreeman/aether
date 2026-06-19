@@ -1355,6 +1355,22 @@ fn explorer_alt_backspace_unwinds_breadcrumb_before_chips() {
 }
 
 #[test]
+fn git_changes_opens_without_reset_to_resume_query_and_filters() {
+    use aether_protocol::picker::PickerKind;
+    // GitChanges preserves its query + filters server-side across opens (like Grep), so the client
+    // opens it with `reset: false` — the server keeps the prior state and re-snapshots candidates.
+    let mut s = session();
+    let fx = s.open_picker(PickerKind::GitChanges, None, None);
+    let view = find_request(&fx, "picker/view").expect("opens via picker/view");
+    assert_eq!(view["kind"], json!("git_changes"));
+    assert_eq!(
+        view["reset"],
+        json!(false),
+        "GitChanges resumes its server-side query + filters"
+    );
+}
+
+#[test]
 fn explorer_delete_confirms_then_trashes_and_relists() {
     use aether_client::session::{ConfirmKind, Prompt};
     use aether_protocol::picker::{PickerItem, PickerKind};

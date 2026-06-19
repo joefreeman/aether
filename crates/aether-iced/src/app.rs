@@ -476,7 +476,7 @@ impl App {
                                 offset: 0,
                                 limit: FETCH_LIMIT,
                                 center_on: None,
-                                center_on_cursor_grep_hit: None,
+                                center_on_cursor: None,
                                 directory_path: None,
                                 explorer_roots: false,
                                 buffer_id: None,
@@ -763,7 +763,7 @@ impl App {
                                 offset: 0,
                                 limit: FETCH_LIMIT,
                                 center_on: None,
-                                center_on_cursor_grep_hit: None,
+                                center_on_cursor: None,
                                 directory_path: None,
                                 explorer_roots: false,
                                 buffer_id: None,
@@ -1040,7 +1040,7 @@ impl App {
                 offset,
                 limit: FETCH_LIMIT,
                 center_on: None,
-                center_on_cursor_grep_hit: None,
+                center_on_cursor: None,
                 directory_path: None,
                 explorer_roots: false,
                 buffer_id: None,
@@ -1115,7 +1115,7 @@ impl App {
                         offset: 0,
                         limit: FETCH_LIMIT,
                         center_on: None,
-                        center_on_cursor_grep_hit: None,
+                        center_on_cursor: None,
                         directory_path: None,
                         explorer_roots: false,
                         buffer_id: None,
@@ -4171,7 +4171,9 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal) -> Option<f32> 
     let sd = p.selected_display_row()?;
     let top = sd as f32 * crate::picker::ROW_H;
     let bottom = top + crate::picker::ROW_H;
-    let clearance = if p.kind == PickerKind::Grep {
+    // File-grouped pickers pin a sticky file header over the top row, so a revealed row must clear
+    // one row's height or it slides under the header (the bug grep already hit).
+    let clearance = if p.kind.groups_by_file() {
         crate::picker::ROW_H
     } else {
         0.0

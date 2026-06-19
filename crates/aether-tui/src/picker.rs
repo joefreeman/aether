@@ -765,6 +765,13 @@ pub enum ItemKey<'a> {
         line: u32,
         col: u32,
     },
+    /// A Git-changes hunk, identified by `(path_index, relative_path, hunk_index)` — stable for the
+    /// picker's snapshot lifetime even as the preview line drifts.
+    GitChange {
+        path_index: u32,
+        relative_path: &'a str,
+        hunk_index: u32,
+    },
     DirEntry(&'a str),
     Project(&'a str),
     Root {
@@ -818,6 +825,16 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             relative_path: relative_path.as_str(),
             line: *line,
             col: *col,
+        },
+        PickerItem::GitChange {
+            path_index,
+            relative_path,
+            hunk_index,
+            ..
+        } => ItemKey::GitChange {
+            path_index: *path_index,
+            relative_path: relative_path.as_str(),
+            hunk_index: *hunk_index,
         },
         PickerItem::DirEntry { name, .. } => ItemKey::DirEntry(name.as_str()),
         PickerItem::Project { name, .. } => ItemKey::Project(name.as_str()),

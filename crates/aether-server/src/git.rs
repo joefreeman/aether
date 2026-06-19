@@ -169,8 +169,9 @@ fn head_blob_bytes(repo: &git2::Repository, rel: &Path) -> Option<Vec<u8>> {
 
 /// CRLF → LF, matching how the editor normalizes buffer text on load (`Buffer::load_from_file`),
 /// so a CRLF-committed file doesn't diff as entirely modified against the LF buffer. A lone `\r`
-/// is left untouched.
-fn normalize_lf(bytes: Vec<u8>) -> Vec<u8> {
+/// is left untouched. `pub(crate)` so the Git-changes picker can normalise working-tree bytes
+/// read off disk the same way buffers and baselines are.
+pub(crate) fn normalize_lf(bytes: Vec<u8>) -> Vec<u8> {
     if !bytes.contains(&b'\r') {
         return bytes;
     }
@@ -200,8 +201,9 @@ pub fn diff_hunks(baseline: Option<&[u8]>, current: &ropey::Rope) -> Vec<DiffHun
 }
 
 /// Core diff: turn two in-memory buffers into buffer-line hunks. Factored out from
-/// [`compute_hunks`] so it's testable without touching a repo.
-fn hunks_from_buffers(old: &[u8], new: &[u8]) -> Vec<DiffHunk> {
+/// [`compute_hunks`] so it's testable without touching a repo. `pub(crate)` so the Git-changes
+/// picker can diff an index blob against working-tree / buffer content off the keystroke path.
+pub(crate) fn hunks_from_buffers(old: &[u8], new: &[u8]) -> Vec<DiffHunk> {
     let mut opts = git2::DiffOptions::new();
     // No surrounding context: we want one hunk per actual change run, and `force_text` keeps
     // libgit2 from guessing "binary" on path-less buffers (which would yield zero hunks).
@@ -701,9 +703,9 @@ impl RepoStatus {
 
 /// Resolve the Git status of every changed file under `root` in one `statuses()` pass, for the
 /// Files picker. Untracked directories are recursed so each untracked file is reported
-/// individually (the picker lists individual files); ignored files are excluded — the workspace
-/// walker already skips them, so they never reach the picker. Best-effort: `None` when `root`
-/// isn't in a repo or any libgit2 call fails.
+/// individually (the picker colours individual files); ignored files are excluded — the workspace
+/// walker already skips them. Best-effort: `None` when `root` isn't in a repo or any libgit2 call
+/// fails.
 pub fn repo_status_for_root(root: &Path) -> Option<RepoStatus> {
     let canonical = root.canonicalize().ok()?;
     let repo = git2::Repository::discover(&canonical).ok()?;
@@ -726,6 +728,108 @@ pub fn repo_status_for_root(root: &Path) -> Option<RepoStatus> {
         }
     }
     Some(RepoStatus { root_rel, map })
+}
+
+/// One changed file under a root: its combined staged+unstaged hunks vs HEAD (anchor order) plus
+/// the LF-normalized working-tree bytes, so the caller can pull each add/modify hunk's preview
+/// line without re-reading the file. `rel_path` is root-relative, forward-slash.
+pub struct ChangedFile {
+    pub rel_path: String,
+    pub hunks: Vec<DiffHunk>,
+    pub working: Vec<u8>,
+}
+
+/// Diff every changed file under `root` against HEAD (combined staged+unstaged), opening the repo
+/// **once** — discovery, the HEAD tree, and the index are resolved a single time and reused for
+/// every file, instead of re-discovering the repo per file (the slow part when a project has many
+/// changes). Untracked directories are not recursed: a wholly-new directory collapses to one entry
+/// (git's default `git status`), which is a directory and skipped — only individual changed files
+/// are diffable. Files with no net change are dropped. Best-effort: empty on any libgit2 error.
+pub fn changed_files_with_hunks(root: &Path) -> Vec<ChangedFile> {
+    let mut out = Vec::new();
+    let Ok(canonical) = root.canonicalize() else {
+        return out;
+    };
+    let Ok(repo) = git2::Repository::discover(&canonical) else {
+        return out;
+    };
+    let Some(workdir) = repo.workdir().and_then(|w| w.canonicalize().ok()) else {
+        return out;
+    };
+    let Ok(root_rel) = canonical.strip_prefix(&workdir) else {
+        return out;
+    };
+    let root_rel = root_rel.to_path_buf();
+
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return out;
+    };
+
+    // Resolve HEAD's tree and the index once; every file's baseline reads from these.
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let index = repo.index().ok();
+
+    for entry in statuses.iter() {
+        let Some(path) = entry.path() else { continue };
+        // A collapsed untracked directory (recurse off) reports with a trailing slash — not a
+        // diffable file.
+        if path.ends_with('/') {
+            continue;
+        }
+        if classify_status(entry.status()).is_none() {
+            continue;
+        }
+        let repo_rel = Path::new(path);
+        let Ok(rel) = repo_rel.strip_prefix(&root_rel) else {
+            continue; // a change in another root of the same repo
+        };
+        let rel_path: String = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if rel_path.is_empty() {
+            continue;
+        }
+
+        // HEAD + index blobs straight from the already-open repo (no per-file discovery).
+        let head = head_tree
+            .as_ref()
+            .and_then(|t| t.get_path(repo_rel).ok())
+            .and_then(|e| e.to_object(&repo).ok())
+            .and_then(|o| o.peel_to_blob().ok())
+            .map(|b| normalize_lf(b.content().to_vec()));
+        let index_blob = index
+            .as_ref()
+            .and_then(|ix| ix.get_path(repo_rel, 0))
+            .and_then(|e| repo.find_blob(e.id).ok())
+            .map(|b| normalize_lf(b.content().to_vec()));
+        // Working-tree side: live disk content, or empty for a deleted file (diffs as a deletion).
+        let working = std::fs::read(workdir.join(repo_rel))
+            .map(normalize_lf)
+            .unwrap_or_default();
+
+        let staged = hunks_from_buffers(
+            head.as_deref().unwrap_or(b""),
+            index_blob.as_deref().unwrap_or(b""),
+        );
+        let unstaged = hunks_from_buffers(index_blob.as_deref().unwrap_or(b""), &working);
+        let both = compose_both(&staged, &unstaged);
+        if both.is_empty() {
+            continue;
+        }
+        out.push(ChangedFile {
+            rel_path,
+            hunks: both,
+            working,
+        });
+    }
+    out
 }
 
 /// Fold libgit2's per-path status bitflags into the one [`GitStatus`] we colour with, in priority
@@ -1524,6 +1628,50 @@ mod tests {
 
         let rs = repo_status_for_root(&repo_root.join("pkg")).expect("subdir is in the repo");
         assert_eq!(rs.status_of("mod.rs"), Some(GitStatus::Modified));
+    }
+
+    // ---- changed_files_with_hunks (Git-changes picker) ------------------------------------------
+
+    #[test]
+    fn changed_files_with_hunks_diffs_each_file_and_collapses_untracked_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(root, &[("a.rs", "one\ntwo\nthree\n"), ("clean.rs", "x\n")]);
+        std::fs::write(root.join("a.rs"), "one\nTWO\nthree\n").unwrap(); // a modification
+        // A wholly-new directory with several files (must collapse), plus a lone new file.
+        std::fs::create_dir_all(root.join("junk")).unwrap();
+        std::fs::write(root.join("junk/x.rs"), "x\n").unwrap();
+        std::fs::write(root.join("junk/y.rs"), "y\n").unwrap();
+        std::fs::write(root.join("loose.rs"), "new\n").unwrap();
+
+        let mut changed = changed_files_with_hunks(root);
+        changed.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let paths: Vec<&str> = changed.iter().map(|c| c.rel_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["a.rs", "loose.rs"],
+            "the modification and the lone new file, but nothing inside junk/"
+        );
+
+        // The modification carries one Modified hunk on line 1 with the old text recorded.
+        let a = &changed[0];
+        assert_eq!(a.hunks.len(), 1);
+        assert_eq!(a.hunks[0].kind, ChangeKind::Modified);
+        assert_eq!(a.hunks[0].anchor_line, 1);
+        assert_eq!(a.hunks[0].deleted, vec!["two".to_string()]);
+        assert_eq!(a.working, b"one\nTWO\nthree\n");
+
+        // The lone new file is a whole-file addition.
+        let loose = &changed[1];
+        assert_eq!(loose.hunks.len(), 1);
+        assert_eq!(loose.hunks[0].kind, ChangeKind::Added);
+    }
+
+    #[test]
+    fn changed_files_with_hunks_no_repo_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        assert!(changed_files_with_hunks(dir.path()).is_empty());
     }
 
     #[test]
