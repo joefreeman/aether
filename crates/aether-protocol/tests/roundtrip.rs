@@ -29,8 +29,8 @@ use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspFormat, LspFormatResult, LspGotoDefinition,
     LspGotoDefinitionResult, LspHover, LspHoverResult, LspLocation, LspNavigateDiagnostic,
-    LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServer, LspServerStatus,
-    LspServerStatusList, LspStatus, LspStatusChanged,
+    LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness, LspRestartServer,
+    LspServerStatus, LspServerStatusList, LspStatus, LspStatusChanged,
 };
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::project::{
@@ -888,27 +888,42 @@ fn lsp_hover_and_goto_shapes() {
     // Cursor-relative params carry only the buffer.
     let v = to_value(LspBufferParams { buffer_id: 3 }).unwrap();
     assert_eq!(v, json!({"buffer_id": 3}));
-    // Hover: optional contents + the markdown-kind flag.
+    // Hover: optional contents + the markdown-kind flag + the readiness of the server that answered.
     let v = to_value(LspHoverResult {
         contents: Some("fn x()".into()),
         markdown: true,
+        readiness: LspReadiness::Ready,
     })
     .unwrap();
     assert_eq!(v["contents"], "fn x()");
     assert_eq!(v["markdown"], true);
-    // `markdown` defaults to false when absent (older servers / no content).
+    assert_eq!(v["readiness"], "ready");
+    // `markdown`/`readiness` default when absent (no content → `Ready` so the client says "no info").
     let r: LspHoverResult = serde_json::from_value(json!({ "contents": null })).unwrap();
     assert!(!r.markdown);
-    // Goto: optional location with absolute path + byte-col position.
+    assert_eq!(r.readiness, LspReadiness::Ready);
+    // Readiness is flat snake_case on the wire.
+    assert_eq!(to_value(LspReadiness::Starting).unwrap(), json!("starting"));
+    assert_eq!(
+        to_value(LspReadiness::NoServer).unwrap(),
+        json!("no_server")
+    );
+    assert_eq!(
+        to_value(LspReadiness::Unavailable).unwrap(),
+        json!("unavailable")
+    );
+    // Goto: optional location with absolute path + byte-col position, plus readiness.
     let r = LspGotoDefinitionResult {
         location: Some(LspLocation {
             path: "/p/src/lib.rs".into(),
             position: LogicalPosition { line: 12, col: 4 },
         }),
+        readiness: LspReadiness::Ready,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["location"]["path"], "/p/src/lib.rs");
     assert_eq!(v["location"]["position"]["line"], 12);
+    assert_eq!(v["readiness"], "ready");
     let back: LspGotoDefinitionResult = from_value(v).unwrap();
     assert_eq!(back.location.unwrap().position.col, 4);
 }

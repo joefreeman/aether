@@ -40,8 +40,8 @@ use aether_protocol::input::{
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspFormatResult, LspGotoDefinitionResult, LspHoverResult,
-    LspLocation, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServerParams,
-    LspServerStatusParams, LspServerStatusResult, LspStatus,
+    LspLocation, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness,
+    LspRestartServerParams, LspServerStatusParams, LspServerStatusResult, LspStatus,
 };
 use aether_protocol::nav::{
     NavGotoParams, NavRecordParams, NavRecordResult, NavStepParams, NavStepResult,
@@ -1771,19 +1771,64 @@ struct LspCursorRequest {
 /// Resolve [`LspCursorRequest`] for `client_id`'s cursor in `buffer_id`, or `None` if the buffer
 /// isn't file-backed or has no ready language server. Runs under the state lock; the caller must
 /// drop the lock before awaiting the request (the LSP round-trip must not hold it).
-fn lsp_cursor_request(
-    s: &ServerState,
-    client_id: ClientId,
-    buffer_id: BufferId,
-) -> Option<LspCursorRequest> {
-    let buf = s.buffers.get(&buffer_id)?;
-    let path = buf.canonical_path.as_deref()?;
-    let key = s.lsp.doc_server.get(&buffer_id)?;
-    let handle = s.lsp.servers.get(key)?;
-    if !matches!(handle.status, LspStatus::Ready) {
-        return None;
+/// Outcome of resolving a cursor-relative LSP request: either a ready request, or *why* it can't
+/// run — so hover / goto-definition can report "still starting" vs. "crashed" vs. "no server"
+/// instead of a blank result. Mirrors [`FormatResolve`].
+enum CursorResolve {
+    Ready(LspCursorRequest),
+    /// No server attached (unsupported language, not file-backed, or the buffer's gone).
+    NoServer,
+    /// A server exists but isn't `Ready` yet.
+    Starting,
+    /// The attached server crashed or was stopped.
+    Unavailable,
+}
+
+impl CursorResolve {
+    /// The wire-level readiness this resolution reports to the client.
+    fn readiness(&self) -> LspReadiness {
+        match self {
+            CursorResolve::Ready(_) => LspReadiness::Ready,
+            CursorResolve::NoServer => LspReadiness::NoServer,
+            CursorResolve::Starting => LspReadiness::Starting,
+            CursorResolve::Unavailable => LspReadiness::Unavailable,
+        }
     }
-    let client = handle.client.clone()?;
+
+    /// The request if ready, else `None` — for callers (the references / symbols pickers) that
+    /// don't surface a readiness message and just fall back to an empty list.
+    fn ready(self) -> Option<LspCursorRequest> {
+        match self {
+            CursorResolve::Ready(req) => Some(req),
+            _ => None,
+        }
+    }
+}
+
+fn lsp_cursor_request(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> CursorResolve {
+    let Some(buf) = s.buffers.get(&buffer_id) else {
+        return CursorResolve::NoServer;
+    };
+    let Some(path) = buf.canonical_path.as_deref() else {
+        return CursorResolve::NoServer;
+    };
+    let Some(key) = s.lsp.doc_server.get(&buffer_id) else {
+        return CursorResolve::NoServer;
+    };
+    let Some(handle) = s.lsp.servers.get(key) else {
+        return CursorResolve::NoServer;
+    };
+    match handle.status {
+        LspStatus::Ready => {}
+        LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => {
+            return CursorResolve::Starting
+        }
+        LspStatus::Crashed { .. } | LspStatus::Stopped => return CursorResolve::Unavailable,
+    }
+    // `Ready` should always carry a live client; treat a missing one as a transient outage.
+    let Some(client) = handle.client.clone() else {
+        return CursorResolve::Unavailable;
+    };
     let encoding = handle.position_encoding;
     let pos = s
         .cursors
@@ -1793,7 +1838,7 @@ fn lsp_cursor_request(
         .position;
     let line_text = line_text_no_newline(buf, pos.line);
     let character = crate::lsp::position::byte_to_lsp(&line_text, pos.col as usize, encoding);
-    Some(LspCursorRequest {
+    CursorResolve::Ready(LspCursorRequest {
         client,
         uri: crate::lsp::uri::path_to_uri(path),
         line: pos.line,
@@ -1836,14 +1881,16 @@ pub async fn lsp_hover(
     ctx: &mut ConnectionCtx,
     params: LspBufferParams,
 ) -> Result<LspHoverResult, RpcError> {
-    let req = {
+    let resolved = {
         let s = state.lock().await;
         lsp_cursor_request(&s, ctx.client_id, params.buffer_id)
     };
-    let Some(req) = req else {
+    let readiness = resolved.readiness();
+    let Some(req) = resolved.ready() else {
         return Ok(LspHoverResult {
             contents: None,
             markdown: false,
+            readiness,
         });
     };
     let params_json = serde_json::json!({
@@ -1861,7 +1908,11 @@ pub async fn lsp_hover(
         Some((s, md)) => (Some(s), md),
         None => (None, false),
     };
-    Ok(LspHoverResult { contents, markdown })
+    Ok(LspHoverResult {
+        contents,
+        markdown,
+        readiness: LspReadiness::Ready,
+    })
 }
 
 /// Definition location for the symbol at the cursor. Returns `None` when there's no ready server
@@ -1871,12 +1922,16 @@ pub async fn lsp_goto_definition(
     ctx: &mut ConnectionCtx,
     params: LspBufferParams,
 ) -> Result<LspGotoDefinitionResult, RpcError> {
-    let req = {
+    let resolved = {
         let s = state.lock().await;
         lsp_cursor_request(&s, ctx.client_id, params.buffer_id)
     };
-    let Some(req) = req else {
-        return Ok(LspGotoDefinitionResult { location: None });
+    let readiness = resolved.readiness();
+    let Some(req) = resolved.ready() else {
+        return Ok(LspGotoDefinitionResult {
+            location: None,
+            readiness,
+        });
     };
     let params_json = serde_json::json!({
         "textDocument": { "uri": req.uri },
@@ -1893,7 +1948,10 @@ pub async fn lsp_goto_definition(
             None
         }
     };
-    Ok(LspGotoDefinitionResult { location })
+    Ok(LspGotoDefinitionResult {
+        location,
+        readiness: LspReadiness::Ready,
+    })
 }
 
 /// Jump the cursor to the next/previous diagnostic in the buffer. The server holds the diagnostics,
@@ -4830,7 +4888,7 @@ async fn build_reference_candidates(
             .active_project(client_id)
             .map(|p| p.paths.clone())
             .unwrap_or_default();
-        (lsp_cursor_request(&s, client_id, buffer_id), roots)
+        (lsp_cursor_request(&s, client_id, buffer_id).ready(), roots)
     };
     let Some(req) = req else {
         return Vec::new();
@@ -4915,7 +4973,7 @@ async fn build_symbol_candidates(
         // not the LSP-encoded one in `req`.
         let cursor = s.cursors.get(&(client_id, buffer_id)).map(|c| c.position);
         (
-            lsp_cursor_request(&s, client_id, buffer_id),
+            lsp_cursor_request(&s, client_id, buffer_id).ready(),
             abs_path,
             cursor,
         )

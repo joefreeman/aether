@@ -33,6 +33,29 @@ pub struct LspHoverResult {
     /// `kind: "plaintext"` (and when there's no content).
     #[serde(default)]
     pub markdown: bool,
+    /// Whether the server could even answer — lets the client say "still starting" / "crashed"
+    /// instead of a misleading "no hover info" when `contents` is empty only because no ready
+    /// server replied.
+    #[serde(default)]
+    pub readiness: LspReadiness,
+}
+
+/// Whether the language server backing a buffer can currently serve a cursor request (hover,
+/// goto-definition). Lets those results tell "server still starting / crashed / absent" apart from
+/// "ready server replied, but there's nothing here" — so the client shows a precise message rather
+/// than a catch-all "nothing found". Mirrors [`FormatStatus`]'s readiness arms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspReadiness {
+    /// A ready server answered — any empty payload is genuine ("nothing here").
+    #[default]
+    Ready,
+    /// No server is attached to this buffer (unsupported language, or not file-backed).
+    NoServer,
+    /// A server exists for this language but isn't `Ready` yet — try again shortly.
+    Starting,
+    /// The attached server crashed or was stopped — it can't answer until it's running again.
+    Unavailable,
 }
 
 // ---- lsp/goto_definition ------------------------------------------------------------------------
@@ -51,6 +74,9 @@ pub struct LspGotoDefinitionResult {
     /// `None` when there's no definition (or no server). The first location is returned when the
     /// server offers several.
     pub location: Option<LspLocation>,
+    /// Whether the server could answer — distinguishes "no definition" from "server not ready yet".
+    #[serde(default)]
+    pub readiness: LspReadiness,
 }
 
 /// A resolved source location, in the editor's own coordinates (absolute path + byte-column

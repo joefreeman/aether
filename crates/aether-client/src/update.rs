@@ -53,7 +53,7 @@ use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspFormat, LspFormatResult, LspGotoDefinition,
     LspGotoDefinitionResult, LspHover, LspHoverResult, LspNavigateDiagnostic,
-    LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspRestartServer,
+    LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness, LspRestartServer,
     LspRestartServerParams, LspServerStatus, LspStatusChanged,
 };
 use aether_protocol::nav::NavStepResult;
@@ -379,11 +379,14 @@ impl Session {
                 Err(e) => Effects::error(e),
             },
 
-            Event::Definition(Ok(r)) => match r.location {
-                Some(location) => {
-                    self.open_path_primed(location.path, Some(location.position), None, None)
-                }
-                None => Effects::toast("No definition found", ToastKind::Info),
+            Event::Definition(Ok(r)) => match lsp_readiness_message(r.readiness) {
+                Some(msg) => Effects::toast(msg, ToastKind::Info),
+                None => match r.location {
+                    Some(location) => {
+                        self.open_path_primed(location.path, Some(location.position), None, None)
+                    }
+                    None => Effects::toast("No definition found", ToastKind::Info),
+                },
             },
             Event::Definition(Err(e)) => Effects::error(e),
 
@@ -411,9 +414,12 @@ impl Session {
                         text,
                     }])))
                 }
+                // No content: say *why* — a server still starting / crashed isn't the same as a
+                // ready server that simply has nothing here ("No hover info").
                 None => {
+                    let msg = lsp_readiness_message(r.readiness).unwrap_or("No hover info");
                     let mut fx = Effects::one(Effect::DismissHover);
-                    fx.push(Effect::Toast("No hover info".into(), ToastKind::Info));
+                    fx.push(Effect::Toast(msg.into(), ToastKind::Info));
                     fx
                 }
             },
@@ -4899,6 +4905,18 @@ fn seeded_filters_for_switch(
 /// Ask the shell for the system clipboard; the text comes back as `ClipboardRead`.
 fn read_clipboard_fx(kind: PasteKind) -> Effects {
     Effects::one(Effect::ReadClipboard(kind))
+}
+
+/// The toast to show when a cursor-relative LSP request (hover / goto-definition) couldn't run
+/// because the server wasn't ready — `None` once a ready server has answered, so the caller falls
+/// back to its own "nothing here" message ("No hover info" / "No definition found").
+fn lsp_readiness_message(readiness: LspReadiness) -> Option<&'static str> {
+    match readiness {
+        LspReadiness::Ready => None,
+        LspReadiness::NoServer => Some("No language server for this buffer"),
+        LspReadiness::Starting => Some("Language server still starting"),
+        LspReadiness::Unavailable => Some("Language server unavailable"),
+    }
 }
 
 #[cfg(test)]

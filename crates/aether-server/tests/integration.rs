@@ -30,7 +30,7 @@ use aether_protocol::input::{
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
-    LspGotoDefinitionResult, LspHover, LspHoverResult, LspServerStatus, LspStatus,
+    LspGotoDefinitionResult, LspHover, LspHoverResult, LspReadiness, LspServerStatus, LspStatus,
     LspStatusChanged,
 };
 use aether_protocol::nav::{
@@ -17086,6 +17086,42 @@ async fn set_cursor(ws: &mut Ws, id: u64, buffer_id: u64, line: u32, col: u32) {
         },
     )
     .await;
+}
+
+/// Hovering a buffer with no language server reports `readiness: NoServer` (not a misleading empty
+/// "no hover info"): a plain `.txt` file has no configured server, so the client can say so. No
+/// real LSP needed — this exercises the readiness plumbing, not a server.
+#[tokio::test]
+async fn lsp_hover_without_a_server_reports_no_server() {
+    let dir = lay_out(&[("notes.txt", "hello world\n")]);
+    let (server, mut ws) = open_and_subscribe("hover-no-lsp", dir.path(), "notes.txt").await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("notes.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    set_cursor(&mut ws, 11, buffer_id, 0, 2).await;
+
+    let r: LspHoverResult =
+        send_request::<LspHover>(&mut ws, 100, &LspBufferParams { buffer_id }).await;
+    drop(server);
+    assert!(r.contents.is_none(), "no server → no hover contents");
+    assert_eq!(
+        r.readiness,
+        LspReadiness::NoServer,
+        "a buffer with no language server reports NoServer, not a blank Ready"
+    );
 }
 
 /// Phase 3: hover at the cursor returns the symbol's info from rust-analyzer. Polls until the

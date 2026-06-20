@@ -1634,6 +1634,45 @@ fn tab_triggers_hover() {
     assert_eq!(method, "lsp/hover");
 }
 
+/// The single Info-toast message in `fx`, if any.
+fn info_toast(fx: &Effects) -> Option<String> {
+    fx.0.iter().find_map(|e| match e {
+        Effect::Toast(m, ToastKind::Info) => Some(m.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
+    // A ready server with no content for the cursor → the genuine "nothing here" message.
+    let mut s = session();
+    let token = the_request(&s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS)).0;
+    let fx = s.on_rpc_result(token, Ok(json!({ "contents": null, "readiness": "ready" })));
+    assert_eq!(info_toast(&fx).as_deref(), Some("No hover info"));
+
+    // A server still starting → say so, not "No hover info".
+    let token = the_request(&s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS)).0;
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({ "contents": null, "readiness": "starting" })),
+    );
+    assert_eq!(
+        info_toast(&fx).as_deref(),
+        Some("Language server still starting")
+    );
+
+    // A crashed/stopped server → "unavailable".
+    let token = the_request(&s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS)).0;
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({ "contents": null, "readiness": "unavailable" })),
+    );
+    assert_eq!(
+        info_toast(&fx).as_deref(),
+        Some("Language server unavailable")
+    );
+}
+
 #[test]
 fn space_j_shows_diagnostic_at_cursor() {
     // Space j → diagnostic at cursor. With no diagnostics loaded it reports "none" via a toast
