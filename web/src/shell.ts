@@ -47,6 +47,9 @@ const GUTTER_COLS = 1;
 const TAB_WIDTH = 4;
 const CONTINUATION_MARKER_WIDTH = 2;
 const BUFFER_PAD = 8; // px of breathing room above the first line / below the last (virtual)
+// Fraction of the viewport above a jumped-to / `;`-placed cursor. Mirrors the core's
+// `CURSOR_REST_FRACTION` (the web jump-reveal + subscribe framing don't cross the wasm boundary).
+const CURSOR_REST_FRACTION = 0.2;
 
 /** Coarse "N{unit} ago" rendering of an author timestamp (Unix seconds) for the inline blame label.
  *  Ports aether-tui/src/shell.rs::time_ago — the last minute and any future (clock-skew) time read
@@ -125,6 +128,7 @@ interface ShellActionDesc {
   name: string;
   dir?: string;
   unit?: string;
+  fraction?: number;
 }
 
 /** One effect from the core (docs/web-core.md §"The boundary"). `tag` selects the variant. */
@@ -139,6 +143,7 @@ interface CoreEffect {
   paste?: unknown;
   action?: ShellActionDesc;
   hover?: HoverContent;
+  style?: "follow" | "jump";
 }
 
 /** Hover-popover content from the core (Effect::ShowHover): rendered markdown (LSP hover) or stacked
@@ -1553,7 +1558,7 @@ export class Shell {
           this.toast(e.message ?? "", e.level ?? "info");
           break;
         case "RevealCursor":
-          void this.ensureCursorVisible();
+          void this.ensureCursorVisible(e.style === "jump" ? "jump" : "follow");
           break;
         case "Resubscribe":
           this.dismissHover(); // a buffer switch resets view-side presentation
@@ -1677,8 +1682,8 @@ export class Shell {
       case "scroll":
         this.scrollView(a.dir ?? "down", a.unit ?? "line");
         break;
-      case "center_cursor":
-        void this.centerCursor();
+      case "place_cursor":
+        void this.placeCursor(a.fraction ?? CURSOR_REST_FRACTION);
         break;
       case "toggle_wrap":
         this.session.toggle_wrap(); // flip core wrap state (no effects); then re-render the viewport
@@ -1731,8 +1736,10 @@ export class Shell {
     // a grep/goto jump, sits on the target. Derived FRESH from the current buffer every time (never a
     // cached value), so a jump always loads the window containing its target and the reveal lands.
     const cursorLine = v.buffer.cursor.position.line;
+    // A fresh jump target (no saved scroll) rests near the top — the cross-buffer counterpart of
+    // the in-buffer jump reveal.
     const scroll = v.buffer.scroll ?? {
-      logical_line: Math.max(0, cursorLine - Math.floor(this.rows / 2)),
+      logical_line: Math.max(0, cursorLine - Math.floor(this.rows * CURSOR_REST_FRACTION)),
       sub_row: 0,
     };
     const epoch = ++this.viewportEpoch;
@@ -1771,8 +1778,8 @@ export class Shell {
   }
 
   /** After a cursor-moving action: load around the cursor if it left the loaded window, paint, then
-   *  scroll the minimum to reveal it. */
-  private async ensureCursorVisible(): Promise<void> {
+   *  reveal it — `follow` scrolls the minimum, `jump` rests it near the top (animating if short). */
+  private async ensureCursorVisible(style: "follow" | "jump"): Promise<void> {
     const v = this.view();
     if (!v.window) return;
     const cl = v.buffer.cursor.position.line;
@@ -1791,7 +1798,20 @@ export class Shell {
       this.session.adopt_window(res);
     }
     this.render();
-    this.revealCursor();
+    if (style === "jump") this.revealCursorJump();
+    else this.revealCursor();
+  }
+
+  /** Jump reveal: leave the view if the cursor is already visible, else rest it near the top.
+   *  `scrollTopTo` glides when the move is short and snaps when it's far (> ~1.5 screens). */
+  private revealCursorJump(): void {
+    const cursorRow = this.cursorAbsoluteVisualRow();
+    if (cursorRow === null) return;
+    const topRow = (this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h;
+    const visible = this.visibleRows();
+    if (cursorRow >= topRow && cursorRow < topRow + visible) return; // already visible
+    const above = Math.floor(visible * CURSOR_REST_FRACTION);
+    this.scrollTopTo((cursorRow - above) * this.cell.h + BUFFER_PAD, true);
   }
 
   /** Native scroll event: fetch a new window when the view nears the loaded window's edge. */
@@ -1847,12 +1867,13 @@ export class Shell {
     }
   }
 
-  private async centerCursor(): Promise<void> {
+  /** `;` / `Alt-;`: scroll so the cursor's line sits `fraction` of the way down the viewport. */
+  private async placeCursor(fraction: number): Promise<void> {
     const v = this.view();
     if (!v.window) return;
     const cl = v.buffer.cursor.position.line;
     // When the cursor's line has been scrolled out of the loaded window its visual row is unknown —
-    // pull that region from the server (scrolling the viewport to the line), then centre. Mirrors
+    // pull that region from the server (scrolling the viewport to the line), then place. Mirrors
     // `ensureCursorVisible`.
     if (cl < v.window.first_logical_line || cl >= v.window.last_logical_line_exclusive) {
       const epoch = this.viewportEpoch;
@@ -1871,7 +1892,8 @@ export class Shell {
     }
     const row = this.cursorAbsoluteVisualRow();
     if (row === null) return;
-    this.scrollTopTo((row - Math.floor(this.visibleRows() / 2)) * this.cell.h + BUFFER_PAD, true);
+    const above = Math.floor(this.visibleRows() * fraction);
+    this.scrollTopTo((row - above) * this.cell.h + BUFFER_PAD, true);
   }
 
   private revealCursor(): void {

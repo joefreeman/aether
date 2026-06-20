@@ -5928,7 +5928,8 @@ mod tests {
             "Application settings",
             "Clear the active search",
             "Show keyboard shortcuts",
-            "Center cursor in window",
+            "Cursor near top",
+            "Cursor near bottom",
         ] {
             assert!(rendered.contains(needle), "missing: {needle:?}");
         }

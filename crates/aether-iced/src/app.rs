@@ -8,13 +8,16 @@
 
 use crate::connection::Handle;
 use crate::connection::NotifRx;
-pub use crate::core::effect::{Effect, Effects, ToastKind};
+pub use crate::core::effect::{Effect, Effects, RevealStyle, ToastKind};
 use crate::core::markdown::{Block as MdBlock, Inline as MdInline};
 pub use crate::core::session::*;
 use crate::core::update::Event as CoreEvent;
 use crate::editor::{self, ClickKind, EditorEvent, GUTTER_COLS, PAD};
 use crate::grid;
-use crate::keymap::{hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit};
+use crate::keymap::{
+    hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit, ViewportPlace,
+    CURSOR_REST_FRACTION,
+};
 use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
 use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
@@ -342,10 +345,12 @@ pub struct App {
     subscribe_scroll: ScrollPosition,
     fetch_in_flight: bool,
     refetch_queued: bool,
-    reveal_after_fetch: bool,
-    /// Like `reveal_after_fetch`, but centres the cursor once its (out-of-window) line lands — for
-    /// `-` (center-cursor) when the cursor has been scrolled out of the loaded window.
-    center_after_fetch: bool,
+    /// Set when a cursor move scrolled out of the loaded window: once the fetch lands, reveal the
+    /// cursor with this style (`Follow` = minimal, `Jump` = rest near the top).
+    reveal_after_fetch: Option<RevealStyle>,
+    /// Like `reveal_after_fetch`, but places the cursor at a fixed fraction down once its
+    /// (out-of-window) line lands — for `;` / `Alt-;` when the line was scrolled out of the window.
+    place_after_fetch: Option<ViewportPlace>,
     /// The picker results list's scroll offset in px (boot chooser or session picker —
     /// never both). The core tracks rows, not pixels; resets arrive as
     /// `Effect::PickerScrollReset`.
@@ -410,8 +415,8 @@ impl App {
             },
             fetch_in_flight: false,
             refetch_queued: false,
-            reveal_after_fetch: false,
-            center_after_fetch: false,
+            reveal_after_fetch: None,
+            place_after_fetch: None,
             picker_scroll_y: 0.0,
             spinner_phase: 0.0,
             last_anim_tick: None,
@@ -1242,16 +1247,14 @@ impl App {
                 self.clamp_scroll();
                 let mut task = Task::none();
                 if anchored {
-                    self.reveal_after_fetch = false;
-                    self.center_after_fetch = false;
+                    self.reveal_after_fetch = None;
+                    self.place_after_fetch = None;
                 } else {
-                    if self.reveal_after_fetch {
-                        self.reveal_after_fetch = false;
-                        self.reveal_cursor();
+                    if let Some(style) = self.reveal_after_fetch.take() {
+                        self.reveal_cursor_styled(style);
                     }
-                    if self.center_after_fetch {
-                        self.center_after_fetch = false;
-                        self.center_cursor_in_window();
+                    if let Some(place) = self.place_after_fetch.take() {
+                        self.place_cursor_in_window(place);
                     }
                 }
                 if self.refetch_queued {
@@ -1422,7 +1425,7 @@ impl App {
             match e {
                 Effect::Toast(message, kind) => tasks.push(self.toast(message, kind)),
                 Effect::WriteClipboard(text) => tasks.push(iced::clipboard::write(text)),
-                Effect::RevealCursor => tasks.push(self.ensure_cursor_visible()),
+                Effect::RevealCursor(style) => tasks.push(self.ensure_cursor_visible(style)),
                 Effect::Resubscribe => {
                     self.scroll_px = 0.0;
                     self.scroll_x_px = 0.0;
@@ -1861,8 +1864,8 @@ impl App {
                 }
                 self.maybe_fetch()
             }
-            A::CenterCursor => {
-                let task = self.center_cursor();
+            A::PlaceCursor(place) => {
+                let task = self.place_cursor(place);
                 Task::batch([task, self.maybe_fetch()])
             }
             A::ToggleWrap => {
@@ -1903,15 +1906,17 @@ impl App {
         // longer resets these on switch/reconnect — they live here now.
         self.fetch_in_flight = false;
         self.refetch_queued = false;
-        self.reveal_after_fetch = false;
+        self.reveal_after_fetch = None;
         let scroll = self.session.buffer.scroll.unwrap_or(ScrollPosition {
+            // A fresh jump target (no saved scroll) rests near the top — the cross-buffer
+            // counterpart of the in-buffer jump reveal.
             logical_line: self
                 .session
                 .buffer
                 .cursor
                 .position
                 .line
-                .saturating_sub(rows / 2),
+                .saturating_sub((rows as f32 * CURSOR_REST_FRACTION) as u32),
             sub_row: 0.0,
         });
         self.subscribe_scroll = scroll;
@@ -2205,9 +2210,9 @@ impl App {
 
     /// After a cursor move: fetch around the cursor when it left the loaded window, otherwise
     /// scroll the minimum to reveal it (web's `ensureCursorVisible` + `revealCursor`).
-    fn ensure_cursor_visible(&mut self) -> Task<Message> {
+    fn ensure_cursor_visible(&mut self, style: RevealStyle) -> Task<Message> {
         let blame = self.maybe_blame();
-        let reveal = self.ensure_cursor_visible_inner();
+        let reveal = self.ensure_cursor_visible_inner(style);
         Task::batch([blame, reveal])
     }
 
@@ -2252,7 +2257,7 @@ impl App {
         )
     }
 
-    fn ensure_cursor_visible_inner(&mut self) -> Task<Message> {
+    fn ensure_cursor_visible_inner(&mut self, style: RevealStyle) -> Task<Message> {
         let Some(window) = &self.session.window else {
             return Task::none();
         };
@@ -2261,7 +2266,7 @@ impl App {
             let Some(viewport_id) = self.session.viewport_id else {
                 return Task::none();
             };
-            self.reveal_after_fetch = true;
+            self.reveal_after_fetch = Some(style);
             self.fetch_in_flight = true;
             return self.rpc::<ViewportScroll>(
                 ViewportScrollParams {
@@ -2274,8 +2279,36 @@ impl App {
                 Message::WindowUpdate,
             );
         }
-        self.reveal_cursor();
+        self.reveal_cursor_styled(style);
         self.maybe_fetch()
+    }
+
+    fn reveal_cursor_styled(&mut self, style: RevealStyle) {
+        match style {
+            RevealStyle::Follow => self.reveal_cursor(),
+            RevealStyle::Jump => self.reveal_cursor_jump(),
+        }
+    }
+
+    /// Jump reveal: leave the view if the cursor is already visible, else rest it near the top.
+    /// `scroll_to_px` animates a short glide there and snaps when the target is far (> ~1.5 screens).
+    fn reveal_cursor_jump(&mut self) {
+        let (Some(cell), Some(window)) = (self.cell, &self.session.window) else {
+            return;
+        };
+        let Some((row, _, _)) =
+            grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH)
+        else {
+            return;
+        };
+        let h = cell.height;
+        let top = PAD + row as f32 * h;
+        let view_h = self.view_size.height;
+        // Already fully visible → don't disturb the view.
+        if top >= self.scroll_px && top + h <= self.scroll_px + view_h {
+            return;
+        }
+        self.scroll_to_px(top - view_h * CURSOR_REST_FRACTION, true);
     }
 
     fn reveal_cursor(&mut self) {
@@ -2310,7 +2343,7 @@ impl App {
         }
     }
 
-    fn center_cursor(&mut self) -> Task<Message> {
+    fn place_cursor(&mut self, place: ViewportPlace) -> Task<Message> {
         let line = self.session.buffer.cursor.position.line;
         let loaded = self
             .session
@@ -2322,12 +2355,12 @@ impl App {
         };
         // When the cursor's line has been scrolled out of the loaded window, its visual row is
         // unknown — pull that region from the server (scrolling the viewport to the line), then
-        // centre once it lands. Mirrors `ensure_cursor_visible_inner`.
+        // place once it lands. Mirrors `ensure_cursor_visible_inner`.
         if line < first || line >= last {
             let Some(viewport_id) = self.session.viewport_id else {
                 return Task::none();
             };
-            self.center_after_fetch = true;
+            self.place_after_fetch = Some(place);
             self.fetch_in_flight = true;
             return self.rpc::<ViewportScroll>(
                 ViewportScrollParams {
@@ -2340,13 +2373,13 @@ impl App {
                 Message::WindowUpdate,
             );
         }
-        self.center_cursor_in_window();
+        self.place_cursor_in_window(place);
         Task::none()
     }
 
-    /// Centre the cursor's line in the viewport. Assumes the line is in the loaded window (the
-    /// caller pulls it in first otherwise); a no-op if its cell isn't resolvable.
-    fn center_cursor_in_window(&mut self) {
+    /// Scroll so the cursor's line sits a fixed fraction down the viewport. Assumes the line is in
+    /// the loaded window (the caller pulls it in first otherwise); a no-op if its cell is unknown.
+    fn place_cursor_in_window(&mut self, place: ViewportPlace) {
         let (Some(cell), Some(window)) = (self.cell, &self.session.window) else {
             return;
         };
@@ -2356,7 +2389,7 @@ impl App {
             return;
         };
         self.scroll_to_px(
-            PAD + row as f32 * cell.height - self.view_size.height / 2.0,
+            PAD + row as f32 * cell.height - self.view_size.height * place.fraction(),
             true,
         );
     }

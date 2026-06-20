@@ -16,6 +16,20 @@ pub enum ToastKind {
     Success,
 }
 
+/// How a cursor reveal should reposition the viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevealStyle {
+    /// Ordinary motions/edits: keep the view stable, scrolling the minimum to bring the cursor
+    /// on-screen (and nothing when it's already visible).
+    Follow,
+    /// A jump to a specific target (search hit, diagnostic, hunk, go-to-line, a cross-buffer open):
+    /// if the cursor is already visible it stays put; otherwise the shell rests it near the top of
+    /// the viewport ([`CURSOR_REST_FRACTION`](crate::keymap::CURSOR_REST_FRACTION) down), where
+    /// there's more context below. Short same-buffer jumps animate the scroll there; far (and
+    /// cross-buffer) ones snap.
+    Jump,
+}
+
 pub enum Effect {
     /// Perform this JSON-RPC call and feed the outcome back through
     /// `Session::on_rpc_result` with the same token. Requests are performed in emission
@@ -31,8 +45,10 @@ pub enum Effect {
     /// Put text on the system clipboard.
     WriteClipboard(String),
     /// Scroll so the cursor is on-screen — geometry, so the shell owns the how (pixel
-    /// reveal + window fetch for the GUI; row scrolling for a terminal).
-    RevealCursor,
+    /// reveal + window fetch for the GUI; row scrolling for a terminal). The [`RevealStyle`]
+    /// distinguishes an ordinary follow from a navigation jump (rest near the top, animate if
+    /// short).
+    RevealCursor(RevealStyle),
     /// The session switched buffers: reset view-side presentation (scroll, hover) and
     /// subscribe a fresh viewport at the shell's grid.
     Resubscribe,

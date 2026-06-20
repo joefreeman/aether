@@ -9,7 +9,7 @@
 
 mod view;
 
-use aether_client::effect::{Effect, Effects, ToastKind};
+use aether_client::effect::{Effect, Effects, RevealStyle, ToastKind};
 use aether_client::keymap::{
     hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
 };
@@ -530,7 +530,13 @@ fn effect_value(e: Effect) -> Value {
         Effect::ReadClipboard(paste) => {
             json!({ "tag": "ReadClipboard", "paste": paste_value(&paste) })
         }
-        Effect::RevealCursor => json!({ "tag": "RevealCursor" }),
+        Effect::RevealCursor(style) => json!({
+            "tag": "RevealCursor",
+            "style": match style {
+                RevealStyle::Follow => "follow",
+                RevealStyle::Jump => "jump",
+            },
+        }),
         Effect::Resubscribe => json!({ "tag": "Resubscribe" }),
         Effect::SaveScrollAnchor => json!({ "tag": "SaveScrollAnchor" }),
         Effect::RestoreScrollAnchor => json!({ "tag": "RestoreScrollAnchor" }),
@@ -605,7 +611,9 @@ fn action_value(a: &Action) -> Value {
         Action::Scroll { dir, unit } => {
             json!({ "name": "scroll", "dir": dbg(dir), "unit": dbg(unit) })
         }
-        Action::CenterCursor => json!({ "name": "center_cursor" }),
+        Action::PlaceCursor(place) => {
+            json!({ "name": "place_cursor", "fraction": place.fraction() })
+        }
         Action::ToggleWrap => json!({ "name": "toggle_wrap" }),
         Action::OpenHelp => json!({ "name": "open_help" }),
         Action::OpenProjectSettings => json!({ "name": "open_project_settings" }),
@@ -739,7 +747,9 @@ mod tests {
 
     #[test]
     fn effect_lowering_tags_match_the_contract() {
-        assert_eq!(effect_value(Effect::RevealCursor)["tag"], "RevealCursor");
+        let reveal = effect_value(Effect::RevealCursor(RevealStyle::Jump));
+        assert_eq!(reveal["tag"], "RevealCursor");
+        assert_eq!(reveal["style"], "jump");
         let toast = effect_value(Effect::Toast("hi".into(), ToastKind::Error));
         assert_eq!(toast["tag"], "Toast");
         assert_eq!(toast["level"], "error");

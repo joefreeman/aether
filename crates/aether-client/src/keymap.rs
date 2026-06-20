@@ -141,6 +141,31 @@ pub enum InsertWhere {
     LastLineEnd,
 }
 
+/// The fraction of the viewport that sits *above* a cursor that's been jumped to or placed near the
+/// top (search/diagnostic/hunk/go-to-line reveals, a cross-buffer open, and `;`). One source of
+/// truth so those rest positions stay aligned; the shells apply it in their own units (rows / px).
+pub const CURSOR_REST_FRACTION: f32 = 0.2;
+
+/// Where to put the cursor's line vertically when the user explicitly repositions the view
+/// (`;` / `Alt-;`). The shell scrolls so the line lands this far down the viewport.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewportPlace {
+    /// Near the top — leaves more context below (matches a jump's rest position, `;`).
+    Upper,
+    /// Near the bottom — keeps the preceding context on screen (`Alt-;`).
+    Lower,
+}
+
+impl ViewportPlace {
+    /// The fraction of the viewport that sits *above* the cursor's line at this placement.
+    pub fn fraction(self) -> f32 {
+        match self {
+            ViewportPlace::Upper => CURSOR_REST_FRACTION,
+            ViewportPlace::Lower => 1.0 - CURSOR_REST_FRACTION,
+        }
+    }
+}
+
 /// Abstract intent, mirroring the TUI's `Action` (subset). `count`/`extend` are execution
 /// context resolved by the app.
 #[derive(Clone, Copy, Debug)]
@@ -194,7 +219,9 @@ pub enum Action {
     MotionUndo,
     MotionRedo,
     RepeatMotion,
-    CenterCursor,
+    /// Reposition the view so the cursor's line sits at a fixed fraction down the viewport
+    /// (`;` / `Alt-;`). Shell-owned (geometry).
+    PlaceCursor(ViewportPlace),
     NavBack,
     NavForward,
 
@@ -623,7 +650,8 @@ static NORMAL: &[Binding] = &[
     bind!(N, KeyCode::Down, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Line }, "Scroll", "Scroll down one line"),
     bind!(N, KeyCode::Left, Any, A::Scroll { dir: ScrollDir::Left, unit: ScrollUnit::Line }, "Scroll", "Scroll left one column"),
     bind!(N, KeyCode::Right, Any, A::Scroll { dir: ScrollDir::Right, unit: ScrollUnit::Line }, "Scroll", "Scroll right one column"),
-    bind!(N, ch(';'), Exact(Mods::NONE), A::CenterCursor, "Scroll", "Center cursor in window"),
+    bind!(N, ch(';'), Exact(Mods::NONE), A::PlaceCursor(ViewportPlace::Upper), "Scroll", "Cursor near top"),
+    bind!(N, ch(';'), Exact(Mods::ALT), A::PlaceCursor(ViewportPlace::Lower), "Scroll", "Cursor near bottom"),
 
     // ---- navigation history (cross-file jump list) ----
     bind!(N, KeyCode::Backspace, Exact(Mods::NONE), A::NavBack, "Navigation", "Jump back (history)"),
@@ -840,6 +868,21 @@ mod tests {
             lookup(KeyContext::Leader, ch('d'), Mods::NONE).map(|b| b.action),
             Some(Action::OpenPicker(PickerKind::Diagnostics))
         ));
+    }
+
+    #[test]
+    fn place_cursor_bindings_are_semicolon_upper_and_alt_semicolon_lower() {
+        assert!(matches!(
+            lookup(KeyContext::Normal, ch(';'), Mods::NONE).map(|b| b.action),
+            Some(Action::PlaceCursor(ViewportPlace::Upper))
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Normal, ch(';'), Mods::ALT).map(|b| b.action),
+            Some(Action::PlaceCursor(ViewportPlace::Lower))
+        ));
+        // Upper rests at the shared jump fraction; Lower is its mirror.
+        assert_eq!(ViewportPlace::Upper.fraction(), CURSOR_REST_FRACTION);
+        assert_eq!(ViewportPlace::Lower.fraction(), 1.0 - CURSOR_REST_FRACTION);
     }
 
     #[test]

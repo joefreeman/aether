@@ -4,7 +4,7 @@
 //! bridges with a single `Message::Core(Event)` variant and an effect executor.
 
 use super::chips::{self, ChipEditor, ChipEditorField, ChipId};
-use super::effect::{Effect, Effects, ToastKind};
+use super::effect::{Effect, Effects, RevealStyle, ToastKind};
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
@@ -90,8 +90,11 @@ use aether_protocol::LogicalPosition;
 pub enum Event {
     SaveTried(Result<SaveTry, String>),
     ReloadTried(Result<ReloadTry, String>),
-    /// A cursor-returning RPC resolved (motions, selections, clicks).
+    /// A cursor-returning RPC resolved (motions, selections, clicks). Reveals as a `Follow`.
     CursorMsg(Result<CursorState, String>),
+    /// As [`CursorMsg`](Event::CursorMsg), but the move was a targeted jump (go-to-line) so the
+    /// reveal rests the cursor a quarter down rather than scrolling the minimum.
+    CursorJump(Result<CursorState, String>),
     /// An edit resolved: adopt the new revision + cursor.
     EditDone(Result<EditResult, String>),
     UndoRedoDone(Result<UndoResult, String>),
@@ -231,14 +234,21 @@ impl Session {
         match event {
             Event::CursorMsg(Ok(cursor)) => {
                 self.buffer.cursor = cursor;
-                Effects::one(Effect::RevealCursor)
+                Effects::one(Effect::RevealCursor(RevealStyle::Follow))
             }
             Event::CursorMsg(Err(e)) => Effects::error(e),
+
+            // Go-to-line and other targeted motions reveal as a jump (rest a quarter down).
+            Event::CursorJump(Ok(cursor)) => {
+                self.buffer.cursor = cursor;
+                Effects::one(Effect::RevealCursor(RevealStyle::Jump))
+            }
+            Event::CursorJump(Err(e)) => Effects::error(e),
 
             Event::EditDone(Ok(r)) => {
                 self.buffer.revision = r.revision;
                 self.buffer.cursor = r.cursor;
-                Effects::one(Effect::RevealCursor)
+                Effects::one(Effect::RevealCursor(RevealStyle::Follow))
             }
             Event::EditDone(Err(e)) => Effects::error(e),
 
@@ -250,7 +260,7 @@ impl Session {
                 } else {
                     Effects::toast("nothing to undo/redo", ToastKind::Info)
                 };
-                fx.push(Effect::RevealCursor);
+                fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
             }
             Event::UndoRedoDone(Err(e)) => Effects::error(e),
@@ -269,7 +279,7 @@ impl Session {
                 let mut fx =
                     Effects::toast(format!("cut {} bytes", r.text.len()), ToastKind::Success);
                 fx.push(Effect::WriteClipboard(r.text));
-                fx.push(Effect::RevealCursor);
+                fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
             }
             Event::CutDone(Err(e)) => Effects::error(format!("cut failed: {e}")),
@@ -295,7 +305,7 @@ impl Session {
                 // whole window and reads as an instant jump.
                 let fx = if open.buffer_id == self.buffer.buffer_id {
                     self.buffer.cursor = open.cursor;
-                    Effects::one(Effect::RevealCursor)
+                    Effects::one(Effect::RevealCursor(RevealStyle::Jump))
                 } else {
                     self.adopt_switch(open)
                 };
@@ -324,7 +334,7 @@ impl Session {
                     // query had jumped them.
                     self.revert_to_snapshot_cursor()
                 } else {
-                    Effects::one(Effect::RevealCursor)
+                    Effects::one(Effect::RevealCursor(RevealStyle::Jump))
                 }
             }
             Event::SearchApplied(Err(_)) => {
@@ -349,7 +359,7 @@ impl Session {
             Event::SearchNav(Ok(r)) => {
                 self.buffer.cursor = r.cursor;
                 self.search.summary = Some(r.summary);
-                Effects::one(Effect::RevealCursor)
+                Effects::one(Effect::RevealCursor(RevealStyle::Jump))
             }
             Event::SearchNav(Err(e)) => Effects::error(e),
 
@@ -397,7 +407,7 @@ impl Session {
                 } else {
                     Effects::toast("no more diagnostics", ToastKind::Info)
                 };
-                fx.push(Effect::RevealCursor);
+                fx.push(Effect::RevealCursor(RevealStyle::Jump));
                 fx
             }
             Event::DiagNav(Err(e)) => Effects::error(e),
@@ -442,7 +452,7 @@ impl Session {
                     Some(n) => Effects::toast(n, ToastKind::Info),
                     None => Effects::none(),
                 };
-                fx.push(Effect::RevealCursor);
+                fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
             }
             Event::FormatDone(Err(e)) => Effects::error(format!("format failed: {e}")),
@@ -481,7 +491,7 @@ impl Session {
                 } else {
                     Effects::toast("no more changes", ToastKind::Info)
                 };
-                fx.push(Effect::RevealCursor);
+                fx.push(Effect::RevealCursor(RevealStyle::Jump));
                 fx
             }
             Event::HunkNav(Err(e)) => Effects::error(e),
@@ -4392,7 +4402,7 @@ impl Session {
                 } else {
                     count.saturating_sub(1)
                 };
-                self.move_motion(
+                self.move_jump(
                     Motion::Goto {
                         position: LogicalPosition { line, col: 0 },
                     },
@@ -4495,7 +4505,7 @@ impl Session {
                 }
                 fx
             }
-            A::CenterCursor | A::Scroll { .. } => {
+            A::PlaceCursor(_) | A::Scroll { .. } => {
                 // Geometry (pixel scroll, cell metrics) and viewport plumbing — the shell
                 // executes these against its own state.
                 Effects::one(Effect::ShellAction(action))
@@ -4780,6 +4790,19 @@ impl Session {
                 extend_selection: extend,
             },
             Event::CursorMsg,
+        )
+    }
+
+    /// Like [`move_motion`](Self::move_motion) but reveals the landing as a jump (go-to-line) —
+    /// a targeted destination, so the cursor rests a quarter down instead of minimal-scrolling.
+    fn move_jump(&mut self, motion: Motion, extend: bool) -> Effects {
+        self.request_str::<CursorMove>(
+            CursorMoveParams {
+                buffer_id: self.buffer.buffer_id,
+                motion,
+                extend_selection: extend,
+            },
+            Event::CursorJump,
         )
     }
 

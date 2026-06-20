@@ -67,9 +67,59 @@ fn insert_entry_is_one_selection_edge_request() {
     assert_eq!(s.buffer.cursor.position.line, 2);
     assert_eq!(s.buffer.cursor.position.col, 5);
     assert!(
-        fx.0.iter().any(|e| matches!(e, Effect::RevealCursor)),
+        fx.0.iter().any(|e| matches!(e, Effect::RevealCursor(_))),
         "a cursor move reveals the cursor"
     );
+}
+
+/// The reveal style of the single `RevealCursor` effect in `fx`, if any.
+fn reveal_style(fx: &Effects) -> Option<aether_client::effect::RevealStyle> {
+    fx.0.iter().find_map(|e| match e {
+        Effect::RevealCursor(style) => Some(*style),
+        _ => None,
+    })
+}
+
+#[test]
+fn ordinary_motion_follows_but_goto_line_jumps() {
+    use aether_client::effect::RevealStyle;
+    let cursor = json!({ "position": {"line": 9, "col": 0}, "anchor": {"line": 9, "col": 0} });
+
+    // A plain motion (`j`) reveals as a Follow — minimal scroll.
+    let mut s = session();
+    let token = the_request(&key(&mut s, 'j')).0;
+    let fx = s.on_rpc_result(token, Ok(cursor.clone()));
+    assert_eq!(reveal_style(&fx), Some(RevealStyle::Follow));
+
+    // Go-to-line (`g`) is a targeted jump — reveals as a Jump (rest a quarter down).
+    let mut s = session();
+    let token = the_request(&key(&mut s, 'g')).0;
+    let fx = s.on_rpc_result(token, Ok(cursor));
+    assert_eq!(reveal_style(&fx), Some(RevealStyle::Jump));
+}
+
+#[test]
+fn search_and_diagnostic_navigation_reveal_as_jumps() {
+    use aether_client::effect::RevealStyle;
+    use aether_client::update::Event;
+
+    // Search next/prev (`n`/`N`) jumps to the match.
+    let mut s = session();
+    let fx = s.on_event(Event::SearchNav(Ok(serde_json::from_value(json!({
+        "cursor": { "position": {"line": 20, "col": 0}, "anchor": {"line": 20, "col": 0} },
+        "summary": { "buffer_id": 0, "total": 3, "truncated": false, "current_index": 1 },
+    }))
+    .unwrap())));
+    assert_eq!(reveal_style(&fx), Some(RevealStyle::Jump));
+
+    // Diagnostic next/prev (`d`/`Alt-d`) jumps to the diagnostic.
+    let mut s = session();
+    let fx = s.on_event(Event::DiagNav(Ok(serde_json::from_value(json!({
+        "cursor": { "position": {"line": 31, "col": 2}, "anchor": {"line": 31, "col": 2} },
+        "moved": true,
+    }))
+    .unwrap())));
+    assert_eq!(reveal_style(&fx), Some(RevealStyle::Jump));
 }
 
 #[test]
@@ -1240,7 +1290,7 @@ fn pointer_press_then_drag_extends_from_the_press_anchor() {
         })),
     );
     assert_eq!(s.buffer.cursor.position.col, 9);
-    assert!(fx.0.iter().any(|e| matches!(e, Effect::RevealCursor)));
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::RevealCursor(_))));
 
     // Release ends the drag — a further drag is inert.
     s.pointer_release();
