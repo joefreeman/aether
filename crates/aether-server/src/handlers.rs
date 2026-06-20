@@ -4191,8 +4191,9 @@ pub async fn viewport_subscribe(
     let hunks = buffer_both_hunks(&s, params.buffer_id);
     let diagnostics = buffer_diagnostics(&s, params.buffer_id);
     let buf = &s.buffers[&params.buffer_id];
-    // A freshly subscribed viewport starts with the diff view off, but still carries gutter
-    // markers (computed from `hunks` regardless of the toggle).
+    // Gutter markers ride `hunks` regardless of the diff toggle; the inline view honours the
+    // client's sticky setting. Hunks are seeded on open (`load_baseline`) and kept fresh per edit,
+    // so they're accurate here without the recompute `git_set_diff_view` does.
     let window = render_window(
         buf,
         first,
@@ -4206,7 +4207,7 @@ pub async fn viewport_subscribe(
         params.rows,
         WindowDecorations {
             search,
-            diff_view: false,
+            diff_view: params.diff_view,
             hunks,
             diagnostics,
             git_status: buffer_git_status(&s, buffer_id),
@@ -4228,7 +4229,7 @@ pub async fn viewport_subscribe(
         tab_width: params.tab_width,
         first_logical_line: first,
         last_logical_line_exclusive: last_excl,
-        diff_view: false,
+        diff_view: params.diff_view,
     };
     s.viewports.insert(viewport_id, viewport);
     s.last_scroll.insert((client_id, buffer_id), params.scroll);
@@ -11131,6 +11132,7 @@ mod subscribe_snapshot_tests {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         }
     }
 

@@ -74,8 +74,6 @@ enum Done {
     /// The initial boot dial: connect + bootstrap from the `Connecting` launch state. `NotUp`
     /// retries (the daemon may still be coming up); `Fatal` (e.g. a bad CLI project) ends the run.
     Booted(Box<Result<Booted, ReconnectError>>),
-    /// Re-enabling the sticky diff view after a fresh subscribe.
-    DiffViewSet(Result<aether_protocol::viewport::ViewportWindowResult, String>),
     /// A floating toast's time-to-live elapsed; removes the toast with this id from the stack.
     ToastExpired(u64),
 }
@@ -473,25 +471,7 @@ impl Shell {
                     self.clamp_scroll();
                     self.reveal_cursor();
                 }
-                // Diff view is sticky across switches; a fresh viewport starts with it off.
-                if self.session.diff_view {
-                    let h = self.handle.clone();
-                    let viewport_id = self.session.viewport_id.unwrap_or(0);
-                    let fut = async move {
-                        h.rpc::<aether_protocol::git::GitSetDiffView>(
-                            aether_protocol::git::GitSetDiffViewParams {
-                                viewport_id,
-                                enabled: true,
-                            },
-                        )
-                        .await
-                    };
-                    self.pending.push(Box::pin(async move {
-                        // Route through the core's DiffViewSet handling via a parked token?
-                        // No token here — feed the event directly.
-                        Done::DiffViewSet(fut.await.map_err(|e| e.to_string()))
-                    }));
-                }
+                // Diff view rides the subscribe params, so there's nothing to re-apply here.
             }
             Done::Subscribed(_, Err(e)) => {
                 self.status(StatusMessage::error(format!("subscribe failed: {e}")))
@@ -531,10 +511,6 @@ impl Shell {
                 buffer_id,
                 line,
                 text,
-            }),
-            Done::DiffViewSet(result) => self.dispatch(CoreEvent::DiffViewSet {
-                enabled: true,
-                result,
             }),
             Done::ToastExpired(id) => self.state.toasts.retain(|t| t.id != id),
             Done::Reconnected(result) => match *result {
@@ -1042,6 +1018,7 @@ impl Shell {
         let h = self.handle.clone();
         let buffer_id = self.session.buffer.buffer_id;
         let wrap = self.session.wrap;
+        let diff_view = self.session.diff_view;
         let fut = async move {
             h.rpc::<ViewportSubscribe>(ViewportSubscribeParams {
                 buffer_id,
@@ -1052,6 +1029,7 @@ impl Shell {
                 wrap,
                 continuation_marker_width: 2,
                 tab_width: TAB_WIDTH,
+                diff_view,
             })
             .await
         };

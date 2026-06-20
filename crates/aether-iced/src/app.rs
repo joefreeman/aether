@@ -20,9 +20,7 @@ use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::{CursorSet, CursorSetParams, Granularity};
 use aether_protocol::envelope::{NotificationMethod, RpcMethod};
-use aether_protocol::git::{
-    GitBlameLine, GitBlameLineParams, GitSetDiffView, GitSetDiffViewParams,
-};
+use aether_protocol::git::{GitBlameLine, GitBlameLineParams};
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::{
     PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerUpdate, PickerUpdateParams,
@@ -1225,18 +1223,7 @@ impl App {
                 }
                 self.clamp_scroll();
                 self.reveal_cursor();
-                // The diff-view toggle is sticky across buffer switches, but a fresh viewport
-                // starts with it off — re-enable server-side.
-                if self.session.diff_view {
-                    let enabled = true;
-                    return self.rpc::<GitSetDiffView>(
-                        GitSetDiffViewParams {
-                            viewport_id: self.session.viewport_id.unwrap_or(0),
-                            enabled,
-                        },
-                        move |result| Message::Core(CoreEvent::DiffViewSet { enabled, result }),
-                    );
-                }
+                // Diff view rides the subscribe params, so there's nothing to re-apply here.
                 Task::none()
             }
             Message::Subscribed(Err(e)) => self.error(format!("subscribe failed: {e}")),
@@ -1938,6 +1925,7 @@ impl App {
                 wrap: self.session.wrap,
                 continuation_marker_width: grid::CONTINUATION_MARKER_COLS,
                 tab_width: TAB_WIDTH,
+                diff_view: self.session.diff_view,
             },
             Message::Subscribed,
         )

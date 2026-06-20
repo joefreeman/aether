@@ -339,6 +339,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -458,6 +459,7 @@ async fn buffer_open_jump_drops_saved_scroll() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -562,6 +564,7 @@ async fn buffer_open_isolates_scroll_per_client() {
                 wrap: WrapMode::None,
                 continuation_marker_width: 0,
                 tab_width: 4,
+                diff_view: false,
             },
         )
         .await;
@@ -836,6 +839,7 @@ async fn viewport_subscribe_renders_window() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -905,6 +909,7 @@ async fn viewport_subscribe_wraps_long_line() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -989,6 +994,7 @@ async fn viewport_scroll_returns_new_window() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -2320,6 +2326,7 @@ async fn input_text_inserts_and_pushes_notification() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -2393,6 +2400,7 @@ async fn input_delete_backspace_removes_char_before_cursor() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -2466,6 +2474,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -2963,6 +2972,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -3036,6 +3046,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -3389,6 +3400,7 @@ async fn cut_selection_deletes_and_returns_text() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -3468,6 +3480,7 @@ async fn input_text_with_select_pasted_makes_selection() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -3520,6 +3533,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -3627,6 +3641,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -3827,6 +3842,7 @@ async fn join_lines_collapses_lines_with_single_space() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -3899,6 +3915,7 @@ async fn input_text_with_selection_replaces_it() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -4986,6 +5003,7 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5030,6 +5048,7 @@ async fn visual_line_preserves_visual_column() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5103,6 +5122,7 @@ async fn visual_line_crosses_logical_line_boundary() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5161,6 +5181,7 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5215,6 +5236,7 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5272,6 +5294,7 @@ async fn viewport_set_wrap_changes_visible_rows() {
 
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5321,6 +5344,7 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5398,6 +5422,7 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5470,6 +5495,7 @@ async fn virtual_col_cleared_by_horizontal_motion() {
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5555,6 +5581,7 @@ async fn virtual_col_cleared_by_mutation() {
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5641,6 +5668,7 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -5680,6 +5708,7 @@ async fn buffer_text(
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -10130,6 +10159,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             wrap: WrapMode::None,
             continuation_marker_width: 1,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -10227,6 +10257,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             wrap: WrapMode::None,
             continuation_marker_width: 1,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -10328,6 +10359,7 @@ async fn buffers_picker_pushes_on_save() {
             wrap: WrapMode::None,
             continuation_marker_width: 1,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -10609,6 +10641,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -11124,6 +11157,7 @@ async fn save_as_to_same_path_is_in_place_save() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -11211,6 +11245,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -11321,6 +11356,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -11415,6 +11451,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -11659,6 +11696,7 @@ async fn buffer_close_drops_viewports() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -11712,6 +11750,7 @@ async fn input_delete_line_removes_line_with_newline() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -11759,6 +11798,7 @@ async fn input_change_line_blanks_content_keeps_newline() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -11806,6 +11846,7 @@ async fn input_replace_line_swaps_content() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -14168,6 +14209,7 @@ async fn setup_watched_buffer(
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -14355,6 +14397,7 @@ async fn connect_and_open_watched(
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -14753,6 +14796,7 @@ async fn subscribe_full(
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await
@@ -15445,6 +15489,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -15514,6 +15559,113 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
     drop(server);
 }
 
+/// A subscribe with `diff_view: true` renders diffs in the first frame, so the sticky toggle
+/// survives a buffer switch without a follow-up `git/set_diff_view` to re-apply it.
+#[tokio::test]
+async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+
+    let server = spawn_for_test("diff-sub-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "diff-sub-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("edit.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    // Subscribe once (diff off), edit the live buffer to create a diff, then re-subscribe with the
+    // diff view on — modelling a buffer switch back with the toggle sticky-on.
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let _edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: open.buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+            at: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        5,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: true,
+        },
+    )
+    .await;
+    // The very first window already carries the phantom deleted baseline row — no GitSetDiffView.
+    let line0 = sub
+        .window
+        .lines
+        .iter()
+        .find(|l| l.logical_line == 0)
+        .expect("line 0 in window");
+    assert_eq!(
+        line0.virtual_rows_above.len(),
+        1,
+        "subscribe with diff_view on shows the deleted baseline row in the first frame"
+    );
+    assert_eq!(line0.virtual_rows_above[0].text, "alpha");
+    assert_eq!(line0.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
+    assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn git_status_counts_ride_the_window() {
     // The status-bar summary (staged/unstaged per-class line counts) is computed server-side
@@ -15566,6 +15718,7 @@ async fn git_status_counts_ride_the_window() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -15675,6 +15828,7 @@ async fn git_status_splits_staged_and_unstaged() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -15757,6 +15911,7 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -16202,6 +16357,7 @@ async fn apply_hunk_stage_refreshes_status_counts() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -16261,6 +16417,7 @@ async fn remodified_staged_line_reads_as_unstaged() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -16313,6 +16470,7 @@ async fn shared_anchor_phantom_rows_show_only_the_unstaged_layer() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -16398,6 +16556,7 @@ async fn git_gutter_marker_present_without_diff_view() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -16623,6 +16782,7 @@ async fn open_and_subscribe(
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -17690,6 +17850,7 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -17739,6 +17900,7 @@ async fn viewport_total_visual_rows_counts_wrapped_rows() {
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -17790,6 +17952,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
                 wrap: WrapMode::Soft,
                 continuation_marker_width: 0,
                 tab_width: 4,
+                diff_view: false,
             },
         )
         .await;
@@ -17915,6 +18078,7 @@ async fn nav_open_file(
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
+            diff_view: false,
         },
     )
     .await;
@@ -19104,6 +19268,7 @@ fn transient_sub_params(buffer_id: u64) -> ViewportSubscribeParams {
         wrap: WrapMode::None,
         continuation_marker_width: 0,
         tab_width: 4,
+        diff_view: false,
     }
 }
 

@@ -951,6 +951,38 @@ fn lsp_format_shape() {
 }
 
 #[test]
+fn viewport_subscribe_params_carry_sticky_diff_view() {
+    use aether_protocol::viewport::{
+        ScrollPosition, ViewportSubscribe, ViewportSubscribeParams, WrapMode,
+    };
+    assert_eq!(ViewportSubscribe::NAME, "viewport/subscribe");
+    let p = ViewportSubscribeParams {
+        buffer_id: 1,
+        cols: 80,
+        rows: 24,
+        overscan_rows: 0,
+        scroll: ScrollPosition {
+            logical_line: 0,
+            sub_row: 0.0,
+        },
+        wrap: WrapMode::None,
+        continuation_marker_width: 0,
+        tab_width: 4,
+        diff_view: true,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["diff_view"], true);
+    // Absent on the wire → defaults off (older clients that don't send the sticky toggle).
+    let back: ViewportSubscribeParams = from_value(json!({
+        "buffer_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,
+        "scroll": { "logical_line": 0, "sub_row": 0.0 },
+        "wrap": "none", "continuation_marker_width": 0, "tab_width": 4,
+    }))
+    .unwrap();
+    assert!(!back.diff_view);
+}
+
+#[test]
 fn lsp_navigate_diagnostic_shape() {
     assert_eq!(LspNavigateDiagnostic::NAME, "lsp/navigate_diagnostic");
     let p = LspNavigateDiagnosticParams {

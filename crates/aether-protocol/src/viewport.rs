@@ -220,6 +220,11 @@ pub struct ViewportSubscribeParams {
     /// client actually renders. Most clients will pass 4 or 8; 0 collapses tabs to zero width
     /// (don't do this unless you also strip tabs client-side).
     pub tab_width: u32,
+    /// Whether to render the new viewport with the inline diff view on. The toggle is a sticky,
+    /// client-wide preference but each viewport is fresh, so the client carries its current setting
+    /// here and the first frame is correct without a follow-up `git/set_diff_view`. Defaults off.
+    #[serde(default)]
+    pub diff_view: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

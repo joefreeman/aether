@@ -1748,6 +1748,8 @@ export class Shell {
         wrap: v.wrap,
         continuation_marker_width: CONTINUATION_MARKER_WIDTH,
         tab_width: TAB_WIDTH,
+        // Sticky diff view rides the subscribe so it survives a buffer switch.
+        diff_view: v.diff_view,
       });
     } catch {
       return; // a failed subscribe (e.g. raced a buffer close) — a newer one will follow
