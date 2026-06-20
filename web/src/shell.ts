@@ -3235,11 +3235,13 @@ export class Shell {
   private renderPickerList(p: PickerView, v: CoreView): void {
     const projectPaths = v.project_paths;
     const list = this.pickerListEl;
-    // No results at all: show a status line so a slow search (grep streaming, references resolving)
-    // reads as "working", not "broken". Gated on `total_matches`, NOT `items.length` — a scroll
-    // refetch momentarily empties the window while results still exist, and collapsing the spacer
-    // here would reset scrollTop to the top. That case falls through to the spacer render below.
-    if (p.total_matches === 0) {
+    // No rows to show at all: a status line so a slow search (grep streaming, references resolving)
+    // reads as "working", not "broken". Gated on BOTH counts being empty: `total_matches > 0` with
+    // an empty window is a scroll refetch in flight (results still exist — fall through to the
+    // spacer render, don't collapse it / reset scrollTop); `items.length > 0` with `total_matches
+    // 0` is the previous query's window kept on screen while a new grep/async search starts (the
+    // server holds it via an `items: None` tick) — render those stale rows + spinner, don't blank.
+    if (p.total_matches === 0 && p.items.length === 0) {
       // Consume a pending scroll-reset here too. An async picker (symbols / references) opens empty
       // and returns early through this branch while loading, so a reset left armed would survive to
       // the fill push and, in the scroll block below, snap to the top *and* cancel the reveal that

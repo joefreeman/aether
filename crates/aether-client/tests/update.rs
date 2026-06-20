@@ -479,6 +479,142 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
 }
 
 #[test]
+fn grep_count_only_ticks_keep_the_window_then_the_first_batch_replaces_it() {
+    // The grep streaming sequence at the core: the previous query's hits stay put through the
+    // initial count-only tick (`items: None`) and the throttled count ticks while the new search
+    // runs, then the first real batch replaces them — so the list never blanks mid-type.
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Grep, None, None);
+    let hit = |path: &str, line: u32| PickerItem::GrepHit {
+        path_index: 0,
+        relative_path: path.into(),
+        line,
+        col: 0,
+        preview: "x".into(),
+        match_indices: vec![],
+    };
+    let gen = s.picker.as_ref().unwrap().generation;
+    let tick = |items: Option<Vec<PickerItem>>, matches: u32| PickerUpdateParams {
+        kind: PickerKind::Grep,
+        generation: gen,
+        offset: 0,
+        items,
+        total_matches: matches,
+        total_candidates: matches,
+        ticking: true,
+        grep_display_offset: Some(0),
+        grep_total_display_rows: Some(matches),
+        center_on: None,
+        explorer_peek_missing: false,
+    };
+    // The previous query's window.
+    assert!(s
+        .picker
+        .as_mut()
+        .unwrap()
+        .apply_update(tick(Some(vec![hit("old.rs", 1), hit("old.rs", 2)]), 2)));
+
+    // New query's initial count-only tick (items: None, count reset to 0): keep the window AND its
+    // geometry. Zeroing total_matches/total_display_rows here would collapse the shells' viewport
+    // (iced list height, web spacer, TUI scrollbar) and flash the kept rows away for a frame.
+    assert!(s.picker.as_mut().unwrap().apply_update(tick(None, 0)));
+    {
+        let p = s.picker.as_ref().unwrap();
+        assert_eq!(
+            p.items.len(),
+            2,
+            "the count-only tick keeps the previous window rather than blanking it"
+        );
+        assert_eq!(
+            p.total_matches, 2,
+            "the prior count is kept, not reset to 0"
+        );
+        assert_eq!(
+            p.total_display_rows, 2,
+            "the prior display geometry is kept so the viewport doesn't collapse"
+        );
+    }
+    // A throttled count tick as hits stream in elsewhere (count climbs, still None): still kept.
+    assert!(s.picker.as_mut().unwrap().apply_update(tick(None, 7)));
+    assert_eq!(s.picker.as_ref().unwrap().items.len(), 2);
+    assert_eq!(s.picker.as_ref().unwrap().total_matches, 7);
+
+    // The first batch that touches the window replaces the stale rows.
+    assert!(s
+        .picker
+        .as_mut()
+        .unwrap()
+        .apply_update(tick(Some(vec![hit("new.rs", 9)]), 7)));
+    let items = &s.picker.as_ref().unwrap().items;
+    assert_eq!(items.len(), 1);
+    assert!(
+        matches!(&items[0], PickerItem::GrepHit { relative_path, .. } if relative_path == "new.rs")
+    );
+}
+
+#[test]
+fn picker_query_change_keeps_stale_window_until_the_new_push_lands() {
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Files, None, None);
+    let file = |name: &str| PickerItem::File {
+        path_index: 0,
+        relative_path: name.into(),
+        match_indices: vec![],
+        git_status: None,
+    };
+    let gen0 = s.picker.as_ref().unwrap().generation;
+    let window = |generation: u64, items: Vec<PickerItem>, total: u32| PickerUpdateParams {
+        kind: PickerKind::Files,
+        generation,
+        offset: 0,
+        items: Some(items),
+        total_matches: total,
+        total_candidates: 3,
+        ticking: false,
+        grep_display_offset: None,
+        grep_total_display_rows: None,
+        center_on: None,
+        explorer_peek_missing: false,
+    };
+    // Seed a window of results, as the server's push would.
+    assert!(s.picker.as_mut().unwrap().apply_update(window(
+        gen0,
+        vec![file("a.rs"), file("b.rs")],
+        2
+    )));
+
+    // Typing must NOT clear the window — the stale rows stay on screen (no empty flash) until the
+    // fresh push replaces them. A new query is in flight (ticking) and re-filters via picker/query.
+    let fx = s.picker_set_query("a".into());
+    let p = s.picker.as_ref().unwrap();
+    assert_eq!(
+        p.items.len(),
+        2,
+        "the previous query's window is kept until the new one arrives"
+    );
+    assert!(p.ticking, "the picker shows it is searching");
+    assert_eq!(p.offset, 0);
+    let gen1 = p.generation;
+    assert!(
+        gen1 > gen0,
+        "the generation bumped to invalidate stale pushes"
+    );
+    assert!(find_request(&fx, "picker/query").is_some());
+
+    // The fresh push (new generation, offset 0) replaces the window atomically.
+    assert!(s
+        .picker
+        .as_mut()
+        .unwrap()
+        .apply_update(window(gen1, vec![file("a.rs")], 1)));
+    assert_eq!(s.picker.as_ref().unwrap().items.len(), 1);
+}
+
+#[test]
 fn chip_editor_is_value_synced_not_keycode_edited() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();

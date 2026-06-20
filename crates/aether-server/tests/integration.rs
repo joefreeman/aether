@@ -8902,6 +8902,54 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
     drop(server);
 }
 
+/// A query change restarts the result list at the top: the pushed window is at offset 0 even when
+/// the picker was scrolled down. The client resets its own offset to 0 on a keystroke, so a window
+/// pushed at the old offset would be rejected (offset-mismatch guard) and leave stale rows on
+/// screen. Resetting server-side keeps the two aligned so the fresh window lands.
+#[tokio::test]
+async fn picker_query_restarts_the_window_at_the_top() {
+    let (server, mut ws) = setup_picker_workspace().await;
+    // Subscribe a window scrolled down to offset 2.
+    let view = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 2,
+            limit: 2,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    assert_eq!(view.effective_offset, 2);
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await; // drain the view's own push
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Files,
+            query: "r".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(
+        update.offset, 0,
+        "a query change windows from the top, not the prior scroll offset"
+    );
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn git_changes_picker_lists_hunks_grouped_by_file() {
     use aether_protocol::viewport::DiffStage;
@@ -12217,6 +12265,70 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
     assert!(sel_path.ends_with("src/lib.rs"));
     assert_eq!(sel_pos.line, 0);
     assert_eq!(sel_pos.col, 3);
+
+    drop(server);
+}
+
+/// A grep query's initial push is a count-only tick (`items: None`), not an empty window. That
+/// keeps the previous query's results on screen while the new search spawns, so typing doesn't
+/// flash the list empty every keystroke. The streaming batches + completion push (always
+/// `Some(...)`) then replace them.
+#[tokio::test]
+async fn picker_grep_query_initial_push_keeps_the_window() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await; // the view's own push
+
+    // Send the query raw (not via `send_request`, which discards notifications while awaiting the
+    // response — and the initial push races ahead of it) so we can inspect the first push.
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id: 11,
+        method: PickerQuery::NAME.into(),
+        params: Some(
+            serde_json::to_value(&PickerQueryParams {
+                filters: Default::default(),
+                kind: PickerKind::Grep,
+                query: "needle".into(),
+                generation: 1,
+            })
+            .unwrap(),
+        ),
+    };
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+
+    // The first push after the query is the synchronous initial tick (sent before the worker runs).
+    let initial = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(initial.generation, 1);
+    assert!(initial.ticking, "the search is in flight");
+    assert!(
+        initial.items.is_none(),
+        "a count-only tick keeps the client's window rather than blanking it; got {:?}",
+        initial.items
+    );
+
+    // The search still completes normally, replacing the window with the real hits.
+    let final_update = drain_grep_until_done(&mut ws).await;
+    assert_eq!(final_update.total_matches, 3);
+    assert!(final_update.items.is_some());
 
     drop(server);
 }

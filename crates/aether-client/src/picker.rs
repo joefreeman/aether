@@ -424,19 +424,29 @@ impl PickerState {
         }
         // `None` is a throttled count-only tick (streaming grep): keep the current window, update
         // the counts. `Some` replaces it (an empty vec is a genuinely empty result set).
+        let has_items = u.items.is_some();
         if let Some(items) = u.items {
             self.items = items;
         }
-        self.total_matches = u.total_matches;
-        self.total_candidates = u.total_candidates;
+        // Adopt the push's counts + display geometry from a real window (`Some`) or a count tick
+        // that's reporting actual progress (`total_matches > 0`). A count-only tick reporting
+        // *nothing yet* (`items: None`, `total_matches == 0`) is the "search just started — keep
+        // the previous window" signal the server sends on a grep/async query change: adopting its
+        // zeros would collapse the geometry the shells size the viewport from (`total_display_rows`
+        // → the iced list height, the web spacer, the TUI scrollbar) and flash the kept rows away
+        // for a frame. Keep the prior counts until the first real batch (or a non-zero tick) lands.
+        if has_items || u.total_matches > 0 {
+            self.total_matches = u.total_matches;
+            self.total_candidates = u.total_candidates;
+            self.display_offset = u.grep_display_offset.unwrap_or(u.offset);
+            self.total_display_rows = u.grep_total_display_rows.unwrap_or(u.total_matches);
+        }
         self.ticking = u.ticking;
         self.explorer_peek_missing = u.explorer_peek_missing;
         // Advance the throbber each applied push while a search is still running.
         if u.ticking {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
         }
-        self.display_offset = u.grep_display_offset.unwrap_or(u.offset);
-        self.total_display_rows = u.grep_total_display_rows.unwrap_or(u.total_matches);
         if let Some(center) = self.pending_center.take() {
             let key = item_key(&center);
             if let Some(pos) = self.items.iter().position(|i| item_key(i) == key) {

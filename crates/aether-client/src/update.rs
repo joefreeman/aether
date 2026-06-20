@@ -1771,14 +1771,16 @@ impl Session {
         p.generation += 1;
         p.selected = 0;
         p.offset = 0;
-        // Clear the stale window now; the fresh one rides `picker/query`'s own `picker/update`
-        // push (the picker is already subscribed from open, so the server pushes the new window to
-        // it). We deliberately do NOT also send a `picker/view` here: it's a redundant round-trip,
-        // and its response carries a point-in-time window *snapshot* that races the streaming-grep
-        // push — an empty snapshot landing after the push would blank the results until the next
-        // keystroke. One request, one source of truth (the push). `picker/view` is still used where
-        // it's the authority: open/resume and scroll (offset changes).
-        p.items.clear();
+        // We deliberately keep the *previous* query's window on screen until the fresh one arrives,
+        // rather than clearing it now — clearing flashes an empty list on every keystroke (the new
+        // window rides `picker/query`'s own `picker/update` push, a round-trip away). For the
+        // synchronous kinds (files/buffers/symbols/diagnostics/explorer) the server reranks and
+        // pushes the real window in one shot, so the stale rows are replaced atomically (same
+        // generation, offset 0 — the server resets its window to match) with no blank in between.
+        // (Streaming grep still clears to its own first push; that's the "Searching…" path.)
+        // We also don't send a `picker/view` here — its point-in-time snapshot races the streaming
+        // grep push and an empty one would blank the list. One request, one source of truth.
+        //
         // A new query is in flight: mark the picker as searching now, before the first
         // `picker/update` push arrives, so the shell can show progress in the gap (otherwise a slow
         // grep reads as "no matches" until results stream). The server's pushes refine it from here.

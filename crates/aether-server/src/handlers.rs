@@ -10342,12 +10342,11 @@ pub async fn picker_query(
         _ => picker.rerank(matcher),
     }
 
-    // After a query change, the prior `offset` may now be past the end of the result set. Clamp.
+    // A new query restarts the result list at the top: the client resets its offset + selection to
+    // 0, so window from 0 to match (the prior offset is meaningless against the new ranking, and a
+    // mismatched offset would make the client reject the push and keep showing stale rows).
     if let Some(window) = picker.subscribed.as_mut() {
-        let total = picker.ranked.len() as u32;
-        if window.offset >= total {
-            window.offset = total.saturating_sub(window.limit);
-        }
+        window.offset = 0;
     }
 
     // References / DocumentSymbols whose async resolve is still outstanding: a filter typed mid-load
@@ -10363,7 +10362,11 @@ pub async fn picker_query(
         && !grep_cache_hit;
     // Mark the initial push as ticking when we're about to spawn the search. Without this the
     // client would briefly see "0 hits, search finished" between sending the query and the
-    // coordinator's first batch landing.
+    // coordinator's first batch landing. Send it as a count-only tick (`items: None`) too: the
+    // results for this query aren't ready (grep just cleared its candidates / the async resolve is
+    // still outstanding), so an `items: Some([])` here would blank the previous query's window on
+    // every keystroke. `None` keeps it on screen until the first real batch — or the completion
+    // push (always `Some(...)` from `build_update`) — replaces it. No stale rows can get stuck.
     if will_spawn_grep_search
         || (matches!(
             params.kind,
@@ -10372,6 +10375,7 @@ pub async fn picker_query(
     {
         if let Some(ref mut u) = update {
             u.ticking = true;
+            u.items = None;
         }
     }
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
