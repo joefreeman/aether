@@ -396,6 +396,107 @@ async fn buffer_open_restores_cursor_and_scroll() {
     drop(server);
 }
 
+/// Scrolling via `viewport/scroll_to_row` (the row-based path nearly every wheel/page scroll takes,
+/// as the client refetches near the loaded edge) must also be restored on reopen — not just the
+/// logical-line `viewport/scroll`. Regression: `scroll_to_row` updated the viewport but forgot the
+/// restore map, so switching back to a buffer jumped to where it was first opened.
+#[tokio::test]
+async fn buffer_open_restores_scroll_from_scroll_to_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.txt");
+    let mut content = String::new();
+    for i in 0..60 {
+        content.push_str(&format!("line {i}\n"));
+    }
+    std::fs::write(&path, &content).unwrap();
+
+    let server = spawn_for_test("scroll-row-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "scroll-row-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Scroll by visual row (no wrap → visual row 20 == logical line 20).
+    let _: ViewportWindowResult = send_request::<ViewportScrollToRow>(
+        &mut ws,
+        4,
+        &ViewportScrollToRowParams {
+            viewport_id: sub.viewport_id,
+            top_visual_row: 20,
+        },
+    )
+    .await;
+
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        5,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(reopen.buffer_id, buffer_id);
+    let scroll = reopen.scroll.expect("scroll restored on reopen");
+    assert_eq!(
+        scroll.logical_line, 20,
+        "a row-based scroll is restored on reopen, not just logical-line scrolls"
+    );
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn buffer_open_jump_drops_saved_scroll() {
     // A `jump_to` open (grep `<`/`>`, goto-definition, nav history) moves the cursor, so the

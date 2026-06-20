@@ -4424,6 +4424,16 @@ pub async fn viewport_scroll_to_row(
     vp.scroll_sub_row = 0.0;
     vp.first_logical_line = first;
     vp.last_logical_line_exclusive = last_excl;
+    // Persist the new top so a buffer switch restores it — mirrors `viewport_scroll`. Without this
+    // the restore map only ever held the initial subscribe position, so switching back to a buffer
+    // jumped to where it was first opened rather than where it was left.
+    s.last_scroll.insert(
+        (client_id, buffer_id),
+        ScrollPosition {
+            logical_line: top_line,
+            sub_row: 0.0,
+        },
+    );
     Ok(ViewportWindowResult { window })
 }
 
