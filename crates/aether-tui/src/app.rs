@@ -27,13 +27,12 @@ pub enum EditorMode {
     Search,
 }
 
-/// Multi-key prefixes the next keystroke completes: `Space` (the picker / app chords) and `Tab`
-/// (the reveal chords). Drives the underline cursor that signals "waiting for one more key"; the
-/// actual second-key dispatch lives in the core.
+/// Multi-key prefix the next keystroke completes: `Space` (the picker / app chords). Drives the
+/// underline cursor that signals "waiting for one more key"; the actual second-key dispatch lives
+/// in the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingLeader {
     Space,
-    Tab,
 }
 
 /// Captured state for a pending `f`/`t` keystroke — the next char the user types becomes the

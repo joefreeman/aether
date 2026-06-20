@@ -276,7 +276,6 @@ fn pending(p: &Pending) -> Value {
     match p {
         Pending::None => Value::Null,
         Pending::Leader => json!({ "kind": "leader" }),
-        Pending::Reveal => json!({ "kind": "reveal" }),
         Pending::Find {
             dir,
             till,

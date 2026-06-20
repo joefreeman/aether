@@ -1351,7 +1351,6 @@ impl Shell {
         st.conn = s.conn;
         st.pending_leader = match s.pending {
             Pending::Leader => Some(PendingLeader::Space),
-            Pending::Reveal => Some(PendingLeader::Tab),
             _ => None,
         };
         st.lsp_status = match (&s.lsp, &s.buffer.lsp_server) {

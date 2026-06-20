@@ -25,8 +25,8 @@ buffer, see each other's cursors, and share a single undo stack.
 ## Keybindings
 
 Type `Space ?` for the in-app overlay. Holding the Shift key extends the selection (e.g., `Shift-w`); a leading
-**count** repeats a motion (e.g., `3w`). There are two leader keys: `Space` for app/file/git/code commands, and
-`Tab` for revealing information at the cursor.
+**count** repeats a motion (e.g., `3w`). `Space` is the leader for app/file/git/code commands, and `Tab` reveals
+hover info at the cursor.
 
 ### Motions (normal mode)
 
@@ -106,14 +106,6 @@ identical in both.
 | `Alt-i`/`Alt-a` | Insert at first non-blank of line/last line end |
 | `Esc` | Leave insert mode |
 
-### Reveal (`Tab` leader)
-
-| Chord | Action |
-| --- | --- |
-| `Tab h` | Hover (type & docs) |
-| `Tab d` | Diagnostic at cursor |
-| `Tab c` | Blame commit details for the cursor line |
-
 ### Application
 
 | Chord | Action |
@@ -139,14 +131,17 @@ identical in both.
 | `c`/`Alt-c` | Next/previous change (hunk) |
 | `Space y`/`Space Alt-y` | Stage-unstage / revert the change under the cursor (or selected lines) |
 | `Space i` | Toggle inline diff |
+| `Space m` | Blame commit details for the cursor line |
 
 ### Code / LSP
 
 | Chord | Action |
 | --- | --- |
+| `Tab` | Hover (type & docs) |
 | `Enter` | Go to definition |
 | `Space r` | Go to references |
 | `d`/`Alt-d` | Next/previous diagnostic |
+| `Space j` | Diagnostic at cursor |
 | `Space d` | Diagnostics list |
 | `Space o` | Document symbols |
 | `Space l` | LSP servers (status, restart) |

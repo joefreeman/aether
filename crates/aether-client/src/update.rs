@@ -1441,7 +1441,7 @@ impl Session {
         )))
     }
 
-    /// `Space y` — blame the cursor line and resolve the commit's details, one round-trip
+    /// `Space m` — blame the cursor line and resolve the commit's details, one round-trip
     /// (`include_commit_info`, docs/protocol-composites.md, G).
     pub fn show_commit_info(&mut self) -> Effects {
         self.request_str::<GitBlameLine>(
@@ -4241,13 +4241,6 @@ impl Session {
                 }
                 return Effects::none();
             }
-            Pending::Reveal => {
-                self.pending = Pending::None;
-                if let Some(b) = lookup(KeyContext::Reveal, code, mods) {
-                    return self.run_action(b.action, 1, mods.shift, visible_rows);
-                }
-                return Effects::none();
-            }
             Pending::None => {}
         }
 
@@ -4550,10 +4543,6 @@ impl Session {
             }
             A::BeginLeader => {
                 self.pending = Pending::Leader;
-                Effects::none()
-            }
-            A::BeginReveal => {
-                self.pending = Pending::Reveal;
                 Effects::none()
             }
 

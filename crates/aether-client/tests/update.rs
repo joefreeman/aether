@@ -1626,15 +1626,36 @@ fn toggle_wrap_flips_between_soft_and_none() {
 }
 
 #[test]
-fn tab_reveal_chord_triggers_hover() {
+fn tab_triggers_hover() {
     let mut s = session();
-    // Tab arms the reveal leader (no effects yet)...
-    let armed = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
-    assert!(armed.0.is_empty(), "arming the reveal leader emits nothing");
-    // ...then `h` dispatches Hover, firing the LSP hover RPC.
-    let fx = s.on_key(KeyCode::Char('h'), Mods::NONE, Some("h".to_string()), ROWS);
+    // Tab fires Hover directly — no leader chord.
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "lsp/hover");
+}
+
+#[test]
+fn space_j_shows_diagnostic_at_cursor() {
+    // Space j → diagnostic at cursor. With no diagnostics loaded it reports "none" via a toast
+    // (resolved locally — no RPC), which still proves the chord reaches `show_diagnostic`.
+    let mut s = session();
+    let _ = key(&mut s, ' '); // leader
+    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, Some("j".to_string()), ROWS);
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Info))),
+        "Space j with no diagnostics toasts an info message"
+    );
+}
+
+#[test]
+fn space_m_shows_blame_commit() {
+    // Space m → blame the cursor line (round-trip resolves the commit's details).
+    let mut s = session();
+    let _ = key(&mut s, ' '); // leader
+    let fx = s.on_key(KeyCode::Char('m'), Mods::NONE, Some("m".to_string()), ROWS);
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "git/blame_line");
 }
 
 // ---- application settings (Space .) -----------------------------------------------------------
