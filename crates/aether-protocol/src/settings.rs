@@ -19,16 +19,26 @@ pub struct AppSettings {
     /// the app-settings overlay toggles it.
     #[serde(default = "default_wrap")]
     pub wrap: WrapMode,
+    /// Coding ligatures in the editor font (the bundled Fira Code). Purely a client-side render
+    /// choice — the native client toggles its shaping, the web client toggles the `calt`/`liga`
+    /// font features. The server stores it but doesn't act on it.
+    #[serde(default = "default_ligatures")]
+    pub ligatures: bool,
 }
 
 fn default_wrap() -> WrapMode {
     WrapMode::Soft
 }
 
+fn default_ligatures() -> bool {
+    true
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             wrap: default_wrap(),
+            ligatures: default_ligatures(),
         }
     }
 }

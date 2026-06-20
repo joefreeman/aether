@@ -2007,6 +2007,7 @@ fn app_settings_loaded_applies_persisted_wrap_only_when_it_differs() {
     let mut s = session();
     let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
         wrap: WrapMode::None,
+        ligatures: true,
     })));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
     assert!(fx
@@ -2018,8 +2019,41 @@ fn app_settings_loaded_applies_persisted_wrap_only_when_it_differs() {
     let mut s = session();
     let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
         wrap: WrapMode::Soft,
+        ligatures: true,
     })));
     assert!(fx.0.is_empty(), "matching wrap is a no-op");
+}
+
+#[test]
+fn app_settings_apply_and_toggle_ligatures() {
+    use aether_client::update::Event;
+    use aether_protocol::settings::AppSettings;
+    use aether_protocol::viewport::WrapMode;
+
+    // Ligatures default on; a persisted `false` is adopted with no reflow effect (it's render-only).
+    let mut s = session();
+    assert!(s.ligatures);
+    let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
+        wrap: WrapMode::Soft,
+        ligatures: false,
+    })));
+    assert!(!s.ligatures, "persisted ligatures value is adopted");
+    assert!(
+        fx.0.is_empty(),
+        "ligatures is render-only — no reflow/shell action"
+    );
+
+    // Toggling the Ligatures row flips the value and persists it via settings/set.
+    let _ = s.open_app_settings(); // the overlay must be open for a toggle to register
+    let rows = s.app_setting_rows();
+    let idx = rows
+        .iter()
+        .position(|r| matches!(r.id, aether_client::session::AppSettingId::Ligatures))
+        .expect("a Ligatures row");
+    let fx = s.app_settings_toggle(idx);
+    assert!(s.ligatures, "toggle flips it back on");
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["ligatures"], json!(true));
 }
 
 // ---- project creation + settings (docs: project creation + project settings) -----------------

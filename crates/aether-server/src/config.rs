@@ -473,11 +473,13 @@ mod tests {
             &path,
             &AppSettings {
                 wrap: WrapMode::None,
+                ligatures: false,
             },
         )
         .unwrap();
         let s = load_app_settings_at(&path).unwrap();
         assert_eq!(s.wrap, WrapMode::None);
+        assert!(!s.ligatures);
     }
 
     #[test]

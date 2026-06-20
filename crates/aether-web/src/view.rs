@@ -39,6 +39,7 @@ pub fn build_view(s: &Session) -> Value {
         "window": s.window.as_ref().map(jv),
         "wrap": jv(&s.wrap),
         "diff_view": s.diff_view,
+        "ligatures": s.ligatures,
         "diagnostics": jv(&s.diagnostics),
         "lsp": s.lsp.as_ref().map(jv),
         "externally_modified": s.externally_modified,

@@ -59,6 +59,14 @@ html, body, #app {
   font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
+/* Bundled editor font (the chrome above stays on the system monospace). */
+@font-face {
+  font-family: "Fira Code";
+  src: url("./fonts/FiraCode-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+
 #buffer {
   flex: 1 1 auto;
   overflow-y: auto; /* native vertical scrolling over the full-height spacer (virtual scroll) */
@@ -68,7 +76,12 @@ html, body, #app {
   position: relative;
   user-select: none; /* the editor draws its own selection; suppress native text selection on drag */
   cursor: text;
+  /* Code-only Fira Code; falls back to the inherited system monospace. Coding ligatures ride
+     `calt`/`liga` — on by default, switched off by `.ligatures-off` (the `ligatures` app setting). */
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-feature-settings: "liga" 1, "calt" 1;
 }
+#buffer.ligatures-off { font-feature-settings: "liga" 0, "calt" 0; }
 #buffer.hscroll { overflow-x: auto; } /* native horizontal scroll when word wrap is off */
 /* Keep horizontal overscroll inside the buffer — never chain to the browser's back/forward swipe. */
 #buffer { overscroll-behavior-x: contain; }

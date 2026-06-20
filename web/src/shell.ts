@@ -314,6 +314,7 @@ interface CoreView {
   mode: "normal" | "insert" | "search";
   wrap: WrapMode;
   diff_view: boolean;
+  ligatures: boolean;
   window: BufferWindow | null;
   viewport_id: number | null;
   buffer: {
@@ -2061,6 +2062,8 @@ export class Shell {
     if (!v.window) return;
     this.maybeBlame(v); // fire-and-forget; updates the core + re-renders when the label lands
     this.bufferEl.classList.toggle("hscroll", v.wrap === "none");
+    // Coding ligatures: the `ligatures` app setting flips the Fira Code `calt`/`liga` features.
+    this.bufferEl.classList.toggle("ligatures-off", !v.ligatures);
     renderBuffer(this.bufferEl, {
       window: v.window,
       cursor: v.buffer.cursor,

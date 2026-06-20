@@ -244,6 +244,7 @@ pub struct AppSettingsOverlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppSettingId {
     SoftWrap,
+    Ligatures,
 }
 
 /// One checkbox row of the application-settings overlay: its identity, label, current on/off state,
@@ -391,6 +392,10 @@ pub struct Session {
     pub viewport_id: Option<ViewportId>,
     pub window: Option<Window>,
     pub wrap: WrapMode,
+    /// Coding ligatures in the editor font — an app-wide setting (`Space .`), seeded from
+    /// `settings/get` at boot. The shells read it each render to pick their text shaping
+    /// (native) / font feature (web); the core just holds the value.
+    pub ligatures: bool,
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
@@ -438,6 +443,7 @@ impl Session {
             viewport_id: None,
             window: None,
             wrap: WrapMode::Soft,
+            ligatures: true,
             diff_view: false,
             diagnostics: DiagnosticCounts::default(),
             lsp: None,
@@ -462,12 +468,20 @@ impl Session {
     pub fn app_setting_groups(&self) -> Vec<AppSettingGroup> {
         vec![AppSettingGroup {
             title: "View",
-            rows: vec![AppSettingRow {
-                id: AppSettingId::SoftWrap,
-                label: "Soft wrap",
-                value: self.wrap == WrapMode::Soft,
-                hint: "Wrap long lines to the viewport width",
-            }],
+            rows: vec![
+                AppSettingRow {
+                    id: AppSettingId::SoftWrap,
+                    label: "Soft wrap",
+                    value: self.wrap == WrapMode::Soft,
+                    hint: "Wrap long lines to the viewport width",
+                },
+                AppSettingRow {
+                    id: AppSettingId::Ligatures,
+                    label: "Ligatures",
+                    value: self.ligatures,
+                    hint: "Coding ligatures in the editor font (→, ≠, ⇒, …)",
+                },
+            ],
         }]
     }
 

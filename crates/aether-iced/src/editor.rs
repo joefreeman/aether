@@ -18,7 +18,7 @@ use aether_protocol::LogicalPosition;
 use iced::advanced::widget::{tree, Tree};
 use iced::advanced::{layout, mouse, renderer, text, Clipboard, Layout, Shell, Widget};
 use iced::keyboard;
-use iced::{Color, Element, Event, Length, Point, Rectangle, Size};
+use iced::{Color, Element, Event, Font, Length, Point, Rectangle, Size};
 
 /// Breathing room above the first line / below the last, in px (web client's `BUFFER_PAD`).
 pub const PAD: f32 = 8.0;
@@ -31,6 +31,12 @@ const SCROLLBAR_W: f32 = 5.0;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
 const CONTINUATION_MARKER: &str = "↪ ";
+
+/// The editor's text font — the bundled Fira Code (registered in `Settings.fonts`). Coding
+/// ligatures are toggled by the *shaping* mode the code-text runs use ([`text::Shaping::Advanced`]
+/// forms them, [`text::Shaping::Basic`] doesn't), keeping the same monospace metrics either way, so
+/// the cell grid never shifts. The UI chrome stays on `Font::MONOSPACE`.
+const EDITOR_FONT: Font = Font::with_name("Fira Code");
 
 /// Line height for buffer text — the web client's `14px/1.4`; the measured cell height (and
 /// therefore every row) includes this spacing.
@@ -53,6 +59,9 @@ pub struct Content<'a> {
     /// Cursor-line blame, drawn as dim virtual text after the line: `(line, "author · age")`.
     pub blame: Option<(u32, &'a str)>,
     pub tab_width: u32,
+    /// Coding ligatures on: code-text runs shape with [`text::Shaping::Advanced`] (forming `=>`,
+    /// `!=`, … from the Fira Code font); off uses `Basic` (no ligatures, same metrics).
+    pub ligatures: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +137,9 @@ struct State {
 
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer> for EditorView<'a, Message>
 where
-    Renderer: text::Renderer,
+    // The editor draws with the bundled Fira Code (`EDITOR_FONT: iced::Font`), so the renderer's
+    // font type must be `iced::Font` — true for the app's real renderer.
+    Renderer: text::Renderer<Font = Font>,
     // The editor draws its own scrollbar but styles it from the theme's scrollable catalog, so
     // it matches the picker/popover scrollbars (same source of truth) including hover/drag.
     Theme: iced::widget::scrollable::Catalog,
@@ -331,6 +342,13 @@ where
         let (sel_min, sel_max) = selection_endpoints(&self.content.cursor);
         let draw_selection = !self.content.cursor.is_point();
         let scroll_x = self.content.scroll_x_px;
+        // Code text shapes with ligatures on (`Advanced`) or off (`Basic`); markers/glyphs always
+        // use `draw_run` (Advanced). Same Fira Code metrics either way, so the grid is unaffected.
+        let text_shaping = if self.content.ligatures {
+            text::Shaping::Advanced
+        } else {
+            text::Shaping::Basic
+        };
         let text_x = |dcol: u32| bounds.x + (GUTTER_COLS + dcol) as f32 * cell.width - scroll_x;
         // Under horizontal scroll, content quads/text must not bleed over the gutter column.
         let content_left = bounds.x + GUTTER_COLS as f32 * cell.width;
@@ -389,13 +407,14 @@ where
                 let text = v
                     .text
                     .replace('\t', &" ".repeat(self.content.tab_width as usize));
-                draw_run(
+                draw_text_run(
                     renderer,
                     text,
                     Point::new(text_x(0), y),
                     cell,
                     fg,
                     content_clip,
+                    text_shaping,
                 );
             }
 
@@ -576,13 +595,14 @@ where
                     if hit && color == theme::NORD3 {
                         color = theme::NORD4;
                     }
-                    draw_run(
+                    draw_text_run(
                         renderer,
                         std::mem::take(run),
                         Point::new(text_x(start), y),
                         cell,
                         color,
                         content_clip,
+                        text_shaping,
                     );
                 };
                 // Byte offset where the row's trailing whitespace run begins (row end if none) —
@@ -954,7 +974,7 @@ impl<'a, Message> EditorView<'a, Message> {
 impl<'a, Message: 'a, Theme: 'a, Renderer> From<EditorView<'a, Message>>
     for Element<'a, Message, Theme, Renderer>
 where
-    Renderer: text::Renderer + 'a,
+    Renderer: text::Renderer<Font = Font> + 'a,
     Theme: iced::widget::scrollable::Catalog,
 {
     fn from(editor: EditorView<'a, Message>) -> Self {
@@ -962,14 +982,14 @@ where
     }
 }
 
-fn measure_cell<Renderer: text::Renderer>(renderer: &Renderer) -> Size {
+fn measure_cell<Renderer: text::Renderer<Font = Font>>(renderer: &Renderer) -> Size {
     use iced::advanced::text::Paragraph as _;
     let paragraph = Renderer::Paragraph::with_text(text::Text {
         content: "M",
         bounds: Size::INFINITE,
         size: renderer.default_size(),
         line_height: EDITOR_LINE_HEIGHT,
-        font: renderer.default_font(),
+        font: EDITOR_FONT,
         align_x: text::Alignment::Left,
         align_y: iced::alignment::Vertical::Top,
         shaping: text::Shaping::Advanced,
@@ -1056,13 +1076,16 @@ fn diagnostic_at(line: &LogicalLineRender, col: u32) -> Option<DiagnosticSeverit
         .max_by_key(|s| severity_rank(*s))
 }
 
-fn draw_run<Renderer: text::Renderer>(
+/// Draw a run of editor text with an explicit shaping mode. Code-text runs pass the ligature-driven
+/// shaping (`Advanced` forms ligatures, `Basic` doesn't); single-glyph markers use [`draw_run`].
+fn draw_text_run<Renderer: text::Renderer<Font = Font>>(
     renderer: &mut Renderer,
     content: String,
     position: Point,
     cell: Size,
     color: Color,
     clip: Rectangle,
+    shaping: text::Shaping,
 ) {
     renderer.fill_text(
         text::Text {
@@ -1070,15 +1093,36 @@ fn draw_run<Renderer: text::Renderer>(
             bounds: Size::new(f32::INFINITY, cell.height),
             size: renderer.default_size(),
             line_height: EDITOR_LINE_HEIGHT,
-            font: renderer.default_font(),
+            font: EDITOR_FONT,
             align_x: text::Alignment::Left,
             align_y: iced::alignment::Vertical::Top,
-            shaping: text::Shaping::Advanced,
+            shaping,
             wrapping: text::Wrapping::None,
         },
         position,
         color,
         clip,
+    );
+}
+
+/// Draw a run that doesn't need ligature control (continuation markers, whitespace glyphs, blame) —
+/// always fully shaped.
+fn draw_run<Renderer: text::Renderer<Font = Font>>(
+    renderer: &mut Renderer,
+    content: String,
+    position: Point,
+    cell: Size,
+    color: Color,
+    clip: Rectangle,
+) {
+    draw_text_run(
+        renderer,
+        content,
+        position,
+        cell,
+        color,
+        clip,
+        text::Shaping::Advanced,
     );
 }
 

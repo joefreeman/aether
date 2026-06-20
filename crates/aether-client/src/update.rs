@@ -3858,6 +3858,10 @@ impl Session {
     /// the existing wrap reflow path (anchor + `ToggleWrap`) lands on it; a matching value is a no-op.
     /// The shell ignores `ToggleWrap` until it has a viewport, so this is safe even at boot.
     fn apply_app_settings(&mut self, settings: AppSettings) -> Effects {
+        // Ligatures is a pure client-side render choice: the shells read `self.ligatures` each frame
+        // (native = text shaping, web = font feature), so adopting the value is enough — the
+        // re-render after this event applies it. No reflow / round-trip like wrap needs.
+        self.ligatures = settings.ligatures;
         if settings.wrap != self.wrap {
             let mut fx = Effects::one(Effect::SaveContentAnchor);
             fx.push(Effect::ShellAction(Action::ToggleWrap));
@@ -3885,12 +3889,27 @@ impl Session {
                     WrapMode::None => WrapMode::Soft,
                 };
                 let mut fx = self.request_str::<SettingsSet>(
-                    AppSettings { wrap: new_wrap },
+                    AppSettings {
+                        wrap: new_wrap,
+                        ligatures: self.ligatures,
+                    },
                     Event::AppSettingsSaved,
                 );
                 fx.push(Effect::SaveContentAnchor);
                 fx.push(Effect::ShellAction(Action::ToggleWrap));
                 fx
+            }
+            // Ligatures is shell-render-only: flip the value + persist; the re-render after this
+            // event applies it (native swaps text shaping, web toggles the font feature). No reflow.
+            AppSettingId::Ligatures => {
+                self.ligatures = !self.ligatures;
+                self.request_str::<SettingsSet>(
+                    AppSettings {
+                        wrap: self.wrap,
+                        ligatures: self.ligatures,
+                    },
+                    Event::AppSettingsSaved,
+                )
             }
         }
     }
