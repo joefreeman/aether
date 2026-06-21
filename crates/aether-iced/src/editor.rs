@@ -499,16 +499,24 @@ where
                     .filter(|m| !(self.content.diff_view && *m == DiffMarker::Deleted));
                 if let Some(marker) = gutter_marker {
                     let color = gutter_color(marker, line.diff_stage);
-                    fill(
-                        renderer,
-                        Rectangle {
-                            x: bounds.x,
-                            y,
-                            width: cell.width * 0.5,
-                            height: cell.height,
-                        },
-                        color,
-                    );
+                    if marker == DiffMarker::Deleted {
+                        // A pure deletion sits *between* this surviving line and the one above,
+                        // so mark it with a small triangle straddling this line's top boundary
+                        // rather than a full-height bar — a bar reads as "this line changed",
+                        // which it didn't. Mirrors the web's `.gutter.deleted::before`.
+                        fill_triangle_right(renderer, bounds.x, y, color);
+                    } else {
+                        fill(
+                            renderer,
+                            Rectangle {
+                                x: bounds.x,
+                                y,
+                                width: cell.width * 0.5,
+                                height: cell.height,
+                            },
+                            color,
+                        );
+                    }
                 }
 
                 // Selection: the saturated NORD10 blue, over the NORD3 search-hit fill
@@ -1052,6 +1060,41 @@ fn fill_wavy<Renderer: renderer::Renderer>(
             fill(renderer, r, color);
         }
         dx += 1.0;
+    }
+}
+
+/// A small right-pointing triangle, its vertical base flush against the gutter's left edge and its
+/// tip pointing toward the text — the web client's `.gutter.deleted::before`. Marks a pure deletion
+/// when the diff view is off: the removed lines sit "between" this line and the one above, so the
+/// marker centres on the line's top boundary (`mid_y`) instead of filling the surviving line. The
+/// renderer only fills axis-aligned rects, so build the taper from a stack of 1px rows.
+fn fill_triangle_right<Renderer: renderer::Renderer>(
+    renderer: &mut Renderer,
+    x: f32,
+    mid_y: f32,
+    color: Color,
+) {
+    const W: f32 = 6.0; // tip distance from the base (web's `border-left` width)
+    const H: f32 = 8.0; // base height (web's `border-top` + `border-bottom`)
+    let half = H / 2.0;
+    let mut dy = -half;
+    while dy < half {
+        // Width tapers linearly from W at the centre to 0 at the top/bottom tips; sample at the
+        // row's midpoint so the taper stays symmetric about `mid_y`.
+        let w = W * (1.0 - ((dy + 0.5).abs() / half)).max(0.0);
+        if w > 0.0 {
+            fill(
+                renderer,
+                Rectangle {
+                    x,
+                    y: mid_y + dy,
+                    width: w,
+                    height: 1.0,
+                },
+                color,
+            );
+        }
+        dy += 1.0;
     }
 }
 
