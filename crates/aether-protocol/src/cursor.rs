@@ -106,10 +106,15 @@ pub enum Motion {
     /// same flat list (document order) the `Space o` picker shows, landing on the symbol's name.
     /// A plain linear walk: nesting doesn't gate it (it freely crosses in and out of containers),
     /// resolved by `cursor::resolve_navigation_motion`. LSP-only — a no-op when the outline hasn't
-    /// loaded or the buffer has no language server.
-    NextNavigationUnit,
-    /// Mirror of [`NextNavigationUnit`] — step to the previous symbol before the cursor.
-    PrevNavigationUnit,
+    /// loaded or the buffer has no language server. `count` walks that many symbols in one go,
+    /// stopping at the last one when the outline runs out before the count is met.
+    NextNavigationUnit {
+        count: u32,
+    },
+    /// Mirror of [`NextNavigationUnit`] — step `count` symbols back before the cursor.
+    PrevNavigationUnit {
+        count: u32,
+    },
     /// Jump to the last char of the smallest navigation unit containing the cursor. Paired
     /// with shift-extend on the TUI, this is "select to end of current function / element /
     /// rule set". No-op when the cursor isn't inside any navigation unit (e.g. on a blank

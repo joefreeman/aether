@@ -341,9 +341,11 @@ impl Action {
         matches!(self, Action::BeginFind { .. } | Action::BeginSurround(_))
     }
 
-    /// Whether `r`/`Shift-r` replays this action — the TUI's `is_repeatable`: every
-    /// cursor/selection motion (absolute ones included) plus the selection motions; never
-    /// edits, scroll, or the non-motion selection ops. (`SearchCycle` joins when search lands.)
+    /// Whether `.` replays this action: every cursor/selection motion (absolute ones included)
+    /// plus the selection motions and the cursor-jumping navigations (symbol / hunk / diagnostic
+    /// next-prev); never edits, scroll, or the non-motion selection ops. (`SearchCycle` joins when
+    /// search lands.) The hunk/diagnostic jumps re-key off the live cursor, so a repeat steps to
+    /// the next one each press.
     pub fn is_repeatable(&self) -> bool {
         matches!(
             self,
@@ -366,6 +368,10 @@ impl Action {
                 | Action::TreeExpand
                 | Action::TreeContract
                 | Action::SearchCycle(_)
+                | Action::NextHunk
+                | Action::PrevHunk
+                | Action::NextDiagnostic
+                | Action::PrevDiagnostic
         )
     }
 }
@@ -982,6 +988,12 @@ mod tests {
         assert!(Action::SelectLine(Direction::Forward).is_repeatable());
         assert!(Action::TreeExpand.is_repeatable());
         assert!(Action::GotoLine { last: false }.is_repeatable());
+        // The cursor-jumping navigations repeat too (symbol / hunk / diagnostic).
+        assert!(Action::NavUnit(Direction::Forward).is_repeatable());
+        assert!(Action::NextHunk.is_repeatable());
+        assert!(Action::PrevHunk.is_repeatable());
+        assert!(Action::NextDiagnostic.is_repeatable());
+        assert!(Action::PrevDiagnostic.is_repeatable());
         // Edits, scroll, nav history, and the find *arming* never repeat.
         assert!(!Action::DeleteSelection.is_repeatable());
         assert!(!Action::Scroll {

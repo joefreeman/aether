@@ -375,11 +375,25 @@ fn git_navigate_hunk_shapes() {
         buffer_id: 2,
         from_line: 10,
         direction: HunkDirection::Next,
+        count: 1,
     };
     let v = to_value(&p).unwrap();
+    // count == 1 is the default and stays off the wire.
     assert_eq!(
         v,
         json!({"buffer_id": 2, "from_line": 10, "direction": "next"})
+    );
+    // A larger count rides along.
+    let v3 = to_value(&GitNavigateHunkParams {
+        buffer_id: 2,
+        from_line: 10,
+        direction: HunkDirection::Next,
+        count: 3,
+    })
+    .unwrap();
+    assert_eq!(
+        v3,
+        json!({"buffer_id": 2, "from_line": 10, "direction": "next", "count": 3})
     );
     assert_eq!(GitNavigateHunk::NAME, "git/navigate_hunk");
 }

@@ -268,8 +268,8 @@ pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -
         // Navigation-unit motions (`o`) are resolved by `resolve_navigation_motion` against the
         // LSP document-symbol outline, never here — `resolve_motion` only sees them if the handler
         // routing changes, so keep them a no-op rather than reintroducing a tree-sitter walk.
-        Motion::NextNavigationUnit
-        | Motion::PrevNavigationUnit
+        Motion::NextNavigationUnit { .. }
+        | Motion::PrevNavigationUnit { .. }
         | Motion::EndOfNavigationUnit
         | Motion::StartOfNavigationUnit => current,
         Motion::FindChar {
@@ -939,17 +939,30 @@ pub fn resolve_navigation_motion(
         return unchanged;
     }
     match motion {
-        Motion::NextNavigationUnit | Motion::PrevNavigationUnit => {
+        Motion::NextNavigationUnit { count } | Motion::PrevNavigationUnit { count } => {
+            let forward = matches!(motion, Motion::NextNavigationUnit { .. });
             // Navigate relative to the *start* of the current selection, not the cursor: after a
             // previous `o` the cursor sits at the symbol's name end, so keying off the cursor would
-            // let `Alt-o` re-find the current symbol (whose own start precedes its end).
-            let from = ordered(position, anchor).0;
-            let target = if matches!(motion, Motion::NextNavigationUnit) {
-                next_symbol(symbols, from)
-            } else {
-                prev_symbol(symbols, from)
-            };
-            match target {
+            // let `Alt-o` re-find the current symbol (whose own start precedes its end). Each step
+            // re-keys off the symbol we just landed on, so a count walks the outline; if it runs
+            // out first we keep the last reachable symbol rather than snapping back.
+            let mut from = ordered(position, anchor).0;
+            let mut landed = None;
+            for _ in 0..(*count).max(1) {
+                let target = if forward {
+                    next_symbol(symbols, from)
+                } else {
+                    prev_symbol(symbols, from)
+                };
+                match target {
+                    Some(i) => {
+                        landed = Some(i);
+                        from = symbols[i].start;
+                    }
+                    None => break,
+                }
+            }
+            match landed {
                 // Select the identifier: anchor at the name start, cursor on its last char.
                 Some(i) => (symbols[i].end, Some(symbols[i].start)),
                 None => unchanged,
@@ -1139,10 +1152,10 @@ mod symbol_nav_tests {
         let o = outline();
         let buf = Buffer::scratch(1, None, 1); // Next/Prev don't touch the buffer
         let next = |pos, anchor| {
-            resolve_navigation_motion(&buf, &o, pos, anchor, &Motion::NextNavigationUnit)
+            resolve_navigation_motion(&buf, &o, pos, anchor, &Motion::NextNavigationUnit { count: 1 })
         };
         let prev = |pos, anchor| {
-            resolve_navigation_motion(&buf, &o, pos, anchor, &Motion::PrevNavigationUnit)
+            resolve_navigation_motion(&buf, &o, pos, anchor, &Motion::PrevNavigationUnit { count: 1 })
         };
         // `o` from the top (point cursor) lands the first reachable symbol's identifier
         // *selected*: anchor at its name start, cursor on its last char (`end`).
@@ -1158,6 +1171,30 @@ mod symbol_nav_tests {
         // No further unit → a no-op that *preserves* the current selection (doesn't collapse it).
         assert_eq!(next(o[5].end, o[5].start), (o[5].end, Some(o[5].start)));
         assert_eq!(prev(o[0].end, o[0].start), (o[0].end, Some(o[0].start)));
+    }
+
+    #[test]
+    fn next_and_prev_honour_count() {
+        let o = outline();
+        let buf = Buffer::scratch(1, None, 1);
+        let nav = |count, forward| {
+            let motion = if forward {
+                Motion::NextNavigationUnit { count }
+            } else {
+                Motion::PrevNavigationUnit { count }
+            };
+            resolve_navigation_motion(&buf, &o, at(0), at(0), &motion)
+        };
+        // From the top, count walks the outline: count 1 → idx 1, count 2 → idx 2, count 3 → idx 3.
+        assert_eq!(nav(1, true), (o[1].end, Some(o[1].start)));
+        assert_eq!(nav(2, true), (o[2].end, Some(o[2].start)));
+        assert_eq!(nav(3, true), (o[3].end, Some(o[3].start)));
+        // An over-large count clamps to the last reachable symbol rather than snapping back.
+        assert_eq!(nav(99, true), (o[5].end, Some(o[5].start)));
+        // count 0 behaves as 1 (the keymap never sends 0, but the resolver must stay total).
+        assert_eq!(nav(0, true), (o[1].end, Some(o[1].start)));
+        // From the top there's nothing before it, so Prev at any count is a no-op.
+        assert_eq!(nav(3, false), (at(0), Some(at(0))));
     }
 
     #[test]

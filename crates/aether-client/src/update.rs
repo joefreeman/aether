@@ -4357,10 +4357,10 @@ impl Session {
         visible_rows: u32,
     ) -> Effects {
         let task = self.dispatch_action(action, count, extend, visible_rows);
-        // Remember the action for `r`/`Shift-r` to replay. Recorded at dispatch (the TUI records
-        // after a successful await; here the RPC is still in flight — a failed motion leaves a
-        // harmless no-op target). `RepeatMotion` itself isn't repeatable, so it never overwrites
-        // the target with itself; find records its resolved motion at the capture site instead.
+        // Remember the action for `.` to replay. Recorded at dispatch (the RPC is still in flight —
+        // a failed motion just leaves a harmless no-op target). `RepeatMotion` itself isn't
+        // repeatable, so it never overwrites the target with itself; find records its resolved
+        // motion at the capture site instead.
         if action.is_repeatable() {
             self.last_repeat = Some(RepeatTarget::Action { action, count });
         }
@@ -4469,8 +4469,12 @@ impl Session {
                     extend,
                 )
             }
-            A::NavUnit(Direction::Forward) => self.move_motion(Motion::NextNavigationUnit, false),
-            A::NavUnit(Direction::Backward) => self.move_motion(Motion::PrevNavigationUnit, false),
+            A::NavUnit(Direction::Forward) => {
+                self.move_motion(Motion::NextNavigationUnit { count }, false)
+            }
+            A::NavUnit(Direction::Backward) => {
+                self.move_motion(Motion::PrevNavigationUnit { count }, false)
+            }
             A::NavUnitEdge { start: false } => self.move_motion(Motion::EndOfNavigationUnit, true),
             A::NavUnitEdge { start: true } => self.move_motion(Motion::StartOfNavigationUnit, true),
             A::BeginFind { dir, till } => {
@@ -4530,7 +4534,7 @@ impl Session {
             A::MotionUndo => self.motion_history::<CursorUndo>(count),
             A::MotionRedo => self.motion_history::<CursorRedo>(count),
             A::RepeatMotion => {
-                // `r`'s own count is how many times to replay; the stored target keeps the
+                // `.`'s own count is how many times to replay; the stored target keeps the
                 // original count baked in. The replayed requests enqueue in order at build
                 // time (the transport sends in call order), so the server applies them
                 // sequentially even though the result futures resolve independently.
@@ -4619,7 +4623,13 @@ impl Session {
                 buffer_id,
                 count: 1,
             }),
-            A::DeleteSelection => self.repeat_edit::<InputDelete>(count),
+            // A selection delete is atomic — to remove more, extend the selection (matches
+            // `Change`/`Cut`). The count is intentionally ignored: looping a selection-delete
+            // degenerates into deleting `count - 1` characters forward, which reads as a bug.
+            A::DeleteSelection => self.edit::<InputDelete>(CountedEditParams {
+                buffer_id,
+                count: 1,
+            }),
             A::DeleteLine => self.edit::<InputDeleteLine>(BufferOnlyParams { buffer_id }),
             A::Undo => self.undo_redo::<InputUndo>(count),
             A::Redo => self.undo_redo::<InputRedo>(count),
@@ -4769,6 +4779,7 @@ impl Session {
                         buffer_id,
                         from_line: self.buffer.cursor.position.line,
                         direction,
+                        count,
                     },
                     Event::HunkNav,
                 )

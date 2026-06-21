@@ -16880,6 +16880,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
             buffer_id,
             from_line: 0,
             direction: HunkDirection::Next,
+            count: 1,
         },
     )
     .await;
@@ -16894,6 +16895,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
             buffer_id,
             from_line: 3,
             direction: HunkDirection::Next,
+            count: 1,
         },
     )
     .await;
@@ -16907,11 +16909,113 @@ async fn git_navigate_hunk_jumps_between_changes() {
             buffer_id,
             from_line: 3,
             direction: HunkDirection::Prev,
+            count: 1,
         },
     )
     .await;
     assert!(prev.moved);
     assert_eq!(prev.cursor.position.line, 0);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_navigate_hunk_honours_count() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "nav.rs", "l0\nl1\nl2\nl3\nl4\nl5\nl6\n");
+
+    let server = spawn_for_test("nav-count-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "nav-count-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("nav.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+
+    // Three separate changed regions: lines 2, 4 and 6.
+    let mut id = 3;
+    for line in [2u32, 4, 6] {
+        let _: CursorState = send_request::<CursorSet>(
+            &mut ws,
+            id,
+            &CursorSetParams {
+                granularity: Granularity::Char,
+                buffer_id,
+                position: LogicalPosition { line, col: 0 },
+                anchor: LogicalPosition { line, col: 0 },
+            },
+        )
+        .await;
+        id += 1;
+        let _: EditResult = send_request::<InputText>(
+            &mut ws,
+            id,
+            &InputTextParams {
+                buffer_id,
+                text: "Z".into(),
+                select_pasted: false,
+                at: None,
+            },
+        )
+        .await;
+        id += 1;
+    }
+
+    // From line 0: count 1 → first hunk (2), count 2 → second (4), count 3 → third (6), and an
+    // over-large count clamps to the furthest forward hunk rather than refusing to move.
+    for (count, expected, req_id) in [(1u32, 2u32, 20u64), (2, 4, 21), (3, 6, 22), (9, 6, 23)] {
+        let r: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+            &mut ws,
+            req_id,
+            &GitNavigateHunkParams {
+                buffer_id,
+                from_line: 0,
+                direction: HunkDirection::Next,
+                count,
+            },
+        )
+        .await;
+        assert!(r.moved, "count {count} should move");
+        assert_eq!(r.cursor.position.line, expected, "count {count}");
+    }
+
+    // Prev honours the count symmetrically: from line 6, count 2 lands on line 2.
+    let back: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        &mut ws,
+        24,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line: 6,
+            direction: HunkDirection::Prev,
+            count: 2,
+        },
+    )
+    .await;
+    assert_eq!(back.cursor.position.line, 2);
 
     drop(server);
 }

@@ -1517,7 +1517,6 @@ impl Shell {
                 Pending::Surround(t) => Some(t),
                 _ => None,
             },
-            last_repeat: None,
             search: self.search_view(),
             blame: BlameState {
                 line: s.blame.as_ref().map(|(l, _)| *l),

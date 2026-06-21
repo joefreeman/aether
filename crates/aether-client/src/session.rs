@@ -349,8 +349,8 @@ pub enum Pending {
     Surround(SurroundTarget),
 }
 
-/// What `r` replays — the TUI's `RepeatTarget`: the binding intent for table actions, the
-/// resolved motion (with its target char) for find.
+/// What `.` replays: the binding intent for table actions, the resolved motion (with its target
+/// char) for find.
 #[derive(Debug, Clone)]
 pub enum RepeatTarget {
     Action { action: Action, count: u32 },

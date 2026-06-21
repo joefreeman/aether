@@ -1452,13 +1452,18 @@ pub async fn git_navigate_hunk(
         anchors.dedup();
         anchors
     };
+    // Walk `count` hunks in `direction`, clamping to the furthest available so an over-large
+    // count lands on the last/first change rather than refusing to move.
+    let skip = (params.count.max(1) - 1) as usize;
     let target = match params.direction {
-        HunkDirection::Next => anchors.iter().find(|&&a| a > params.from_line).copied(),
-        HunkDirection::Prev => anchors
-            .iter()
-            .rev()
-            .find(|&&a| a < params.from_line)
-            .copied(),
+        HunkDirection::Next => {
+            let mut it = anchors.iter().filter(|&&a| a > params.from_line);
+            it.nth(skip).or_else(|| anchors.iter().rfind(|&&a| a > params.from_line)).copied()
+        }
+        HunkDirection::Prev => {
+            let mut it = anchors.iter().rev().filter(|&&a| a < params.from_line);
+            it.nth(skip).or_else(|| anchors.iter().find(|&&a| a < params.from_line)).copied()
+        }
     };
 
     let Some(target_line) = target else {
@@ -5849,8 +5854,8 @@ pub async fn cursor_move(
         // is empty and the motion is a no-op; it never falls back to a different source, so `o`
         // behaves the same before and after symbols load. `Next`/`Prev` also return an anchor so
         // the target's identifier lands *selected* (see `nav_anchor`).
-        Motion::NextNavigationUnit
-        | Motion::PrevNavigationUnit
+        Motion::NextNavigationUnit { .. }
+        | Motion::PrevNavigationUnit { .. }
         | Motion::EndOfNavigationUnit
         | Motion::StartOfNavigationUnit => {
             let symbols = s

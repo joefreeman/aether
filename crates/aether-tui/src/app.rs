@@ -1,9 +1,8 @@
 //! Application state and event loop. Modal editing (Normal vs Insert) lives entirely here; the
 //! server has no notion of mode.
 
-use aether_client::keymap::Action;
 use aether_client::session::ConnState;
-use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
+use aether_protocol::cursor::{CursorState, Direction, Granularity};
 use aether_protocol::git::GitBufferStatus;
 use aether_protocol::input::SurroundTarget;
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus};
@@ -44,21 +43,6 @@ pub struct PendingFind {
     pub till: bool,
     pub extend: bool,
     pub count: u32,
-}
-
-/// What `r`/`Shift-r` replays. The repeat unit is the binding *intent*, not a resolved `Motion`:
-/// most actions are remembered as the `Action` (plus the `count` they were issued with) and replayed
-/// straight back through `run_action`, which reconstructs the motion against live state each time.
-/// The one exception is find-char: `BeginFind` only arms a capture, so the actual target char isn't
-/// known until the next keystroke — that resolved `Motion::FindChar` is stored directly.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-pub enum RepeatTarget {
-    /// Re-run this binding via `run_action(action, count, extend)`. Covers every repeatable action
-    /// except find — see [`Action::is_repeatable`].
-    Action { action: Action, count: u32 },
-    /// Replay a resolved `f`/`t` find (the target char is baked in). Recorded when the char is typed.
-    Find(Motion),
 }
 
 /// Client-side mirror of the server's search state. The server owns the match list (and pushes
@@ -483,9 +467,6 @@ pub struct EditorState {
     /// binding. The value records the target (selection in Normal, line in Insert). Mirrors
     /// `pending_find`'s next-key-is-data capture.
     pub pending_surround: Option<SurroundTarget>,
-    /// The most recent repeatable action, replayed by `r` (no extend) or `Shift-r` (extend the
-    /// selection with the replayed motion). See [`RepeatTarget`].
-    pub last_repeat: Option<RepeatTarget>,
     pub search: SearchState,
     /// Git blame for the cursor's line, shown as end-of-line virtual text in Normal mode. Lazily
     /// fetched (see [`refresh_blame`]) when the cursor changes line or the buffer revision
@@ -1003,7 +984,6 @@ mod tests {
             pending_count: 0,
             pending_find: None,
             pending_surround: None,
-            last_repeat: None,
             search: Default::default(),
             blame: Default::default(),
             file_path: None,
