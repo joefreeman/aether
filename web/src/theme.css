@@ -790,7 +790,7 @@ html, body, #app {
 /* Content-hugging variant for the dir editor's root segment: the ghost layer becomes the
    in-flow sizer and the input overlays it, so the segment is exactly as wide as typed text +
    ghost remainder and the `:` separator sits flush after it — the row reads as one
-   `dir: root: path` field. The ghost must stay an *inline* span here: making it inline-block
+   `path: root: path` field. The ghost must stay an *inline* span here: making it inline-block
    (with the base rule's overflow: hidden) moves its baseline to its bottom edge, dropping the
    in-flow ghost text below the overlaid input's text. */
 .picker-editor-rootwrap.hug {

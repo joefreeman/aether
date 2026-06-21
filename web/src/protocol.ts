@@ -260,6 +260,7 @@ export type PickerKind =
   | "buffers"
   | "grep"
   | "git_changes"
+  | "git_changes_file"
   | "explorer"
   | "projects"
   | "diagnostics"

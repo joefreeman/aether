@@ -9192,6 +9192,99 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
 }
 
 #[tokio::test]
+async fn git_changes_file_is_locked_to_its_buffer() {
+    // The modal `Space Alt-c` picker (GitChangesFile) shows *only* the buffer named by `buffer_id`,
+    // even when the project has other changed files — its scope is intrinsic, not a project filter.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    std::fs::write(dir.path().join("a.rs"), "one\ntwo\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "x\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("a.rs")).unwrap();
+    index.add_path(std::path::Path::new("b.rs")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+    // b.rs changes on disk (not opened); a.rs is opened and edited below.
+    std::fs::write(dir.path().join("b.rs"), "X\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let (server, mut ws, buffer_id) = setup_git_apply(&dir_path, "gcf", "a.rs").await;
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: LogicalPosition { line: 0, col: 3 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id,
+            text: "!".into(),
+            select_pasted: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let view_params = |kind, buffer_id| PickerViewParams {
+        filters: None,
+        kind,
+        reset: true,
+        offset: 0,
+        limit: 30,
+        center_on: None,
+        center_on_cursor: None,
+        directory_path: None,
+        buffer_id,
+        explorer_roots: false,
+    };
+    let paths = |view: &aether_protocol::picker::PickerViewResult| -> Vec<String> {
+        view.update
+            .as_ref()
+            .expect("window")
+            .items()
+            .iter()
+            .map(|i| match i {
+                PickerItem::GitChange { relative_path, .. } => relative_path.clone(),
+                other => panic!("expected GitChange, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // Project changes: both files.
+    let project =
+        send_request::<PickerView>(&mut ws, 5, &view_params(PickerKind::GitChanges, None)).await;
+    let mut p = paths(&project);
+    p.sort();
+    assert_eq!(p, vec!["a.rs".to_string(), "b.rs".to_string()]);
+
+    // File changes, locked to a.rs's buffer: only a.rs, even though b.rs is also changed.
+    let file = send_request::<PickerView>(
+        &mut ws,
+        6,
+        &view_params(PickerKind::GitChangesFile, Some(buffer_id)),
+    )
+    .await;
+    assert_eq!(
+        paths(&file),
+        vec!["a.rs".to_string()],
+        "the buffer-locked picker ignores b.rs"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn git_changes_picker_centers_on_the_cursor_hunk() {
     // Two hunks in the active file, far apart. Opening the picker with the cursor near the second
     // should land the highlight on that hunk (the `Space c` "where you are" behaviour).
@@ -9612,6 +9705,7 @@ async fn git_changes_picker_filters_by_directory() {
                 directories: vec![ScopedPath {
                     path_index: 0,
                     relative_path: "src".into(),
+                    is_file: false,
                 }],
                 ..Default::default()
             }),
@@ -9639,6 +9733,95 @@ async fn git_changes_picker_filters_by_directory() {
         })
         .collect();
     assert_eq!(paths, vec!["src/a.rs"], "the dir scope drops docs/b.md");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_changes_picker_filters_by_exact_file() {
+    // Three changed files, two of them sharing the `src/` prefix. An `is_file` scope on
+    // `src/a.rs` matches that one file exactly — its sibling `src/a_helper.rs` (which a `src`
+    // directory scope would keep) is dropped. This is what `Space Alt-c` seeds.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "one\n").unwrap();
+    std::fs::write(dir.path().join("src/a_helper.rs"), "one\n").unwrap();
+    std::fs::write(dir.path().join("b.md"), "one\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("src/a.rs")).unwrap();
+    index
+        .add_path(std::path::Path::new("src/a_helper.rs"))
+        .unwrap();
+    index.add_path(std::path::Path::new("b.md")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+    // Modify all three.
+    std::fs::write(dir.path().join("src/a.rs"), "ONE\n").unwrap();
+    std::fs::write(dir.path().join("src/a_helper.rs"), "ONE\n").unwrap();
+    std::fs::write(dir.path().join("b.md"), "ONE\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("file-filter-proj", vec![dir_path])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "file-filter-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            filters: Some(PickerFilters {
+                directories: vec![ScopedPath {
+                    path_index: 0,
+                    relative_path: "src/a.rs".into(),
+                    is_file: true,
+                }],
+                ..Default::default()
+            }),
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    let update = view.update.expect("window rides the response");
+    let paths: Vec<&str> = update
+        .items()
+        .iter()
+        .map(|i| {
+            let PickerItem::GitChange { relative_path, .. } = i else {
+                panic!("expected GitChange, got {i:?}");
+            };
+            relative_path.as_str()
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["src/a.rs"],
+        "the exact-file scope matches only src/a.rs, not the src/a_helper.rs sibling"
+    );
 
     drop(server);
 }
@@ -17868,15 +18051,27 @@ async fn references_picker_lists_all_uses() {
         .filter(|(_, is_def)| *is_def)
         .map(|(l, _)| *l)
         .collect();
-    assert_eq!(defs, vec![0], "the declaration on line 0 is the sole definition");
-    assert!(refs[0].1, "the definition is ordered first (Definition section)");
+    assert_eq!(
+        defs,
+        vec![0],
+        "the declaration on line 0 is the sole definition"
+    );
+    assert!(
+        refs[0].1,
+        "the definition is ordered first (Definition section)"
+    );
     // The picker seeds on the occurrence under the cursor — the cursor sits on the line-0
     // declaration, so the resolve frames + centres on that (the definition) row.
     let center = final_update
         .center_on
         .as_deref()
         .expect("references seed a center_on like grep/outline");
-    let PickerItem::Reference { line, is_definition, .. } = center else {
+    let PickerItem::Reference {
+        line,
+        is_definition,
+        ..
+    } = center
+    else {
         panic!("center_on should be a Reference, got {center:?}");
     };
     assert_eq!(*line, 0, "seeded on the cursor's occurrence (line 0)");
@@ -18869,6 +19064,7 @@ async fn grep_filter_directory_scope() {
         directories: vec![ScopedPath {
             path_index: 0,
             relative_path: "src".into(),
+            is_file: false,
         }],
         ..Default::default()
     };
@@ -18882,10 +19078,12 @@ async fn grep_filter_directory_scope() {
             ScopedPath {
                 path_index: 0,
                 relative_path: "src".into(),
+                is_file: false,
             },
             ScopedPath {
                 path_index: 0,
                 relative_path: String::new(),
+                is_file: false,
             },
         ],
         ..Default::default()
@@ -19218,6 +19416,7 @@ async fn grep_view_with_filters_replaces_and_drops_stale_hits() {
         directories: vec![ScopedPath {
             path_index: 0,
             relative_path: "src".into(),
+            is_file: false,
         }],
         ..Default::default()
     };
@@ -19300,6 +19499,7 @@ async fn grep_filter_root_scope() {
         directories: vec![ScopedPath {
             path_index: 1,
             relative_path: String::new(),
+            is_file: false,
         }],
         ..Default::default()
     };
@@ -19323,10 +19523,12 @@ async fn grep_filter_root_scope() {
             ScopedPath {
                 path_index: 0,
                 relative_path: String::new(),
+                is_file: false,
             },
             ScopedPath {
                 path_index: 1,
                 relative_path: String::new(),
+                is_file: false,
             },
         ],
         ..Default::default()
@@ -19402,6 +19604,7 @@ async fn files_picker_filters_narrow_candidates() {
         directories: vec![ScopedPath {
             path_index: 0,
             relative_path: "src".into(),
+            is_file: false,
         }],
         ..Default::default()
     };
@@ -19451,10 +19654,12 @@ async fn files_picker_filters_narrow_candidates() {
             ScopedPath {
                 path_index: 0,
                 relative_path: "src".into(),
+                is_file: false,
             },
             ScopedPath {
                 path_index: 0,
                 relative_path: String::new(),
+                is_file: false,
             },
         ],
         ..Default::default()

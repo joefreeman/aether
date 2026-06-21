@@ -146,7 +146,8 @@ pub struct GitChangeCandidate {
     pub removed: u32,
     /// The hunk's changed lines, trimmed — new-side (added/modified) lines first, then the removed
     /// baseline lines. The query regex-matches against these line-by-line (grep-style, content not
-    /// path), and the row previews `lines[0]` by default or the first line that matches the query.
+    /// path), and the row previews the first non-blank line by default, or the first line that
+    /// matches the query.
     pub lines: Vec<String>,
 }
 
@@ -182,7 +183,7 @@ impl GitChangeCandidate {
     /// span. Only ever called for the fetched window's rows (a handful). Falls back to the first
     /// line if nothing matches.
     pub fn preview(&self, re: Option<&regex::Regex>) -> (String, Vec<u32>) {
-        let default = || (self.lines.first().cloned().unwrap_or_default(), Vec::new());
+        let default = || (self.first_nonblank_line(), Vec::new());
         let Some(re) = re else { return default() };
         match regex_line_match(&self.lines, re) {
             Some((i, start, len)) => (
@@ -211,6 +212,18 @@ impl GitChangeCandidate {
     /// bytes (no per-call allocation or case folding — case is baked into `re`).
     pub fn matches(&self, re: &regex::Regex) -> bool {
         self.lines.iter().any(|line| re.is_match(line))
+    }
+
+    /// The first non-blank changed line (lines are stored trimmed, so "blank" is empty), falling
+    /// back to the first line and then the empty string. This is the row's default preview, so a
+    /// hunk that leads with a blank added/removed line doesn't render as an empty row.
+    fn first_nonblank_line(&self) -> String {
+        self.lines
+            .iter()
+            .find(|l| !l.is_empty())
+            .or_else(|| self.lines.first())
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -605,7 +618,7 @@ impl PickerCandidates {
                     stage: c.stage,
                     added: c.added,
                     removed: c.removed,
-                    preview: c.lines.first().cloned().unwrap_or_default(),
+                    preview: c.first_nonblank_line(),
                     match_indices,
                 }
             }
@@ -908,25 +921,33 @@ struct FilesFilter {
     /// An invalid glob rejects everything — mirrors grep's invalid-pattern behavior (the chip
     /// stays visible so the user can see what to fix).
     reject_all: bool,
-    /// Union of directory scopes: a file passes when it's under *any* of them (matching how
-    /// multiple include globs combine). Empty `relative_path` scopes to the whole root — root
-    /// scoping is just an entry with no path. An empty vec means no dir narrowing.
-    directories: Vec<(u32, String)>,
+    /// Union of path scopes `(path_index, relative_path, is_file)`: a file passes when it's under
+    /// *any* of them (matching how multiple include globs combine). A directory scope passes its
+    /// subtree — empty `relative_path` scopes to the whole root; an `is_file` scope passes only
+    /// that exact file. An empty vec means no scope narrowing.
+    directories: Vec<(u32, String, bool)>,
     changed_only: bool,
 }
 
-/// True when `file` sits under the `(path_index, relative_path)` directory scope. An empty
-/// relative path scopes to the whole root. Shared shape with grep's `FileFilter`.
+/// True when `file` sits under the `(path_index, relative_path)` scope. A directory scope (the
+/// default) matches as a prefix — an empty relative path scopes to the whole root; a `is_file`
+/// scope matches that one file exactly. Shared shape with grep's `FileFilter`.
 pub(crate) fn under_scope(
     file_path_index: u32,
     file_relative_path: &str,
     path_index: u32,
     rel: &str,
+    is_file: bool,
 ) -> bool {
-    file_path_index == path_index
-        && (rel.is_empty()
-            || (file_relative_path.starts_with(rel)
-                && file_relative_path.as_bytes().get(rel.len()) == Some(&b'/')))
+    if file_path_index != path_index {
+        return false;
+    }
+    if is_file {
+        return file_relative_path == rel;
+    }
+    rel.is_empty()
+        || (file_relative_path.starts_with(rel)
+            && file_relative_path.as_bytes().get(rel.len()) == Some(&b'/'))
 }
 
 impl FilesFilter {
@@ -941,7 +962,7 @@ impl FilesFilter {
             directories: filters
                 .directories
                 .iter()
-                .map(|d| (d.path_index, d.relative_path.clone()))
+                .map(|d| (d.path_index, d.relative_path.clone(), d.is_file))
                 .collect(),
             changed_only: filters.changed_only,
         }
@@ -957,7 +978,7 @@ impl FilesFilter {
             && !self
                 .directories
                 .iter()
-                .any(|(pi, rel)| under_scope(path_index, relative_path, *pi, rel))
+                .any(|(pi, rel, isf)| under_scope(path_index, relative_path, *pi, rel, *isf))
         {
             return false;
         }
@@ -1274,6 +1295,12 @@ impl PickerState {
     /// that don't group by file (everything but Grep and GitChanges). Mirrors the client's
     /// header-per-file rendering so its virtual-scroll spacer + positioning are exact.
     fn grouped_display_metrics(&self, offset: u32) -> Option<(u32, u32)> {
+        // The buffer-locked GitChangesFile shares GitChanges' candidate type but renders headerless,
+        // so gate on the kind (References groups into sections, so use the header predicate, not the
+        // file-grouping one) to keep the row math flat there.
+        if !self.kind.renders_group_headers() {
+            return None;
+        }
         // The group key of ranked row `ci`, for the grouped kinds — `(path_index, relative_path)`
         // for the file-grouped kinds, and a synthetic `(is_definition, "")` section key for
         // References (the Definition section vs the References section). Only equality matters here;
@@ -1511,7 +1538,13 @@ mod tests {
         }
         // The definition flag rides through make_item too (candidate 1 is the definition).
         assert!(
-            matches!(c.make_item(1, vec![]), PickerItem::Reference { is_definition: true, .. }),
+            matches!(
+                c.make_item(1, vec![]),
+                PickerItem::Reference {
+                    is_definition: true,
+                    ..
+                }
+            ),
             "the definition candidate makes a definition item"
         );
     }
@@ -1566,7 +1599,9 @@ mod tests {
             is_definition: false,
         }]);
         match c.select_result(0) {
-            Some(PickerSelectResult::FileAt { position, anchor, .. }) => {
+            Some(PickerSelectResult::FileAt {
+                position, anchor, ..
+            }) => {
                 assert_eq!(position, LogicalPosition { line: 2, col: 5 });
                 assert_eq!(anchor, None);
             }
@@ -1601,14 +1636,21 @@ mod tests {
 
         // Two sections over three rows → 3 + 2 = 5 display rows. A window opening at ranked row 0
         // sits one row down (the Definition header above it).
-        let (display_offset, total) =
-            s.grouped_display_metrics(0).expect("references are header-grouped");
+        let (display_offset, total) = s
+            .grouped_display_metrics(0)
+            .expect("references are header-grouped");
         assert_eq!(total, 5, "3 items + 2 section headers");
-        assert_eq!(display_offset, 1, "the Definition header precedes ranked row 0");
+        assert_eq!(
+            display_offset, 1,
+            "the Definition header precedes ranked row 0"
+        );
         // A window opening at the first use is below both headers.
         let (display_offset, total) = s.grouped_display_metrics(1).unwrap();
         assert_eq!(total, 5);
-        assert_eq!(display_offset, 3, "Definition + References headers precede the first use");
+        assert_eq!(
+            display_offset, 3,
+            "Definition + References headers precede the first use"
+        );
     }
 
     #[test]
@@ -1944,6 +1986,7 @@ mod tests {
             directories: vec![ScopedPath {
                 path_index: 0,
                 relative_path: "src".into(),
+                is_file: false,
             }],
             ..Default::default()
         };
@@ -1962,6 +2005,71 @@ mod tests {
             vec![2],
             "only docs/b.md survives the exclude glob"
         );
+
+        // An exact-file scope on src/a.rs keeps both of its hunks and drops docs/b.md — same
+        // result as the `src` dir scope here, but via equality, not prefix.
+        let cands = PickerCandidates::GitChanges(vec![
+            GitChangeCandidate::new(
+                0,
+                "src/a.rs".into(),
+                "/p/src/a.rs".into(),
+                0,
+                1,
+                DiffStage::Unstaged,
+                1,
+                0,
+                vec!["a".into()],
+            ),
+            GitChangeCandidate::new(
+                0,
+                "src/a.rs".into(),
+                "/p/src/a.rs".into(),
+                1,
+                9,
+                DiffStage::Unstaged,
+                1,
+                0,
+                vec!["a2".into()],
+            ),
+            GitChangeCandidate::new(
+                0,
+                "docs/b.md".into(),
+                "/p/docs/b.md".into(),
+                0,
+                2,
+                DiffStage::Unstaged,
+                1,
+                0,
+                vec!["b".into()],
+            ),
+        ]);
+        let mut s = PickerState::new(cands);
+        s.filters = PickerFilters {
+            directories: vec![ScopedPath {
+                path_index: 0,
+                relative_path: "src/a.rs".into(),
+                is_file: true,
+            }],
+            ..Default::default()
+        };
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0, 1], "both src/a.rs hunks, no docs/b.md");
+    }
+
+    #[test]
+    fn under_scope_file_matches_by_equality_not_prefix() {
+        // Directory scope: prefix match, with a `/` boundary so `src` doesn't catch `src2`.
+        assert!(under_scope(0, "src/a.rs", 0, "src", false));
+        assert!(under_scope(0, "src/deep/a.rs", 0, "src", false));
+        assert!(!under_scope(0, "src2/a.rs", 0, "src", false));
+        assert!(under_scope(0, "anything", 0, "", false)); // empty = whole root
+        assert!(!under_scope(0, "src/a.rs", 1, "src", false)); // wrong root
+
+        // File scope: exact equality only — no subtree, no sibling.
+        assert!(under_scope(0, "src/a.rs", 0, "src/a.rs", true));
+        assert!(!under_scope(0, "src/a.rs", 0, "src", true)); // dir path, file flag → no match
+        assert!(!under_scope(0, "src/a_helper.rs", 0, "src/a.rs", true)); // sibling
+        assert!(!under_scope(0, "src/a.rs", 1, "src/a.rs", true)); // wrong root
     }
 
     #[test]
@@ -2010,7 +2118,7 @@ mod tests {
             other => panic!("expected GitChange, got {other:?}"),
         }
 
-        // Empty query → every hunk, previewing its first changed line with no highlight.
+        // Empty query → every hunk, previewing its first non-blank changed line with no highlight.
         s.query = String::new();
         s.rerank(&mut m);
         assert_eq!(s.ranked, vec![0, 1]);
@@ -2023,6 +2131,47 @@ mod tests {
             } => {
                 assert_eq!(preview, "fn one()");
                 assert!(match_indices.is_empty());
+            }
+            other => panic!("expected GitChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_change_preview_skips_leading_blank_lines() {
+        // A hunk that adds a blank line before any code (lines stored trimmed, so "" is blank).
+        let cand = |rel: &str, lines: Vec<&str>| {
+            GitChangeCandidate::new(
+                0,
+                rel.into(),
+                format!("/{rel}"),
+                0,
+                0,
+                DiffStage::Unstaged,
+                lines.len() as u32,
+                0,
+                lines.into_iter().map(String::from).collect(),
+            )
+        };
+        let cands = PickerCandidates::GitChanges(vec![
+            cand("a.rs", vec!["", "", "fn real()"]),
+            cand("blank.rs", vec!["", ""]), // all-blank hunk → falls back to the (empty) first line
+        ]);
+        let mut s = PickerState::new(cands);
+        let mut m = make_matcher();
+        s.rerank(&mut m);
+        let (_, items) = s.build_window_items(0, 10, &mut m);
+        match &items[0] {
+            PickerItem::GitChange { preview, .. } => {
+                assert_eq!(preview, "fn real()", "skips the leading blank lines");
+            }
+            other => panic!("expected GitChange, got {other:?}"),
+        }
+        match &items[1] {
+            PickerItem::GitChange { preview, .. } => {
+                assert_eq!(
+                    preview, "",
+                    "an all-blank hunk falls back to empty, not a panic"
+                );
             }
             other => panic!("expected GitChange, got {other:?}"),
         }

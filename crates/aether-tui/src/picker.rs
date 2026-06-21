@@ -195,6 +195,9 @@ pub struct Chip {
 #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
 pub struct ChipEditor {
     pub kind: ChipEditorKind,
+    /// The field label to render — `glob:`, `path:`, or `dir:` (the core's
+    /// [`aether_client::chips::ChipEditor::field_tag`]). Precomputed in the core→view sync.
+    pub tag: &'static str,
     /// Which field has focus. Always `Path` for glob and single-root dir editors.
     pub field: ChipEditorField,
     /// The glob text / the root-relative directory path.
@@ -256,6 +259,7 @@ impl ChipEditor {
     pub fn glob(prefill: String, edit: Option<usize>) -> Self {
         ChipEditor {
             kind: ChipEditorKind::Glob { edit },
+            tag: "glob:",
             field: ChipEditorField::Path,
             input: crate::text_input::TextInput::new(prefill),
             root_filter: crate::text_input::TextInput::default(),
@@ -275,6 +279,7 @@ impl ChipEditor {
     pub fn dir(path: String, field: ChipEditorField, root_index: u32, edit: Option<usize>) -> Self {
         ChipEditor {
             kind: ChipEditorKind::Dir { edit },
+            tag: "dir:",
             field,
             input: crate::text_input::TextInput::new(path),
             root_filter: crate::text_input::TextInput::default(),
@@ -326,11 +331,12 @@ impl ChipEditor {
             .is_some_and(|(_, suffix)| suffix.is_empty())
     }
 
-    /// Store a `directory/list` response, keeping only subdirectories — a file never completes
-    /// a directory scope.
+    /// Store a `directory/list` response. The mirror is a passive view — it keeps whatever the core
+    /// kept (subdirectories, plus files when the editor allows a file scope); the file-vs-dir
+    /// distinction is honoured at render time in [`Self::path_ghost`].
     #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
     pub fn set_dir_listing(&mut self, entries: Vec<DirectoryEntry>) {
-        self.listing = entries.into_iter().filter(|e| e.is_dir).collect();
+        self.listing = entries;
         self.listing_state = DirListingState::Loaded;
         self.suggestion_idx = 0;
     }
@@ -390,9 +396,10 @@ impl ChipEditor {
         }
     }
 
-    /// The path field's ghost: the rest of the current directory match beyond the partial leaf,
-    /// plus the `/` that opens the next segment. Visible only with the cursor at the end of the
-    /// input (matching the save-as prompt's rule).
+    /// The path field's ghost: the rest of the current match beyond the partial leaf — plus, for a
+    /// directory, the `/` that opens the next segment (a file is a terminal leaf, no slash). Visible
+    /// only with the cursor at the end of the input (matching the save-as prompt's rule). Mirrors
+    /// the core's [`aether_client::chips::ChipEditor::path_ghost`].
     pub fn path_ghost(&self) -> Option<String> {
         if !self.is_dir() || self.input.cursor != self.input.text.len() {
             return None;
@@ -402,7 +409,9 @@ impl ChipEditor {
         let pick = *matches.get(self.suggestion_idx)?;
         let entry = self.listing.get(pick)?;
         let mut suffix: String = entry.name.chars().skip(partial.chars().count()).collect();
-        suffix.push('/');
+        if entry.is_dir {
+            suffix.push('/');
+        }
         Some(suffix)
     }
 
@@ -901,10 +910,12 @@ mod tests {
                 ScopedPath {
                     path_index: 1,
                     relative_path: "src/app".into(),
+                    is_file: false,
                 },
                 ScopedPath {
                     path_index: 0,
                     relative_path: "docs".into(),
+                    is_file: false,
                 },
             ],
             ..Default::default()
@@ -931,6 +942,7 @@ mod tests {
             directories: vec![ScopedPath {
                 path_index: 1,
                 relative_path: String::new(),
+                is_file: false,
             }],
             ..Default::default()
         });
@@ -1044,6 +1056,17 @@ mod tests {
         assert_eq!(ed.path_ghost().as_deref(), Some("rc/"));
         ed.input.move_left();
         assert_eq!(ed.path_ghost(), None);
+    }
+
+    #[test]
+    fn dir_editor_path_ghost_slash_only_for_directories() {
+        // A directory ghost opens the next segment with `/`; a file is a terminal leaf, no slash.
+        let mut ed = ChipEditor::dir("m".into(), ChipEditorField::Path, 0, None);
+        ed.set_dir_listing(vec![listing_entry("models", true)]);
+        assert_eq!(ed.path_ghost().as_deref(), Some("odels/"));
+        let mut ed = ChipEditor::dir("m".into(), ChipEditorField::Path, 0, None);
+        ed.set_dir_listing(vec![listing_entry("main.rs", false)]);
+        assert_eq!(ed.path_ghost().as_deref(), Some("ain.rs"));
     }
 
     #[test]

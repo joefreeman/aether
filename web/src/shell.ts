@@ -72,6 +72,7 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   buffers: "Switch buffer…",
   grep: "Grep workspace…",
   git_changes: "Search changes…",
+  git_changes_file: "Changes in current file…",
   explorer: "Explore files…",
   projects: "Select project…",
   diagnostics: "List diagnostics…",
@@ -269,6 +270,8 @@ interface EditorInput {
  *  renders it and routes keys. `root_*` apply only to a multi-root dir editor. */
 interface ChipEditorView {
   is_dir: boolean;
+  /** The field label — "glob:", "path:" (file-or-dir scope) or "dir:" (Files picker, dir-only). */
+  tag: string;
   field: "root" | "path";
   input: EditorInput;
   root_filter: EditorInput;
@@ -2798,7 +2801,7 @@ export class Shell {
     this.editorSepEl = null;
     const tag = document.createElement("span");
     tag.className = "picker-editor-label";
-    tag.textContent = ce.is_dir ? "dir:" : "glob:";
+    tag.textContent = ce.tag;
     this.pickerEditorRow.replaceChildren(tag);
     if (!ce.is_dir) {
       // Glob: a single plain input (no ghost), with the syntax hint as its placeholder.
@@ -3305,10 +3308,11 @@ export class Shell {
     let selectedRow: HTMLElement | null = null;
     let prevGrepKey: string | null = null;
     let section: HTMLElement | null = null;
+    // Grep and project git-changes group per file with a sticky header; the buffer-locked
+    // git_changes_file is a single headerless file (the core emits flat display-row offsets/counts).
+    const groupByFile = p.kind === "grep" || p.kind === "git_changes";
     p.items.forEach((item, i) => {
-      // Grep and git-changes are grouped per file: a non-selectable, sticky file header before the
-      // first row of each file in the window (the core emits matching display-row offsets/counts).
-      if (item.kind === "grep_hit" || item.kind === "git_change") {
+      if (groupByFile && (item.kind === "grep_hit" || item.kind === "git_change")) {
         const key = `${item.path_index}\0${item.relative_path}`;
         if (key !== prevGrepKey) {
           prevGrepKey = key;

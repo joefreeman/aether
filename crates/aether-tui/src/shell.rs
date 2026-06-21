@@ -1766,6 +1766,7 @@ fn chip_editor_view(
             c::ChipEditorKind::Glob { edit } => t::ChipEditorKind::Glob { edit },
             c::ChipEditorKind::Dir { edit } => t::ChipEditorKind::Dir { edit },
         },
+        tag: e.field_tag(),
         field: match e.field {
             c::ChipEditorField::Root => t::ChipEditorField::Root,
             c::ChipEditorField::Path => t::ChipEditorField::Path,

@@ -99,12 +99,15 @@ pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
     match kind {
         PickerKind::Grep => true,
         PickerKind::Files => matches!(id, ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Changed),
-        // The Git-changes picker greps content like Grep, so it offers the regex options
-        // (case/word/literal) plus the path-scope chips. It's inherently changed-only.
+        // The project Git-changes picker greps content like Grep, so it offers the regex options
+        // (case/word/literal) plus the path-scope chips. Inherently changed-only.
         PickerKind::GitChanges => matches!(
             id,
             ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Case | ChipId::Word | ChipId::Lit
         ),
+        // The buffer-locked single-file picker greps the same content, so it keeps the regex
+        // options — but path scopes are meaningless on one file (its scope is intrinsic).
+        PickerKind::GitChangesFile => matches!(id, ChipId::Case | ChipId::Word | ChipId::Lit),
         PickerKind::Explorer => matches!(id, ChipId::Ignored | ChipId::Hidden | ChipId::Changed),
         _ => false,
     }
@@ -122,6 +125,12 @@ pub fn derive_chips(values: &[ChipValue], project_paths: &[String]) -> Vec<Chip>
         .map(|(i, v)| {
             let (id, label) = match v {
                 ChipValue::Dir(d) => {
+                    // A directory chip trails a `/`; a file chip shows the bare path.
+                    let path = if d.is_file {
+                        d.relative_path.clone()
+                    } else {
+                        format!("{}/", d.relative_path)
+                    };
                     let label = if project_paths.len() > 1 {
                         let labels = crate::labels::root_labels(project_paths);
                         let root_label = labels
@@ -131,10 +140,10 @@ pub fn derive_chips(values: &[ChipValue], project_paths: &[String]) -> Vec<Chip>
                         if d.relative_path.is_empty() {
                             root_label.to_string()
                         } else {
-                            format!("{root_label}: {}/", d.relative_path)
+                            format!("{root_label}: {path}")
                         }
                     } else {
-                        format!("{}/", d.relative_path)
+                        path
                     };
                     (ChipId::Dir(i), label)
                 }
@@ -506,8 +515,13 @@ pub struct ChipEditor {
     pub root_selected: usize,
     /// Dir: the root the editor opened with — the fallback when the filter matches nothing.
     pub root_index: u32,
-    /// Dir: cached `directory/list` entries (subdirectories only — files never complete a dir
-    /// scope) for the dir portion of `input`.
+    /// Dir: when true the editor may complete to a file (an exact-file scope), not just
+    /// subdirectories — set for Grep / GitChanges, cleared for the Files picker (narrowing a
+    /// file list to one file is degenerate). Controls what `set_dir_listing` keeps and whether a
+    /// committed leaf becomes an [`ScopedPath::is_file`] scope.
+    pub allow_files: bool,
+    /// Dir: cached `directory/list` entries for the dir portion of `input` — subdirectories
+    /// only, unless `allow_files` (then files are kept too, so a file name can complete).
     pub listing: Vec<DirectoryEntry>,
     /// Dir: the absolute path `listing` was last synced against (the staleness key).
     pub listing_dir_abs: String,
@@ -527,6 +541,7 @@ impl ChipEditor {
             root_filter: Input::default(),
             root_selected: 0,
             root_index: 0,
+            allow_files: false,
             listing: Vec::new(),
             listing_dir_abs: String::new(),
             listing_state: DirListingState::Pending,
@@ -535,8 +550,15 @@ impl ChipEditor {
     }
 
     /// A dir editor. `listing_dir_abs` starts empty, so the caller's first
-    /// [`ChipEditor::sync_dir_listing`] always reports a refetch is due.
-    pub fn dir(path: String, field: ChipEditorField, root_index: u32, edit: Option<usize>) -> Self {
+    /// [`ChipEditor::sync_dir_listing`] always reports a refetch is due. `allow_files` lets the
+    /// path field complete to a file (an exact-file scope) as well as a subdirectory.
+    pub fn dir(
+        path: String,
+        field: ChipEditorField,
+        root_index: u32,
+        edit: Option<usize>,
+        allow_files: bool,
+    ) -> Self {
         ChipEditor {
             kind: ChipEditorKind::Dir { edit },
             field,
@@ -546,6 +568,7 @@ impl ChipEditor {
             // doubles as its position among them.
             root_selected: root_index as usize,
             root_index,
+            allow_files,
             listing: Vec::new(),
             listing_dir_abs: String::new(),
             listing_state: DirListingState::Pending,
@@ -555,6 +578,17 @@ impl ChipEditor {
 
     pub fn is_dir(&self) -> bool {
         matches!(self.kind, ChipEditorKind::Dir { .. })
+    }
+
+    /// The editor's field label — `glob:`, `path:`, or `dir:`. A path-scope editor reads `path:`
+    /// when it can also scope to a file (Grep / GitChanges) and `dir:` when it's directory-only
+    /// (the Files picker), matching what its completion offers. Shells render this verbatim.
+    pub fn field_tag(&self) -> &'static str {
+        match self.kind {
+            ChipEditorKind::Glob { .. } => "glob:",
+            ChipEditorKind::Dir { .. } if self.allow_files => "path:",
+            ChipEditorKind::Dir { .. } => "dir:",
+        }
     }
 
     /// The root the editor would commit: the highlighted candidate for the current filter,
@@ -626,10 +660,15 @@ impl ChipEditor {
         ))
     }
 
-    /// Store a `directory/list` response, keeping only subdirectories — a file never completes
-    /// a directory scope.
+    /// Store a `directory/list` response. Without `allow_files`, keep only subdirectories — a
+    /// file can't complete a directory scope. With it, keep files too so a file name can
+    /// complete to an exact-file scope.
     pub fn set_dir_listing(&mut self, entries: Vec<DirectoryEntry>) {
-        self.listing = entries.into_iter().filter(|e| e.is_dir).collect();
+        self.listing = if self.allow_files {
+            entries
+        } else {
+            entries.into_iter().filter(|e| e.is_dir).collect()
+        };
         self.listing_state = DirListingState::Loaded;
         self.suggestion_idx = 0;
     }
@@ -737,7 +776,26 @@ impl ChipEditor {
         Some(ScopedPath {
             path_index,
             relative_path: text,
+            is_file: self.committed_is_file(),
         })
+    }
+
+    /// Whether the value a commit would adopt names a file (an exact-file scope) rather than a
+    /// directory. Only ever true when `allow_files`; a trailing-slash / empty leaf is always a
+    /// directory. Reads the same highlighted entry [`ChipEditor::committed_path`] resolves, so
+    /// the two never disagree.
+    fn committed_is_file(&self) -> bool {
+        if !self.allow_files || self.listing_state != DirListingState::Loaded {
+            return false;
+        }
+        let leaf = partial_of_input(&self.input.text);
+        if leaf.is_empty() {
+            return false;
+        }
+        matching_indices(&self.listing, leaf)
+            .get(self.suggestion_idx)
+            .and_then(|&i| self.listing.get(i))
+            .is_some_and(|e| !e.is_dir)
     }
 
     /// True when the path is *definitely* wrong — the red-worthy condition: the dir portion
@@ -770,7 +828,11 @@ impl ChipEditor {
         let pick = *matches.get(self.suggestion_idx)?;
         let entry = self.listing.get(pick)?;
         let mut suffix: String = entry.name.chars().skip(partial.chars().count()).collect();
-        suffix.push('/');
+        // A directory opens a next segment; a file is a terminal leaf (no trailing slash, so
+        // accepting it doesn't grow the dir portion and trigger a refetch).
+        if entry.is_dir {
+            suffix.push('/');
+        }
         Some(suffix)
     }
 
@@ -833,6 +895,18 @@ mod tests {
     }
 
     #[test]
+    fn git_changes_file_offers_content_options_but_no_path_scopes() {
+        use PickerKind::GitChangesFile;
+        // The single-file picker greps content, so the regex toggles apply...
+        assert!(filter_applies(GitChangesFile, ChipId::Case));
+        assert!(filter_applies(GitChangesFile, ChipId::Word));
+        assert!(filter_applies(GitChangesFile, ChipId::Lit));
+        // ...but path scopes are meaningless on one file.
+        assert!(!filter_applies(GitChangesFile, ChipId::Dir(0)));
+        assert!(!filter_applies(GitChangesFile, ChipId::Glob(0)));
+    }
+
+    #[test]
     fn wire_roundtrip_restores_canonical_chips() {
         let chips = vec![
             ChipValue::Word,
@@ -840,6 +914,7 @@ mod tests {
             ChipValue::Dir(ScopedPath {
                 path_index: 1,
                 relative_path: "src".into(),
+                is_file: false,
             }),
             ChipValue::Ignored { hide: false },
             ChipValue::Case(CaseMode::Insensitive),
@@ -913,7 +988,7 @@ mod tests {
     #[test]
     fn dir_editor_path_flow() {
         let roots = vec!["/tmp/root".to_string()];
-        let mut ed = ChipEditor::dir(String::new(), ChipEditorField::Path, 0, None);
+        let mut ed = ChipEditor::dir(String::new(), ChipEditorField::Path, 0, None, false);
         assert!(ed.sync_dir_listing(&roots));
         assert_eq!(ed.listing_dir_abs, "/tmp/root");
         assert!(ed.path_valid()); // an empty path is always committable (whole-root scope)
@@ -946,5 +1021,41 @@ mod tests {
         ed.input.push_str("zzz");
         assert!(ed.path_invalid());
         assert!(!ed.path_valid());
+    }
+
+    #[test]
+    fn dir_editor_completes_files_when_allowed() {
+        let roots = vec!["/tmp/root".to_string()];
+        let mut ed = ChipEditor::dir(String::new(), ChipEditorField::Path, 0, None, true);
+        ed.sync_dir_listing(&roots);
+        ed.set_dir_listing(vec![
+            DirectoryEntry {
+                name: "src".into(),
+                is_dir: true,
+            },
+            DirectoryEntry {
+                name: "main.rs".into(),
+                is_dir: false,
+            },
+        ]);
+        assert_eq!(ed.listing.len(), 2); // files kept when allow_files
+        ed.input.push_str("main");
+        ed.path_edited(&roots);
+        // A file ghost is terminal — no trailing slash.
+        assert_eq!(ed.path_ghost(), Some(".rs".into()));
+        assert!(ed.path_valid());
+        assert_eq!(ed.committed_path(), "main.rs");
+        // The committed scope is an exact-file scope.
+        let scope = ed.preview_scope(&roots).unwrap();
+        assert_eq!(scope.relative_path, "main.rs");
+        assert!(scope.is_file);
+        // Accepting a file leaf doesn't grow the dir portion (no refetch due).
+        assert!(!ed.accept_path_suggestion(&roots));
+        assert_eq!(ed.input.text, "main.rs");
+        // A directory leaf in the same editor still scopes as a directory.
+        ed.input.set("src".into());
+        ed.path_edited(&roots);
+        assert_eq!(ed.path_ghost(), Some("/".into()));
+        assert!(!ed.preview_scope(&roots).unwrap().is_file);
     }
 }

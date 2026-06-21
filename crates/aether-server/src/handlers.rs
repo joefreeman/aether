@@ -1458,11 +1458,15 @@ pub async fn git_navigate_hunk(
     let target = match params.direction {
         HunkDirection::Next => {
             let mut it = anchors.iter().filter(|&&a| a > params.from_line);
-            it.nth(skip).or_else(|| anchors.iter().rfind(|&&a| a > params.from_line)).copied()
+            it.nth(skip)
+                .or_else(|| anchors.iter().rfind(|&&a| a > params.from_line))
+                .copied()
         }
         HunkDirection::Prev => {
             let mut it = anchors.iter().rev().filter(|&&a| a < params.from_line);
-            it.nth(skip).or_else(|| anchors.iter().find(|&&a| a < params.from_line)).copied()
+            it.nth(skip)
+                .or_else(|| anchors.iter().find(|&&a| a < params.from_line))
+                .copied()
         }
     };
 
@@ -10165,6 +10169,46 @@ pub async fn picker_view(
             };
             picker_state::PickerCandidates::GitChanges(build_git_change_candidates(&roots, open))
         }
+        PickerKind::GitChangesFile => {
+            // Modal sibling of GitChanges, locked to the active buffer (`params.buffer_id`): just
+            // that buffer's live hunks, no disk walk. Like Diagnostics, a fresh open carries the
+            // buffer id and rebuilds; a scroll/resume re-view passes `None` and `preserve_existing`
+            // keeps the snapshot.
+            let open = match params.buffer_id {
+                Some(buffer_id) => {
+                    let s = state.lock().await;
+                    let roots = s.active_project_or_err(client_id)?.paths.clone();
+                    s.buffers
+                        .get(&buffer_id)
+                        .and_then(|b| {
+                            let abs = b.canonical_path.as_deref()?;
+                            let (path_index, relative_path) =
+                                crate::workspace_index::project_relative_parts(abs, &roots)?;
+                            let (index, staged) = s
+                                .git_baseline
+                                .get(&buffer_id)
+                                .map(|base| (base.index_blob.clone(), base.staged_hunks.clone()))
+                                .unwrap_or((None, Vec::new()));
+                            let unstaged = crate::git::hunks_from_buffers(
+                                index.as_deref().unwrap_or(b""),
+                                b.text.to_string().as_bytes(),
+                            );
+                            Some(OpenChange {
+                                path_index,
+                                relative_path,
+                                abs_path: abs.to_string_lossy().into_owned(),
+                                hunks: crate::git::compose_both(&staged, &unstaged),
+                                text: b.text.clone(),
+                            })
+                        })
+                        .into_iter()
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            // Empty `roots` ⇒ no disk walk; only the single open buffer's hunks are built.
+            picker_state::PickerCandidates::GitChanges(build_git_change_candidates(&[], open))
+        }
     };
 
     let mut s = state.lock().await;
@@ -10175,7 +10219,7 @@ pub async fn picker_view(
     // split.
     let cursor_centering_info: Option<(LogicalPosition, Option<(u32, String)>)> =
         match (params.kind, params.center_on_cursor) {
-            (kind, Some(buffer_id)) if kind.groups_by_file() => {
+            (kind, Some(buffer_id)) if kind.centers_on_cursor() => {
                 let cursor = s
                     .cursors
                     .get(&(client_id, buffer_id))
@@ -10213,7 +10257,11 @@ pub async fn picker_view(
     }
     match pickers.entry(key) {
         std::collections::hash_map::Entry::Vacant(e) => {
-            e.insert(picker_state::PickerState::new(candidates));
+            let mut ps = picker_state::PickerState::new(candidates);
+            // GitChangesFile shares GitChanges' candidate type, so pin the slot's kind to the
+            // requested one — the `picker/update` push echoes it and the client drops mismatches.
+            ps.kind = params.kind;
+            e.insert(ps);
         }
         std::collections::hash_map::Entry::Occupied(mut o) => {
             let p = o.get_mut();
@@ -10250,6 +10298,13 @@ pub async fn picker_view(
                     picker_state::PickerCandidates::Symbols(_),
                     picker_state::PickerCandidates::Symbols(_),
                 ) => true,
+                // GitChangesFile: locked to a buffer, so re-views send an empty placeholder — keep
+                // the snapshot then, but a fresh open carries the buffer's hunks and rebuilds.
+                // (Project GitChanges always re-snapshots, so it falls through to `false`.)
+                (
+                    picker_state::PickerCandidates::GitChanges(_),
+                    picker_state::PickerCandidates::GitChanges(new),
+                ) if params.kind == PickerKind::GitChangesFile => new.is_empty(),
                 _ => false,
             };
             if !preserve_existing {
@@ -10268,9 +10323,9 @@ pub async fn picker_view(
         picker.explorer_peek_missing = peek_missing;
     }
 
-    // Replace persisted filters when the caller sent a set (`None` keeps what hide left). A
-    // change re-ranks; for Grep it also drops the cached hits — they were produced under the
-    // old filters and the client's follow-up `picker/query` will respawn the search.
+    // Replace persisted filters when the caller sent a set (`None` keeps what hide left). A change
+    // re-ranks; for Grep it also drops the cached hits — they were produced under the old filters
+    // and the client's follow-up `picker/query` will respawn the search.
     if let Some(filters) = params.filters {
         if filters != picker.filters {
             picker.filters = filters;
@@ -10437,14 +10492,14 @@ pub async fn picker_query(
     // the existing candidates are still valid. Bump generation (so any in-flight worker from a
     // prior query bails on its next batch) but skip the wipe + respawn. The initial push built
     // below will carry the cached items.
+    picker.query = params.query;
+    picker.filters = params.filters;
+    picker.generation = params.generation;
     let grep_cache_hit = matches!(params.kind, PickerKind::Grep)
         && picker
             .last_completed_search
             .as_ref()
-            .is_some_and(|(q, f)| *q == params.query && *f == params.filters);
-    picker.query = params.query;
-    picker.filters = params.filters;
-    picker.generation = params.generation;
+            .is_some_and(|(q, f)| *q == picker.query && *f == picker.filters);
     match params.kind {
         // Grep: the query *is* the search. On a cache miss, drop any prior results and let the
         // spawned worker (kicked off below, outside the lock) repopulate. On a cache hit, leave
@@ -11517,21 +11572,53 @@ mod diagnostic_span_tests {
         use DiagnosticDirection::{Next, Prev};
         let pos = |line, col| LogicalPosition { line, col };
         // Three diagnostics on line 5 (cols 2, 8, 14) plus a neighbour on line 9.
-        let diags = [diag(5, 8, 5, 9), diag(5, 2, 5, 4), diag(9, 0, 9, 1), diag(5, 14, 5, 16)];
+        let diags = [
+            diag(5, 8, 5, 9),
+            diag(5, 2, 5, 4),
+            diag(9, 0, 9, 1),
+            diag(5, 14, 5, 16),
+        ];
         // From the line start, Next steps through each same-line diagnostic by column…
-        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 0), Next, 1), Some(pos(5, 2)));
-        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 2), Next, 1), Some(pos(5, 8)));
-        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 8), Next, 1), Some(pos(5, 14)));
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(5, 0), Next, 1),
+            Some(pos(5, 2))
+        );
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(5, 2), Next, 1),
+            Some(pos(5, 8))
+        );
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(5, 8), Next, 1),
+            Some(pos(5, 14))
+        );
         // …then crosses to the next line once the line's diagnostics are exhausted.
-        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 14), Next, 1), Some(pos(9, 0)));
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(5, 14), Next, 1),
+            Some(pos(9, 0))
+        );
         // A count jumps multiple same-line diagnostics at once.
-        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 0), Next, 3), Some(pos(5, 14)));
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(5, 0), Next, 3),
+            Some(pos(5, 14))
+        );
         // Prev is the column-aware mirror.
-        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 14), Prev, 1), Some(pos(5, 8)));
-        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 8), Prev, 1), Some(pos(5, 2)));
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(5, 14), Prev, 1),
+            Some(pos(5, 8))
+        );
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(5, 8), Prev, 1),
+            Some(pos(5, 2))
+        );
         // A cursor mid-span (col 10, between the col-8 and col-14 diagnostics) resolves by position.
-        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 10), Next, 1), Some(pos(5, 14)));
-        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 10), Prev, 1), Some(pos(5, 8)));
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(5, 10), Next, 1),
+            Some(pos(5, 14))
+        );
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(5, 10), Prev, 1),
+            Some(pos(5, 8))
+        );
     }
 
     #[test]

@@ -1188,8 +1188,8 @@ fn dir_editor_holds_while_listing_pending_then_previews_on_load() {
     let mut s = session();
     s.project_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None);
-    // Alt-d opens the dir editor and fires a directory/list for the root.
-    let _ = s.on_key(KeyCode::Char('d'), Mods::ALT, None, ROWS);
+    // Alt-p opens the path-scope editor and fires a directory/list for the root.
+    let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
     // Type a leaf before the listing lands: the path's validity is unknown, so results are
     // held — no re-query flapping them wider for a frame.
     let fx = s.chip_editor_set_input("sr".into());
@@ -1235,7 +1235,7 @@ fn invalid_dir_path_preview_contributes_nothing() {
     let mut s = session();
     s.project_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None);
-    let _ = s.on_key(KeyCode::Char('d'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
     let _ = s.chip_editor_set_input("zzz".into());
     // The listing lands with no directory the leaf prefixes → the path is invalid → the preview
     // contributes nothing (results show as if the half-typed chip weren't there).
@@ -1254,6 +1254,59 @@ fn invalid_dir_path_preview_contributes_nothing() {
     assert!(
         find_request(&fx, "picker/query").is_none(),
         "an invalid path leaves the effective filters unchanged"
+    );
+}
+
+#[test]
+fn space_alt_c_opens_the_buffer_locked_changes_picker() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    s.buffer.path = Some("/p/src/main.rs".into());
+    // `Space Alt-c`: the modal file-changes picker — its own kind, locked to the active buffer via
+    // `buffer_id` (intrinsic, like Diagnostics), not a filter chip.
+    let fx = s.open_picker(PickerKind::GitChangesFile, None, None);
+    let params = find_request(&fx, "picker/view").expect("opens the picker");
+    assert_eq!(params["kind"], json!("git_changes_file"));
+    assert_eq!(
+        params["buffer_id"],
+        json!(s.buffer.buffer_id),
+        "locked to the active buffer"
+    );
+    assert!(
+        params["filters"].is_null(),
+        "no filter chips — the scope is intrinsic"
+    );
+}
+
+#[test]
+fn space_alt_g_seeds_a_removable_directory_chip() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    s.buffer.path = Some("/p/src/main.rs".into());
+    // `Space Alt-g`: Grep pre-scoped to the buffer's directory as an ordinary, composable dir chip.
+    let fx = s.open_picker_in_buffer_dir(PickerKind::Grep);
+    let params = find_request(&fx, "picker/view").expect("opens the picker");
+    assert_eq!(params["kind"], json!("grep"));
+    assert_eq!(
+        params["filters"]["directories"],
+        json!([{"path_index": 0, "relative_path": "src"}]),
+        "a normal dir chip (no scope override) for the buffer's directory"
+    );
+}
+
+#[test]
+fn space_alt_g_unscoped_for_scratch_buffer() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    s.buffer.path = None; // scratch buffer — no directory to scope to
+    let fx = s.open_picker_in_buffer_dir(PickerKind::Grep);
+    let params = find_request(&fx, "picker/view").expect("opens the picker");
+    assert!(
+        params["filters"].is_null(),
+        "a scratch buffer opens the whole workspace"
     );
 }
 

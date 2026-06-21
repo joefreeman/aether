@@ -310,8 +310,10 @@ pub enum Action {
 
     // ---- pickers ----
     OpenPicker(PickerKind),
-    /// `Space Alt-f` / `Space Alt-g` — Files/Grep pre-scoped to the active buffer's directory
-    /// (seeded as a directory filter chip, removable like any chip).
+    /// `Space Alt-f` / `Space Alt-g` — open Files / Grep pre-scoped to the active buffer's
+    /// directory, seeded as an ordinary directory filter chip (editable, composable, removable).
+    /// The buffer-locked changes/diagnostics *modes* use a dedicated kind instead (see
+    /// [`PickerKind::GitChangesFile`]).
     OpenPickerInBufferDir(PickerKind),
     /// `Space Alt-e` — Explorer at the buffer's project root rather than its directory.
     OpenExplorerAtRoot,
@@ -752,6 +754,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('r'), Exact(Mods::NONE), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
     bind!(L, ch('c'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitChanges), "Git", "Git changes (hunks)"),
+    bind!(L, ch('c'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitChangesFile), "Git", "Git changes in current file"),
     bind!(L, ch('n'), Exact(Mods::NONE), A::GrepNavigate(Direction::Forward), "Search", "Next grep hit"),
     bind!(L, ch('n'), Exact(Mods::ALT), A::GrepNavigate(Direction::Backward), "Search", "Previous grep hit"),
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),

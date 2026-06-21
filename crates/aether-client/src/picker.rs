@@ -513,9 +513,10 @@ impl PickerState {
         let mut rows = Vec::with_capacity(self.items.len() + 8);
         let mut last_file: Option<(u32, &str)> = None;
         let mut last_section: Option<bool> = None;
+        // The grouped kinds (Grep, project GitChanges) emit one file header before each file's
+        // first row. The buffer-locked GitChangesFile is a single file with no header.
+        let group_by_file = self.kind.groups_by_file();
         for (i, item) in self.items.iter().enumerate() {
-            // Grep hits and Git changes both group by file: emit one header before each file's
-            // first row.
             if let PickerItem::GrepHit {
                 path_index,
                 relative_path,
@@ -528,7 +529,7 @@ impl PickerState {
             } = item
             {
                 let f = (*path_index, relative_path.as_str());
-                if last_file != Some(f) {
+                if group_by_file && last_file != Some(f) {
                     last_file = Some(f);
                     rows.push(DisplayRow::Header {
                         path_index: *path_index,
@@ -543,7 +544,11 @@ impl PickerState {
                 if last_section != Some(*is_definition) {
                     last_section = Some(*is_definition);
                     rows.push(DisplayRow::Section {
-                        label: if *is_definition { "Definition" } else { "References" },
+                        label: if *is_definition {
+                            "Definition"
+                        } else {
+                            "References"
+                        },
                     });
                 }
             }
@@ -576,7 +581,9 @@ impl PickerState {
         let leads_with_header = self.items.first().is_some_and(|i| {
             matches!(
                 i,
-                PickerItem::GrepHit { .. } | PickerItem::GitChange { .. } | PickerItem::Reference { .. }
+                PickerItem::GrepHit { .. }
+                    | PickerItem::GitChange { .. }
+                    | PickerItem::Reference { .. }
             )
         });
         self.display_offset.saturating_sub(leads_with_header as u32)
@@ -849,6 +856,36 @@ mod tests {
     }
 
     #[test]
+    fn git_changes_file_renders_headerless() {
+        let hunk = |line: u32| PickerItem::GitChange {
+            path_index: 0,
+            relative_path: "src/main.rs".into(),
+            hunk_index: line,
+            line,
+            stage: aether_protocol::viewport::DiffStage::Unstaged,
+            added: 1,
+            removed: 0,
+            preview: "x".into(),
+            match_indices: vec![],
+        };
+        let items = vec![hunk(1), hunk(5)];
+        // Project GitChanges leads each file with a header row...
+        let mut project = PickerState::new(PickerKind::GitChanges);
+        project.items = items.clone();
+        assert!(project
+            .display_rows()
+            .iter()
+            .any(|r| matches!(r, DisplayRow::Header { .. })));
+        // ...but the buffer-locked GitChangesFile is a single file with no header.
+        let mut file = PickerState::new(PickerKind::GitChangesFile);
+        file.items = items;
+        assert!(file
+            .display_rows()
+            .iter()
+            .all(|r| matches!(r, DisplayRow::Item { .. })));
+    }
+
+    #[test]
     fn references_display_rows_split_into_definition_and_references_sections() {
         let reference = |path: &str, line: u32, is_definition: bool| PickerItem::Reference {
             path: path.into(),
@@ -882,17 +919,39 @@ mod tests {
         }));
         let rows = s.display_rows();
         // Section("Definition"), the def item, Section("References"), then the two uses.
-        assert!(matches!(rows[0], DisplayRow::Section { label: "Definition" }));
+        assert!(matches!(
+            rows[0],
+            DisplayRow::Section {
+                label: "Definition"
+            }
+        ));
         assert!(matches!(rows[1], DisplayRow::Item { abs: 0, .. }));
-        assert!(matches!(rows[2], DisplayRow::Section { label: "References" }));
+        assert!(matches!(
+            rows[2],
+            DisplayRow::Section {
+                label: "References"
+            }
+        ));
         assert!(matches!(rows[3], DisplayRow::Item { abs: 1, .. }));
         assert!(matches!(rows[4], DisplayRow::Item { abs: 2, .. }));
         // Section headers are non-selectable; the display-row index accounts for the headers above.
-        assert_eq!(s.window_base(), 0, "the window leads with the Definition header");
+        assert_eq!(
+            s.window_base(),
+            0,
+            "the window leads with the Definition header"
+        );
         s.selected = 0;
-        assert_eq!(s.selected_display_row(), Some(1), "def row sits below its header");
+        assert_eq!(
+            s.selected_display_row(),
+            Some(1),
+            "def row sits below its header"
+        );
         s.selected = 1;
-        assert_eq!(s.selected_display_row(), Some(3), "first use is below both headers");
+        assert_eq!(
+            s.selected_display_row(),
+            Some(3),
+            "first use is below both headers"
+        );
     }
 
     #[test]

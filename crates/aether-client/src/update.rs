@@ -1573,12 +1573,15 @@ impl Session {
                 offset: 0,
                 limit: FETCH_LIMIT,
                 center_on,
-                center_on_cursor: kind.groups_by_file().then_some(buffer_id),
+                center_on_cursor: kind.centers_on_cursor().then_some(buffer_id),
                 directory_path,
                 explorer_roots: false,
                 buffer_id: matches!(
                     kind,
-                    PickerKind::Diagnostics | PickerKind::References | PickerKind::DocumentSymbols
+                    PickerKind::Diagnostics
+                        | PickerKind::References
+                        | PickerKind::DocumentSymbols
+                        | PickerKind::GitChangesFile
                 )
                 .then_some(buffer_id),
                 filters: seed_filters,
@@ -1598,9 +1601,9 @@ impl Session {
         }
     }
 
-    /// `Space Alt-f` / `Space Alt-g`: open Files/Grep pre-scoped to the active buffer's
-    /// directory — a normal dir filter chip, visible and removable. Falls back to an unscoped
-    /// open for scratch buffers or files outside every root.
+    /// `Space Alt-f` / `Space Alt-g`: open Files / Grep pre-scoped to the active buffer's
+    /// directory — a normal dir filter chip, visible/editable/removable, composable with globs.
+    /// Falls back to an unscoped open for scratch buffers or files outside every root.
     pub fn open_picker_in_buffer_dir(&mut self, kind: PickerKind) -> Effects {
         let seed = self
             .buffer
@@ -1613,6 +1616,7 @@ impl Session {
                 directories: vec![ScopedPath {
                     path_index,
                     relative_path,
+                    is_file: false,
                 }],
                 ..PickerFilters::default()
             });
@@ -1636,6 +1640,7 @@ impl Session {
             .map(|(path_index, relative_path)| ScopedPath {
                 path_index,
                 relative_path,
+                is_file: false,
             });
         let seeded = seeded_filters_for_switch(&p.wire_filters(), dir_scope, target);
         let hide = self.close_picker();
@@ -2066,9 +2071,10 @@ impl Session {
             return Effects::none();
         };
         match kind {
-            PickerKind::Grep | PickerKind::Files | PickerKind::GitChanges => {
-                self.picker_query_changed()
-            }
+            PickerKind::Grep
+            | PickerKind::Files
+            | PickerKind::GitChanges
+            | PickerKind::GitChangesFile => self.picker_query_changed(),
             PickerKind::Explorer => {
                 let filters = {
                     let Some(p) = &mut self.picker else {
@@ -2206,11 +2212,15 @@ impl Session {
         } else {
             ChipEditorField::Path
         };
+        // Grep / GitChanges may scope to a single file; the Files picker stays directory-only
+        // (narrowing a file list to one file is degenerate).
+        let allow_files = matches!(p.kind, PickerKind::Grep | PickerKind::GitChanges);
         let mut ed = ChipEditor::dir(
             current.map(|d| d.relative_path).unwrap_or_default(),
             field,
             root_index,
             edit,
+            allow_files,
         );
         ed.sync_dir_listing(&project_paths);
         // Baseline for the live-preview dedup — the currently displayed (committed) set.
@@ -2596,7 +2606,7 @@ impl Session {
             KeyCode::Char('g') if mods.alt && !mods.ctrl => {
                 return self.open_glob_prompt(None);
             }
-            KeyCode::Char('d') if mods.alt && !mods.ctrl => {
+            KeyCode::Char('p') if mods.alt && !mods.ctrl => {
                 return self.open_dir_prompt(None);
             }
             KeyCode::PageUp => {
@@ -5011,6 +5021,7 @@ mod tests {
         let scope = ScopedPath {
             path_index: 0,
             relative_path: "src".into(),
+            is_file: false,
         };
         let defaults = PickerFilters::default();
         let seeded = seeded_filters_for_switch(&defaults, Some(scope.clone()), PickerKind::Grep);

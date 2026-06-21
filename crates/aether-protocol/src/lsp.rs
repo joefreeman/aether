@@ -165,7 +165,10 @@ pub struct LspNavigateDiagnosticParams {
     pub direction: DiagnosticDirection,
     /// How many diagnostics to skip in `direction`. Defaults to 1; when fewer than `count` remain
     /// the cursor lands on the furthest reachable diagnostic rather than not moving at all.
-    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    #[serde(
+        default = "crate::count_one",
+        skip_serializing_if = "crate::count_is_one"
+    )]
     pub count: u32,
     /// Grow the selection to the landing diagnostic (Shift) rather than collapsing to a point there:
     /// the anchor is kept and the cursor jumps to the diagnostic.

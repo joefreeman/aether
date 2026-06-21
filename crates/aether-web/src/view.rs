@@ -161,6 +161,7 @@ fn chip_editor(ce: &Option<ChipEditor>, project_paths: &[String]) -> Value {
     let input = |i: &aether_client::chips::Input| json!({ "text": i.text });
     json!({
         "is_dir": ed.is_dir(),
+        "tag": ed.field_tag(),
         "field": match ed.field {
             ChipEditorField::Root => "root",
             ChipEditorField::Path => "path",

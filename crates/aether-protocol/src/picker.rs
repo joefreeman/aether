@@ -76,9 +76,23 @@ pub enum PickerKind {
     /// so unsaved edits are reflected. Untracked files appear as a single whole-file addition.
     /// Selecting a hunk jumps to its anchor line (via `FileAt`). Reset on each open (not preserved).
     GitChanges,
+    /// The working-tree changes of a *single* buffer — the modal sibling of [`GitChanges`], opened
+    /// by `Space Alt-c`. Locked to the buffer named by [`PickerViewParams::buffer_id`] (the active
+    /// one, re-pointed each open), exactly how the [`Diagnostics`] picker locks to its buffer — the
+    /// scope is intrinsic, not a filter chip, so there's nothing to add or remove. Its own state
+    /// slot, independent of the project-wide [`GitChanges`]. Rows are the buffer's hunks, under the
+    /// file's header.
+    GitChangesFile,
 }
 
 impl PickerKind {
+    /// True for the two changes pickers — the project-wide [`Self::GitChanges`] and the
+    /// buffer-locked [`Self::GitChangesFile`] — which share hunk rows / select behaviour but live
+    /// in separate slots and build their candidates from a different scope.
+    pub fn is_git_changes(self) -> bool {
+        matches!(self, PickerKind::GitChanges | PickerKind::GitChangesFile)
+    }
+
     /// Whether this picker saves its highlight + query on hide/select so the next open
     /// resumes the prior state. Only Grep does — its candidate set is the result of a
     /// (potentially slow) workspace scan and dropping it on every reopen would be wasteful.
@@ -87,34 +101,41 @@ impl PickerKind {
     /// directory so it acts like "show me where I am" rather than a persistent file-manager
     /// session.
     pub fn preserves_state(self) -> bool {
-        // Grep keeps its (expensive) search results; GitChanges keeps its query + filters so a
-        // re-open resumes the same content search and scope. Both rebuild their candidate set on
-        // re-view regardless (GitChanges re-snapshots the working tree), and the server wipes a
-        // client's pickers on project switch, so persisted scope never leaks across projects.
-        matches!(self, PickerKind::Grep | PickerKind::GitChanges)
+        // Grep keeps its (expensive) search results; the changes pickers keep their query +
+        // filters so a re-open resumes. All rebuild their candidate set on re-view regardless
+        // (the changes pickers re-snapshot the working tree), and the server wipes a client's
+        // pickers on project switch, so persisted state never leaks across projects.
+        matches!(self, PickerKind::Grep) || self.is_git_changes()
     }
 
     /// Whether this picker groups its rows into per-file sections, rendering a non-selectable file
-    /// header above each file's first row (Grep hits and Git changes). The single source of truth
-    /// for the file-grouped layout: clients gate their header rendering, sticky-header pin, header
-    /// clearance when revealing a row, and virtual-scroll row math on it, so adding another grouped
-    /// picker is one edit here rather than a hunt across the shells.
+    /// header above each file's first row (Grep hits and project Git changes). The single source of
+    /// truth for the file-grouped layout: clients gate their header rendering, sticky-header pin,
+    /// header clearance when revealing a row, and virtual-scroll row math on it. The buffer-locked
+    /// [`Self::GitChangesFile`] is *not* here — it's a single file, so a header would just repeat it;
+    /// it still centres on the cursor (see [`Self::centers_on_cursor`]).
     pub fn groups_by_file(self) -> bool {
         matches!(self, PickerKind::Grep | PickerKind::GitChanges)
     }
 
     /// Whether this picker interleaves non-selectable header rows above grouped runs of items.
-    /// A superset of [`Self::groups_by_file`]: the file-grouped kinds (Grep, GitChanges) plus
-    /// References, which groups into a `Definition` section and a `References` section. The header
-    /// *content* and grouping key differ per kind — file path vs section label — but the header
-    /// *row* accounting is identical, so clients gate their header-clearance and virtual-scroll row
-    /// math on this single predicate. `groups_by_file` stays narrower (it also drives the
-    /// cursor-nearest `center_on_cursor` seeding, which References does its own way).
+    /// A superset of [`Self::groups_by_file`]: the file-grouped kinds plus References, which groups
+    /// into a `Definition` section and a `References` section. The header *content* differs per kind
+    /// — file path vs section label — but the header *row* accounting is identical, so clients gate
+    /// header-clearance and virtual-scroll row math on this single predicate.
     pub fn renders_group_headers(self) -> bool {
         matches!(
             self,
             PickerKind::Grep | PickerKind::GitChanges | PickerKind::References
         )
+    }
+
+    /// Whether `picker/view`'s `center_on_cursor` applies — the picker can resolve a result near
+    /// the buffer's cursor and open framed on it (Grep's nearest hit, the changes pickers' nearest
+    /// hunk). Wider than [`Self::groups_by_file`]: it includes the headerless buffer-locked changes
+    /// picker, which still wants to land on "where you are".
+    pub fn centers_on_cursor(self) -> bool {
+        matches!(self, PickerKind::Grep) || self.is_git_changes()
     }
 }
 
@@ -539,17 +560,27 @@ impl MatchOptions {
     }
 }
 
-/// A directory inside one of the project's roots — the `dir:` filter chip. Addressed the same
+/// A path inside one of the project's roots — the scope filter chip. Addressed the same
 /// way picker items are (`path_index` + root-relative path) so it survives root reordering no
 /// worse than everything else does. There is deliberately no separate root filter: scoping to
 /// a whole root is this with an empty `relative_path` (a directory always implies its root).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Usually a directory (a prefix scope: every file beneath it passes). When `is_file` is set the
+/// `relative_path` names a single file and the scope matches that file exactly — what `Space
+/// Alt-c` uses to pin the Git-changes picker to the active buffer. File scopes are produced only
+/// for Grep / GitChanges (the Files picker stays directory-only — narrowing a file list to one
+/// file is degenerate).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopedPath {
     /// Index into the project's root list.
     pub path_index: u32,
     /// Path relative to `roots[path_index]`, forward-slash separated, no trailing slash.
     /// Empty scopes to the root itself.
     pub relative_path: String,
+    /// When true, `relative_path` is a single file matched exactly rather than a directory
+    /// prefix. Defaults to false, so the field is absent on the wire for the common dir scope.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_file: bool,
 }
 
 /// Result-narrowing filters, surfaced as chips in the clients (see `docs/picker-filters.md`).
@@ -600,9 +631,10 @@ pub struct PickerFilters {
     /// must match some include glob; independently, it must match no exclude glob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub globs: Vec<String>,
-    /// Grep + Files: restrict to files under *any* of these directories (union semantics,
-    /// matching how multiple include globs combine; a whole root is an entry with an empty
-    /// `relative_path` — there is no separate root filter). Repeatable, like `globs`.
+    /// Grep + Files: restrict to files under *any* of these scopes (union semantics, matching how
+    /// multiple include globs combine; a whole root is an entry with an empty `relative_path` —
+    /// there is no separate root filter). A directory scope passes everything beneath it; a
+    /// [`ScopedPath::is_file`] scope passes only that exact file. Repeatable, like `globs`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub directories: Vec<ScopedPath>,
 }
@@ -682,8 +714,8 @@ pub struct PickerViewParams {
     pub buffer_id: Option<BufferId>,
     /// Replace the persisted filters before attaching. `None` keeps whatever the prior
     /// `view`/`query`/`hide` cycle left behind (the default, no-op filters on first open or
-    /// after `reset`). `Some` is how a client opens a picker pre-scoped (e.g. a future
-    /// "grep this directory").
+    /// after `reset`). `Some` is how a client opens a picker pre-scoped (e.g. `Space Alt-f` /
+    /// `Space Alt-g` seeding the buffer's directory chip).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<PickerFilters>,
 }

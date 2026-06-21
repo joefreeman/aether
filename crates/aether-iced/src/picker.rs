@@ -179,6 +179,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::References => "List references…",
         PickerKind::DocumentSymbols => "Go to symbol…",
         PickerKind::GitChanges => "Search changes…",
+        PickerKind::GitChangesFile => "Changes in current file…",
     }
 }
 
@@ -518,7 +519,11 @@ pub fn overlay<'a>(
     // `position: sticky`). The stack is ALWAYS present with a pin slot — conditionally
     // changing the tree shape would reset the scrollable's state (iced keys widget state by
     // tree position), which is a scroll-to-top.
-    let pinned: Option<(u32, String)> = {
+    let pinned: Option<(u32, String)> = if !state.kind.groups_by_file() {
+        // Headerless kinds (e.g. the single-file GitChangesFile) have nothing to pin — without this
+        // the top item's own file would pin a stray header over the row.
+        None
+    } else {
         let first_visible = first_visible_row(scroll_y);
         first_visible.checked_sub(window_base).and_then(|rel| {
             state
@@ -774,7 +779,7 @@ pub(crate) fn field_with_ghost<'a>(
 }
 
 /// The chip-editor line below the input row, or a zero-size placeholder (the slot must always
-/// exist — see the call site). Mirrors the web's `.picker-editor-row`: `glob:`/`dir:` label,
+/// exist — see the call site). Mirrors the web's `.picker-editor-row`: `glob:`/`path:`/`dir:` label,
 /// then for multi-root dir editors a root typeahead segment, a `:` separator (shown once the
 /// path is in play), and the root-relative path with directory ghost suggestions.
 fn editor_line<'a>(state: &'a PickerState, roots: &'a [String]) -> Element<'a, PickerMsg> {
@@ -784,7 +789,7 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String]) -> Element<'a, P
     let labels = crate::labels::root_labels(roots);
     let multi_root = ed.is_dir() && roots.len() > 1;
     let mut line = row![].spacing(6).align_y(iced::Alignment::Center);
-    let tag = if ed.is_dir() { "dir:" } else { "glob:" };
+    let tag = ed.field_tag();
     line = line.push(text(tag).size(13).font(SANS).color(theme::NORD8));
     if multi_root {
         let invalid = ed.root_invalid(&labels);

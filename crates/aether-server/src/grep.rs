@@ -260,10 +260,11 @@ struct FileFilter {
     /// rg `-g` semantics via `ignore::overrides`: `!`-globs exclude; with ≥1 plain glob
     /// present, non-matching files are excluded too. `None` when no globs were given.
     overrides: Option<ignore::overrides::Override>,
-    /// Union of `(path_index, relative_path)` directory scopes — a file passes when it's under
-    /// *any* of them (matching how multiple include globs combine). Empty `relative_path`
-    /// scopes to the whole root; an empty vec means no dir narrowing.
-    directories: Vec<(u32, String)>,
+    /// Union of `(path_index, relative_path, is_file)` path scopes — a file passes when it's under
+    /// *any* of them (matching how multiple include globs combine). A directory scope passes its
+    /// subtree (empty `relative_path` = whole root); an `is_file` scope passes only that exact
+    /// file. An empty vec means no scope narrowing.
+    directories: Vec<(u32, String, bool)>,
     /// Per-root repo status, aligned to root index. Only `Some` under `changed_only`; a root
     /// outside any repo yields `None` inside, which excludes its files (nothing in it is
     /// "changed").
@@ -281,7 +282,7 @@ impl FileFilter {
             directories: filters
                 .directories
                 .iter()
-                .map(|d| (d.path_index, d.relative_path.clone()))
+                .map(|d| (d.path_index, d.relative_path.clone(), d.is_file))
                 .collect(),
             changed: filters.changed_only.then(|| {
                 roots
@@ -294,8 +295,14 @@ impl FileFilter {
 
     fn passes(&self, f: &CachedFile) -> bool {
         if !self.directories.is_empty()
-            && !self.directories.iter().any(|(path_index, rel)| {
-                crate::picker::under_scope(f.path_index, &f.relative_path, *path_index, rel)
+            && !self.directories.iter().any(|(path_index, rel, is_file)| {
+                crate::picker::under_scope(
+                    f.path_index,
+                    &f.relative_path,
+                    *path_index,
+                    rel,
+                    *is_file,
+                )
             })
         {
             return false;

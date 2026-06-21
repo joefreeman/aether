@@ -1468,6 +1468,19 @@ fn picker_item_git_change_is_tagged() {
         to_value(PickerKind::GitChanges).unwrap(),
         json!("git_changes")
     );
+    assert_eq!(
+        to_value(PickerKind::GitChangesFile).unwrap(),
+        json!("git_changes_file")
+    );
+    // Both changes pickers preserve state and centre on the cursor's hunk, but only the project one
+    // renders file headers — the buffer-locked file picker is a single, headerless file.
+    assert!(
+        PickerKind::GitChanges.preserves_state() && PickerKind::GitChangesFile.preserves_state()
+    );
+    assert!(
+        PickerKind::GitChanges.groups_by_file() && !PickerKind::GitChangesFile.groups_by_file()
+    );
+    assert!(PickerKind::GitChangesFile.centers_on_cursor());
 
     // An unstaged hunk: the default stage is omitted from the wire.
     let item = PickerItem::GitChange {
@@ -1709,7 +1722,6 @@ fn picker_view_params_omit_center_on_when_none() {
     assert_eq!(v["kind"], "files");
     assert_eq!(v["reset"], true);
 }
-
 #[test]
 fn picker_view_params_center_on_serialized() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerViewParams};
@@ -2200,10 +2212,17 @@ fn picker_filters_wire_shape() {
             ScopedPath {
                 path_index: 1,
                 relative_path: "src/app".into(),
+                is_file: false,
             },
             ScopedPath {
                 path_index: 0,
                 relative_path: String::new(),
+                is_file: false,
+            },
+            ScopedPath {
+                path_index: 1,
+                relative_path: "src/main.rs".into(),
+                is_file: true,
             },
         ],
     };
@@ -2221,8 +2240,10 @@ fn picker_filters_wire_shape() {
             "changed_only": true,
             "globs": ["*.rs", "!*_test.rs"],
             "directories": [
+                // A directory scope omits `is_file` (default false); a file scope carries it.
                 {"path_index": 1, "relative_path": "src/app"},
                 {"path_index": 0, "relative_path": ""},
+                {"path_index": 1, "relative_path": "src/main.rs", "is_file": true},
             ],
         })
     );

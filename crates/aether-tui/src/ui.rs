@@ -2318,18 +2318,18 @@ fn chip_editor_spans(state: &AppState) -> (Vec<Span<'static>>, u16) {
 
     match ed.kind {
         ChipEditorKind::Glob { .. } => {
-            push(&mut spans, &mut w, "glob: ".into(), label_style);
+            push(&mut spans, &mut w, format!("{} ", ed.tag), label_style);
             cursor = w + ed.input.width_to_cursor();
             push(&mut spans, &mut w, ed.input.text.clone(), text_style);
         }
         ChipEditorKind::Dir { .. } => {
-            // One field to the eye: `dir: {root}: {path}` in multi-root projects (the same
-            // `root: path` shape the dir chip and status bar use), `dir: {path}` in
-            // single-root ones. The root segment while unfocused — and the `:` separator —
-            // render in the committed-prefix blue; the focused segment carries the caret;
-            // invalid segments go red instead.
+            // One field to the eye: `{tag} {root}: {path}` in multi-root projects (the same
+            // `root: path` shape the dir chip and status bar use), `{tag} {path}` in
+            // single-root ones — `tag` is `path:` (file-or-dir scope) or `dir:` (Files picker).
+            // The root segment while unfocused — and the `:` separator — render in the
+            // committed-prefix blue; the focused segment carries the caret; invalid go red.
             let multi_root = state.project_paths.len() > 1;
-            push(&mut spans, &mut w, "dir: ".into(), label_style);
+            push(&mut spans, &mut w, format!("{} ", ed.tag), label_style);
             if multi_root {
                 let labels = crate::labels::root_labels(&state.project_paths);
                 let invalid = ed.root_invalid(&labels);
@@ -2567,6 +2567,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::References) => "List references…",
         Some(aether_protocol::picker::PickerKind::DocumentSymbols) => "Go to symbol…",
         Some(aether_protocol::picker::PickerKind::GitChanges) => "Search changes…",
+        Some(aether_protocol::picker::PickerKind::GitChangesFile) => "Changes in current file…",
         None => "Search…",
     }
 }
@@ -2649,16 +2650,18 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     let visible_end = (visible_start + visible_count).min(state.picker.items.len());
 
     let mut lines: Vec<Line> = Vec::with_capacity(visible_count);
-    // For Grep, insert a non-selectable file header above the first hit of each new file path.
+    // For the grouped kinds, insert a non-selectable header above the first row of each group.
     // Headers eat into the visible row budget; the visible-count math above already accounts
-    // for them, so what we render here will fit in `pane_height` rows.
+    // for them, so what we render here will fit in `pane_height` rows. The headerless kinds (the
+    // single-file GitChangesFile) skip this — and must, or the rows wouldn't match that budget.
+    let renders_headers = state.picker.kind.is_some_and(|k| k.renders_group_headers());
     let mut prev_grep_key: Option<(u32, &str)> = None;
     for (offset_in_slice, item) in state.picker.items[visible_start..visible_end]
         .iter()
         .enumerate()
     {
         let i = visible_start + offset_in_slice;
-        if let Some(key) = picker_group_key(item) {
+        if let Some(key) = picker_group_key(item).filter(|_| renders_headers) {
             if prev_grep_key != Some(key) {
                 // References render a section label (Definition / References) rather than a file
                 // header; the other grouped kinds render the file path.
