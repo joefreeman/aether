@@ -932,6 +932,7 @@ pub fn resolve_navigation_motion(
     position: LogicalPosition,
     anchor: LogicalPosition,
     motion: &Motion,
+    extend: bool,
 ) -> (LogicalPosition, Option<LogicalPosition>) {
     // A no-op leaves the selection exactly as it was (no-symbols, or no further unit).
     let unchanged = (position, Some(anchor));
@@ -941,12 +942,18 @@ pub fn resolve_navigation_motion(
     match motion {
         Motion::NextNavigationUnit { count } | Motion::PrevNavigationUnit { count } => {
             let forward = matches!(motion, Motion::NextNavigationUnit { .. });
-            // Navigate relative to the *start* of the current selection, not the cursor: after a
-            // previous `o` the cursor sits at the symbol's name end, so keying off the cursor would
-            // let `Alt-o` re-find the current symbol (whose own start precedes its end). Each step
-            // re-keys off the symbol we just landed on, so a count walks the outline; if it runs
-            // out first we keep the last reachable symbol rather than snapping back.
-            let mut from = ordered(position, anchor).0;
+            let (lo, hi) = ordered(position, anchor);
+            // Where the walk starts. Without extend we key off the selection *start* for both
+            // directions: after a previous `o` the cursor sits at the symbol's name end, so keying
+            // off the cursor would let `Alt-o` re-find the current symbol (whose own start precedes
+            // its end). When extending we key off the leading edge in the direction of travel and
+            // grow the selection outward. Each step re-keys off the symbol just landed on, so a
+            // count walks the outline; if it runs out first we keep the last reachable symbol.
+            let mut from = match (extend, forward) {
+                (false, _) => lo,
+                (true, true) => hi,
+                (true, false) => lo,
+            };
             let mut landed = None;
             for _ in 0..(*count).max(1) {
                 let target = if forward {
@@ -963,7 +970,18 @@ pub fn resolve_navigation_motion(
                 }
             }
             match landed {
-                // Select the identifier: anchor at the name start, cursor on its last char.
+                // Extend grows the selection to *include* the target identifier: the cursor lands on
+                // its far side (name end going forward, name start going back) while the opposite
+                // edge of the original selection stays put as the anchor.
+                Some(i) if extend => {
+                    if forward {
+                        (symbols[i].end, Some(lo))
+                    } else {
+                        (symbols[i].start, Some(hi))
+                    }
+                }
+                // Plain `o`/`Alt-o` select the identifier: anchor at the name start, cursor on its
+                // last char.
                 Some(i) => (symbols[i].end, Some(symbols[i].start)),
                 None => unchanged,
             }
@@ -1152,10 +1170,24 @@ mod symbol_nav_tests {
         let o = outline();
         let buf = Buffer::scratch(1, None, 1); // Next/Prev don't touch the buffer
         let next = |pos, anchor| {
-            resolve_navigation_motion(&buf, &o, pos, anchor, &Motion::NextNavigationUnit { count: 1 })
+            resolve_navigation_motion(
+                &buf,
+                &o,
+                pos,
+                anchor,
+                &Motion::NextNavigationUnit { count: 1 },
+                false,
+            )
         };
         let prev = |pos, anchor| {
-            resolve_navigation_motion(&buf, &o, pos, anchor, &Motion::PrevNavigationUnit { count: 1 })
+            resolve_navigation_motion(
+                &buf,
+                &o,
+                pos,
+                anchor,
+                &Motion::PrevNavigationUnit { count: 1 },
+                false,
+            )
         };
         // `o` from the top (point cursor) lands the first reachable symbol's identifier
         // *selected*: anchor at its name start, cursor on its last char (`end`).
@@ -1183,7 +1215,7 @@ mod symbol_nav_tests {
             } else {
                 Motion::PrevNavigationUnit { count }
             };
-            resolve_navigation_motion(&buf, &o, at(0), at(0), &motion)
+            resolve_navigation_motion(&buf, &o, at(0), at(0), &motion, false)
         };
         // From the top, count walks the outline: count 1 → idx 1, count 2 → idx 2, count 3 → idx 3.
         assert_eq!(nav(1, true), (o[1].end, Some(o[1].start)));
@@ -1195,6 +1227,39 @@ mod symbol_nav_tests {
         assert_eq!(nav(0, true), (o[1].end, Some(o[1].start)));
         // From the top there's nothing before it, so Prev at any count is a no-op.
         assert_eq!(nav(3, false), (at(0), Some(at(0))));
+    }
+
+    #[test]
+    fn extend_grows_the_selection_to_include_the_identifier() {
+        let o = outline();
+        let buf = Buffer::scratch(1, None, 1);
+        let ext = |pos, anchor, count, forward| {
+            let motion = if forward {
+                Motion::NextNavigationUnit { count }
+            } else {
+                Motion::PrevNavigationUnit { count }
+            };
+            resolve_navigation_motion(&buf, &o, pos, anchor, &motion, true)
+        };
+
+        // `Shift-o` from the top point grows the cursor forward to the first symbol's name end,
+        // pinning the anchor at the original edge (it does *not* collapse onto the identifier).
+        assert_eq!(ext(at(0), at(0), 1, true), (o[1].end, Some(at(0))));
+
+        // From a selection of `impl S` (idx 1: anchor at name start, cursor at name end), `Shift-o`
+        // extends forward to include `fn a` (idx 2): cursor → idx 2's name end, anchor stays at the
+        // selection's backward edge (idx 1's start).
+        assert_eq!(ext(o[1].end, o[1].start, 1, true), (o[2].end, Some(o[1].start)));
+
+        // `Shift-Alt-o` from that same selection extends *backward* to include `struct S` (idx 0):
+        // cursor → idx 0's name *start*, anchor pinned to the selection's forward edge (idx 1's end).
+        assert_eq!(ext(o[1].end, o[1].start, 1, false), (o[0].start, Some(o[1].end)));
+
+        // A count grows past several identifiers in one go (forward two from the top → idx 2's end).
+        assert_eq!(ext(at(0), at(0), 2, true), (o[2].end, Some(at(0))));
+
+        // Running out of symbols leaves the selection untouched rather than collapsing it.
+        assert_eq!(ext(o[5].end, o[5].start, 1, true), (o[5].end, Some(o[5].start)));
     }
 
     #[test]

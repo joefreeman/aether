@@ -31,6 +31,10 @@ pub struct GitNavigateHunkParams {
     /// cursor lands on the furthest reachable hunk rather than not moving at all.
     #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
     pub count: u32,
+    /// Grow the selection to the landing hunk (Shift) rather than collapsing to a point there: the
+    /// anchor is kept and the cursor jumps to the hunk.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub extend: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

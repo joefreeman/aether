@@ -68,12 +68,6 @@ impl Mods {
         alt: false,
         shift: true,
     };
-    const SHIFT_ALT: Mods = Mods {
-        ctrl: false,
-        alt: true,
-        shift: true,
-    };
-
     fn without_shift(self) -> Mods {
         Mods {
             shift: false,
@@ -198,9 +192,6 @@ pub enum Action {
         half: bool,
     },
     NavUnit(Direction),
-    NavUnitEdge {
-        start: bool,
-    },
     BeginFind {
         dir: Direction,
         till: bool,
@@ -362,7 +353,6 @@ impl Action {
                 | Action::MatchBracket { .. }
                 | Action::PageMotion { .. }
                 | Action::NavUnit(_)
-                | Action::NavUnitEdge { .. }
                 | Action::SelectWord { .. }
                 | Action::SelectLine(_)
                 | Action::TreeExpand
@@ -620,19 +610,17 @@ static NORMAL: &[Binding] = &[
     // ---- motions: brackets / nav units / goto ----
     bind!(N, ch('m'), IgnoreShift(Mods::NONE), A::MatchBracket { inner: false }, "Motion", "Matching bracket"),
     bind!(N, ch('m'), IgnoreShift(Mods::ALT), A::MatchBracket { inner: true }, "Motion", "Inner matching bracket"),
-    bind!(N, ch('o'), Exact(Mods::NONE), A::NavUnit(Direction::Forward), "Navigation", "Next symbol"),
-    bind!(N, ch('o'), Exact(Mods::ALT), A::NavUnit(Direction::Backward), "Navigation", "Previous symbol"),
-    bind!(N, ch('o'), Exact(Mods::SHIFT), A::NavUnitEdge { start: false }, "Navigation", "Select to end of unit"),
-    bind!(N, ch('o'), Exact(Mods::SHIFT_ALT), A::NavUnitEdge { start: true }, "Navigation", "Select to start of unit"),
+    bind!(N, ch('o'), IgnoreShift(Mods::NONE), A::NavUnit(Direction::Forward), "Navigation", "Next symbol"),
+    bind!(N, ch('o'), IgnoreShift(Mods::ALT), A::NavUnit(Direction::Backward), "Navigation", "Previous symbol"),
     bind!(N, ch('g'), IgnoreShift(Mods::ALT), A::GotoLine { last: true }, "Motion", "Go to line from end (count, default last)"),
     bind!(N, ch('g'), IgnoreShift(Mods::NONE), A::GotoLine { last: false }, "Motion", "Go to line (count, default 1)"),
     bind!(N, KeyCode::Enter, Exact(Mods::NONE), A::GotoDefinition, "Code", "Go to definition"),
 
     // ---- cursor-local git / diagnostic navigation (the list pickers live under Space) ----
-    bind!(N, ch('c'), Exact(Mods::NONE), A::NextHunk, "Git", "Next change (hunk)"),
-    bind!(N, ch('c'), Exact(Mods::ALT), A::PrevHunk, "Git", "Previous change (hunk)"),
-    bind!(N, ch('d'), Exact(Mods::NONE), A::NextDiagnostic, "Code", "Next diagnostic"),
-    bind!(N, ch('d'), Exact(Mods::ALT), A::PrevDiagnostic, "Code", "Previous diagnostic"),
+    bind!(N, ch('c'), IgnoreShift(Mods::NONE), A::NextHunk, "Git", "Next change (hunk)"),
+    bind!(N, ch('c'), IgnoreShift(Mods::ALT), A::PrevHunk, "Git", "Previous change (hunk)"),
+    bind!(N, ch('d'), IgnoreShift(Mods::NONE), A::NextDiagnostic, "Code", "Next diagnostic"),
+    bind!(N, ch('d'), IgnoreShift(Mods::ALT), A::PrevDiagnostic, "Code", "Previous diagnostic"),
 
     // ---- line selection ----
     bind!(N, ch('x'), IgnoreShift(Mods::NONE), A::SelectLine(Direction::Forward), "Selection", "Select line downward"),

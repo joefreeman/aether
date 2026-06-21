@@ -167,6 +167,10 @@ pub struct LspNavigateDiagnosticParams {
     /// the cursor lands on the furthest reachable diagnostic rather than not moving at all.
     #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
     pub count: u32,
+    /// Grow the selection to the landing diagnostic (Shift) rather than collapsing to a point there:
+    /// the anchor is kept and the cursor jumps to the diagnostic.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub extend: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

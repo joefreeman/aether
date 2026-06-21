@@ -4472,13 +4472,11 @@ impl Session {
                 )
             }
             A::NavUnit(Direction::Forward) => {
-                self.move_motion(Motion::NextNavigationUnit { count }, false)
+                self.move_motion(Motion::NextNavigationUnit { count }, extend)
             }
             A::NavUnit(Direction::Backward) => {
-                self.move_motion(Motion::PrevNavigationUnit { count }, false)
+                self.move_motion(Motion::PrevNavigationUnit { count }, extend)
             }
-            A::NavUnitEdge { start: false } => self.move_motion(Motion::EndOfNavigationUnit, true),
-            A::NavUnitEdge { start: true } => self.move_motion(Motion::StartOfNavigationUnit, true),
             A::BeginFind { dir, till } => {
                 self.pending = Pending::Find {
                     dir,
@@ -4782,6 +4780,7 @@ impl Session {
                         from_line: self.buffer.cursor.position.line,
                         direction,
                         count,
+                        extend,
                     },
                     Event::HunkNav,
                 )
@@ -4832,6 +4831,7 @@ impl Session {
                         buffer_id,
                         direction,
                         count,
+                        extend,
                     },
                     Event::DiagNav,
                 )

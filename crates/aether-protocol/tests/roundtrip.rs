@@ -376,24 +376,26 @@ fn git_navigate_hunk_shapes() {
         from_line: 10,
         direction: HunkDirection::Next,
         count: 1,
+        extend: false,
     };
     let v = to_value(&p).unwrap();
-    // count == 1 is the default and stays off the wire.
+    // count == 1 and extend == false are the defaults and stay off the wire.
     assert_eq!(
         v,
         json!({"buffer_id": 2, "from_line": 10, "direction": "next"})
     );
-    // A larger count rides along.
+    // A larger count and extend ride along when set.
     let v3 = to_value(&GitNavigateHunkParams {
         buffer_id: 2,
         from_line: 10,
         direction: HunkDirection::Next,
         count: 3,
+        extend: true,
     })
     .unwrap();
     assert_eq!(
         v3,
-        json!({"buffer_id": 2, "from_line": 10, "direction": "next", "count": 3})
+        json!({"buffer_id": 2, "from_line": 10, "direction": "next", "count": 3, "extend": true})
     );
     assert_eq!(GitNavigateHunk::NAME, "git/navigate_hunk");
 }
@@ -1007,19 +1009,24 @@ fn lsp_navigate_diagnostic_shape() {
         buffer_id: 7,
         direction: DiagnosticDirection::Next,
         count: 1,
+        extend: false,
     };
     let v = to_value(&p).unwrap();
-    // count == 1 is the default and stays off the wire. Navigation is from the server's cursor, so
-    // no position rides on the params.
+    // count == 1 and extend == false are the defaults and stay off the wire. Navigation is from the
+    // server's cursor, so no position rides on the params.
     assert_eq!(v, json!({"buffer_id": 7, "direction": "next"}));
-    // A larger count rides along.
+    // A larger count and extend ride along when set.
     let v2 = to_value(&LspNavigateDiagnosticParams {
         buffer_id: 7,
         direction: DiagnosticDirection::Next,
         count: 2,
+        extend: true,
     })
     .unwrap();
-    assert_eq!(v2, json!({"buffer_id": 7, "direction": "next", "count": 2}));
+    assert_eq!(
+        v2,
+        json!({"buffer_id": 7, "direction": "next", "count": 2, "extend": true})
+    );
     assert_eq!(to_value(DiagnosticDirection::Prev).unwrap(), json!("prev"));
     let r = LspNavigateDiagnosticResult {
         cursor: CursorState::default(),

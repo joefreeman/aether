@@ -16881,6 +16881,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
             from_line: 0,
             direction: HunkDirection::Next,
             count: 1,
+            extend: false,
         },
     )
     .await;
@@ -16896,6 +16897,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
             from_line: 3,
             direction: HunkDirection::Next,
             count: 1,
+            extend: false,
         },
     )
     .await;
@@ -16910,11 +16912,30 @@ async fn git_navigate_hunk_jumps_between_changes() {
             from_line: 3,
             direction: HunkDirection::Prev,
             count: 1,
+            extend: false,
         },
     )
     .await;
     assert!(prev.moved);
     assert_eq!(prev.cursor.position.line, 0);
+
+    // Extend (Shift) keeps the anchor and grows the selection to the hunk: from the point at line 0,
+    // an extending Next lands the cursor on line 3 while the anchor stays at line 0.
+    let grown: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        &mut ws,
+        9,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line: 0,
+            direction: HunkDirection::Next,
+            count: 1,
+            extend: true,
+        },
+    )
+    .await;
+    assert!(grown.moved);
+    assert_eq!(grown.cursor.position.line, 3);
+    assert_eq!(grown.cursor.anchor.line, 0, "extend keeps the anchor");
 
     drop(server);
 }
@@ -16996,6 +17017,7 @@ async fn git_navigate_hunk_honours_count() {
                 from_line: 0,
                 direction: HunkDirection::Next,
                 count,
+                extend: false,
             },
         )
         .await;
@@ -17012,6 +17034,7 @@ async fn git_navigate_hunk_honours_count() {
             from_line: 6,
             direction: HunkDirection::Prev,
             count: 2,
+            extend: false,
         },
     )
     .await;

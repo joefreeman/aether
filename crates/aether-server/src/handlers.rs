@@ -1484,7 +1484,13 @@ pub async fn git_navigate_hunk(
     );
     let result = CursorState {
         position,
-        anchor: position,
+        // Extend keeps the existing anchor (grow the selection to the hunk); otherwise collapse to
+        // a point at the landing line.
+        anchor: if params.extend {
+            current.anchor
+        } else {
+            position
+        },
         match_bracket: None,
         grep_position: None,
     };
@@ -1992,7 +1998,13 @@ pub async fn lsp_navigate_diagnostic(
     let position = motion::clamp_position(buf, target);
     let result = CursorState {
         position,
-        anchor: position,
+        // Extend keeps the existing anchor (grow the selection to the diagnostic); otherwise
+        // collapse to a point at the diagnostic.
+        anchor: if params.extend {
+            current.anchor
+        } else {
+            position
+        },
         match_bracket: None,
         grep_position: None,
     };
@@ -5885,21 +5897,23 @@ pub async fn cursor_move(
                 current.position,
                 current.anchor,
                 &params.motion,
+                params.extend_selection,
             );
             nav_anchor = anchor;
             pos
         }
         _ => motion::resolve_motion(buf, current.position, &params.motion),
     };
-    // Extending: keep the current anchor (which may already equal position, i.e. a point).
-    // A navigation motion that selected its target (`o`/`Alt-o` → the identifier) supplies its own
-    // anchor. Otherwise: collapse to a 1-char point at the new position. The data model always has
-    // an anchor, so "no selection" means `anchor == position`.
-    let new_anchor = if params.extend_selection {
+    // A navigation motion that supplies its own anchor wins: `o`/`Alt-o` select the identifier, and
+    // `Shift-o`/`Shift-Alt-o` grow the selection to include it (anchor pinned to the kept edge).
+    // Otherwise extend keeps the current anchor (which may already equal position, i.e. a point) and
+    // a plain move collapses to a 1-char point. The data model always has an anchor, so "no
+    // selection" means `anchor == position`.
+    let new_anchor = nav_anchor.unwrap_or(if params.extend_selection {
         current.anchor
     } else {
-        nav_anchor.unwrap_or(new_pos)
-    };
+        new_pos
+    });
 
     let new_state = CursorState {
         position: new_pos,

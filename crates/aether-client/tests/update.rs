@@ -155,6 +155,59 @@ fn search_and_diagnostic_navigation_reveal_as_jumps() {
 }
 
 #[test]
+fn shift_extends_hunk_and_diagnostic_navigation() {
+    // Plain `c`/`d` collapse to the target (no extend on the wire); Shift grows the selection.
+    let press = |c: char, mods: Mods| -> serde_json::Value {
+        let mut s = session();
+        let fx = s.on_key(KeyCode::Char(c), mods, None, ROWS);
+        the_request(&fx).2
+    };
+
+    // `c` → git/navigate_hunk, no extend; `Shift-c` → extend: true.
+    assert_eq!(press('c', Mods::NONE)["extend"], json!(null));
+    assert_eq!(press('c', Mods::SHIFT)["extend"], json!(true));
+    // `Alt-c` (prev) likewise gains extend under Shift-Alt.
+    let shift_alt = Mods {
+        shift: true,
+        ..Mods::ALT
+    };
+    assert_eq!(press('c', shift_alt)["extend"], json!(true));
+
+    // Same for diagnostics (`d` → lsp/navigate_diagnostic).
+    assert_eq!(press('d', Mods::NONE)["extend"], json!(null));
+    assert_eq!(press('d', Mods::SHIFT)["extend"], json!(true));
+    assert_eq!(press('d', shift_alt)["extend"], json!(true));
+}
+
+#[test]
+fn shift_extends_symbol_navigation() {
+    let press = |mods: Mods| -> serde_json::Value {
+        let mut s = session();
+        let fx = s.on_key(KeyCode::Char('o'), mods, None, ROWS);
+        let (_, method, params) = the_request(&fx);
+        assert_eq!(method, "cursor/move");
+        params
+    };
+    let shift_alt = Mods {
+        shift: true,
+        ..Mods::ALT
+    };
+    // `o`/`Alt-o` move; `Shift-o`/`Shift-Alt-o` extend the selection (same motion, extend flag set).
+    assert_eq!(
+        press(Mods::NONE)["motion"]["kind"],
+        json!("next_navigation_unit")
+    );
+    assert_eq!(press(Mods::NONE)["extend_selection"], json!(false));
+    assert_eq!(press(Mods::SHIFT)["extend_selection"], json!(true));
+    assert_eq!(
+        press(Mods::ALT)["motion"]["kind"],
+        json!("prev_navigation_unit")
+    );
+    assert_eq!(press(Mods::ALT)["extend_selection"], json!(false));
+    assert_eq!(press(shift_alt)["extend_selection"], json!(true));
+}
+
+#[test]
 fn nav_back_into_the_same_buffer_reveals_as_a_jump() {
     use aether_client::effect::RevealStyle;
     use aether_client::update::Event;
