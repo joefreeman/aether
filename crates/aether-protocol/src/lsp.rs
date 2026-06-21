@@ -162,9 +162,11 @@ impl RpcMethod for LspNavigateDiagnostic {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LspNavigateDiagnosticParams {
     pub buffer_id: BufferId,
-    /// The cursor's current 0-based line; the search for the next/previous diagnostic starts here.
-    pub from_line: u32,
     pub direction: DiagnosticDirection,
+    /// How many diagnostics to skip in `direction`. Defaults to 1; when fewer than `count` remain
+    /// the cursor lands on the furthest reachable diagnostic rather than not moving at all.
+    #[serde(default = "crate::count_one", skip_serializing_if = "crate::count_is_one")]
+    pub count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

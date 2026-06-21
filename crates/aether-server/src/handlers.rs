@@ -1976,8 +1976,9 @@ pub async fn lsp_navigate_diagnostic(
 
     let target = navigate_diagnostic_target(
         buffer_diagnostics(&s, params.buffer_id),
-        params.from_line,
+        current.position,
         params.direction,
+        params.count,
     );
     let Some(target) = target else {
         let response = wrap_for_response(&s, client_id, params.buffer_id, current);
@@ -2011,21 +2012,36 @@ pub async fn lsp_navigate_diagnostic(
     })
 }
 
-/// The position of the nearest diagnostic strictly beyond `from_line` in `direction`, or `None` if
+/// The position of the `count`-th diagnostic strictly beyond `from` in `direction`, or `None` if
 /// there's none that way. Diagnostics are compared by their start position (line then byte column),
-/// so the jump lands on the diagnostic's column; like hunk navigation it's line-granular — a second
-/// diagnostic on the cursor's own line isn't a separate stop.
+/// so the jump is *position*-granular: a second diagnostic further along the cursor's own line is a
+/// distinct stop, and navigation moves off the exact cursor position rather than off its whole line.
+/// An over-large `count` clamps to the furthest reachable diagnostic rather than refusing to move.
 fn navigate_diagnostic_target(
     diags: &[crate::lsp::diagnostics::BufferDiagnostic],
-    from_line: u32,
+    from: LogicalPosition,
     direction: DiagnosticDirection,
+    count: u32,
 ) -> Option<LogicalPosition> {
+    let key = |p: &LogicalPosition| (p.line, p.col);
+    let from_key = key(&from);
     let mut anchors: Vec<LogicalPosition> = diags.iter().map(|d| d.start).collect();
-    anchors.sort_by_key(|p| (p.line, p.col));
+    anchors.sort_by_key(key);
     anchors.dedup();
+    let skip = (count.max(1) - 1) as usize;
     match direction {
-        DiagnosticDirection::Next => anchors.iter().find(|p| p.line > from_line).copied(),
-        DiagnosticDirection::Prev => anchors.iter().rev().find(|p| p.line < from_line).copied(),
+        DiagnosticDirection::Next => {
+            let mut it = anchors.iter().filter(|p| key(p) > from_key);
+            it.nth(skip)
+                .or_else(|| anchors.iter().rfind(|p| key(p) > from_key))
+                .copied()
+        }
+        DiagnosticDirection::Prev => {
+            let mut it = anchors.iter().rev().filter(|p| key(p) < from_key);
+            it.nth(skip)
+                .or_else(|| anchors.iter().find(|p| key(p) < from_key))
+                .copied()
+        }
     }
 }
 
@@ -11445,34 +11461,73 @@ mod diagnostic_span_tests {
     fn navigate_diagnostic_finds_next_and_prev() {
         use DiagnosticDirection::{Next, Prev};
         // Diagnostics on lines 2 (col 4), 5, 9 — deliberately out of order to exercise the sort.
+        let pos = |line, col| LogicalPosition { line, col };
         let diags = [diag(5, 0, 5, 1), diag(2, 4, 2, 6), diag(9, 0, 9, 3)];
-        // From line 3: next is line 5, prev is line 2 (at its column).
+        // From (3, 0): next is line 5, prev is line 2 (at its column).
         assert_eq!(
-            navigate_diagnostic_target(&diags, 3, Next),
-            Some(LogicalPosition { line: 5, col: 0 })
+            navigate_diagnostic_target(&diags, pos(3, 0), Next, 1),
+            Some(pos(5, 0))
         );
         assert_eq!(
-            navigate_diagnostic_target(&diags, 3, Prev),
-            Some(LogicalPosition { line: 2, col: 4 })
+            navigate_diagnostic_target(&diags, pos(3, 0), Prev, 1),
+            Some(pos(2, 4))
         );
-        // Strictly beyond the cursor line: standing on a diagnostic line skips it.
+        // Strictly beyond the cursor *position*: standing exactly on a diagnostic skips it.
         assert_eq!(
-            navigate_diagnostic_target(&diags, 5, Next),
-            Some(LogicalPosition { line: 9, col: 0 })
+            navigate_diagnostic_target(&diags, pos(5, 0), Next, 1),
+            Some(pos(9, 0))
         );
         assert_eq!(
-            navigate_diagnostic_target(&diags, 5, Prev),
-            Some(LogicalPosition { line: 2, col: 4 })
+            navigate_diagnostic_target(&diags, pos(5, 0), Prev, 1),
+            Some(pos(2, 4))
         );
+        // Count walks the list: from (3, 0), count 2 forward skips line 5 to land on line 9.
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(3, 0), Next, 2),
+            Some(pos(9, 0))
+        );
+        // An over-large count clamps to the furthest diagnostic rather than returning None.
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(3, 0), Next, 9),
+            Some(pos(9, 0))
+        );
+        // count 0 behaves as 1.
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(3, 0), Next, 0),
+            Some(pos(5, 0))
+        );
+    }
+
+    #[test]
+    fn navigate_diagnostic_distinguishes_diagnostics_on_one_line() {
+        use DiagnosticDirection::{Next, Prev};
+        let pos = |line, col| LogicalPosition { line, col };
+        // Three diagnostics on line 5 (cols 2, 8, 14) plus a neighbour on line 9.
+        let diags = [diag(5, 8, 5, 9), diag(5, 2, 5, 4), diag(9, 0, 9, 1), diag(5, 14, 5, 16)];
+        // From the line start, Next steps through each same-line diagnostic by column…
+        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 0), Next, 1), Some(pos(5, 2)));
+        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 2), Next, 1), Some(pos(5, 8)));
+        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 8), Next, 1), Some(pos(5, 14)));
+        // …then crosses to the next line once the line's diagnostics are exhausted.
+        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 14), Next, 1), Some(pos(9, 0)));
+        // A count jumps multiple same-line diagnostics at once.
+        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 0), Next, 3), Some(pos(5, 14)));
+        // Prev is the column-aware mirror.
+        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 14), Prev, 1), Some(pos(5, 8)));
+        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 8), Prev, 1), Some(pos(5, 2)));
+        // A cursor mid-span (col 10, between the col-8 and col-14 diagnostics) resolves by position.
+        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 10), Next, 1), Some(pos(5, 14)));
+        assert_eq!(navigate_diagnostic_target(&diags, pos(5, 10), Prev, 1), Some(pos(5, 8)));
     }
 
     #[test]
     fn navigate_diagnostic_returns_none_at_the_ends() {
         use DiagnosticDirection::{Next, Prev};
+        let pos = |line, col| LogicalPosition { line, col };
         let diags = [diag(2, 0, 2, 1), diag(7, 0, 7, 1)];
-        assert_eq!(navigate_diagnostic_target(&diags, 7, Next), None); // nothing past the last
-        assert_eq!(navigate_diagnostic_target(&diags, 2, Prev), None); // nothing before the first
-        assert_eq!(navigate_diagnostic_target(&[], 0, Next), None); // no diagnostics at all
+        assert_eq!(navigate_diagnostic_target(&diags, pos(7, 0), Next, 1), None); // past the last
+        assert_eq!(navigate_diagnostic_target(&diags, pos(2, 0), Prev, 1), None); // before the first
+        assert_eq!(navigate_diagnostic_target(&[], pos(0, 0), Next, 1), None); // none at all
     }
 }
 

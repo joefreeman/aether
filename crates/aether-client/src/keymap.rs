@@ -624,7 +624,7 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('o'), Exact(Mods::ALT), A::NavUnit(Direction::Backward), "Navigation", "Previous symbol"),
     bind!(N, ch('o'), Exact(Mods::SHIFT), A::NavUnitEdge { start: false }, "Navigation", "Select to end of unit"),
     bind!(N, ch('o'), Exact(Mods::SHIFT_ALT), A::NavUnitEdge { start: true }, "Navigation", "Select to start of unit"),
-    bind!(N, ch('g'), IgnoreShift(Mods::ALT), A::GotoLine { last: true }, "Motion", "Go to last line"),
+    bind!(N, ch('g'), IgnoreShift(Mods::ALT), A::GotoLine { last: true }, "Motion", "Go to line from end (count, default last)"),
     bind!(N, ch('g'), IgnoreShift(Mods::NONE), A::GotoLine { last: false }, "Motion", "Go to line (count, default 1)"),
     bind!(N, KeyCode::Enter, Exact(Mods::NONE), A::GotoDefinition, "Code", "Go to definition"),
 

@@ -99,6 +99,38 @@ fn ordinary_motion_follows_but_goto_line_jumps() {
 }
 
 #[test]
+fn goto_line_from_end_counts_up_from_the_bottom() {
+    use aether_protocol::viewport::Window;
+    // The client needs the buffer's line count (carried on the window) to count from the bottom.
+    let mut s = session();
+    s.window = Some(Window {
+        first_logical_line: 0,
+        last_logical_line_exclusive: 40,
+        line_count: 100,
+        max_scroll_logical_line: 60,
+        total_visual_rows: 100,
+        first_visual_row: 0,
+        max_line_width: 0,
+        git_status: None,
+        lines: vec![],
+    });
+
+    let goto_line = |s: &mut Session| -> u64 {
+        let fx = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+        let (_, method, params) = the_request(&fx);
+        assert_eq!(method, "cursor/move");
+        assert_eq!(params["motion"]["kind"], "goto");
+        params["motion"]["position"]["line"].as_u64().unwrap()
+    };
+
+    // Bare `Alt-g` (count 1) lands on the last line (index 99).
+    assert_eq!(goto_line(&mut s), 99);
+    // `3 Alt-g` is three lines up from the end: 100 - 3 = 97.
+    let _ = key(&mut s, '3');
+    assert_eq!(goto_line(&mut s), 97);
+}
+
+#[test]
 fn search_and_diagnostic_navigation_reveal_as_jumps() {
     use aether_client::effect::RevealStyle;
     use aether_client::update::Event;

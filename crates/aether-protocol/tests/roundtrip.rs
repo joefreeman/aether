@@ -1005,14 +1005,21 @@ fn lsp_navigate_diagnostic_shape() {
     assert_eq!(LspNavigateDiagnostic::NAME, "lsp/navigate_diagnostic");
     let p = LspNavigateDiagnosticParams {
         buffer_id: 7,
-        from_line: 3,
         direction: DiagnosticDirection::Next,
+        count: 1,
     };
     let v = to_value(&p).unwrap();
-    assert_eq!(
-        v,
-        json!({"buffer_id": 7, "from_line": 3, "direction": "next"})
-    );
+    // count == 1 is the default and stays off the wire. Navigation is from the server's cursor, so
+    // no position rides on the params.
+    assert_eq!(v, json!({"buffer_id": 7, "direction": "next"}));
+    // A larger count rides along.
+    let v2 = to_value(&LspNavigateDiagnosticParams {
+        buffer_id: 7,
+        direction: DiagnosticDirection::Next,
+        count: 2,
+    })
+    .unwrap();
+    assert_eq!(v2, json!({"buffer_id": 7, "direction": "next", "count": 2}));
     assert_eq!(to_value(DiagnosticDirection::Prev).unwrap(), json!("prev"));
     let r = LspNavigateDiagnosticResult {
         cursor: CursorState::default(),

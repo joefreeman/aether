@@ -4439,9 +4439,11 @@ impl Session {
             ),
             A::GotoLine { last } => {
                 let line = if last {
+                    // `Alt-g` counts from the bottom: bare (count 1) → last line, `N Alt-g` → the
+                    // N-th line up from the end. `g`/`Alt-g` are thus mirror absolute jumps.
                     self.window
                         .as_ref()
-                        .map(|w| w.line_count.saturating_sub(1))
+                        .map(|w| w.line_count.saturating_sub(count))
                         .unwrap_or(0)
                 } else {
                     count.saturating_sub(1)
@@ -4828,8 +4830,8 @@ impl Session {
                 self.request_str::<LspNavigateDiagnostic>(
                     LspNavigateDiagnosticParams {
                         buffer_id,
-                        from_line: self.buffer.cursor.position.line,
                         direction,
+                        count,
                     },
                     Event::DiagNav,
                 )
