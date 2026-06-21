@@ -239,10 +239,7 @@ impl Session {
             Event::CursorMsg(Err(e)) => Effects::error(e),
 
             // Go-to-line and other targeted motions reveal as a jump (rest a quarter down).
-            Event::CursorJump(Ok(cursor)) => {
-                self.buffer.cursor = cursor;
-                Effects::one(Effect::RevealCursor(RevealStyle::Jump))
-            }
+            Event::CursorJump(Ok(cursor)) => self.jump_to_cursor(cursor),
             Event::CursorJump(Err(e)) => Effects::error(e),
 
             Event::EditDone(Ok(r)) => {
@@ -291,7 +288,7 @@ impl Session {
                 self.paste(kind, text)
             }
 
-            Event::Switched(Ok(open)) => self.adopt_switch(open),
+            Event::Switched(Ok(open)) => self.adopt_navigation(open),
             Event::Switched(Err(e)) => Effects::error(e),
 
             Event::SwitchedPrimed(Ok(Some((query, options, open)))) => {
@@ -299,16 +296,8 @@ impl Session {
                 // `search/state_changed` push races this switch and the client's `buffer_id`
                 // guard drops it if it lands before the switch, so the count rode the response.
                 let summary = open.search_summary.clone();
-                // A hit in the SAME buffer is a move, not a switch: keep the window/viewport/
-                // diagnostics and just reposition the cursor, so the shell animates a short scroll to
-                // it (consecutive same-file hits glide) instead of resubscribing — which replaces the
-                // whole window and reads as an instant jump.
-                let fx = if open.buffer_id == self.buffer.buffer_id {
-                    self.buffer.cursor = open.cursor;
-                    Effects::one(Effect::RevealCursor(RevealStyle::Jump))
-                } else {
-                    self.adopt_switch(open)
-                };
+                // Same-buffer hits glide, cross-buffer hits switch — see `adopt_navigation`.
+                let fx = self.adopt_navigation(open);
                 // adopt_switch reset the search state; adopt the primed query + options (the
                 // server-side search was already set in the open chain) and its summary, so the
                 // search reads and steps exactly as the grep that found the hit did.
@@ -357,9 +346,8 @@ impl Session {
             Event::SearchRestored(Err(e)) => Effects::error(e),
 
             Event::SearchNav(Ok(r)) => {
-                self.buffer.cursor = r.cursor;
                 self.search.summary = Some(r.summary);
-                Effects::one(Effect::RevealCursor(RevealStyle::Jump))
+                self.jump_to_cursor(r.cursor)
             }
             Event::SearchNav(Err(e)) => Effects::error(e),
 
@@ -377,7 +365,8 @@ impl Session {
             Event::SearchFromSel(Err(e)) => Effects::error(e),
 
             Event::NavDone { forward, result } => match result {
-                Ok(NavStepResult { target: Some(open) }) => self.adopt_switch(open),
+                // Same-buffer step glides, cross-buffer step switches — see `adopt_navigation`.
+                Ok(NavStepResult { target: Some(open) }) => self.adopt_navigation(open),
                 Ok(_) => Effects::toast(
                     if forward {
                         "no later location in history"
@@ -400,16 +389,7 @@ impl Session {
             },
             Event::Definition(Err(e)) => Effects::error(e),
 
-            Event::DiagNav(Ok(r)) => {
-                self.buffer.cursor = r.cursor;
-                let mut fx = if r.moved {
-                    Effects::none()
-                } else {
-                    Effects::toast("no more diagnostics", ToastKind::Info)
-                };
-                fx.push(Effect::RevealCursor(RevealStyle::Jump));
-                fx
-            }
+            Event::DiagNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "no more diagnostics"),
             Event::DiagNav(Err(e)) => Effects::error(e),
 
             Event::HoverInfo(Ok(r)) => match r.contents {
@@ -484,16 +464,7 @@ impl Session {
                 Effects::none()
             }
 
-            Event::HunkNav(Ok(r)) => {
-                self.buffer.cursor = r.cursor;
-                let mut fx = if r.moved {
-                    Effects::none()
-                } else {
-                    Effects::toast("no more changes", ToastKind::Info)
-                };
-                fx.push(Effect::RevealCursor(RevealStyle::Jump));
-                fx
-            }
+            Event::HunkNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "no more changes"),
             Event::HunkNav(Err(e)) => Effects::error(e),
 
             Event::HunkApplied { action, result } => match result {
@@ -1236,6 +1207,48 @@ impl Session {
             WrapMode::None => WrapMode::Soft,
         };
         Effects::none()
+    }
+
+    /// Land the cursor on a target reached by a same-buffer jump — go-to-line, search `n`/`N`, or
+    /// the same-buffer branch of a navigation — and reveal it with a `Jump` scroll: short hops
+    /// glide, far ones snap (the shell decides which). The one primitive for *how* an in-file jump
+    /// scrolls into view, so every jump-style motion frames its target identically.
+    pub fn jump_to_cursor(&mut self, cursor: CursorState) -> Effects {
+        self.buffer.cursor = cursor;
+        Effects::one(Effect::RevealCursor(RevealStyle::Jump))
+    }
+
+    /// [`Self::jump_to_cursor`] for a *stepping* motion (next/prev diagnostic or hunk), which can
+    /// run out of places to go: reveal the cursor as a jump, but when the step found nowhere new
+    /// (`moved == false`) toast `exhausted` instead of silently re-revealing the same spot.
+    pub fn step_to_cursor(&mut self, cursor: CursorState, moved: bool, exhausted: &str) -> Effects {
+        self.buffer.cursor = cursor;
+        let mut fx = if moved {
+            Effects::none()
+        } else {
+            Effects::toast(exhausted, ToastKind::Info)
+        };
+        fx.push(Effect::RevealCursor(RevealStyle::Jump));
+        fx
+    }
+
+    /// Adopt the result of a navigation that moves the cursor and *may* land in the buffer we're
+    /// already on (goto-definition, a picker / explorer open, a grep hit, nav-history back/forward).
+    ///
+    /// A hit in the SAME buffer is a move, not a switch: keep the window / viewport / diagnostics
+    /// and just reposition the cursor, letting the shell reveal it with a `Jump` scroll — short
+    /// hops glide, far ones snap. Resubscribing would replace the whole window (reading as an
+    /// instant jump) and, for a nav-history step, reinstate the *saved* scroll that predates the
+    /// jump, stranding the cursor off-screen. A hit in a DIFFERENT buffer is a real switch
+    /// ([`Self::adopt_switch`]). One definition so every cursor-moving navigation scrolls its
+    /// target into view the same way; genuine buffer switches (close, new-scratch, project change)
+    /// always land on a different `buffer_id`, so routing them here is just a switch.
+    pub fn adopt_navigation(&mut self, open: BufferOpenResult) -> Effects {
+        if open.buffer_id == self.buffer.buffer_id {
+            self.jump_to_cursor(open.cursor)
+        } else {
+            self.adopt_switch(open)
+        }
     }
 
     /// Rebind the session to a freshly opened buffer: reset all per-buffer state (modal,

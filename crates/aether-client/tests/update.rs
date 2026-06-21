@@ -123,6 +123,109 @@ fn search_and_diagnostic_navigation_reveal_as_jumps() {
 }
 
 #[test]
+fn nav_back_into_the_same_buffer_reveals_as_a_jump() {
+    use aether_client::effect::RevealStyle;
+    use aether_client::update::Event;
+
+    // A back/forward jump that lands in the buffer we're already on is a move, not a switch:
+    // it must reposition the cursor and reveal it (Jump scroll), not resubscribe — otherwise the
+    // restored scroll predates the jump and the cursor lands off-screen.
+    let mut s = session();
+    s.buffer.buffer_id = 7;
+    let same_buffer_open = json!({
+        "buffer_id": 7,
+        "language": null,
+        "line_count": 200,
+        "byte_count": 4000,
+        "revision": 1,
+        "saved_revision": 1,
+        "path": "/p/foo.rs",
+        "cursor": { "position": {"line": 150, "col": 3}, "anchor": {"line": 150, "col": 3} },
+    });
+    let fx = s.on_event(Event::NavDone {
+        forward: false,
+        result: Ok(serde_json::from_value(json!({ "target": same_buffer_open })).unwrap()),
+    });
+    assert_eq!(s.buffer.cursor.position.line, 150);
+    assert_eq!(reveal_style(&fx), Some(RevealStyle::Jump));
+    // A same-buffer move keeps the viewport binding rather than resubscribing.
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
+        "a same-buffer nav jump must not resubscribe"
+    );
+
+    // A jump into a DIFFERENT buffer still resubscribes (full switch).
+    let mut s = session();
+    s.buffer.buffer_id = 7;
+    let other_open = json!({
+        "buffer_id": 9,
+        "language": null,
+        "line_count": 10,
+        "byte_count": 100,
+        "revision": 1,
+        "saved_revision": 1,
+        "path": "/p/bar.rs",
+        "cursor": { "position": {"line": 2, "col": 0}, "anchor": {"line": 2, "col": 0} },
+    });
+    let fx = s.on_event(Event::NavDone {
+        forward: false,
+        result: Ok(serde_json::from_value(json!({ "target": other_open })).unwrap()),
+    });
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
+        "a cross-buffer nav jump resubscribes"
+    );
+}
+
+#[test]
+fn goto_definition_into_the_same_buffer_glides_not_resubscribes() {
+    use aether_client::effect::RevealStyle;
+    use aether_client::update::Event;
+
+    // Goto-definition / picker opens funnel through `Event::Switched`. Landing in the buffer we're
+    // already on must glide to the target (Jump reveal) like a grep hit or nav step — not tear down
+    // and rebuild the whole window. This is the generalisation: one `adopt_navigation` path.
+    let mut s = session();
+    s.buffer.buffer_id = 4;
+    let same = json!({
+        "buffer_id": 4,
+        "language": null,
+        "line_count": 300,
+        "byte_count": 6000,
+        "revision": 2,
+        "saved_revision": 2,
+        "path": "/p/foo.rs",
+        "cursor": { "position": {"line": 250, "col": 8}, "anchor": {"line": 250, "col": 8} },
+    });
+    let fx = s.on_event(Event::Switched(Ok(serde_json::from_value(same).unwrap())));
+    assert_eq!(s.buffer.cursor.position.line, 250);
+    assert_eq!(reveal_style(&fx), Some(RevealStyle::Jump));
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
+        "a same-buffer goto-def must not resubscribe"
+    );
+
+    // A definition in another file is still a full switch.
+    let mut s = session();
+    s.buffer.buffer_id = 4;
+    let other = json!({
+        "buffer_id": 8,
+        "language": null,
+        "line_count": 10,
+        "byte_count": 100,
+        "revision": 1,
+        "saved_revision": 1,
+        "path": "/p/bar.rs",
+        "cursor": { "position": {"line": 1, "col": 0}, "anchor": {"line": 1, "col": 0} },
+    });
+    let fx = s.on_event(Event::Switched(Ok(serde_json::from_value(other).unwrap())));
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
+        "a cross-buffer goto-def resubscribes"
+    );
+}
+
+#[test]
 fn save_as_prompt_is_value_synced_not_keycode_edited() {
     use aether_client::chips::ChipEditorField;
     use aether_client::save_as::SaveAsEditor;
