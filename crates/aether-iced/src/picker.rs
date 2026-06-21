@@ -438,6 +438,9 @@ pub fn overlay<'a>(
             } => {
                 list = list.push(grep_header(roots, path_index, relative_path));
             }
+            DisplayRow::Section { label } => {
+                list = list.push(section_header(label));
+            }
             DisplayRow::Item { abs, item } => {
                 let selected = abs == state.selected;
                 let hovered = state.hovered == Some(abs);
@@ -542,9 +545,9 @@ pub fn overlay<'a>(
                         path_index,
                         relative_path,
                     } => Some((path_index, relative_path.to_string())),
-                    // The create row is Explorer-only; grep (the only picker with headers)
-                    // never shows it, so it's never the pinned row.
-                    DisplayRow::Create { .. } => None,
+                    // References section labels don't sticky-pin (the sections are short — at most
+                    // one definition row), and the create row is Explorer-only.
+                    DisplayRow::Section { .. } | DisplayRow::Create { .. } => None,
                 })
         })
     };
@@ -884,6 +887,21 @@ fn grep_header<'a>(
 ) -> Element<'a, PickerMsg> {
     let mut label = root_label(roots, path_index).unwrap_or_default();
     label.push_str(relative_path);
+    container(text(label).size(13).font(SANS_BOLD).color(theme::NORD8))
+        .width(Length::Fill)
+        .height(ROW_H)
+        .padding([3, 12])
+        .align_y(iced::alignment::Vertical::Center)
+        .style(|_| container::Style {
+            background: Some(theme::NORD1.into()),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// A References-picker section label (`Definition` / `References`). Same footprint and chrome as
+/// [`grep_header`] but a fixed label rather than a file path.
+fn section_header<'a>(label: &'static str) -> Element<'a, PickerMsg> {
     container(text(label).size(13).font(SANS_BOLD).color(theme::NORD8))
         .width(Length::Fill)
         .height(ROW_H)

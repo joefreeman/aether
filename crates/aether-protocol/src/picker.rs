@@ -102,6 +102,20 @@ impl PickerKind {
     pub fn groups_by_file(self) -> bool {
         matches!(self, PickerKind::Grep | PickerKind::GitChanges)
     }
+
+    /// Whether this picker interleaves non-selectable header rows above grouped runs of items.
+    /// A superset of [`Self::groups_by_file`]: the file-grouped kinds (Grep, GitChanges) plus
+    /// References, which groups into a `Definition` section and a `References` section. The header
+    /// *content* and grouping key differ per kind — file path vs section label — but the header
+    /// *row* accounting is identical, so clients gate their header-clearance and virtual-scroll row
+    /// math on this single predicate. `groups_by_file` stays narrower (it also drives the
+    /// cursor-nearest `center_on_cursor` seeding, which References does its own way).
+    pub fn renders_group_headers(self) -> bool {
+        matches!(
+            self,
+            PickerKind::Grep | PickerKind::GitChanges | PickerKind::References
+        )
+    }
 }
 
 /// Save/disk state of an open buffer, shown as a colour-coded dot in the buffer picker and
@@ -410,6 +424,14 @@ pub enum PickerItem {
         col: u32,
         /// The text of the referenced line, trailing newline trimmed. Fuzzy haystack + preview.
         preview: String,
+        /// True for the row that is the symbol's definition (the location `textDocument/definition`
+        /// resolves to), false for an ordinary use. Drives the `Definition` / `References` section
+        /// split: candidates are ordered definition-first, and clients open a section header above
+        /// each run. At most one row is the definition; `false` for every row when the server can't
+        /// resolve a definition (no `textDocument/definition` support, or it falls outside the
+        /// returned references), in which case the list is a single `References` section.
+        #[serde(default)]
+        is_definition: bool,
         /// Char offsets into `preview` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,

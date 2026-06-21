@@ -2382,10 +2382,38 @@ fn parse_location_entry(
     let character = start.get("character")?.as_u64()? as u32;
     let path = crate::lsp::uri::uri_to_path(uri)?;
     let col = target_byte_col(&path, line, character, encoding);
+    let position = LogicalPosition { line, col };
     Some(LspLocation {
         path: path.display().to_string(),
-        position: LogicalPosition { line, col },
+        position,
+        end: lsp_range_end_inclusive(range, position, &path, encoding),
     })
+}
+
+/// The inclusive last position of an LSP `range` (the identifier span), or `start` when the range
+/// is empty, multi-line, or malformed. LSP end is exclusive, so step back one LSP char; identifiers
+/// are single-line, so this stays on the start line and encoding-correct via `target_byte_col`.
+/// Shared by `parse_location_entry` (references / goto-definition) and `push_symbol` (the outline),
+/// so all three land the identifier selected identically.
+fn lsp_range_end_inclusive(
+    range: &serde_json::Value,
+    start: LogicalPosition,
+    path: &std::path::Path,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> LogicalPosition {
+    (|| {
+        let s = range.get("start")?;
+        let e = range.get("end")?;
+        let line = s.get("line")?.as_u64()? as u32;
+        let start_char = s.get("character")?.as_u64()? as u32;
+        let end_char = e.get("character")?.as_u64()? as u32;
+        let same_line = e.get("line")?.as_u64()? as u32 == line;
+        (same_line && end_char > start_char).then(|| LogicalPosition {
+            line,
+            col: target_byte_col(path, line, end_char - 1, encoding),
+        })
+    })()
+    .unwrap_or(start)
 }
 
 /// Parse an LSP `textDocument/references` response (`Location[]`, `LocationLink[]`, or null) into
@@ -2503,22 +2531,10 @@ fn push_symbol(
     let Some(name_pos) = name_range.and_then(|r| pos_at(r, "start")) else {
         return;
     };
-    // Inclusive last char of the name — `selectionRange.end` is exclusive, so step back one
-    // LSP-char (names are single-line, so this stays on the name line and is encoding-correct via
-    // `target_byte_col`). Empty / multi-line / missing ranges fall back to the name start (point).
+    // Inclusive last char of the name span (see `lsp_range_end_inclusive`); a point when there's no
+    // distinct span.
     let name_end = name_range
-        .and_then(|r| {
-            let start = r.get("start")?;
-            let end = r.get("end")?;
-            let line = start.get("line")?.as_u64()? as u32;
-            let start_char = start.get("character")?.as_u64()? as u32;
-            let end_char = end.get("character")?.as_u64()? as u32;
-            let same_line = end.get("line")?.as_u64()? as u32 == line;
-            (same_line && end_char > start_char).then(|| LogicalPosition {
-                line,
-                col: target_byte_col(path, line, end_char - 1, encoding),
-            })
-        })
+        .map(|r| lsp_range_end_inclusive(r, name_pos, path, encoding))
         .unwrap_or(name_pos);
     // The enclosing extent for cursor-containment; fall back to a zero-width span at the name.
     let range_start = full_range
@@ -4884,9 +4900,11 @@ fn build_diagnostic_candidates(
 
 /// Build the references-picker candidates: ask the language server for every reference to the
 /// symbol at the cursor (`textDocument/references`, including the declaration), then attach a
-/// line-text preview and a display label to each. Returns empty when there's no ready server, the
-/// server resolves nothing, or the request fails. Async (off the lock): an LSP round-trip plus
-/// reading each referenced file's line from disk.
+/// line-text preview and a display label to each. A parallel `textDocument/definition` resolves
+/// which of those locations is the symbol's definition, so the picker can split into a `Definition`
+/// section and a `References` section (candidates come back ordered definition-first). Returns empty
+/// when there's no ready server, the server resolves nothing, or the request fails. Async (off the
+/// lock): the two LSP round-trips plus reading each referenced file's line from disk.
 async fn build_reference_candidates(
     state: &SharedState,
     client_id: ClientId,
@@ -4904,20 +4922,38 @@ async fn build_reference_candidates(
     let Some(req) = req else {
         return Vec::new();
     };
-    let params_json = serde_json::json!({
-        "textDocument": { "uri": req.uri },
+    let refs_params = serde_json::json!({
+        "textDocument": { "uri": req.uri.clone() },
         "position": { "line": req.line, "character": req.character },
         "context": { "includeDeclaration": true },
     });
     let locations = match req
         .client
-        .request("textDocument/references", params_json)
+        .request("textDocument/references", refs_params)
         .await
     {
         Ok(v) => parse_references(&v, req.encoding),
         Err(e) => {
             tracing::debug!(error = %e, "lsp references request failed");
             return Vec::new();
+        }
+    };
+    // Resolve the definition in parallel so its reference row can be split into the Definition
+    // section. Non-fatal: on failure (or a server without goto-definition) every row stays a use
+    // and the picker shows a single References section.
+    let def_params = serde_json::json!({
+        "textDocument": { "uri": req.uri },
+        "position": { "line": req.line, "character": req.character },
+    });
+    let definition = match req
+        .client
+        .request("textDocument/definition", def_params)
+        .await
+    {
+        Ok(v) => parse_definition(&v, req.encoding),
+        Err(e) => {
+            tracing::debug!(error = %e, "lsp definition request (for references split) failed");
+            None
         }
     };
 
@@ -4949,7 +4985,10 @@ async fn build_reference_candidates(
                 display_path,
                 line: loc.position.line,
                 col: loc.position.col,
+                end_line: loc.end.line,
+                end_col: loc.end.col,
                 preview,
+                is_definition: false,
             })
         })
         .collect();
@@ -4961,6 +5000,27 @@ async fn build_reference_candidates(
             .then_with(|| (a.line, a.col).cmp(&(b.line, b.col)))
     });
     out.dedup_by(|a, b| a.abs_path == b.abs_path && a.line == b.line && a.col == b.col);
+    // Flag the reference that is the definition. Exact `(path, line, col)` first; else the nearest
+    // column on the same `(path, line)` — goto-definition may report the name's selection-range
+    // start a few columns off from the reference entry. At most one row is flagged.
+    if let Some(def) = definition {
+        let exact = out.iter().position(|c| {
+            c.abs_path == def.path && c.line == def.position.line && c.col == def.position.col
+        });
+        let chosen = exact.or_else(|| {
+            out.iter()
+                .enumerate()
+                .filter(|(_, c)| c.abs_path == def.path && c.line == def.position.line)
+                .min_by_key(|(_, c)| c.col.abs_diff(def.position.col))
+                .map(|(i, _)| i)
+        });
+        if let Some(i) = chosen {
+            out[i].is_definition = true;
+        }
+    }
+    // Definition first, then the file-grouped order within each section. Stable `sort_by_key`, so
+    // the `(display_path, line, col)` ordering set above survives inside each section.
+    out.sort_by_key(|c| !c.is_definition);
     out
 }
 
@@ -5095,6 +5155,10 @@ async fn apply_async_candidates(
     epoch: u64,
     candidates: picker_state::PickerCandidates,
     cursor: Option<LogicalPosition>,
+    // The canonical path of the buffer `cursor` lives in — only needed by References, whose
+    // candidates are cross-file, to seed on the occurrence in the active file. `None` for the
+    // single-file DocumentSymbols seeding.
+    cursor_path: Option<String>,
 ) {
     let mut s = state.lock().await;
     let key = (client_id, kind);
@@ -5130,6 +5194,29 @@ async fn apply_async_candidates(
                 (c.depth, c.range_start.line, c.range_start.col)
             })
             .map(|(rank, &ci)| (rank as u32, ci as usize)),
+        // References: seed on the occurrence the cursor is on (find-references is invoked from a
+        // use of the symbol). Among the references in the active file, take the nearest at-or-after
+        // the cursor, wrapping to that file's first — mirroring the grep cursor-nearest rule. Then
+        // map that candidate to its rank so the window frames around it.
+        (picker_state::PickerCandidates::References(refs), Some(pos)) => {
+            let path = cursor_path.as_deref();
+            picker
+                .ranked
+                .iter()
+                .map(|&ci| ci as usize)
+                .filter(|&ci| Some(refs[ci].abs_path.as_str()) == path)
+                .min_by_key(|&ci| {
+                    let after = (refs[ci].line, refs[ci].col) >= (pos.line, pos.col);
+                    (!after, refs[ci].line, refs[ci].col)
+                })
+                .and_then(|ci| {
+                    picker
+                        .ranked
+                        .iter()
+                        .position(|&r| r as usize == ci)
+                        .map(|rank| (rank as u32, ci))
+                })
+        }
         _ => None,
     };
     // Frame the window: around the centered symbol when there is one (it rides the push as
@@ -5164,13 +5251,33 @@ pub fn spawn_reference_resolve(
 ) {
     tokio::spawn(async move {
         let candidates = build_reference_candidates(&state, client_id, buffer_id).await;
+        // The cursor + its file, so the picker opens on the occurrence find-references was invoked
+        // on (the same "land on where you are" the grep / outline pickers do). Use the selection's
+        // *leading edge* (min of anchor/position), like the grep picker: a jump lands the identifier
+        // selected, so the live cursor's `position` is the name's last char while the occurrence
+        // starts at the anchor — seeding off `position` would land at-or-after the name's end and
+        // miss it.
+        let (cursor, cursor_path) = {
+            let s = state.lock().await;
+            let cursor = s
+                .cursors
+                .get(&(client_id, buffer_id))
+                .map(|c| motion::ordered(c.position, c.anchor).0);
+            let path = s
+                .buffers
+                .get(&buffer_id)
+                .and_then(|b| b.canonical_path.as_deref())
+                .map(|p| p.display().to_string());
+            (cursor, path)
+        };
         apply_async_candidates(
             &state,
             client_id,
             PickerKind::References,
             epoch,
             picker_state::PickerCandidates::References(candidates),
-            None, // references open at the top, no cursor centering
+            cursor,
+            cursor_path,
         )
         .await;
     });
@@ -5193,6 +5300,7 @@ pub fn spawn_symbol_resolve(
             epoch,
             picker_state::PickerCandidates::Symbols(candidates),
             cursor,
+            None, // single-file: the symbol's own buffer, matched by position alone
         )
         .await;
     });
@@ -11449,8 +11557,12 @@ mod lsp_parse_tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].path, "/p/a.rs");
         assert_eq!(refs[0].position, LogicalPosition { line: 0, col: 3 });
+        // The identifier span's inclusive last char (LSP end is exclusive at char 9 → col 8), for
+        // landing the reference selected.
+        assert_eq!(refs[0].end, LogicalPosition { line: 0, col: 8 });
         assert_eq!(refs[1].path, "/p/b.rs");
         assert_eq!(refs[1].position, LogicalPosition { line: 4, col: 8 });
+        assert_eq!(refs[1].end, LogicalPosition { line: 4, col: 13 });
     }
 
     #[test]

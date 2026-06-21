@@ -178,6 +178,58 @@ fn nav_back_into_the_same_buffer_reveals_as_a_jump() {
 }
 
 #[test]
+fn goto_definition_lands_the_identifier_selected() {
+    use aether_client::update::Event;
+    use aether_protocol::lsp::LspGotoDefinitionResult;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+
+    // A definition with a real identifier span opens the buffer as a selection: cursor on the
+    // span's last char, anchor at its start — like the outline / references pickers.
+    let with_span: LspGotoDefinitionResult = serde_json::from_value(json!({
+        "location": {
+            "path": "/p/src/lib.rs",
+            "position": { "line": 10, "col": 4 },
+            "end": { "line": 10, "col": 9 },
+        },
+        "readiness": "ready",
+    }))
+    .unwrap();
+    let fx = s.on_event(Event::Definition(Ok(with_span)));
+    let params = find_request(&fx, "buffer/open").expect("goto-def opens the target buffer");
+    assert_eq!(
+        params["jump_to"],
+        json!({ "line": 10, "col": 9 }),
+        "cursor on the identifier's last char"
+    );
+    assert_eq!(
+        params["jump_to_anchor"],
+        json!({ "line": 10, "col": 4 }),
+        "anchor at the identifier's start"
+    );
+
+    // No distinct span (end == position): a point cursor, no anchor.
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    let point: LspGotoDefinitionResult = serde_json::from_value(json!({
+        "location": {
+            "path": "/p/src/lib.rs",
+            "position": { "line": 3, "col": 0 },
+            "end": { "line": 3, "col": 0 },
+        },
+        "readiness": "ready",
+    }))
+    .unwrap();
+    let fx = s.on_event(Event::Definition(Ok(point)));
+    let params = find_request(&fx, "buffer/open").expect("goto-def opens the target buffer");
+    assert_eq!(params["jump_to"], json!({ "line": 3, "col": 0 }));
+    assert!(
+        params["jump_to_anchor"].is_null(),
+        "a zero-width span lands a point, not a selection"
+    );
+}
+
+#[test]
 fn goto_definition_into_the_same_buffer_glides_not_resubscribes() {
     use aether_client::effect::RevealStyle;
     use aether_client::update::Event;

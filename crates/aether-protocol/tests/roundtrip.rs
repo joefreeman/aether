@@ -917,15 +917,19 @@ fn lsp_hover_and_goto_shapes() {
         location: Some(LspLocation {
             path: "/p/src/lib.rs".into(),
             position: LogicalPosition { line: 12, col: 4 },
+            end: LogicalPosition { line: 12, col: 9 },
         }),
         readiness: LspReadiness::Ready,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["location"]["path"], "/p/src/lib.rs");
     assert_eq!(v["location"]["position"]["line"], 12);
+    assert_eq!(v["location"]["end"]["col"], 9);
     assert_eq!(v["readiness"], "ready");
     let back: LspGotoDefinitionResult = from_value(v).unwrap();
-    assert_eq!(back.location.unwrap().position.col, 4);
+    let loc = back.location.unwrap();
+    assert_eq!(loc.position.col, 4);
+    assert_eq!(loc.end, LogicalPosition { line: 12, col: 9 });
 }
 
 #[test]
@@ -1539,6 +1543,7 @@ fn picker_item_reference_is_tagged() {
         line: 41,
         col: 7,
         preview: "    helper();".into(),
+        is_definition: true,
         match_indices: vec![4, 5],
     };
     let v = to_value(&item).unwrap();
@@ -1548,17 +1553,18 @@ fn picker_item_reference_is_tagged() {
     assert_eq!(v["line"], 41);
     assert_eq!(v["col"], 7);
     assert_eq!(v["preview"], "    helper();");
+    assert_eq!(v["is_definition"], true);
     assert_eq!(v["match_indices"], json!([4, 5]));
     let back: PickerItem = from_value(v).unwrap();
     assert_eq!(back, item);
 
-    // match_indices defaults to empty when omitted (matches the other item variants).
+    // is_definition and match_indices default (false / empty) when omitted, as the other variants do.
     let bare: PickerItem = from_value(json!({
         "kind": "reference", "path": "/a", "display_path": "a", "line": 0, "col": 0, "preview": ""
     }))
     .unwrap();
     assert!(
-        matches!(bare, PickerItem::Reference { ref match_indices, .. } if match_indices.is_empty())
+        matches!(bare, PickerItem::Reference { ref match_indices, is_definition: false, .. } if match_indices.is_empty())
     );
 }
 

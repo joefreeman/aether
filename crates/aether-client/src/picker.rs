@@ -512,6 +512,7 @@ impl PickerState {
     pub fn display_rows(&self) -> Vec<DisplayRow<'_>> {
         let mut rows = Vec::with_capacity(self.items.len() + 8);
         let mut last_file: Option<(u32, &str)> = None;
+        let mut last_section: Option<bool> = None;
         for (i, item) in self.items.iter().enumerate() {
             // Grep hits and Git changes both group by file: emit one header before each file's
             // first row.
@@ -532,6 +533,17 @@ impl PickerState {
                     rows.push(DisplayRow::Header {
                         path_index: *path_index,
                         relative_path,
+                    });
+                }
+            }
+            // References split into a Definition section and a References section: a label row at
+            // each `is_definition` transition. Candidates arrive definition-first, so this is at
+            // most two headers. The transition rule matches the server's display-row accounting.
+            if let PickerItem::Reference { is_definition, .. } = item {
+                if last_section != Some(*is_definition) {
+                    last_section = Some(*is_definition);
+                    rows.push(DisplayRow::Section {
+                        label: if *is_definition { "Definition" } else { "References" },
                     });
                 }
             }
@@ -562,7 +574,10 @@ impl PickerState {
     /// cover), so the window starts one row earlier.
     pub fn window_base(&self) -> u32 {
         let leads_with_header = self.items.first().is_some_and(|i| {
-            matches!(i, PickerItem::GrepHit { .. } | PickerItem::GitChange { .. })
+            matches!(
+                i,
+                PickerItem::GrepHit { .. } | PickerItem::GitChange { .. } | PickerItem::Reference { .. }
+            )
         });
         self.display_offset.saturating_sub(leads_with_header as u32)
     }
@@ -577,7 +592,7 @@ impl PickerState {
                 DisplayRow::Item { abs, .. } | DisplayRow::Create { abs, .. } => {
                     *abs == self.selected
                 }
-                DisplayRow::Header { .. } => false,
+                DisplayRow::Header { .. } | DisplayRow::Section { .. } => false,
             })
             .map(|i| base + i as u32)
     }
@@ -678,6 +693,12 @@ pub enum DisplayRow<'a> {
     Header {
         path_index: u32,
         relative_path: &'a str,
+    },
+    /// A non-selectable section label (References picker): `Definition` above the definition row,
+    /// `References` above the uses. Like [`DisplayRow::Header`] but the content is a fixed label,
+    /// not a file path.
+    Section {
+        label: &'static str,
     },
     Item {
         abs: u32,
@@ -825,6 +846,53 @@ mod tests {
         // above the fetched window does.
         assert_eq!(s.scrolled_refetch(13), None);
         assert!(s.scrolled_refetch(5).is_some());
+    }
+
+    #[test]
+    fn references_display_rows_split_into_definition_and_references_sections() {
+        let reference = |path: &str, line: u32, is_definition: bool| PickerItem::Reference {
+            path: path.into(),
+            display_path: path.into(),
+            line,
+            col: 0,
+            preview: "x".into(),
+            is_definition,
+            match_indices: vec![],
+        };
+        let mut s = PickerState::new(PickerKind::References);
+        // Definition-first, then two uses — and the server's matching display-row geometry: 3 items
+        // + 2 section headers = 5 display rows, the first item one row down under the Definition
+        // header.
+        assert!(s.apply_update(PickerUpdateParams {
+            kind: PickerKind::References,
+            generation: 0,
+            offset: 0,
+            items: Some(vec![
+                reference("lib.rs", 0, true),
+                reference("a.rs", 5, false),
+                reference("b.rs", 9, false),
+            ]),
+            total_matches: 3,
+            total_candidates: 3,
+            ticking: false,
+            grep_display_offset: Some(1),
+            grep_total_display_rows: Some(5),
+            center_on: None,
+            explorer_peek_missing: false,
+        }));
+        let rows = s.display_rows();
+        // Section("Definition"), the def item, Section("References"), then the two uses.
+        assert!(matches!(rows[0], DisplayRow::Section { label: "Definition" }));
+        assert!(matches!(rows[1], DisplayRow::Item { abs: 0, .. }));
+        assert!(matches!(rows[2], DisplayRow::Section { label: "References" }));
+        assert!(matches!(rows[3], DisplayRow::Item { abs: 1, .. }));
+        assert!(matches!(rows[4], DisplayRow::Item { abs: 2, .. }));
+        // Section headers are non-selectable; the display-row index accounts for the headers above.
+        assert_eq!(s.window_base(), 0, "the window leads with the Definition header");
+        s.selected = 0;
+        assert_eq!(s.selected_display_row(), Some(1), "def row sits below its header");
+        s.selected = 1;
+        assert_eq!(s.selected_display_row(), Some(3), "first use is below both headers");
     }
 
     #[test]

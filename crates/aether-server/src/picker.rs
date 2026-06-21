@@ -284,8 +284,17 @@ pub struct ReferenceCandidate {
     pub display_path: String,
     pub line: u32,
     pub col: u32,
+    /// Inclusive last position of the reference's identifier span (`== (line, col)` when the server
+    /// gave no distinct span). Selecting the row lands the identifier selected — anchor at
+    /// `(line, col)`, cursor here — like the outline picker.
+    pub end_line: u32,
+    pub end_col: u32,
     /// The referenced line's text (trailing newline trimmed). Haystack + preview.
     pub preview: String,
+    /// True for the one candidate that is the symbol's definition (resolved via a parallel
+    /// `textDocument/definition`), false for ordinary uses. Drives the Definition/References
+    /// section split; candidates are sorted definition-first.
+    pub is_definition: bool,
 }
 
 /// One document-symbols-picker candidate — a single symbol from `textDocument/documentSymbol`,
@@ -561,6 +570,7 @@ impl PickerCandidates {
                     line: c.line,
                     col: c.col,
                     preview: c.preview.clone(),
+                    is_definition: c.is_definition,
                     match_indices,
                 }
             }
@@ -774,13 +784,20 @@ impl PickerCandidates {
             PickerCandidates::LspServers(_) => None,
             PickerCandidates::References(v) => {
                 let c = &v[idx];
+                // Land the identifier *selected*, like the outline picker: cursor on the span's
+                // last char, anchor at its start. A point when there's no distinct span.
+                let start = LogicalPosition {
+                    line: c.line,
+                    col: c.col,
+                };
+                let end = LogicalPosition {
+                    line: c.end_line,
+                    col: c.end_col,
+                };
                 Some(PickerSelectResult::FileAt {
                     path: c.abs_path.clone(),
-                    position: LogicalPosition {
-                        line: c.line,
-                        col: c.col,
-                    },
-                    anchor: None,
+                    position: end,
+                    anchor: (end != start).then_some(start),
                 })
             }
             PickerCandidates::Symbols(v) => {
@@ -1257,13 +1274,17 @@ impl PickerState {
     /// that don't group by file (everything but Grep and GitChanges). Mirrors the client's
     /// header-per-file rendering so its virtual-scroll spacer + positioning are exact.
     fn grouped_display_metrics(&self, offset: u32) -> Option<(u32, u32)> {
-        // The `(path_index, relative_path)` group key of ranked row `ci`, for the grouped kinds.
+        // The group key of ranked row `ci`, for the grouped kinds — `(path_index, relative_path)`
+        // for the file-grouped kinds, and a synthetic `(is_definition, "")` section key for
+        // References (the Definition section vs the References section). Only equality matters here;
+        // the count is the number of group transitions in ranked order.
         let key_at = |ci: usize| -> Option<(u32, &str)> {
             match &self.candidates {
                 PickerCandidates::Grep(v) => Some((v[ci].path_index, v[ci].relative_path.as_str())),
                 PickerCandidates::GitChanges(v) => {
                     Some((v[ci].path_index, v[ci].relative_path.as_str()))
                 }
+                PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
                 _ => None,
             }
         };
@@ -1442,14 +1463,20 @@ mod tests {
                 display_path: "src/lib.rs".into(),
                 line: 4,
                 col: 8,
+                end_line: 4,
+                end_col: 13, // "helper" spans cols 8..=13
                 preview: "    helper();".into(),
+                is_definition: false,
             },
             ReferenceCandidate {
                 abs_path: "/proj/src/main.rs".into(),
                 display_path: "src/main.rs".into(),
                 line: 0,
                 col: 3,
+                end_line: 0,
+                end_col: 8, // "helper" spans cols 3..=8
                 preview: "fn helper() {}".into(),
+                is_definition: true,
             },
         ])
     }
@@ -1469,6 +1496,7 @@ mod tests {
                 line,
                 col,
                 preview,
+                is_definition,
                 match_indices,
             } => {
                 assert_eq!(path, "/proj/src/lib.rs");
@@ -1476,10 +1504,16 @@ mod tests {
                 assert_eq!(line, 4);
                 assert_eq!(col, 8);
                 assert_eq!(preview, "    helper();");
+                assert!(!is_definition); // candidate 0 is a use
                 assert_eq!(match_indices, vec![4, 5]);
             }
             other => panic!("expected Reference, got {other:?}"),
         }
+        // The definition flag rides through make_item too (candidate 1 is the definition).
+        assert!(
+            matches!(c.make_item(1, vec![]), PickerItem::Reference { is_definition: true, .. }),
+            "the definition candidate makes a definition item"
+        );
     }
 
     #[test]
@@ -1494,14 +1528,16 @@ mod tests {
             line: 99,
             col: 8,
             preview: "ignored".into(),
+            is_definition: false,
             match_indices: vec![],
         };
         assert_eq!(c.position_of(&elsewhere), None);
     }
 
     #[test]
-    fn reference_selects_to_file_at() {
-        // Selecting a reference jumps to its location (path + start position).
+    fn reference_selects_to_file_at_with_the_identifier_selected() {
+        // Selecting a reference lands the identifier *selected* (like the outline): cursor on the
+        // span's last char, anchor at its start.
         match reference_candidates().select_result(1) {
             Some(PickerSelectResult::FileAt {
                 path,
@@ -1509,11 +1545,93 @@ mod tests {
                 anchor,
             }) => {
                 assert_eq!(path, "/proj/src/main.rs");
-                assert_eq!(position, LogicalPosition { line: 0, col: 3 });
-                assert_eq!(anchor, None); // a reference lands a point, not a selection
+                assert_eq!(position, LogicalPosition { line: 0, col: 8 }); // span's last char
+                assert_eq!(anchor, Some(LogicalPosition { line: 0, col: 3 })); // span start
             }
             other => panic!("expected FileAt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reference_with_no_distinct_span_lands_a_point() {
+        // A zero-width span (end == start) is a point cursor, no selection.
+        let c = PickerCandidates::References(vec![ReferenceCandidate {
+            abs_path: "/proj/a.rs".into(),
+            display_path: "a.rs".into(),
+            line: 2,
+            col: 5,
+            end_line: 2,
+            end_col: 5,
+            preview: "x".into(),
+            is_definition: false,
+        }]);
+        match c.select_result(0) {
+            Some(PickerSelectResult::FileAt { position, anchor, .. }) => {
+                assert_eq!(position, LogicalPosition { line: 2, col: 5 });
+                assert_eq!(anchor, None);
+            }
+            other => panic!("expected FileAt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn references_group_into_definition_and_use_sections() {
+        // A definition (is_definition) followed by two uses. `grouped_display_metrics` opens one
+        // section header per `is_definition` transition — Definition then References — exactly as
+        // the client's `display_rows` does, so the virtual-scroll row math lines up.
+        let cand = |rel: &str, line: u32, is_definition: bool| ReferenceCandidate {
+            abs_path: format!("/proj/{rel}"),
+            display_path: rel.into(),
+            line,
+            col: 0,
+            end_line: line,
+            end_col: 0,
+            preview: "x".into(),
+            is_definition,
+        };
+        let cands = PickerCandidates::References(vec![
+            cand("lib.rs", 0, true),
+            cand("a.rs", 5, false),
+            cand("b.rs", 9, false),
+        ]);
+        let mut s = PickerState::new(cands);
+        let mut m = make_matcher();
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0, 1, 2], "definition-first, then the uses");
+
+        // Two sections over three rows → 3 + 2 = 5 display rows. A window opening at ranked row 0
+        // sits one row down (the Definition header above it).
+        let (display_offset, total) =
+            s.grouped_display_metrics(0).expect("references are header-grouped");
+        assert_eq!(total, 5, "3 items + 2 section headers");
+        assert_eq!(display_offset, 1, "the Definition header precedes ranked row 0");
+        // A window opening at the first use is below both headers.
+        let (display_offset, total) = s.grouped_display_metrics(1).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(display_offset, 3, "Definition + References headers precede the first use");
+    }
+
+    #[test]
+    fn references_with_no_definition_are_a_single_section() {
+        // No row flagged the definition (server couldn't resolve one): a single References section,
+        // so just one header row.
+        let cand = |rel: &str| ReferenceCandidate {
+            abs_path: format!("/proj/{rel}"),
+            display_path: rel.into(),
+            line: 1,
+            col: 0,
+            end_line: 1,
+            end_col: 0,
+            preview: "x".into(),
+            is_definition: false,
+        };
+        let cands = PickerCandidates::References(vec![cand("a.rs"), cand("b.rs")]);
+        let mut s = PickerState::new(cands);
+        let mut m = make_matcher();
+        s.rerank(&mut m);
+        let (display_offset, total) = s.grouped_display_metrics(0).unwrap();
+        assert_eq!(total, 3, "2 items + 1 References header");
+        assert_eq!(display_offset, 1);
     }
 
     fn symbol_candidates() -> PickerCandidates {

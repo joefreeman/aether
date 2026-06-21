@@ -577,28 +577,36 @@ function describePickerItem(
         dirty: (item.unsaved_buffers ?? 0) > 0 ? "unsaved" : undefined,
       };
     case "lsp_server": {
-      // The status bar's SVG icon in the leading cell (spinning when busy); language as the meta.
+      // The status bar's SVG icon in the leading cell (spinning when busy); dim metadata matching
+      // the native/TUI clients: language, the monorepo sub-root, then the active operation.
       const busy = item.status.state === "ready" && (item.progress?.length ?? 0) > 0;
       const cls = busy ? "lsp-busy" : lspStateClass(item.status.state);
+      let meta = item.language;
+      if (item.root_label) meta += ` · ${item.root_label}`;
+      if (item.progress?.[0]) meta += ` · ${item.progress[0].title}`;
       return {
         primary: item.name,
         matches: item.match_indices,
-        meta: item.language,
+        meta,
         bullet: true,
         bulletIcon: cls,
         bulletSpin: busy,
       };
     }
     case "reference": {
-      // Dim `path:line` location prefix, path-elided to ~half the row so the filename survives.
+      // Matching the native client: the code preview leads, and a dim `path:line` location is
+      // right-aligned as the meta (path-elided to ~half the row so the filename survives). Leading
+      // indentation is stripped (noise in a flat list); match_indices index the untrimmed preview,
+      // so shift them by the stripped char count — same as a grep hit.
       const linePart = `:${item.line + 1}`;
       const pb = Math.max(8, Math.floor(budget / 2) - [...linePart].length);
       const { display } = truncatePath(item.display_path, undefined, pb);
+      const trimmed = item.preview.trimStart();
+      const lead = [...item.preview].length - [...trimmed].length;
       return {
-        primary: item.preview,
-        matches: item.match_indices,
-        prefix: `${display}${linePart}`,
-        prefixClass: "picker-loc",
+        primary: trimmed.trimEnd(),
+        matches: item.match_indices?.map((i) => i - lead).filter((i) => i >= 0),
+        meta: `${display}${linePart}`,
       };
     }
     case "symbol": {
@@ -3315,6 +3323,22 @@ export class Shell {
           } else {
             h.textContent = truncatePath(item.relative_path, undefined, budget).display;
           }
+          section.append(h);
+          win.append(section);
+        }
+      }
+      // References split into a Definition section and a References section: a non-selectable label
+      // row at each is_definition transition (references arrive definition-first). The same
+      // section-header chrome as grep, keyed on the boolean rather than a file path.
+      if (item.kind === "reference") {
+        const key = item.is_definition ? "def" : "use";
+        if (key !== prevGrepKey) {
+          prevGrepKey = key;
+          section = document.createElement("div");
+          section.className = "grep-section";
+          const h = document.createElement("div");
+          h.className = "picker-row grep-header";
+          h.textContent = item.is_definition ? "Definition" : "References";
           section.append(h);
           win.append(section);
         }

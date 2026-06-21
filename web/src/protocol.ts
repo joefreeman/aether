@@ -330,6 +330,9 @@ export type PickerItem =
       col: number;
       /** The referenced line's text; the fuzzy haystack + preview. */
       preview: string;
+      /** True for the row that is the symbol's definition (vs an ordinary use). Drives the
+       *  Definition / References section split; references arrive definition-first. */
+      is_definition?: boolean;
       match_indices?: number[];
     }
   | {

@@ -1847,7 +1847,7 @@ fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
     {
         return 1; // one-row loading / empty message ("Finding references…", "No symbols found", …)
     }
-    if picker.kind.is_some_and(|k| k.groups_by_file()) {
+    if picker.kind.is_some_and(|k| k.renders_group_headers()) {
         return picker.total_display_rows.unwrap_or(picker.total_matches);
     }
     picker.total_matches + picker.synthetic_create_idx.is_some() as u32
@@ -1897,9 +1897,10 @@ pub fn picker_result_rows(buffer_area_cols: u32, buffer_area_rows: u32) -> u32 {
     (box_rect.height as u32).saturating_sub(4)
 }
 
-/// The `(path_index, relative_path)` file-group key of a picker item, for the file-grouped kinds
-/// (Grep hits and Git changes — both render a header above each file's first row). `None` for the
-/// flat kinds.
+/// The group key of a picker item, for the header-grouped kinds: `(path_index, relative_path)` for
+/// the file-grouped kinds (Grep hits, Git changes), and a synthetic `(is_definition, "")` section
+/// key for References (the Definition section vs the References section). Only equality matters — a
+/// header opens wherever the key changes. `None` for the flat kinds.
 fn picker_group_key(item: &PickerItem) -> Option<(u32, &str)> {
     match item {
         PickerItem::GrepHit {
@@ -1912,14 +1913,16 @@ fn picker_group_key(item: &PickerItem) -> Option<(u32, &str)> {
             relative_path,
             ..
         } => Some((*path_index, relative_path.as_str())),
+        PickerItem::Reference { is_definition, .. } => Some((*is_definition as u32, "")),
         _ => None,
     }
 }
 
-/// Whether a picker kind uses the file-grouped layout (a non-selectable header row per file).
-/// Delegates to the protocol's single source of truth so a new grouped kind needs no edit here.
-fn is_file_grouped(kind: Option<aether_protocol::picker::PickerKind>) -> bool {
-    kind.is_some_and(|k| k.groups_by_file())
+/// Whether a picker kind interleaves non-selectable header rows (file headers for Grep/GitChanges,
+/// Definition/References section labels for References). Delegates to the protocol's single source
+/// of truth so a new grouped kind needs no edit here.
+fn picker_renders_headers(kind: Option<aether_protocol::picker::PickerKind>) -> bool {
+    kind.is_some_and(|k| k.renders_group_headers())
 }
 
 /// Count how many items starting at `start` fit when rendered with the file-grouped layout (one
@@ -1965,7 +1968,7 @@ pub fn picker_visible_item_count_from(
     pane_height: usize,
     kind: Option<aether_protocol::picker::PickerKind>,
 ) -> usize {
-    if is_file_grouped(kind) {
+    if picker_renders_headers(kind) {
         grep_visible_item_count_from(items, start, pane_height)
     } else {
         items.len().saturating_sub(start).min(pane_height)
@@ -1997,7 +2000,7 @@ pub fn picker_scroll_for_selected(
         return current;
     }
     // Below the window: bottom-align so `selected` is the last visible row.
-    if !is_file_grouped(kind) {
+    if !picker_renders_headers(kind) {
         return (selected + 1).saturating_sub(pane);
     }
     let mut start = selected;
@@ -2655,15 +2658,24 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         .enumerate()
     {
         let i = visible_start + offset_in_slice;
-        if let Some((path_index, relative_path)) = picker_group_key(item) {
-            if prev_grep_key != Some((path_index, relative_path)) {
-                lines.push(Line::from(grep_file_header_spans(
-                    path_index,
-                    relative_path,
-                    &state.root_labels,
-                    text_width as usize,
-                )));
-                prev_grep_key = Some((path_index, relative_path));
+        if let Some(key) = picker_group_key(item) {
+            if prev_grep_key != Some(key) {
+                // References render a section label (Definition / References) rather than a file
+                // header; the other grouped kinds render the file path.
+                let header = match item {
+                    PickerItem::Reference { is_definition, .. } => section_header_spans(
+                        if *is_definition { "Definition" } else { "References" },
+                        text_width as usize,
+                    ),
+                    _ => grep_file_header_spans(
+                        key.0,
+                        key.1,
+                        &state.root_labels,
+                        text_width as usize,
+                    ),
+                };
+                lines.push(Line::from(header));
+                prev_grep_key = Some(key);
             }
         }
         // A staged delete renders its [y/N] confirmation *over* the target row — in the same
@@ -3051,6 +3063,16 @@ fn grep_file_header_spans(
     vec![Span::styled(display, style)]
 }
 
+/// References-picker section label (`Definition` / `References`) — same bold header chrome as
+/// [`grep_file_header_spans`] but a fixed label rather than a file path.
+fn section_header_spans(label: &'static str, max_width: usize) -> Vec<Span<'static>> {
+    let style = Style::default()
+        .fg(NORD8)
+        .bg(NORD0)
+        .add_modifier(Modifier::BOLD);
+    vec![Span::styled(truncate_right(label, max_width), style)]
+}
+
 /// Dim foreground for secondary text on a picker row (root labels, line numbers, locations,
 /// metadata tails). NORD3 is a neighbouring Polar Night shade to the NORD2 selection background
 /// and all but vanishes on it, so the highlighted row brightens its dim spans to NORD4 — the
@@ -3427,9 +3449,12 @@ fn diag_range_label(r: DiagRange) -> String {
     }
 }
 
-/// One references-picker row: a dim `path:line` location prefix (path middle-truncated when long,
-/// so the filename + line stay visible), then the referenced line's preview with `match_indices`
-/// highlighted — the same fuzzy-match tinting the grep/diagnostics rows use.
+/// One references-picker row, matching the native client: the referenced line's preview on the
+/// left (`match_indices` highlighted, the same fuzzy-match tinting the grep/diagnostics rows use),
+/// then a dim `path:line` location right-aligned at the row's edge (path segment-elided when long,
+/// so the filename + line survive). Leading indentation is stripped (noise in a flat list), and an
+/// overflowing preview is cut with a dim `…` so the location always stays visible — mirroring the
+/// grep row's layout, just with the cross-file path alongside the line number.
 fn reference_item_spans(
     display_path: &str,
     line: u32,
@@ -3441,67 +3466,56 @@ fn reference_item_spans(
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
-    let loc_style = base.fg(picker_dim_fg(highlighted));
+    let dim_style = base.fg(picker_dim_fg(highlighted));
+    let gap = 2; // minimum gap between the preview and the location
 
-    // Reserve up to half the row for the location prefix; the path truncates (segment-elided)
-    // to fit so the filename and line number — the bits that identify the reference — survive.
-    let line_part = format!(":{} ", line + 1);
-    let prefix_budget = max_width / 2;
-    let path_budget = prefix_budget.saturating_sub(line_part.width());
+    // Right-aligned `path:line`, capped to half the row so a deep path can't crowd out the code.
+    let line_part = format!(":{}", line + 1);
+    let loc_budget = (max_width / 2).max(line_part.width());
+    let path_budget = loc_budget.saturating_sub(line_part.width());
     let (path_shown, _) = truncate_path_with_indices(display_path, &[], path_budget);
-    let prefix = format!("{path_shown}{line_part}");
-    let preview_budget = max_width.saturating_sub(prefix.width());
+    let loc = format!("{path_shown}{line_part}");
 
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, loc_style)];
-
-    // Truncate the preview from the right when it overflows; drop match indices past the cut
-    // (same approach as the grep row).
-    let truncated: String = preview
-        .chars()
-        .scan(0usize, |w, c| {
-            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            if *w + cw > preview_budget {
-                None
-            } else {
-                *w += cw;
-                Some(c)
-            }
-        })
-        .collect();
-    let kept_char_count = truncated.chars().count() as u32;
-    let kept_indices: Vec<u32> = match_indices
+    // Preview on the left, leading indentation stripped; shift match indices down by the stripped
+    // char count (indices inside the stripped whitespace drop out).
+    let trimmed = preview.trim_start();
+    let lead_chars = (preview.chars().count() - trimmed.chars().count()) as u32;
+    let shifted: Vec<u32> = match_indices
         .iter()
-        .copied()
-        .filter(|&i| i < kept_char_count)
+        .filter_map(|i| i.checked_sub(lead_chars))
         .collect();
 
-    if kept_indices.is_empty() {
-        spans.push(Span::styled(truncated, base));
+    let preview_budget = max_width.saturating_sub(gap + loc.width());
+    let (shown, ellipsis) = if trimmed.width() <= preview_budget {
+        (trimmed.to_string(), false)
     } else {
-        let mut current = String::new();
-        let mut current_is_match = false;
-        let mut idx_iter = kept_indices.iter().copied().peekable();
-        for (ci, ch) in truncated.chars().enumerate() {
-            let is_match = idx_iter.peek().copied() == Some(ci as u32);
-            if is_match {
-                idx_iter.next();
-            }
-            if is_match != current_is_match && !current.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut current),
-                    if current_is_match { match_style } else { base },
-                ));
-            }
-            current_is_match = is_match;
-            current.push(ch);
-        }
-        if !current.is_empty() {
-            spans.push(Span::styled(
-                current,
-                if current_is_match { match_style } else { base },
-            ));
-        }
+        let text_budget = preview_budget.saturating_sub(1);
+        let cut: String = trimmed
+            .chars()
+            .scan(0usize, |w, c| {
+                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                if *w + cw > text_budget {
+                    None
+                } else {
+                    *w += cw;
+                    Some(c)
+                }
+            })
+            .collect();
+        (cut, true)
+    };
+    let kept_char_count = shown.chars().count() as u32;
+    let kept_indices: Vec<u32> = shifted.into_iter().filter(|&i| i < kept_char_count).collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    push_styled_with_match_indices(&mut spans, &shown, &kept_indices, base, match_style);
+    if ellipsis {
+        spans.push(Span::styled("…".to_string(), dim_style));
     }
+    // Pad out to the right edge (≥ the gap by construction) so the location aligns down the list.
+    let used = shown.width() + usize::from(ellipsis) + loc.width();
+    spans.push(Span::styled(" ".repeat(max_width.saturating_sub(used)), base));
+    spans.push(Span::styled(loc, dim_style));
     spans
 }
 
@@ -6576,6 +6590,19 @@ mod tests {
         assert!(text.contains("let x = 1;  "));
         let num = spans.last().expect("line-number span");
         assert_eq!(num.style.fg, Some(NORD3));
+    }
+
+    #[test]
+    fn reference_row_preview_leads_with_right_aligned_location() {
+        // Matching the native client: the code preview leads, the dim `path:line` location is
+        // right-aligned at the row's edge (not a left prefix). Leading indentation is stripped.
+        let spans = reference_item_spans("src/lib.rs", 4, "    helper();", &[], false, 40);
+        let text = spans_text(&spans);
+        assert!(text.starts_with("helper();"), "preview leads: {text:?}");
+        assert!(text.ends_with("src/lib.rs:5"), "location right-aligned: {text:?}");
+        assert_eq!(spans_total_width(&spans), 40);
+        let loc = spans.last().expect("location span");
+        assert_eq!(loc.style.fg, Some(NORD3), "the location is dim");
     }
 
     #[test]

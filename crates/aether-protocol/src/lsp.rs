@@ -85,7 +85,12 @@ pub struct LspGotoDefinitionResult {
 pub struct LspLocation {
     /// Absolute filesystem path to the target file.
     pub path: String,
+    /// Start of the identifier span (the jump target / selection anchor).
     pub position: LogicalPosition,
+    /// Inclusive last position of the identifier span — equal to `position` when the server gives
+    /// no distinct span (empty / multi-line / malformed range). Lets the caller land the identifier
+    /// *selected* (anchor at `position`, cursor here), matching the outline picker.
+    pub end: LogicalPosition,
 }
 
 /// Params for the cursor-relative LSP requests: just the buffer; the server uses its own cursor.

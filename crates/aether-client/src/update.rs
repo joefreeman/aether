@@ -382,7 +382,17 @@ impl Session {
                 Some(msg) => Effects::toast(msg, ToastKind::Info),
                 None => match r.location {
                     Some(location) => {
-                        self.open_path_primed(location.path, Some(location.position), None, None)
+                        // Land the identifier selected (anchor at its start, cursor on its last
+                        // char) — consistent with the outline and references pickers. A point when
+                        // the server gave no distinct span (`end == position`).
+                        let start = location.position;
+                        let end = location.end;
+                        self.open_path_primed(
+                            location.path,
+                            Some(end),
+                            (end != start).then_some(start),
+                            None,
+                        )
                     }
                     None => Effects::toast("No definition found", ToastKind::Info),
                 },

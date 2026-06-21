@@ -17603,6 +17603,11 @@ async fn lsp_goto_definition_resolves() {
         loc.path
     );
     assert_eq!(loc.position.line, 0, "helper is defined on line 0");
+    // The location carries the identifier's inclusive span so the client lands it selected: in
+    // `fn helper() -> i32 {`, the name `helper` runs cols 3..=8.
+    assert_eq!(loc.position.col, 3, "name starts after `fn `");
+    assert_eq!(loc.end.line, 0, "the name is single-line");
+    assert_eq!(loc.end.col, 8, "inclusive last char of `helper`");
 }
 
 /// Phase 6: the References picker resolves `textDocument/references` at the cursor and streams the
@@ -17637,7 +17642,22 @@ async fn references_picker_lists_all_uses() {
     )
     .await;
     let buffer_id = open.buffer_id;
-    set_cursor(&mut ws, 11, buffer_id, 0, 3).await; // on the `helper` declaration
+    // Mimic the realistic post-jump state: the identifier is *selected* (anchor at its start,
+    // cursor on its last char) — `fn helper(` runs cols 3..=8 — exactly as goto-definition or a
+    // prior reference jump leaves it. The picker must seed off the selection's leading edge (col 3),
+    // not its `position` (col 8, the name's end), or it lands at-or-after the name's end and seeds
+    // the wrong occurrence.
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        11,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 8 },
+            anchor: LogicalPosition { line: 0, col: 3 },
+        },
+    )
+    .await;
 
     let final_update = tokio::time::timeout(Duration::from_secs(90), async {
         let mut id = 100;
@@ -17690,7 +17710,7 @@ async fn references_picker_lists_all_uses() {
         "expected the declaration + call site, got {}",
         final_update.total_matches
     );
-    let lines: Vec<u32> = final_update
+    let refs: Vec<(u32, bool)> = final_update
         .items()
         .iter()
         .map(|i| {
@@ -17699,6 +17719,7 @@ async fn references_picker_lists_all_uses() {
                 display_path,
                 line,
                 preview,
+                is_definition,
                 ..
             } = i
             else {
@@ -17707,11 +17728,32 @@ async fn references_picker_lists_all_uses() {
             assert!(path.ends_with("main.rs"), "unexpected path: {path}");
             assert_eq!(display_path, "main.rs", "project-relative display path");
             assert!(!preview.is_empty(), "reference rows carry a line preview");
-            *line
+            (*line, *is_definition)
         })
         .collect();
+    let lines: Vec<u32> = refs.iter().map(|(l, _)| *l).collect();
     assert!(lines.contains(&0), "helper is declared on line 0");
     assert!(lines.contains(&4), "helper is called on line 4");
+    // Exactly one row is flagged the definition (the line-0 declaration), and it's ordered first —
+    // the Definition section leads, the References section follows.
+    let defs: Vec<u32> = refs
+        .iter()
+        .filter(|(_, is_def)| *is_def)
+        .map(|(l, _)| *l)
+        .collect();
+    assert_eq!(defs, vec![0], "the declaration on line 0 is the sole definition");
+    assert!(refs[0].1, "the definition is ordered first (Definition section)");
+    // The picker seeds on the occurrence under the cursor — the cursor sits on the line-0
+    // declaration, so the resolve frames + centres on that (the definition) row.
+    let center = final_update
+        .center_on
+        .as_deref()
+        .expect("references seed a center_on like grep/outline");
+    let PickerItem::Reference { line, is_definition, .. } = center else {
+        panic!("center_on should be a Reference, got {center:?}");
+    };
+    assert_eq!(*line, 0, "seeded on the cursor's occurrence (line 0)");
+    assert!(*is_definition, "that occurrence is the definition");
 }
 
 /// Phase 5: `lsp/format` reformats the buffer via rust-analyzer (rustfmt). Polls until the server
