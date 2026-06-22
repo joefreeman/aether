@@ -60,7 +60,8 @@ use aether_protocol::nav::NavStepResult;
 use aether_protocol::nav::{NavBack, NavForward, NavStepParams};
 use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate, PickerGrepNavigateParams,
+    BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate,
+    PickerGrepNavigateParams,
     PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,
     PickerSectionJump, PickerSectionJumpParams, PickerSelect, PickerSelectParams,
     PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
@@ -83,7 +84,7 @@ use aether_protocol::viewport::{
     DiagnosticSeverity, ViewportLinesChanged, ViewportLinesChangedParams, ViewportSubscribeResult,
     ViewportWindowResult, Window, WrapMode,
 };
-use aether_protocol::LogicalPosition;
+use aether_protocol::{BufferId, LogicalPosition};
 
 /// A core event: an async result (or shell-forwarded input) the core's update consumes.
 #[derive(Debug)]
@@ -2542,6 +2543,14 @@ impl Session {
             {
                 return self.picker_stage_delete();
             }
+            // Ctrl-d in the Buffers picker closes the highlighted buffer in place (no open) —
+            // `Ctrl-w` is the obvious mnemonic but the browser swallows it, so `Ctrl-d` matches the
+            // delete-in-picker gesture used by Files/Explorer/Projects above.
+            KeyCode::Char('d')
+                if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers =>
+            {
+                return self.picker_close_buffer();
+            }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).
             KeyCode::Char('k') if mods.alt && !mods.ctrl => return self.picker_move(-1),
             KeyCode::Char('j') if mods.alt && !mods.ctrl => return self.picker_move(1),
@@ -3549,6 +3558,66 @@ impl Session {
         Effects::none()
     }
 
+    /// `Ctrl-d` in the Buffers picker: close the highlighted buffer without opening it. Unsaved
+    /// buffers go through a discard confirm first (mirroring the editor's own close); clean and
+    /// externally-changed buffers (no in-buffer edits to lose) close straight away. The picker stays
+    /// open and re-lists from the server's `picker/update` push.
+    pub fn picker_close_buffer(&mut self) -> Effects {
+        let Some(p) = &self.picker else {
+            return Effects::none();
+        };
+        if p.kind != PickerKind::Buffers {
+            return Effects::none();
+        }
+        let Some(PickerItem::Buffer {
+            buffer_id,
+            status,
+            display,
+            ..
+        }) = p.selected_item()
+        else {
+            return Effects::none();
+        };
+        let buffer_id = *buffer_id;
+        if matches!(status, BufferDirtyState::Unsaved) {
+            self.prompt = Some(Prompt::Confirm {
+                kind: ConfirmKind::DiscardOnClose {
+                    label: display.clone(),
+                },
+                action: ConfirmAction::ClosePickerBuffer { buffer_id },
+            });
+            return Effects::none();
+        }
+        self.close_picker_buffer(buffer_id)
+    }
+
+    /// Fire `buffer/close` for a buffer chosen in the picker. `open_next` is set only when the
+    /// closed buffer is the editor's active one — then the server attaches the viewport to the next
+    /// MRU buffer (or a fresh scratch) and we adopt it; closing a background buffer leaves the
+    /// editor untouched. Either way the picker re-lists from the server's refresh push.
+    fn close_picker_buffer(&mut self, buffer_id: BufferId) -> Effects {
+        let closing_active = buffer_id == self.buffer.buffer_id;
+        self.request_str::<BufferClose>(
+            BufferCloseParams {
+                buffer_id,
+                open_next: closing_active,
+            },
+            move |r| {
+                if closing_active {
+                    Event::Switched(r.and_then(|closed| {
+                        closed
+                            .opened
+                            .ok_or_else(|| "buffer/close returned no successor".into())
+                    }))
+                } else {
+                    // Background buffer: nothing to adopt — the picker refresh rides a separate push.
+                    let _ = r;
+                    Event::Noop
+                }
+            },
+        )
+    }
+
     /// Create whatever the Explorer query names in the listed directory — a directory when it ends
     /// with `/`, otherwise a file (which opens). Reached by selecting the synthetic "+ Create …"
     /// row (see [`PickerState::pending_create`]). Multi-segment names create the intermediate
@@ -4131,6 +4200,7 @@ impl Session {
             ConfirmAction::Save { target } => self.save(target, true),
             ConfirmAction::ReloadDiscard => self.reload(true),
             ConfirmAction::CloseDiscard => self.close_buffer(),
+            ConfirmAction::ClosePickerBuffer { buffer_id } => self.close_picker_buffer(buffer_id),
             ConfirmAction::DeletePath { path, noun } => self
                 .request_str::<PathDelete>(PathDeleteParams { path }, move |result| {
                     Event::PathDeleted { noun, result }

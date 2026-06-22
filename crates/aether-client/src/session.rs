@@ -303,6 +303,11 @@ pub enum ConfirmAction {
     ReloadDiscard,
     /// Close the buffer despite unsaved changes.
     CloseDiscard,
+    /// Close a specific (unsaved) buffer picked from the Buffers picker, despite its changes. Unlike
+    /// [`CloseDiscard`] (which targets the active buffer), this carries the picked buffer's id — the
+    /// picker selection may have moved by the time the confirm resolves. The picker stays open and
+    /// re-lists from the server's `picker/update` push.
+    ClosePickerBuffer { buffer_id: BufferId },
     /// Trash a file/directory from the Files/Explorer picker (`path/delete`). `noun` is
     /// "file"/"directory" for the success toast; the still-open picker is re-listed after.
     DeletePath { path: String, noun: &'static str },

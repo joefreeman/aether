@@ -1995,6 +1995,84 @@ fn projects_delete_confirms_then_deletes_and_guards_active() {
 }
 
 #[test]
+fn buffers_picker_ctrl_d_closes_in_place() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
+
+    fn buf(buffer_id: u64, display: &str, status: BufferDirtyState) -> PickerItem {
+        PickerItem::Buffer {
+            buffer_id,
+            display: display.into(),
+            status,
+            path_index: None,
+            relative_path: None,
+            match_indices: vec![],
+            transient: false,
+        }
+    }
+
+    let mut s = session();
+    // The active editor buffer is id 0 (placeholder default).
+    let _ = s.open_picker(PickerKind::Buffers, None, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![
+            buf(0, "active.rs", BufferDirtyState::Clean),
+            buf(7, "background.rs", BufferDirtyState::Clean),
+            buf(9, "dirty.rs", BufferDirtyState::Unsaved),
+        ];
+        p.offset = 0;
+        p.total_matches = 3;
+        p.selected = 1; // a clean background buffer
+    }
+
+    // Clean background buffer: closes immediately, no prompt, and *doesn't* switch the editor.
+    let fx = s.picker_close_buffer();
+    assert!(s.prompt.is_none(), "clean close needs no confirm");
+    let close = find_request(&fx, "buffer/close").expect("buffer/close fired");
+    assert_eq!(close["buffer_id"], json!(7));
+    assert_eq!(
+        close["open_next"],
+        json!(false),
+        "closing a background buffer leaves the editor put"
+    );
+    assert!(
+        s.picker.is_some(),
+        "the picker stays open — it re-lists from the server push"
+    );
+
+    // The active buffer: closing it must attach the successor (open_next), so the editor doesn't
+    // sit on a closed buffer.
+    s.picker.as_mut().unwrap().selected = 0;
+    let fx = s.picker_close_buffer();
+    assert!(s.prompt.is_none());
+    let close = find_request(&fx, "buffer/close").expect("buffer/close fired");
+    assert_eq!(close["buffer_id"], json!(0));
+    assert_eq!(
+        close["open_next"],
+        json!(true),
+        "closing the active buffer opens its MRU successor"
+    );
+
+    // A dirty buffer: Ctrl-d stages a discard confirm and sends nothing yet.
+    s.picker.as_mut().unwrap().selected = 2;
+    let fx = s.picker_close_buffer();
+    assert!(fx.0.is_empty(), "dirty close stages a confirm, sends nothing");
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::DiscardOnClose { label },
+            ..
+        }) => assert_eq!(label, "dirty.rs"),
+        other => panic!("expected a discard-on-close confirm, got {other:?}"),
+    }
+    // `y` accepts → buffer/close { buffer_id: 9, open_next: false } (id 9 isn't the active buffer).
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let close = find_request(&fx, "buffer/close").expect("buffer/close fired on confirm");
+    assert_eq!(close["buffer_id"], json!(9));
+    assert_eq!(close["open_next"], json!(false));
+}
+
+#[test]
 fn explorer_create_makes_a_file_with_create_if_missing() {
     use aether_protocol::picker::PickerKind;
 
