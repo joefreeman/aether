@@ -47,9 +47,18 @@ pub enum PickerKind {
     /// kinds in that this picker is usable *before* a project is active (it's how the user
     /// gets one active in the first place) — every other picker requires `active_project`.
     Projects,
-    /// The current buffer's LSP diagnostics, fuzzy-matched on the message. Scoped to one buffer
-    /// (`PickerViewParams::buffer_id`). Selecting one jumps to its position (via `FileAt`).
+    /// The current buffer's LSP diagnostics (`Space Alt-d`), fuzzy-matched on the message. Scoped to
+    /// one buffer (`PickerViewParams::buffer_id`), flat (no file header). Selecting one jumps to its
+    /// position (via `FileAt`).
     Diagnostics,
+    /// **Project-wide** LSP diagnostics (`Space d`) — the modal sibling of [`Diagnostics`], grouped
+    /// by file. Pulled via `workspace/diagnostic` from every server in the active project that
+    /// advertises it, merged with the open buffers' live diagnostics (so servers without pull, and
+    /// unsaved edits, still show). A one-shot async snapshot taken on open (like [`References`]):
+    /// the picker opens empty + `ticking` and is filled by the spawned resolve. Rows are
+    /// [`PickerItem::Diagnostic`] carrying their file; selecting one jumps to the line (via
+    /// `FileAt`).
+    DiagnosticsProject,
     /// The language servers for the active project, fuzzy-matched on server name. Unlike the
     /// other kinds this isn't a jump target: the client restarts the highlighted server in place
     /// (`Ctrl-r` → `lsp/restart_server`) and the list live-updates as statuses change.
@@ -115,7 +124,10 @@ impl PickerKind {
     /// [`Self::GitChangesFile`] is *not* here — it's a single file, so a header would just repeat it;
     /// it still centres on the cursor (see [`Self::centers_on_cursor`]).
     pub fn groups_by_file(self) -> bool {
-        matches!(self, PickerKind::Grep | PickerKind::GitChanges)
+        matches!(
+            self,
+            PickerKind::Grep | PickerKind::GitChanges | PickerKind::DiagnosticsProject
+        )
     }
 
     /// Whether this picker interleaves non-selectable header rows above grouped runs of items.
@@ -126,7 +138,10 @@ impl PickerKind {
     pub fn renders_group_headers(self) -> bool {
         matches!(
             self,
-            PickerKind::Grep | PickerKind::GitChanges | PickerKind::References
+            PickerKind::Grep
+                | PickerKind::GitChanges
+                | PickerKind::References
+                | PickerKind::DiagnosticsProject
         )
     }
 
@@ -378,6 +393,13 @@ pub enum PickerItem {
     /// `(line, col)`. `(line, col)` is the range start; `(end_line, end_col)` the (exclusive) end —
     /// the picker shows the full range so distinct diagnostics that read alike are tellable apart.
     Diagnostic {
+        /// The diagnostic's file, as project root index + root-relative path. Used by the
+        /// project-wide picker to group by file; the buffer-scoped picker fills it with the buffer's
+        /// own path (it renders flat, so the value is unused there).
+        #[serde(default)]
+        path_index: u32,
+        #[serde(default)]
+        relative_path: String,
         line: u32,
         col: u32,
         #[serde(default)]

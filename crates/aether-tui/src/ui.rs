@@ -1833,19 +1833,40 @@ fn picker_box_rect(area: Rect) -> Rect {
     }
 }
 
-/// Rows the full result set needs in the results pane — what the picker box collapses to when
-/// that's shorter than the full-size box (mirroring the web client, whose list shrinks to fit
-/// content). Grep uses the server-reported display-row total (hits + per-file headers); the
-/// References empty states need one row for their message; the client-side synthetic
-/// "Create …" row isn't counted in `total_matches`.
-fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
+/// The one-line message shown in place of the rows when the picker is empty, or `None` when rows
+/// render (or nothing should show — an unqueried Grep). The async kinds (References / DocumentSymbols)
+/// get a kind-specific "Finding…" line while loading; everything else, and the async kinds once
+/// settled, shows the core-owned [`empty_note`](aether_client::picker::PickerState::empty_note)
+/// ("No diagnostics" / "No matches" / …). Single source for the TUI's empty pane — shared by
+/// [`picker_content_rows`] (which reserves a row for it) and [`draw_picker_results`] (which draws it).
+fn picker_empty_message(picker: &crate::picker::PickerState) -> Option<&str> {
     use aether_protocol::picker::PickerKind;
-    if matches!(
+    if !picker.items.is_empty() {
+        return None;
+    }
+    let async_kind = matches!(
         picker.kind,
         Some(PickerKind::References | PickerKind::DocumentSymbols)
-    ) && picker.items.is_empty()
-    {
-        return 1; // one-row loading / empty message ("Finding references…", "No symbols found", …)
+    );
+    if picker.ticking && async_kind {
+        return Some(if picker.kind == Some(PickerKind::DocumentSymbols) {
+            "Finding symbols…"
+        } else {
+            "Finding references…"
+        });
+    }
+    // `empty_note` is already `None` while ticking (non-async) or for an unqueried Grep.
+    picker.empty_note.as_deref()
+}
+
+/// Rows the full result set needs in the results pane — what the picker box collapses to when
+/// that's shorter than the full-size box (mirroring the web client, whose list shrinks to fit
+/// content). Grep uses the server-reported display-row total (hits + per-file headers); an empty
+/// picker with a message ([`picker_empty_message`]) needs one row for it; the client-side synthetic
+/// "Create …" row isn't counted in `total_matches`.
+fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
+    if picker_empty_message(picker).is_some() {
+        return 1; // one row for the loading / empty message ("Finding references…", "No diagnostics", …)
     }
     if picker.kind.is_some_and(|k| k.renders_group_headers()) {
         return picker.total_display_rows.unwrap_or(picker.total_matches);
@@ -1909,6 +1930,11 @@ fn picker_group_key(item: &PickerItem) -> Option<(u32, &str)> {
             ..
         }
         | PickerItem::GitChange {
+            path_index,
+            relative_path,
+            ..
+        }
+        | PickerItem::Diagnostic {
             path_index,
             relative_path,
             ..
@@ -2562,12 +2588,13 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Grep) => "Grep workspace…",
         Some(aether_protocol::picker::PickerKind::Explorer) => "Explore files…",
         Some(aether_protocol::picker::PickerKind::Projects) => "Select project…",
-        Some(aether_protocol::picker::PickerKind::Diagnostics) => "List diagnostics…",
+        Some(aether_protocol::picker::PickerKind::Diagnostics) => "Diagnostics in current file…",
+        Some(aether_protocol::picker::PickerKind::DiagnosticsProject) => "Diagnostics in project…",
         Some(aether_protocol::picker::PickerKind::LspServers) => "List LSPs…",
         Some(aether_protocol::picker::PickerKind::References) => "List references…",
         Some(aether_protocol::picker::PickerKind::DocumentSymbols) => "Go to symbol…",
-        Some(aether_protocol::picker::PickerKind::GitChanges) => "Search changes…",
         Some(aether_protocol::picker::PickerKind::GitChangesFile) => "Changes in current file…",
+        Some(aether_protocol::picker::PickerKind::GitChanges) => "Changes in project…",
         None => "Search…",
     }
 }
@@ -2595,23 +2622,12 @@ fn draw_picker_separator(f: &mut Frame, box_area: Rect, area: Rect) {
 }
 
 fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
-    // References / DocumentSymbols resolve asynchronously (an LSP round-trip), so they open empty. A
-    // blank pane would read as a broken picker — show progress while it loads, and an explicit
-    // "none" once it finishes empty. (The result-set kinds that are never empty-by-design skip this.)
-    use aether_protocol::picker::PickerKind;
-    if state.picker.items.is_empty()
-        && matches!(
-            state.picker.kind,
-            Some(PickerKind::References | PickerKind::DocumentSymbols)
-        )
-    {
-        let symbols = state.picker.kind == Some(PickerKind::DocumentSymbols);
-        let msg = match (symbols, state.picker.ticking) {
-            (false, true) => "Finding references…",
-            (false, false) => "No references found",
-            (true, true) => "Finding symbols…",
-            (true, false) => "No symbols found",
-        };
+    // An empty picker shows a one-line message instead of rows: a "Finding…" progress line for the
+    // async kinds (References / DocumentSymbols open empty during their LSP round-trip), and the
+    // core-owned empty note ("No diagnostics", "No matches", …) for a settled-empty set. A blank
+    // pane would read as broken. `picker_empty_message` is the shared decision (also drives the
+    // box's row reservation); an unqueried Grep returns `None` here and falls through to draw nothing.
+    if let Some(msg) = picker_empty_message(&state.picker) {
         f.render_widget(
             Paragraph::new(msg).style(
                 Style::default()
@@ -2667,7 +2683,11 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
                 // header; the other grouped kinds render the file path.
                 let header = match item {
                     PickerItem::Reference { is_definition, .. } => section_header_spans(
-                        if *is_definition { "Definition" } else { "References" },
+                        if *is_definition {
+                            "Definition"
+                        } else {
+                            "References"
+                        },
                         text_width as usize,
                     ),
                     _ => grep_file_header_spans(
@@ -3508,7 +3528,10 @@ fn reference_item_spans(
         (cut, true)
     };
     let kept_char_count = shown.chars().count() as u32;
-    let kept_indices: Vec<u32> = shifted.into_iter().filter(|&i| i < kept_char_count).collect();
+    let kept_indices: Vec<u32> = shifted
+        .into_iter()
+        .filter(|&i| i < kept_char_count)
+        .collect();
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     push_styled_with_match_indices(&mut spans, &shown, &kept_indices, base, match_style);
@@ -3517,7 +3540,10 @@ fn reference_item_spans(
     }
     // Pad out to the right edge (≥ the gap by construction) so the location aligns down the list.
     let used = shown.width() + usize::from(ellipsis) + loc.width();
-    spans.push(Span::styled(" ".repeat(max_width.saturating_sub(used)), base));
+    spans.push(Span::styled(
+        " ".repeat(max_width.saturating_sub(used)),
+        base,
+    ));
     spans.push(Span::styled(loc, dim_style));
     spans
 }
@@ -6574,9 +6600,17 @@ mod tests {
         p.kind = Some(PickerKind::Grep);
         p.total_display_rows = Some(8);
         assert_eq!(picker_content_rows(&p), 8);
-        // References shows a one-row message while empty.
+        // An empty async picker reserves a row for its "Finding…" loading line...
         p.kind = Some(PickerKind::References);
         p.total_matches = 0;
+        p.ticking = true;
+        assert_eq!(picker_content_rows(&p), 1);
+        // ...and a settled empty picker reserves a row for the core's empty note (synced into
+        // `empty_note`) — for any kind, not just the async ones. (The Files case above, with no note,
+        // reserves nothing and just counts its rows.)
+        p.ticking = false;
+        p.kind = Some(PickerKind::Diagnostics);
+        p.empty_note = Some("No diagnostics".into());
         assert_eq!(picker_content_rows(&p), 1);
     }
 
@@ -6602,7 +6636,10 @@ mod tests {
         let spans = reference_item_spans("src/lib.rs", 4, "    helper();", &[], false, 40);
         let text = spans_text(&spans);
         assert!(text.starts_with("helper();"), "preview leads: {text:?}");
-        assert!(text.ends_with("src/lib.rs:5"), "location right-aligned: {text:?}");
+        assert!(
+            text.ends_with("src/lib.rs:5"),
+            "location right-aligned: {text:?}"
+        );
         assert_eq!(spans_total_width(&spans), 40);
         let loc = spans.last().expect("location span");
         assert_eq!(loc.style.fg, Some(NORD3), "the location is dim");

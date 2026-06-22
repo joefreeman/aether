@@ -97,8 +97,16 @@ pub struct ServerState {
     /// them. See [`crate::lsp::manager`].
     pub lsp: crate::lsp::manager::LspManager,
     /// Latest diagnostics per buffer, in buffer coordinates (byte columns). Replaced wholesale on
-    /// each `publishDiagnostics`; cleared on close. Empty/absent when a buffer has none.
+    /// each `publishDiagnostics`; cleared on close. Empty/absent when a buffer has none. Drives the
+    /// open-buffer surfaces: squiggles, gutter counts, and the buffer-scoped `Space d` picker.
     pub diagnostics: HashMap<BufferId, Vec<crate::lsp::diagnostics::BufferDiagnostic>>,
+    /// Latest diagnostics per file **path**, line-granular (no byte column). Every `publishDiagnostics`
+    /// updates this keyed by the file's canonical path — for *every* file a server reports, open or
+    /// not (rust-analyzer's `cargo check` / flycheck pushes cover the whole build). This is the sole
+    /// source for the project-wide `Space Alt-d` picker — independent of the buffer-keyed
+    /// [`Self::diagnostics`], not merged with it — and it retains a file's last-known set after its
+    /// buffer closes. An empty push removes the entry.
+    pub path_diagnostics: HashMap<std::path::PathBuf, Vec<crate::lsp::diagnostics::RawDiagnostic>>,
     /// Latest LSP `textDocument/documentSymbol` outline per buffer, flattened depth-first (the
     /// same shape the `Space o` picker shows). Refreshed asynchronously after the language server
     /// re-analyzes (on `publishDiagnostics`) and on buffer open. Drives the `o` symbol-navigation
@@ -258,6 +266,7 @@ impl ServerState {
             matcher: picker_state::make_matcher(),
             lsp: crate::lsp::manager::LspManager::default(),
             diagnostics: HashMap::new(),
+            path_diagnostics: HashMap::new(),
             document_symbols: HashMap::new(),
             started_at_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

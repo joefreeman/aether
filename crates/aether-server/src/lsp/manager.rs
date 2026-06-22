@@ -586,8 +586,12 @@ async fn handle_progress(
     out
 }
 
-/// Resolve a `publishDiagnostics` payload to a buffer, convert it to buffer coordinates using the
-/// server's negotiated encoding, store it, and re-render the buffer's viewports.
+/// Handle a `publishDiagnostics` payload. Always records the file's diagnostics path-keyed and
+/// line-granular in `path_diagnostics` — the project picker's source, populated for every file a
+/// server reports (rust-analyzer's flycheck pushes cover the whole build, opened or not). If the
+/// file is also open as a buffer, *separately* converts to byte columns against the buffer text,
+/// stores that as the live buffer-keyed set, and re-renders the buffer's viewports (squiggles). The
+/// two stores are independent (no merge); an empty push clears both.
 async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, params: &Value) {
     let Some(doc_uri) = params.get("uri").and_then(Value::as_str) else {
         return;
@@ -600,30 +604,51 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
     let (pushes, buffer_id) = {
         let mut guard = state.lock().await;
         let s = &mut *guard;
-        let Some(buffer_id) = s.buffers.iter().find_map(|(id, b)| {
+
+        // Path-keyed line-only store (the project picker's source): always updated, for open and
+        // closed files alike. An empty push removes the entry so a fixed file stops showing.
+        let raw = super::diagnostics::raw_from_lsp(&diags_json);
+        if raw.is_empty() {
+            s.path_diagnostics.remove(&path);
+        } else {
+            s.path_diagnostics.insert(path.clone(), raw);
+        }
+        // Live-refresh any open `Space Alt-d`: it reads `path_diagnostics`, so this push may add or
+        // change a file's rows. No-op when no client has the project picker open (the common case),
+        // and it fires for closed files too — that's how a never-opened file's diagnostics appear.
+        let mut pushes = crate::handlers::refresh_project_diagnostics_pickers(s);
+
+        let buffer_id = s.buffers.iter().find_map(|(id, b)| {
             (b.canonical_path.as_deref() == Some(path.as_path())).then_some(*id)
-        }) else {
-            return; // diagnostics for a buffer we don't have open
-        };
-        let encoding = s
-            .lsp
-            .servers
-            .get(key)
-            .map(|h| h.position_encoding)
-            .unwrap_or(PositionEncoding::Utf16);
-        let diags = {
-            let buf = &s.buffers[&buffer_id];
-            super::diagnostics::from_lsp(&diags_json, &buf.text, encoding)
-        };
-        (
-            crate::handlers::set_diagnostics_and_refresh(s, buffer_id, diags),
-            buffer_id,
-        )
+        });
+        match buffer_id {
+            // No open buffer: the path-keyed store + project-picker refresh above are all there is —
+            // no squiggles to render and no symbol outline to refresh for a file we don't have open.
+            None => (pushes, None),
+            Some(buffer_id) => {
+                let encoding = s
+                    .lsp
+                    .servers
+                    .get(key)
+                    .map(|h| h.position_encoding)
+                    .unwrap_or(PositionEncoding::Utf16);
+                let diags = {
+                    let buf = &s.buffers[&buffer_id];
+                    super::diagnostics::from_lsp(&diags_json, &buf.text, encoding)
+                };
+                pushes.extend(crate::handlers::set_diagnostics_and_refresh(
+                    s, buffer_id, diags,
+                ));
+                (pushes, Some(buffer_id))
+            }
+        }
     };
-    // A fresh diagnostics publish means the server just re-analyzed the document, so its symbol
-    // outline may have changed too — re-fetch it (naturally debounced by the analysis cycle). This
-    // keeps the `o` symbol-navigation motion and the `Space o` outline in sync with edits.
-    crate::handlers::spawn_document_symbol_refresh(state.clone(), buffer_id);
+    // A fresh diagnostics publish for an OPEN buffer means the server just re-analyzed it, so its
+    // symbol outline may have changed too — re-fetch it (naturally debounced by the analysis cycle).
+    // This keeps the `o` symbol-navigation motion and the `Space o` outline in sync with edits.
+    if let Some(buffer_id) = buffer_id {
+        crate::handlers::spawn_document_symbol_refresh(state.clone(), buffer_id);
+    }
     send_all(pushes).await;
 }
 

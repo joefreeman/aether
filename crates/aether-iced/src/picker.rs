@@ -174,12 +174,13 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::Grep => "Grep workspace…",
         PickerKind::Explorer => "Explore files…",
         PickerKind::Projects => "Select project…",
-        PickerKind::Diagnostics => "List diagnostics…",
+        PickerKind::Diagnostics => "Diagnostics in current file…",
+        PickerKind::DiagnosticsProject => "Diagnostics in project…",
         PickerKind::LspServers => "List LSPs…",
         PickerKind::References => "List references…",
         PickerKind::DocumentSymbols => "Go to symbol…",
-        PickerKind::GitChanges => "Search changes…",
         PickerKind::GitChangesFile => "Changes in current file…",
+        PickerKind::GitChanges => "Changes in project…",
     }
 }
 
@@ -371,21 +372,14 @@ pub fn overlay<'a>(
         format!("{}", state.total_matches)
     };
     input = input.push(text(counts).size(12).font(SANS).color(theme::NORD3_BRIGHT));
-    // An empty grep query means "no search has run" — saying "No matches" there would read
-    // as a failed search. Every other kind lists candidates without a query, so an empty
-    // result set is informative.
-    let unqueried_grep = state.kind == PickerKind::Grep && state.query.is_empty();
-    // The Explorer's "+ Create …" row is content in its own right — don't also say "No matches"
-    // when a brand-new name has zero existing matches.
-    let show_empty_note = state.total_matches == 0
-        && !state.ticking
-        && !unqueried_grep
-        && state.pending_create().is_none();
+    // The settled empty-state line (or none) — wording + when-to-show are owned by the core so all
+    // shells agree (e.g. "No diagnostics" for an unfiltered empty list, "No matches" under a query).
+    let empty_note = state.empty_note();
     // Nothing renders below the input (no rows, no message, no editor line): round its bottom
     // corners too, so the NORD0 row doesn't poke out of the panel's rounded border.
     let input_is_last = state.total_display_rows == 0
         && state.pending_create().is_none()
-        && !show_empty_note
+        && empty_note.is_none()
         && state.chip_editor.is_none();
     panel = panel.push(
         container(input)
@@ -532,13 +526,19 @@ pub fn overlay<'a>(
                 .nth(rel as usize)
                 .and_then(|r| match r {
                     DisplayRow::Item { item, .. } => match item {
-                        // Both file-grouped kinds (grep hits and Git changes) carry the group key.
+                        // The file-grouped kinds (grep hits, Git changes, project diagnostics) carry
+                        // the group key.
                         PickerItem::GrepHit {
                             path_index,
                             relative_path,
                             ..
                         }
                         | PickerItem::GitChange {
+                            path_index,
+                            relative_path,
+                            ..
+                        }
+                        | PickerItem::Diagnostic {
                             path_index,
                             relative_path,
                             ..
@@ -572,12 +572,12 @@ pub fn overlay<'a>(
     };
     panel = panel.push(iced::widget::stack![scroll, pin_layer]);
 
-    if show_empty_note {
+    if let Some(note) = empty_note {
         // The web's `.picker-empty` styling (italic, dim, list-row padding) — but a notch
         // brighter than its NORD3: that reads fine on the web panel, too faint here.
         panel = panel.push(
             container(
-                text("No matches")
+                text(note)
                     .size(13)
                     .font(SANS_ITALIC)
                     .color(theme::NORD3_BRIGHT),
@@ -1118,6 +1118,7 @@ fn render_item<'a>(
             severity,
             message,
             match_indices,
+            .. // path_index/relative_path are for grouping (the file header), not the row
         } => row![
             glyph_cell(
                 theme::diag_glyph(*severity),

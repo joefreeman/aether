@@ -513,26 +513,17 @@ impl PickerState {
         let mut rows = Vec::with_capacity(self.items.len() + 8);
         let mut last_file: Option<(u32, &str)> = None;
         let mut last_section: Option<bool> = None;
-        // The grouped kinds (Grep, project GitChanges) emit one file header before each file's
-        // first row. The buffer-locked GitChangesFile is a single file with no header.
+        // The grouped kinds (Grep, project GitChanges, project Diagnostics) emit one file header
+        // before each file's first row. The buffer-locked GitChangesFile / Diagnostics are a single
+        // file (or flat) with no header — gated by `groups_by_file`.
         let group_by_file = self.kind.groups_by_file();
         for (i, item) in self.items.iter().enumerate() {
-            if let PickerItem::GrepHit {
-                path_index,
-                relative_path,
-                ..
-            }
-            | PickerItem::GitChange {
-                path_index,
-                relative_path,
-                ..
-            } = item
-            {
-                let f = (*path_index, relative_path.as_str());
+            if let Some((path_index, relative_path)) = file_group_key(item) {
+                let f = (path_index, relative_path);
                 if group_by_file && last_file != Some(f) {
                     last_file = Some(f);
                     rows.push(DisplayRow::Header {
-                        path_index: *path_index,
+                        path_index,
                         relative_path,
                     });
                 }
@@ -578,22 +569,27 @@ impl PickerState {
     /// a mid-file window start, it stands in for the hit row the spacer would otherwise
     /// cover), so the window starts one row earlier.
     pub fn window_base(&self) -> u32 {
-        let leads_with_header = self.items.first().is_some_and(|i| {
-            matches!(
-                i,
-                PickerItem::GrepHit { .. }
-                    | PickerItem::GitChange { .. }
-                    | PickerItem::Reference { .. }
-            )
-        });
+        self.window_base_of(&self.display_rows())
+    }
+
+    /// [`Self::window_base`] from already-built rows — derives "leads with a header" straight from
+    /// `display_rows` so the two can never disagree about which kinds emit headers. (They did once:
+    /// project Diagnostics was added to `display_rows` but not to `window_base`'s old hardcoded
+    /// variant list, so the window sat one row off.) Callers holding the rows pass them in to avoid
+    /// rebuilding.
+    fn window_base_of(&self, rows: &[DisplayRow]) -> u32 {
+        let leads_with_header = matches!(
+            rows.first(),
+            Some(DisplayRow::Header { .. } | DisplayRow::Section { .. })
+        );
         self.display_offset.saturating_sub(leads_with_header as u32)
     }
 
     /// The highlighted item's display-row index in the whole virtual list, when it's inside
     /// the fetched window.
     pub fn selected_display_row(&self) -> Option<u32> {
-        let base = self.window_base();
         let rows = self.display_rows();
+        let base = self.window_base_of(&rows);
         rows.iter()
             .position(|r| match r {
                 DisplayRow::Item { abs, .. } | DisplayRow::Create { abs, .. } => {
@@ -614,9 +610,9 @@ impl PickerState {
             return None; // nothing fetched yet / refetch already in flight
         }
         let last_visible = first_visible + VISIBLE_ROWS as u32;
-        let base = self.window_base();
-        let window_rows = self.display_rows().len() as u32;
-        let window_end = base + window_rows;
+        let rows = self.display_rows();
+        let base = self.window_base_of(&rows);
+        let window_end = base + rows.len() as u32;
         let needs = first_visible < base
             || (last_visible > window_end && window_end < self.total_display_rows);
         if !needs {
@@ -625,6 +621,32 @@ impl PickerState {
         let ratio = self.total_matches as f32 / self.total_display_rows as f32;
         let est_item = (first_visible as f32 * ratio) as u32;
         Some(est_item.saturating_sub(FETCH_LIMIT / 2))
+    }
+
+    /// The settled empty-state note for the rows area — the line to show when the result set is
+    /// empty and not mid-search — or `None` when no note belongs: results exist, a search is still
+    /// running (the shell shows its own "Searching…"), an *unqueried* Grep (no search has run yet,
+    /// so a note would read as a failed one), or the Explorer's "+ Create …" row stands in.
+    ///
+    /// The single source of this wording across shells. A non-empty query that matched nothing is
+    /// "No matches"; an empty query is the kind's "nothing here" line ("No diagnostics" / "No
+    /// changes" / …) — because those kinds list their whole set without a query, so empty means
+    /// genuinely none, not a failed search. References / symbols keep their own phrasing regardless.
+    pub fn empty_note(&self) -> Option<&'static str> {
+        if self.ticking || self.total_matches != 0 || self.pending_create().is_some() {
+            return None;
+        }
+        if self.kind == PickerKind::Grep && self.query.is_empty() {
+            return None;
+        }
+        Some(match self.kind {
+            PickerKind::References => "No references found",
+            PickerKind::DocumentSymbols => "No symbols found",
+            _ if !self.query.is_empty() => "No matches",
+            PickerKind::Diagnostics | PickerKind::DiagnosticsProject => "No diagnostics",
+            PickerKind::GitChanges | PickerKind::GitChangesFile => "No changes",
+            _ => "No results",
+        })
     }
 }
 
@@ -718,6 +740,33 @@ pub enum DisplayRow<'a> {
         name: String,
         is_dir: bool,
     },
+}
+
+/// The file-group key `(path_index, relative_path)` of an item in a file-grouped picker, or `None`
+/// for items that don't group by file. **Single source of truth** for which item kinds sit under a
+/// file header — used by both [`PickerState::display_rows`] (to emit a header at each key change)
+/// and, transitively, [`PickerState::window_base`]. A new file-grouped picker item is wired here
+/// once; the server mirror is `PickerState::grouped_display_metrics`'s `key_at` in
+/// `aether-server/src/picker.rs` (same list, keyed by `PickerCandidates`).
+fn file_group_key(item: &PickerItem) -> Option<(u32, &str)> {
+    match item {
+        PickerItem::GrepHit {
+            path_index,
+            relative_path,
+            ..
+        }
+        | PickerItem::GitChange {
+            path_index,
+            relative_path,
+            ..
+        }
+        | PickerItem::Diagnostic {
+            path_index,
+            relative_path,
+            ..
+        } => Some((*path_index, relative_path.as_str())),
+        _ => None,
+    }
 }
 
 /// The Explorer's pending create affordance — the name a "+ Create …" row would create.
@@ -853,6 +902,126 @@ mod tests {
         // above the fetched window does.
         assert_eq!(s.scrolled_refetch(13), None);
         assert!(s.scrolled_refetch(5).is_some());
+    }
+
+    #[test]
+    fn project_diagnostics_count_file_headers_in_window_math() {
+        // Regression: `display_rows` grouped project Diagnostics by file, but `window_base` (and so
+        // `selected_display_row`) used a hardcoded variant list that omitted `Diagnostic`, so the
+        // window sat one row off and the geometry undercounted the headers. Both now derive from the
+        // same `file_group_key`, so a Diagnostic-bearing window is accounted for like Grep.
+        let diag = |path: &str, line: u32| PickerItem::Diagnostic {
+            path_index: 0,
+            relative_path: path.into(),
+            line,
+            col: 0,
+            end_line: line,
+            end_col: 0,
+            severity: aether_protocol::viewport::DiagnosticSeverity::Error,
+            message: "boom".into(),
+            match_indices: vec![],
+        };
+        let mut s = PickerState::new(PickerKind::DiagnosticsProject);
+        // Window rows: [0]=hdr a.rs, [1]=diag, [2]=diag, [3]=hdr b.rs, [4]=diag.
+        assert!(s.apply_update(PickerUpdateParams {
+            kind: PickerKind::DiagnosticsProject,
+            generation: 0,
+            offset: 0,
+            items: Some(vec![
+                diag("src/a.rs", 2),
+                diag("src/a.rs", 9),
+                diag("src/b.rs", 4)
+            ]),
+            total_matches: 3,
+            total_candidates: 3,
+            ticking: false,
+            grep_display_offset: Some(1), // a.rs's header occupies display row 0
+            grep_total_display_rows: Some(5), // 3 diagnostics + 2 file headers
+            center_on: None,
+            explorer_peek_missing: false,
+        }));
+        // display_rows interleaves a header before each file's first diagnostic.
+        let headers = s
+            .display_rows()
+            .iter()
+            .filter(|r| matches!(r, DisplayRow::Header { .. }))
+            .count();
+        assert_eq!(headers, 2, "one header per file group");
+        // The geometry reflects the headers (not just the 3 items)...
+        assert_eq!(s.total_display_rows, 5);
+        // ...and the window leads with a.rs's header, so it starts at row 0, not 1.
+        assert_eq!(s.window_base(), 0);
+        // Selected-row math lands on the right display rows (below their headers).
+        s.selected = 0;
+        assert_eq!(s.selected_display_row(), Some(1));
+        s.selected = 2;
+        assert_eq!(s.selected_display_row(), Some(4));
+    }
+
+    #[test]
+    fn empty_note_wording_by_kind_and_query() {
+        // A settled (not ticking), result-less picker with the given query.
+        let settled = |kind: PickerKind, query: &str| {
+            let mut s = PickerState::new(kind);
+            s.ticking = false;
+            s.query = query.into();
+            s
+        };
+        // Empty query → the kind's "nothing here" line (not "No matches").
+        assert_eq!(
+            settled(PickerKind::Diagnostics, "").empty_note(),
+            Some("No diagnostics")
+        );
+        assert_eq!(
+            settled(PickerKind::DiagnosticsProject, "").empty_note(),
+            Some("No diagnostics")
+        );
+        assert_eq!(
+            settled(PickerKind::GitChanges, "").empty_note(),
+            Some("No changes")
+        );
+        assert_eq!(
+            settled(PickerKind::GitChangesFile, "").empty_note(),
+            Some("No changes")
+        );
+        assert_eq!(
+            settled(PickerKind::Files, "").empty_note(),
+            Some("No results")
+        );
+        assert_eq!(
+            settled(PickerKind::References, "").empty_note(),
+            Some("No references found")
+        );
+        assert_eq!(
+            settled(PickerKind::DocumentSymbols, "").empty_note(),
+            Some("No symbols found")
+        );
+        // A query that filtered everything out → "No matches" (the async kinds keep their phrasing).
+        assert_eq!(
+            settled(PickerKind::Diagnostics, "foo").empty_note(),
+            Some("No matches")
+        );
+        assert_eq!(
+            settled(PickerKind::Files, "foo").empty_note(),
+            Some("No matches")
+        );
+        assert_eq!(
+            settled(PickerKind::References, "foo").empty_note(),
+            Some("No references found")
+        );
+        // An unqueried Grep hasn't searched → no note; a queried empty Grep → "No matches".
+        assert_eq!(settled(PickerKind::Grep, "").empty_note(), None);
+        assert_eq!(
+            settled(PickerKind::Grep, "foo").empty_note(),
+            Some("No matches")
+        );
+        // Still searching, or rows present → no note.
+        let mut ticking = settled(PickerKind::Diagnostics, "");
+        ticking.ticking = true;
+        assert_eq!(ticking.empty_note(), None);
+        let mut has_rows = settled(PickerKind::Diagnostics, "");
+        has_rows.total_matches = 3;
+        assert_eq!(has_rows.empty_note(), None);
     }
 
     #[test]

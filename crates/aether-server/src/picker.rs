@@ -276,6 +276,10 @@ pub fn build_match_regex(
 /// fuzzy haystack; `abs_path` + `(line, col)` drive the `FileAt` jump on select.
 #[derive(Debug, Clone)]
 pub struct DiagnosticCandidate {
+    /// The file as project root index + root-relative path — only used by the project-wide picker
+    /// to group by file (the buffer-scoped picker renders flat).
+    pub path_index: u32,
+    pub relative_path: String,
     pub line: u32,
     pub col: u32,
     pub end_line: u32,
@@ -554,6 +558,8 @@ impl PickerCandidates {
             PickerCandidates::Diagnostics(v) => {
                 let c = &v[idx];
                 PickerItem::Diagnostic {
+                    path_index: c.path_index,
+                    relative_path: c.relative_path.clone(),
                     line: c.line,
                     col: c.col,
                     end_line: c.end_line,
@@ -1311,6 +1317,9 @@ impl PickerState {
                 PickerCandidates::GitChanges(v) => {
                     Some((v[ci].path_index, v[ci].relative_path.as_str()))
                 }
+                PickerCandidates::Diagnostics(v) => {
+                    Some((v[ci].path_index, v[ci].relative_path.as_str()))
+                }
                 PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
                 _ => None,
             }
@@ -1674,6 +1683,50 @@ mod tests {
         let (display_offset, total) = s.grouped_display_metrics(0).unwrap();
         assert_eq!(total, 3, "2 items + 1 References header");
         assert_eq!(display_offset, 1);
+    }
+
+    #[test]
+    fn project_diagnostics_count_file_headers_in_display_metrics() {
+        // `PickerCandidates::Diagnostics` backs two kinds: the flat buffer-locked `Diagnostics` and
+        // the file-grouped `DiagnosticsProject`. Only the latter renders headers, so its display
+        // metrics must include one header per file group (the regression: `key_at` omitted
+        // Diagnostics, so this returned `None` and the headers went uncounted).
+        let cand = |rel: &str, line: u32| DiagnosticCandidate {
+            path_index: 0,
+            relative_path: rel.into(),
+            line,
+            col: 0,
+            end_line: line,
+            end_col: 0,
+            severity: aether_protocol::viewport::DiagnosticSeverity::Error,
+            message: "boom".into(),
+            abs_path: format!("/proj/{rel}"),
+        };
+        // Two files: a.rs (two diagnostics) then b.rs (one) → 3 rows + 2 file headers = 5.
+        let cands = PickerCandidates::Diagnostics(vec![
+            cand("src/a.rs", 2),
+            cand("src/a.rs", 9),
+            cand("src/b.rs", 4),
+        ]);
+
+        // Buffer-locked `Diagnostics` is flat → no header accounting at all.
+        let mut flat = PickerState::new(cands.clone());
+        flat.rerank(&mut make_matcher());
+        assert_eq!(flat.kind, PickerKind::Diagnostics);
+        assert_eq!(flat.grouped_display_metrics(0), None);
+
+        // Project `DiagnosticsProject` groups by file → headers counted.
+        let mut proj = PickerState::new(cands);
+        proj.kind = PickerKind::DiagnosticsProject;
+        proj.rerank(&mut make_matcher());
+        let (display_offset, total) = proj
+            .grouped_display_metrics(0)
+            .expect("project diagnostics are header-grouped");
+        assert_eq!(total, 5, "3 diagnostics + 2 file headers");
+        assert_eq!(display_offset, 1, "a.rs's header precedes ranked row 0");
+        // A window opening at b.rs's first row (ranked 2) sits below both file headers.
+        let (display_offset, _) = proj.grouped_display_metrics(2).unwrap();
+        assert_eq!(display_offset, 4, "both file headers precede b.rs's row");
     }
 
     fn symbol_candidates() -> PickerCandidates {

@@ -49,24 +49,70 @@ fn convert_one(d: &Value, text: &Rope, encoding: PositionEncoding) -> Option<Buf
     let range = d.get("range")?;
     let start = lsp_pos_to_buffer(range.get("start")?, text, encoding)?;
     let end = lsp_pos_to_buffer(range.get("end")?, text, encoding)?;
-    // LSP severity: 1=Error 2=Warning 3=Information 4=Hint. Absent → treat as Warning.
-    let severity = match d.get("severity").and_then(Value::as_u64) {
+    Some(BufferDiagnostic {
+        start,
+        end,
+        severity: severity_of(d),
+        message: message_of(d),
+    })
+}
+
+/// LSP severity: 1=Error 2=Warning 3=Information 4=Hint. Absent → treat as Warning.
+fn severity_of(d: &Value) -> DiagnosticSeverity {
+    match d.get("severity").and_then(Value::as_u64) {
         Some(1) => DiagnosticSeverity::Error,
         Some(3) => DiagnosticSeverity::Information,
         Some(4) => DiagnosticSeverity::Hint,
         _ => DiagnosticSeverity::Warning,
-    };
-    let message = d
-        .get("message")
+    }
+}
+
+fn message_of(d: &Value) -> String {
+    d.get("message")
         .and_then(Value::as_str)
         .unwrap_or_default()
-        .to_string();
-    Some(BufferDiagnostic {
-        start,
-        end,
-        severity,
-        message,
-    })
+        .to_string()
+}
+
+/// A diagnostic in **LSP-native coordinates** (the `start` line only — no byte-column conversion),
+/// used by the project-diagnostics picker for files that aren't open as a buffer (so there's no
+/// buffer text to convert a column against). Selecting one jumps to the line start; the exact
+/// squiggle span resolves once the file opens and becomes a [`BufferDiagnostic`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawDiagnostic {
+    pub line: u32,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+}
+
+/// Parse a `publishDiagnostics` `diagnostics` array into line-only [`RawDiagnostic`]s for the
+/// path-keyed closed-file store. Same input as [`from_lsp`], but keeps only the start line (no
+/// per-column byte conversion — we don't necessarily have the file's text), and dedups verbatim
+/// repeats the way `from_lsp` does.
+pub fn raw_from_lsp(diagnostics: &Value) -> Vec<RawDiagnostic> {
+    let Some(arr) = diagnostics.as_array() else {
+        return Vec::new();
+    };
+    let mut out: Vec<RawDiagnostic> = Vec::new();
+    for d in arr {
+        let Some(line) = d
+            .get("range")
+            .and_then(|r| r.get("start"))
+            .and_then(|s| s.get("line"))
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let raw = RawDiagnostic {
+            line: line as u32,
+            severity: severity_of(d),
+            message: message_of(d),
+        };
+        if !out.contains(&raw) {
+            out.push(raw);
+        }
+    }
+    out
 }
 
 fn lsp_pos_to_buffer(
@@ -106,6 +152,25 @@ mod tests {
             "severity": sev,
             "message": msg,
         })
+    }
+
+    #[test]
+    fn raw_from_lsp_keeps_line_severity_message_and_dedups() {
+        // Closed-file store: keep the start line only (no column), default absent severity to
+        // Warning, and drop verbatim repeats. Distinct lines stay.
+        let arr = json!([
+            diag(4, 0, 4, 3, 1, "boom"),
+            diag(4, 0, 4, 3, 1, "boom"), // verbatim repeat → dropped
+            diag(9, 2, 9, 5, 2, "warn"),
+        ]);
+        let got = raw_from_lsp(&arr);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].line, 4);
+        assert_eq!(got[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(got[0].message, "boom");
+        assert_eq!(got[1].line, 9);
+        assert_eq!(got[1].severity, DiagnosticSeverity::Warning);
+        assert!(raw_from_lsp(&json!(null)).is_empty());
     }
 
     #[test]

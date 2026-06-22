@@ -747,14 +747,15 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('e'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Explorer), "Files", "File explorer"),
     bind!(L, ch('e'), Exact(Mods::ALT), A::OpenExplorerAtRoot, "Files", "File explorer at project root"),
     bind!(L, ch('p'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Projects), "Project", "Switch project"),
-    bind!(L, ch('d'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics list"),
+    bind!(L, ch('d'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics in current buffer"),
+    bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::DiagnosticsProject), "Code", "Project diagnostics"),
     bind!(L, ch('j'), Exact(Mods::NONE), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
     bind!(L, ch('r'), Exact(Mods::NONE), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
-    bind!(L, ch('c'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitChanges), "Git", "Git changes (hunks)"),
-    bind!(L, ch('c'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitChangesFile), "Git", "Git changes in current file"),
+    bind!(L, ch('c'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitChangesFile), "Git", "Git changes in current file"),
+    bind!(L, ch('c'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitChanges), "Git", "Project git changes (hunks)"),
     bind!(L, ch('n'), Exact(Mods::NONE), A::GrepNavigate(Direction::Forward), "Search", "Next grep hit"),
     bind!(L, ch('n'), Exact(Mods::ALT), A::GrepNavigate(Direction::Backward), "Search", "Previous grep hit"),
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),
@@ -856,14 +857,28 @@ mod tests {
             lookup(KeyContext::Leader, ch('m'), Mods::NONE).map(|b| b.action),
             Some(Action::ShowCommitInfo)
         ));
-        // Go-to-definition is on Enter; the Space leader's `d` is the diagnostics list.
+        // Go-to-definition is on Enter; the Space leader's `d` is the project diagnostics list, and
+        // `Alt-d` the current buffer's.
         assert!(matches!(
             lookup(KeyContext::Normal, KeyCode::Enter, Mods::NONE).map(|b| b.action),
             Some(Action::GotoDefinition)
         ));
+        // Plain leader is buffer-scoped, Alt widens to the project (diagnostics + git changes).
         assert!(matches!(
             lookup(KeyContext::Leader, ch('d'), Mods::NONE).map(|b| b.action),
             Some(Action::OpenPicker(PickerKind::Diagnostics))
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Leader, ch('d'), Mods::ALT).map(|b| b.action),
+            Some(Action::OpenPicker(PickerKind::DiagnosticsProject))
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Leader, ch('c'), Mods::NONE).map(|b| b.action),
+            Some(Action::OpenPicker(PickerKind::GitChangesFile))
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Leader, ch('c'), Mods::ALT).map(|b| b.action),
+            Some(Action::OpenPicker(PickerKind::GitChanges))
         ));
     }
 

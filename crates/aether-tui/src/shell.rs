@@ -1598,6 +1598,7 @@ impl Shell {
         p.ticking = core.ticking;
         p.spinner = core.spinner_glyph();
         p.total_display_rows = Some(core.total_display_rows);
+        p.empty_note = core.empty_note().map(str::to_string);
         p.selected = (core.selected.saturating_sub(core.offset)) as usize;
         // The Explorer's synthetic "+ Create …" affordance — the core owns the decision
         // (`pending_create`); the shell appends it as a trailing row (italicised via

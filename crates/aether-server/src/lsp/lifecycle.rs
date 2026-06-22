@@ -94,7 +94,6 @@ pub async fn initialize(
         .and_then(|c| c.get("documentFormattingProvider"))
         .map(|v| v != &Value::Bool(false))
         .unwrap_or(false);
-
     client.notify("initialized", json!({}))?;
     Ok(ServerCaps {
         name,

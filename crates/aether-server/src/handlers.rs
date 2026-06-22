@@ -4887,7 +4887,9 @@ fn buffer_diagnostics(
 /// Notify the language server of a buffer's new full text (LSP `didChange`). Must be called by
 /// *every* path that changes buffer text — edits, undo/redo, reload — or the server's analysis
 /// (and its diagnostics) goes stale. A no-op unless the buffer is file-backed and open against a
-/// ready server; `notify` is a channel send, so it's fire-and-forget under the lock.
+/// ready server; `notify` is a channel send, so it's fire-and-forget under the lock. The server
+/// re-publishes diagnostics on its own after the `didChange`, which the `publishDiagnostics` hook
+/// then renders.
 fn notify_lsp_change(s: &mut ServerState, buffer_id: BufferId) {
     let Some(buf) = s.buffers.get(&buffer_id) else {
         return;
@@ -4922,6 +4924,9 @@ fn build_diagnostic_candidates(
     let mut out: Vec<picker_state::DiagnosticCandidate> = buffer_diagnostics(s, buffer_id)
         .iter()
         .map(|d| picker_state::DiagnosticCandidate {
+            // The buffer-scoped picker renders flat, so the file path-index/relative-path are unused.
+            path_index: 0,
+            relative_path: String::new(),
             line: d.start.line,
             col: d.start.col,
             end_line: d.end.line,
@@ -4932,6 +4937,57 @@ fn build_diagnostic_candidates(
         })
         .collect();
     out.sort_by_key(|c| (c.line, c.col));
+    out
+}
+
+/// Build the **project-wide** diagnostics candidates (the `Space Alt-d` picker), grouped by file.
+/// Reads a single source — the path-keyed [`ServerState::path_diagnostics`], which `publishDiagnostics`
+/// fills for every file a server reports (rust-analyzer's flycheck covers the whole build). This is
+/// kept *separate* from the buffer-scoped picker's live byte-precise set ([`ServerState::diagnostics`]),
+/// not merged: every project row is line-granular (`col: 0`, lands on the line start), so the list is
+/// uniform — "diagnostics as of the last analysis/check" — rather than mixing live and reported rows.
+///
+/// Synchronous — no LSP round-trip (no configured server answers the workspace pull; everything is
+/// already stored). Sorted by (file, line) so the picker groups rows under their file header.
+fn build_project_diagnostic_candidates(
+    s: &ServerState,
+    client_id: ClientId,
+) -> Vec<picker_state::DiagnosticCandidate> {
+    let Some(project) = s.active_project(client_id) else {
+        return Vec::new();
+    };
+    let roots = project.paths.clone();
+
+    let mut out: Vec<picker_state::DiagnosticCandidate> = Vec::new();
+    for (path, diags) in &s.path_diagnostics {
+        let Some((path_index, relative_path)) =
+            crate::workspace_index::project_relative_parts(path, &roots)
+        else {
+            continue; // outside the active project
+        };
+        let abs_path = path.to_string_lossy().into_owned();
+        for d in diags {
+            out.push(picker_state::DiagnosticCandidate {
+                path_index,
+                relative_path: relative_path.clone(),
+                line: d.line,
+                col: 0, // line-granular: no buffer text to resolve a byte column
+                end_line: d.line,
+                end_col: 0,
+                severity: d.severity,
+                message: d.message.clone(),
+                abs_path: abs_path.clone(),
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        (a.path_index, a.relative_path.as_str(), a.line).cmp(&(
+            b.path_index,
+            b.relative_path.as_str(),
+            b.line,
+        ))
+    });
     out
 }
 
@@ -9412,6 +9468,50 @@ pub fn refresh_lsp_server_pickers(s: &mut ServerState) -> PendingPushes {
     pushes
 }
 
+/// Rebuild every *open* project-diagnostics picker (`Space Alt-d`) from the current
+/// `path_diagnostics` and push the update — so it live-updates as servers push diagnostics (while
+/// rust-analyzer indexes the workspace, or after a `cargo check`) instead of showing only the
+/// snapshot from when it opened. Called on every diagnostics push; a no-op (empty, no rebuild) when
+/// no client has the picker open. Mirrors [`refresh_lsp_server_pickers`].
+pub fn refresh_project_diagnostics_pickers(s: &mut ServerState) -> PendingPushes {
+    let client_ids: Vec<ClientId> = s
+        .pickers
+        .iter()
+        .filter_map(|((c, k), p)| {
+            (*k == PickerKind::DiagnosticsProject && p.subscribed.is_some()).then_some(*c)
+        })
+        .collect();
+    let mut pushes = Vec::new();
+    for client_id in client_ids {
+        let new_candidates = build_project_diagnostic_candidates(s, client_id);
+        let ServerState {
+            pickers,
+            matcher,
+            clients,
+            ..
+        } = &mut *s;
+        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::DiagnosticsProject)) else {
+            continue;
+        };
+        picker.candidates = picker_state::PickerCandidates::Diagnostics(new_candidates);
+        picker.rerank(matcher);
+        if let Some(window) = picker.subscribed.as_mut() {
+            let total = picker.ranked.len() as u32;
+            if window.offset >= total {
+                window.offset = total.saturating_sub(window.limit);
+            }
+        }
+        let Some(update) = picker_state::build_update(picker, matcher) else {
+            continue;
+        };
+        let Some(sender) = clients.get(&client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        pushes.push((sender, picker_update_notif(update)));
+    }
+    pushes
+}
+
 pub(crate) fn picker_update_notif(params: PickerUpdateParams) -> Notification {
     Notification {
         jsonrpc: JsonRpc,
@@ -10111,6 +10211,15 @@ pub async fn picker_view(
             // Resume / scroll re-view: an empty placeholder; `preserve_existing` keeps the snapshot.
             None => picker_state::PickerCandidates::Diagnostics(Vec::new()),
         },
+        // Modal sibling of GitChanges: project-wide, rebuilt fresh on every view from the stored
+        // diagnostics (open buffers' live set + the path-keyed closed-file set). All in-memory, so
+        // it's synchronous — there's no slow LSP round-trip (no server answers the workspace pull).
+        PickerKind::DiagnosticsProject => {
+            let s = state.lock().await;
+            picker_state::PickerCandidates::Diagnostics(build_project_diagnostic_candidates(
+                &s, client_id,
+            ))
+        }
         PickerKind::LspServers => {
             // Rebuilt every view from the active project's servers — the set is tiny and statuses
             // change, so there's no snapshot to preserve.
@@ -11308,6 +11417,154 @@ mod subscribe_snapshot_tests {
             severity,
             message: "m".into(),
         }
+    }
+
+    #[test]
+    fn project_diagnostics_read_path_store_not_buffer_set() {
+        use crate::lsp::diagnostics::RawDiagnostic;
+        let mut st = ServerState::new();
+        let root = std::path::PathBuf::from("/proj");
+        st.projects.insert(
+            "p".to_string(),
+            crate::state::ProjectEntry {
+                name: "p".to_string(),
+                paths: vec![root.clone()],
+                workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
+                    vec![root.clone()],
+                )),
+                mru_buffers: std::collections::VecDeque::new(),
+            },
+        );
+        let client_id = uuid::Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        std::mem::forget(_rx);
+        st.clients.insert(
+            client_id,
+            crate::state::ClientSession {
+                client_id,
+                outbound: tx,
+                active_project: Some("p".to_string()),
+            },
+        );
+
+        // a.rs is open with a diagnostic in the BUFFER-keyed set (line 42). The project picker is a
+        // separate lens — it must ignore that set entirely and read only `path_diagnostics`.
+        let buffer_id = st.allocate_buffer_id();
+        let mut buf = Buffer::scratch(buffer_id, None, 1);
+        buf.canonical_path = Some(root.join("src/a.rs"));
+        st.buffers.insert(buffer_id, buf);
+        st.diagnostics
+            .insert(buffer_id, vec![diag(42, DiagnosticSeverity::Error)]);
+
+        // The path-keyed store is the project picker's sole source: a.rs (open) + b.rs (closed).
+        st.path_diagnostics.insert(
+            root.join("src/a.rs"),
+            vec![
+                RawDiagnostic {
+                    line: 2,
+                    severity: DiagnosticSeverity::Warning,
+                    message: "warn".into(),
+                },
+                RawDiagnostic {
+                    line: 9,
+                    severity: DiagnosticSeverity::Error,
+                    message: "err".into(),
+                },
+            ],
+        );
+        st.path_diagnostics.insert(
+            root.join("src/b.rs"),
+            vec![RawDiagnostic {
+                line: 5,
+                severity: DiagnosticSeverity::Error,
+                message: "boom".into(),
+            }],
+        );
+
+        let cands = build_project_diagnostic_candidates(&st, client_id);
+
+        // Three rows, all from `path_diagnostics`; the buffer-keyed line 42 is NOT merged in.
+        assert_eq!(cands.len(), 3);
+        assert!(
+            !cands.iter().any(|c| c.line == 42),
+            "buffer-keyed set is a separate lens, not merged"
+        );
+        // Grouped by file (a.rs before b.rs), then by line; every row is line-granular (col 0).
+        assert_eq!(cands[0].relative_path, "src/a.rs");
+        assert_eq!(cands[0].line, 2);
+        assert_eq!(cands[1].relative_path, "src/a.rs");
+        assert_eq!(cands[1].line, 9);
+        assert_eq!(cands[2].relative_path, "src/b.rs");
+        assert_eq!(cands[2].line, 5);
+        assert_eq!(cands[2].message, "boom");
+        assert!(
+            cands.iter().all(|c| c.col == 0 && c.end_col == 0),
+            "project rows are line-granular"
+        );
+    }
+
+    #[test]
+    fn open_project_picker_live_refreshes_from_path_diagnostics() {
+        use crate::lsp::diagnostics::RawDiagnostic;
+        let mut st = ServerState::new();
+        let root = std::path::PathBuf::from("/proj");
+        st.projects.insert(
+            "p".to_string(),
+            crate::state::ProjectEntry {
+                name: "p".to_string(),
+                paths: vec![root.clone()],
+                workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
+                    vec![root.clone()],
+                )),
+                mru_buffers: std::collections::VecDeque::new(),
+            },
+        );
+        let client_id = uuid::Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        std::mem::forget(_rx);
+        st.clients.insert(
+            client_id,
+            crate::state::ClientSession {
+                client_id,
+                outbound: tx,
+                active_project: Some("p".to_string()),
+            },
+        );
+        // An OPEN (subscribed), currently-empty project-diagnostics picker.
+        let mut picker =
+            picker_state::PickerState::new(picker_state::PickerCandidates::Diagnostics(Vec::new()));
+        picker.kind = PickerKind::DiagnosticsProject;
+        picker.subscribed = Some(picker_state::SubscribedWindow {
+            offset: 0,
+            limit: 50,
+        });
+        st.pickers
+            .insert((client_id, PickerKind::DiagnosticsProject), picker);
+
+        // A push lands a never-opened file's diagnostic in `path_diagnostics`...
+        st.path_diagnostics.insert(
+            root.join("src/markdown.rs"),
+            vec![RawDiagnostic {
+                line: 37,
+                severity: DiagnosticSeverity::Error,
+                message: "unexpected `}`".into(),
+            }],
+        );
+        let pushes = refresh_project_diagnostics_pickers(&mut st);
+
+        // ...and the open picker picks it up live, with an update pushed to the viewing client.
+        assert_eq!(
+            pushes.len(),
+            1,
+            "one update to the client viewing the picker"
+        );
+        let picker = &st.pickers[&(client_id, PickerKind::DiagnosticsProject)];
+        let picker_state::PickerCandidates::Diagnostics(rows) = &picker.candidates else {
+            panic!("expected Diagnostics candidates");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].relative_path, "src/markdown.rs");
+        assert_eq!(rows[0].line, 37);
     }
 
     /// State with one file-text buffer carrying `diags` and the given external-change flags. No

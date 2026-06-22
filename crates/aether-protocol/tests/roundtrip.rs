@@ -1536,7 +1536,18 @@ fn picker_item_diagnostic_is_tagged() {
         to_value(PickerKind::Diagnostics).unwrap(),
         json!("diagnostics")
     );
+    assert_eq!(
+        to_value(PickerKind::DiagnosticsProject).unwrap(),
+        json!("diagnostics_project")
+    );
+    // The project picker groups by file; the buffer-scoped one is flat (and centres on neither).
+    assert!(
+        PickerKind::DiagnosticsProject.groups_by_file()
+            && !PickerKind::Diagnostics.groups_by_file()
+    );
     let item = PickerItem::Diagnostic {
+        path_index: 1,
+        relative_path: "src/main.rs".into(),
         line: 12,
         col: 4,
         end_line: 12,
@@ -1547,6 +1558,8 @@ fn picker_item_diagnostic_is_tagged() {
     };
     let v = to_value(&item).unwrap();
     assert_eq!(v["kind"], "diagnostic");
+    assert_eq!(v["path_index"], 1);
+    assert_eq!(v["relative_path"], "src/main.rs");
     assert_eq!(v["line"], 12);
     assert_eq!(v["col"], 4);
     assert_eq!(v["end_line"], 12);

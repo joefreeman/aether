@@ -1249,17 +1249,26 @@ mod symbol_nav_tests {
         // From a selection of `impl S` (idx 1: anchor at name start, cursor at name end), `Shift-o`
         // extends forward to include `fn a` (idx 2): cursor → idx 2's name end, anchor stays at the
         // selection's backward edge (idx 1's start).
-        assert_eq!(ext(o[1].end, o[1].start, 1, true), (o[2].end, Some(o[1].start)));
+        assert_eq!(
+            ext(o[1].end, o[1].start, 1, true),
+            (o[2].end, Some(o[1].start))
+        );
 
         // `Shift-Alt-o` from that same selection extends *backward* to include `struct S` (idx 0):
         // cursor → idx 0's name *start*, anchor pinned to the selection's forward edge (idx 1's end).
-        assert_eq!(ext(o[1].end, o[1].start, 1, false), (o[0].start, Some(o[1].end)));
+        assert_eq!(
+            ext(o[1].end, o[1].start, 1, false),
+            (o[0].start, Some(o[1].end))
+        );
 
         // A count grows past several identifiers in one go (forward two from the top → idx 2's end).
         assert_eq!(ext(at(0), at(0), 2, true), (o[2].end, Some(at(0))));
 
         // Running out of symbols leaves the selection untouched rather than collapsing it.
-        assert_eq!(ext(o[5].end, o[5].start, 1, true), (o[5].end, Some(o[5].start)));
+        assert_eq!(
+            ext(o[5].end, o[5].start, 1, true),
+            (o[5].end, Some(o[5].start))
+        );
     }
 
     #[test]

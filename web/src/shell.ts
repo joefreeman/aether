@@ -71,11 +71,12 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   files: "Find files…",
   buffers: "Switch buffer…",
   grep: "Grep workspace…",
-  git_changes: "Search changes…",
   git_changes_file: "Changes in current file…",
+  git_changes: "Changes in project…",
   explorer: "Explore files…",
   projects: "Select project…",
-  diagnostics: "List diagnostics…",
+  diagnostics: "Diagnostics in current file…",
+  diagnostics_project: "Diagnostics in project…",
   lsp_servers: "List LSPs…",
   references: "List references…",
   document_symbols: "Go to symbol…",
@@ -247,6 +248,10 @@ interface PickerView {
   total_matches: number;
   total_candidates: number;
   ticking: boolean;
+  /** Settled empty-state line (core-owned wording: "No diagnostics" / "No matches" / …), or null
+   *  while searching or when rows exist. The "Searching…/Finding…" loading text is derived shell-side
+   *  from `ticking` + `kind`. */
+  empty_note: string | null;
   total_display_rows: number;
   window_base: number;
   directory: string | null;
@@ -3270,15 +3275,18 @@ export class Shell {
         list.querySelector(".picker-row.selected")?.scrollIntoView({ block: "nearest" });
         return;
       }
+      // Loading text is shell-derived (the async kinds get a kind-specific "Finding…"); the settled
+      // empty-state wording comes from the core (`empty_note`) so all shells say the same thing.
       let text = "";
-      if (p.kind === "references") {
-        text = p.ticking ? "Finding references…" : "No references found";
-      } else if (p.kind === "document_symbols") {
-        text = p.ticking ? "Finding symbols…" : "No symbols found";
-      } else if (p.ticking) {
-        text = "Searching…";
-      } else if (p.query.length > 0) {
-        text = "No matches";
+      if (p.ticking) {
+        text =
+          p.kind === "references"
+            ? "Finding references…"
+            : p.kind === "document_symbols"
+              ? "Finding symbols…"
+              : "Searching…";
+      } else {
+        text = p.empty_note ?? "";
       }
       if (text) {
         const msg = document.createElement("div");
@@ -3308,12 +3316,21 @@ export class Shell {
     let selectedRow: HTMLElement | null = null;
     let prevGrepKey: string | null = null;
     let section: HTMLElement | null = null;
-    // Grep and project git-changes group per file with a sticky header; the buffer-locked
-    // git_changes_file is a single headerless file (the core emits flat display-row offsets/counts).
-    const groupByFile = p.kind === "grep" || p.kind === "git_changes";
+    // Grep, project git-changes, and project diagnostics group per file with a sticky header; the
+    // buffer-locked git_changes_file / diagnostics are flat/single-file (the core emits matching
+    // flat display-row offsets/counts).
+    const groupByFile =
+      p.kind === "grep" || p.kind === "git_changes" || p.kind === "diagnostics_project";
     p.items.forEach((item, i) => {
-      if (groupByFile && (item.kind === "grep_hit" || item.kind === "git_change")) {
-        const key = `${item.path_index}\0${item.relative_path}`;
+      if (
+        groupByFile &&
+        (item.kind === "grep_hit" || item.kind === "git_change" || item.kind === "diagnostic")
+      ) {
+        // Diagnostic items carry the path optionally (the buffer picker omits it); in the grouped
+        // project picker it's always present.
+        const pathIndex = item.path_index ?? 0;
+        const relPath = item.relative_path ?? "";
+        const key = `${pathIndex}\0${relPath}`;
         if (key !== prevGrepKey) {
           prevGrepKey = key;
           section = document.createElement("div");
@@ -3321,11 +3338,11 @@ export class Shell {
           const h = document.createElement("div");
           h.className = "picker-row grep-header";
           if (labels.length > 1) {
-            const label = labels[item.path_index] ?? `root ${item.path_index}`;
+            const label = labels[pathIndex] ?? `root ${pathIndex}`;
             const pb = Math.max(8, budget - [...label].length - 2);
-            h.textContent = `${label}: ${truncatePath(item.relative_path, undefined, pb).display}`;
+            h.textContent = `${label}: ${truncatePath(relPath, undefined, pb).display}`;
           } else {
-            h.textContent = truncatePath(item.relative_path, undefined, budget).display;
+            h.textContent = truncatePath(relPath, undefined, budget).display;
           }
           section.append(h);
           win.append(section);

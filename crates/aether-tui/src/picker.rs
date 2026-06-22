@@ -63,6 +63,10 @@ pub struct PickerState {
     /// Server-reported; in practice grep-only (hits + one header per file group — the wire field
     /// is `grep_total_display_rows`), `None` for the other kinds. Sizes the collapsed picker box.
     pub total_display_rows: Option<u32>,
+    /// The settled empty-state line (core-owned wording, e.g. "No diagnostics"), or `None` while
+    /// searching / when rows exist. Synced from the core's [`PickerState::empty_note`]; the async
+    /// kinds' "Finding…" loading text is still derived shell-side from `ticking`.
+    pub empty_note: Option<String>,
     /// Index into `items` of the highlighted row.
     pub selected: usize,
     /// When non-None, the item we're trying to re-anchor on after resume. Cleared once located

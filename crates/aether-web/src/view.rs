@@ -127,6 +127,10 @@ fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
                 // The web throbber is CSS-animated off `ticking` (the braille `spinner_glyph` is for
                 // the terminal); no glyph needed here.
                 "ticking": p.ticking,
+                // Settled empty-state line (core-owned wording), or null while searching / when rows
+                // exist. The shell renders it verbatim; the "Searching…/Finding…" loading text it
+                // still derives from `ticking` + kind.
+                "empty_note": p.empty_note(),
                 "total_display_rows": p.total_display_rows,
                 // Display-row index of the loaded window's first rendered row (a grep header sits one
                 // row above the first hit) — where the shell positions the window within the spacer.
