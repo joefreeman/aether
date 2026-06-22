@@ -290,6 +290,10 @@ pub enum Action {
     /// Toggle the active buffer's transient ("keep") state — pin a preview permanent, or release a
     /// permanent buffer back to transient. Refused for unsaved buffers (auto-close would discard).
     ToggleKeep,
+    /// Copy the active buffer's project-relative path to the system clipboard.
+    CopyRelativePath,
+    /// Copy the active buffer's absolute (canonical) path to the system clipboard.
+    CopyAbsolutePath,
     NewScratch,
     CloseBuffer,
 
@@ -770,6 +774,8 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
     bind!(L, ch('k'), Exact(Mods::NONE), A::ToggleKeep, "App", "Keep buffer (toggle transient)"),
     bind!(L, ch('k'), Exact(Mods::ALT), A::Reload, "App", "Reload from disk"),
+    bind!(L, ch('a'), Exact(Mods::NONE), A::CopyRelativePath, "App", "Copy relative path"),
+    bind!(L, ch('a'), Exact(Mods::ALT), A::CopyAbsolutePath, "App", "Copy absolute path"),
     bind!(L, ch('y'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
     bind!(L, ch('y'), Exact(Mods::ALT), A::RevertHunk, "Git", "Revert change"),
     bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),

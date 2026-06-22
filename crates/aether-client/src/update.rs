@@ -9,7 +9,8 @@ use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
 use super::session::{
-    buffer_info, min_pos, severity_label, strip_longest_root, AppSettingId, AppSettingsOverlay,
+    buffer_info, label_for_path, min_pos, severity_label, strip_longest_root, AppSettingId,
+    AppSettingsOverlay,
     CommitDetails, ConfirmAction, ConfirmKind, ConnState, HoverBlock, HoverText, Mode, PasteKind,
     Pending, ProjectSettings, Prompt, ReloadTry, RepeatTarget, SaveTry, SearchSnapshot,
     SearchState, Session, TextField,
@@ -1341,6 +1342,30 @@ impl Session {
                 }))
             },
         )
+    }
+
+    /// Copy the active buffer's path to the system clipboard — `absolute` picks the canonical
+    /// on-disk path (`Space Alt-a`), otherwise the project-relative path (`Space a`). Scratch
+    /// buffers have no path, so it warns instead.
+    fn copy_buffer_path(&mut self, absolute: bool) -> Effects {
+        let Some(path) = self.buffer.path.as_deref() else {
+            return Effects::toast("scratch buffer has no path", ToastKind::Warning);
+        };
+        let text = if absolute {
+            path.to_string()
+        } else {
+            label_for_path(path, &self.project_paths)
+        };
+        let mut fx = Effects::toast(
+            if absolute {
+                "copied absolute path"
+            } else {
+                "copied relative path"
+            },
+            ToastKind::Success,
+        );
+        fx.push(Effect::WriteClipboard(text));
+        fx
     }
 
     /// Open a file by absolute path as a transient preview — result-style navigation (picker
@@ -4838,6 +4863,8 @@ impl Session {
                     |r| Event::KeepToggled(r.map(|res| res.transient)),
                 )
             }
+            A::CopyRelativePath => self.copy_buffer_path(false),
+            A::CopyAbsolutePath => self.copy_buffer_path(true),
             A::NewScratch => {
                 // Opening a fresh scratch is a buffer switch — record the origin so Alt-Left
                 // returns (folded into the open's `record_nav_from`).

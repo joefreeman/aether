@@ -1757,6 +1757,14 @@ fn find_request<'a>(fx: &'a Effects, method: &str) -> Option<&'a serde_json::Val
     })
 }
 
+/// The text handed to a `WriteClipboard` effect, if any.
+fn written_clipboard(fx: &Effects) -> Option<String> {
+    fx.0.iter().find_map(|e| match e {
+        Effect::WriteClipboard(t) => Some(t.clone()),
+        _ => None,
+    })
+}
+
 #[test]
 fn explorer_tab_applies_common_prefix_completion() {
     use aether_client::keymap::Mods;
@@ -2319,6 +2327,40 @@ fn reload_moved_to_space_alt_k() {
     assert!(
         find_request(&fx, "buffer/reload").is_none(),
         "Space a is no longer bound to reload"
+    );
+}
+
+#[test]
+fn space_a_copies_relative_and_absolute_paths() {
+    let mut s = session();
+    s.project_paths = vec!["/proj".into()];
+    s.buffer.path = Some("/proj/src/main.rs".into());
+
+    // Space a → project-relative path.
+    let _ = key(&mut s, ' '); // leader
+    let fx = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
+    assert_eq!(written_clipboard(&fx).as_deref(), Some("src/main.rs"));
+
+    // Space Alt-a → absolute path.
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None, ROWS);
+    assert_eq!(written_clipboard(&fx).as_deref(), Some("/proj/src/main.rs"));
+}
+
+#[test]
+fn copy_path_warns_for_scratch_buffer() {
+    let mut s = session();
+    s.buffer.path = None; // a scratch buffer
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
+    assert!(
+        written_clipboard(&fx).is_none(),
+        "no path — nothing is copied"
+    );
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Warning))),
+        "a scratch buffer warns instead"
     );
 }
 
