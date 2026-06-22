@@ -265,10 +265,12 @@ struct FileFilter {
     /// subtree (empty `relative_path` = whole root); an `is_file` scope passes only that exact
     /// file. An empty vec means no scope narrowing.
     directories: Vec<(u32, String, bool)>,
-    /// Per-root repo status, aligned to root index. Only `Some` under `changed_only`; a root
-    /// outside any repo yields `None` inside, which excludes its files (nothing in it is
-    /// "changed").
-    changed: Option<Vec<Option<crate::git::RepoStatus>>>,
+    /// Per-root repo status, aligned to root index. `Some` whenever a status-dependent filter is
+    /// active (`changed_only` and/or `hide_untracked`); a root outside any repo yields `None`
+    /// inside. Resolved once because the worktree walk is the expensive part.
+    status: Option<Vec<Option<crate::git::RepoStatus>>>,
+    changed_only: bool,
+    hide_untracked: bool,
 }
 
 impl FileFilter {
@@ -284,12 +286,14 @@ impl FileFilter {
                 .iter()
                 .map(|d| (d.path_index, d.relative_path.clone(), d.is_file))
                 .collect(),
-            changed: filters.changed_only.then(|| {
+            status: (filters.changed_only || filters.hide_untracked).then(|| {
                 roots
                     .iter()
                     .map(|r| crate::git::repo_status_for_root(r))
                     .collect()
             }),
+            changed_only: filters.changed_only,
+            hide_untracked: filters.hide_untracked,
         }
     }
 
@@ -312,12 +316,17 @@ impl FileFilter {
                 return false;
             }
         }
-        if let Some(changed) = &self.changed {
-            let status = changed
+        if let Some(statuses) = &self.status {
+            let status = statuses
                 .get(f.path_index as usize)
                 .and_then(|rs| rs.as_ref())
                 .and_then(|rs| rs.status_of(&f.relative_path));
-            if status.is_none() {
+            if self.changed_only && status.is_none() {
+                return false;
+            }
+            if self.hide_untracked
+                && status == Some(aether_protocol::git::GitStatus::Untracked)
+            {
                 return false;
             }
         }

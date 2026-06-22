@@ -737,6 +737,10 @@ pub struct ChangedFile {
     pub rel_path: String,
     pub hunks: Vec<DiffHunk>,
     pub working: Vec<u8>,
+    /// True when the file has no committed (HEAD) blob *and* no index blob — i.e. wholly untracked.
+    /// A staged-new file has an index blob, so it reads as tracked (`false`). Used by the
+    /// Git-changes picker's `hide_untracked` filter.
+    pub untracked: bool,
 }
 
 /// Diff every changed file under `root` against HEAD (combined staged+unstaged), opening the repo
@@ -827,6 +831,7 @@ pub fn changed_files_with_hunks(root: &Path) -> Vec<ChangedFile> {
             rel_path,
             hunks: both,
             working,
+            untracked: head.is_none() && index_blob.is_none(),
         });
     }
     out

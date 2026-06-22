@@ -9744,6 +9744,13 @@ pub(crate) fn build_explorer_candidates_for_canonical(
         {
             continue;
         }
+        // Hide untracked entries (and directories whose aggregated status is untracked — a wholly
+        // new subtree). Composes with `changed_only`: changed + tracked-only, or all-tracked alone.
+        if filters.hide_untracked
+            && git_status == Some(aether_protocol::git::GitStatus::Untracked)
+        {
+            continue;
+        }
         entries.push(picker_state::ExplorerEntry {
             name,
             is_dir,
@@ -9963,6 +9970,9 @@ struct OpenChange {
     abs_path: String,
     hunks: Vec<crate::git::DiffHunk>,
     text: ropey::Rope,
+    /// No HEAD blob and no index blob in the cached baseline — a wholly untracked file. Drives the
+    /// `hide_untracked` filter; a staged-new file (index blob present) is `false`.
+    untracked: bool,
 }
 
 /// One changed file's hunks, gathered before flattening into candidates with a stable file order.
@@ -9971,6 +9981,7 @@ struct FileChanges {
     relative_path: String,
     abs_path: String,
     hunks: Vec<HunkInfo>,
+    untracked: bool,
 }
 
 /// The per-hunk facts the Git-changes picker needs, reduced from a [`crate::git::DiffHunk`].
@@ -10039,6 +10050,7 @@ fn build_git_change_candidates(
                 relative_path: o.relative_path.clone(),
                 abs_path: o.abs_path.clone(),
                 hunks: infos,
+                untracked: o.untracked,
             });
         }
     }
@@ -10070,6 +10082,7 @@ fn build_git_change_candidates(
                 abs_path: root.join(&changed.rel_path).to_string_lossy().into_owned(),
                 relative_path: changed.rel_path,
                 hunks: infos,
+                untracked: changed.untracked,
             });
         }
     }
@@ -10081,17 +10094,20 @@ fn build_git_change_candidates(
     let mut out = Vec::new();
     for f in files {
         for (i, info) in f.hunks.into_iter().enumerate() {
-            out.push(picker_state::GitChangeCandidate::new(
-                f.path_index,
-                f.relative_path.clone(),
-                f.abs_path.clone(),
-                i as u32,
-                info.line,
-                info.stage,
-                info.added,
-                info.removed,
-                info.lines,
-            ));
+            out.push(
+                picker_state::GitChangeCandidate::new(
+                    f.path_index,
+                    f.relative_path.clone(),
+                    f.abs_path.clone(),
+                    i as u32,
+                    info.line,
+                    info.stage,
+                    info.added,
+                    info.removed,
+                    info.lines,
+                )
+                .with_untracked(f.untracked),
+            );
         }
     }
     out
@@ -10244,11 +10260,17 @@ pub async fn picker_view(
                         // refreshes while the inline diff view is on, so unsaved edits always show.
                         // Same shape as the disk path: a `None` index blob (untracked) diffs the
                         // whole buffer as an addition.
-                        let (index, staged) = s
+                        let (head, index, staged) = s
                             .git_baseline
                             .get(id)
-                            .map(|base| (base.index_blob.clone(), base.staged_hunks.clone()))
-                            .unwrap_or((None, Vec::new()));
+                            .map(|base| {
+                                (
+                                    base.blob.is_some(),
+                                    base.index_blob.clone(),
+                                    base.staged_hunks.clone(),
+                                )
+                            })
+                            .unwrap_or((false, None, Vec::new()));
                         let unstaged = crate::git::hunks_from_buffers(
                             index.as_deref().unwrap_or(b""),
                             b.text.to_string().as_bytes(),
@@ -10259,6 +10281,7 @@ pub async fn picker_view(
                             abs_path: abs.to_string_lossy().into_owned(),
                             hunks: crate::git::compose_both(&staged, &unstaged),
                             text: b.text.clone(),
+                            untracked: !head && index.is_none(),
                         })
                     })
                     .collect();
@@ -10281,11 +10304,17 @@ pub async fn picker_view(
                             let abs = b.canonical_path.as_deref()?;
                             let (path_index, relative_path) =
                                 crate::workspace_index::project_relative_parts(abs, &roots)?;
-                            let (index, staged) = s
+                            let (head, index, staged) = s
                                 .git_baseline
                                 .get(&buffer_id)
-                                .map(|base| (base.index_blob.clone(), base.staged_hunks.clone()))
-                                .unwrap_or((None, Vec::new()));
+                                .map(|base| {
+                                    (
+                                        base.blob.is_some(),
+                                        base.index_blob.clone(),
+                                        base.staged_hunks.clone(),
+                                    )
+                                })
+                                .unwrap_or((false, None, Vec::new()));
                             let unstaged = crate::git::hunks_from_buffers(
                                 index.as_deref().unwrap_or(b""),
                                 b.text.to_string().as_bytes(),
@@ -10296,6 +10325,7 @@ pub async fn picker_view(
                                 abs_path: abs.to_string_lossy().into_owned(),
                                 hunks: crate::git::compose_both(&staged, &unstaged),
                                 text: b.text.clone(),
+                                untracked: !head && index.is_none(),
                             })
                         })
                         .into_iter()

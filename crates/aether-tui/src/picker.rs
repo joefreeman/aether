@@ -154,6 +154,7 @@ pub enum ChipId {
     Ignored,
     Hidden,
     Changed,
+    Untracked,
 }
 
 /// One chip, by value — the element of the client's ordered filter state. Everything the
@@ -178,6 +179,8 @@ pub enum ChipValue {
         hide: bool,
     },
     Changed,
+    /// Hide untracked entries. Plain on/off, like `Changed` — untracked shows by default.
+    Untracked,
 }
 
 impl ChipValue {}
@@ -556,6 +559,7 @@ impl PickerState {
                         (ChipId::Hidden, if *hide { "-." } else { "+." }.into())
                     }
                     ChipValue::Changed => (ChipId::Changed, "Δ".into()),
+                    ChipValue::Untracked => (ChipId::Untracked, "-??".into()),
                 };
                 Chip { id, label }
             })
@@ -579,6 +583,7 @@ impl PickerState {
                 ChipValue::Hidden { hide: true } => f.hide_hidden = true,
                 ChipValue::Hidden { hide: false } => f.include_hidden = true,
                 ChipValue::Changed => f.changed_only = true,
+                ChipValue::Untracked => f.hide_untracked = true,
             }
         }
         f
@@ -614,6 +619,9 @@ impl PickerState {
         }
         if f.changed_only {
             chips.push(ChipValue::Changed);
+        }
+        if f.hide_untracked {
+            chips.push(ChipValue::Untracked);
         }
         self.chips = chips;
     }
@@ -741,6 +749,7 @@ impl PickerState {
                 .chips
                 .retain(|v| !matches!(v, ChipValue::Hidden { .. })),
             ChipId::Changed => self.chips.retain(|v| *v != ChipValue::Changed),
+            ChipId::Untracked => self.chips.retain(|v| *v != ChipValue::Untracked),
         }
     }
 

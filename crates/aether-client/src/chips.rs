@@ -54,6 +54,7 @@ pub enum ChipId {
     Ignored,
     Hidden,
     Changed,
+    Untracked,
 }
 
 /// One chip, by value — the element of the client's ordered filter state.
@@ -75,6 +76,9 @@ pub enum ChipValue {
         hide: bool,
     },
     Changed,
+    /// Hide untracked entries. Hide-only (untracked shows by default everywhere), so it's a plain
+    /// on/off chip like `Changed`, not a `+`/`-` pair like `Ignored`/`Hidden`.
+    Untracked,
 }
 
 impl ChipValue {
@@ -98,17 +102,29 @@ pub struct Chip {
 pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
     match kind {
         PickerKind::Grep => true,
-        PickerKind::Files => matches!(id, ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Changed),
+        PickerKind::Files => matches!(
+            id,
+            ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Changed | ChipId::Untracked
+        ),
         // The project Git-changes picker greps content like Grep, so it offers the regex options
-        // (case/word/literal) plus the path-scope chips. Inherently changed-only.
+        // (case/word/literal) plus the path-scope chips. Inherently changed-only, but it can still
+        // hide untracked files to show only diffs to tracked ones.
         PickerKind::GitChanges => matches!(
             id,
-            ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Case | ChipId::Word | ChipId::Lit
+            ChipId::Dir(_)
+                | ChipId::Glob(_)
+                | ChipId::Case
+                | ChipId::Word
+                | ChipId::Lit
+                | ChipId::Untracked
         ),
         // The buffer-locked single-file picker greps the same content, so it keeps the regex
         // options — but path scopes are meaningless on one file (its scope is intrinsic).
         PickerKind::GitChangesFile => matches!(id, ChipId::Case | ChipId::Word | ChipId::Lit),
-        PickerKind::Explorer => matches!(id, ChipId::Ignored | ChipId::Hidden | ChipId::Changed),
+        PickerKind::Explorer => matches!(
+            id,
+            ChipId::Ignored | ChipId::Hidden | ChipId::Changed | ChipId::Untracked
+        ),
         _ => false,
     }
 }
@@ -159,6 +175,7 @@ pub fn derive_chips(values: &[ChipValue], project_paths: &[String]) -> Vec<Chip>
                     (ChipId::Hidden, if *hide { "-." } else { "+." }.into())
                 }
                 ChipValue::Changed => (ChipId::Changed, "Δ".into()),
+                ChipValue::Untracked => (ChipId::Untracked, "-??".into()),
             };
             Chip { id, label }
         })
@@ -181,6 +198,7 @@ pub fn wire_filters(values: &[ChipValue]) -> PickerFilters {
             ChipValue::Hidden { hide: true } => f.hide_hidden = true,
             ChipValue::Hidden { hide: false } => f.include_hidden = true,
             ChipValue::Changed => f.changed_only = true,
+            ChipValue::Untracked => f.hide_untracked = true,
         }
     }
     f
@@ -214,6 +232,9 @@ pub fn adopt_filters(f: &PickerFilters) -> Vec<ChipValue> {
     if f.changed_only {
         chips.push(ChipValue::Changed);
     }
+    if f.hide_untracked {
+        chips.push(ChipValue::Untracked);
+    }
     chips
 }
 
@@ -244,6 +265,7 @@ pub fn apply_chip_toggle(values: &mut Vec<ChipValue>, id: ChipId, explorer: bool
         ChipId::Ignored => ChipValue::Ignored { hide: explorer },
         ChipId::Hidden => ChipValue::Hidden { hide: explorer },
         ChipId::Changed => ChipValue::Changed,
+        ChipId::Untracked => ChipValue::Untracked,
         ChipId::Dir(_) | ChipId::Glob(_) => return false,
     };
     match values.iter().position(|v| v.same_kind(&value)) {
@@ -269,6 +291,7 @@ pub fn remove_chip(values: &mut Vec<ChipValue>, id: ChipId) {
         ChipId::Ignored => values.retain(|v| !matches!(v, ChipValue::Ignored { .. })),
         ChipId::Hidden => values.retain(|v| !matches!(v, ChipValue::Hidden { .. })),
         ChipId::Changed => values.retain(|v| *v != ChipValue::Changed),
+        ChipId::Untracked => values.retain(|v| *v != ChipValue::Untracked),
     }
 }
 
@@ -928,6 +951,34 @@ mod tests {
         assert!(matches!(restored[0], ChipValue::Dir(_)));
         assert!(matches!(restored[1], ChipValue::Glob(_)));
         assert_eq!(wire_filters(&restored), wire);
+    }
+
+    #[test]
+    fn untracked_chip_wires_and_renders() {
+        // Offered on Grep / Files / GitChanges / Explorer; absent only from the single-file picker
+        // (one file — tracking state is intrinsic, nothing to filter).
+        assert!(filter_applies(PickerKind::Grep, ChipId::Untracked));
+        assert!(filter_applies(PickerKind::Files, ChipId::Untracked));
+        assert!(filter_applies(PickerKind::GitChanges, ChipId::Untracked));
+        assert!(filter_applies(PickerKind::Explorer, ChipId::Untracked));
+        assert!(!filter_applies(PickerKind::GitChangesFile, ChipId::Untracked));
+
+        // Toggle on → hide_untracked; the chip renders `-??`.
+        let mut chips = vec![ChipValue::Changed];
+        assert!(apply_chip_toggle(&mut chips, ChipId::Untracked, false));
+        let wire = wire_filters(&chips);
+        assert!(wire.hide_untracked && wire.changed_only, "composes with changed");
+        let rendered = derive_chips(&chips, &[]);
+        assert!(
+            rendered.iter().any(|c| c.label == "-??"),
+            "labels: {:?}",
+            rendered.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+
+        // Adopt restores it, and toggling off removes it.
+        assert_eq!(adopt_filters(&wire), chips);
+        assert!(apply_chip_toggle(&mut chips, ChipId::Untracked, false));
+        assert!(!wire_filters(&chips).hide_untracked);
     }
 
     #[test]

@@ -2603,6 +2603,9 @@ impl Session {
             KeyCode::Char('m') if mods.alt && !mods.ctrl => {
                 return self.toggle_picker_filter(ChipId::Changed);
             }
+            KeyCode::Char('u') if mods.alt && !mods.ctrl => {
+                return self.toggle_picker_filter(ChipId::Untracked);
+            }
             KeyCode::Char('g') if mods.alt && !mods.ctrl => {
                 return self.open_glob_prompt(None);
             }

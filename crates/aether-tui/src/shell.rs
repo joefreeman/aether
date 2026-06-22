@@ -1743,6 +1743,7 @@ fn chip_value_view(v: &aether_client::chips::ChipValue) -> crate::picker::ChipVa
         C::Ignored { hide } => T::Ignored { hide: *hide },
         C::Hidden { hide } => T::Hidden { hide: *hide },
         C::Changed => T::Changed,
+        C::Untracked => T::Untracked,
     }
 }
 

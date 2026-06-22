@@ -610,10 +610,11 @@ pub struct ScopedPath {
 /// diff" keeps the server stateless about chip edits. Defaults mean "no filtering", so an
 /// all-default struct is equivalent to the field being absent on the wire.
 ///
-/// Which fields apply depends on the picker kind: Grep reads everything; Files reads
-/// `globs`/`directories`/`changed_only`; GitChanges reads `globs`/`directories` (it's inherently
-/// changed-only); Explorer reads `hide_ignored`/`hide_hidden`/`changed_only`. Inapplicable fields
-/// are ignored, not errors — clients only offer the chips that apply.
+/// Which fields apply depends on the picker kind: Grep reads everything (including
+/// `hide_untracked`); Files reads `globs`/`directories`/`changed_only`/`hide_untracked`; GitChanges
+/// reads `globs`/`directories`/`hide_untracked` (it's inherently changed-only); Explorer reads
+/// `hide_ignored`/`hide_hidden`/`changed_only`/`hide_untracked`. Inapplicable fields are ignored,
+/// not errors — clients only offer the chips that apply.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PickerFilters {
     /// Grep: how the search pattern treats case.
@@ -648,6 +649,14 @@ pub struct PickerFilters {
     /// status). For Explorer, directories with changed descendants stay visible.
     #[serde(default, skip_serializing_if = "is_false")]
     pub changed_only: bool,
+    /// Grep / Files / GitChanges / Explorer: drop untracked entries (no HEAD blob *and* no index
+    /// blob — a wholly-new file git isn't tracking yet; a staged-new file has an index blob and
+    /// stays). Orthogonal to `changed_only`: on the Grep/Files/Explorer pickers the two compose
+    /// (changed + tracked-only, or all-tracked on its own), and GitChanges — inherently
+    /// changed-only — uses it to show only diffs to tracked files. Hide-only, defaulting off, like
+    /// `hide_ignored`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_untracked: bool,
     /// Grep + Files: ripgrep-style include globs, matched against the root-relative path.
     /// A leading `!` makes a glob an exclude. With at least one non-`!` glob present, a file
     /// must match some include glob; independently, it must match no exclude glob.

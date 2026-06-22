@@ -2220,6 +2220,7 @@ fn picker_filters_wire_shape() {
         hide_ignored: true,
         hide_hidden: true,
         changed_only: true,
+        hide_untracked: true,
         globs: vec!["*.rs".into(), "!*_test.rs".into()],
         directories: vec![
             ScopedPath {
@@ -2251,6 +2252,7 @@ fn picker_filters_wire_shape() {
             "hide_ignored": true,
             "hide_hidden": true,
             "changed_only": true,
+            "hide_untracked": true,
             "globs": ["*.rs", "!*_test.rs"],
             "directories": [
                 // A directory scope omits `is_file` (default false); a file scope carries it.

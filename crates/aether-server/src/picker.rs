@@ -149,6 +149,9 @@ pub struct GitChangeCandidate {
     /// path), and the row previews the first non-blank line by default, or the first line that
     /// matches the query.
     pub lines: Vec<String>,
+    /// File-level: the file has no HEAD blob and no index blob (wholly untracked). All hunks of one
+    /// file share this. The `hide_untracked` filter drops these; a staged-new file is `false`.
+    pub untracked: bool,
 }
 
 impl GitChangeCandidate {
@@ -174,7 +177,15 @@ impl GitChangeCandidate {
             added,
             removed,
             lines,
+            untracked: false,
         }
+    }
+
+    /// Builder tweak: mark every hunk of an untracked file. Set during candidate flattening so
+    /// `::new`'s arg list stays put (its many call sites don't care about tracking state).
+    pub fn with_untracked(mut self, untracked: bool) -> Self {
+        self.untracked = untracked;
+        self
     }
 
     /// The line to show on the row, and the char offsets of the regex match within it. With no
@@ -933,6 +944,7 @@ struct FilesFilter {
     /// that exact file. An empty vec means no scope narrowing.
     directories: Vec<(u32, String, bool)>,
     changed_only: bool,
+    hide_untracked: bool,
 }
 
 /// True when `file` sits under the `(path_index, relative_path)` scope. A directory scope (the
@@ -971,6 +983,7 @@ impl FilesFilter {
                 .map(|d| (d.path_index, d.relative_path.clone(), d.is_file))
                 .collect(),
             changed_only: filters.changed_only,
+            hide_untracked: filters.hide_untracked,
         }
     }
 
@@ -1002,6 +1015,9 @@ impl FilesFilter {
         }
         // The workspace walk never yields ignored files, so any status here is a real change.
         if self.changed_only && status.is_none() {
+            return false;
+        }
+        if self.hide_untracked && status == Some(aether_protocol::git::GitStatus::Untracked) {
             return false;
         }
         true
@@ -1057,6 +1073,7 @@ impl PickerState {
                 }
                 PickerCandidates::GitChanges(v) => {
                     ff.passes_path(v[i].path_index, &v[i].relative_path)
+                        && !(ff.hide_untracked && v[i].untracked)
                 }
                 _ => true,
             }

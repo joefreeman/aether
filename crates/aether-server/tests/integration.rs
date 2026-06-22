@@ -9184,6 +9184,91 @@ async fn git_changes_picker_collapses_untracked_directories() {
 }
 
 #[tokio::test]
+async fn git_changes_picker_hide_untracked() {
+    // `-??` (hide_untracked) drops wholly-new files from the changes picker, leaving only diffs to
+    // tracked files — even though GitChanges is otherwise inherently changed-only.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "one\n");
+    std::fs::write(dir.path().join("a.rs"), "ONE\n").unwrap(); // a tracked modification
+    std::fs::write(dir.path().join("loose.rs"), "loose\n").unwrap(); // a lone untracked file
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("hide-untracked-proj", vec![dir_path])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "hide-untracked-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    async fn paths_for(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        id: u64,
+        filters: Option<PickerFilters>,
+    ) -> Vec<String> {
+        let view = send_request::<PickerView>(
+            ws,
+            id,
+            &PickerViewParams {
+                filters,
+                kind: PickerKind::GitChanges,
+                reset: true,
+                offset: 0,
+                limit: 30,
+                center_on: None,
+                center_on_cursor: None,
+                directory_path: None,
+                buffer_id: None,
+                explorer_roots: false,
+            },
+        )
+        .await;
+        view.update
+            .expect("window rides the response")
+            .items()
+            .iter()
+            .map(|i| {
+                let PickerItem::GitChange { relative_path, .. } = i else {
+                    panic!("expected GitChange, got {i:?}");
+                };
+                relative_path.clone()
+            })
+            .collect()
+    }
+
+    // Unfiltered: both the tracked modification and the untracked file.
+    assert_eq!(
+        paths_for(&mut ws, 2, None).await,
+        vec!["a.rs", "loose.rs"],
+        "baseline shows both"
+    );
+
+    // hide_untracked: only the tracked modification survives.
+    let filters = PickerFilters {
+        hide_untracked: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        paths_for(&mut ws, 3, Some(filters)).await,
+        vec!["a.rs"],
+        "untracked loose.rs dropped"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn git_changes_picker_reflects_unsaved_buffer_edits() {
     // A file clean on disk but edited in an open buffer must show the *buffer's* change — the
     // picker prefers live buffer text over disk for open files.
@@ -19353,6 +19438,31 @@ async fn grep_filter_changed_only() {
 }
 
 #[tokio::test]
+async fn grep_filter_hide_untracked() {
+    let (server, mut ws) = setup_grep_filter_workspace().await;
+    // hide_untracked drops the wholly-new new.rs but keeps every tracked hit (including the
+    // committed-clean ones — it's orthogonal to changed_only).
+    let filters = PickerFilters {
+        hide_untracked: true,
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
+    let files = grep_hit_files(&update);
+    assert!(!files.contains(&"new.rs".to_string()), "untracked dropped: {files:?}");
+    assert!(files.contains(&"changed.rs".to_string()), "tracked kept: {files:?}");
+
+    // Composed with changed_only: changed *and* tracked — just the tracked modification.
+    let filters = PickerFilters {
+        changed_only: true,
+        hide_untracked: true,
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 11, "needle", filters, 2).await;
+    assert_eq!(grep_hit_files(&update), vec!["changed.rs"]);
+    drop(server);
+}
+
+#[tokio::test]
 async fn grep_filter_include_ignored_and_hidden() {
     let (server, mut ws) = setup_grep_filter_workspace().await;
     // +ignored surfaces the gitignored debug.log hit.
@@ -19734,6 +19844,43 @@ async fn files_picker_filters_narrow_candidates() {
     let update = files_query(&mut ws, 14, "", filters, 4).await;
     assert_eq!(update.total_matches, 5);
 
+    // Hide-untracked alone: every tracked file stays, only the untracked new.rs drops — "all
+    // tracked" (the orthogonal axis to changed-only).
+    let filters = PickerFilters {
+        hide_untracked: true,
+        ..Default::default()
+    };
+    let update = files_query(&mut ws, 15, "", filters, 5).await;
+    let names: Vec<&str> = update
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::File { relative_path, .. } => Some(relative_path.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(update.total_matches, 4, "tracked-only: {names:?}");
+    assert!(!names.contains(&"new.rs"), "untracked dropped: {names:?}");
+    assert!(names.contains(&"changed.rs"), "tracked change kept: {names:?}");
+
+    // Changed-only composed with hide-untracked: changed *and* tracked — new.rs falls out, leaving
+    // just the tracked modification.
+    let filters = PickerFilters {
+        changed_only: true,
+        hide_untracked: true,
+        ..Default::default()
+    };
+    let update = files_query(&mut ws, 16, "", filters, 6).await;
+    let names: Vec<&str> = update
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::File { relative_path, .. } => Some(relative_path.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["changed.rs"], "changed + tracked-only: {names:?}");
+
     drop(server);
 }
 
@@ -19844,6 +19991,20 @@ async fn explorer_filters_hide_and_changed_only() {
     assert!(
         entry_names(&update).contains(&"src"),
         "reset restores the full listing"
+    );
+
+    // Changed-only composed with hide-untracked: the untracked new.rs drops out, leaving only the
+    // tracked modification.
+    let filters = PickerFilters {
+        changed_only: true,
+        hide_untracked: true,
+        ..Default::default()
+    };
+    let update = explorer_view(&mut ws, 16, Some(filters)).await;
+    assert_eq!(
+        entry_names(&update),
+        vec!["changed.rs"],
+        "changed + tracked-only"
     );
 
     drop(server);
