@@ -140,11 +140,12 @@ impl RpcMethod for InputDedent {
 
 // ---- input/increment_number, input/decrement_number ---------------------------------------------
 
-/// Adjust the integer the cursor sits on (or the first one after it on the cursor's line) by
-/// `+count`. With a selection, the number scan starts at the selection's leading edge. An
-/// immediately-preceding `-` is part of the number, and a zero-padded number keeps its width
-/// (`007` → `008`). The post-edit cursor selects the whole result, so the selection tracks the
-/// digit count. No-op when there's no number at or after the cursor on its line. `Ctrl-e`.
+/// Adjust the selected integer by `+count`. Selection-only with no scanning: the operand is exactly
+/// the selected chars (a point cursor being the single char under the block), so an unselected `-`
+/// or neighbouring digit is never swept in. A leading `-` *within* the selection is the number's
+/// sign, and a zero-padded number keeps its width (`007` → `008`). The post-edit cursor selects the
+/// whole result, so the selection tracks the digit count. No-op unless the selection is a clean
+/// integer (optional `-` then digits). `Ctrl-e`.
 pub struct InputIncrementNumber;
 impl RpcMethod for InputIncrementNumber {
     const NAME: &'static str = "input/increment_number";
@@ -152,7 +153,7 @@ impl RpcMethod for InputIncrementNumber {
     type Result = EditResult;
 }
 
-/// Adjust the cursor's number by `-count` — the inverse of [`InputIncrementNumber`]. `Ctrl-Alt-e`.
+/// Adjust the selected integer by `-count` — the inverse of [`InputIncrementNumber`]. `Ctrl-Alt-e`.
 pub struct InputDecrementNumber;
 impl RpcMethod for InputDecrementNumber {
     const NAME: &'static str = "input/decrement_number";

@@ -7786,25 +7786,13 @@ fn resolve_number_edit(
     cursor: &CursorState,
     delta: i64,
 ) -> Option<(usize, usize, u32, String)> {
-    if cursor.is_point() {
-        let line = cursor.position.line as usize;
-        let line_start = buf.text.line_to_char(line);
-        let scan_char = motion::pos_to_char(buf, cursor.position);
-        let line_text: String = buf.text.line(line).chars().collect();
-        crate::number::adjust(&line_text, scan_char.saturating_sub(line_start), delta).map(|ne| {
-            (
-                line_start + ne.start,
-                line_start + ne.end,
-                cursor.position.line,
-                ne.text,
-            )
-        })
-    } else {
-        let (sc, ec) = current_selection_char_range(buf, cursor);
-        let selected: String = buf.text.slice(sc..ec).chars().collect();
-        crate::number::adjust_exact(&selected, delta)
-            .map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
-    }
+    // Increment/decrement is selection-only: the operand is exactly the selected chars (a point
+    // cursor being the single char under the block). No scanning outward — a `-` or extra digits
+    // that aren't selected stay out, so the adjustment can never invert by sweeping up a sign.
+    let (sc, ec) = current_selection_char_range(buf, cursor);
+    let selected: String = buf.text.slice(sc..ec).chars().collect();
+    crate::number::adjust_exact(&selected, delta)
+        .map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
 }
 
 pub async fn input_increment_number(

@@ -6069,6 +6069,43 @@ async fn dedent_strips_two_spaces() {
 #[tokio::test]
 async fn increment_number_selects_the_result() {
     let (server, mut ws, buffer_id) = setup_with_buffer("foo 42 bar\n123\n").await;
+    // Select the whole `42` (cols 4–5); the adjustment operates on exactly that.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            anchor: LogicalPosition { line: 0, col: 4 },
+            position: LogicalPosition { line: 0, col: 5 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 12, buffer_id).await,
+        "foo 43 bar\n123\n"
+    );
+    // The whole result is selected: anchor on the first digit, cursor on the last.
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 4 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 5 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn increment_point_adjusts_only_the_selected_char() {
+    // A bare point cursor is a single-char selection: on the `4` of `42`, only that char adjusts
+    // (`4` → `5`, giving `52`) — the operand never expands to the rest of the number.
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo 42 bar\n").await;
     send_request::<CursorSet>(
         &mut ws,
         10,
@@ -6089,13 +6126,10 @@ async fn increment_number_selects_the_result() {
         },
     )
     .await;
-    assert_eq!(
-        buffer_text(&mut ws, 12, buffer_id).await,
-        "foo 43 bar\n123\n"
-    );
-    // The whole result is selected: anchor on the first digit, cursor on the last.
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "foo 52 bar\n");
+    // The single-char result stays selected.
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 4 });
-    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 5 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 4 });
 
     drop(server);
 }
@@ -6239,8 +6273,9 @@ async fn increment_non_integer_selection_is_a_noop() {
 }
 
 #[tokio::test]
-async fn increment_scans_forward_to_first_number_on_line() {
-    // Cursor sits before the number; the scan finds it later on the same line.
+async fn increment_never_scans_to_a_number_elsewhere() {
+    // Point cursor on a non-digit char: it's a no-op even though a number sits later on the line —
+    // the operation only ever touches the selection, it never scans forward to find a number.
     let (server, mut ws, buffer_id) = setup_with_buffer("count = 9\n").await;
     send_request::<CursorSet>(
         &mut ws,
@@ -6262,7 +6297,38 @@ async fn increment_scans_forward_to_first_number_on_line() {
         },
     )
     .await;
-    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "count = 10\n");
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "count = 9\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn increment_single_digit_after_unselected_minus_is_not_inverted() {
+    // Regression: `-5` with only the `5` selected (the `-` left out). Incrementing adjusts the bare
+    // `5` → `6` (yielding `-6`), not `-5` → `-4`: the unselected sign is never swept in, so the
+    // direction can't invert.
+    let (server, mut ws, buffer_id) = setup_with_buffer("-5\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputIncrementNumber>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "-6\n");
 
     drop(server);
 }
@@ -6299,14 +6365,15 @@ async fn decrement_crosses_zero_into_negative() {
 async fn increment_count_applies_in_one_step() {
     // `5 Ctrl-e` adds 5 in a single undoable edit; one undo restores the original.
     let (server, mut ws, buffer_id) = setup_with_buffer("v 10\n").await;
+    // Select the whole `10` (cols 2–3).
     send_request::<CursorSet>(
         &mut ws,
         10,
         &CursorSetParams {
             granularity: Granularity::Char,
             buffer_id,
-            position: LogicalPosition { line: 0, col: 2 },
             anchor: LogicalPosition { line: 0, col: 2 },
+            position: LogicalPosition { line: 0, col: 3 },
         },
     )
     .await;
