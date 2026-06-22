@@ -93,6 +93,9 @@ impl ConnectQuery {
     }
 }
 
+// The `accept_hdr_async` callback's `Result<HsResp, HsErr>` type is dictated by tungstenite's
+// `Callback` trait, so the large `Err` variant (an http `Response`) can't be boxed away here.
+#[allow(clippy::result_large_err)]
 pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
     let peer = stream.peer_addr().ok();
 

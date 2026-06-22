@@ -962,13 +962,19 @@ mod tests {
         assert!(filter_applies(PickerKind::Files, ChipId::Untracked));
         assert!(filter_applies(PickerKind::GitChanges, ChipId::Untracked));
         assert!(filter_applies(PickerKind::Explorer, ChipId::Untracked));
-        assert!(!filter_applies(PickerKind::GitChangesFile, ChipId::Untracked));
+        assert!(!filter_applies(
+            PickerKind::GitChangesFile,
+            ChipId::Untracked
+        ));
 
         // Toggle on → hide_untracked; the chip renders `-??`.
         let mut chips = vec![ChipValue::Changed];
         assert!(apply_chip_toggle(&mut chips, ChipId::Untracked, false));
         let wire = wire_filters(&chips);
-        assert!(wire.hide_untracked && wire.changed_only, "composes with changed");
+        assert!(
+            wire.hide_untracked && wire.changed_only,
+            "composes with changed"
+        );
         let rendered = derive_chips(&chips, &[]);
         assert!(
             rendered.iter().any(|c| c.label == "-??"),

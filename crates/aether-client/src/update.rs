@@ -10,10 +10,9 @@ use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VIS
 use super::save_as::SaveAsEditor;
 use super::session::{
     buffer_info, label_for_path, min_pos, severity_label, strip_longest_root, AppSettingId,
-    AppSettingsOverlay,
-    CommitDetails, ConfirmAction, ConfirmKind, ConnState, HoverBlock, HoverText, Mode, PasteKind,
-    Pending, ProjectSettings, Prompt, ReloadTry, RepeatTarget, SaveTry, SearchSnapshot,
-    SearchState, Session, TextField,
+    AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState, HoverBlock,
+    HoverText, Mode, PasteKind, Pending, ProjectSettings, Prompt, ReloadTry, RepeatTarget, SaveTry,
+    SearchSnapshot, SearchState, Session, TextField,
 };
 use super::transport::RpcError;
 use aether_protocol::buffer::{
@@ -62,11 +61,10 @@ use aether_protocol::nav::{NavBack, NavForward, NavStepParams};
 use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate,
-    PickerGrepNavigateParams,
-    PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,
-    PickerSectionJump, PickerSectionJumpParams, PickerSelect, PickerSelectParams,
-    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
-    PickerViewResult, ScopedPath,
+    PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
+    PickerQueryParams, PickerSectionJump, PickerSectionJumpParams, PickerSelect,
+    PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
+    PickerViewParams, PickerViewResult, ScopedPath,
 };
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectAddRoot,
@@ -2586,9 +2584,7 @@ impl Session {
             // Ctrl-d in the Buffers picker closes the highlighted buffer in place (no open) —
             // `Ctrl-w` is the obvious mnemonic but the browser swallows it, so `Ctrl-d` matches the
             // delete-in-picker gesture used by Files/Explorer/Projects above.
-            KeyCode::Char('d')
-                if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers =>
-            {
+            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
                 return self.picker_close_buffer();
             }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).

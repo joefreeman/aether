@@ -315,16 +315,14 @@ fn find_char(
             // Start one char past the cursor so `f x` from an existing 'x' lands on the *next*.
             let start = (cur_idx + 1).min(total);
             let iter = text.chars_at(start);
-            let mut at = start;
             let mut found = 0usize;
-            for c in iter {
+            for (at, c) in (start..).zip(iter) {
                 if c == ch {
                     found += 1;
                     if found == count {
                         return Some(at);
                     }
                 }
-                at += 1;
             }
             None
         }

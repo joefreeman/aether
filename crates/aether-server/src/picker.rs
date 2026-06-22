@@ -2297,7 +2297,11 @@ mod tests {
         );
         s.filters.regex = true;
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![0], "regex `\\d+` matches the line with digits");
+        assert_eq!(
+            s.ranked,
+            vec![0],
+            "regex `\\d+` matches the line with digits"
+        );
 
         // Whole-word: a substring matches by default, but not as a whole word with the chip.
         let mut s = PickerState::new(cands.clone());
@@ -2319,7 +2323,11 @@ mod tests {
         let mut s = PickerState::new(cands.clone());
         s.query = "a.b".into();
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![2], "literal 'a.b' matches only 'a.b literal'");
+        assert_eq!(
+            s.ranked,
+            vec![2],
+            "literal 'a.b' matches only 'a.b literal'"
+        );
         s.filters.regex = true;
         s.rerank(&mut m);
         assert_eq!(s.ranked, vec![1, 2], "regex `a.b` matches 'axb' and 'a.b'");

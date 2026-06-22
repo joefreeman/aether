@@ -325,9 +325,7 @@ impl FileFilter {
             if self.changed_only && status.is_none() {
                 return false;
             }
-            if self.hide_untracked
-                && status == Some(aether_protocol::git::GitStatus::Untracked)
-            {
+            if self.hide_untracked && status == Some(aether_protocol::git::GitStatus::Untracked) {
                 return false;
             }
         }

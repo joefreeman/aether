@@ -1535,25 +1535,26 @@ impl App {
                 if cols == 0 || rows == 0 {
                     return Task::none();
                 }
-                if self.session.viewport_id.is_none() {
-                    if self.sent_grid.is_some() {
-                        return Task::none(); // subscribe in flight
+                match self.session.viewport_id {
+                    None => {
+                        if self.sent_grid.is_some() {
+                            return Task::none(); // subscribe in flight
+                        }
+                        self.sent_grid = Some((cols, rows));
+                        self.subscribe_task()
                     }
-                    self.sent_grid = Some((cols, rows));
-                    self.subscribe_task()
-                } else if self.sent_grid != Some((cols, rows)) {
-                    self.sent_grid = Some((cols, rows));
-                    let viewport_id = self.session.viewport_id.unwrap();
-                    self.rpc::<ViewportResize>(
-                        ViewportResizeParams {
-                            viewport_id,
-                            cols,
-                            rows,
-                        },
-                        Message::WindowUpdate,
-                    )
-                } else {
-                    Task::none()
+                    Some(viewport_id) if self.sent_grid != Some((cols, rows)) => {
+                        self.sent_grid = Some((cols, rows));
+                        self.rpc::<ViewportResize>(
+                            ViewportResizeParams {
+                                viewport_id,
+                                cols,
+                                rows,
+                            },
+                            Message::WindowUpdate,
+                        )
+                    }
+                    Some(_) => Task::none(),
                 }
             }
             EditorEvent::Wheel {

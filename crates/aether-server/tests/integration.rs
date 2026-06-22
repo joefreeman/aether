@@ -1894,7 +1894,11 @@ async fn search_set_from_selection_echoes_literal() {
         },
     )
     .await;
-    assert_eq!(r.query.as_deref(), Some("a.c"), "echoes the raw selection text");
+    assert_eq!(
+        r.query.as_deref(),
+        Some("a.c"),
+        "echoes the raw selection text"
+    );
     assert_eq!(r.summary.total, 2, "literal a.c matches twice, NOT abc");
 
     // Empty selection (point cursor on the blank end) → nothing set, query None.
@@ -19474,8 +19478,14 @@ async fn grep_filter_hide_untracked() {
     };
     let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
     let files = grep_hit_files(&update);
-    assert!(!files.contains(&"new.rs".to_string()), "untracked dropped: {files:?}");
-    assert!(files.contains(&"changed.rs".to_string()), "tracked kept: {files:?}");
+    assert!(
+        !files.contains(&"new.rs".to_string()),
+        "untracked dropped: {files:?}"
+    );
+    assert!(
+        files.contains(&"changed.rs".to_string()),
+        "tracked kept: {files:?}"
+    );
 
     // Composed with changed_only: changed *and* tracked — just the tracked modification.
     let filters = PickerFilters {
@@ -19887,7 +19897,10 @@ async fn files_picker_filters_narrow_candidates() {
         .collect();
     assert_eq!(update.total_matches, 4, "tracked-only: {names:?}");
     assert!(!names.contains(&"new.rs"), "untracked dropped: {names:?}");
-    assert!(names.contains(&"changed.rs"), "tracked change kept: {names:?}");
+    assert!(
+        names.contains(&"changed.rs"),
+        "tracked change kept: {names:?}"
+    );
 
     // Changed-only composed with hide-untracked: changed *and* tracked — new.rs falls out, leaving
     // just the tracked modification.
@@ -19905,7 +19918,11 @@ async fn files_picker_filters_narrow_candidates() {
             _ => None,
         })
         .collect();
-    assert_eq!(names, vec!["changed.rs"], "changed + tracked-only: {names:?}");
+    assert_eq!(
+        names,
+        vec!["changed.rs"],
+        "changed + tracked-only: {names:?}"
+    );
 
     drop(server);
 }
@@ -20331,7 +20348,10 @@ async fn set_transient_flips_the_flag_both_ways() {
         },
     )
     .await;
-    assert!(demoted.transient, "set_transient(true) reports the flag set");
+    assert!(
+        demoted.transient,
+        "set_transient(true) reports the flag set"
+    );
     // Reopening (attach, no intent) reflects the new server-side state.
     let reopen: BufferOpenResult =
         send_request::<BufferOpen>(&mut ws, 5, &attach_open_params(a.buffer_id, None)).await;

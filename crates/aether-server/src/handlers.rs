@@ -2310,7 +2310,7 @@ fn apply_lsp_text_edits(
         }
         byte_edits.push((sb, eb, new_text));
     }
-    byte_edits.sort_by(|a, b| b.0.cmp(&a.0));
+    byte_edits.sort_by_key(|b| std::cmp::Reverse(b.0));
     let mut out: String = text.to_string();
     for (sb, eb, new) in byte_edits {
         if eb > out.len() || !out.is_char_boundary(sb) || !out.is_char_boundary(eb) {
@@ -9776,8 +9776,7 @@ pub(crate) fn build_explorer_candidates_for_canonical(
         }
         // Hide untracked entries (and directories whose aggregated status is untracked — a wholly
         // new subtree). Composes with `changed_only`: changed + tracked-only, or all-tracked alone.
-        if filters.hide_untracked
-            && git_status == Some(aether_protocol::git::GitStatus::Untracked)
+        if filters.hide_untracked && git_status == Some(aether_protocol::git::GitStatus::Untracked)
         {
             continue;
         }

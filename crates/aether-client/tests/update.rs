@@ -2065,7 +2065,10 @@ fn buffers_picker_ctrl_d_closes_in_place() {
     // A dirty buffer: Ctrl-d stages a discard confirm and sends nothing yet.
     s.picker.as_mut().unwrap().selected = 2;
     let fx = s.picker_close_buffer();
-    assert!(fx.0.is_empty(), "dirty close stages a confirm, sends nothing");
+    assert!(
+        fx.0.is_empty(),
+        "dirty close stages a confirm, sends nothing"
+    );
     match &s.prompt {
         Some(Prompt::Confirm {
             kind: ConfirmKind::DiscardOnClose { label },
@@ -2525,7 +2528,7 @@ fn app_settings_apply_and_toggle_ligatures() {
     );
 
     // Toggling the Ligatures row flips the value and persists it via settings/set.
-    let _ = s.open_app_settings(); // the overlay must be open for a toggle to register
+    s.open_app_settings(); // the overlay must be open for a toggle to register
     let rows = s.app_setting_rows();
     let idx = rows
         .iter()
