@@ -601,7 +601,7 @@ fn search_set_params() {
         options: MatchOptions {
             case: CaseMode::Sensitive,
             whole_word: true,
-            fixed_string: false,
+            regex: false,
         },
     })
     .unwrap();
@@ -2231,7 +2231,7 @@ fn picker_filters_wire_shape() {
     let f = PickerFilters {
         case: CaseMode::Insensitive,
         whole_word: true,
-        fixed_string: true,
+        regex: true,
         include_ignored: true,
         include_hidden: true,
         hide_ignored: true,
@@ -2263,7 +2263,7 @@ fn picker_filters_wire_shape() {
         json!({
             "case": "insensitive",
             "whole_word": true,
-            "fixed_string": true,
+            "regex": true,
             "include_ignored": true,
             "include_hidden": true,
             "hide_ignored": true,

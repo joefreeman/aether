@@ -557,9 +557,9 @@ impl CaseMode {
 
 /// The three pattern-matching options shared by the grep picker ([`PickerFilters`]) and buffer
 /// search (`search/set`): how the pattern treats letter case, whether it matches only at word
-/// boundaries, and whether the query is a literal string rather than a regex. The defaults
-/// (`Smart`, off, off) mean "regex, smartcase" — the long-standing buffer-search behavior — so an
-/// all-default value is a no-op on the wire and equivalent to the field being absent.
+/// boundaries, and whether the query is interpreted as a regex rather than a literal string. The
+/// defaults (`Smart`, off, off) mean "literal, smartcase" — regex is opt-in — so an all-default
+/// value is a no-op on the wire and equivalent to the field being absent.
 ///
 /// Grep derives these from its filter chips; buffer search toggles them in the search prompt
 /// (`Alt-c` / `Alt-w` / `Alt-e`). When a grep result primes a buffer's search the grep options
@@ -571,8 +571,10 @@ pub struct MatchOptions {
     pub case: CaseMode,
     #[serde(default, skip_serializing_if = "is_false")]
     pub whole_word: bool,
+    /// Treat the query as a regular expression. Default (`false`) matches the query literally
+    /// (the query is `regex::escape`d before compiling); `true` opts into full regex syntax.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub fixed_string: bool,
+    pub regex: bool,
 }
 
 impl MatchOptions {
@@ -623,9 +625,10 @@ pub struct PickerFilters {
     /// Grep: match only at word boundaries (ripgrep `-w`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub whole_word: bool,
-    /// Grep: treat the query as a literal string, not a regex (ripgrep `-F`).
+    /// Grep / changes pickers: interpret the query as a regex. Default (`false`) matches literally
+    /// (ripgrep `-F`); `true` opts into regex syntax.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub fixed_string: bool,
+    pub regex: bool,
     /// Grep: include `.gitignore`d files (ripgrep `--no-ignore`). Not offered for Files — the
     /// workspace index excludes ignored files at walk time and re-walking per toggle is too
     /// costly there. (The Explorer's equivalent is `hide_ignored`, inverted: its listing shows
@@ -677,14 +680,14 @@ impl PickerFilters {
         *self == PickerFilters::default()
     }
 
-    /// The pattern-matching subset (case / whole-word / literal) — the options that also apply to
+    /// The pattern-matching subset (case / whole-word / regex) — the options that also apply to
     /// buffer search. Used when a grep result primes a buffer's search so the primed search
     /// matches the same way the grep did.
     pub fn match_options(&self) -> MatchOptions {
         MatchOptions {
             case: self.case,
             whole_word: self.whole_word,
-            fixed_string: self.fixed_string,
+            regex: self.regex,
         }
     }
 }

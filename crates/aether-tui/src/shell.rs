@@ -1739,7 +1739,7 @@ fn chip_value_view(v: &aether_client::chips::ChipValue) -> crate::picker::ChipVa
         C::Glob(g) => T::Glob(g.clone()),
         C::Case(m) => T::Case(*m),
         C::Word => T::Word,
-        C::Lit => T::Lit,
+        C::Regex => T::Regex,
         C::Ignored { hide } => T::Ignored { hide: *hide },
         C::Hidden { hide } => T::Hidden { hide: *hide },
         C::Changed => T::Changed,

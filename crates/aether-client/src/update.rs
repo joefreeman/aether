@@ -359,9 +359,9 @@ impl Session {
 
             Event::SearchFromSel(Ok(Some((query, r)))) => {
                 self.search.query = query.clone();
-                // The selection was searched as an escaped literal, so the committed search is a
-                // regex of that literal — clear `fixed_string` while keeping case / whole-word.
-                self.search.options.fixed_string = false;
+                // The selection is searched literally, so the committed search is too — clear
+                // `regex` while keeping case / whole-word.
+                self.search.options.regex = false;
                 self.search.active = true;
                 self.search.summary = Some(r.summary);
                 self.push_history(query);
@@ -2641,7 +2641,7 @@ impl Session {
                 return self.toggle_picker_filter(ChipId::Word);
             }
             KeyCode::Char('e') if mods.alt && !mods.ctrl => {
-                return self.toggle_picker_filter(ChipId::Lit);
+                return self.toggle_picker_filter(ChipId::Regex);
             }
             KeyCode::Char('i') if mods.alt && !mods.ctrl => {
                 return self.toggle_picker_filter(ChipId::Ignored);
@@ -3479,10 +3479,10 @@ impl Session {
                 anchor: None,
                 extend: false,
                 from_selection: true,
-                // The server regex-escapes the selection itself, so the query is already literal —
-                // forcing `fixed_string` off avoids double-escaping. Case / whole-word stay sticky.
+                // Searching a selection is a literal search — force `regex` off (the server matches
+                // the raw selection text literally). Case / whole-word stay sticky.
                 options: MatchOptions {
-                    fixed_string: false,
+                    regex: false,
                     ..self.search.options
                 },
             },
@@ -4134,7 +4134,7 @@ impl Session {
         match chip {
             ChipId::Case => self.search.options.case = CaseMode::Smart,
             ChipId::Word => self.search.options.whole_word = false,
-            ChipId::Lit => self.search.options.fixed_string = false,
+            ChipId::Regex => self.search.options.regex = false,
             _ => {}
         }
         let remaining = self.search.option_chips().len();
@@ -4143,7 +4143,7 @@ impl Session {
     }
 
     /// Enter on the selected chip: cycle/toggle the option it stands for (case cycles
-    /// smart → sensitive → insensitive → smart; word / literal flip). Keeps the selection on the
+    /// smart → sensitive → insensitive → smart; word / regex flip). Keeps the selection on the
     /// same option while its chip is still present, else clamps into the row, then re-runs search.
     fn cycle_search_chip(&mut self, sel: usize) -> Effects {
         let Some(id) = self.search.option_chips().get(sel).map(|c| c.id) else {
@@ -4152,7 +4152,7 @@ impl Session {
         match id {
             ChipId::Case => self.cycle_search_case(),
             ChipId::Word => self.search.options.whole_word = !self.search.options.whole_word,
-            ChipId::Lit => self.search.options.fixed_string = !self.search.options.fixed_string,
+            ChipId::Regex => self.search.options.regex = !self.search.options.regex,
             _ => {}
         }
         let chips = self.search.option_chips();
@@ -4198,7 +4198,7 @@ impl Session {
             }
             Action::SearchToggleRegex => {
                 self.search.chip_selected = None;
-                self.search.options.fixed_string = !self.search.options.fixed_string;
+                self.search.options.regex = !self.search.options.regex;
                 self.incremental_search()
             }
             _ => Effects::none(),

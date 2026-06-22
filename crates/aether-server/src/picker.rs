@@ -260,12 +260,13 @@ pub fn build_match_regex(
     query: &str,
     options: &MatchOptions,
 ) -> Result<regex::Regex, regex::Error> {
-    // Literal queries are escaped first; whole-word then fences the (escaped or raw) pattern with
-    // word boundaries. Smartcase reads the *original* query's casing.
-    let body = if options.fixed_string {
-        regex::escape(query)
-    } else {
+    // Literal queries (the default) are escaped first; regex queries pass through raw. Whole-word
+    // then fences the (escaped or raw) pattern with word boundaries. Smartcase reads the *original*
+    // query's casing.
+    let body = if options.regex {
         query.to_string()
+    } else {
+        regex::escape(query)
     };
     let pattern = if options.whole_word {
         format!(r"\b(?:{body})\b")
@@ -2286,15 +2287,17 @@ mod tests {
         ]);
         let mut m = make_matcher();
 
-        // A real regex pattern.
+        // Regex is opt-in: `\d+` matches literally (nothing) by default, as a regex with the chip.
         let mut s = PickerState::new(cands.clone());
         s.query = r"\d+".into();
         s.rerank(&mut m);
-        assert_eq!(
-            s.ranked,
-            vec![0],
-            "only the line with digits matches `\\d+`"
+        assert!(
+            s.ranked.is_empty(),
+            "literal `\\d+` matches no line by default"
         );
+        s.filters.regex = true;
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0], "regex `\\d+` matches the line with digits");
 
         // Whole-word: a substring matches by default, but not as a whole word with the chip.
         let mut s = PickerState::new(cands.clone());
@@ -2312,22 +2315,20 @@ mod tests {
             "whole-word: 'ount' isn't a whole word in 'count'"
         );
 
-        // Fixed-string: `a.b` is a regex (`.` = any char) without the chip, a literal with it.
+        // Regex chip: `a.b` is literal by default (only 'a.b literal'), a regex (`.` = any) with it.
         let mut s = PickerState::new(cands.clone());
         s.query = "a.b".into();
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![1, 2], "regex `a.b` matches 'axb' and 'a.b'");
-        s.filters.fixed_string = true;
+        assert_eq!(s.ranked, vec![2], "literal 'a.b' matches only 'a.b literal'");
+        s.filters.regex = true;
         s.rerank(&mut m);
-        assert_eq!(
-            s.ranked,
-            vec![2],
-            "literal 'a.b' matches only 'a.b literal'"
-        );
+        assert_eq!(s.ranked, vec![1, 2], "regex `a.b` matches 'axb' and 'a.b'");
 
-        // An unparseable pattern matches nothing (the picker shows no results until it's valid).
+        // An unparseable regex matches nothing (only reachable in regex mode — a literal '(' is
+        // a valid query that simply matches no line here).
         let mut s = PickerState::new(cands);
         s.query = "(".into();
+        s.filters.regex = true;
         s.rerank(&mut m);
         assert!(s.ranked.is_empty(), "an invalid regex matches nothing");
     }

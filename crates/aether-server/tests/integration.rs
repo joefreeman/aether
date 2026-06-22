@@ -1564,8 +1564,8 @@ async fn buffer_open_prime_search_carries_options() {
     // hit did. "a.c" as a literal must NOT match "abc".
     let (_server, mut ws, buffer_id) = setup_with_buffer("a.c abc axc\n").await;
 
-    // Regex prime (default options): "a.c" matches all three.
-    let regex: BufferOpenResult = send_request::<BufferOpen>(
+    // Literal prime (default options): "a.c" matches only the exact "a.c".
+    let literal: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
         &BufferOpenParams {
@@ -1576,20 +1576,20 @@ async fn buffer_open_prime_search_carries_options() {
     )
     .await;
     assert_eq!(
-        regex.search_summary.as_ref().map(|s| s.total),
-        Some(3),
-        "regex prime matches a.c / abc / axc"
+        literal.search_summary.as_ref().map(|s| s.total),
+        Some(1),
+        "literal prime (the default) matches only the exact a.c"
     );
 
-    // Literal prime: same query, but `fixed_string` makes it match only the literal "a.c".
-    let literal: BufferOpenResult = send_request::<BufferOpen>(
+    // Regex prime: same query, but `regex` opts in so "a.c" matches all three.
+    let regex: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         11,
         &BufferOpenParams {
             buffer_id: Some(buffer_id),
             prime_search: Some("a.c".into()),
             prime_search_options: MatchOptions {
-                fixed_string: true,
+                regex: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -1597,9 +1597,9 @@ async fn buffer_open_prime_search_carries_options() {
     )
     .await;
     assert_eq!(
-        literal.search_summary.as_ref().map(|s| s.total),
-        Some(1),
-        "literal prime matches only the exact a.c"
+        regex.search_summary.as_ref().map(|s| s.total),
+        Some(3),
+        "regex prime matches a.c / abc / axc"
     );
 }
 
@@ -1865,9 +1865,9 @@ async fn git_blame_line_include_commit_info_resolves_in_one_trip() {
 }
 
 #[tokio::test]
-async fn search_set_from_selection_escapes_and_echoes() {
-    // docs/protocol-composites.md, H: Alt-/ in one trip — the server takes the selection's
-    // text, regex-escapes it, sets the search, and echoes the effective query.
+async fn search_set_from_selection_echoes_literal() {
+    // docs/protocol-composites.md, H: Alt-/ in one trip — the server takes the selection's text,
+    // sets a *literal* search of it (regex off), and echoes the raw query.
     let (_server, mut ws, buffer_id) = setup_with_buffer("a.c x\na.c y\nabc z\n").await;
     // Select "a.c" on line 0 (chars 0..=2) — the dot must match literally, not as a regex.
     send_request::<CursorSet>(
@@ -1894,7 +1894,7 @@ async fn search_set_from_selection_escapes_and_echoes() {
         },
     )
     .await;
-    assert_eq!(r.query.as_deref(), Some("a\\.c"));
+    assert_eq!(r.query.as_deref(), Some("a.c"), "echoes the raw selection text");
     assert_eq!(r.summary.total, 2, "literal a.c matches twice, NOT abc");
 
     // Empty selection (point cursor on the blank end) → nothing set, query None.
@@ -8060,20 +8060,21 @@ async fn search_set_honours_match_options() {
     assert_eq!(total(&mut ws, 21, buffer_id, "foo", word).await, 2);
     drop(server);
 
-    // Literal: "a.c" as a regex matches "abc"/"axc" too; as a fixed string it matches only "a.c".
+    // Regex opt-in: "a.c" matches literally by default (only "a.c"); with `regex` it matches
+    // "abc"/"axc" too.
     let (server, mut ws, buffer_id) = setup_with_buffer("a.c abc axc\n").await;
     assert_eq!(
         total(&mut ws, 30, buffer_id, "a.c", MatchOptions::default()).await,
-        3
+        1,
+        "literal is the default — a.c matches only a.c"
     );
-    let literal = MatchOptions {
-        fixed_string: true,
+    let regex = MatchOptions {
+        regex: true,
         ..Default::default()
     };
-    assert_eq!(total(&mut ws, 31, buffer_id, "a.c", literal).await, 1);
-    // Literal + whole-word together don't double-escape: "a.c" still matches as a whole word.
+    assert_eq!(total(&mut ws, 31, buffer_id, "a.c", regex).await, 3);
+    // Literal (default) + whole-word together don't double-escape: "a.c" still matches as a word.
     let literal_word = MatchOptions {
-        fixed_string: true,
         whole_word: true,
         ..Default::default()
     };
@@ -8178,6 +8179,21 @@ async fn search_smartcase_uppercase_is_case_sensitive() {
 #[tokio::test]
 async fn search_regex_metacharacters() {
     let (server, mut ws, buffer_id) = setup_with_buffer("abc 123 def 4567\n").await;
+    // Regex is opt-in: `\d+` matches literally (nothing) by default, two runs with `regex` on.
+    let lit: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        9,
+        &SearchSetParams {
+            buffer_id,
+            query: r"\d+".into(),
+            anchor: None,
+            extend: false,
+            from_selection: false,
+            options: Default::default(),
+        },
+    )
+    .await;
+    assert_eq!(lit.summary.total, 0, "literal `\\d+` matches nothing");
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         10,
@@ -8187,7 +8203,10 @@ async fn search_regex_metacharacters() {
             anchor: None,
             extend: false,
             from_selection: false,
-            options: Default::default(),
+            options: MatchOptions {
+                regex: true,
+                ..Default::default()
+            },
         },
     )
     .await;
@@ -9786,12 +9805,15 @@ async fn git_changes_picker_query_is_a_regex() {
     .await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
 
-    // `c.unt` (with `.` as any-char) matches "count" via regex, not as a literal.
+    // `c.unt` (with `.` as any-char) matches "count" via regex — opt in with the `.*` chip.
     let _: () = send_request::<PickerQuery>(
         &mut ws,
         3,
         &PickerQueryParams {
-            filters: Default::default(),
+            filters: PickerFilters {
+                regex: true,
+                ..Default::default()
+            },
             kind: PickerKind::GitChanges,
             query: "c.unt".into(),
             generation: 1,
@@ -12791,8 +12813,8 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
     drop(server);
 }
 
-/// Grep queries are regex, same as buffer search (`/`). A pattern like `n.+dle` matches `needle`
-/// — confirms `regex::escape` is not being applied (which would turn the `.+` into a literal).
+/// Grep treats the query as a regex when the `.*` chip is on (opt-in, like buffer search). A
+/// pattern like `n.+dle` then matches `needle`; by default the query is literal.
 #[tokio::test]
 async fn picker_grep_treats_query_as_regex() {
     let (server, mut ws) = setup_grep_workspace().await;
@@ -12819,7 +12841,10 @@ async fn picker_grep_treats_query_as_regex() {
         &mut ws,
         11,
         &PickerQueryParams {
-            filters: Default::default(),
+            filters: PickerFilters {
+                regex: true,
+                ..Default::default()
+            },
             kind: PickerKind::Grep,
             query: "n.+dle".into(),
             generation: 1,
@@ -19162,18 +19187,18 @@ async fn grep_filter_whole_word() {
 }
 
 #[tokio::test]
-async fn grep_filter_fixed_string() {
+async fn grep_filter_regex() {
     let (server, mut ws) = setup_grep_filter_workspace().await;
-    // As a regex, `a.b` matches both `"a.b"` and `"axb"` in lib.rs.
+    // Literal by default: `a.b` matches only the literal `"a.b"` in lib.rs.
     let update = grep_with_filters(&mut ws, 10, "a.b", PickerFilters::default(), 1).await;
-    assert_eq!(update.total_matches, 2);
-    // As a literal, only `"a.b"`.
+    assert_eq!(update.total_matches, 1, "literal is the default");
+    // With the `.*` (regex) chip, `a.b` also matches `"axb"`.
     let filters = PickerFilters {
-        fixed_string: true,
+        regex: true,
         ..Default::default()
     };
     let update = grep_with_filters(&mut ws, 11, "a.b", filters, 2).await;
-    assert_eq!(update.total_matches, 1);
+    assert_eq!(update.total_matches, 2);
     drop(server);
 }
 

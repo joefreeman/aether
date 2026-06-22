@@ -117,8 +117,8 @@ impl SearchState {
         if self.options.whole_word {
             values.push(crate::chips::ChipValue::Word);
         }
-        if self.options.fixed_string {
-            values.push(crate::chips::ChipValue::Lit);
+        if self.options.regex {
+            values.push(crate::chips::ChipValue::Regex);
         }
         // No Dir chips here, so `project_paths` is irrelevant.
         crate::chips::derive_chips(&values, &[])

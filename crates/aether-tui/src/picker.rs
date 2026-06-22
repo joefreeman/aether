@@ -150,7 +150,7 @@ pub enum ChipId {
     Glob(usize),
     Case,
     Word,
-    Lit,
+    Regex,
     Ignored,
     Hidden,
     Changed,
@@ -167,7 +167,7 @@ pub enum ChipValue {
     /// `Sensitive` or `Insensitive` — `Smart` (the default) is "no chip".
     Case(CaseMode),
     Word,
-    Lit,
+    Regex,
     /// Gitignored-file visibility. `hide` records the per-kind direction at creation time
     /// (the Explorer hides, Grep includes — see docs §1.2), so the wire conversion needs no
     /// kind context.
@@ -551,7 +551,7 @@ impl PickerState {
                     ChipValue::Case(CaseMode::Insensitive) => (ChipId::Case, "aa".into()),
                     ChipValue::Case(_) => (ChipId::Case, "Aa".into()),
                     ChipValue::Word => (ChipId::Word, "wd".into()),
-                    ChipValue::Lit => (ChipId::Lit, "lit".into()),
+                    ChipValue::Regex => (ChipId::Regex, ".*".into()),
                     ChipValue::Ignored { hide } => {
                         (ChipId::Ignored, if *hide { "-ig" } else { "+ig" }.into())
                     }
@@ -577,7 +577,7 @@ impl PickerState {
                 ChipValue::Glob(g) => f.globs.push(g.clone()),
                 ChipValue::Case(mode) => f.case = *mode,
                 ChipValue::Word => f.whole_word = true,
-                ChipValue::Lit => f.fixed_string = true,
+                ChipValue::Regex => f.regex = true,
                 ChipValue::Ignored { hide: true } => f.hide_ignored = true,
                 ChipValue::Ignored { hide: false } => f.include_ignored = true,
                 ChipValue::Hidden { hide: true } => f.hide_hidden = true,
@@ -604,8 +604,8 @@ impl PickerState {
         if f.whole_word {
             chips.push(ChipValue::Word);
         }
-        if f.fixed_string {
-            chips.push(ChipValue::Lit);
+        if f.regex {
+            chips.push(ChipValue::Regex);
         }
         if f.include_ignored || f.hide_ignored {
             chips.push(ChipValue::Ignored {
@@ -741,7 +741,7 @@ impl PickerState {
             }
             ChipId::Case => self.chips.retain(|v| !matches!(v, ChipValue::Case(_))),
             ChipId::Word => self.chips.retain(|v| *v != ChipValue::Word),
-            ChipId::Lit => self.chips.retain(|v| *v != ChipValue::Lit),
+            ChipId::Regex => self.chips.retain(|v| *v != ChipValue::Regex),
             ChipId::Ignored => self
                 .chips
                 .retain(|v| !matches!(v, ChipValue::Ignored { .. })),

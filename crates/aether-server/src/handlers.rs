@@ -2685,11 +2685,11 @@ pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -
 
 pub const SEARCH_MAX_MATCHES: usize = 10_000;
 
-/// Run `query` against the buffer and produce a fresh `SearchEntry`, honouring `options`:
-/// `fixed_string` escapes the query to a literal, `whole_word` wraps it in `\b…\b`, and `case`
-/// selects smartcase (case-insensitive unless the query has an uppercase letter), forced-sensitive
-/// or forced-insensitive. `multi_line: true` throughout. Zero-width matches are skipped so
-/// patterns like `^` don't pin the cursor.
+/// Run `query` against the buffer and produce a fresh `SearchEntry`, honouring `options`: by
+/// default the query is matched literally (escaped), and `regex` opts into regex syntax;
+/// `whole_word` wraps it in `\b…\b`, and `case` selects smartcase (case-insensitive unless the
+/// query has an uppercase letter), forced-sensitive or forced-insensitive. `multi_line: true`
+/// throughout. Zero-width matches are skipped so patterns like `^` don't pin the cursor.
 pub fn compute_search_entry(
     buf: &Buffer,
     query: &str,
@@ -2775,10 +2775,11 @@ pub async fn search_set(
                 query: None,
             });
         }
-        params.query = regex::escape(&text);
-        // The selection is already regex-escaped to a literal, so a `fixed_string` option would
-        // escape it a second time — clear it (case / whole-word still apply).
-        params.options.fixed_string = false;
+        params.query = text;
+        // Search the selection literally: clear `regex` (the default) so `build_match_regex`
+        // escapes it for us. The query stored/shown is then the raw selection text, not an escaped
+        // pattern. Case / whole-word still apply.
+        params.options.regex = false;
         effective_query = Some(params.query.clone());
     }
     let (summary, pushes) = if params.query.is_empty() {

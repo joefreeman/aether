@@ -50,7 +50,7 @@ pub enum ChipId {
     Glob(usize),
     Case,
     Word,
-    Lit,
+    Regex,
     Ignored,
     Hidden,
     Changed,
@@ -65,7 +65,8 @@ pub enum ChipValue {
     /// `Sensitive` or `Insensitive` — `Smart` (the default) is "no chip".
     Case(CaseMode),
     Word,
-    Lit,
+    /// Interpret the query as a regex (opt-in; literal is the default). Renders as `.*`.
+    Regex,
     /// Gitignored-file visibility. `hide` records the per-kind direction at creation time
     /// (the Explorer hides, Grep includes), so the wire conversion needs no kind context.
     Ignored {
@@ -115,12 +116,12 @@ pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
                 | ChipId::Glob(_)
                 | ChipId::Case
                 | ChipId::Word
-                | ChipId::Lit
+                | ChipId::Regex
                 | ChipId::Untracked
         ),
         // The buffer-locked single-file picker greps the same content, so it keeps the regex
         // options — but path scopes are meaningless on one file (its scope is intrinsic).
-        PickerKind::GitChangesFile => matches!(id, ChipId::Case | ChipId::Word | ChipId::Lit),
+        PickerKind::GitChangesFile => matches!(id, ChipId::Case | ChipId::Word | ChipId::Regex),
         PickerKind::Explorer => matches!(
             id,
             ChipId::Ignored | ChipId::Hidden | ChipId::Changed | ChipId::Untracked
@@ -167,7 +168,7 @@ pub fn derive_chips(values: &[ChipValue], project_paths: &[String]) -> Vec<Chip>
                 ChipValue::Case(CaseMode::Insensitive) => (ChipId::Case, "aa".into()),
                 ChipValue::Case(_) => (ChipId::Case, "Aa".into()),
                 ChipValue::Word => (ChipId::Word, "wd".into()),
-                ChipValue::Lit => (ChipId::Lit, "lit".into()),
+                ChipValue::Regex => (ChipId::Regex, ".*".into()),
                 ChipValue::Ignored { hide } => {
                     (ChipId::Ignored, if *hide { "-ig" } else { "+ig" }.into())
                 }
@@ -192,7 +193,7 @@ pub fn wire_filters(values: &[ChipValue]) -> PickerFilters {
             ChipValue::Glob(g) => f.globs.push(g.clone()),
             ChipValue::Case(mode) => f.case = *mode,
             ChipValue::Word => f.whole_word = true,
-            ChipValue::Lit => f.fixed_string = true,
+            ChipValue::Regex => f.regex = true,
             ChipValue::Ignored { hide: true } => f.hide_ignored = true,
             ChipValue::Ignored { hide: false } => f.include_ignored = true,
             ChipValue::Hidden { hide: true } => f.hide_hidden = true,
@@ -216,8 +217,8 @@ pub fn adopt_filters(f: &PickerFilters) -> Vec<ChipValue> {
     if f.whole_word {
         chips.push(ChipValue::Word);
     }
-    if f.fixed_string {
-        chips.push(ChipValue::Lit);
+    if f.regex {
+        chips.push(ChipValue::Regex);
     }
     if f.include_ignored || f.hide_ignored {
         chips.push(ChipValue::Ignored {
@@ -261,7 +262,7 @@ pub fn apply_chip_toggle(values: &mut Vec<ChipValue>, id: ChipId, explorer: bool
             return true;
         }
         ChipId::Word => ChipValue::Word,
-        ChipId::Lit => ChipValue::Lit,
+        ChipId::Regex => ChipValue::Regex,
         ChipId::Ignored => ChipValue::Ignored { hide: explorer },
         ChipId::Hidden => ChipValue::Hidden { hide: explorer },
         ChipId::Changed => ChipValue::Changed,
@@ -287,7 +288,7 @@ pub fn remove_chip(values: &mut Vec<ChipValue>, id: ChipId) {
         }
         ChipId::Case => values.retain(|v| !matches!(v, ChipValue::Case(_))),
         ChipId::Word => values.retain(|v| *v != ChipValue::Word),
-        ChipId::Lit => values.retain(|v| *v != ChipValue::Lit),
+        ChipId::Regex => values.retain(|v| *v != ChipValue::Regex),
         ChipId::Ignored => values.retain(|v| !matches!(v, ChipValue::Ignored { .. })),
         ChipId::Hidden => values.retain(|v| !matches!(v, ChipValue::Hidden { .. })),
         ChipId::Changed => values.retain(|v| *v != ChipValue::Changed),
@@ -923,7 +924,7 @@ mod tests {
         // The single-file picker greps content, so the regex toggles apply...
         assert!(filter_applies(GitChangesFile, ChipId::Case));
         assert!(filter_applies(GitChangesFile, ChipId::Word));
-        assert!(filter_applies(GitChangesFile, ChipId::Lit));
+        assert!(filter_applies(GitChangesFile, ChipId::Regex));
         // ...but path scopes are meaningless on one file.
         assert!(!filter_applies(GitChangesFile, ChipId::Dir(0)));
         assert!(!filter_applies(GitChangesFile, ChipId::Glob(0)));

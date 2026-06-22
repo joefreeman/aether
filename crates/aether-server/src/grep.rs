@@ -108,7 +108,8 @@ async fn run_search(
     };
     builder
         .word(filters.whole_word)
-        .fixed_strings(filters.fixed_string);
+        // Literal by default (ripgrep `-F`); the `.*` chip opts into regex.
+        .fixed_strings(!filters.regex);
     let matcher = match builder.build(&query) {
         Ok(m) => m,
         Err(_) => {

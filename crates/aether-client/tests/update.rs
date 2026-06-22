@@ -1338,12 +1338,12 @@ fn search_option_toggles_cycle_and_ride_the_request() {
     let _ = key(&mut s, '/'); // enter search
     let _ = s.search_set_query("foo".into());
 
-    // Alt-e toggles literal/regex; the new query goes back out with the options in the params.
+    // Alt-e toggles regex; the new query goes back out with the options in the params.
     let fx = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS);
-    assert!(s.search.options.fixed_string, "Alt-e enables literal");
+    assert!(s.search.options.regex, "Alt-e enables regex");
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "search/set");
-    assert_eq!(params["options"], json!({"fixed_string": true}));
+    assert_eq!(params["options"], json!({"regex": true}));
 
     // Alt-w toggles whole-word; Alt-c cycles smart -> sensitive -> insensitive -> smart.
     let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
@@ -1563,7 +1563,7 @@ fn primed_switch_adopts_summary_from_the_response_not_a_push() {
     let opts = aether_protocol::picker::MatchOptions {
         case: aether_protocol::picker::CaseMode::Sensitive,
         whole_word: true,
-        fixed_string: false,
+        regex: false,
     };
     let _ = s.on_event(Event::SwitchedPrimed(Ok(Some((
         "needle".into(),

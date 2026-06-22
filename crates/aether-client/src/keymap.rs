@@ -738,7 +738,7 @@ static SEARCH: &[Binding] = &[
     // Match-option toggles, mirroring the grep picker's chip chords (Alt-c / Alt-w / Alt-e).
     bind!(KeyContext::Search, ch('c'), Exact(Mods::ALT), A::SearchToggleCase, "Search", "Cycle case sensitivity"),
     bind!(KeyContext::Search, ch('w'), Exact(Mods::ALT), A::SearchToggleWord, "Search", "Toggle whole-word match"),
-    bind!(KeyContext::Search, ch('e'), Exact(Mods::ALT), A::SearchToggleRegex, "Search", "Toggle literal/regex"),
+    bind!(KeyContext::Search, ch('e'), Exact(Mods::ALT), A::SearchToggleRegex, "Search", "Toggle regex"),
     // Text entry (chars, Backspace, Left/Right caret) is owned by each shell's search input, which
     // syncs the value via `search_set_query`; only the command keys above live in this table.
 ];
