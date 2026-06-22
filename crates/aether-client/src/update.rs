@@ -18,8 +18,8 @@ use super::transport::RpcError;
 use aether_protocol::buffer::{
     BufferClose, BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopy, BufferCopyParams,
     BufferCopyResult, BufferCut, BufferCutResult, BufferOpen, BufferOpenParams, BufferOpenResult,
-    BufferReload, BufferReloadParams, BufferSave, BufferSaveParams, BufferState, BufferStateParams,
-    CopyScope,
+    BufferReload, BufferReloadParams, BufferSave, BufferSaveParams, BufferSetTransient,
+    BufferSetTransientParams, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::Direction;
 use aether_protocol::cursor::{
@@ -184,6 +184,10 @@ pub enum Event {
         noun: &'static str,
         result: Result<PathDeleteResult, String>,
     },
+    /// `buffer/set_transient` (the `Space k` keep toggle) resolved. The bool is the buffer's new
+    /// transient flag; the toast confirms it (`self.buffer.transient` itself rides the `buffer/state`
+    /// push). Errors surface as an error toast.
+    KeepToggled(Result<bool, String>),
     /// `directory/create` (Explorer "+ Create … name/") resolved: navigate into the new directory.
     DirCreated(Result<DirectoryCreateResult, String>),
     /// Project switch resolved: the activated project + the buffer to land on.
@@ -879,6 +883,17 @@ impl Session {
                     }
                     fx
                 }
+            },
+            Event::KeepToggled(result) => match result {
+                Err(e) => Effects::error(format!("keep toggle failed: {e}")),
+                Ok(transient) => Effects::toast(
+                    if transient {
+                        "buffer released"
+                    } else {
+                        "buffer kept"
+                    },
+                    ToastKind::Success,
+                ),
             },
             Event::DirCreated(Err(e)) => Effects::error(format!("create directory failed: {e}")),
             Event::DirCreated(Ok(r)) => {
@@ -4806,6 +4821,22 @@ impl Session {
                     );
                 }
                 self.reload(false)
+            }
+            A::ToggleKeep => {
+                let target = !self.buffer.transient;
+                // Refuse to make a buffer with unsaved edits transient — it would auto-close (and
+                // discard them) once hidden. Silent no-op; pinning permanent, or toggling a clean
+                // buffer, is fine.
+                if target && self.buffer.revision != self.buffer.saved_revision {
+                    return Effects::none();
+                }
+                self.request_str::<BufferSetTransient>(
+                    BufferSetTransientParams {
+                        buffer_id,
+                        transient: target,
+                    },
+                    |r| Event::KeepToggled(r.map(|res| res.transient)),
+                )
             }
             A::NewScratch => {
                 // Opening a fresh scratch is a buffer switch — record the origin so Alt-Left

@@ -5,7 +5,8 @@ use aether_protocol::buffer::{
     BufferClose, BufferCloseParams, BufferCloseResult, BufferClosed, BufferClosedParams,
     BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
     BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferSaveResult,
-    BufferState, BufferStateParams, CopyScope,
+    BufferSetTransient, BufferSetTransientParams, BufferSetTransientResult, BufferState,
+    BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
@@ -20280,6 +20281,52 @@ async fn transient_open_does_not_demote_existing_buffer() {
         send_request::<BufferOpen>(&mut ws, 3, &file_open_params("a.txt", Some(true))).await;
     assert_eq!(again.buffer_id, first.buffer_id);
     assert!(!again.transient, "an open never demotes a permanent buffer");
+    drop(server);
+}
+
+/// `buffer/set_transient` flips the flag *both* ways — including the deliberate demotion
+/// (permanent → transient) that `buffer/open` refuses. Drives the `Space k` keep toggle.
+#[tokio::test]
+async fn set_transient_flips_the_flag_both_ways() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    // Open a.txt permanent (a fresh non-transient open ⇒ transient: false).
+    let a: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", None)).await;
+    assert!(!a.transient, "a fresh non-transient open is permanent");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
+
+    // Demote it to transient — the thing `buffer/open` can't do.
+    let demoted: BufferSetTransientResult = send_request::<BufferSetTransient>(
+        &mut ws,
+        4,
+        &BufferSetTransientParams {
+            buffer_id: a.buffer_id,
+            transient: true,
+        },
+    )
+    .await;
+    assert!(demoted.transient, "set_transient(true) reports the flag set");
+    // Reopening (attach, no intent) reflects the new server-side state.
+    let reopen: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 5, &attach_open_params(a.buffer_id, None)).await;
+    assert!(reopen.transient, "the demotion stuck server-side");
+
+    // Pin it permanent again.
+    let pinned: BufferSetTransientResult = send_request::<BufferSetTransient>(
+        &mut ws,
+        6,
+        &BufferSetTransientParams {
+            buffer_id: a.buffer_id,
+            transient: false,
+        },
+    )
+    .await;
+    assert!(!pinned.transient);
+    let reopen2: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 7, &attach_open_params(a.buffer_id, None)).await;
+    assert!(!reopen2.transient, "pinned back to permanent");
+
     drop(server);
 }
 

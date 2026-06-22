@@ -287,6 +287,9 @@ pub enum Action {
     Save,
     SaveAs,
     Reload,
+    /// Toggle the active buffer's transient ("keep") state — pin a preview permanent, or release a
+    /// permanent buffer back to transient. Refused for unsaved buffers (auto-close would discard).
+    ToggleKeep,
     NewScratch,
     CloseBuffer,
 
@@ -765,7 +768,8 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('w'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
-    bind!(L, ch('a'), Exact(Mods::NONE), A::Reload, "App", "Reload from disk"),
+    bind!(L, ch('k'), Exact(Mods::NONE), A::ToggleKeep, "App", "Keep buffer (toggle transient)"),
+    bind!(L, ch('k'), Exact(Mods::ALT), A::Reload, "App", "Reload from disk"),
     bind!(L, ch('y'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
     bind!(L, ch('y'), Exact(Mods::ALT), A::RevertHunk, "Git", "Revert change"),
     bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),

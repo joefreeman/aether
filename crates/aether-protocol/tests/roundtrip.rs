@@ -1361,6 +1361,23 @@ fn buffer_closed_notification_shape() {
 }
 
 #[test]
+fn buffer_set_transient_shape() {
+    use aether_protocol::buffer::{BufferSetTransientParams, BufferSetTransientResult};
+    let p = to_value(BufferSetTransientParams {
+        buffer_id: 4,
+        transient: true,
+    })
+    .unwrap();
+    assert_eq!(p, json!({"buffer_id": 4, "transient": true}));
+    let parsed: BufferSetTransientParams =
+        from_value(json!({"buffer_id": 9, "transient": false})).unwrap();
+    assert_eq!(parsed.buffer_id, 9);
+    assert!(!parsed.transient);
+    let r = to_value(BufferSetTransientResult { transient: false }).unwrap();
+    assert_eq!(r, json!({"transient": false}));
+}
+
+#[test]
 fn nav_goto_params_shape() {
     use aether_protocol::cursor::CursorState;
     use aether_protocol::nav::NavGotoParams;

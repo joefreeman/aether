@@ -14,7 +14,8 @@ use crate::wrap;
 use aether_protocol::buffer::{
     BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopyParams, BufferCopyResult,
     BufferCutResult, BufferOpenParams, BufferOpenResult, BufferReloadParams, BufferReloadResult,
-    BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
+    BufferSaveParams, BufferSaveResult, BufferSetTransientParams, BufferSetTransientResult,
+    BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorBufferOnlyParams, CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams,
@@ -4125,6 +4126,34 @@ pub async fn buffer_reload(
         let _ = sender.send(notif).await;
     }
     Ok(result)
+}
+
+/// Set a buffer's transient flag explicitly — the `Space k` "keep" toggle. Unlike `buffer/open`'s
+/// promote-only intent, this flips the flag either way. Applied unconditionally: the client owns
+/// the "don't mark an unsaved buffer transient" policy (auto-close would discard the edits), the
+/// same way `buffer/close` leaves the discard decision to the client. Pushes `buffer/state` so every
+/// viewer's flag updates, and refreshes open Buffers pickers so the italic transient label tracks it.
+pub async fn buffer_set_transient(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferSetTransientParams,
+) -> Result<BufferSetTransientResult, RpcError> {
+    let _ = ctx;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get_mut(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    buf.transient = params.transient;
+    let mut pushes = collect_buffer_state_pushes(&s, params.buffer_id);
+    pushes.extend(refresh_buffer_pickers(&mut s));
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(BufferSetTransientResult {
+        transient: params.transient,
+    })
 }
 
 /// Re-read a buffer from disk inside the lock, returning the RPC result and the pushes the

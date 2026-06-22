@@ -2254,6 +2254,74 @@ fn space_m_shows_blame_commit() {
     assert_eq!(method, "git/blame_line");
 }
 
+#[test]
+fn space_k_toggles_keep_and_guards_unsaved() {
+    let mut s = session();
+
+    // Clean transient buffer: Space k pins it permanent (transient: false).
+    s.buffer.transient = true;
+    s.buffer.revision = 3;
+    s.buffer.saved_revision = 3;
+    let _ = key(&mut s, ' '); // leader
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let params = find_request(&fx, "buffer/set_transient").expect("Space k toggles transient");
+    assert_eq!(params["buffer_id"], json!(s.buffer.buffer_id));
+    assert_eq!(
+        params["transient"],
+        json!(false),
+        "pins the transient buffer permanent"
+    );
+
+    // Clean permanent buffer: Space k releases it back to transient.
+    s.buffer.transient = false;
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let params = find_request(&fx, "buffer/set_transient").expect("toggles the other way");
+    assert_eq!(params["transient"], json!(true));
+
+    // Dirty permanent buffer: Space k refuses to make it transient — silent no-op, no RPC.
+    s.buffer.transient = false;
+    s.buffer.revision = 5;
+    s.buffer.saved_revision = 3;
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    assert!(
+        find_request(&fx, "buffer/set_transient").is_none(),
+        "an unsaved buffer can't be made transient"
+    );
+    assert!(fx.0.is_empty(), "the refusal is a silent no-op");
+
+    // A dirty *transient* buffer can still be pinned permanent — that's safe (stops it auto-closing
+    // with the unsaved edits), so the guard only blocks the make-transient direction.
+    s.buffer.transient = true;
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let params = find_request(&fx, "buffer/set_transient").expect("dirty transient can be pinned");
+    assert_eq!(params["transient"], json!(false));
+}
+
+#[test]
+fn reload_moved_to_space_alt_k() {
+    let mut s = session();
+    s.buffer.path = Some("/p/file.rs".into()); // reload needs a file-backed buffer
+
+    // Reload now lives on Space Alt-k.
+    let _ = key(&mut s, ' '); // leader
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    assert!(
+        find_request(&fx, "buffer/reload").is_some(),
+        "Space Alt-k reloads"
+    );
+
+    // ...and its old home, Space a, no longer reloads.
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
+    assert!(
+        find_request(&fx, "buffer/reload").is_none(),
+        "Space a is no longer bound to reload"
+    );
+}
+
 // ---- application settings (Space .) -----------------------------------------------------------
 
 #[test]

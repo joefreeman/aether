@@ -233,6 +233,33 @@ pub struct BufferReloadResult {
     pub saved_at_unix_ms: Option<u64>,
 }
 
+// ---- buffer/set_transient -----------------------------------------------------------------------
+
+pub struct BufferSetTransient;
+impl RpcMethod for BufferSetTransient {
+    const NAME: &'static str = "buffer/set_transient";
+    type Params = BufferSetTransientParams;
+    type Result = BufferSetTransientResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferSetTransientParams {
+    pub buffer_id: BufferId,
+    /// The transient flag to set. `true` marks the buffer transient (it auto-closes once no
+    /// viewport shows it); `false` pins it permanent. Unlike [`BufferOpenParams::transient`] —
+    /// which only ever *promotes* — this flips the flag either way, driving the `Space k` "keep"
+    /// toggle. The server applies it unconditionally; the client owns the policy that a buffer with
+    /// unsaved edits is never marked transient (auto-close would discard them), mirroring how
+    /// `buffer/close` leaves the discard decision to the client.
+    pub transient: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferSetTransientResult {
+    /// The buffer's transient flag after the change — echoes the request so the client can confirm.
+    pub transient: bool,
+}
+
 // ---- buffer/copy & buffer/cut -------------------------------------------------------------------
 
 pub struct BufferCopy;
