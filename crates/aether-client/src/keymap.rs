@@ -583,8 +583,8 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch(','), Exact(Mods::ALT), A::SwapAnchor, "Selection", "Swap cursor and anchor"),
     bind!(N, ch('p'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
     bind!(N, ch('p'), Exact(Mods::ALT), A::TreeContract, "Selection", "Contract selection to child syntax node"),
-    bind!(N, ch('u'), Exact(Mods::ALT), A::MotionRedo, "Selection", "Redo cursor/selection motion"),
-    bind!(N, ch('u'), Exact(Mods::NONE), A::MotionUndo, "Selection", "Undo cursor/selection motion"),
+    bind!(N, ch('z'), Exact(Mods::ALT), A::MotionRedo, "Selection", "Redo cursor/selection motion"),
+    bind!(N, ch('z'), Exact(Mods::NONE), A::MotionUndo, "Selection", "Undo cursor/selection motion"),
     bind!(N, ch('.'), Exact(Mods::NONE), A::RepeatMotion, "Selection", "Repeat last motion"),
 
     // ---- motions: chars / lines ----
@@ -689,8 +689,8 @@ static NORMAL: &[Binding] = &[
 
 #[rustfmt::skip]
 static GLOBAL: &[Binding] = &[
-    bind!(G, ch('u'), Exact(Mods::CTRL), A::Undo, "Edit", "Undo"),
-    bind!(G, ch('u'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
+    bind!(G, ch('z'), Exact(Mods::CTRL), A::Undo, "Edit", "Undo"),
+    bind!(G, ch('z'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
     bind!(G, ch('j'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Down), "Edit", "Move line(s) down"),
     bind!(G, ch('k'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Up), "Edit", "Move line(s) up"),
     bind!(G, ch('g'), Exact(Mods::CTRL), A::JoinLines, "Edit", "Join lines"),
@@ -932,10 +932,10 @@ mod tests {
             lookup(KeyContext::Normal, ch('h'), Mods::ALT).map(|b| b.action),
             Some(Action::MoveLineFirstNonblank)
         ));
-        // Ctrl-u (undo) lives in Global, not Normal (plain `u` is the motion-undo).
-        assert!(lookup(KeyContext::Normal, ch('u'), Mods::CTRL).is_none());
+        // Ctrl-z (undo) lives in Global, not Normal (plain `z` is the motion-undo).
+        assert!(lookup(KeyContext::Normal, ch('z'), Mods::CTRL).is_none());
         assert!(matches!(
-            lookup(KeyContext::Global, ch('u'), Mods::CTRL).map(|b| b.action),
+            lookup(KeyContext::Global, ch('z'), Mods::CTRL).map(|b| b.action),
             Some(Action::Undo)
         ));
         // Mode-divergent Ctrl-d: selection-scoped in Normal, line-scoped in Insert.
