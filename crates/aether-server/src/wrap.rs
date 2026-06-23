@@ -176,9 +176,20 @@ pub(crate) fn compute_rows(
                     row_start_byte = byte_idx;
                 }
             }
-            row_cols = 0;
+            // After a whitespace break we keep the partial word that was already consumed past
+            // the break point — `[row_start_byte, byte_idx)` — as the head of the new row. Those
+            // chars were measured into the row we just closed, so they must be re-counted against
+            // the new row's budget; resetting `row_cols` to 0 let them ride for free and the next
+            // row overflowed (the bug only bit continuation rows, since the first row carries
+            // nothing in). The new row is always a continuation, so it lays out from `lead`; the
+            // carried slice holds no whitespace (a later space would have advanced
+            // `last_break_byte`), so this is a tab-free, position-independent measure. A hard
+            // break leaves the slice empty, so this naturally yields 0.
+            row_cols = line[row_start_byte..byte_idx]
+                .chars()
+                .fold(0, |acc, ch| acc + char_display_width(ch, lead + acc, tab_width));
             last_break_byte = None;
-            continue; // re-evaluate `c` against the new (empty) row
+            continue; // re-evaluate `c` against the new row (now holding the carried prefix)
         }
 
         row_cols += step;
@@ -371,6 +382,62 @@ mod tests {
         let first = row_text(&rows[0]);
         assert!(first.starts_with('\t'));
         assert!(!first.contains("world"));
+    }
+
+    /// Display column where a row's text *ends* when rendered the way the client does it:
+    /// continuation rows are prefixed by the wrap marker plus the row's continuation indent
+    /// (see `aether_client::grid::row_prefix_cols`), and non-tab chars never collapse to 0.
+    /// Used to assert the wrap never packs a row wider than the client can show.
+    fn client_rendered_end_col(info: &RowInfo, marker: u32, tab_width: u32) -> u32 {
+        let mut dcol = if info.byte_offset == 0 {
+            0
+        } else {
+            marker + info.continuation_indent
+        };
+        for ch in info.text.chars() {
+            dcol += if ch == '\t' {
+                let tw = tab_width.max(1);
+                tw - (dcol % tw)
+            } else {
+                (UnicodeWidthChar::width(ch).unwrap_or(1) as u32).max(1)
+            };
+        }
+        dcol
+    }
+
+    #[test]
+    fn continuation_rows_dont_overflow_carried_word() {
+        // Regression: the wrapper consumes the partial word past the break point while filling a
+        // row, then carries it onto the next row. That carried prefix must count against the next
+        // row's width budget — otherwise continuation rows overflowed the viewport. (Bug only bit
+        // the second-and-later rows; the first row carries nothing in.)
+        let marker = 2;
+        let tab = 4;
+        let cases: &[(&str, u32)] = &[
+            ("the quick brown fox jumps over", 10),
+            ("    println!(\"hello world from aether\");", 20),
+            ("a bb ccc dddd eeeee ffffff ggggggg", 8),
+            // combining mark must not let the row sneak an extra visible column past the edge.
+            ("cafe\u{0301} latte mocha frappuccino blend", 12),
+        ];
+        for (line, cols) in cases {
+            for r in compute_rows(line, *cols, marker, tab) {
+                let end = client_rendered_end_col(&r, marker, tab);
+                assert!(
+                    end <= *cols,
+                    "row {:?} (indent {}) renders to col {end} > cols {cols} for line {line:?}",
+                    r.text,
+                    r.continuation_indent,
+                );
+            }
+        }
+
+        // Pin the exact split the carried-word fix produces for the canonical case.
+        let texts: Vec<_> = compute_rows("the quick brown fox jumps over", 10, marker, tab)
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert_eq!(texts, vec!["the quick", "brown", "fox", "jumps", "over"]);
     }
 
     #[test]
