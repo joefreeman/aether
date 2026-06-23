@@ -604,8 +604,22 @@ html, body, #app {
 .as-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .as-label { color: var(--nord6); flex: 1 1 auto; cursor: pointer; }
 .as-check { accent-color: var(--nord8); cursor: pointer; margin: 0; flex: 0 0 auto; }
-/* Focus rings just the checkbox — a future setting may pair several controls in one row. */
-.as-setting.selected .as-check { outline: 2px solid var(--nord8); outline-offset: 2px; border-radius: 2px; }
+/* A stepped numeric setting (font size): a compact pill showing the current value; click cycles. */
+.as-value {
+  flex: 0 0 auto;
+  min-width: 34px;
+  padding: 2px 8px;
+  font: inherit;
+  text-align: center;
+  color: var(--nord6);
+  background: var(--nord2);
+  border: 1px solid var(--nord3);
+  border-radius: 4px;
+  cursor: pointer;
+}
+/* Focus rings just the control — a future setting may pair several controls in one row. */
+.as-setting.selected .as-check,
+.as-setting.selected .as-value { outline: 2px solid var(--nord8); outline-offset: 2px; border-radius: 2px; }
 .as-desc { color: var(--nord3-brighter); font-size: 12px; margin-top: 2px; }
 
 /* Help overlay. */

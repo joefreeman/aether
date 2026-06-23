@@ -333,7 +333,8 @@ pub enum Action {
     OpenHelp,
     /// `Space ,` — the project-settings overlay (roots + rename). TUI-only today.
     OpenProjectSettings,
-    /// `Space .` — the application-settings overlay (global preferences, e.g. soft wrap).
+    /// `Space .` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
+    /// lives here too (a stepped value row), not on a keybinding.
     OpenAppSettings,
 }
 

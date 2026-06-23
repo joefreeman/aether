@@ -2572,20 +2572,27 @@ fn app_settings_wire_shape_and_defaults() {
     assert_eq!(AppSettings::default().wrap, WrapMode::Soft);
     assert!(AppSettings::default().ligatures);
 
-    // Wire shape: `wrap` serializes as the lowercase WrapMode tag; `ligatures` as a bool.
+    // Wire shape: `wrap` serializes as the lowercase WrapMode tag; `ligatures` as a bool; `font_size`
+    // as a number.
     let s = AppSettings {
         wrap: WrapMode::None,
         ligatures: false,
+        font_size: 16,
     };
     assert_eq!(
         to_value(s).unwrap(),
-        json!({ "wrap": "none", "ligatures": false })
+        json!({ "wrap": "none", "ligatures": false, "font_size": 16 })
     );
 
-    // A file with only `wrap` set (added before `ligatures`) reads back with ligatures defaulting on.
+    // A file with only `wrap` set (added before `ligatures`/`font_size`) reads back with those
+    // defaulting (ligatures on, font size at the default).
     let parsed: AppSettings = from_value(json!({ "wrap": "none" })).unwrap();
     assert_eq!(parsed.wrap, WrapMode::None);
     assert!(parsed.ligatures);
+    assert_eq!(
+        parsed.font_size,
+        aether_protocol::settings::default_font_size()
+    );
 
     // An empty object (a fresh / older settings.toml with no keys) reads back as defaults — every
     // field carries a serde default so settings can be added without breaking old files.

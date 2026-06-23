@@ -245,17 +245,69 @@ pub struct AppSettingsOverlay {
 pub enum AppSettingId {
     SoftWrap,
     Ligatures,
+    FontSize,
 }
 
-/// One checkbox row of the application-settings overlay: its identity, label, current on/off state,
-/// and a hint describing what it does. Built by [`Session::app_setting_groups`] so every shell shows
-/// the same rows in the same order.
+/// Editor font-size presets the [`AppSettingId::FontSize`] row steps through (px). The default
+/// ([`aether_protocol::settings::default_font_size`]) is one of them, so the stored value always
+/// lands on a preset and the row's "current" maps cleanly to an index.
+pub const FONT_SIZE_PRESETS: &[u32] = &[10, 11, 12, 13, 14, 16, 18, 20, 24];
+
+/// Step `current` to an adjacent font-size preset. `up` picks the larger neighbour. With `wrap`,
+/// stepping past an end wraps around (Enter/Space cycle the row); without, it clamps (the Left/Right
+/// stepper). A `current` that isn't a preset (e.g. an older hand-edited `settings.toml`) snaps to
+/// the nearest one first.
+pub fn step_font_size(current: u32, up: bool, wrap: bool) -> u32 {
+    let presets = FONT_SIZE_PRESETS;
+    let idx = presets
+        .iter()
+        .position(|&v| v == current)
+        .or_else(|| {
+            presets
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, &v)| v.abs_diff(current))
+                .map(|(i, _)| i)
+        })
+        .unwrap_or(0);
+    let n = presets.len();
+    let next = if up {
+        if idx + 1 < n {
+            idx + 1
+        } else if wrap {
+            0
+        } else {
+            idx
+        }
+    } else if idx > 0 {
+        idx - 1
+    } else if wrap {
+        n - 1
+    } else {
+        idx
+    };
+    presets[next]
+}
+
+/// The control a settings row presents: an on/off checkbox, or a stepped numeric value (font size).
+/// The shells render each kind; activating a row (Enter / Space / click) advances it — flips a
+/// toggle, or steps a value to the next preset (wrapping) — via [`Session::activate_app_setting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppSettingControl {
+    /// `true` is "on" / checked.
+    Toggle(bool),
+    /// The current value (px, for font size); presets + stepping live in the core.
+    Value(u32),
+}
+
+/// One row of the application-settings overlay: its identity, label, current control state, and a
+/// hint describing what it does. Built by [`Session::app_setting_groups`] so every shell shows the
+/// same rows in the same order.
 #[derive(Debug, Clone)]
 pub struct AppSettingRow {
     pub id: AppSettingId,
     pub label: &'static str,
-    /// The checkbox state — `true` is "on" / checked.
-    pub value: bool,
+    pub control: AppSettingControl,
     pub hint: &'static str,
 }
 
@@ -401,6 +453,10 @@ pub struct Session {
     /// `settings/get` at boot. The shells read it each render to pick their text shaping
     /// (native) / font feature (web); the core just holds the value.
     pub ligatures: bool,
+    /// Editor font size in px — an app-wide setting (`Space .`), seeded from `settings/get` at
+    /// boot and synced via `settings/changed`. The GUI/web shells read it each render to size the
+    /// buffer text (and reflow); the terminal client ignores it. The core just holds the value.
+    pub font_size: u32,
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
@@ -449,6 +505,7 @@ impl Session {
             window: None,
             wrap: WrapMode::Soft,
             ligatures: true,
+            font_size: aether_protocol::settings::default_font_size(),
             diff_view: false,
             diagnostics: DiagnosticCounts::default(),
             lsp: None,
@@ -477,14 +534,20 @@ impl Session {
                 AppSettingRow {
                     id: AppSettingId::SoftWrap,
                     label: "Soft wrap",
-                    value: self.wrap == WrapMode::Soft,
+                    control: AppSettingControl::Toggle(self.wrap == WrapMode::Soft),
                     hint: "Wrap long lines to the viewport width",
                 },
                 AppSettingRow {
                     id: AppSettingId::Ligatures,
                     label: "Ligatures",
-                    value: self.ligatures,
+                    control: AppSettingControl::Toggle(self.ligatures),
                     hint: "Coding ligatures in the editor font (→, ≠, ⇒, …)",
+                },
+                AppSettingRow {
+                    id: AppSettingId::FontSize,
+                    label: "Font size",
+                    control: AppSettingControl::Value(self.font_size),
+                    hint: "Editor text size in pixels (GUI/web; the terminal uses its own font)",
                 },
             ],
         }]

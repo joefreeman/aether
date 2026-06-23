@@ -2292,6 +2292,47 @@ fn space_m_shows_blame_commit() {
 }
 
 #[test]
+fn font_size_setting_steps_and_persists() {
+    use aether_client::keymap::{KeyCode, Mods};
+    use aether_client::session::AppSettingId;
+    use aether_client::update::Event;
+    use aether_protocol::settings::AppSettings;
+    use aether_protocol::viewport::WrapMode;
+
+    // Persisted font size is adopted into the session (render-only, like ligatures — no effects).
+    let mut s = session();
+    let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
+        wrap: WrapMode::Soft,
+        ligatures: true,
+        font_size: 16,
+    })));
+    assert_eq!(s.font_size, 16, "persisted font size is adopted");
+    assert!(
+        fx.0.is_empty(),
+        "font size is render-only — no reflow effect"
+    );
+
+    // The Font size row sits in the app-settings overlay. Activating it (Enter/Space/click) steps
+    // to the next preset and persists via settings/set.
+    s.open_app_settings();
+    let rows = s.app_setting_rows();
+    let idx = rows
+        .iter()
+        .position(|r| matches!(r.id, AppSettingId::FontSize))
+        .expect("a Font size row");
+    let fx = s.app_settings_toggle(idx);
+    assert_eq!(s.font_size, 18, "16 → next preset 18");
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["font_size"], json!(18));
+
+    // Left steps down to the previous preset (no wrap), also persisting.
+    let fx = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    assert_eq!(s.font_size, 16, "Left steps down a preset");
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["font_size"], json!(16));
+}
+
+#[test]
 fn space_k_toggles_keep_and_guards_unsaved() {
     let mut s = session();
 
@@ -2518,6 +2559,7 @@ fn app_settings_loaded_applies_persisted_wrap_only_when_it_differs() {
     let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
         wrap: WrapMode::None,
         ligatures: true,
+        ..AppSettings::default()
     })));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
     assert!(fx
@@ -2530,6 +2572,7 @@ fn app_settings_loaded_applies_persisted_wrap_only_when_it_differs() {
     let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
         wrap: WrapMode::Soft,
         ligatures: true,
+        ..AppSettings::default()
     })));
     assert!(fx.0.is_empty(), "matching wrap is a no-op");
 }
@@ -2546,6 +2589,7 @@ fn app_settings_apply_and_toggle_ligatures() {
     let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
         wrap: WrapMode::Soft,
         ligatures: false,
+        ..AppSettings::default()
     })));
     assert!(!s.ligatures, "persisted ligatures value is adopted");
     assert!(

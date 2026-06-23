@@ -185,9 +185,9 @@ pub(crate) fn compute_rows(
             // carried slice holds no whitespace (a later space would have advanced
             // `last_break_byte`), so this is a tab-free, position-independent measure. A hard
             // break leaves the slice empty, so this naturally yields 0.
-            row_cols = line[row_start_byte..byte_idx]
-                .chars()
-                .fold(0, |acc, ch| acc + char_display_width(ch, lead + acc, tab_width));
+            row_cols = line[row_start_byte..byte_idx].chars().fold(0, |acc, ch| {
+                acc + char_display_width(ch, lead + acc, tab_width)
+            });
             last_break_byte = None;
             continue; // re-evaluate `c` against the new row (now holding the carried prefix)
         }

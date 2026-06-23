@@ -7,7 +7,7 @@ use crate::app::{
 use aether_client::keymap;
 use aether_client::keymap::KeyCode;
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
-use aether_client::session::ConnState;
+use aether_client::session::{AppSettingControl, ConnState};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::GitStatus;
 use aether_protocol::lsp::{LspProgress, LspStatus};
@@ -289,25 +289,31 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
             let selected = flat == settings.selected;
             // A gap before each setting (separating it from the header / the previous setting).
             lines.push(Line::from(""));
-            // Label flush-left, checkbox right-aligned. Only the checkbox carries the focus
-            // highlight (a NORD2 background), so a future row with multiple controls can highlight
-            // just the focused one.
-            let check = if row.value { "[\u{2713}]" } else { "[ ]" };
-            // Checked uses the frost accent; unchecked stays white so the empty box reads clearly
-            // over the focus cell's NORD2 background.
-            let check_fg = if row.value { NORD8 } else { NORD6 };
+            // Label flush-left, control right-aligned. Only the control carries the focus highlight
+            // (a NORD2 background). A toggle shows a checkbox; a stepped value (font size) shows the
+            // number — the terminal can't change its own font, but the value is shown for parity and
+            // because the setting is synced (it drives the GUI/web clients).
+            let (control_text, control_fg) = match row.control {
+                AppSettingControl::Toggle(true) => ("[\u{2713}]".to_string(), NORD8),
+                AppSettingControl::Toggle(false) => ("[ ]".to_string(), NORD6),
+                AppSettingControl::Value(v) => (v.to_string(), NORD8),
+            };
+            let control_w = control_text.chars().count().max(CHECK_W);
             let check_bg = if selected { NORD2 } else { NORD0 };
-            let label_budget = w.saturating_sub(CHECK_W + 1);
+            let label_budget = w.saturating_sub(control_w + 1);
             let label = truncate_right(row.label, label_budget);
             let pad = w
-                .saturating_sub(CHECK_W)
+                .saturating_sub(control_w)
                 .saturating_sub(label.chars().count());
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{}{}", label, " ".repeat(pad)),
                     Style::default().fg(NORD6).bg(NORD0),
                 ),
-                Span::styled(check, Style::default().fg(check_fg).bg(check_bg)),
+                Span::styled(
+                    format!("{control_text:>control_w$}"),
+                    Style::default().fg(control_fg).bg(check_bg),
+                ),
             ]));
             // Description on the very next line — grouped tight under the label.
             lines.push(Line::from(Span::styled(

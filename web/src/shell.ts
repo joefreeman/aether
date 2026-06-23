@@ -323,6 +323,8 @@ interface CoreView {
   wrap: WrapMode;
   diff_view: boolean;
   ligatures: boolean;
+  /** Editor font size in px (the synced `font_size` app setting). */
+  font_size: number;
   window: BufferWindow | null;
   viewport_id: number | null;
   buffer: {
@@ -368,9 +370,13 @@ interface ProjectSettingsView {
  *  state + key handling (`on_app_settings_key`); the shell renders grouped checkboxes and routes
  *  keys through the global keydown → `on_key`, plus checkbox clicks via `app_settings_toggle`.
  *  `selected` is the flat row index across all groups. */
+type AppSettingControl =
+  | { kind: "toggle"; value: boolean }
+  | { kind: "value"; value: number };
+
 interface AppSettingsView {
   selected: number;
-  groups: { title: string; rows: { label: string; value: boolean; hint: string }[] }[];
+  groups: { title: string; rows: { label: string; hint: string; control: AppSettingControl }[] }[];
 }
 
 /** Cumulative visual rows before `line` in the loaded window (phantom rows included), or null when
@@ -687,12 +693,19 @@ export class Shell {
    *  it captures nothing itself (handled keys are preventDefaulted; stray ones are cleared). Its sole
    *  job is to keep a form field focused, which stops Firefox/Chrome opening the menu bar on Alt. */
   private readonly capture: HTMLTextAreaElement;
-  private readonly cell: Cell;
+  // Re-measured on font-size change (client-local zoom), so not `readonly`.
+  private cell: Cell;
   private client!: RpcClient;
   private session!: WasmSession;
 
   private cols = 80;
   private rows = 24;
+  /** The `#app` root element — its `font-size` is the editor size (the buffer inherits it), driven
+   *  by the synced `font_size` app setting. */
+  private rootEl!: HTMLElement;
+  /** The font size (px) currently applied to the DOM, so `render` re-measures only when it changes.
+   *  The authoritative value is the core's `view.font_size`. */
+  private appliedFontSize = 0;
   /** The most recent `view()` — refreshed every `render()`, read by the geometry methods so they
    *  don't re-serialize the window on every scroll event. */
   private snapshot: CoreView | null = null;
@@ -790,6 +803,7 @@ export class Shell {
   private composing = false;
 
   constructor(root: HTMLElement, cfg: Config) {
+    this.rootEl = root;
     this.bufferEl = document.createElement("div");
     this.bufferEl.id = "buffer";
     this.bufferEl.tabIndex = 0;
@@ -1715,6 +1729,22 @@ export class Shell {
     }
   }
 
+  /** Apply the editor font size from the synced `font_size` app setting: set the `#app` font-size
+   *  (the buffer inherits it) and re-measure the cell, then resize the server viewport so soft-wrap
+   *  reflows. Called at the top of `render`, so it only re-measures (the in-flight render then draws
+   *  at the new cell) and kicks the async resize — it must not re-enter `render` itself. No-op when
+   *  unchanged. */
+  private applyFontSize(px: number): void {
+    if (px === this.appliedFontSize) return;
+    this.appliedFontSize = px;
+    this.rootEl.style.fontSize = `${px}px`;
+    this.cell = measureCell(this.bufferEl);
+    // `onResize` recomputes the grid and, when a viewport is already subscribed, issues the reflow
+    // RPC; before the first subscribe it just updates cols/rows (the subscribe reads them). It does
+    // not re-enter `render`, so calling it from the render path is safe.
+    this.onResize();
+  }
+
   /** Re-render the viewport at the just-toggled wrap mode. The core already flipped `Session.wrap`;
    *  this issues the geometry RPC (mirrors iced): zero the horizontal scroll, ask the server to
    *  re-render the existing viewport at the new wrap, adopt the window, then keep the cursor on-screen
@@ -2061,6 +2091,8 @@ export class Shell {
     }
     const v = this.view();
     this.snapshot = v;
+    // Adopt the synced editor font size before drawing, so this paint uses the right cell metrics.
+    this.applyFontSize(v.font_size);
     this.renderSearch(v);
     this.renderPrompt(v);
     this.renderPicker(v);
@@ -2581,21 +2613,34 @@ export class Shell {
         label.className = "as-label";
         label.textContent = r.label;
         label.addEventListener("mousedown", (e) => e.preventDefault()); // keep focus on `capture`
-        const box = document.createElement("input");
-        box.type = "checkbox";
-        box.className = "as-check";
-        box.checked = r.value;
-        // Keep focus on `capture` (so the global keydown keeps driving the overlay), and toggle the
-        // setting through the core by flat index.
-        box.addEventListener("mousedown", (e) => e.preventDefault());
-        box.addEventListener("change", () => {
+        // Activating a row (click) routes through the core by flat index — it flips a toggle or
+        // steps a value to the next preset (same as Enter/Space). Focus stays on `capture` so the
+        // global keydown keeps driving the overlay.
+        const activate = () => {
           if (this.session) this.runEffects(this.session.app_settings_toggle(i) as CoreEffect[]);
-        });
-        // Associate the label with the checkbox so clicking the label toggles too.
-        const id = `as-check-${i}`;
-        box.id = id;
-        label.setAttribute("for", id);
-        head.append(label, box);
+        };
+        if (r.control.kind === "value") {
+          // A stepped numeric setting (font size): show the current value as a button that cycles.
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "as-value";
+          btn.textContent = String(r.control.value);
+          btn.addEventListener("mousedown", (e) => e.preventDefault());
+          btn.addEventListener("click", activate);
+          head.append(label, btn);
+        } else {
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.className = "as-check";
+          box.checked = r.control.value;
+          box.addEventListener("mousedown", (e) => e.preventDefault());
+          box.addEventListener("change", activate);
+          // Associate the label with the checkbox so clicking the label toggles too.
+          const id = `as-check-${i}`;
+          box.id = id;
+          label.setAttribute("for", id);
+          head.append(label, box);
+        }
 
         const desc = document.createElement("div");
         desc.className = "as-desc";

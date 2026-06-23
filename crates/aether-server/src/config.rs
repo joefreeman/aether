@@ -474,12 +474,14 @@ mod tests {
             &AppSettings {
                 wrap: WrapMode::None,
                 ligatures: false,
+                font_size: 18,
             },
         )
         .unwrap();
         let s = load_app_settings_at(&path).unwrap();
         assert_eq!(s.wrap, WrapMode::None);
         assert!(!s.ligatures);
+        assert_eq!(s.font_size, 18);
     }
 
     #[test]

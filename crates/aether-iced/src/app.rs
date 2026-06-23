@@ -2429,6 +2429,7 @@ impl App {
                     .map(|(line, text)| (*line, text.as_str())),
                 tab_width: TAB_WIDTH,
                 ligatures: self.session.ligatures,
+                font_size: self.session.font_size as f32,
             },
             Message::Editor,
         );
@@ -2860,26 +2861,59 @@ impl App {
                 let i = flat;
                 flat += 1;
                 let focused = s.selected == i;
-                // The focus ring sits on just the checkbox (a future row may carry several
-                // controls, so highlighting the whole row would be ambiguous).
-                let check = container(
-                    iced::widget::checkbox(r.value)
+                // The focus ring sits on just the control (a future row may carry several
+                // controls, so highlighting the whole row would be ambiguous). A toggle renders a
+                // checkbox; a stepped value (font size) renders a pill button — clicking either
+                // activates the row (flip / step to the next preset), the same as Enter/Space.
+                let control: Element<'_, Message> = match r.control {
+                    AppSettingControl::Toggle(on) => iced::widget::checkbox(on)
                         .size(16)
-                        .on_toggle(move |_| Message::Core(CoreEvent::AppSettingToggle(i))),
-                )
-                .padding(2)
-                .style(move |_| container::Style {
-                    border: iced::Border {
-                        color: if focused {
-                            theme::NORD8
-                        } else {
-                            iced::Color::TRANSPARENT
+                        .on_toggle(move |_| Message::Core(CoreEvent::AppSettingToggle(i)))
+                        .into(),
+                    AppSettingControl::Value(v) => {
+                        // `button` needs a `Clone` press message and `Message` isn't `Clone`, so the
+                        // button carries the row index (a `usize`) and we map it to `Message` — the
+                        // same pattern as the project-settings delete button.
+                        let btn = iced::widget::button(
+                            text(v.to_string()).size(13).font(SANS).color(theme::NORD6),
+                        )
+                        .padding([2, 8])
+                        .style(|_, status| iced::widget::button::Style {
+                            background: Some(
+                                if matches!(status, iced::widget::button::Status::Hovered) {
+                                    theme::NORD3
+                                } else {
+                                    theme::NORD2
+                                }
+                                .into(),
+                            ),
+                            text_color: theme::NORD6,
+                            border: iced::Border {
+                                color: theme::NORD3,
+                                width: 1.0,
+                                radius: 4.0.into(),
+                            },
+                            ..iced::widget::button::Style::default()
+                        })
+                        .on_press(i);
+                        Element::from(btn)
+                            .map(|idx| Message::Core(CoreEvent::AppSettingToggle(idx)))
+                    }
+                };
+                let check = container(control)
+                    .padding(2)
+                    .style(move |_| container::Style {
+                        border: iced::Border {
+                            color: if focused {
+                                theme::NORD8
+                            } else {
+                                iced::Color::TRANSPARENT
+                            },
+                            width: 1.0,
+                            radius: 4.0.into(),
                         },
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    ..container::Style::default()
-                });
+                        ..container::Style::default()
+                    });
                 // Label + checkbox, then the description grouped tight beneath the label.
                 let field = column![
                     row![

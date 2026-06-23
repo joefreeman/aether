@@ -9,10 +9,10 @@ use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
 use super::session::{
-    buffer_info, label_for_path, min_pos, severity_label, strip_longest_root, AppSettingId,
-    AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState, HoverBlock,
-    HoverText, Mode, PasteKind, Pending, ProjectSettings, Prompt, ReloadTry, RepeatTarget, SaveTry,
-    SearchSnapshot, SearchState, Session, TextField,
+    buffer_info, label_for_path, min_pos, severity_label, step_font_size, strip_longest_root,
+    AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
+    HoverBlock, HoverText, Mode, PasteKind, Pending, ProjectSettings, Prompt, ReloadTry,
+    RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, TextField,
 };
 use super::transport::RpcError;
 use aether_protocol::buffer::{
@@ -3996,6 +3996,19 @@ impl Session {
             return Effects::none();
         }
 
+        // Left/Right step a value row (font size) without wrapping — a natural stepper. They're
+        // inert on a toggle row (Enter/Space flips those).
+        let left = code == KeyCode::Left || (mods.alt && code == KeyCode::Char('h'));
+        let right = code == KeyCode::Right || (mods.alt && code == KeyCode::Char('l'));
+        if left || right {
+            if let Some(AppSettingId::FontSize) =
+                self.app_setting_rows().get(selected).map(|r| r.id)
+            {
+                return self.set_font_size(step_font_size(self.font_size, right, false));
+            }
+            return Effects::none();
+        }
+
         if code == KeyCode::Enter || code == KeyCode::Char(' ') {
             return self.toggle_app_setting(selected);
         }
@@ -4026,6 +4039,10 @@ impl Session {
         // (native = text shaping, web = font feature), so adopting the value is enough — the
         // re-render after this event applies it. No reflow / round-trip like wrap needs.
         self.ligatures = settings.ligatures;
+        // Font size is likewise client-side: the GUI/web shells read `self.font_size` each render
+        // and re-measure their cell + reflow when it changes (the terminal ignores it). Adopting the
+        // value is enough — the re-render after this event applies it.
+        self.font_size = settings.font_size;
         if settings.wrap != self.wrap {
             let mut fx = Effects::one(Effect::SaveContentAnchor);
             fx.push(Effect::ShellAction(Action::ToggleWrap));
@@ -4056,6 +4073,7 @@ impl Session {
                     AppSettings {
                         wrap: new_wrap,
                         ligatures: self.ligatures,
+                        font_size: self.font_size,
                     },
                     Event::AppSettingsSaved,
                 );
@@ -4071,11 +4089,35 @@ impl Session {
                     AppSettings {
                         wrap: self.wrap,
                         ligatures: self.ligatures,
+                        font_size: self.font_size,
                     },
                     Event::AppSettingsSaved,
                 )
             }
+            // Font size: activating the row cycles to the next preset (wrapping). Like ligatures
+            // it's shell-render-only — set the value + persist, and the GUI/web re-render re-measures
+            // the cell and reflows. `step` lets the Left/Right keys pass a non-wrapping direction.
+            AppSettingId::FontSize => {
+                self.set_font_size(step_font_size(self.font_size, true, true))
+            }
         }
+    }
+
+    /// Persist a new editor font size + apply it (the GUI/web re-render reads `self.font_size`).
+    /// No-op when unchanged. Shared by the row's activate-cycle and the Left/Right stepper.
+    fn set_font_size(&mut self, font_size: u32) -> Effects {
+        if font_size == self.font_size {
+            return Effects::none();
+        }
+        self.font_size = font_size;
+        self.request_str::<SettingsSet>(
+            AppSettings {
+                wrap: self.wrap,
+                ligatures: self.ligatures,
+                font_size,
+            },
+            Event::AppSettingsSaved,
+        )
     }
 
     /// Keys in the search prompt. Text entry (insert / delete / caret) is owned by each shell's

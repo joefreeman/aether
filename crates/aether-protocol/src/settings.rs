@@ -24,6 +24,12 @@ pub struct AppSettings {
     /// font features. The server stores it but doesn't act on it.
     #[serde(default = "default_ligatures")]
     pub ligatures: bool,
+    /// Editor font size in px. Another client-side render choice the server only stores: the
+    /// GUI/web clients render the buffer at this size (and reflow soft-wrap to the new width); the
+    /// terminal client ignores it (the terminal owns its font). The overlay steps it through a small
+    /// set of preset sizes.
+    #[serde(default = "default_font_size")]
+    pub font_size: u32,
 }
 
 fn default_wrap() -> WrapMode {
@@ -34,11 +40,16 @@ fn default_ligatures() -> bool {
     true
 }
 
+pub const fn default_font_size() -> u32 {
+    14
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             wrap: default_wrap(),
             ligatures: default_ligatures(),
+            font_size: default_font_size(),
         }
     }
 }

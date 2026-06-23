@@ -39,8 +39,9 @@ const CONTINUATION_MARKER: &str = "↪ ";
 const EDITOR_FONT: Font = Font::with_name("Fira Code");
 
 /// Line height for buffer text — the web client's `14px/1.4`; the measured cell height (and
-/// therefore every row) includes this spacing.
-const EDITOR_LINE_HEIGHT: text::LineHeight = text::LineHeight::Relative(1.4);
+/// therefore every row) includes this spacing. Relative, so it scales with the font size.
+const LINE_HEIGHT_FACTOR: f32 = 1.4;
+const EDITOR_LINE_HEIGHT: text::LineHeight = text::LineHeight::Relative(LINE_HEIGHT_FACTOR);
 
 /// What the app gives the widget to draw — borrowed views of app state.
 pub struct Content<'a> {
@@ -62,6 +63,9 @@ pub struct Content<'a> {
     /// Coding ligatures on: code-text runs shape with [`text::Shaping::Advanced`] (forming `=>`,
     /// `!=`, … from the Fira Code font); off uses `Basic` (no ligatures, same metrics).
     pub ligatures: bool,
+    /// Editor font size in px (client-local zoom). Drives the cell measurement and glyph size; the
+    /// cell height is `font_size * LINE_HEIGHT_FACTOR`.
+    pub font_size: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +125,8 @@ pub fn editor<'a, Message: 'a>(
 #[derive(Default)]
 struct State {
     cell: Option<Size>,
+    /// The font size `cell` was measured at — re-measure when the zoom changes.
+    measured_font_size: Option<f32>,
     published: Option<(Size, Size)>,
     modifiers: keyboard::Modifiers,
     last_click: Option<mouse::Click>,
@@ -179,10 +185,13 @@ where
         let state = tree.state.downcast_mut::<State>();
         let bounds = layout.bounds();
 
-        // Measure the monospace cell once, then keep the app's idea of (cell, content size)
-        // fresh — this is what drives viewport subscribe/resize.
-        if state.cell.is_none() {
-            state.cell = Some(measure_cell(renderer));
+        // Measure the monospace cell (re-measuring when the zoom changed), then keep the app's idea
+        // of (cell, content size) fresh — this is what drives viewport subscribe/resize. A font-size
+        // change arrives as a fresh `Content` and a redraw; the changed cell republishes `Layout`,
+        // which the app turns into a `viewport/resize` so soft-wrap reflows.
+        if state.measured_font_size != Some(self.content.font_size) {
+            state.cell = Some(measure_cell(renderer, self.content.font_size));
+            state.measured_font_size = Some(self.content.font_size);
         }
         if let Some(cell) = state.cell {
             let current = (cell, bounds.size());
@@ -990,12 +999,17 @@ where
     }
 }
 
-fn measure_cell<Renderer: text::Renderer<Font = Font>>(renderer: &Renderer) -> Size {
+fn measure_cell<Renderer: text::Renderer<Font = Font>>(
+    // Only the `Renderer` type matters (for `Renderer::Paragraph`); the instance is unused now that
+    // the glyph size comes from `font_size` rather than the renderer's global default.
+    _renderer: &Renderer,
+    font_size: f32,
+) -> Size {
     use iced::advanced::text::Paragraph as _;
     let paragraph = Renderer::Paragraph::with_text(text::Text {
         content: "M",
         bounds: Size::INFINITE,
-        size: renderer.default_size(),
+        size: iced::Pixels(font_size),
         line_height: EDITOR_LINE_HEIGHT,
         font: EDITOR_FONT,
         align_x: text::Alignment::Left,
@@ -1134,7 +1148,10 @@ fn draw_text_run<Renderer: text::Renderer<Font = Font>>(
         text::Text {
             content,
             bounds: Size::new(f32::INFINITY, cell.height),
-            size: renderer.default_size(),
+            // The cell was measured at the editor font size with a relative line height, so
+            // `cell.height / LINE_HEIGHT_FACTOR` recovers that font size — glyphs track the zoom
+            // without threading the size through every draw call.
+            size: iced::Pixels(cell.height / LINE_HEIGHT_FACTOR),
             line_height: EDITOR_LINE_HEIGHT,
             font: EDITOR_FONT,
             align_x: text::Alignment::Left,

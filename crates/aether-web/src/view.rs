@@ -40,6 +40,7 @@ pub fn build_view(s: &Session) -> Value {
         "wrap": jv(&s.wrap),
         "diff_view": s.diff_view,
         "ligatures": s.ligatures,
+        "font_size": s.font_size,
         "diagnostics": jv(&s.diagnostics),
         "lsp": s.lsp.as_ref().map(jv),
         "externally_modified": s.externally_modified,
@@ -73,7 +74,14 @@ fn app_settings(s: &Session) -> Value {
                 "rows": g
                     .rows
                     .iter()
-                    .map(|r| json!({ "label": r.label, "value": r.value, "hint": r.hint }))
+                    .map(|r| {
+                        use aether_client::session::AppSettingControl as C;
+                        let control = match r.control {
+                            C::Toggle(v) => json!({ "kind": "toggle", "value": v }),
+                            C::Value(v) => json!({ "kind": "value", "value": v }),
+                        };
+                        json!({ "label": r.label, "control": control, "hint": r.hint })
+                    })
                     .collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
