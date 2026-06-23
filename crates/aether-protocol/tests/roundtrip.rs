@@ -1733,6 +1733,7 @@ fn picker_item_lsp_server_is_tagged() {
 fn picker_view_params_omit_center_on_when_none() {
     use aether_protocol::picker::{PickerKind, PickerViewParams};
     let p = PickerViewParams {
+        from_selection: false,
         kind: PickerKind::Files,
         reset: true,
         offset: 0,
@@ -1751,11 +1752,42 @@ fn picker_view_params_omit_center_on_when_none() {
     );
     assert_eq!(v["kind"], "files");
     assert_eq!(v["reset"], true);
+    assert!(
+        v.get("from_selection").is_none(),
+        "default from_selection is skipped on the wire"
+    );
 }
+
+#[test]
+fn picker_view_params_from_selection_serialized() {
+    use aether_protocol::picker::{PickerKind, PickerViewParams};
+    // `Space Alt-g`: grep-for-selection rides `from_selection` + the active buffer id.
+    let p = PickerViewParams {
+        from_selection: true,
+        kind: PickerKind::Grep,
+        reset: false,
+        offset: 0,
+        limit: 30,
+        center_on: None,
+        center_on_cursor: None,
+        directory_path: None,
+        buffer_id: Some(4),
+        explorer_roots: false,
+        filters: None,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["from_selection"], true);
+    assert_eq!(v["buffer_id"], 4);
+    let back: PickerViewParams = serde_json::from_value(v).unwrap();
+    assert!(back.from_selection);
+    assert_eq!(back.buffer_id, Some(4));
+}
+
 #[test]
 fn picker_view_params_center_on_serialized() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerViewParams};
     let p = PickerViewParams {
+        from_selection: false,
         kind: PickerKind::Files,
         reset: false,
         offset: 0,
@@ -2124,6 +2156,7 @@ fn picker_item_dir_entry_carries_git_status() {
 fn picker_view_params_directory_path_skipped_when_none() {
     use aether_protocol::picker::{PickerKind, PickerViewParams};
     let p = PickerViewParams {
+        from_selection: false,
         kind: PickerKind::Explorer,
         reset: false,
         offset: 0,
@@ -2146,6 +2179,7 @@ fn picker_view_params_directory_path_skipped_when_none() {
 fn picker_view_params_directory_path_serialized() {
     use aether_protocol::picker::{PickerKind, PickerViewParams};
     let p = PickerViewParams {
+        from_selection: false,
         kind: PickerKind::Explorer,
         reset: true,
         offset: 0,

@@ -208,6 +208,7 @@ impl WasmSession {
             aether_protocol::picker::PickerKind::Projects,
             None,
             None,
+            false,
         )))
     }
 

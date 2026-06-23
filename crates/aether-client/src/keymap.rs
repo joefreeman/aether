@@ -317,11 +317,13 @@ pub enum Action {
 
     // ---- pickers ----
     OpenPicker(PickerKind),
-    /// `Space Alt-f` / `Space Alt-g` — open Files / Grep pre-scoped to the active buffer's
-    /// directory, seeded as an ordinary directory filter chip (editable, composable, removable).
-    /// The buffer-locked changes/diagnostics *modes* use a dedicated kind instead (see
-    /// [`PickerKind::GitChangesFile`]).
-    OpenPickerInBufferDir(PickerKind),
+    /// `Space Alt-f` — open Files pre-scoped to the active buffer's directory, seeded as an
+    /// ordinary directory filter chip (editable, composable, removable). The buffer-locked
+    /// changes/diagnostics *modes* use a dedicated kind instead (see [`PickerKind::GitChangesFile`]).
+    OpenFilesInBufferDir,
+    /// `Space Alt-g` — open Grep with the query seeded from the buffer's selection (the grep
+    /// equivalent of `Alt-/`). Sticky filters/options carry over; an empty selection just opens grep.
+    OpenGrepFromSelection,
     /// `Space Alt-e` — Explorer at the buffer's project root rather than its directory.
     OpenExplorerAtRoot,
 
@@ -746,11 +748,11 @@ static SEARCH: &[Binding] = &[
 #[rustfmt::skip]
 static LEADER: &[Binding] = &[
     bind!(L, ch('f'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Files), "Files", "Find files"),
-    bind!(L, ch('f'), Exact(Mods::ALT), A::OpenPickerInBufferDir(PickerKind::Files), "Files", "Find files in buffer's directory"),
+    bind!(L, ch('f'), Exact(Mods::ALT), A::OpenFilesInBufferDir, "Files", "Find files in buffer's directory"),
     bind!(L, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Buffers), "Files", "Switch buffer"),
     bind!(L, ch('b'), Exact(Mods::ALT), A::NewScratch, "Files", "New scratch buffer"),
     bind!(L, ch('g'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Grep), "Files", "Grep workspace"),
-    bind!(L, ch('g'), Exact(Mods::ALT), A::OpenPickerInBufferDir(PickerKind::Grep), "Files", "Grep buffer's directory"),
+    bind!(L, ch('g'), Exact(Mods::ALT), A::OpenGrepFromSelection, "Files", "Grep for selection"),
     bind!(L, ch('e'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Explorer), "Files", "File explorer"),
     bind!(L, ch('e'), Exact(Mods::ALT), A::OpenExplorerAtRoot, "Files", "File explorer at project root"),
     bind!(L, ch('p'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Projects), "Project", "Switch project"),

@@ -1301,7 +1301,9 @@ impl Shell {
     fn reconnect_to_chooser(&mut self) {
         use aether_protocol::picker::PickerKind;
         self.session = Session::placeholder(); // conn = Connected, so notifications resume
-        let startup = self.session.open_picker(PickerKind::Projects, None, None);
+        let startup = self
+            .session
+            .open_picker(PickerKind::Projects, None, None, false);
         self.run_effects(startup);
         self.status(StatusMessage::error(
             "project no longer exists — pick another".to_string(),
@@ -2053,7 +2055,7 @@ pub async fn bootstrap(
     let (mut session, project_name, project_paths, startup) = match project {
         None => {
             let mut session = Session::placeholder();
-            let startup = session.open_picker(PickerKind::Projects, None, None);
+            let startup = session.open_picker(PickerKind::Projects, None, None, false);
             (session, String::new(), Vec::new(), startup)
         }
         Some(project) => {
@@ -2109,9 +2111,12 @@ pub async fn bootstrap(
                 buffer_info(open, &project_paths),
             );
             let startup = match &resolved {
-                Some(abs) if abs.is_dir() => {
-                    session.open_picker(PickerKind::Explorer, Some(abs.display().to_string()), None)
-                }
+                Some(abs) if abs.is_dir() => session.open_picker(
+                    PickerKind::Explorer,
+                    Some(abs.display().to_string()),
+                    None,
+                    false,
+                ),
                 _ => Effects::none(),
             };
             (session, activated.project.name, project_paths, startup)

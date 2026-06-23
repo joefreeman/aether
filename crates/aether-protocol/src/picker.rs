@@ -744,8 +744,16 @@ pub struct PickerViewParams {
     pub explorer_roots: bool,
     /// Diagnostics only: the buffer to list diagnostics for. Required when opening the Diagnostics
     /// picker (`reset: true`); `None` on resume/scroll re-views (the candidate snapshot is kept).
+    /// Also carries the active buffer for [`PickerViewParams::from_selection`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_id: Option<BufferId>,
+    /// Grep only (`Space Alt-g`): derive the initial query from `buffer_id`'s selection — the
+    /// grep equivalent of `Alt-/`. The server slices the selection text, installs it as the
+    /// query (literally, like the rest of grep), and kicks off the search in this same call;
+    /// the derived query and its `generation` come back in the result for the client to adopt.
+    /// Requires `buffer_id`; ignored for other kinds and when the selection is empty.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub from_selection: bool,
     /// Replace the persisted filters before attaching. `None` keeps whatever the prior
     /// `view`/`query`/`hide` cycle left behind (the default, no-op filters on first open or
     /// after `reset`). `Some` is how a client opens a picker pre-scoped (e.g. `Space Alt-f` /

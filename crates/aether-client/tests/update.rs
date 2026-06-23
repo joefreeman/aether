@@ -659,7 +659,7 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams, PickerViewResult};
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Grep, None, None);
+    let _ = s.open_picker(PickerKind::Grep, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.generation = 5;
@@ -726,7 +726,7 @@ fn grep_count_only_ticks_keep_the_window_then_the_first_batch_replaces_it() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Grep, None, None);
+    let _ = s.open_picker(PickerKind::Grep, None, None, false);
     let hit = |path: &str, line: u32| PickerItem::GrepHit {
         path_index: 0,
         relative_path: path.into(),
@@ -799,7 +799,7 @@ fn picker_query_change_keeps_stale_window_until_the_new_push_lands() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Files, None, None);
+    let _ = s.open_picker(PickerKind::Files, None, None, false);
     let file = |name: &str| PickerItem::File {
         path_index: 0,
         relative_path: name.into(),
@@ -859,7 +859,7 @@ fn chip_editor_is_value_synced_not_keycode_edited() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Grep, None, None);
+    let _ = s.open_picker(PickerKind::Grep, None, None, false);
     // Alt-g opens the glob filter editor (a chip-editor line).
     let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
     let glob_open = |s: &Session| -> String {
@@ -895,7 +895,7 @@ fn picker_query_is_value_synced_and_chip_row_gestures_work() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Grep, None, None);
+    let _ = s.open_picker(PickerKind::Grep, None, None, false);
     // The shell's input owns query typing and syncs the value; the core re-filters on it.
     let fx = s.picker_set_query("foo".into());
     assert_eq!(s.picker.as_ref().unwrap().query, "foo");
@@ -932,7 +932,7 @@ fn lsp_picker_centers_on_the_current_buffers_server() {
         language: "rust".into(),
         workspace_root: "/p".into(),
     });
-    let fx = s.open_picker(PickerKind::LspServers, None, None);
+    let fx = s.open_picker(PickerKind::LspServers, None, None, false);
     let params = find_request(&fx, "picker/view").expect("LSP picker opens via picker/view");
     // The view is anchored on the active buffer's own server (matched by language + workspace).
     assert_eq!(params["center_on"]["kind"], "lsp_server");
@@ -947,7 +947,7 @@ fn closing_the_lsp_dialog_returns_to_the_picker() {
     use aether_protocol::picker::{PickerItem, PickerKind};
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::LspServers, None, None);
+    let _ = s.open_picker(PickerKind::LspServers, None, None, false);
     {
         let p = s.picker.as_mut().expect("picker open");
         p.items = vec![PickerItem::LspServer {
@@ -998,7 +998,7 @@ fn lsp_dialog_working_field_tracks_live_picker_progress() {
 
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::LspServers, None, None);
+    let _ = s.open_picker(PickerKind::LspServers, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.items = vec![server(0)];
@@ -1144,7 +1144,7 @@ fn glob_editor_live_previews_results_and_reverts_on_cancel() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Files, None, None);
+    let _ = s.open_picker(PickerKind::Files, None, None, false);
     // Open the glob editor — no chip committed yet, so nothing narrows.
     let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
     // Typing a glob folds the would-commit value into the live filters → a re-query carrying it,
@@ -1169,7 +1169,7 @@ fn degenerate_glob_preview_does_not_requery() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Files, None, None);
+    let _ = s.open_picker(PickerKind::Files, None, None, false);
     let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
     // "*" normalizes away (match-everything) → the effective set is unchanged → no wasted
     // re-query (and no blank-and-refetch flash).
@@ -1187,7 +1187,7 @@ fn dir_editor_holds_while_listing_pending_then_previews_on_load() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Files, None, None);
+    let _ = s.open_picker(PickerKind::Files, None, None, false);
     // Alt-p opens the path-scope editor and fires a directory/list for the root.
     let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
     // Type a leaf before the listing lands: the path's validity is unknown, so results are
@@ -1234,7 +1234,7 @@ fn invalid_dir_path_preview_contributes_nothing() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Files, None, None);
+    let _ = s.open_picker(PickerKind::Files, None, None, false);
     let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
     let _ = s.chip_editor_set_input("zzz".into());
     // The listing lands with no directory the leaf prefixes → the path is invalid → the preview
@@ -1265,7 +1265,7 @@ fn space_alt_c_opens_the_buffer_locked_changes_picker() {
     s.buffer.path = Some("/p/src/main.rs".into());
     // `Space Alt-c`: the modal file-changes picker — its own kind, locked to the active buffer via
     // `buffer_id` (intrinsic, like Diagnostics), not a filter chip.
-    let fx = s.open_picker(PickerKind::GitChangesFile, None, None);
+    let fx = s.open_picker(PickerKind::GitChangesFile, None, None, false);
     let params = find_request(&fx, "picker/view").expect("opens the picker");
     assert_eq!(params["kind"], json!("git_changes_file"));
     assert_eq!(
@@ -1280,15 +1280,14 @@ fn space_alt_c_opens_the_buffer_locked_changes_picker() {
 }
 
 #[test]
-fn space_alt_g_seeds_a_removable_directory_chip() {
-    use aether_protocol::picker::PickerKind;
+fn space_alt_f_seeds_a_removable_directory_chip() {
     let mut s = session();
     s.project_paths = vec!["/p".into()];
     s.buffer.path = Some("/p/src/main.rs".into());
-    // `Space Alt-g`: Grep pre-scoped to the buffer's directory as an ordinary, composable dir chip.
-    let fx = s.open_picker_in_buffer_dir(PickerKind::Grep);
+    // `Space Alt-f`: Files pre-scoped to the buffer's directory as an ordinary, composable dir chip.
+    let fx = s.open_files_in_buffer_dir();
     let params = find_request(&fx, "picker/view").expect("opens the picker");
-    assert_eq!(params["kind"], json!("grep"));
+    assert_eq!(params["kind"], json!("files"));
     assert_eq!(
         params["filters"]["directories"],
         json!([{"path_index": 0, "relative_path": "src"}]),
@@ -1297,17 +1296,44 @@ fn space_alt_g_seeds_a_removable_directory_chip() {
 }
 
 #[test]
-fn space_alt_g_unscoped_for_scratch_buffer() {
-    use aether_protocol::picker::PickerKind;
+fn space_alt_f_unscoped_for_scratch_buffer() {
     let mut s = session();
     s.project_paths = vec!["/p".into()];
     s.buffer.path = None; // scratch buffer — no directory to scope to
-    let fx = s.open_picker_in_buffer_dir(PickerKind::Grep);
+    let fx = s.open_files_in_buffer_dir();
     let params = find_request(&fx, "picker/view").expect("opens the picker");
     assert!(
         params["filters"].is_null(),
         "a scratch buffer opens the whole workspace"
     );
+}
+
+#[test]
+fn space_alt_g_opens_grep_from_selection() {
+    // `Space Alt-g`: open Grep asking the server to seed the query from the buffer's selection.
+    // The client carries no selection text — it just sets `from_selection` + the buffer id and
+    // lets the server slice + search (the query/generation ride back via the `PickerViewed` echo).
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+    s.buffer.path = Some("/p/src/main.rs".into());
+    let fx = s.open_grep_from_selection();
+    let params = find_request(&fx, "picker/view").expect("opens the picker");
+    assert_eq!(params["kind"], json!("grep"));
+    assert_eq!(params["from_selection"], json!(true));
+    assert_eq!(
+        params["buffer_id"],
+        json!(s.buffer.buffer_id),
+        "the active buffer rides along so the server can slice its selection"
+    );
+    assert!(
+        params["filters"].is_null(),
+        "no dir scope — grep-for-selection is workspace-wide, sticky filters aside"
+    );
+    // Not a cursor-centred resume: a fresh search has no cached hits to land on.
+    assert!(params
+        .get("center_on_cursor")
+        .map(|v| v.is_null())
+        .unwrap_or(true));
 }
 
 #[test]
@@ -1599,7 +1625,7 @@ fn picker_view_response_renders_items_without_the_push() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams, PickerViewResult};
 
     let mut s = session();
-    let _ = s.open_picker(PickerKind::Grep, None, None);
+    let _ = s.open_picker(PickerKind::Grep, None, None, false);
     assert!(
         s.picker.is_some(),
         "open_picker creates the local picker state"
@@ -1659,14 +1685,14 @@ fn grep_open_does_not_reset_scroll_but_fresh_pickers_do() {
     use aether_protocol::picker::PickerKind;
 
     let mut s = session();
-    let fx = s.open_picker(PickerKind::Grep, None, None);
+    let fx = s.open_picker(PickerKind::Grep, None, None, false);
     assert!(
         !fx.0.iter().any(|e| matches!(e, Effect::PickerScrollReset)),
         "grep (state-preserving) open must not reset the scroll — it resumes onto its selection"
     );
 
     let mut s = session();
-    let fx = s.open_picker(PickerKind::Files, None, None);
+    let fx = s.open_picker(PickerKind::Files, None, None, false);
     assert!(
         fx.0.iter().any(|e| matches!(e, Effect::PickerScrollReset)),
         "a fresh Files picker resets the scroll to the top on open"
@@ -1771,7 +1797,7 @@ fn explorer_tab_applies_common_prefix_completion() {
     use aether_protocol::picker::{PickerItem, PickerKind};
 
     let mut s = session();
-    let _ = s.open_picker(PickerKind::Explorer, None, None);
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.directory = Some("/proj".into());
@@ -1807,7 +1833,7 @@ fn explorer_alt_backspace_unwinds_breadcrumb_before_chips() {
     use aether_protocol::picker::PickerKind;
 
     let mut s = session();
-    let _ = s.open_picker(PickerKind::Explorer, None, None);
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.directory = Some("/proj/src/sub".into());
@@ -1847,7 +1873,7 @@ fn git_changes_opens_without_reset_to_resume_query_and_filters() {
     // GitChanges preserves its query + filters server-side across opens (like Grep), so the client
     // opens it with `reset: false` — the server keeps the prior state and re-snapshots candidates.
     let mut s = session();
-    let fx = s.open_picker(PickerKind::GitChanges, None, None);
+    let fx = s.open_picker(PickerKind::GitChanges, None, None, false);
     let view = find_request(&fx, "picker/view").expect("opens via picker/view");
     assert_eq!(view["kind"], json!("git_changes"));
     assert_eq!(
@@ -1863,7 +1889,7 @@ fn explorer_delete_confirms_then_trashes_and_relists() {
     use aether_protocol::picker::{PickerItem, PickerKind};
 
     let mut s = session();
-    let _ = s.open_picker(PickerKind::Explorer, None, None);
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.directory = Some("/proj/src".into());
@@ -1925,7 +1951,7 @@ fn projects_delete_confirms_then_deletes_and_guards_active() {
 
     let mut s = session();
     s.project = "current".into();
-    let _ = s.open_picker(PickerKind::Projects, None, None);
+    let _ = s.open_picker(PickerKind::Projects, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.items = vec![
@@ -2021,7 +2047,7 @@ fn buffers_picker_ctrl_d_closes_in_place() {
 
     let mut s = session();
     // The active editor buffer is id 0 (placeholder default).
-    let _ = s.open_picker(PickerKind::Buffers, None, None);
+    let _ = s.open_picker(PickerKind::Buffers, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.items = vec![
@@ -2089,7 +2115,7 @@ fn explorer_create_makes_a_file_with_create_if_missing() {
 
     let mut s = session();
     s.project_paths = vec!["/proj".into()];
-    let _ = s.open_picker(PickerKind::Explorer, None, None);
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.directory = Some("/proj/src".into());
@@ -2108,7 +2134,7 @@ fn explorer_create_with_trailing_slash_makes_a_directory() {
 
     let mut s = session();
     s.project_paths = vec!["/proj".into()];
-    let _ = s.open_picker(PickerKind::Explorer, None, None);
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.directory = Some("/proj/src".into());
@@ -2132,7 +2158,7 @@ fn selecting_the_create_row_creates_the_file() {
 
     let mut s = session();
     s.project_paths = vec!["/proj".into()];
-    let _ = s.open_picker(PickerKind::Explorer, None, None);
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.directory = Some("/proj/src".into());
@@ -2548,7 +2574,7 @@ fn project_create_row_appears_for_a_novel_name_in_the_projects_picker() {
 
     let mut s = session();
     s.project = "aether".into();
-    let _ = s.open_picker(PickerKind::Projects, None, None);
+    let _ = s.open_picker(PickerKind::Projects, None, None, false);
     let p = s.picker.as_mut().unwrap();
     p.apply_update(PickerUpdateParams {
         kind: PickerKind::Projects,
@@ -2585,7 +2611,7 @@ fn accepting_the_projects_create_row_emits_project_create() {
 
     let mut s = session();
     s.project = "aether".into();
-    let _ = s.open_picker(PickerKind::Projects, None, None);
+    let _ = s.open_picker(PickerKind::Projects, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.apply_update(PickerUpdateParams {
@@ -2847,7 +2873,7 @@ fn document_symbols_opens_scoped_to_buffer_with_no_filters() {
     s.project_paths = vec!["/p".into()];
     // The symbols picker opens unfiltered (the full hierarchy, indented by depth — no top-level
     // collapse) and scoped to the active buffer so the server can resolve symbols + the cursor.
-    let fx = s.open_picker(PickerKind::DocumentSymbols, None, None);
+    let fx = s.open_picker(PickerKind::DocumentSymbols, None, None, false);
     let params = find_request(&fx, "picker/view").expect("symbols picker opens via picker/view");
     assert!(
         params.get("filters").is_none(),
@@ -2865,7 +2891,7 @@ fn symbol_push_center_on_lands_the_highlight() {
     };
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::DocumentSymbols, None, None);
+    let _ = s.open_picker(PickerKind::DocumentSymbols, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.generation = 0;
@@ -2920,7 +2946,7 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
     };
     let mut s = session();
     s.project_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::DocumentSymbols, None, None);
+    let _ = s.open_picker(PickerKind::DocumentSymbols, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.generation = 0;

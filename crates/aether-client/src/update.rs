@@ -854,6 +854,7 @@ impl Session {
                         directory_path: None,
                         explorer_roots: false,
                         buffer_id: None,
+                        from_selection: false,
                         filters: None,
                     },
                     move |__r| Event::PickerViewed {
@@ -877,7 +878,7 @@ impl Session {
                             // resetting where the user was filtering.
                             fx = fx.and(self.picker_query_changed());
                         } else if kind == PickerKind::Files {
-                            fx = fx.and(self.open_picker(PickerKind::Files, None, None));
+                            fx = fx.and(self.open_picker(PickerKind::Files, None, None, false));
                         }
                     }
                     fx
@@ -1549,12 +1550,16 @@ impl Session {
     /// its prior query/hits (centred on the cursor's nearest hit); the rest reset.
     /// `directory_path` seeds the Explorer's listing (its `Space e` = the buffer's directory).
     /// `seed_filters` replaces the server's persisted set (Explorer→Grep/Files switches,
-    /// `Space Alt-f/g`); the echo through `PickerViewed` rebuilds the chip row.
+    /// `Space Alt-f`); the echo through `PickerViewed` rebuilds the chip row.
+    /// `from_selection` (Grep, `Space Alt-g`) tells the server to seed the query from the buffer's
+    /// selection and run the search in this same call — the derived query/generation ride the
+    /// `PickerViewed` echo, so there's no separate `picker/query` to send.
     pub fn open_picker(
         &mut self,
         kind: PickerKind,
         directory_path: Option<String>,
         seed_filters: Option<PickerFilters>,
+        from_selection: bool,
     ) -> Effects {
         let reset = !kind.preserves_state();
         self.picker = Some(PickerState::new(kind));
@@ -1612,17 +1617,22 @@ impl Session {
                 offset: 0,
                 limit: FETCH_LIMIT,
                 center_on,
-                center_on_cursor: kind.centers_on_cursor().then_some(buffer_id),
+                // A from-selection grep runs a brand-new search; there are no cached hits to land
+                // the cursor on, so skip cursor-centering for it.
+                center_on_cursor: (!from_selection && kind.centers_on_cursor())
+                    .then_some(buffer_id),
                 directory_path,
                 explorer_roots: false,
-                buffer_id: matches!(
-                    kind,
-                    PickerKind::Diagnostics
-                        | PickerKind::References
-                        | PickerKind::DocumentSymbols
-                        | PickerKind::GitChangesFile
-                )
+                buffer_id: (from_selection
+                    || matches!(
+                        kind,
+                        PickerKind::Diagnostics
+                            | PickerKind::References
+                            | PickerKind::DocumentSymbols
+                            | PickerKind::GitChangesFile
+                    ))
                 .then_some(buffer_id),
+                from_selection,
                 filters: seed_filters,
             },
             move |__r| Event::PickerViewed {
@@ -1640,10 +1650,11 @@ impl Session {
         }
     }
 
-    /// `Space Alt-f` / `Space Alt-g`: open Files / Grep pre-scoped to the active buffer's
-    /// directory — a normal dir filter chip, visible/editable/removable, composable with globs.
-    /// Falls back to an unscoped open for scratch buffers or files outside every root.
-    pub fn open_picker_in_buffer_dir(&mut self, kind: PickerKind) -> Effects {
+    /// `Space Alt-f`: open Files pre-scoped to the active buffer's directory — a normal dir filter
+    /// chip, visible/editable/removable, composable with globs. Falls back to an unscoped open for
+    /// scratch buffers or files outside every root. (Grep's `Space Alt-g` is the unrelated
+    /// [`Session::open_grep_from_selection`].)
+    pub fn open_files_in_buffer_dir(&mut self) -> Effects {
         let seed = self
             .buffer
             .path
@@ -1659,7 +1670,16 @@ impl Session {
                 }],
                 ..PickerFilters::default()
             });
-        self.open_picker(kind, None, seed)
+        self.open_picker(PickerKind::Files, None, seed, false)
+    }
+
+    /// `Space Alt-g`: open Grep with the query seeded from the buffer's selection — the grep
+    /// equivalent of `Alt-/`. The server slices the selection, installs it as a literal query, and
+    /// runs the search in the same `picker/view`; the derived query/generation ride back through
+    /// the `PickerViewed` echo (so there's no follow-up `picker/query`). Sticky filters/options are
+    /// preserved. An empty selection just opens grep with no query.
+    pub fn open_grep_from_selection(&mut self) -> Effects {
+        self.open_picker(PickerKind::Grep, None, None, true)
     }
 
     /// `Ctrl-g` / `Ctrl-f` in the Explorer: switch to the Grep / Files picker scoped to the
@@ -1683,7 +1703,7 @@ impl Session {
             });
         let seeded = seeded_filters_for_switch(&p.wire_filters(), dir_scope, target);
         let hide = self.close_picker();
-        hide.and(self.open_picker(target, None, Some(seeded)))
+        hide.and(self.open_picker(target, None, Some(seeded), false))
     }
 
     /// `Space e` / `Space Alt-e`: Explorer at the buffer's directory, or at its project root.
@@ -1699,7 +1719,7 @@ impl Session {
                     .map(|p| p.display().to_string())
             }
         });
-        self.open_picker(PickerKind::Explorer, dir, None)
+        self.open_picker(PickerKind::Explorer, dir, None, false)
     }
 
     /// Explorer navigation: list a different directory (or the project roots). Clears the
@@ -1754,6 +1774,7 @@ impl Session {
                 directory_path,
                 explorer_roots: roots,
                 buffer_id: None,
+                from_selection: false,
                 filters: Some(filters),
             },
             move |__r| Event::PickerViewed {
@@ -1819,6 +1840,7 @@ impl Session {
                 directory_path: None,
                 explorer_roots: false,
                 buffer_id: None,
+                from_selection: false,
                 filters: None,
             },
             move |__r| Event::PickerViewed {
@@ -2141,6 +2163,7 @@ impl Session {
                         directory_path: None,
                         explorer_roots: false,
                         buffer_id: None,
+                        from_selection: false,
                         filters: Some(filters),
                     },
                     move |__r| Event::PickerViewed {
@@ -4942,8 +4965,9 @@ impl Session {
 
             // ---- pickers ----
             A::OpenPicker(PickerKind::Explorer) => self.open_explorer(false),
-            A::OpenPicker(kind) => self.open_picker(kind, None, None),
-            A::OpenPickerInBufferDir(kind) => self.open_picker_in_buffer_dir(kind),
+            A::OpenPicker(kind) => self.open_picker(kind, None, None, false),
+            A::OpenFilesInBufferDir => self.open_files_in_buffer_dir(),
+            A::OpenGrepFromSelection => self.open_grep_from_selection(),
             A::OpenExplorerAtRoot => self.open_explorer(true),
 
             // ---- LSP ----

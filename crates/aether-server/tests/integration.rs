@@ -8937,6 +8937,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: true,
@@ -9005,6 +9006,7 @@ async fn picker_query_restarts_the_window_at_the_top() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: true,
@@ -9074,6 +9076,7 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::GitChanges,
             reset: true,
@@ -9173,6 +9176,7 @@ async fn git_changes_picker_collapses_untracked_directories() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::GitChanges,
             reset: true,
@@ -9245,6 +9249,7 @@ async fn git_changes_picker_hide_untracked() {
             ws,
             id,
             &PickerViewParams {
+                from_selection: false,
                 filters,
                 kind: PickerKind::GitChanges,
                 reset: true,
@@ -9330,6 +9335,7 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
         &mut ws,
         5,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::GitChanges,
             reset: true,
@@ -9413,6 +9419,7 @@ async fn git_changes_file_is_locked_to_its_buffer() {
     .await;
 
     let view_params = |kind, buffer_id| PickerViewParams {
+        from_selection: false,
         filters: None,
         kind,
         reset: true,
@@ -9489,6 +9496,7 @@ async fn git_changes_picker_centers_on_the_cursor_hunk() {
         &mut ws,
         4,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::GitChanges,
             reset: true,
@@ -9541,6 +9549,7 @@ async fn git_changes_picker_query_greps_diff_content() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::GitChanges,
             reset: true,
@@ -9629,6 +9638,7 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::GitChanges,
             reset: true,
@@ -9707,6 +9717,7 @@ async fn git_changes_picker_persists_query_across_reopen() {
 
     // Open (fresh), search "marker", then hide.
     let open = |id| PickerViewParams {
+        from_selection: false,
         filters: None,
         kind: PickerKind::GitChanges,
         reset: id == 0, // first open resets; the reopen below resumes
@@ -9794,6 +9805,7 @@ async fn git_changes_picker_query_is_a_regex() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::GitChanges,
             reset: true,
@@ -9880,6 +9892,7 @@ async fn git_changes_picker_filters_by_directory() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: Some(PickerFilters {
                 directories: vec![ScopedPath {
                     path_index: 0,
@@ -9965,6 +9978,7 @@ async fn git_changes_picker_filters_by_exact_file() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: Some(PickerFilters {
                 directories: vec![ScopedPath {
                     path_index: 0,
@@ -10012,6 +10026,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: true,
@@ -10069,6 +10084,7 @@ async fn picker_select_returns_absolute_path() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: true,
@@ -10136,6 +10152,7 @@ async fn picker_resume_centers_on_remembered_item() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: true,
@@ -10177,6 +10194,7 @@ async fn picker_resume_centers_on_remembered_item() {
         &mut ws,
         13,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: false,
@@ -10214,6 +10232,7 @@ async fn picker_reset_wipes_persisted_query() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: true,
@@ -10254,6 +10273,7 @@ async fn picker_reset_wipes_persisted_query() {
         &mut ws,
         13,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: true,
@@ -10359,6 +10379,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Buffers,
             reset: true,
@@ -10438,6 +10459,7 @@ async fn buffers_picker_select_returns_buffer_id() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Buffers,
             reset: true,
@@ -10556,6 +10578,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Buffers,
             reset: true,
@@ -10679,6 +10702,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
         &mut ws,
         4,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Buffers,
             reset: true,
@@ -10776,6 +10800,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
         &mut ws,
         4,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Buffers,
             reset: true,
@@ -10889,6 +10914,7 @@ async fn buffers_picker_pushes_on_save() {
         &mut ws,
         5,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Buffers,
             reset: true,
@@ -10970,6 +10996,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Buffers,
             reset: true,
@@ -11064,6 +11091,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
         &mut ws_b,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Buffers,
             reset: true,
@@ -12563,6 +12591,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -12631,6 +12660,133 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
     drop(server);
 }
 
+/// `Space Alt-g`: `picker/view { from_selection }` slices the buffer's selection into a literal
+/// grep query and runs the search in the same call — the query rides back in the response and the
+/// hits stream in, with no separate `picker/query`.
+#[tokio::test]
+async fn picker_grep_from_selection_seeds_query_and_searches() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    // Open src/main.rs and select "needle" on line 1 (`    needle();`, cols 4..=9).
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("src/main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 9 },
+            anchor: LogicalPosition { line: 1, col: 4 },
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        4,
+        &PickerViewParams {
+            from_selection: true,
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: false,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: Some(buffer_id),
+            explorer_roots: false,
+        },
+    )
+    .await;
+    assert_eq!(view.query, "needle", "query is seeded from the selection");
+
+    // The search ran from the view call — no `picker/query` needed. Drain to completion.
+    let final_update = drain_grep_until_done(&mut ws).await;
+    assert_eq!(
+        final_update.generation, view.generation,
+        "tagged with the echoed generation"
+    );
+    assert_eq!(final_update.total_matches, 3, "2 in main.rs + 1 in lib.rs");
+
+    drop(server);
+}
+
+/// A from-selection grep on an empty selection (point cursor on a blank line) seeds no query and
+/// spawns no search — grep just opens unseeded.
+#[tokio::test]
+async fn picker_grep_from_selection_empty_is_unseeded() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    // README.md ends with a newline; opening it and sitting on the trailing empty line gives a
+    // point cursor over an empty slice.
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("README.md".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: LogicalPosition { line: 1, col: 0 },
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        4,
+        &PickerViewParams {
+            from_selection: true,
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: false,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: Some(buffer_id),
+            explorer_roots: false,
+        },
+    )
+    .await;
+    assert_eq!(view.query, "", "empty selection leaves grep unseeded");
+    // The initial push is the open snapshot, not a search tick.
+    let push = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert!(!push.ticking, "no search spawned for an empty selection");
+
+    drop(server);
+}
+
 /// A grep query's initial push is a count-only tick (`items: None`), not an empty window. That
 /// keeps the previous query's results on screen while the new search spawns, so typing doesn't
 /// flash the list empty every keystroke. The streaming batches + completion push (always
@@ -12642,6 +12798,7 @@ async fn picker_grep_query_initial_push_keeps_the_window() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -12704,6 +12861,7 @@ async fn picker_grep_short_query_yields_empty_result() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -12750,6 +12908,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -12794,6 +12953,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
         &mut ws,
         13,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: false,
@@ -12826,6 +12986,7 @@ async fn picker_grep_treats_query_as_regex() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -12875,6 +13036,7 @@ async fn picker_grep_caches_completed_query() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -12967,6 +13129,7 @@ async fn setup_grep_with_needle_query() -> (
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -13297,6 +13460,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
         &mut ws,
         22,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: false,
@@ -13326,6 +13490,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
         &mut ws,
         24,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: false,
@@ -13521,6 +13686,7 @@ async fn picker_explorer_default_lists_project_root() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -13571,6 +13737,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -13615,6 +13782,7 @@ async fn picker_explorer_query_filters_by_prefix() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -13677,6 +13845,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -13746,6 +13915,7 @@ async fn setup_peek_workspace() -> (
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -13961,6 +14131,7 @@ async fn picker_explorer_peek_survives_refetch_and_keeps_anchor() {
         &mut ws,
         4,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: false,
@@ -14003,6 +14174,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -14067,6 +14239,7 @@ async fn picker_explorer_query_is_smartcase() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -14132,6 +14305,7 @@ async fn picker_explorer_select_file_returns_absolute_path() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -14182,6 +14356,7 @@ async fn picker_explorer_select_directory_errors() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -14227,6 +14402,7 @@ async fn picker_explorer_rejects_path_outside_project() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -14440,6 +14616,7 @@ async fn picker_explorer_resumes_last_directory() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -14468,6 +14645,7 @@ async fn picker_explorer_resumes_last_directory() {
         &mut ws,
         12,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: false,
@@ -14555,6 +14733,7 @@ async fn picker_explorer_tags_entries_with_git_status() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -14610,6 +14789,7 @@ async fn picker_files_tags_entries_with_git_status() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: true,
@@ -14673,6 +14853,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -18160,6 +18341,7 @@ async fn references_picker_lists_all_uses() {
                 &mut ws,
                 id,
                 &PickerViewParams {
+                    from_selection: false,
                     filters: None,
                     kind: PickerKind::References,
                     reset: true,
@@ -18447,6 +18629,7 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
         &mut ws,
         20,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Diagnostics,
             reset: true,
@@ -19079,6 +19262,7 @@ async fn setup_grep_filter_workspace() -> (
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -19315,6 +19499,7 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -19395,6 +19580,7 @@ async fn grep_flood_does_not_deadlock_request_dispatch() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -19577,6 +19763,7 @@ async fn grep_filters_persist_across_hide_and_reset_wipes() {
         &mut ws,
         12,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: false,
@@ -19599,6 +19786,7 @@ async fn grep_filters_persist_across_hide_and_reset_wipes() {
         &mut ws,
         13,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -19637,6 +19825,7 @@ async fn grep_view_with_filters_replaces_and_drops_stale_hits() {
         &mut ws,
         11,
         &PickerViewParams {
+            from_selection: false,
             filters: Some(scoped.clone()),
             kind: PickerKind::Grep,
             reset: false,
@@ -19693,6 +19882,7 @@ async fn grep_filter_root_scope() {
         &mut ws,
         2,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Grep,
             reset: true,
@@ -19794,6 +19984,7 @@ async fn files_picker_filters_narrow_candidates() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Files,
             reset: true,
@@ -19944,6 +20135,7 @@ async fn explorer_filters_hide_and_changed_only() {
             ws,
             id,
             &PickerViewParams {
+                from_selection: false,
                 filters,
                 kind: PickerKind::Explorer,
                 reset: false,
@@ -20017,6 +20209,7 @@ async fn explorer_filters_hide_and_changed_only() {
         &mut ws,
         15,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Explorer,
             reset: true,
@@ -20554,6 +20747,7 @@ async fn buffers_picker_reports_transient_flag() {
         &mut ws,
         10,
         &PickerViewParams {
+            from_selection: false,
             filters: None,
             kind: PickerKind::Buffers,
             reset: true,

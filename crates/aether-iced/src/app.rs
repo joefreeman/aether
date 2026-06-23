@@ -474,6 +474,7 @@ impl App {
                     async move {
                         handle
                             .rpc::<PickerView>(PickerViewParams {
+                                from_selection: false,
                                 kind: PickerKind::Projects,
                                 reset: true,
                                 offset: 0,
@@ -761,6 +762,7 @@ impl App {
                     async move {
                         handle
                             .rpc::<PickerView>(PickerViewParams {
+                                from_selection: false,
                                 kind: PickerKind::Projects,
                                 reset: true,
                                 offset: 0,
@@ -1038,6 +1040,7 @@ impl App {
         boot.picker.items.clear();
         self.boot_rpc::<PickerView>(
             PickerViewParams {
+                from_selection: false,
                 kind: PickerKind::Projects,
                 reset: false,
                 offset,
@@ -1113,6 +1116,7 @@ impl App {
             async move {
                 handle
                     .rpc::<PickerView>(PickerViewParams {
+                        from_selection: false,
                         kind: PickerKind::Projects,
                         reset: true,
                         offset: 0,
@@ -1166,9 +1170,10 @@ impl App {
                 self.sent_grid = self.current_grid();
                 // A directory CLI arg opens the file explorer over the scratch buffer.
                 let startup = match b.explorer_dir {
-                    Some(dir) => self
-                        .session
-                        .open_picker(PickerKind::Explorer, Some(dir), None),
+                    Some(dir) => {
+                        self.session
+                            .open_picker(PickerKind::Explorer, Some(dir), None, false)
+                    }
                     None => Effects::none(),
                 };
                 // Fetch the persisted app settings (e.g. the soft-wrap default) on this connection.

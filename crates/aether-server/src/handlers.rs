@@ -10402,6 +10402,29 @@ pub async fn picker_view(
             _ => None,
         };
 
+    // `Space Alt-g`: grep for the buffer's selection. Slice the selection text now (the same
+    // derivation `search_set`'s `from_selection` does for `Alt-/`), before the `pickers`/`matcher`
+    // split-borrow takes `s`. An empty selection (empty buffer) leaves grep unseeded.
+    let grep_selection_query: Option<String> =
+        match (params.from_selection, params.kind, params.buffer_id) {
+            (true, PickerKind::Grep, Some(buffer_id)) => {
+                s.buffers.get(&buffer_id).and_then(|buf| {
+                    let cursor = s
+                        .cursors
+                        .get(&(client_id, buffer_id))
+                        .copied()
+                        .unwrap_or_default();
+                    let (start, end) = scope_range(buf, &cursor, CopyScope::Selection);
+                    let text = buf.text.slice(start..end).to_string();
+                    (!text.is_empty()).then_some(text)
+                })
+            }
+            _ => None,
+        };
+    // Filled by the from-selection hydration below, then drained into a search spawn after the lock.
+    let mut grep_search_to_spawn: Option<(String, aether_protocol::picker::PickerFilters, u64)> =
+        None;
+
     // (Re-)hydrate picker state. `reset` always wipes; otherwise we keep whatever was persisted
     // from a prior `view`/`query`/`hide` cycle. Split-borrow `pickers` and `matcher` from `s`
     // so we can hold mutable references to both at once.
@@ -10493,6 +10516,26 @@ pub async fn picker_view(
         }
     }
 
+    // from-selection grep (`Space Alt-g`): install the sliced selection as a literal query and kick
+    // off the search in this same call — the grep analogue of `Alt-/`, but spawning the async walk
+    // like References/DocumentSymbols do above. Bump the generation so the worker's pushes are
+    // tagged freshly; the client adopts `result.generation`/`result.query` and keeps them. Queries
+    // below the grep minimum are seeded (and shown) but not searched, matching `picker/query`.
+    if let Some(query) = grep_selection_query {
+        picker.query = query;
+        picker.generation += 1;
+        picker.candidates = picker_state::PickerCandidates::Grep(Vec::new());
+        picker.ranked.clear();
+        picker.last_completed_search = None;
+        if picker.query.len() >= grep::MIN_QUERY_LEN {
+            grep_search_to_spawn = Some((
+                picker.query.clone(),
+                picker.filters.clone(),
+                picker.generation,
+            ));
+        }
+    }
+
     // References / DocumentSymbols: a fresh open (`buffer_id` present, vs `None` on scroll/resume
     // re-views) kicks off the async LSP resolve. Mint an epoch, mark the picker loading, and
     // remember what to spawn once the lock is released — the picker is pushed empty + `ticking`
@@ -10570,10 +10613,15 @@ pub async fn picker_view(
     // before it can render. Caller will treat the response and the notification as redundant.
     let mut update = picker_state::build_update(picker, matcher);
     // References / DocumentSymbols open empty while they resolve — mark the push `ticking` so the
-    // client shows the loading state instead of an empty result set.
-    if async_resolve.is_some() {
+    // client shows the loading state instead of an empty result set. A from-selection grep is the
+    // same shape (search spawning below), so mark it ticking too and send the window count-only
+    // (`items: None`) so the client renders "Searching…" rather than "No results" in the gap.
+    if async_resolve.is_some() || grep_search_to_spawn.is_some() {
         if let Some(ref mut u) = update {
             u.ticking = true;
+            if grep_search_to_spawn.is_some() {
+                u.items = None;
+            }
         }
     }
     // Echo the committed *anchor*, not the (possibly peeked) listing — the client pins its
@@ -10599,10 +10647,35 @@ pub async fn picker_view(
         update: update.clone(),
     };
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
+    // Grab the workspace snapshot for a from-selection grep before releasing the lock (same data
+    // `picker/query` hands to `grep::spawn_search`). `None` if the active project somehow vanished.
+    let grep_workspace = if grep_search_to_spawn.is_some() {
+        s.active_project(client_id)
+            .map(|p| (p.workspace_index.clone(), p.paths.clone()))
+    } else {
+        None
+    };
     drop(s);
 
     if let (Some(sender), Some(params)) = (outbound, update) {
         let _ = sender.send(picker_update_notif(params)).await;
+    }
+
+    // from-selection grep: spawn the walk now that the empty + ticking state is on the wire,
+    // mirroring `picker/query`'s spawn (the search is normally driven from there).
+    if let (Some((query, filters, generation)), Some((workspace_index, roots))) =
+        (grep_search_to_spawn, grep_workspace)
+    {
+        let files = workspace_index.files().await;
+        grep::spawn_search(
+            state.clone(),
+            files,
+            roots,
+            client_id,
+            query,
+            filters,
+            generation,
+        );
     }
 
     // Kick off the async resolve now that the empty + loading state is on the wire.
