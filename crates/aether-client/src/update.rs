@@ -3355,6 +3355,15 @@ impl Session {
             pos
         };
         self.drag = Some((anchor, granularity));
+        // A pointer selection is a Normal-mode concept. Double/triple-click (Word/Line) and
+        // shift-click create a selection immediately, and a selection can't coexist with the
+        // insert-mode bar caret: the selection's endpoint is an inclusive char, the caret is the
+        // gap before it, so the two render in different places. Drop to Normal so the block cursor
+        // sits on the endpoint. A plain single click stays in Insert — it only repositions the
+        // caret (a point cursor, no selection).
+        if self.mode == Mode::Insert && (extend || granularity != Granularity::Char) {
+            self.mode = Mode::Normal;
+        }
         self.request_str::<CursorSet>(
             CursorSetParams {
                 buffer_id: self.buffer.buffer_id,
@@ -3373,6 +3382,12 @@ impl Session {
         let Some((anchor, granularity)) = self.drag else {
             return Effects::none();
         };
+        // Dragging is a selection gesture: once it covers more than the press anchor it's a real
+        // selection, so leave Insert for the same reason as `pointer_press`. (Word/Line drags
+        // already switched at press time; this catches the Char-granularity drag.)
+        if self.mode == Mode::Insert && pos != anchor {
+            self.mode = Mode::Normal;
+        }
         self.request_str::<CursorSet>(
             CursorSetParams {
                 buffer_id: self.buffer.buffer_id,

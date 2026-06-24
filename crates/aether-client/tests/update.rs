@@ -1772,6 +1772,43 @@ fn shift_pointer_press_extends_from_the_existing_anchor() {
     );
 }
 
+#[test]
+fn pointer_selection_in_insert_mode_drops_to_normal() {
+    // A selection can't coexist with the insert-mode bar caret (the inclusive endpoint and the
+    // between-chars caret render in different cells), so a pointer gesture that creates a
+    // selection leaves Insert. A plain single click only repositions the caret and stays.
+    use aether_client::session::Mode;
+    use aether_protocol::cursor::Granularity;
+    use aether_protocol::LogicalPosition;
+
+    // Single click (Char, no extend) → point cursor, stays in Insert.
+    let mut s = session();
+    let _ = key(&mut s, 'i');
+    assert_eq!(s.mode, Mode::Insert);
+    let _ = s.pointer_press(LogicalPosition { line: 2, col: 3 }, Granularity::Char, false);
+    assert_eq!(s.mode, Mode::Insert, "single click only repositions the caret");
+
+    // Double click (Word) → immediate selection, drops to Normal.
+    let mut s = session();
+    let _ = key(&mut s, 'i');
+    let _ = s.pointer_press(LogicalPosition { line: 2, col: 3 }, Granularity::Word, false);
+    assert_eq!(s.mode, Mode::Normal, "double-click selects a word → Normal");
+
+    // Shift-click (extend) → selection from the existing anchor, drops to Normal.
+    let mut s = session();
+    let _ = key(&mut s, 'i');
+    let _ = s.pointer_press(LogicalPosition { line: 2, col: 3 }, Granularity::Char, true);
+    assert_eq!(s.mode, Mode::Normal, "shift-click extends a selection → Normal");
+
+    // Char drag past the press anchor → selection, drops to Normal.
+    let mut s = session();
+    let _ = key(&mut s, 'i');
+    let _ = s.pointer_press(LogicalPosition { line: 2, col: 3 }, Granularity::Char, false);
+    assert_eq!(s.mode, Mode::Insert, "the press alone hasn't selected anything yet");
+    let _ = s.pointer_drag(LogicalPosition { line: 2, col: 7 });
+    assert_eq!(s.mode, Mode::Normal, "dragging out a selection → Normal");
+}
+
 /// Find the first `Effect::Request` whose method matches (the multi-request flows — re-list,
 /// create — emit more than one, so `the_request`'s exactly-one assertion doesn't fit).
 fn find_request<'a>(fx: &'a Effects, method: &str) -> Option<&'a serde_json::Value> {

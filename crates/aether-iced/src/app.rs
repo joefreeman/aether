@@ -21,7 +21,7 @@ use crate::keymap::{
 use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
 use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
-use aether_protocol::cursor::{CursorSet, CursorSetParams, Granularity};
+use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::{NotificationMethod, RpcMethod};
 use aether_protocol::git::{GitBlameLine, GitBlameLineParams};
 use aether_protocol::lsp::LspStatus;
@@ -1612,44 +1612,23 @@ impl App {
                     ClickKind::Double => Granularity::Word,
                     ClickKind::Triple => Granularity::Line,
                 };
-                let anchor = if shift {
-                    self.session.buffer.cursor.anchor
-                } else {
-                    pos
-                };
-                self.session.drag = Some((anchor, granularity));
-                self.rpc::<CursorSet>(
-                    CursorSetParams {
-                        buffer_id: self.session.buffer.buffer_id,
-                        position: pos,
-                        anchor,
-                        granularity,
-                    },
-                    |r| Message::Core(CoreEvent::CursorMsg(r)),
-                )
+                // Selection semantics (drag anchor, click-streak granularity, and the
+                // selection-in-Insert → Normal switch) live in the core, shared by every shell.
+                let fx = self.session.pointer_press(pos, granularity, shift);
+                self.run_core(fx)
             }
             EditorEvent::Dragged { row, dcol } => {
-                let Some((anchor, granularity)) = self.session.drag else {
-                    return Task::none();
-                };
                 let Some(window) = &self.session.window else {
                     return Task::none();
                 };
                 let Some(pos) = grid::hit_test(window, row, dcol, TAB_WIDTH) else {
                     return Task::none();
                 };
-                self.rpc::<CursorSet>(
-                    CursorSetParams {
-                        buffer_id: self.session.buffer.buffer_id,
-                        position: pos,
-                        anchor,
-                        granularity,
-                    },
-                    |r| Message::Core(CoreEvent::CursorMsg(r)),
-                )
+                let fx = self.session.pointer_drag(pos);
+                self.run_core(fx)
             }
             EditorEvent::Released => {
-                self.session.drag = None;
+                self.session.pointer_release();
                 Task::none()
             }
         }
