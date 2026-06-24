@@ -9,9 +9,9 @@
 
 mod view;
 
-use aether_client::effect::{Effect, Effects, RevealStyle, ToastKind};
+use aether_client::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
 use aether_client::keymap::{
-    hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
+    hover_action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
 };
 use aether_client::session::{buffer_info, HoverText, PasteKind, Session};
 use aether_client::transport::RpcError;
@@ -610,22 +610,19 @@ fn reveal_value(r: aether_client::picker::Reveal) -> Value {
     )
 }
 
-/// Lower the subset of [`Action`] the shell executes directly (`shell.rs::run_shell_action`):
-/// scrolling, centring, wrap, help, project settings. Anything else only reaches a `ShellAction`
-/// effect by mistake, so it falls back to its debug name for diagnosis.
-fn action_value(a: &Action) -> Value {
+/// Lower a [`ShellAction`] to the JSON the web shell's `runShellAction` consumes
+/// (`{ name, dir?, unit?, fraction? }`): scrolling, cursor placement, wrap, help.
+fn action_value(a: &ShellAction) -> Value {
     let dbg = |x: &dyn std::fmt::Debug| format!("{x:?}").to_lowercase();
     match a {
-        Action::Scroll { dir, unit } => {
+        ShellAction::Scroll { dir, unit } => {
             json!({ "name": "scroll", "dir": dbg(dir), "unit": dbg(unit) })
         }
-        Action::PlaceCursor(place) => {
+        ShellAction::PlaceCursor(place) => {
             json!({ "name": "place_cursor", "fraction": place.fraction() })
         }
-        Action::ToggleWrap => json!({ "name": "toggle_wrap" }),
-        Action::OpenHelp => json!({ "name": "open_help" }),
-        Action::OpenProjectSettings => json!({ "name": "open_project_settings" }),
-        other => json!({ "name": format!("{other:?}") }),
+        ShellAction::ToggleWrap => json!({ "name": "toggle_wrap" }),
+        ShellAction::OpenHelp => json!({ "name": "open_help" }),
     }
 }
 

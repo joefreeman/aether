@@ -127,15 +127,38 @@ function measureCell(buffer: HTMLElement): Cell {
 type ToastLevel = "info" | "error" | "warning" | "success";
 
 interface ShellActionDesc {
-  name: string;
+  name: "scroll" | "place_cursor" | "toggle_wrap" | "open_help";
   dir?: string;
   unit?: string;
   fraction?: number;
 }
 
+/** Every effect tag the core can emit (mirrors `effects_to_json` in crates/aether-web/src/lib.rs).
+ *  Keeping this an explicit union lets the `runEffects` switch be exhaustiveness-checked: a new core
+ *  variant becomes a compile error here until it's handled (or explicitly deferred). */
+type EffectTag =
+  | "Request"
+  | "Toast"
+  | "WriteClipboard"
+  | "ReadClipboard"
+  | "RevealCursor"
+  | "Resubscribe"
+  | "SaveScrollAnchor"
+  | "RestoreScrollAnchor"
+  | "SaveContentAnchor"
+  | "ShowHover"
+  | "DismissHover"
+  | "WindowAdopted"
+  | "RevealPickerSelection"
+  | "PickerScrollReset"
+  | "Reconnect"
+  | "Exit"
+  | "ToChooser"
+  | "ShellAction";
+
 /** One effect from the core (docs/web-core.md §"The boundary"). `tag` selects the variant. */
 interface CoreEffect {
-  tag: string;
+  tag: EffectTag;
   token?: number;
   method?: string;
   params?: unknown;
@@ -1716,6 +1739,11 @@ export class Shell {
         case "PickerScrollReset":
           this.pickerScrollReset = true;
           break;
+        // Deferred to later milestones (browser tab — no process to exit, reconnect handled by a
+        // page reload). Explicit no-ops so the exhaustive `default` below stays a drift detector.
+        case "Reconnect":
+        case "Exit":
+          break;
         case "ToChooser":
           // The last buffer of an ephemeral ("no project") context closed and we navigated into
           // it (web never launches with a file, so it always lands here). Discard the now
@@ -1725,9 +1753,14 @@ export class Shell {
           this.runEffects(this.session.open_projects() as CoreEffect[]);
           this.capture.focus();
           break;
-        // Deferred to later milestones: Reconnect, Exit.
-        default:
+        default: {
+          // Compile-time exhaustiveness: if the core gains an effect this switch doesn't handle
+          // (or explicitly defer above), `e.tag` is no longer `never` and this fails to build.
+          // The runtime warn covers wasm/TS drift if the union itself falls behind the bridge.
+          const unhandled: never = e.tag;
+          console.warn("unhandled core effect", unhandled);
           break;
+        }
       }
     }
     if (coalesce) this.scheduleRender();
@@ -1806,9 +1839,12 @@ export class Shell {
       case "open_help":
         this.openHelp();
         break;
-      // open_project_settings: a shell-local editor, a later milestone.
-      default:
+      default: {
+        // Exhaustiveness: a new shell-action name fails to build here until it's handled.
+        const unhandled: never = a.name;
+        console.warn("unhandled shell action", unhandled);
         break;
+      }
     }
   }
 

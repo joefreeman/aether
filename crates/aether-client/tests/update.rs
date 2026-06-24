@@ -2,7 +2,7 @@
 //! machine — key events in, `Effect::Request`s out, canned JSON results back in — with no
 //! transport, no mock, no async runtime.
 
-use aether_client::effect::{Effect, Effects, ToastKind};
+use aether_client::effect::{Effect, Effects, ShellAction, ToastKind};
 use aether_client::keymap::{KeyCode, Mods};
 use aether_client::session::Session;
 use aether_client::transport::RpcError;
@@ -2541,7 +2541,7 @@ fn app_settings_toggle_persists_and_reflows() {
     );
     assert!(
         fx.0.iter()
-            .any(|e| matches!(e, Effect::ShellAction(Action::ToggleWrap))),
+            .any(|e| matches!(e, Effect::ShellAction(ShellAction::ToggleWrap))),
         "delegates the reflow to the shell's wrap path"
     );
 }
@@ -2584,7 +2584,7 @@ fn settings_changed_push_applies_wrap_live() {
     assert!(fx
         .0
         .iter()
-        .any(|e| matches!(e, Effect::ShellAction(Action::ToggleWrap))));
+        .any(|e| matches!(e, Effect::ShellAction(ShellAction::ToggleWrap))));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
     assert!(fx
         .0
@@ -2597,7 +2597,7 @@ fn settings_changed_push_applies_wrap_live() {
     assert!(!fx
         .0
         .iter()
-        .any(|e| matches!(e, Effect::ShellAction(Action::ToggleWrap))));
+        .any(|e| matches!(e, Effect::ShellAction(ShellAction::ToggleWrap))));
 }
 
 #[test]
@@ -2626,7 +2626,7 @@ fn app_settings_loaded_applies_persisted_wrap_only_when_it_differs() {
     assert!(fx
         .0
         .iter()
-        .any(|e| matches!(e, Effect::ShellAction(Action::ToggleWrap))));
+        .any(|e| matches!(e, Effect::ShellAction(ShellAction::ToggleWrap))));
 
     // Persisted `soft` already matches the default → nothing to do.
     let mut s = session();

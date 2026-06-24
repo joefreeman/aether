@@ -16,9 +16,9 @@ use crate::app::{
 use crate::connection::Handle;
 use crate::connection::RpcError;
 use crate::{clipboard, labels, ui};
-use aether_client::effect::{Effect, Effects, RevealStyle, ToastKind};
+use aether_client::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
 use aether_client::keymap::{
-    hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit, ViewportPlace,
+    hover_action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit, ViewportPlace,
     CURSOR_REST_FRACTION,
 };
 use aether_client::session::{
@@ -938,9 +938,9 @@ impl Shell {
 
     // ---- shell actions (geometry + local overlays) --------------------------------------
 
-    fn run_shell_action(&mut self, action: Action) {
+    fn run_shell_action(&mut self, action: ShellAction) {
         match action {
-            Action::Scroll { dir, unit } => {
+            ShellAction::Scroll { dir, unit } => {
                 let rows = self.visible_rows() as i64;
                 let delta = match unit {
                     ScrollUnit::Line => 1,
@@ -969,8 +969,8 @@ impl Shell {
                     }
                 }
             }
-            Action::PlaceCursor(place) => self.place_cursor(place),
-            Action::ToggleWrap => {
+            ShellAction::PlaceCursor(place) => self.place_cursor(place),
+            ShellAction::ToggleWrap => {
                 self.session.wrap = match self.session.wrap {
                     WrapMode::Soft => WrapMode::None,
                     WrapMode::None => WrapMode::Soft,
@@ -978,11 +978,10 @@ impl Shell {
                 self.sent_grid = Some(self.grid());
                 self.subscribe();
             }
-            Action::OpenHelp => {
+            ShellAction::OpenHelp => {
                 self.state.help.open = true;
                 self.state.help.scroll = Default::default();
             }
-            _ => {}
         }
     }
 

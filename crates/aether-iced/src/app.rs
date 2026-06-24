@@ -8,14 +8,14 @@
 
 use crate::connection::Handle;
 use crate::connection::NotifRx;
-pub use crate::core::effect::{Effect, Effects, RevealStyle, ToastKind};
+pub use crate::core::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
 use crate::core::markdown::{Block as MdBlock, Inline as MdInline};
 pub use crate::core::session::*;
 use crate::core::update::Event as CoreEvent;
 use crate::editor::{self, ClickKind, EditorEvent, GUTTER_COLS, PAD};
 use crate::grid;
 use crate::keymap::{
-    hover_action, Action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit, ViewportPlace,
+    hover_action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit, ViewportPlace,
     CURSOR_REST_FRACTION,
 };
 use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
@@ -1851,8 +1851,8 @@ impl App {
     }
 
     /// Actions whose execution is irreducibly shell-side (`Effect::ShellAction`).
-    fn run_shell_action(&mut self, action: Action) -> Task<Message> {
-        use Action as A;
+    fn run_shell_action(&mut self, action: ShellAction) -> Task<Message> {
+        use ShellAction as A;
         match action {
             A::Scroll { dir, unit } => {
                 let Some(cell) = self.cell else {
@@ -1904,7 +1904,6 @@ impl App {
                     iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
                 )
             }
-            _ => Task::none(),
         }
     }
 

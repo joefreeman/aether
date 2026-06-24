@@ -4,8 +4,24 @@
 //! sans-IO — it never constructs futures, so the whole surface is inspectable and the
 //! update loop unit-testable with canned results (docs/client-core.md).
 
-use super::keymap::Action;
+use super::keymap::{ScrollDir, ScrollUnit, ViewportPlace};
 use super::session::{HoverText, PasteKind};
+
+/// An action whose execution is irreducibly shell-side — geometry (pixel scroll, cell metrics,
+/// cursor placement), viewport wrap plumbing, or the help overlay. The keymap and dispatch stay in
+/// the core; only the body is the shell's. Deliberately a small, closed set (not the whole `Action`
+/// enum) so every shell matches it exhaustively — a new shell-action can't be silently dropped.
+#[derive(Debug, Clone, Copy)]
+pub enum ShellAction {
+    /// Pixel/row scroll by direction and unit.
+    Scroll { dir: ScrollDir, unit: ScrollUnit },
+    /// Rest the cursor at a viewport position (`;` / `Alt-;`).
+    PlaceCursor(ViewportPlace),
+    /// Flip soft-wrap and re-render the viewport (paired with [`Effect::SaveContentAnchor`]).
+    ToggleWrap,
+    /// Open the shell-local help cheatsheet (rendered from the keymap tables).
+    OpenHelp,
+}
 
 /// Web-client toast kinds; the colour of the toast's accent bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,9 +109,9 @@ pub enum Effect {
     ToChooser,
     /// Read the system clipboard; the text comes back as `Event::ClipboardRead`.
     ReadClipboard(PasteKind),
-    /// An action whose execution is irreducibly shell-side (pixel scrolling, cell metrics,
-    /// viewport wrap plumbing) — the keymap and dispatch stay core; the body doesn't.
-    ShellAction(Action),
+    /// An action whose execution is irreducibly shell-side (see [`ShellAction`]) — the keymap and
+    /// dispatch stay core; the body doesn't.
+    ShellAction(ShellAction),
 }
 
 /// An ordered batch of effects, with builder conveniences mirroring how `iced::Task` reads
@@ -119,13 +135,11 @@ impl Effects {
         Effects::toast(message, ToastKind::Error)
     }
 
-    #[allow(dead_code)] // exercised as more update arms migrate into core
     pub fn push(&mut self, e: Effect) {
         self.0.push(e);
     }
 
     /// Append `other`'s effects after this batch's (the `Task::batch` analogue).
-    #[allow(dead_code)] // exercised as more update arms migrate into core
     pub fn and(mut self, other: Effects) -> Self {
         self.0.extend(other.0);
         self

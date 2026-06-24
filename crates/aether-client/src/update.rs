@@ -4,7 +4,7 @@
 //! bridges with a single `Message::Core(Event)` variant and an effect executor.
 
 use super::chips::{self, ChipEditor, ChipEditorField, ChipId};
-use super::effect::{Effect, Effects, RevealStyle, ToastKind};
+use super::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
@@ -4180,7 +4180,7 @@ impl Session {
         self.font_size = settings.font_size;
         if settings.wrap != self.wrap {
             let mut fx = Effects::one(Effect::SaveContentAnchor);
-            fx.push(Effect::ShellAction(Action::ToggleWrap));
+            fx.push(Effect::ShellAction(ShellAction::ToggleWrap));
             fx
         } else {
             Effects::none()
@@ -4213,7 +4213,7 @@ impl Session {
                     Event::AppSettingsSaved,
                 );
                 fx.push(Effect::SaveContentAnchor);
-                fx.push(Effect::ShellAction(Action::ToggleWrap));
+                fx.push(Effect::ShellAction(ShellAction::ToggleWrap));
                 fx
             }
             // Ligatures is shell-render-only: flip the value + persist; the re-render after this
@@ -4887,23 +4887,26 @@ impl Session {
                 }
                 fx
             }
-            A::PlaceCursor(_) | A::Scroll { .. } => {
-                // Geometry (pixel scroll, cell metrics) and viewport plumbing — the shell
-                // executes these against its own state.
-                Effects::one(Effect::ShellAction(action))
+            // Geometry (pixel scroll, cell metrics) and viewport plumbing — the shell executes
+            // these against its own state.
+            A::PlaceCursor(place) => {
+                Effects::one(Effect::ShellAction(ShellAction::PlaceCursor(place)))
+            }
+            A::Scroll { dir, unit } => {
+                Effects::one(Effect::ShellAction(ShellAction::Scroll { dir, unit }))
             }
             A::ToggleWrap => {
                 // Re-layout: capture a content anchor first (against the current window), then let
                 // the shell flip wrap + re-render; the shell restores the anchor when it adopts the
                 // new window. Keeps the viewport on the same content across the reflow.
                 let mut fx = Effects::one(Effect::SaveContentAnchor);
-                fx.push(Effect::ShellAction(action));
+                fx.push(Effect::ShellAction(ShellAction::ToggleWrap));
                 fx
             }
             A::OpenHelp => {
                 // The help cheatsheet is still a shell-local overlay (it renders from the keymap
                 // tables); a shell without it ignores the action.
-                Effects::one(Effect::ShellAction(action))
+                Effects::one(Effect::ShellAction(ShellAction::OpenHelp))
             }
             A::OpenProjectSettings => {
                 // The project-settings overlay now lives in the core (state + key handling); every
