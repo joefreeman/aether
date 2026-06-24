@@ -194,8 +194,8 @@ impl LspManager {
         self.servers.get(key).map(handle_status)
     }
 
-    /// Snapshot of every server owned by `project_id` — drives `lsp/server_status` and the LSP
-    /// servers picker. Project-keyed (not root-keyed) so a project sees exactly its own servers,
+    /// Snapshot of every server owned by `project_id` — drives the LSP servers picker.
+    /// Project-keyed (not root-keyed) so a project sees exactly its own servers,
     /// even when a sibling project shares its workspace root.
     pub fn status_for_project(&self, project_id: &str) -> Vec<LspServerStatus> {
         self.servers

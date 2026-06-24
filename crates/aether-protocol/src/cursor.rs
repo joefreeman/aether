@@ -2,15 +2,16 @@
 //!
 //! `Motion` is shared with `input/delete` (§8.2).
 
-use crate::envelope::{NotificationMethod, RpcMethod};
-use crate::{BufferId, ClientId, LogicalPosition, Revision, ViewportId};
+use crate::envelope::RpcMethod;
+use crate::{BufferId, LogicalPosition, ViewportId};
 use serde::{Deserialize, Serialize};
 
 // ---- Motion vocabulary --------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
+    #[default]
     Forward,
     Backward,
 }
@@ -336,33 +337,35 @@ pub struct CursorUndoResult {
     pub cursor: CursorState,
 }
 
-// ---- cursor/expand and cursor/contract ---------------------------------------------------------
+// ---- cursor/tree_select -------------------------------------------------------------------------
 //
-// Tree-sitter–driven selection expansion (Helix `Alt-o`-style). `expand` grows the selection to
-// the smallest enclosing syntax node strictly larger than the current selection. `contract`
-// reverses one step. The server maintains a per-(client, buffer) history so a chain of expands
-// can be undone by an equal number of contracts. Any other cursor RPC (or buffer mutation)
-// clears the history.
+// Tree-sitter–driven selection resizing (Helix `Alt-o`-style). `Expand` grows the selection to the
+// smallest enclosing syntax node strictly larger than the current selection; `Contract` reverses
+// one step. The server maintains a per-(client, buffer) history so a chain of expands can be undone
+// by an equal number of contracts. Any other cursor RPC (or buffer mutation) clears the history.
 
-pub struct CursorExpand;
-impl RpcMethod for CursorExpand {
-    const NAME: &'static str = "cursor/expand";
-    type Params = CursorBufferOnlyParams;
+pub struct CursorTreeSelect;
+impl RpcMethod for CursorTreeSelect {
+    const NAME: &'static str = "cursor/tree_select";
+    type Params = CursorTreeSelectParams;
     type Result = CursorState;
 }
 
-pub struct CursorContract;
-impl RpcMethod for CursorContract {
-    const NAME: &'static str = "cursor/contract";
-    type Params = CursorBufferOnlyParams;
-    type Result = CursorState;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TreeSelectDirection {
+    /// Grow the selection to the enclosing syntax node.
+    Expand,
+    /// Shrink one step back along the expand history.
+    Contract,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CursorBufferOnlyParams {
+pub struct CursorTreeSelectParams {
     pub buffer_id: BufferId,
-    /// Repeat the expand/contract this many times (`0` = `1`), stopping early once the
-    /// cursor stops changing — the repeat loop lives server-side.
+    pub direction: TreeSelectDirection,
+    /// Repeat the resize this many times (`0` = `1`), stopping early once the cursor stops
+    /// changing — the repeat loop lives server-side.
     #[serde(
         default = "crate::count_one",
         skip_serializing_if = "crate::count_is_one"
@@ -398,21 +401,4 @@ impl RpcMethod for CursorSelectAll {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CursorSelectAllParams {
     pub buffer_id: BufferId,
-}
-
-// ---- cursor/update (notification) ---------------------------------------------------------------
-
-pub struct CursorUpdate;
-impl NotificationMethod for CursorUpdate {
-    const NAME: &'static str = "cursor/update";
-    type Params = CursorUpdateParams;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CursorUpdateParams {
-    pub buffer_id: BufferId,
-    pub client_id: ClientId,
-    pub revision: Revision,
-    pub position: LogicalPosition,
-    pub anchor: LogicalPosition,
 }

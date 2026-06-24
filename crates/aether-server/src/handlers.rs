@@ -19,9 +19,10 @@ use aether_protocol::buffer::{
     BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
-    CursorBufferOnlyParams, CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams,
-    CursorSelectWordParams, CursorSetParams, CursorState, CursorSwapAnchorParams, CursorUndoParams,
-    CursorUndoResult, Direction, Granularity, GrepPosition, Motion, VerticalDirection,
+    CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams, CursorSelectWordParams,
+    CursorSetParams, CursorState, CursorSwapAnchorParams, CursorTreeSelectParams, CursorUndoParams,
+    CursorUndoResult, Direction, Granularity, GrepPosition, Motion, TreeSelectDirection,
+    VerticalDirection,
 };
 use aether_protocol::directory::{
     DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryListParams,
@@ -31,24 +32,21 @@ use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBlameLineParams,
-    GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitCommitInfoParams, GitCommitInfoResult,
-    GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitNavigateHunkParams,
+    GitNavigateHunkResult, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputMoveLinesParams,
-    InputOpenLineParams, InputSurroundParams, InputTextParams, InputTransformCaseParams,
-    InputUnsurroundParams, LineSide, SurroundTarget,
-    UndoResult,
+    BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputAdjustNumberParams,
+    InputMoveLinesParams, InputOpenLineParams, InputSurroundParams, InputTextParams,
+    InputTransformCaseParams, InputUnsurroundParams, LineSide, SurroundTarget, UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspFormatResult, LspGotoDefinitionResult, LspHoverResult,
     LspLocation, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness,
-    LspRestartServerParams, LspServerStatusParams, LspServerStatusResult, LspStatus,
+    LspRestartServerParams, LspStatus,
 };
-use aether_protocol::nav::{
-    NavGotoParams, NavRecordParams, NavRecordResult, NavStepParams, NavStepResult,
-};
+use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     BufferDirtyState, MatchOptions, PickerGrepNavigateParams, PickerGrepNavigateTarget,
@@ -63,16 +61,15 @@ use aether_protocol::project::{
     ProjectRenamedParams, ProjectSummary,
 };
 use aether_protocol::search::{
-    SearchClearParams, SearchMatchRange, SearchNavParams, SearchNavResult, SearchSetParams,
-    SearchSetResult, SearchStateChanged, SearchSummary,
+    SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,
+    SearchStateChanged, SearchStepParams, SearchSummary,
 };
 use aether_protocol::settings::{AppSettings, SettingsChanged, SettingsGetParams};
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSpan, DiffMarker, DiffStage, LogicalLineRange,
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams,
-    ViewportSubscribeResult, ViewportUnsubscribeParams, ViewportWindowResult, VirtualRow,
-    VirtualRowKind, Window,
+    ViewportSubscribeResult, ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
 };
 use aether_protocol::LogicalPosition;
 use aether_protocol::{BufferId, ClientId, Revision};
@@ -1131,92 +1128,94 @@ async fn buffer_open_inner(
         }
     } else {
         match (params.path_index, params.relative_path.as_deref()) {
-        (None, None) => {
-            let mut s = state.lock().await;
-            let id = s.allocate_buffer_id();
-            let scratch_number = s.next_scratch_number(&active_project_name);
-            let mut buf = Buffer::scratch(id, params.language.clone(), scratch_number);
-            buf.transient = params.transient == Some(true);
-            let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
-            let clamped_anchor = params
-                .jump_to_anchor
-                .map(|a| motion::clamp_position(&buf, a));
-            let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
-            let scroll = open_scroll(&s, client_id, id, params.jump_to);
-            let result = BufferOpenResult {
-                buffer_id: id,
-                language: buf.language.clone(),
-                line_count: buf.line_count(),
-                byte_count: buf.byte_count(),
-                revision: 0,
-                saved_revision: buf.saved_revision(),
-                path: None,
-                scratch_number: Some(scratch_number),
-                cursor,
-                scroll,
-                lsp_server: None, // scratch buffers are never language-server-backed
-                transient: buf.transient,
-                search_summary: None, // set by buffer_open's prime post-step, not here
-            };
-            s.buffers.insert(id, buf);
-            s.buffer_projects.insert(id, active_project_name.clone());
-            s.touch_mru(id);
-            let pushes = refresh_buffer_pickers(&mut s);
-            drop(s);
-            for (sender, notif) in pushes {
-                let _ = sender.send(notif).await;
+            (None, None) => {
+                let mut s = state.lock().await;
+                let id = s.allocate_buffer_id();
+                let scratch_number = s.next_scratch_number(&active_project_name);
+                let mut buf = Buffer::scratch(id, params.language.clone(), scratch_number);
+                buf.transient = params.transient == Some(true);
+                let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
+                let clamped_anchor = params
+                    .jump_to_anchor
+                    .map(|a| motion::clamp_position(&buf, a));
+                let cursor =
+                    resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
+                let scroll = open_scroll(&s, client_id, id, params.jump_to);
+                let result = BufferOpenResult {
+                    buffer_id: id,
+                    language: buf.language.clone(),
+                    line_count: buf.line_count(),
+                    byte_count: buf.byte_count(),
+                    revision: 0,
+                    saved_revision: buf.saved_revision(),
+                    path: None,
+                    scratch_number: Some(scratch_number),
+                    cursor,
+                    scroll,
+                    lsp_server: None, // scratch buffers are never language-server-backed
+                    transient: buf.transient,
+                    search_summary: None, // set by buffer_open's prime post-step, not here
+                };
+                s.buffers.insert(id, buf);
+                s.buffer_projects.insert(id, active_project_name.clone());
+                s.touch_mru(id);
+                let pushes = refresh_buffer_pickers(&mut s);
+                drop(s);
+                for (sender, notif) in pushes {
+                    let _ = sender.send(notif).await;
+                }
+                return Ok(result);
             }
-            return Ok(result);
-        }
-        (Some(idx), rel) => {
-            let s = state.lock().await;
-            let base = s
-                .active_project_or_err(ctx.client_id)?
-                .paths
-                .get(idx as usize)
-                .ok_or_else(|| RpcError::invalid_path(format!("path_index {idx} out of range")))?
-                .clone();
-            drop(s);
-            let base_is_file = base.is_file();
-            let candidate = match rel {
-                None | Some("") => base.clone(),
-                Some(r) if base_is_file => {
-                    return Err(RpcError::invalid_path(format!(
+            (Some(idx), rel) => {
+                let s = state.lock().await;
+                let base = s
+                    .active_project_or_err(ctx.client_id)?
+                    .paths
+                    .get(idx as usize)
+                    .ok_or_else(|| {
+                        RpcError::invalid_path(format!("path_index {idx} out of range"))
+                    })?
+                    .clone();
+                drop(s);
+                let base_is_file = base.is_file();
+                let candidate = match rel {
+                    None | Some("") => base.clone(),
+                    Some(r) if base_is_file => {
+                        return Err(RpcError::invalid_path(format!(
                         "path_index {idx} is a single-file entry; relative_path must be empty (got {r:?})"
                     )));
-                }
-                Some(r) => base.join(r),
-            };
-            // Resolve to a canonical-shaped path. When the target file already exists,
-            // straight canonicalize. When `create_if_missing` is set and the file (or even
-            // some of its parents — multi-segment paths like `foo/bar/baz.rs`) doesn't
-            // exist, walk up to the deepest existing ancestor via `canonicalize_partial`
-            // and re-attach the not-yet-existing tail. The file (and any missing parents)
-            // is written to disk at the first save; the boundary check below runs against
-            // the resolved path either way.
-            match std::fs::canonicalize(&candidate) {
-                Ok(p) => p,
-                Err(_) if params.create_if_missing => {
-                    canonicalize_partial(&candidate).map_err(|e| {
-                        RpcError::invalid_path(format!(
+                    }
+                    Some(r) => base.join(r),
+                };
+                // Resolve to a canonical-shaped path. When the target file already exists,
+                // straight canonicalize. When `create_if_missing` is set and the file (or even
+                // some of its parents — multi-segment paths like `foo/bar/baz.rs`) doesn't
+                // exist, walk up to the deepest existing ancestor via `canonicalize_partial`
+                // and re-attach the not-yet-existing tail. The file (and any missing parents)
+                // is written to disk at the first save; the boundary check below runs against
+                // the resolved path either way.
+                match std::fs::canonicalize(&candidate) {
+                    Ok(p) => p,
+                    Err(_) if params.create_if_missing => canonicalize_partial(&candidate)
+                        .map_err(|e| {
+                            RpcError::invalid_path(format!(
+                                "canonicalizing {}: {e}",
+                                candidate.display()
+                            ))
+                        })?,
+                    Err(e) => {
+                        return Err(RpcError::invalid_path(format!(
                             "canonicalizing {}: {e}",
                             candidate.display()
-                        ))
-                    })?
-                }
-                Err(e) => {
-                    return Err(RpcError::invalid_path(format!(
-                        "canonicalizing {}: {e}",
-                        candidate.display()
-                    )));
+                        )));
+                    }
                 }
             }
-        }
-        (None, Some(_)) => {
-            return Err(RpcError::invalid_params(
-                "relative_path provided without path_index",
-            ));
-        }
+            (None, Some(_)) => {
+                return Err(RpcError::invalid_params(
+                    "relative_path provided without path_index",
+                ));
+            }
         }
     };
 
@@ -1455,7 +1454,7 @@ pub async fn git_blame_line(
         .get(&params.buffer_id)
         .and_then(|c| c.lines.get(params.line as usize).cloned().flatten());
     // Composite post-step (docs/protocol-composites.md, G): resolve the commit's details in
-    // the same round-trip. Best-effort, like `git/commit_info`.
+    // the same round-trip. Best-effort — an unresolvable hash just yields `None`.
     let commit_info = match &blame {
         Some(b) if params.include_commit_info && !b.is_uncommitted => s
             .git_baseline
@@ -1465,25 +1464,6 @@ pub async fn git_blame_line(
         _ => None,
     };
     Ok(GitBlameLineResult { blame, commit_info })
-}
-
-/// Full details for a single commit (the blame "commit details" popover). Best-effort: a buffer
-/// with no repo, or a revision that doesn't resolve, yields `info: None` rather than an error.
-pub async fn git_commit_info(
-    state: &SharedState,
-    _ctx: &mut ConnectionCtx,
-    params: GitCommitInfoParams,
-) -> Result<GitCommitInfoResult, RpcError> {
-    let s = state.lock().await;
-    if !s.buffers.contains_key(&params.buffer_id) {
-        return Err(RpcError::buffer_not_found(params.buffer_id));
-    }
-    let info = s
-        .git_baseline
-        .get(&params.buffer_id)
-        .and_then(|b| b.repo.as_ref())
-        .and_then(|repo| crate::git::commit_info(repo, &params.commit));
-    Ok(GitCommitInfoResult { info })
 }
 
 /// Toggle the inline diff view for a viewport. Turning it on recomputes the buffer's hunks (they
@@ -1886,19 +1866,6 @@ pub async fn git_apply_hunk(
 }
 
 // ---- lsp/* --------------------------------------------------------------------------------------
-
-/// Status of every language server in the client's active project. Drives the LSP status dialog.
-pub async fn lsp_server_status(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    _params: LspServerStatusParams,
-) -> Result<LspServerStatusResult, RpcError> {
-    let s = state.lock().await;
-    let project = s.active_project_or_err(ctx.client_id)?.id.clone();
-    Ok(LspServerStatusResult {
-        servers: s.lsp.status_for_project(&project),
-    })
-}
 
 /// Restart the language server(s) for a language in the client's active project.
 pub async fn lsp_restart_server(
@@ -3024,23 +2991,15 @@ pub async fn search_clear(
     Ok(())
 }
 
-pub async fn search_next(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: SearchNavParams,
-) -> Result<SearchNavResult, RpcError> {
-    search_navigate_counted(state, ctx, params, Direction::Forward).await
-}
-
-/// Shared `search/next`+`search/prev` wrapper handling the composite params
+/// `search/step` — step `count` matches in `params.direction`, handling the composite params
 /// (docs/protocol-composites.md, I): optional query revive first (skipping the step when it
 /// has no matches — same early-out the clients used), then `count` steps.
-async fn search_navigate_counted(
+pub async fn search_step(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: SearchNavParams,
-    direction: Direction,
+    params: SearchStepParams,
 ) -> Result<SearchNavResult, RpcError> {
+    let direction = params.direction;
     if let Some(query) = params.set_query.clone() {
         let set = search_set(
             state,
@@ -3067,14 +3026,6 @@ async fn search_navigate_counted(
         last = Some(search_navigate(state, ctx, params.buffer_id, direction, params.extend).await?);
     }
     Ok(last.expect("count.max(1) iterations"))
-}
-
-pub async fn search_prev(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: SearchNavParams,
-) -> Result<SearchNavResult, RpcError> {
-    search_navigate_counted(state, ctx, params, Direction::Backward).await
 }
 
 async fn search_navigate(
@@ -3773,26 +3724,9 @@ async fn navigate_to(
     Ok(result)
 }
 
-/// `nav/record` — snapshot the client's current location onto the back stack. The client only
-/// calls this for a navigation that actually moves, so recording is unconditional bar the
-/// duplicate-top collapse in [`NavHistory::record`].
-pub async fn nav_record(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: NavRecordParams,
-) -> Result<NavRecordResult, RpcError> {
-    let client_id = ctx.client_id;
-    let mut s = state.lock().await;
-    let Some(entry) = nav_entry_for(&s, client_id, params.buffer_id) else {
-        return Ok(NavRecordResult { recorded: false });
-    };
-    let recorded = s.nav_history.entry(client_id).or_default().record(entry);
-    Ok(NavRecordResult { recorded })
-}
-
 /// Shared back/forward step: pop the chosen stack (skipping unrecoverable entries — a closed
 /// scratch), push the current location onto the other stack, and navigate to the popped entry.
-async fn nav_step(
+async fn nav_step_dir(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     current_buffer: BufferId,
@@ -3845,20 +3779,13 @@ async fn nav_step(
     }
 }
 
-pub async fn nav_back(
+pub async fn nav_step(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: NavStepParams,
 ) -> Result<NavStepResult, RpcError> {
-    nav_step(state, ctx, params.buffer_id, false).await
-}
-
-pub async fn nav_forward(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: NavStepParams,
-) -> Result<NavStepResult, RpcError> {
-    nav_step(state, ctx, params.buffer_id, true).await
+    let forward = matches!(params.direction, Direction::Forward);
+    nav_step_dir(state, ctx, params.buffer_id, forward).await
 }
 
 /// `nav/goto` — restore a stored entry without touching the server-side stacks. The web client
@@ -4797,44 +4724,6 @@ pub async fn viewport_scroll(
     vp.last_logical_line_exclusive = last_excl;
     s.last_scroll.insert((client_id, buffer_id), params.scroll);
     Ok(ViewportWindowResult { window })
-}
-
-pub async fn viewport_unsubscribe(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: ViewportUnsubscribeParams,
-) -> Result<(), RpcError> {
-    let client_id = ctx.client_id;
-    let mut s = state.lock().await;
-    let vp = s.viewports.get(&params.viewport_id).ok_or_else(|| {
-        RpcError::new(
-            ErrorCode::VIEWPORT_NOT_FOUND,
-            format!("unknown viewport_id: {}", params.viewport_id),
-        )
-    })?;
-    if vp.client_id != client_id {
-        return Err(RpcError::new(
-            ErrorCode::VIEWPORT_NOT_FOUND,
-            "viewport is not owned by this client",
-        ));
-    }
-    let buffer_id = vp.buffer_id;
-    s.viewports.remove(&params.viewport_id);
-    // If that was the last viewport on a transient buffer, the buffer just went hidden — close
-    // it (same rule as the viewport supersession in `viewport_subscribe`).
-    let (closed, stopped_servers) = s.close_orphaned_transients([buffer_id]);
-    let mut pushes = Vec::new();
-    if !closed.is_empty() {
-        pushes.extend(refresh_buffer_pickers(&mut s));
-    }
-    if !stopped_servers.is_empty() {
-        pushes.extend(refresh_lsp_server_pickers(&mut s));
-    }
-    drop(s);
-    for (sender, notif) in pushes {
-        let _ = sender.send(notif).await;
-    }
-    Ok(())
 }
 
 // ---- helpers -----------------------------------------------------------------------------------
@@ -6598,16 +6487,21 @@ async fn cursor_redo_once(
 
 // ---- cursor/expand and cursor/contract ---------------------------------------------------------
 
-pub async fn cursor_expand(
+pub async fn cursor_tree_select(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: CursorBufferOnlyParams,
+    params: CursorTreeSelectParams,
 ) -> Result<CursorState, RpcError> {
     // Repeat server-side, stopping once the cursor stops changing (top of the tree /
     // single node — repeated presses are a no-op, not an error).
     let mut last: Option<CursorState> = None;
     for _ in 0..params.count.max(1) {
-        let r = cursor_expand_once(state, ctx, &params).await?;
+        let r = match params.direction {
+            TreeSelectDirection::Expand => cursor_expand_once(state, ctx, params.buffer_id).await?,
+            TreeSelectDirection::Contract => {
+                cursor_contract_once(state, ctx, params.buffer_id).await?
+            }
+        };
         if last == Some(r) {
             break;
         }
@@ -6619,15 +6513,15 @@ pub async fn cursor_expand(
 async fn cursor_expand_once(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: &CursorBufferOnlyParams,
+    buffer_id: BufferId,
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
         .buffers
-        .get(&params.buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
-    let key = (client_id, params.buffer_id);
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let key = (client_id, buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
 
     let Some(syntax) = buf.syntax.as_ref() else {
@@ -6676,8 +6570,8 @@ async fn cursor_expand_once(
         .entry(key)
         .or_default()
         .push(current);
-    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let new_cursor = wrap_for_response(&s, client_id, params.buffer_id, new_cursor);
+    let search_update = collect_cursor_search_update(&mut s, client_id, buffer_id);
+    let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -6685,35 +6579,17 @@ async fn cursor_expand_once(
     Ok(new_cursor)
 }
 
-pub async fn cursor_contract(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: CursorBufferOnlyParams,
-) -> Result<CursorState, RpcError> {
-    // Repeat server-side, stopping once the cursor stops changing (top of the tree /
-    // single node — repeated presses are a no-op, not an error).
-    let mut last: Option<CursorState> = None;
-    for _ in 0..params.count.max(1) {
-        let r = cursor_contract_once(state, ctx, &params).await?;
-        if last == Some(r) {
-            break;
-        }
-        last = Some(r);
-    }
-    Ok(last.expect("count.max(1) iterations"))
-}
-
 async fn cursor_contract_once(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: &CursorBufferOnlyParams,
+    buffer_id: BufferId,
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    if !s.buffers.contains_key(&params.buffer_id) {
-        return Err(RpcError::buffer_not_found(params.buffer_id));
+    if !s.buffers.contains_key(&buffer_id) {
+        return Err(RpcError::buffer_not_found(buffer_id));
     }
-    let key = (client_id, params.buffer_id);
+    let key = (client_id, buffer_id);
     let prev = s
         .tree_selection_history
         .get_mut(&key)
@@ -6721,14 +6597,14 @@ async fn cursor_contract_once(
     let Some(prev) = prev else {
         // Nothing to contract back to.
         let cur = s.cursors.get(&key).copied().unwrap_or_default();
-        return Ok(wrap_for_response(&s, client_id, params.buffer_id, cur));
+        return Ok(wrap_for_response(&s, client_id, buffer_id, cur));
     };
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     s.cursors.insert(key, prev);
     s.record_motion(key, current, prev);
     s.virtual_col.remove(&key);
-    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let prev = wrap_for_response(&s, client_id, params.buffer_id, prev);
+    let search_update = collect_cursor_search_update(&mut s, client_id, buffer_id);
+    let prev = wrap_for_response(&s, client_id, buffer_id, prev);
     drop(s);
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
@@ -6775,7 +6651,9 @@ fn resolve_transform_case(
     let (start_char, end_char, first_line, last_line) = if was_point {
         let (start_pos, end_pos) = motion::word_run(buf, cursor.position);
         let sc = motion::pos_to_char(buf, start_pos);
-        let ec = motion::pos_to_char(buf, end_pos).saturating_add(1).min(total);
+        let ec = motion::pos_to_char(buf, end_pos)
+            .saturating_add(1)
+            .min(total);
         (sc, ec, start_pos.line, end_pos.line)
     } else {
         let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
@@ -7057,7 +6935,7 @@ pub async fn input_transform_case(
     .await
 }
 
-pub async fn input_undo(
+pub async fn edit_undo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: CountedEditParams,
@@ -7065,7 +6943,7 @@ pub async fn input_undo(
     undo_redo_counted(state, ctx, params, UndoDirection::Undo).await
 }
 
-pub async fn input_redo(
+pub async fn edit_redo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: CountedEditParams,
@@ -8068,33 +7946,16 @@ fn resolve_number_edit(
         .map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
 }
 
-pub async fn input_increment_number(
+/// `Ctrl-e` / `Ctrl-Alt-e`: shift the cursor's number by `delta` in a single edit (so `3` +
+/// `Ctrl-e` is one undo step adding 3). Prechecks for a number at/after the cursor so a miss is a
+/// clean no-op rather than an empty undo entry, mirroring `input_unsurround`.
+pub async fn input_adjust_number(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: CountedEditParams,
-) -> Result<EditResult, RpcError> {
-    adjust_number(state, ctx, params, 1).await
-}
-
-pub async fn input_decrement_number(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: CountedEditParams,
-) -> Result<EditResult, RpcError> {
-    adjust_number(state, ctx, params, -1).await
-}
-
-/// `Ctrl-e` / `Ctrl-Alt-e`: shift the cursor's number by `step * count` in a single edit (so `3` +
-/// `Ctrl-e` is one undo step). Prechecks for a number at/after the cursor so a miss is a clean
-/// no-op rather than an empty undo entry, mirroring `input_unsurround`.
-async fn adjust_number(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: CountedEditParams,
-    step: i64,
+    params: InputAdjustNumberParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
-    let delta = step * i64::from(params.count.max(1));
+    let delta = i64::from(params.delta);
     {
         let s = state.lock().await;
         let buf = s

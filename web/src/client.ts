@@ -1,5 +1,5 @@
 //! WebSocket JSON-RPC 2.0 client. Mirrors the TUI's client.rs split: request/response by id, plus
-//! a notification callback for server-pushed messages (viewport/lines_changed, cursor/update, …).
+//! a notification callback for server-pushed messages (viewport/lines_changed, buffer/state, …).
 //!
 //! Reconnection: a dropped socket auto-reconnects with backoff. Because the server assigns a fresh
 //! client_id per connection (so cursor/selection/undo/viewport/picker state is per-connection), the

@@ -23,11 +23,11 @@ use aether_protocol::buffer::{
 };
 use aether_protocol::cursor::Direction;
 use aether_protocol::cursor::{
-    CursorBufferOnlyParams, CursorContract, CursorExpand, CursorMove, CursorMoveParams, CursorRedo,
-    CursorSelectAll, CursorSelectAllParams, CursorSelectLine, CursorSelectLineParams,
-    CursorSelectWord, CursorSelectWordParams, CursorSet, CursorSetParams, CursorState,
-    CursorSwapAnchor, CursorSwapAnchorParams, CursorUndo, CursorUndoParams, CursorUndoResult,
-    Granularity, Motion, SelectionEdge,
+    CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
+    CursorSelectLine, CursorSelectLineParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
+    CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorTreeSelect,
+    CursorTreeSelectParams, CursorUndo, CursorUndoParams, CursorUndoResult, Granularity, Motion,
+    SelectionEdge, TreeSelectDirection,
 };
 use aether_protocol::directory::{
     DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryList,
@@ -42,13 +42,13 @@ use aether_protocol::git::{
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputBackspace, InputChangeLine,
-    InputDecrementNumber, InputDedent, InputDelete, InputDeleteLine, InputIncrementNumber,
-    InputIndent, InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent,
-    InputOpenLine, InputOpenLineParams, InputRedo, InputReplaceLine, InputReplaceLineParams,
-    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment,
-    InputTransformCase, InputTransformCaseParams, InputUndo, InputUnsurround, InputUnsurroundParams,
-    LineSide, UndoResult,
+    BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
+    InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChangeLine, InputDedent,
+    InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
+    InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams,
+    InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams, InputText,
+    InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
+    InputUnsurround, InputUnsurroundParams, LineSide, UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -58,7 +58,7 @@ use aether_protocol::lsp::{
     LspRestartServerParams, LspServerStatus, LspStatusChanged,
 };
 use aether_protocol::nav::NavStepResult;
-use aether_protocol::nav::{NavBack, NavForward, NavStepParams};
+use aether_protocol::nav::{NavStep, NavStepParams};
 use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate,
@@ -70,13 +70,13 @@ use aether_protocol::picker::{
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectAddRoot,
     ProjectAddRootParams, ProjectCreate, ProjectCreateParams, ProjectDelete, ProjectDeleteParams,
-    ProjectInfo, ProjectOpenPath, ProjectOpenPathParams, ProjectRemoveRoot, ProjectRemoveRootParams,
-    ProjectRemoveRootResult, ProjectRename, ProjectRenameParams, ProjectRenamed,
-    ProjectRenamedParams,
+    ProjectInfo, ProjectOpenPath, ProjectOpenPathParams, ProjectRemoveRoot,
+    ProjectRemoveRootParams, ProjectRemoveRootResult, ProjectRename, ProjectRenameParams,
+    ProjectRenamed, ProjectRenamedParams,
 };
 use aether_protocol::search::{
-    SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
-    SearchSet, SearchSetParams, SearchSetResult, SearchStateChanged, SearchSummary,
+    SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
+    SearchStateChanged, SearchStep, SearchStepParams, SearchSummary,
 };
 use aether_protocol::settings::{
     AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
@@ -3610,17 +3610,17 @@ impl Session {
         // Revive + count ride the nav RPC itself (docs/protocol-composites.md, I): the
         // server re-sets the query first (skipping the step when it has no matches), then
         // steps `count` times.
-        let params = SearchNavParams {
-            buffer_id: self.buffer.buffer_id,
-            extend,
-            count,
-            set_query: revive,
-            options: self.search.options,
-        };
-        match direction {
-            Direction::Forward => self.request_str::<SearchNext>(params, Event::SearchNav),
-            Direction::Backward => self.request_str::<SearchPrev>(params, Event::SearchNav),
-        }
+        self.request_str::<SearchStep>(
+            SearchStepParams {
+                buffer_id: self.buffer.buffer_id,
+                direction,
+                extend,
+                count,
+                set_query: revive,
+                options: self.search.options,
+            },
+            Event::SearchNav,
+        )
     }
 
     /// `Alt-/`: search for the selected text, literally — the server derives and escapes
@@ -4863,8 +4863,8 @@ impl Session {
                     Event::CursorMsg,
                 )
             }
-            A::TreeExpand => self.repeat_cursor::<CursorExpand>(count),
-            A::TreeContract => self.repeat_cursor::<CursorContract>(count),
+            A::TreeExpand => self.tree_select(TreeSelectDirection::Expand, count),
+            A::TreeContract => self.tree_select(TreeSelectDirection::Contract, count),
             A::MotionUndo => self.motion_history::<CursorUndo>(count),
             A::MotionRedo => self.motion_history::<CursorRedo>(count),
             A::RepeatMotion => {
@@ -4923,11 +4923,18 @@ impl Session {
                     forward,
                     result: res.map_err(|e| e.to_string()),
                 };
-                if forward {
-                    self.request::<NavForward>(NavStepParams { buffer_id }, f)
+                let direction = if forward {
+                    Direction::Forward
                 } else {
-                    self.request::<NavBack>(NavStepParams { buffer_id }, f)
-                }
+                    Direction::Backward
+                };
+                self.request::<NavStep>(
+                    NavStepParams {
+                        buffer_id,
+                        direction,
+                    },
+                    f,
+                )
             }
 
             // ---- mode transitions ----
@@ -4965,8 +4972,8 @@ impl Session {
                 count: 1,
             }),
             A::DeleteLine => self.edit::<InputDeleteLine>(BufferOnlyParams { buffer_id }),
-            A::Undo => self.undo_redo::<InputUndo>(count),
-            A::Redo => self.undo_redo::<InputRedo>(count),
+            A::Undo => self.undo_redo::<EditUndo>(count),
+            A::Redo => self.undo_redo::<EditRedo>(count),
             A::MoveLines(direction) => self.request_str::<InputMoveLines>(
                 InputMoveLinesParams {
                     buffer_id,
@@ -4978,8 +4985,14 @@ impl Session {
             A::JoinLines => self.repeat_edit::<InputJoinLines>(count),
             A::Indent => self.repeat_edit::<InputIndent>(count),
             A::Dedent => self.repeat_edit::<InputDedent>(count),
-            A::IncrementNumber => self.repeat_edit::<InputIncrementNumber>(count),
-            A::DecrementNumber => self.repeat_edit::<InputDecrementNumber>(count),
+            A::IncrementNumber => self.edit::<InputAdjustNumber>(InputAdjustNumberParams {
+                buffer_id,
+                delta: count as i32,
+            }),
+            A::DecrementNumber => self.edit::<InputAdjustNumber>(InputAdjustNumberParams {
+                buffer_id,
+                delta: -(count as i32),
+            }),
             A::ToggleComment => self.edit::<InputToggleComment>(BufferOnlyParams { buffer_id }),
             A::OpenLineBelow | A::OpenLineAbove => {
                 // Vim's `o`/`O` as one server-side edit (park, open, land — smart indent
@@ -5056,7 +5069,9 @@ impl Session {
             A::OpenPath => {
                 // Open the project-agnostic path overlay (empty field). The shell focuses it and
                 // syncs typed text via `open_path_set_input`; Enter opens via `project/open_path`.
-                self.prompt = Some(Prompt::OpenPath(crate::session::TextField::new(String::new())));
+                self.prompt = Some(Prompt::OpenPath(crate::session::TextField::new(
+                    String::new(),
+                )));
                 Effects::none()
             }
             A::Reload => {
@@ -5240,13 +5255,11 @@ impl Session {
 
     /// Counted tree expand/contract — repeats server-side, stopping when the cursor stops
     /// changing.
-    fn repeat_cursor<M>(&mut self, count: u32) -> Effects
-    where
-        M: RpcMethod<Params = CursorBufferOnlyParams, Result = CursorState> + 'static,
-    {
-        self.request_str::<M>(
-            CursorBufferOnlyParams {
+    fn tree_select(&mut self, direction: TreeSelectDirection, count: u32) -> Effects {
+        self.request_str::<CursorTreeSelect>(
+            CursorTreeSelectParams {
                 buffer_id: self.buffer.buffer_id,
+                direction,
                 count,
             },
             Event::CursorMsg,

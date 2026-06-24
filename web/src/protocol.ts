@@ -203,7 +203,7 @@ export interface LspProgress {
 export type LspStatus =
   | { state: "starting" | "initializing" | "ready" | "restarting" | "stopped" }
   | { state: "crashed"; code?: number | null; message: string };
-/** lsp/status_changed payload (also a row in lsp/server_status). */
+/** lsp/status_changed payload (also a row in the LSP servers picker). */
 export interface LspServerStatus {
   name: string;
   language: string;

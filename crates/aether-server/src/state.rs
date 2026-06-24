@@ -67,8 +67,9 @@ pub struct ServerState {
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
     /// Per-client navigation history (the jump list): back/forward across files, browser-style.
     /// Distinct from `motion_history` (per-buffer cursor undo via `z`): coarse, cross-buffer, and
-    /// untouched by edits or `z`. Recorded on qualifying jumps (see `nav/record`); driven by the
-    /// TUI's `nav/back`/`nav/forward`. The web client rides native browser history instead, so its
+    /// untouched by edits or `z`. Recorded on qualifying jumps (the navigating `buffer/open`'s
+    /// `record_nav_from`); driven by the TUI's `nav/back`/`nav/forward`. The web client rides
+    /// native browser history instead, so its
     /// entries here go unused — but recording stays uniform across clients. Cleared on disconnect.
     pub nav_history: HashMap<ClientId, NavHistory>,
     /// Per-buffer *unstaged* diff hunks: the live buffer against its **index** content
@@ -1479,7 +1480,10 @@ mod project_state_tests {
         // Project map re-keyed; the entry's own name field follows.
         assert!(!s.projects.contains_key("old"));
         assert_eq!(s.projects.get("new").map(|p| p.id.as_str()), Some("new"));
-        assert_eq!(s.projects.get("new").and_then(|p| p.name.as_deref()), Some("new"));
+        assert_eq!(
+            s.projects.get("new").and_then(|p| p.name.as_deref()),
+            Some("new")
+        );
         assert!(s.projects.contains_key("other"));
 
         // The buffer is re-pointed but still present (nothing closed); the unrelated one is left.

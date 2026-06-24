@@ -18,27 +18,23 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameLine,
-    GitBlameLineParams, GitBlameLineResult, GitCommitInfo, GitCommitInfoParams,
-    GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBlameLineParams, GitBlameLineResult, GitNavigateHunk, GitNavigateHunkParams,
+    GitNavigateHunkResult, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputBackspace, InputDecrementNumber,
-    InputDedent, InputIncrementNumber, InputIndent, InputJoinLines, InputMoveLines,
-    InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams, InputRedo,
-    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment,
-    InputTransformCase, InputTransformCaseParams, InputUndo, InputUnsurround, InputUnsurroundParams,
-    LineSide, SurroundTarget, UndoResult,
+    BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
+    InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputDedent, InputIndent,
+    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine,
+    InputOpenLineParams, InputSurround, InputSurroundParams, InputText, InputTextParams,
+    InputToggleComment, InputTransformCase, InputTransformCaseParams, InputUnsurround,
+    InputUnsurroundParams, LineSide, SurroundTarget, UndoResult,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
     LspGotoDefinitionResult, LspHover, LspHoverResult, LspReadiness, LspServerStatus, LspStatus,
     LspStatusChanged,
 };
-use aether_protocol::nav::{
-    NavBack, NavForward, NavGoto, NavGotoParams, NavRecord, NavRecordParams, NavRecordResult,
-    NavStepParams, NavStepResult,
-};
+use aether_protocol::nav::{NavGoto, NavGotoParams, NavStep, NavStepParams, NavStepResult};
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate,
     PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem,
@@ -50,16 +46,16 @@ use aether_protocol::project::{
     ProjectDeleteParams, ProjectOpenPath, ProjectOpenPathParams,
 };
 use aether_protocol::search::{
-    SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
-    SearchSet, SearchSetParams, SearchSetResult,
+    SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
+    SearchStep, SearchStepParams,
 };
 use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker};
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
     ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportScrollToRow,
     ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportUnsubscribe,
-    ViewportUnsubscribeParams, ViewportWindowResult, VirtualRowKind, WrapMode,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, VirtualRowKind,
+    WrapMode,
 };
 use aether_protocol::LogicalPosition;
 use aether_server::{spawn_for_test, spawn_for_test_multi};
@@ -1457,7 +1453,7 @@ async fn select_word_on_last_word_is_a_stable_end_state() {
 #[tokio::test]
 async fn buffer_open_composite_records_nav_and_primes_search() {
     // docs/protocol-composites.md, A: `record_nav_from` + `prime_search` fold the old
-    // NavRecord -> BufferOpen -> SearchSet client chain into one open.
+    // nav/record -> buffer/open -> search/set client chain into one open.
     let (_server, mut ws, origin_id) = setup_with_buffer("alpha beta\n").await;
 
     let opened: BufferOpenResult = send_request::<BufferOpen>(
@@ -1486,10 +1482,11 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
     // The search was primed: stepping works without a prior search/set. ("nd" has no match
     // in an empty created buffer — prime a buffer with content instead via reopening the
     // origin.) The primed state exists even with zero matches; total reflects it.
-    let nav: SearchNavResult = send_request::<SearchNext>(
+    let nav: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id: opened.buffer_id,
             extend: false,
             count: 1,
@@ -1504,11 +1501,12 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
     );
 
     // The origin was recorded: nav/back from the new buffer returns to it.
-    let back: NavStepResult = send_request::<NavBack>(
+    let back: NavStepResult = send_request::<NavStep>(
         &mut ws,
         12,
         &NavStepParams {
             buffer_id: opened.buffer_id,
+            direction: Direction::Backward,
         },
     )
     .await;
@@ -1542,10 +1540,11 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
         .expect("a primed open carries its search summary");
     assert_eq!(primed.total, 1);
     assert_eq!(primed.current_index, 1, "the cursor sits on the match");
-    let nav: SearchNavResult = send_request::<SearchNext>(
+    let nav: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         14,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id: origin_id,
             extend: false,
             count: 1,
@@ -1838,6 +1837,12 @@ async fn git_blame_line_include_commit_info_resolves_in_one_trip() {
     assert!(!blame.is_uncommitted);
     let info = r.commit_info.expect("details resolved in the same trip");
     assert_eq!(info.message.trim(), "init commit");
+    assert_eq!(info.author, "Test");
+    assert!(info.commit.starts_with(&blame.commit)); // full hash extends the abbreviated one
+                                                     // Date is pre-formatted "YYYY-MM-DD HH:MM:SS ±HHMM" (25 chars) in the commit's own timezone.
+    assert_eq!(info.date.len(), 25, "unexpected date format: {}", info.date);
+    assert!(info.date.starts_with("20"));
+    assert!(info.date[20..].starts_with(['+', '-']));
 
     // An uncommitted line never gets details, even when asked.
     send_request::<InputText>(
@@ -1936,10 +1941,11 @@ async fn search_nav_count_and_revive() {
     let (_server, mut ws, buffer_id) = setup_with_buffer("x a x b x c\n").await;
     // count: step two matches forward in one trip (cursor starts on the first x, so two
     // steps land on the third; wrapping semantics untouched).
-    let r: SearchNavResult = send_request::<SearchNext>(
+    let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         10,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: false,
             count: 2,
@@ -1956,10 +1962,11 @@ async fn search_nav_count_and_revive() {
     );
 
     // Reviving a query with no matches: the step is skipped, zero summary comes back.
-    let r: SearchNavResult = send_request::<SearchNext>(
+    let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: false,
             count: 1,
@@ -1991,7 +1998,7 @@ async fn counted_edits_run_server_side() {
 
     // Counted undo larger than the stack: stops when exhausted (applied: false comes back),
     // buffer fully reverted.
-    let r: UndoResult = send_request::<InputUndo>(
+    let r: UndoResult = send_request::<EditUndo>(
         &mut ws,
         12,
         &CountedEditParams {
@@ -3812,7 +3819,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
 
     // Undo: should revert "XY", cursor back to col 3, and (since saved_revision is 0) the
     // revision drops to 0 — client derives `dirty == false` from that.
-    let undo: UndoResult = send_request::<InputUndo>(
+    let undo: UndoResult = send_request::<EditUndo>(
         &mut ws,
         13,
         &CountedEditParams {
@@ -3832,7 +3839,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     );
 
     // Redo: re-applies "XY", revision advances past saved.
-    let redo: UndoResult = send_request::<InputRedo>(
+    let redo: UndoResult = send_request::<EditRedo>(
         &mut ws,
         14,
         &CountedEditParams {
@@ -3856,7 +3863,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
 #[tokio::test]
 async fn undo_on_empty_stack_returns_applied_false() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hi\n").await;
-    let r: UndoResult = send_request::<InputUndo>(
+    let r: UndoResult = send_request::<EditUndo>(
         &mut ws,
         10,
         &CountedEditParams {
@@ -3939,7 +3946,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
     let _ = expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
 
     // Undo: should put "X" back, taking us back to the saved revision → derived dirty == false.
-    let undo: UndoResult = send_request::<InputUndo>(
+    let undo: UndoResult = send_request::<EditUndo>(
         &mut ws,
         15,
         &CountedEditParams {
@@ -6239,12 +6246,12 @@ async fn increment_number_selects_the_result() {
         },
     )
     .await;
-    let r: EditResult = send_request::<InputIncrementNumber>(
+    let r: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: 1,
         },
     )
     .await;
@@ -6275,12 +6282,12 @@ async fn increment_point_adjusts_only_the_selected_char() {
         },
     )
     .await;
-    let r: EditResult = send_request::<InputIncrementNumber>(
+    let r: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: 1,
         },
     )
     .await;
@@ -6308,12 +6315,12 @@ async fn increment_selection_grows_with_digit_count() {
         },
     )
     .await;
-    let r: EditResult = send_request::<InputIncrementNumber>(
+    let r: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: 1,
         },
     )
     .await;
@@ -6322,12 +6329,12 @@ async fn increment_selection_grows_with_digit_count() {
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 3 });
 
     // The maintained selection lets a follow-up press operate on the same number.
-    let r: EditResult = send_request::<InputIncrementNumber>(
+    let r: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         13,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: 1,
         },
     )
     .await;
@@ -6353,12 +6360,12 @@ async fn decrement_selection_shrinks_with_digit_count() {
         },
     )
     .await;
-    let r: EditResult = send_request::<InputDecrementNumber>(
+    let r: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: -1,
         },
     )
     .await;
@@ -6384,12 +6391,12 @@ async fn increment_partial_selection_adjusts_only_selected_digits() {
         },
     )
     .await;
-    let r: EditResult = send_request::<InputIncrementNumber>(
+    let r: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: 1,
         },
     )
     .await;
@@ -6416,12 +6423,12 @@ async fn increment_non_integer_selection_is_a_noop() {
         },
     )
     .await;
-    let _: EditResult = send_request::<InputIncrementNumber>(
+    let _: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: 1,
         },
     )
     .await;
@@ -6446,12 +6453,12 @@ async fn increment_never_scans_to_a_number_elsewhere() {
         },
     )
     .await;
-    let _: EditResult = send_request::<InputIncrementNumber>(
+    let _: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: 1,
         },
     )
     .await;
@@ -6477,12 +6484,12 @@ async fn increment_single_digit_after_unselected_minus_is_not_inverted() {
         },
     )
     .await;
-    let _: EditResult = send_request::<InputIncrementNumber>(
+    let _: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: 1,
         },
     )
     .await;
@@ -6505,12 +6512,12 @@ async fn decrement_crosses_zero_into_negative() {
         },
     )
     .await;
-    let _: EditResult = send_request::<InputDecrementNumber>(
+    let _: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: -1,
         },
     )
     .await;
@@ -6535,17 +6542,17 @@ async fn increment_count_applies_in_one_step() {
         },
     )
     .await;
-    let _: EditResult = send_request::<InputIncrementNumber>(
+    let _: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 5,
+            delta: 5,
         },
     )
     .await;
     assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "v 15\n");
-    let _: aether_protocol::input::UndoResult = send_request::<InputUndo>(
+    let _: aether_protocol::input::UndoResult = send_request::<EditUndo>(
         &mut ws,
         13,
         &CountedEditParams {
@@ -6573,12 +6580,12 @@ async fn increment_with_no_number_is_a_noop() {
         },
     )
     .await;
-    let _: EditResult = send_request::<InputIncrementNumber>(
+    let _: EditResult = send_request::<InputAdjustNumber>(
         &mut ws,
         11,
-        &CountedEditParams {
+        &InputAdjustNumberParams {
             buffer_id,
-            count: 1,
+            delta: 1,
         },
     )
     .await;
@@ -8445,10 +8452,11 @@ async fn search_next_cycles_forward_and_wraps() {
         },
     )
     .await;
-    let r1: SearchNavResult = send_request::<SearchNext>(
+    let r1: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8459,10 +8467,11 @@ async fn search_next_cycles_forward_and_wraps() {
     .await;
     assert_eq!(r1.summary.current_index, 2);
     assert_eq!(r1.cursor.anchor, LogicalPosition { line: 0, col: 8 });
-    let r2: SearchNavResult = send_request::<SearchNext>(
+    let r2: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         12,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8473,10 +8482,11 @@ async fn search_next_cycles_forward_and_wraps() {
     .await;
     assert_eq!(r2.summary.current_index, 3);
     // Wrap.
-    let r3: SearchNavResult = send_request::<SearchNext>(
+    let r3: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         13,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8507,10 +8517,11 @@ async fn search_prev_cycles_backward_with_wrap() {
     )
     .await;
     // From the first match, prev wraps to the last.
-    let r: SearchNavResult = send_request::<SearchPrev>(
+    let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Backward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8543,10 +8554,11 @@ async fn search_prev_orients_backward() {
     .await;
     // Backward (non-extend) re-selects the previous match oriented by travel direction: the head
     // leads on the start char (cursor before anchor), the anchor trails on the last char.
-    let r: SearchNavResult = send_request::<SearchPrev>(
+    let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Backward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8582,10 +8594,11 @@ async fn search_next_wrap_stays_forward_oriented() {
     // From the last match, forward `next` wraps physically backward to the first match — but the
     // orientation follows logical travel (forward), so it stays forward-oriented: anchor on the
     // start, head on the last char. The wrap doesn't flip orientation.
-    let r: SearchNavResult = send_request::<SearchNext>(
+    let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8621,10 +8634,11 @@ async fn search_prev_wrap_stays_backward_oriented() {
     // From the first match, backward `prev` wraps physically forward to the last match — orientation
     // still follows logical travel (backward), so it stays backward-oriented: head on the start,
     // anchor on the last char.
-    let r: SearchNavResult = send_request::<SearchPrev>(
+    let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Backward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8661,10 +8675,11 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
     )
     .await;
     // Alt-n: backward-oriented selection of the first match — anchor (0,2), head (0,0).
-    let back: SearchNavResult = send_request::<SearchPrev>(
+    let back: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Backward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8677,10 +8692,11 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
     assert_eq!(back.cursor.position, LogicalPosition { line: 0, col: 0 });
     // Shift-n: extend forward to the second match. Crosses the pivot, re-anchors to the previous
     // head (0,0), so the selection grows to (0,0)..(0,10) — both matches covered, not just the second.
-    let fwd: SearchNavResult = send_request::<SearchNext>(
+    let fwd: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         12,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: true,
             count: 1,
@@ -8715,10 +8731,11 @@ async fn search_extend_resets_to_single_match_on_wrap() {
     )
     .await;
     // Start on the second match (0,4). Extend forward twice: spans matches 2..4 (0,4)..(0,22).
-    let _: SearchNavResult = send_request::<SearchNext>(
+    let _: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: true,
             count: 1,
@@ -8727,10 +8744,11 @@ async fn search_extend_resets_to_single_match_on_wrap() {
         },
     )
     .await;
-    let pre: SearchNavResult = send_request::<SearchNext>(
+    let pre: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         12,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: true,
             count: 1,
@@ -8743,10 +8761,11 @@ async fn search_extend_resets_to_single_match_on_wrap() {
     assert_eq!(pre.cursor.position, LogicalPosition { line: 0, col: 22 });
     // One more extend wraps past the end. Rather than re-anchoring across the wrap (which would
     // engulf (0,0)..(0,22)), it resets to just the first match, forward-oriented.
-    let wrap: SearchNavResult = send_request::<SearchNext>(
+    let wrap: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         13,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: true,
             count: 1,
@@ -8782,10 +8801,11 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
     )
     .await;
     // On the first match; `next` → second match (forward-oriented, head at (0,10)).
-    let fwd: SearchNavResult = send_request::<SearchNext>(
+    let fwd: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8796,10 +8816,11 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
     .await;
     assert_eq!(fwd.summary.current_index, 2);
     // Reverse: `prev` steps to the first match, not back onto the second.
-    let back: SearchNavResult = send_request::<SearchPrev>(
+    let back: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         12,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Backward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8832,10 +8853,11 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
     )
     .await;
     // Extend forward: selection now spans the first two matches (anchor (0,0), head (0,6)).
-    let _: SearchNavResult = send_request::<SearchNext>(
+    let _: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: true,
             count: 1,
@@ -8845,10 +8867,11 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
     )
     .await;
     // Plain next: steps off the whole selection to the third match at (0,12), not the second (0,4).
-    let r: SearchNavResult = send_request::<SearchNext>(
+    let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         12,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: false,
             count: 1,
@@ -8883,10 +8906,11 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
     .await;
     // Cursor sits on the first match: anchor (0,0), head (0,2).
     // Extend-next pins the anchor and moves only the head onto the second match's end.
-    let r1: SearchNavResult = send_request::<SearchNext>(
+    let r1: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: true,
             count: 1,
@@ -8902,10 +8926,11 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
     assert_eq!(r1.summary.current_index, 2);
     // A second extend-next keeps the same anchor and steps the head to the third match — i.e. it
     // makes progress rather than re-finding the second match.
-    let r2: SearchNavResult = send_request::<SearchNext>(
+    let r2: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         12,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: true,
             count: 1,
@@ -8941,10 +8966,11 @@ async fn search_prev_extend_keeps_anchor_and_grows_backward() {
     // the second match's start. Because that crosses the pivot (the head jumps from the right of the
     // anchor to its left), the anchor re-pins to the previous cursor position (1,2) so the third
     // match stays fully covered — the selection becomes (0,8)..(1,2), not (0,8)..(1,0).
-    let r: SearchNavResult = send_request::<SearchPrev>(
+    let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Backward,
             buffer_id,
             extend: true,
             count: 1,
@@ -8980,10 +9006,11 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
     .await;
     // On the second match: anchor (0,8), head (0,10). Extend-prev to the first match crosses the
     // pivot → anchor re-pins to (0,10), selection (0,0)..(0,10) (both matches covered).
-    let back: SearchNavResult = send_request::<SearchPrev>(
+    let back: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         11,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Backward,
             buffer_id,
             extend: true,
             count: 1,
@@ -8997,10 +9024,11 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
     // Now extend forward to the third match. This reverses again and crosses the pivot, so the
     // anchor re-pins to the previous cursor (0,0): the selection grows to (0,0)..(1,2), covering all
     // three matches, rather than shrinking back to just the third.
-    let fwd: SearchNavResult = send_request::<SearchNext>(
+    let fwd: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         12,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: true,
             count: 1,
@@ -9033,10 +9061,11 @@ async fn search_clear_removes_active_search() {
     .await;
     let _: () = send_request::<SearchClear>(&mut ws, 11, &SearchClearParams { buffer_id }).await;
     // After clear, n/prev should report no matches.
-    let r: SearchNavResult = send_request::<SearchNext>(
+    let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         12,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id,
             extend: false,
             count: 1,
@@ -13376,10 +13405,11 @@ async fn grep_navigate_open_composite_returns_opened_buffer() {
     );
 
     // The opened buffer's search is primed: stepping works immediately.
-    let nav: SearchNavResult = send_request::<SearchNext>(
+    let nav: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         23,
-        &SearchNavParams {
+        &SearchStepParams {
+            direction: Direction::Forward,
             buffer_id: opened.buffer_id,
             extend: false,
             count: 1,
@@ -13391,11 +13421,12 @@ async fn grep_navigate_open_composite_returns_opened_buffer() {
     assert!(nav.summary.total > 0, "search primed with the grep query");
 
     // And the origin was recorded: nav/back returns to main.rs.
-    let back: NavStepResult = send_request::<NavBack>(
+    let back: NavStepResult = send_request::<NavStep>(
         &mut ws,
         24,
         &NavStepParams {
             buffer_id: opened.buffer_id,
+            direction: Direction::Backward,
         },
     )
     .await;
@@ -16276,27 +16307,6 @@ async fn git_blame_line_reports_committed_author() {
     assert!(!blame.is_uncommitted);
     assert_eq!(blame.commit.len(), 7);
 
-    // The abbreviated hash from blame resolves to full commit details via `git/commit_info`.
-    let info_res: GitCommitInfoResult = send_request::<GitCommitInfo>(
-        &mut ws,
-        4,
-        &GitCommitInfoParams {
-            buffer_id: open.buffer_id,
-            commit: blame.commit.clone(),
-        },
-    )
-    .await;
-    let info = info_res
-        .info
-        .expect("blame hash should resolve to a commit");
-    assert_eq!(info.author, "Test");
-    assert_eq!(info.message, "init commit");
-    assert!(info.commit.starts_with(&blame.commit)); // full hash extends the abbreviated one
-                                                     // Date is pre-formatted "YYYY-MM-DD HH:MM:SS ±HHMM" (25 chars) in the commit's own timezone.
-    assert_eq!(info.date.len(), 25, "unexpected date format: {}", info.date);
-    assert!(info.date.starts_with("20"));
-    assert!(info.date[20..].starts_with(['+', '-']));
-
     drop(server);
 }
 
@@ -17136,7 +17146,7 @@ async fn apply_hunk_reverts_modification_and_is_undoable() {
     );
 
     // The revert is an ordinary edit: one undo step brings the change back.
-    let _: UndoResult = send_request::<InputUndo>(
+    let _: UndoResult = send_request::<EditUndo>(
         &mut ws,
         7,
         &CountedEditParams {
@@ -18254,7 +18264,7 @@ async fn lsp_diagnostics_clear_on_undo() {
     );
 
     // Undo — the fix must send didChange so the server re-analyzes the reverted text and clears it.
-    let undo: UndoResult = send_request::<InputUndo>(
+    let undo: UndoResult = send_request::<EditUndo>(
         &mut ws,
         13,
         &CountedEditParams {
@@ -19126,23 +19136,19 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
 // -------- nav (jump list) ------------------------------------------------------------------------
 
 /// Open + viewport-subscribe a file, returning (buffer_id, viewport_id). Mirrors a client switching
-/// buffers: the caller unsubscribes the previous viewport so the client only ever has one.
+/// buffers: the client only ever has one viewport, since subscribing supersedes (and drops) the
+/// previous one server-side, so there's no explicit unsubscribe. `record_from` is the origin
+/// buffer for a qualifying jump — the open records it onto the nav back-stack (`record_nav_from`,
+/// composite A); pass `None` when the open is just following a back/forward step (which must not
+/// record).
 async fn nav_open_file(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     id: u64,
     file: &str,
-    prev_vp: Option<u64>,
+    record_from: Option<u64>,
 ) -> (u64, u64) {
-    if let Some(vp) = prev_vp {
-        send_request::<ViewportUnsubscribe>(
-            ws,
-            id + 2,
-            &ViewportUnsubscribeParams { viewport_id: vp },
-        )
-        .await;
-    }
     let open: BufferOpenResult = send_request::<BufferOpen>(
         ws,
         id,
@@ -19154,6 +19160,7 @@ async fn nav_open_file(
             language: None,
             create_if_missing: false,
             jump_to: None,
+            record_nav_from: record_from,
             ..Default::default()
         },
     )
@@ -19203,7 +19210,7 @@ async fn nav_back_and_forward_across_files() {
     .await;
 
     // In a.txt, make a selection on line 1 (anchor before cursor) so we can prove it's restored.
-    let (buf_a, vp_a) = nav_open_file(&mut ws, 10, "a.txt", None).await;
+    let (buf_a, _vp_a) = nav_open_file(&mut ws, 10, "a.txt", None).await;
     send_request::<CursorSet>(
         &mut ws,
         20,
@@ -19216,33 +19223,52 @@ async fn nav_back_and_forward_across_files() {
     )
     .await;
 
-    // Record the jump origin, then jump to b.txt (dropping a's viewport, as a real client does).
-    let rec: NavRecordResult =
-        send_request::<NavRecord>(&mut ws, 30, &NavRecordParams { buffer_id: buf_a }).await;
-    assert!(rec.recorded);
-    let (buf_b, vp_b) = nav_open_file(&mut ws, 40, "b.txt", Some(vp_a)).await;
+    // Jump to b.txt; the open records the origin (buf_a) onto the back-stack via `record_nav_from`.
+    let (buf_b, _vp_b) = nav_open_file(&mut ws, 40, "b.txt", Some(buf_a)).await;
 
     // Back (from b) → returns a.txt with the selection restored.
-    let back: NavStepResult =
-        send_request::<NavBack>(&mut ws, 50, &NavStepParams { buffer_id: buf_b }).await;
+    let back: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        50,
+        &NavStepParams {
+            buffer_id: buf_b,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
     let target = back.target.expect("back should move to a.txt");
     assert_eq!(target.buffer_id, buf_a);
     assert_eq!(target.cursor.position, LogicalPosition { line: 1, col: 4 });
     assert_eq!(target.cursor.anchor, LogicalPosition { line: 1, col: 1 });
 
-    // Re-point the viewport to a (the client follows the target), then forward (from a) → b.txt.
-    let (_a_again, vp_a2) = nav_open_file(&mut ws, 60, "a.txt", Some(vp_b)).await;
-    let fwd: NavStepResult =
-        send_request::<NavForward>(&mut ws, 70, &NavStepParams { buffer_id: buf_a }).await;
+    // Re-point the viewport to a (the client follows the target — a back step never records),
+    // then forward (from a) → b.txt.
+    let (_a_again, _vp_a2) = nav_open_file(&mut ws, 60, "a.txt", None).await;
+    let fwd: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        70,
+        &NavStepParams {
+            buffer_id: buf_a,
+            direction: Direction::Forward,
+        },
+    )
+    .await;
     assert_eq!(
         fwd.target.expect("forward should move to b.txt").buffer_id,
         buf_b
     );
 
     // Re-point to b, then back again (from b) lands on a once more (stack intact).
-    let (_b_again, _vp_b2) = nav_open_file(&mut ws, 90, "b.txt", Some(vp_a2)).await;
-    let back2: NavStepResult =
-        send_request::<NavBack>(&mut ws, 80, &NavStepParams { buffer_id: buf_b }).await;
+    let (_b_again, _vp_b2) = nav_open_file(&mut ws, 90, "b.txt", None).await;
+    let back2: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        80,
+        &NavStepParams {
+            buffer_id: buf_b,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
     assert_eq!(back2.target.expect("back again to a.txt").buffer_id, buf_a);
 
     drop(server);
@@ -19270,8 +19296,15 @@ async fn nav_back_empty_is_noop() {
     .await;
     let (buf_a, _) = nav_open_file(&mut ws, 10, "a.txt", None).await;
 
-    let back: NavStepResult =
-        send_request::<NavBack>(&mut ws, 20, &NavStepParams { buffer_id: buf_a }).await;
+    let back: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        20,
+        &NavStepParams {
+            buffer_id: buf_a,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
     assert!(back.target.is_none());
     drop(server);
 }
@@ -20826,26 +20859,27 @@ async fn nav_back_reopens_closed_transient_as_transient() {
         send_request::<BufferOpen>(&mut ws, 2, &file_open_params("a.txt", Some(true))).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, 3, &transient_sub_params(a.buffer_id)).await;
-    // Record the jump origin (as the TUI does before a picker-driven switch), then switch.
-    let _: NavRecordResult = send_request::<NavRecord>(
+    // Switch to b.txt, recording the jump origin (a) on the open itself — the composite the TUI
+    // uses for a picker-driven switch (`record_nav_from`, composite A).
+    let b: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
-        4,
-        &NavRecordParams {
-            buffer_id: a.buffer_id,
+        5,
+        &BufferOpenParams {
+            record_nav_from: Some(a.buffer_id),
+            ..file_open_params("b.txt", None)
         },
     )
     .await;
-    let b: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, 5, &file_open_params("b.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, 6, &transient_sub_params(b.buffer_id)).await;
 
     // a is gone; nav/back reopens it by path, transient again.
-    let res: NavStepResult = send_request::<NavBack>(
+    let res: NavStepResult = send_request::<NavStep>(
         &mut ws,
         7,
         &NavStepParams {
             buffer_id: b.buffer_id,
+            direction: Direction::Backward,
         },
     )
     .await;

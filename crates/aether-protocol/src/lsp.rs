@@ -191,25 +191,6 @@ pub struct LspNavigateDiagnosticResult {
     pub moved: bool,
 }
 
-// ---- lsp/server_status --------------------------------------------------------------------------
-
-/// Snapshot of every language server for the client's active project. Drives the "LSP servers"
-/// status dialog.
-pub struct LspServerStatusList;
-impl RpcMethod for LspServerStatusList {
-    const NAME: &'static str = "lsp/server_status";
-    type Params = LspServerStatusParams;
-    type Result = LspServerStatusResult;
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct LspServerStatusParams {}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LspServerStatusResult {
-    pub servers: Vec<LspServerStatus>,
-}
-
 // ---- lsp/restart_server -------------------------------------------------------------------------
 
 /// Restart the language server for a given language: shut it down and respawn, then re-open every

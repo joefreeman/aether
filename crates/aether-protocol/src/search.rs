@@ -2,7 +2,7 @@
 //! per-`(client, buffer)` query + match list; the client just sees a summary and lets the server
 //! drive navigation. Visible match highlights ride along with viewport line renders.
 
-use crate::cursor::CursorState;
+use crate::cursor::{CursorState, Direction};
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::picker::MatchOptions;
 use crate::{BufferId, LogicalPosition};
@@ -75,26 +75,23 @@ pub struct SearchClearParams {
 
 // ---- search/next & search/prev ------------------------------------------------------------------
 
-/// Move the cursor to the next match after its current position (wraps to the first match at the
-/// buffer end). No-op if there's no active search or no matches. When `extend` is set the anchor
-/// stays put and only the cursor head moves to the match, growing the selection.
-pub struct SearchNext;
-impl RpcMethod for SearchNext {
-    const NAME: &'static str = "search/next";
-    type Params = SearchNavParams;
-    type Result = SearchNavResult;
-}
-
-pub struct SearchPrev;
-impl RpcMethod for SearchPrev {
-    const NAME: &'static str = "search/prev";
-    type Params = SearchNavParams;
+/// Step the cursor `count` matches in `direction` (`Forward` = next, `Backward` = prev), wrapping
+/// at the buffer ends. No-op if there's no active search or no matches. When `extend` is set the
+/// anchor stays put and only the cursor head moves to the match, growing the selection.
+pub struct SearchStep;
+impl RpcMethod for SearchStep {
+    const NAME: &'static str = "search/step";
+    type Params = SearchStepParams;
     type Result = SearchNavResult;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SearchNavParams {
+pub struct SearchStepParams {
     pub buffer_id: BufferId,
+    /// `Forward` steps to the next match (`n`), `Backward` to the previous (`N`). Defaults to
+    /// `Forward`, the common case, and is then omitted on the wire.
+    #[serde(default, skip_serializing_if = "is_forward")]
+    pub direction: Direction,
     /// Keep the current anchor and move only the cursor head onto the match (`Shift-n` /
     /// `Shift-Alt-n`), so the selection grows from the anchor to the match. When false the
     /// navigation re-selects just the match (anchor at its start, head at its end).
@@ -122,6 +119,11 @@ fn default_nav_count() -> u32 {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_one(n: &u32) -> bool {
     *n == 1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_forward(d: &Direction) -> bool {
+    matches!(d, Direction::Forward)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

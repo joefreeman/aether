@@ -15,27 +15,24 @@ use aether_protocol::buffer::{
     BufferClose, BufferCopy, BufferCut, BufferOpen, BufferReload, BufferSave, BufferSetTransient,
 };
 use aether_protocol::cursor::{
-    CursorContract, CursorExpand, CursorMove, CursorRedo, CursorSelectAll, CursorSelectLine,
-    CursorSelectWord, CursorSet, CursorSwapAnchor, CursorUndo,
+    CursorMove, CursorRedo, CursorSelectAll, CursorSelectLine, CursorSelectWord, CursorSet,
+    CursorSwapAnchor, CursorTreeSelect, CursorUndo,
 };
 use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
-use aether_protocol::git::{
-    GitApplyHunk, GitBlameLine, GitCommitInfo, GitNavigateHunk, GitSetDiffView,
-};
+use aether_protocol::git::{GitApplyHunk, GitBlameLine, GitNavigateHunk, GitSetDiffView};
 use aether_protocol::input::{
-    InputBackspace, InputChangeLine, InputDecrementNumber, InputDedent, InputDelete,
-    InputDeleteLine, InputIncrementNumber, InputIndent, InputJoinLines, InputMoveLines,
-    InputNewlineAndIndent, InputOpenLine, InputRedo, InputReplaceLine, InputSurround, InputText,
-    InputToggleComment, InputTransformCase, InputUndo, InputUnsurround,
+    EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputChangeLine, InputDedent,
+    InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
+    InputNewlineAndIndent, InputOpenLine, InputReplaceLine, InputSurround, InputText,
+    InputToggleComment, InputTransformCase, InputUnsurround,
 };
 use aether_protocol::lsp::{
     LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic, LspRestartServer,
-    LspServerStatusList,
 };
-use aether_protocol::nav::{NavBack, NavForward, NavGoto, NavRecord};
+use aether_protocol::nav::{NavGoto, NavStep};
 use aether_protocol::path::PathDelete;
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerHide, PickerQuery, PickerSectionJump, PickerSelect, PickerView,
@@ -44,11 +41,10 @@ use aether_protocol::project::{
     ProjectActivate, ProjectAddRoot, ProjectCreate, ProjectDelete, ProjectList, ProjectOpenPath,
     ProjectRemoveRoot, ProjectRename,
 };
-use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
+use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
-    ViewportUnsubscribe,
 };
 use aether_protocol::ClientId;
 use anyhow::Context;
@@ -375,9 +371,9 @@ async fn dispatch(
     }
 
     match method {
-        ProjectList::NAME => run!(ProjectList, handlers::project_list),
         SettingsGet::NAME => run!(SettingsGet, handlers::settings_get),
         SettingsSet::NAME => run!(SettingsSet, handlers::settings_set),
+        ProjectList::NAME => run!(ProjectList, handlers::project_list),
         ProjectActivate::NAME => run!(ProjectActivate, handlers::project_activate),
         ProjectCreate::NAME => run!(ProjectCreate, handlers::project_create),
         ProjectOpenPath::NAME => run!(ProjectOpenPath, handlers::project_open_path),
@@ -391,14 +387,11 @@ async fn dispatch(
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),
         BufferSetTransient::NAME => run!(BufferSetTransient, handlers::buffer_set_transient),
         BufferClose::NAME => run!(BufferClose, handlers::buffer_close),
-        NavRecord::NAME => run!(NavRecord, handlers::nav_record),
-        NavBack::NAME => run!(NavBack, handlers::nav_back),
-        NavForward::NAME => run!(NavForward, handlers::nav_forward),
+        NavStep::NAME => run!(NavStep, handlers::nav_step),
         NavGoto::NAME => run!(NavGoto, handlers::nav_goto),
         SearchSet::NAME => run!(SearchSet, handlers::search_set),
         SearchClear::NAME => run!(SearchClear, handlers::search_clear),
-        SearchNext::NAME => run!(SearchNext, handlers::search_next),
-        SearchPrev::NAME => run!(SearchPrev, handlers::search_prev),
+        SearchStep::NAME => run!(SearchStep, handlers::search_step),
         BufferCopy::NAME => run!(BufferCopy, handlers::buffer_copy),
         BufferCut::NAME => run!(BufferCut, handlers::buffer_cut),
         ViewportSubscribe::NAME => run!(ViewportSubscribe, handlers::viewport_subscribe),
@@ -406,7 +399,6 @@ async fn dispatch(
         ViewportScroll::NAME => run!(ViewportScroll, handlers::viewport_scroll),
         ViewportScrollToRow::NAME => run!(ViewportScrollToRow, handlers::viewport_scroll_to_row),
         ViewportSetWrap::NAME => run!(ViewportSetWrap, handlers::viewport_set_wrap),
-        ViewportUnsubscribe::NAME => run!(ViewportUnsubscribe, handlers::viewport_unsubscribe),
         CursorMove::NAME => run!(CursorMove, handlers::cursor_move),
         CursorSet::NAME => run!(CursorSet, handlers::cursor_set),
         CursorSelectLine::NAME => run!(CursorSelectLine, handlers::cursor_select_line),
@@ -414,8 +406,7 @@ async fn dispatch(
         CursorSelectWord::NAME => run!(CursorSelectWord, handlers::cursor_select_word),
         CursorSwapAnchor::NAME => run!(CursorSwapAnchor, handlers::cursor_swap_anchor),
         CursorUndo::NAME => run!(CursorUndo, handlers::cursor_undo),
-        CursorExpand::NAME => run!(CursorExpand, handlers::cursor_expand),
-        CursorContract::NAME => run!(CursorContract, handlers::cursor_contract),
+        CursorTreeSelect::NAME => run!(CursorTreeSelect, handlers::cursor_tree_select),
         CursorRedo::NAME => run!(CursorRedo, handlers::cursor_redo),
         InputText::NAME => run!(InputText, handlers::input_text),
         InputDelete::NAME => run!(InputDelete, handlers::input_delete),
@@ -423,18 +414,13 @@ async fn dispatch(
         InputDeleteLine::NAME => run!(InputDeleteLine, handlers::input_delete_line),
         InputChangeLine::NAME => run!(InputChangeLine, handlers::input_change_line),
         InputReplaceLine::NAME => run!(InputReplaceLine, handlers::input_replace_line),
-        InputUndo::NAME => run!(InputUndo, handlers::input_undo),
-        InputRedo::NAME => run!(InputRedo, handlers::input_redo),
+        EditUndo::NAME => run!(EditUndo, handlers::edit_undo),
+        EditRedo::NAME => run!(EditRedo, handlers::edit_redo),
         InputJoinLines::NAME => run!(InputJoinLines, handlers::input_join_lines),
         InputMoveLines::NAME => run!(InputMoveLines, handlers::input_move_lines),
         InputIndent::NAME => run!(InputIndent, handlers::input_indent),
         InputDedent::NAME => run!(InputDedent, handlers::input_dedent),
-        InputIncrementNumber::NAME => {
-            run!(InputIncrementNumber, handlers::input_increment_number)
-        }
-        InputDecrementNumber::NAME => {
-            run!(InputDecrementNumber, handlers::input_decrement_number)
-        }
+        InputAdjustNumber::NAME => run!(InputAdjustNumber, handlers::input_adjust_number),
         InputOpenLine::NAME => {
             run!(InputOpenLine, handlers::input_open_line)
         }
@@ -454,11 +440,9 @@ async fn dispatch(
         DirectoryList::NAME => run!(DirectoryList, handlers::directory_list),
         DirectoryCreate::NAME => run!(DirectoryCreate, handlers::directory_create),
         GitBlameLine::NAME => run!(GitBlameLine, handlers::git_blame_line),
-        GitCommitInfo::NAME => run!(GitCommitInfo, handlers::git_commit_info),
         GitSetDiffView::NAME => run!(GitSetDiffView, handlers::git_set_diff_view),
         GitNavigateHunk::NAME => run!(GitNavigateHunk, handlers::git_navigate_hunk),
         GitApplyHunk::NAME => run!(GitApplyHunk, handlers::git_apply_hunk),
-        LspServerStatusList::NAME => run!(LspServerStatusList, handlers::lsp_server_status),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),
         LspGotoDefinition::NAME => run!(LspGotoDefinition, handlers::lsp_goto_definition),

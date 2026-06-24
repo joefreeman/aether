@@ -1453,7 +1453,7 @@ fn undo_result_updates_revision_and_cursor() {
     let mut s = session();
     let fx = ctrl(&mut s, 'z');
     let (token, method, params) = the_request(&fx);
-    assert_eq!(method, "input/undo");
+    assert_eq!(method, "edit/undo");
     assert!(params.get("count").is_none(), "count 1 stays off the wire");
 
     let _ = s.on_rpc_result(
@@ -1476,7 +1476,7 @@ fn rpc_error_surfaces_as_an_error_toast() {
     let fx = s.on_rpc_result(
         token,
         Err(RpcError {
-            method: "input/undo",
+            method: "edit/undo",
             code: 0,
             message: "boom".into(),
         }),
@@ -1508,7 +1508,7 @@ fn connection_loss_drops_in_flight_results() {
     let fx = s.on_rpc_result(
         token,
         Err(RpcError {
-            method: "input/undo",
+            method: "edit/undo",
             code: 0,
             message: "connection closed".into(),
         }),
@@ -1785,26 +1785,50 @@ fn pointer_selection_in_insert_mode_drops_to_normal() {
     let mut s = session();
     let _ = key(&mut s, 'i');
     assert_eq!(s.mode, Mode::Insert);
-    let _ = s.pointer_press(LogicalPosition { line: 2, col: 3 }, Granularity::Char, false);
-    assert_eq!(s.mode, Mode::Insert, "single click only repositions the caret");
+    let _ = s.pointer_press(
+        LogicalPosition { line: 2, col: 3 },
+        Granularity::Char,
+        false,
+    );
+    assert_eq!(
+        s.mode,
+        Mode::Insert,
+        "single click only repositions the caret"
+    );
 
     // Double click (Word) → immediate selection, drops to Normal.
     let mut s = session();
     let _ = key(&mut s, 'i');
-    let _ = s.pointer_press(LogicalPosition { line: 2, col: 3 }, Granularity::Word, false);
+    let _ = s.pointer_press(
+        LogicalPosition { line: 2, col: 3 },
+        Granularity::Word,
+        false,
+    );
     assert_eq!(s.mode, Mode::Normal, "double-click selects a word → Normal");
 
     // Shift-click (extend) → selection from the existing anchor, drops to Normal.
     let mut s = session();
     let _ = key(&mut s, 'i');
     let _ = s.pointer_press(LogicalPosition { line: 2, col: 3 }, Granularity::Char, true);
-    assert_eq!(s.mode, Mode::Normal, "shift-click extends a selection → Normal");
+    assert_eq!(
+        s.mode,
+        Mode::Normal,
+        "shift-click extends a selection → Normal"
+    );
 
     // Char drag past the press anchor → selection, drops to Normal.
     let mut s = session();
     let _ = key(&mut s, 'i');
-    let _ = s.pointer_press(LogicalPosition { line: 2, col: 3 }, Granularity::Char, false);
-    assert_eq!(s.mode, Mode::Insert, "the press alone hasn't selected anything yet");
+    let _ = s.pointer_press(
+        LogicalPosition { line: 2, col: 3 },
+        Granularity::Char,
+        false,
+    );
+    assert_eq!(
+        s.mode,
+        Mode::Insert,
+        "the press alone hasn't selected anything yet"
+    );
     let _ = s.pointer_drag(LogicalPosition { line: 2, col: 7 });
     assert_eq!(s.mode, Mode::Normal, "dragging out a selection → Normal");
 }
@@ -3148,7 +3172,11 @@ fn ephemeral_close_with_sibling_attaches_instead_of_leaving() {
     );
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "buffer/open");
-    assert_eq!(params["buffer_id"], json!(5), "attach to the remaining sibling");
+    assert_eq!(
+        params["buffer_id"],
+        json!(5),
+        "attach to the remaining sibling"
+    );
 }
 
 /// A persisted project is unaffected: closing its last buffer still spawns a scratch successor

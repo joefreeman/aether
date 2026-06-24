@@ -17,12 +17,11 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{
     ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
-    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitChangeCounts, GitCommitInfo,
-    GitCommitInfoParams, GitCommitInfoResult, GitNavigateHunk, GitNavigateHunkParams,
-    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitChangeCounts, GitNavigateHunk,
+    GitNavigateHunkParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    CountedEditParams, InputDecrementNumber, InputIncrementNumber, InputSurround,
+    CountedEditParams, InputAdjustNumber, InputAdjustNumberParams, InputSurround,
     InputSurroundParams, InputText, InputTextParams,
 };
 use aether_protocol::lsp::{
@@ -30,7 +29,7 @@ use aether_protocol::lsp::{
     LspDiagnosticsChangedParams, LspFormat, LspFormatResult, LspGotoDefinition,
     LspGotoDefinitionResult, LspHover, LspHoverResult, LspLocation, LspNavigateDiagnostic,
     LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness, LspRestartServer,
-    LspServerStatus, LspServerStatusList, LspStatus, LspStatusChanged,
+    LspServerStatus, LspStatus, LspStatusChanged,
 };
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::project::{
@@ -155,6 +154,8 @@ fn git_blame_line_params_shape() {
 #[test]
 fn git_blame_line_result_roundtrip() {
     // A committed line and an uncommitted line both round-trip; `None` is the no-blame case.
+    // The lean `blame` carries no message; full commit details ride alongside in `commit_info`
+    // when the caller asks for them (`include_commit_info`, composite G).
     let committed = GitBlameLineResult {
         blame: Some(BlameInfo {
             commit: "a1b2c3d".into(),
@@ -162,39 +163,7 @@ fn git_blame_line_result_roundtrip() {
             timestamp: 1_700_000_000,
             is_uncommitted: false,
         }),
-        commit_info: None,
-    };
-    let v = to_value(&committed).unwrap();
-    assert_eq!(v["blame"]["commit"], "a1b2c3d");
-    assert_eq!(v["blame"]["author"], "Ada");
-    assert_eq!(v["blame"]["timestamp"], 1_700_000_000_i64);
-    assert_eq!(v["blame"]["is_uncommitted"], false);
-    // The commit message no longer rides along on blame — it's fetched via `git/commit_info`.
-    assert!(v["blame"].get("summary").is_none());
-    let back: GitBlameLineResult = from_value(v).unwrap();
-    assert_eq!(back.blame.unwrap().author, "Ada");
-
-    let none = GitBlameLineResult {
-        blame: None,
-        commit_info: None,
-    };
-    assert_eq!(to_value(&none).unwrap(), json!({"blame": null}));
-}
-
-#[test]
-fn git_commit_info_roundtrip() {
-    let p = GitCommitInfoParams {
-        buffer_id: 7,
-        commit: "a1b2c3d".into(),
-    };
-    assert_eq!(
-        to_value(&p).unwrap(),
-        json!({"buffer_id": 7, "commit": "a1b2c3d"})
-    );
-    assert_eq!(GitCommitInfo::NAME, "git/commit_info");
-
-    let res = GitCommitInfoResult {
-        info: Some(CommitInfo {
+        commit_info: Some(CommitInfo {
             commit: "a1b2c3d4e5f6".into(),
             author: "Ada".into(),
             email: "ada@example.com".into(),
@@ -202,15 +171,28 @@ fn git_commit_info_roundtrip() {
             message: "Wire up blame\n\nLong body.".into(),
         }),
     };
-    let v = to_value(&res).unwrap();
-    assert_eq!(v["info"]["commit"], "a1b2c3d4e5f6");
-    assert_eq!(v["info"]["email"], "ada@example.com");
-    assert_eq!(v["info"]["date"], "2026-06-01 14:32:05 +0100");
-    let back: GitCommitInfoResult = from_value(v).unwrap();
-    assert_eq!(back.info.unwrap().message, "Wire up blame\n\nLong body.");
+    let v = to_value(&committed).unwrap();
+    assert_eq!(v["blame"]["commit"], "a1b2c3d");
+    assert_eq!(v["blame"]["author"], "Ada");
+    assert_eq!(v["blame"]["timestamp"], 1_700_000_000_i64);
+    assert_eq!(v["blame"]["is_uncommitted"], false);
+    // The commit message no longer rides on `blame` itself — it lives in `commit_info`.
+    assert!(v["blame"].get("summary").is_none());
+    assert_eq!(v["commit_info"]["commit"], "a1b2c3d4e5f6");
+    assert_eq!(v["commit_info"]["email"], "ada@example.com");
+    assert_eq!(v["commit_info"]["date"], "2026-06-01 14:32:05 +0100");
+    let back: GitBlameLineResult = from_value(v).unwrap();
+    assert_eq!(back.blame.unwrap().author, "Ada");
+    assert_eq!(
+        back.commit_info.unwrap().message,
+        "Wire up blame\n\nLong body."
+    );
 
-    let none = GitCommitInfoResult { info: None };
-    assert_eq!(to_value(&none).unwrap(), json!({"info": null}));
+    let none = GitBlameLineResult {
+        blame: None,
+        commit_info: None,
+    };
+    assert_eq!(to_value(&none).unwrap(), json!({"blame": null}));
 }
 
 #[test]
@@ -736,8 +718,21 @@ fn input_transform_case_params() {
 #[test]
 fn input_adjust_number_methods() {
     use aether_protocol::envelope::RpcMethod;
-    assert_eq!(InputIncrementNumber::NAME, "input/increment_number");
-    assert_eq!(InputDecrementNumber::NAME, "input/decrement_number");
+    assert_eq!(InputAdjustNumber::NAME, "input/adjust_number");
+
+    // Signed delta rides on the wire both ways (increment is `+count`, decrement `-count`).
+    let inc = to_value(InputAdjustNumberParams {
+        buffer_id: 3,
+        delta: 1,
+    })
+    .unwrap();
+    assert_eq!(inc, json!({"buffer_id": 3, "delta": 1}));
+    let dec = to_value(InputAdjustNumberParams {
+        buffer_id: 3,
+        delta: -4,
+    })
+    .unwrap();
+    assert_eq!(dec, json!({"buffer_id": 3, "delta": -4}));
 
     // The shared counted-edit shape omits `count` when it's 1, and carries it otherwise.
     let one = to_value(CountedEditParams {
@@ -937,7 +932,6 @@ fn notification_roundtrip() {
 
 #[test]
 fn lsp_method_names() {
-    assert_eq!(LspServerStatusList::NAME, "lsp/server_status");
     assert_eq!(LspRestartServer::NAME, "lsp/restart_server");
     assert_eq!(LspStatusChanged::NAME, "lsp/status_changed");
 }

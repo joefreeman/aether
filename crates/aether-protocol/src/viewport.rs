@@ -330,20 +330,6 @@ pub struct ViewportSetWrapParams {
     pub wrap: WrapMode,
 }
 
-// ---- viewport/unsubscribe -----------------------------------------------------------------------
-
-pub struct ViewportUnsubscribe;
-impl RpcMethod for ViewportUnsubscribe {
-    const NAME: &'static str = "viewport/unsubscribe";
-    type Params = ViewportUnsubscribeParams;
-    type Result = ();
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ViewportUnsubscribeParams {
-    pub viewport_id: ViewportId,
-}
-
 // ---- viewport/lines_changed (notification) ------------------------------------------------------
 
 pub struct ViewportLinesChanged;

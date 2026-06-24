@@ -205,7 +205,7 @@ pub struct GitBlameLineResult {
     /// end of the file. An uncommitted line is `Some` with `is_uncommitted = true`.
     pub blame: Option<BlameInfo>,
     /// With `include_commit_info`: the blamed commit's full details, when the line blames to
-    /// a real commit that still resolves. Same best-effort semantics as `git/commit_info`.
+    /// a real commit that still resolves. Best-effort — `None` if the hash doesn't resolve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_info: Option<CommitInfo>,
 }
@@ -213,7 +213,7 @@ pub struct GitBlameLineResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlameInfo {
     /// Abbreviated (7-char) commit hash. Empty when `is_uncommitted`. The full message and metadata
-    /// are fetched on demand via `git/commit_info` (the blame popover), keyed by this hash.
+    /// are fetched on demand by re-requesting blame with `include_commit_info` (the blame popover).
     pub commit: String,
     pub author: String,
     /// Author time as Unix seconds. `0` when `is_uncommitted`.
@@ -222,32 +222,12 @@ pub struct BlameInfo {
     pub is_uncommitted: bool,
 }
 
-// ---- git/commit_info ----------------------------------------------------------------------------
+// ---- commit details -----------------------------------------------------------------------------
 
-/// Full details for a single commit, resolved on demand from a hash the client already has (e.g.
-/// the abbreviated hash in a line's [`BlameInfo`]). Drives the blame "commit details" popover and
-/// is deliberately generic — not blame-specific — so a future log/show view can reuse it.
-pub struct GitCommitInfo;
-impl RpcMethod for GitCommitInfo {
-    const NAME: &'static str = "git/commit_info";
-    type Params = GitCommitInfoParams;
-    type Result = GitCommitInfoResult;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GitCommitInfoParams {
-    /// Used to locate the repo (the commit is resolved in that buffer's repository).
-    pub buffer_id: BufferId,
-    /// Any revision the repo can parse — typically the abbreviated hash from [`BlameInfo::commit`].
-    pub commit: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GitCommitInfoResult {
-    /// `None` when there's no repo for the buffer or the revision doesn't resolve to a commit.
-    pub info: Option<CommitInfo>,
-}
-
+/// Full details for a single commit, resolved from a hash the client already has (e.g. the
+/// abbreviated hash in a line's [`BlameInfo`]) and returned alongside blame when
+/// `include_commit_info` is set. Drives the blame "commit details" popover and is deliberately
+/// generic — not blame-specific — so a future log/show view can reuse it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitInfo {
     /// Full (40-char) commit hash.

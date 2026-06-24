@@ -5,65 +5,36 @@
 //! "this jump didn't move me" check gates recording). This keeps the terminal client and the web
 //! client — which rides the *native* browser history — behaving identically.
 //!
-//! - TUI: drives the server-side list via [`NavRecord`] (before each qualifying navigation) and
-//!   [`NavBack`] / [`NavForward`] (the `Alt-Left` / `Alt-Right` keys).
+//! - TUI: drives the server-side list via [`NavStep`] with a `direction` (the `Alt-Left` /
+//!   `Alt-Right` keys). Recording the origin happens as part of the navigating `buffer/open`
+//!   (its `record_nav_from` field), not a separate call.
 //! - Web: uses native browser history + `popstate`; it only needs [`NavGoto`] to restore a stored
 //!   entry (open the buffer, reopening a closed file by path, and restore the full
 //!   cursor/selection) without polluting the per-buffer motion-undo (`z`) history.
 
 use crate::buffer::BufferOpenResult;
-use crate::cursor::CursorState;
+use crate::cursor::{CursorState, Direction};
 use crate::envelope::RpcMethod;
 use crate::BufferId;
 use serde::{Deserialize, Serialize};
 
-/// `nav/record` — snapshot the client's current location onto the back stack and clear the forward
-/// stack. Called *before* a qualifying (cross-file-capable) navigation. The client owns the
-/// "didn't move" decision — it knows both origin and destination — so the server records
-/// unconditionally except for collapsing an exact duplicate of the current back-stack top.
-pub struct NavRecord;
-impl RpcMethod for NavRecord {
-    const NAME: &'static str = "nav/record";
-    type Params = NavRecordParams;
-    type Result = NavRecordResult;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct NavRecordParams {
-    /// The client's current buffer (where the jump originates). The server reads the cursor for
-    /// `(client, buffer)` and maps the path itself. Passed explicitly rather than inferred from a
-    /// viewport, since a client may hold several viewports over its lifetime.
-    pub buffer_id: BufferId,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct NavRecordResult {
-    /// Whether an entry was pushed (false when there was no current location, or it duplicated
-    /// the back-stack top).
-    pub recorded: bool,
-}
-
-/// `nav/back` — step one entry back through the jump list and navigate there.
-pub struct NavBack;
-impl RpcMethod for NavBack {
-    const NAME: &'static str = "nav/back";
-    type Params = NavStepParams;
-    type Result = NavStepResult;
-}
-
-/// `nav/forward` — step one entry forward through the jump list and navigate there.
-pub struct NavForward;
-impl RpcMethod for NavForward {
-    const NAME: &'static str = "nav/forward";
+/// `nav/step` — step one entry through the jump list in `direction` (`Backward` = back,
+/// `Forward` = forward, browser-style) and navigate there. The `Alt-Left` / `Alt-Right` keys.
+pub struct NavStep;
+impl RpcMethod for NavStep {
+    const NAME: &'static str = "nav/step";
     type Params = NavStepParams;
     type Result = NavStepResult;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NavStepParams {
-    /// The client's current buffer, pushed onto the opposite stack as we step (see
-    /// [`NavRecordParams::buffer_id`] for why it's explicit).
+    /// The client's current buffer, pushed onto the opposite stack as we step. Passed explicitly
+    /// (rather than inferred from a viewport) since a client may hold several viewports over its
+    /// lifetime.
     pub buffer_id: BufferId,
+    /// `Backward` walks the back stack (older locations), `Forward` the forward stack.
+    pub direction: Direction,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

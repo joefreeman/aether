@@ -191,7 +191,10 @@ mod tests {
     fn acronyms_split_at_the_tail() {
         // The all-caps run stays together; the boundary is before the word-initial capital.
         assert_eq!(t(CaseKind::Snake, "HTTPServer"), "http_server");
-        assert_eq!(t(CaseKind::Words, "parseHTTPResponse"), "parse http response");
+        assert_eq!(
+            t(CaseKind::Words, "parseHTTPResponse"),
+            "parse http response"
+        );
         assert_eq!(t(CaseKind::Pascal, "getHTTP"), "GetHttp"); // trailing acronym, no tail
     }
 
@@ -220,7 +223,10 @@ mod tests {
 
     #[test]
     fn single_word_round_trips_are_idempotent() {
-        assert_eq!(t(CaseKind::Snake, t(CaseKind::Snake, "fooBar").as_str()), "foo_bar");
+        assert_eq!(
+            t(CaseKind::Snake, t(CaseKind::Snake, "fooBar").as_str()),
+            "foo_bar"
+        );
         assert_eq!(t(CaseKind::Camel, "fooBar"), "fooBar");
         assert_eq!(t(CaseKind::Pascal, "FooBar"), "FooBar");
     }

@@ -175,9 +175,15 @@ mod tests {
         // An ephemeral "(no project)" context shows no `[project]` chrome — just the buffer label,
         // like there's no project. With no label it's the bare app name.
         assert!(!shows_project_chrome("ephemeral/3"));
-        assert_eq!(title_body("ephemeral/3", "outside.rs"), Some("outside.rs".into()));
+        assert_eq!(
+            title_body("ephemeral/3", "outside.rs"),
+            Some("outside.rs".into())
+        );
         assert_eq!(title_body("ephemeral/3", ""), None);
-        assert_eq!(window_title("ephemeral/3", "outside.rs"), "outside.rs - Aether");
+        assert_eq!(
+            window_title("ephemeral/3", "outside.rs"),
+            "outside.rs - Aether"
+        );
         assert_eq!(window_title("ephemeral/3", ""), "Aether");
         // A persisted project still gets the bracket.
         assert!(shows_project_chrome("demo"));

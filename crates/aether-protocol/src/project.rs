@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 /// Enumerate configured projects (the `*.toml` files under `$XDG_CONFIG_HOME/aether/projects/`).
 /// Does not indicate which one — if any — the calling client has active; the client tracks that
-/// locally.
+/// locally. Issued directly by the web client's bootstrap chooser (the native shells reach the
+/// project list through the projects picker instead).
 pub struct ProjectList;
 impl RpcMethod for ProjectList {
     const NAME: &'static str = "project/list";

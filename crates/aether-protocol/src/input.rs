@@ -138,27 +138,27 @@ impl RpcMethod for InputDedent {
     type Result = EditResult;
 }
 
-// ---- input/increment_number, input/decrement_number ---------------------------------------------
+// ---- input/adjust_number ------------------------------------------------------------------------
 
-/// Adjust the selected integer by `+count`. Selection-only with no scanning: the operand is exactly
-/// the selected chars (a point cursor being the single char under the block), so an unselected `-`
-/// or neighbouring digit is never swept in. A leading `-` *within* the selection is the number's
-/// sign, and a zero-padded number keeps its width (`007` → `008`). The post-edit cursor selects the
-/// whole result, so the selection tracks the digit count. No-op unless the selection is a clean
-/// integer (optional `-` then digits). `Ctrl-e`.
-pub struct InputIncrementNumber;
-impl RpcMethod for InputIncrementNumber {
-    const NAME: &'static str = "input/increment_number";
-    type Params = CountedEditParams;
+/// Adjust the selected integer by `delta` (signed): `Ctrl-e` sends `+count`, `Ctrl-Alt-e` sends
+/// `-count`. Selection-only with no scanning: the operand is exactly the selected chars (a point
+/// cursor being the single char under the block), so an unselected `-` or neighbouring digit is
+/// never swept in. A leading `-` *within* the selection is the number's sign, and a zero-padded
+/// number keeps its width (`007` → `008`). The post-edit cursor selects the whole result, so the
+/// selection tracks the digit count. No-op unless the selection is a clean integer (optional `-`
+/// then digits), or when `delta` is zero.
+pub struct InputAdjustNumber;
+impl RpcMethod for InputAdjustNumber {
+    const NAME: &'static str = "input/adjust_number";
+    type Params = InputAdjustNumberParams;
     type Result = EditResult;
 }
 
-/// Adjust the selected integer by `-count` — the inverse of [`InputIncrementNumber`]. `Ctrl-Alt-e`.
-pub struct InputDecrementNumber;
-impl RpcMethod for InputDecrementNumber {
-    const NAME: &'static str = "input/decrement_number";
-    type Params = CountedEditParams;
-    type Result = EditResult;
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InputAdjustNumberParams {
+    pub buffer_id: BufferId,
+    /// Signed amount to add to the number (negative decrements). Zero is a no-op.
+    pub delta: i32,
 }
 
 // ---- input/newline_and_indent -------------------------------------------------------------------
@@ -365,18 +365,20 @@ pub struct InputTransformCaseParams {
     pub kind: CaseKind,
 }
 
-// ---- input/undo, input/redo ---------------------------------------------------------------------
+// ---- edit/undo, edit/redo -----------------------------------------------------------------------
+// Text-history undo/redo. Distinct from `cursor/undo`+`cursor/redo`, which step the
+// selection/motion history (the `z` ring) without touching buffer text.
 
-pub struct InputUndo;
-impl RpcMethod for InputUndo {
-    const NAME: &'static str = "input/undo";
+pub struct EditUndo;
+impl RpcMethod for EditUndo {
+    const NAME: &'static str = "edit/undo";
     type Params = CountedEditParams;
     type Result = UndoResult;
 }
 
-pub struct InputRedo;
-impl RpcMethod for InputRedo {
-    const NAME: &'static str = "input/redo";
+pub struct EditRedo;
+impl RpcMethod for EditRedo {
+    const NAME: &'static str = "edit/redo";
     type Params = CountedEditParams;
     type Result = UndoResult;
 }
