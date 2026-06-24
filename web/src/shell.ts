@@ -214,7 +214,10 @@ type PromptView =
       path_ghost: string | null;
       path_invalid: boolean;
     }
-  | { kind: "lspinfo"; status: LspServerStatus };
+  | { kind: "lspinfo"; status: LspServerStatus }
+  /** Open-from-path: a single plain `<input>` path field (no root chips). The core opens it via
+   *  `project/open_path` on Enter and syncs typed text via `open_path_set_input`. */
+  | { kind: "openpath"; input: string };
 
 /** The web client's phrasing for each confirmation reason — a presentational choice, matching the
  *  native/TUI wording. The modal then offers Yes/No (the destructive action in red). */
@@ -437,6 +440,18 @@ function lspIcon(lsp: LspServerStatus | null): { kind: IconKind; cls: string; sp
   return { kind: cls, cls, spin: cls === "lsp-busy" };
 }
 
+/** Mirrors `aether_protocol::EPHEMERAL_PROJECT_PREFIX`: an ephemeral "(no project)" context's id
+ *  is `ephemeral/<n>` (a `/` that can't appear in a real project name). */
+const EPHEMERAL_PROJECT_PREFIX = "ephemeral/";
+
+/** Whether to wrap a project id in the `[project]` chrome shown in the status bar / window title.
+ *  False for the empty (no project) state and for an ephemeral context — neither is a real, named
+ *  project, so we show just the buffer label rather than `[(no project)]`. Mirrors the native
+ *  clients' `labels::shows_project_chrome`. */
+function showsProjectChrome(project: string): boolean {
+  return project.length > 0 && !project.startsWith(EPHEMERAL_PROJECT_PREFIX);
+}
+
 /** The explorer breadcrumb: the listed directory shown *within* its project root (ported from the
  *  old client's `explorerDisplayPath`). Empty at a single root's top; `root: rel/` under multi-root.
  *  (Deferred polish: the disambiguated root label + path-budget elision — uses the basename here.) */
@@ -582,14 +597,20 @@ function describePickerItem(
       const p = projectPaths[item.path_index];
       return { primary: `${p ? basename(p) : `root ${item.path_index}`}/`, matches: item.match_indices, dir: true };
     }
-    case "project":
+    case "project": {
       // Trailing frost-blue dot when the project has unsaved buffers — the same dirty indicator
-      // the buffer picker shows, so the two pickers read alike.
+      // the buffer picker shows, so the two pickers read alike. An ephemeral context renders as an
+      // italic "(project N)" (mirrors the native clients — `labels::project_display`, slanted like
+      // a transient buffer); its id isn't a meaningful match haystack, so drop the highlight indices.
+      const ephemeral = item.name.startsWith(EPHEMERAL_PROJECT_PREFIX);
+      const n = item.name.slice(EPHEMERAL_PROJECT_PREFIX.length);
       return {
-        primary: item.name,
-        matches: item.match_indices,
+        primary: ephemeral ? `(project ${n})` : item.name,
+        matches: ephemeral ? [] : item.match_indices,
+        italic: ephemeral,
         dirty: (item.unsaved_buffers ?? 0) > 0 ? "unsaved" : undefined,
       };
+    }
     case "lsp_server": {
       // The status bar's SVG icon in the leading cell (spinning when busy); dim metadata matching
       // the native/TUI clients: language, the monorepo sub-root, then the active operation.
@@ -667,6 +688,11 @@ export class Shell {
   private saveAsPathSpan: HTMLElement | null = null;
   private saveAsSepEl: HTMLElement | null = null;
   private saveAsStructKey: string | null = null;
+  /** Open-from-path has its own persistent overlay with a single native `<input>` (so it keeps
+   *  focus/caret across renders), parallel to save-as. */
+  private readonly openPathEl: HTMLElement;
+  private readonly openPathInput: HTMLInputElement;
+  private openPathOpen = false;
   private readonly pickerEl: HTMLElement;
   private readonly pickerInput: HTMLInputElement;
   private pickerInputGhost: HTMLElement | null = null;
@@ -908,6 +934,47 @@ export class Shell {
         );
       }
     });
+    // Open-from-path: a persistent overlay with a single native <input> (so it keeps focus/caret),
+    // parallel to save-as but with no root chips. The input owns text editing and syncs to the core
+    // (`open_path_set_input`); Enter (open) / Esc (cancel) route through `on_key` → `on_prompt_key`.
+    this.openPathEl = document.createElement("div");
+    this.openPathEl.className = "overlay";
+    this.openPathEl.style.display = "none";
+    const openModal = document.createElement("div");
+    openModal.className = "modal";
+    const openMsg = document.createElement("div");
+    openMsg.className = "modal-message";
+    openMsg.textContent = "Open file";
+    const openField = document.createElement("div");
+    openField.className = "modal-field saveas-field";
+    this.openPathInput = document.createElement("input");
+    this.openPathInput.className = "picker-editor-input";
+    this.openPathInput.spellcheck = false;
+    this.openPathInput.autocapitalize = "off";
+    this.openPathInput.setAttribute("autocomplete", "off");
+    this.openPathInput.placeholder = "path to open";
+    this.openPathInput.addEventListener("keydown", (e) => this.routeOverlayKey(e));
+    this.openPathInput.addEventListener("input", () => {
+      if (this.session) {
+        this.runEffects(
+          this.session.open_path_set_input(this.openPathInput.value) as CoreEffect[],
+        );
+      }
+    });
+    openField.append(this.openPathInput);
+    const openButtons = document.createElement("div");
+    openButtons.className = "modal-buttons";
+    const openCancel = document.createElement("span");
+    openCancel.className = "modal-btn";
+    openCancel.textContent = "Cancel";
+    openCancel.addEventListener("click", () => this.saveAsCommand("Escape"));
+    const openOk = document.createElement("span");
+    openOk.className = "modal-btn primary";
+    openOk.textContent = "Open";
+    openOk.addEventListener("click", () => this.saveAsCommand("Enter"));
+    openButtons.append(openCancel, openOk);
+    openModal.append(openMsg, openField, openButtons);
+    this.openPathEl.append(openModal);
     // The picker overlay is persistent DOM (built once) so its native <input> keeps focus + caret
     // across re-renders — only the results list is rebuilt. The input owns text editing and syncs
     // its value to the core (picker_set_query); nav/accept/cancel keys route through on_key.
@@ -1167,6 +1234,7 @@ export class Shell {
       this.toastsEl,
       this.overlayEl,
       this.saveAsEl,
+      this.openPathEl,
       this.pickerEl,
       // `hoverEl` is not appended here — it's parented into the buffer's spacer while shown (so it
       // can be `position: sticky` relative to the scrolling buffer) and removed on dismiss.
@@ -1302,7 +1370,11 @@ export class Shell {
     const v = this.snapshot;
     return !!(
       v &&
-      (v.picker || v.mode === "search" || v.prompt?.kind === "saveas" || v.project_settings)
+      (v.picker ||
+        v.mode === "search" ||
+        v.prompt?.kind === "saveas" ||
+        v.prompt?.kind === "openpath" ||
+        v.project_settings)
     );
   }
 
@@ -1313,7 +1385,8 @@ export class Shell {
     const v = this.snapshot;
     // A confirm / lsp-info prompt (e.g. remove-root over the settings dialog) owns the keyboard via
     // the global keydown on `capture` — its y/N keys must not be swallowed as native input editing.
-    if (v?.prompt && v.prompt.kind !== "saveas") return this.capture;
+    if (v?.prompt && v.prompt.kind !== "saveas" && v.prompt.kind !== "openpath")
+      return this.capture;
     const ce = v?.picker?.chip_editor;
     if (ce) return ce.is_dir && ce.multi_root && ce.field === "root" ? this.editorRootInput : this.editorPathInput;
     // A selected filter chip owns the keyboard, not the query: park focus on the hidden capture
@@ -1327,6 +1400,7 @@ export class Shell {
         ? this.saveAsRootInput
         : this.saveAsPathInput;
     }
+    if (v?.prompt?.kind === "openpath") return this.openPathInput;
     // The project-settings overlay: focus the input matching the selected row — the name field, or
     // the add-root input. A selected *root* row has no text field, so park focus on the hidden
     // capture field (its keys route through the global handler) rather than the add input, which
@@ -1641,6 +1715,15 @@ export class Shell {
           break;
         case "PickerScrollReset":
           this.pickerScrollReset = true;
+          break;
+        case "ToChooser":
+          // The last buffer of an ephemeral ("no project") context closed and we navigated into
+          // it (web never launches with a file, so it always lands here). Discard the now
+          // buffer-less session and re-raise the mandatory Projects chooser — the same reset the
+          // reconnect-while-choosing path uses, so no stale buffer lingers behind the picker.
+          this.session = new WasmSession();
+          this.runEffects(this.session.open_projects() as CoreEffect[]);
+          this.capture.focus();
           break;
         // Deferred to later milestones: Reconnect, Exit.
         default:
@@ -2295,6 +2378,22 @@ export class Shell {
     if (wasSaveAs) {
       this.saveAsEl.style.display = "none";
       this.saveAsStructKey = null;
+      this.capture.focus();
+    }
+
+    // Open-from-path: another persistent native-input overlay (single path field).
+    const wasOpenPath = this.openPathOpen;
+    this.openPathOpen = p?.kind === "openpath";
+    if (p?.kind === "openpath") {
+      this.overlayEl.style.display = "none";
+      this.overlayEl.replaceChildren();
+      this.openPathEl.style.display = "";
+      // Sync the value out-of-band only when it actually differs, so the live caret survives.
+      if (this.openPathInput.value !== p.input) this.openPathInput.value = p.input;
+      return;
+    }
+    if (wasOpenPath) {
+      this.openPathEl.style.display = "none";
       this.capture.focus();
     }
     if (!p) {
@@ -3564,7 +3663,7 @@ export class Shell {
       dot.textContent = "●";
       fileGroup.append(dot);
     }
-    const proj = v.project ? `[${v.project}] ` : "";
+    const proj = showsProjectChrome(v.project) ? `[${v.project}] ` : "";
     fileGroup.append(proj);
     const name = document.createElement("span");
     if (v.buffer.transient) name.className = "status-transient"; // preview buffers slant
@@ -3656,10 +3755,13 @@ export class Shell {
     }
 
     this.statusEl.replaceChildren(left, right);
-    // Mirror the native clients: "[project] label - Aether", or just "Aether" with no project.
-    document.title = v.project
+    // Mirror the native clients: "[project] label - Aether"; an ephemeral / no-project context
+    // drops the `[project]` chrome and shows just the label (or "Aether" with no label).
+    document.title = showsProjectChrome(v.project)
       ? `${v.buffer.label ? `[${v.project}] ${v.buffer.label}` : `[${v.project}]`} - Aether`
-      : "Aether";
+      : v.buffer.label
+        ? `${v.buffer.label} - Aether`
+        : "Aether";
     this.updateFavicon(v);
   }
 

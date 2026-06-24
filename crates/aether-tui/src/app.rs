@@ -195,6 +195,10 @@ pub struct AppState {
     pub picker: crate::picker::PickerState,
     /// Active save-as prompt. Overlays on top of the buffer; bound to the active editor.
     pub save_prompt: Option<SavePromptState>,
+    /// Active open-from-path prompt (`Space Alt-w`): a single-line path input shown in the status
+    /// row. `Some` holds the field's text + caret; text entry is shell-owned (synced into the
+    /// core's `Prompt::OpenPath`), `Enter` opens via `project/open_path`, `Esc` cancels.
+    pub open_path_prompt: Option<crate::text_input::TextInput>,
     /// Active binary y/N confirmation prompt. Layers on top of any other overlay (including
     /// `save_prompt`, e.g. for the save-as overwrite confirm). Holds the question text and the
     /// action to run on `y`.
@@ -866,6 +870,7 @@ mod tests {
             pending_leader: None,
             picker: crate::picker::PickerState::default(),
             save_prompt: None,
+            open_path_prompt: None,
             confirm_prompt: None,
             editor: None,
             project_settings: None,
@@ -895,6 +900,7 @@ mod tests {
             pending_leader: None,
             picker: crate::picker::PickerState::default(),
             save_prompt: None,
+            open_path_prompt: None,
             confirm_prompt: None,
             editor: None,
             project_settings: None,
@@ -927,6 +933,7 @@ mod tests {
             pending_leader: None,
             picker: crate::picker::PickerState::default(),
             save_prompt: None,
+            open_path_prompt: None,
             confirm_prompt: None,
             editor: Some(stub_editor_state("src/main.rs")),
             project_settings: None,

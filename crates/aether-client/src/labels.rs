@@ -6,13 +6,41 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// How a project id is shown to the user in a *project list* (the switcher). A persisted project
+/// shows its name verbatim; an *ephemeral* one (the synthesized "no project" context that hosts
+/// files opened outside any configured project) shows `(project <n>)` — mirroring scratch buffers'
+/// `(scratch <n>)`, so multiple ephemeral contexts are distinguishable — rather than its internal
+/// `ephemeral/<n>` id. The status bar / title use [`shows_project_chrome`] instead: they omit the
+/// `[…]` entirely for an ephemeral context.
+pub fn project_display(project: &str) -> String {
+    match project.strip_prefix(aether_protocol::EPHEMERAL_PROJECT_PREFIX) {
+        Some(n) => format!("(project {n})"),
+        None => project.to_string(),
+    }
+}
+
+/// Whether a project id should be wrapped in the `[project]` chrome shown in the status bar and
+/// window title. False for the empty (no project active) state *and* for an ephemeral context —
+/// neither is a real, named project, so we show just the buffer label with no bracket rather than
+/// a `[(no project)]` that reads like a project literally named that.
+pub fn shows_project_chrome(project: &str) -> bool {
+    !project.is_empty() && !aether_protocol::is_ephemeral_project_id(project)
+}
+
 /// The window/terminal title's *body* for `(project, buffer label)`: `None` before a project is
 /// active (the title is then just the app name), otherwise `[project]` or `[project] label`. The
-/// `[…]` is omitted entirely when there's no project, so a connecting/chooser state never shows a
-/// stray `[]`. Shells append `" - Aether"` (and the TUI prepends a dirty dot).
+/// `[…]` is omitted entirely when there's no real project — a connecting/chooser state (so no
+/// stray `[]`) *and* an ephemeral "(no project)" context, which shows just the buffer label.
+/// Shells append `" - Aether"` (and the TUI prepends a dirty dot).
 pub fn title_body(project: &str, label: &str) -> Option<String> {
     if project.is_empty() {
+        // Boot / connecting / chooser: no project *and* no buffer — the title is just the app name.
         return None;
+    }
+    if aether_protocol::is_ephemeral_project_id(project) {
+        // Ephemeral "(no project)" context: show the buffer label alone (the filename you're
+        // editing), with no `[project]` bracket — or nothing when there's no label.
+        return (!label.is_empty()).then(|| label.to_string());
     }
     Some(if label.is_empty() {
         format!("[{project}]")
@@ -140,6 +168,19 @@ mod tests {
             window_title("demo", "src/main.rs"),
             "[demo] src/main.rs - Aether"
         );
+    }
+
+    #[test]
+    fn ephemeral_project_drops_the_bracket_chrome() {
+        // An ephemeral "(no project)" context shows no `[project]` chrome — just the buffer label,
+        // like there's no project. With no label it's the bare app name.
+        assert!(!shows_project_chrome("ephemeral/3"));
+        assert_eq!(title_body("ephemeral/3", "outside.rs"), Some("outside.rs".into()));
+        assert_eq!(title_body("ephemeral/3", ""), None);
+        assert_eq!(window_title("ephemeral/3", "outside.rs"), "outside.rs - Aether");
+        assert_eq!(window_title("ephemeral/3", ""), "Aether");
+        // A persisted project still gets the bracket.
+        assert!(shows_project_chrome("demo"));
     }
 
     #[test]

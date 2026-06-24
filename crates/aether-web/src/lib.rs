@@ -261,6 +261,12 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.save_as_set_root_filter(text)))
     }
 
+    /// Replace the open-from-path prompt's path-field text (native `<input>` owns editing).
+    /// Returns `Effect[]`.
+    pub fn open_path_set_input(&mut self, text: String) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.open_path_set_input(text)))
+    }
+
     /// Click an unfocused save-as segment to focus it (`root: true` for the root). Returns
     /// `Effect[]`.
     pub fn save_as_set_field(&mut self, root: bool) -> Result<JsValue, JsValue> {
@@ -551,6 +557,7 @@ fn effect_value(e: Effect) -> Value {
         Effect::PickerScrollReset => json!({ "tag": "PickerScrollReset" }),
         Effect::Reconnect { attempt } => json!({ "tag": "Reconnect", "attempt": attempt }),
         Effect::Exit => json!({ "tag": "Exit" }),
+        Effect::ToChooser => json!({ "tag": "ToChooser" }),
         Effect::ShellAction(action) => {
             json!({ "tag": "ShellAction", "action": action_value(&action) })
         }

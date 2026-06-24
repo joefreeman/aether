@@ -38,6 +38,21 @@ pub fn default_server_url() -> String {
     format!("ws://127.0.0.1:{SERVER_PORT}")
 }
 
+/// Prefix marking a project id as *ephemeral* (a "no-project" context synthesized to host files
+/// opened outside any configured project). A project is addressed on the wire by id (the `name`
+/// field of [`project::ProjectInfo`] / [`project::ProjectActivateParams`]); for a persisted project
+/// that id is its human name, for an ephemeral one it's a reserved token of the form
+/// `ephemeral/<n>`. The `/` can't appear in a real project name (the server rejects separators), so
+/// the two namespaces never collide. Clients use [`is_ephemeral_project_id`] to render such a
+/// context as "(no project)" rather than showing the raw token.
+pub const EPHEMERAL_PROJECT_PREFIX: &str = "ephemeral/";
+
+/// Whether a project id denotes an ephemeral ("(no project)") context. See
+/// [`EPHEMERAL_PROJECT_PREFIX`].
+pub fn is_ephemeral_project_id(id: &str) -> bool {
+    id.starts_with(EPHEMERAL_PROJECT_PREFIX)
+}
+
 /// The build version a client announces on connect (`?version=`); the server requires an
 /// exact match against its own copy of this string. Server and all clients ship in one binary, so
 /// "same release" always means identical versions — any difference means a freshly-installed binary

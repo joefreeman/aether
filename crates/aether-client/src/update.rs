@@ -70,8 +70,9 @@ use aether_protocol::picker::{
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectAddRoot,
     ProjectAddRootParams, ProjectCreate, ProjectCreateParams, ProjectDelete, ProjectDeleteParams,
-    ProjectInfo, ProjectRemoveRoot, ProjectRemoveRootParams, ProjectRemoveRootResult,
-    ProjectRename, ProjectRenameParams, ProjectRenamed, ProjectRenamedParams,
+    ProjectInfo, ProjectOpenPath, ProjectOpenPathParams, ProjectRemoveRoot, ProjectRemoveRootParams,
+    ProjectRemoveRootResult, ProjectRename, ProjectRenameParams, ProjectRenamed,
+    ProjectRenamedParams,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
@@ -207,6 +208,11 @@ pub enum Event {
     /// `project/delete` (from the project switcher) resolved: toast success — the refreshed list
     /// arrives via a `picker/update` push — or surface the refusal (active / dirty).
     ProjectDeleted(Result<(), String>),
+    /// `buffer/close` resolved for a buffer in an *ephemeral* ("(project N)") context, closed
+    /// without an `open_next` scratch. Carries the project's next remaining buffer: `Some` →
+    /// attach to it; `None` → the context is empty, so leave it (quit on native, chooser on web —
+    /// see [`App::leave_ephemeral_project`]).
+    EphemeralClosed(Result<Option<BufferId>, String>),
     /// `settings/get` resolved at boot: seed the session from the persisted app settings (notably
     /// the soft-wrap default). A failure is non-fatal — we keep the defaults.
     AppSettingsLoaded(Result<AppSettings, String>),
@@ -295,6 +301,20 @@ impl Session {
 
             Event::Switched(Ok(open)) => self.adopt_navigation(open),
             Event::Switched(Err(e)) => Effects::error(e),
+
+            // Last/only buffer of an ephemeral context closed (no scratch was spawned).
+            Event::EphemeralClosed(Ok(Some(next))) => {
+                // A sibling buffer still lives in this ephemeral context — attach to it.
+                self.request_str::<BufferOpen>(
+                    BufferOpenParams {
+                        buffer_id: Some(next),
+                        ..Default::default()
+                    },
+                    Event::Switched,
+                )
+            }
+            Event::EphemeralClosed(Ok(None)) => self.leave_ephemeral_project(),
+            Event::EphemeralClosed(Err(e)) => Effects::error(format!("close failed: {e}")),
 
             Event::SwitchedPrimed(Ok(Some((query, options, open)))) => {
                 // Grab the primed summary before `open` is consumed: the equivalent
@@ -632,6 +652,10 @@ impl Session {
             Event::ProjectActivated(Ok((project, open))) => {
                 self.project = project.name;
                 self.project_paths = project.paths;
+                // A deliberate switch means we're no longer in the launch context, so closing the
+                // last buffer of an ephemeral context reached this way returns to the chooser
+                // rather than quitting (see `leave_ephemeral_project`).
+                self.launched_with_file = false;
                 self.adopt_switch(open)
             }
             Event::ProjectActivated(Err(e)) => {
@@ -644,6 +668,7 @@ impl Session {
                 } = activate;
                 self.project = project.name.clone();
                 self.project_paths = project.paths;
+                self.launched_with_file = false;
                 let mut fx = match opened {
                     // The project came with a landing buffer (it had roots / history). Adopt it.
                     Some(open) => self.adopt_switch(open),
@@ -1327,8 +1352,19 @@ impl Session {
     }
 
     /// Close the buffer, then attach to the server-indicated next MRU buffer (or a fresh
-    /// scratch).
+    /// scratch). In an *ephemeral* context, never replace it with a scratch — an empty ephemeral
+    /// project is pointless — so we close without `open_next` and either attach to a remaining
+    /// sibling buffer or leave the context entirely (see [`Self::leave_ephemeral_project`]).
     pub fn close_buffer(&mut self) -> Effects {
+        if aether_protocol::is_ephemeral_project_id(&self.project) {
+            return self.request_str::<BufferClose>(
+                BufferCloseParams {
+                    buffer_id: self.buffer.buffer_id,
+                    open_next: false,
+                },
+                |r| Event::EphemeralClosed(r.map(|closed| closed.next_buffer_id)),
+            );
+        }
         self.request_str::<BufferClose>(
             BufferCloseParams {
                 buffer_id: self.buffer.buffer_id,
@@ -1342,6 +1378,28 @@ impl Session {
                 }))
             },
         )
+    }
+
+    /// Leave an ephemeral ("(project N)") context whose last buffer just closed.
+    ///
+    /// If the session was *launched* to view this file (`ae /path` → [`Self::launched_with_file`]),
+    /// there's nothing left to show, so we quit — `Effect::Exit`, which native clients honour
+    /// (vim `file` → `:q`). A session that merely *navigated into* an ephemeral context (selected
+    /// it from the switcher, or a second client that joined it) instead returns to the project
+    /// chooser — quitting would be surprising when the app was already in use for something else.
+    ///
+    /// The web client never launches with a file and can't quit a tab anyway (it ignores
+    /// `Effect::Exit`), and its chooser is mandatory — so it always lands on the chooser, which is
+    /// exactly the non-launch branch here.
+    fn leave_ephemeral_project(&mut self) -> Effects {
+        if self.launched_with_file {
+            Effects::one(Effect::Exit)
+        } else {
+            // Reset to the chooser (shell-side — see `Effect::ToChooser`). The current session's
+            // buffer is already closed; the shell discards the session rather than leaving the
+            // stale buffer rendered behind the picker.
+            Effects::one(Effect::ToChooser)
+        }
     }
 
     /// Copy the active buffer's path to the system clipboard — `absolute` picks the canonical
@@ -1472,6 +1530,28 @@ impl Session {
                 // route through `on_save_as_key` — put the editor back so it can read/mutate it.
                 self.prompt = Some(Prompt::SaveAs(editor));
                 self.on_save_as_key(code, mods, text)
+            }
+            Prompt::OpenPath(field) => {
+                // Plain single-line path field — text entry is shell-owned (synced via
+                // `open_path_set_input`); only Enter (open) and Esc (cancel) are command keys.
+                let no_chord = !mods.ctrl && !mods.alt;
+                match code {
+                    KeyCode::Enter if no_chord => {
+                        let path = field.text.trim().to_string();
+                        if path.is_empty() {
+                            self.prompt = Some(Prompt::OpenPath(field)); // nothing typed — stay open
+                            Effects::none()
+                        } else {
+                            self.commit_open_path(path)
+                        }
+                    }
+                    // Esc: the prompt was already taken above, so just leaving it `None` cancels.
+                    KeyCode::Esc => Effects::none(),
+                    _ => {
+                        self.prompt = Some(Prompt::OpenPath(field));
+                        Effects::none()
+                    }
+                }
             }
         }
     }
@@ -3021,6 +3101,36 @@ impl Session {
         self.save(Some(target), false)
     }
 
+    /// Sync the open-from-path field's value from the shell's input (the shell owns text entry).
+    pub fn open_path_set_input(&mut self, text: String) -> Effects {
+        if let Some(Prompt::OpenPath(field)) = self.prompt.as_mut() {
+            field.set(text);
+        }
+        Effects::none()
+    }
+
+    /// Submit the open-from-path overlay: open `path` (absolute, or relative to the server's cwd)
+    /// via `project/open_path`. The server resolves the project context — internal if it's under
+    /// the active project's roots, an external buffer if not, a fresh ephemeral context if no
+    /// project is active. The result lands like a project switch (adopt the project + buffer); the
+    /// path field is already non-empty (checked by the caller).
+    fn commit_open_path(&mut self, path: String) -> Effects {
+        self.prompt = None;
+        self.request_str::<ProjectOpenPath>(
+            ProjectOpenPathParams {
+                path,
+                transient: None,
+            },
+            |r| {
+                Event::ProjectActivated(r.and_then(|a| {
+                    a.opened
+                        .map(|open| (a.project, open))
+                        .ok_or_else(|| "open_path returned no buffer".into())
+                }))
+            },
+        )
+    }
+
     /// Jump the open picker's selection to the next / previous section boundary — the next/prev
     /// file's first hit (Grep) or top-level symbol (DocumentSymbols). The server finds the boundary
     /// across the *whole* result list (so it works past the over-fetch window); the result lands as
@@ -3191,16 +3301,25 @@ impl Session {
                 if p.buffer_id != self.buffer.buffer_id {
                     return Effects::none();
                 }
-                let mut fx = Effects::toast("buffer closed by another client", ToastKind::Warning);
+                let fx = Effects::toast("buffer closed by another client", ToastKind::Warning);
 
-                fx = fx.and(self.request::<BufferOpen>(
+                // In an ephemeral context, don't fall back to a fresh scratch when nothing remains
+                // — leave the context, same as closing it ourselves (see `close_buffer`). This is
+                // the multi-client case: another client closed the shared external file we were
+                // both viewing, and there's no other buffer in this throwaway context to land on.
+                if aether_protocol::is_ephemeral_project_id(&self.project)
+                    && p.next_buffer_id.is_none()
+                {
+                    return fx.and(self.leave_ephemeral_project());
+                }
+
+                fx.and(self.request::<BufferOpen>(
                     BufferOpenParams {
                         buffer_id: p.next_buffer_id,
                         ..Default::default()
                     },
                     move |__r| Event::Switched(__r.map_err(|e| e.to_string())),
-                ));
-                fx
+                ))
             }
             ProjectRenamed::NAME => {
                 // Another client renamed our active project. The server already re-keyed our
@@ -4381,7 +4500,7 @@ impl Session {
     fn accept_prompt(&mut self) -> Effects {
         match self.prompt.take() {
             Some(Prompt::Confirm { action, .. }) => self.run_confirm(action),
-            Some(p @ Prompt::SaveAs(_)) => {
+            Some(p @ (Prompt::SaveAs(_) | Prompt::OpenPath(_))) => {
                 // Submit via the same path as Enter.
                 self.prompt = Some(p);
                 self.on_prompt_key(KeyCode::Enter, Mods::default(), None)
@@ -4933,6 +5052,12 @@ impl Session {
                     .and_then(|p| strip_longest_root(p, &self.project_paths))
                     .unwrap_or((0, String::new()));
                 self.open_save_as(path_index, input)
+            }
+            A::OpenPath => {
+                // Open the project-agnostic path overlay (empty field). The shell focuses it and
+                // syncs typed text via `open_path_set_input`; Enter opens via `project/open_path`.
+                self.prompt = Some(Prompt::OpenPath(crate::session::TextField::new(String::new())));
+                Effects::none()
             }
             A::Reload => {
                 if self.buffer.path.is_none() {

@@ -208,11 +208,26 @@ impl NavHistory {
     }
 }
 
-/// One configured project, loaded and ready to serve. Owns its canonical roots and workspace
-/// index (the picker file cache). One per active project; lives in `ServerState::projects`.
+/// One project, loaded and ready to serve. Owns its canonical roots and workspace index (the
+/// picker file cache). One per active project; lives in `ServerState::projects`, keyed by `id`.
+///
+/// Identity (`id`) is separate from the human name (`name`). A persisted project — one backed by a
+/// `<name>.toml` on disk — has `name: Some(..)`, and its `id` equals that name. An *ephemeral*
+/// project — synthesized to host files opened outside any configured project (`ae /path/to/file`,
+/// open-from-path, goto-def into the stdlib) — has `name: None`, a generated reserved `id`, no
+/// config on disk, and is auto-removed once its last buffer closes. So `name.is_some()` *is* the
+/// persistence signal: there's no separate "ephemeral" flag that could fall out of sync.
 pub struct ProjectEntry {
-    pub name: String,
-    /// Canonicalized project paths. Each is either a file or a directory.
+    /// Stable identity and `projects` map key. For a persisted project this equals its `name`; for
+    /// an ephemeral project it's a generated token (see [`ServerState::ephemeral_project_id`]) that
+    /// can never collide with a valid project name — it contains a path separator, which
+    /// `validate_project_name` forbids.
+    pub id: String,
+    /// The persisted project name, or `None` for an ephemeral project. `Some` ⇔ a `<name>.toml`
+    /// exists on disk ⇔ this project survives losing its last buffer.
+    pub name: Option<String>,
+    /// Canonicalized project paths. Each is either a file or a directory. Empty for an ephemeral
+    /// project (so every buffer in it is "external" — see [`ProjectEntry::contains`]).
     pub paths: Vec<PathBuf>,
     /// Workspace-wide candidate cache for this project. Walked lazily on first picker access;
     /// survives picker hide/show.
@@ -228,11 +243,18 @@ pub struct ProjectEntry {
 }
 
 impl ProjectEntry {
-    /// True iff the given canonical path falls under one of this project's roots.
+    /// True iff the given canonical path falls under one of this project's roots. Always `false`
+    /// for an ephemeral project (no roots), which is exactly what makes every buffer in it
+    /// "external" — see [`ServerState::buffer_is_external`].
     pub fn contains(&self, canonical: &Path) -> bool {
         self.paths
             .iter()
             .any(|p| canonical == p || canonical.starts_with(p))
+    }
+
+    /// Ephemeral ⇔ not persisted ⇔ no on-disk config. The single source of truth is `name.is_none()`.
+    pub fn is_ephemeral(&self) -> bool {
+        self.name.is_none()
     }
 }
 
@@ -301,10 +323,127 @@ impl ServerState {
             .ok_or_else(crate::error::RpcError::no_active_project)
     }
 
-    /// Name of the project a buffer belongs to. `None` if the buffer is unknown or somehow
+    /// Id of the project a buffer belongs to. `None` if the buffer is unknown or somehow
     /// untagged (shouldn't happen for live buffers but the lookup is defensive).
     pub fn project_for_buffer(&self, buffer_id: BufferId) -> Option<&str> {
         self.buffer_projects.get(&buffer_id).map(|s| s.as_str())
+    }
+
+    /// Whether a buffer is *external* to its owning project: a file-backed buffer whose path falls
+    /// under none of the project's roots. Computed live from the roots (never stored), so adding or
+    /// removing a root reclassifies open buffers automatically. Scratch buffers (no path) and
+    /// buffers whose project can't be found are not external. Every file-backed buffer in an
+    /// ephemeral project is external (it has no roots). External buffers get no git baseline and a
+    /// trust-restricted LSP path (see the LSP manager); the client shows an "external" marker.
+    pub fn buffer_is_external(&self, buffer_id: BufferId) -> bool {
+        let Some(path) = self
+            .buffers
+            .get(&buffer_id)
+            .and_then(|b| b.canonical_path.as_deref())
+        else {
+            return false;
+        };
+        match self
+            .buffer_projects
+            .get(&buffer_id)
+            .and_then(|id| self.projects.get(id))
+        {
+            Some(project) => !project.contains(path),
+            None => false,
+        }
+    }
+
+    /// The display number for a *new* ephemeral project: the lowest positive integer not in use by
+    /// another live ephemeral project. Mirrors [`Self::next_scratch_number`] — numbers stay small
+    /// and a freed one is reused once its project is pruned — so the picker shows `(project 1)`,
+    /// `(project 2)`, … rather than an ever-climbing counter. Because ephemeral projects are pruned
+    /// the moment they empty, the lowest-free number is always unique among the live set, so it
+    /// doubles as the id suffix.
+    fn next_ephemeral_number(&self) -> u32 {
+        let used: std::collections::HashSet<u32> = self
+            .projects
+            .values()
+            .filter_map(|p| {
+                p.id.strip_prefix(aether_protocol::EPHEMERAL_PROJECT_PREFIX)
+                    .and_then(|n| n.parse().ok())
+            })
+            .collect();
+        (1..)
+            .find(|n| !used.contains(n))
+            .expect("u32 range is non-empty")
+    }
+
+    /// Mint a fresh ephemeral-project id, `ephemeral/<n>`. The `/` can never appear in a valid
+    /// project name (`validate_project_name` rejects separators), so the id never collides with a
+    /// persisted project or resolves to an on-disk config path; `<n>` is the small reusable display
+    /// number (see [`Self::next_ephemeral_number`]).
+    pub fn ephemeral_project_id(&mut self) -> String {
+        let n = self.next_ephemeral_number();
+        format!("{}{n}", aether_protocol::EPHEMERAL_PROJECT_PREFIX)
+    }
+
+    /// Register a fresh, rootless, nameless project and return its id. The caller activates it for
+    /// a client and opens a buffer in it; it is auto-removed when that last buffer closes (see
+    /// [`Self::prune_ephemeral_if_empty`]).
+    pub fn register_ephemeral_project(&mut self) -> String {
+        let id = self.ephemeral_project_id();
+        let workspace_index = Arc::new(WorkspaceIndex::new(Vec::new()));
+        self.projects.insert(
+            id.clone(),
+            ProjectEntry {
+                id: id.clone(),
+                name: None,
+                paths: Vec::new(),
+                workspace_index,
+                mru_buffers: VecDeque::new(),
+            },
+        );
+        id
+    }
+
+    /// Drop an ephemeral project once it holds no buffers and no client still has it active. A
+    /// no-op for persisted projects and for ephemeral ones that still host a buffer. Call after any
+    /// buffer close so an ephemeral project's lifetime is exactly "while it has a buffer".
+    /// Returns `true` if the project was removed.
+    pub fn prune_ephemeral_if_empty(&mut self, project_id: &str) -> bool {
+        let is_ephemeral = self
+            .projects
+            .get(project_id)
+            .is_some_and(|p| p.is_ephemeral());
+        if !is_ephemeral {
+            return false;
+        }
+        if self.buffers_in_project(project_id).is_empty()
+            && !self.project_active_anywhere(project_id)
+        {
+            self.projects.remove(project_id);
+            return true;
+        }
+        false
+    }
+
+    /// Retire an ephemeral project the moment it loses its *last buffer*: remove it and clear it
+    /// from any client still parked in it. Unlike [`Self::prune_ephemeral_if_empty`] — which keeps
+    /// an empty context alive while a client has it active — this *evicts* those clients (their
+    /// `active_project` becomes `None`), because an ephemeral context with no files has no reason
+    /// to linger in the switcher even if a second client had selected it. Call after a user-driven
+    /// `buffer/close`; the evicted clients are being told the buffer closed (`buffer/closed`) and
+    /// drop to the chooser. Returns whether the project was removed.
+    pub fn retire_ephemeral_if_empty(&mut self, project_id: &str) -> bool {
+        let is_ephemeral = self
+            .projects
+            .get(project_id)
+            .is_some_and(|p| p.is_ephemeral());
+        if !is_ephemeral || !self.buffers_in_project(project_id).is_empty() {
+            return false;
+        }
+        for s in self.clients.values_mut() {
+            if s.active_project.as_deref() == Some(project_id) {
+                s.active_project = None;
+            }
+        }
+        self.projects.remove(project_id);
+        true
     }
 
     /// Rename a loaded project in place: move its entry to the new key (updating `entry.name`),
@@ -315,7 +454,9 @@ impl ServerState {
     /// responsible for renaming the on-disk config and for rejecting name collisions first.
     pub fn rename_project(&mut self, old: &str, new: &str) -> Option<Vec<String>> {
         let mut entry = self.projects.remove(old)?;
-        entry.name = new.to_string();
+        // Rename only applies to persisted projects, whose id tracks their name.
+        entry.id = new.to_string();
+        entry.name = Some(new.to_string());
         let paths: Vec<String> = entry
             .paths
             .iter()
@@ -1285,7 +1426,8 @@ mod project_state_tests {
 
     fn project_entry(name: &str, paths: Vec<PathBuf>) -> ProjectEntry {
         ProjectEntry {
-            name: name.to_string(),
+            id: name.to_string(),
+            name: Some(name.to_string()),
             paths: paths.clone(),
             workspace_index: Arc::new(WorkspaceIndex::new(paths)),
             mru_buffers: VecDeque::new(),
@@ -1336,7 +1478,8 @@ mod project_state_tests {
 
         // Project map re-keyed; the entry's own name field follows.
         assert!(!s.projects.contains_key("old"));
-        assert_eq!(s.projects.get("new").map(|p| p.name.as_str()), Some("new"));
+        assert_eq!(s.projects.get("new").map(|p| p.id.as_str()), Some("new"));
+        assert_eq!(s.projects.get("new").and_then(|p| p.name.as_deref()), Some("new"));
         assert!(s.projects.contains_key("other"));
 
         // The buffer is re-pointed but still present (nothing closed); the unrelated one is left.
@@ -1374,6 +1517,53 @@ mod project_state_tests {
         s.clients.insert(c1, sess1);
         assert!(s.project_active_anywhere("alpha"));
         assert!(!s.project_active_anywhere("beta"));
+    }
+
+    /// An ephemeral project is retired only once it has no buffers *and* no client still has it
+    /// active. This is the multi-client safety property: if a second client joined the ephemeral
+    /// context (via the switcher), closing the first client's buffer must not delete the project
+    /// out from under it.
+    #[test]
+    fn ephemeral_pruned_only_when_empty_and_inactive() {
+        let mut s = ServerState::new();
+        let id = s.register_ephemeral_project();
+        assert!(s.projects.contains_key(&id));
+        assert!(s.projects[&id].is_ephemeral());
+
+        // A client is active in the context and it holds a buffer.
+        let (client, sess) = session(&id);
+        s.clients.insert(client, sess);
+        let buf = s.allocate_buffer_id();
+        s.buffer_projects.insert(buf, id.clone());
+        assert!(!s.prune_ephemeral_if_empty(&id), "active + non-empty stays");
+
+        // The buffer closes, but the client is still parked here → still not pruned (no rug-pull).
+        s.buffer_projects.remove(&buf);
+        assert!(
+            !s.prune_ephemeral_if_empty(&id),
+            "an active client keeps the context even with no buffers"
+        );
+        assert!(s.projects.contains_key(&id));
+
+        // The client switches away → now it's both empty and inactive, so it's retired.
+        s.clients.get_mut(&client).unwrap().active_project = Some("other".to_string());
+        assert!(s.prune_ephemeral_if_empty(&id));
+        assert!(!s.projects.contains_key(&id));
+    }
+
+    /// Ephemeral display numbers reuse the lowest free slot (like scratch numbers), so the picker
+    /// shows small, stable `(project N)` labels rather than an ever-climbing counter.
+    #[test]
+    fn ephemeral_ids_reuse_the_lowest_free_number() {
+        let mut s = ServerState::new();
+        let a = s.register_ephemeral_project();
+        let b = s.register_ephemeral_project();
+        assert_eq!(a, "ephemeral/1");
+        assert_eq!(b, "ephemeral/2");
+        // Retire #1; the next mint reuses its number rather than climbing to 3.
+        s.projects.remove(&a);
+        let c = s.register_ephemeral_project();
+        assert_eq!(c, "ephemeral/1");
     }
 
     /// Deleting a project drops its entry and closes exactly its buffers (tearing down their

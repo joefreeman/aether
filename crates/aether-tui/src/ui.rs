@@ -142,7 +142,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // Status-bar prompts dim the editor too, so attention moves to the prompt: the save-as path
     // input and the y/N confirm prompts. Search is deliberately excluded — it live-highlights
     // matches in the buffer, so the editor must stay legible (and it sets neither flag below).
-    let status_prompt_open = state.save_prompt.is_some() || state.confirm_prompt.is_some();
+    let status_prompt_open = state.save_prompt.is_some()
+        || state.confirm_prompt.is_some()
+        || state.open_path_prompt.is_some();
     if modal_open || status_prompt_open {
         dim_backdrop(f.buffer_mut(), chunks[0]);
     }
@@ -2958,6 +2960,13 @@ fn picker_item_spans(
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
 
+    // A project row's display label is computed (an ephemeral context becomes "(project N)"), so
+    // it's owned here to outlive the borrow taken in the match below.
+    let project_label = match item {
+        PickerItem::Project { name, .. } => aether_client::labels::project_display(name),
+        _ => String::new(),
+    };
+
     // Right-aligned buffer-state dot — matches the status bar's colour-coded indicator and the
     // rich clients' trailing dot. Rendered after the display so it doesn't shift `match_indices`
     // (which index into the display). `None` = clean. The project picker reuses the same dot to
@@ -2980,14 +2989,19 @@ fn picker_item_spans(
             name,
             unsaved_buffers,
             match_indices,
-        } => (
-            name.as_str(),
-            match_indices.as_slice(),
-            // Frost-blue dot when the project has unsaved buffers, matching the unsaved buffer-dot
-            // colour; nothing when clean.
-            (*unsaved_buffers > 0).then_some(NORD9),
-            false,
-        ),
+        } => {
+            // An ephemeral context shows as an italic "(project N)"; its internal id isn't a
+            // meaningful match haystack, so drop the highlight indices for it.
+            let ephemeral = aether_protocol::is_ephemeral_project_id(name);
+            (
+                project_label.as_str(),
+                if ephemeral { &[][..] } else { match_indices.as_slice() },
+                // Frost-blue dot when the project has unsaved buffers, matching the unsaved
+                // buffer-dot colour; nothing when clean.
+                (*unsaved_buffers > 0).then_some(NORD9),
+                ephemeral,
+            )
+        }
         PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
         | PickerItem::GitChange { .. }
@@ -4902,6 +4916,9 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     } else if let Some(prompt) = state.save_prompt.as_ref() {
         // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
         Line::from(draw_save_prompt_spans(prompt, state, area.width as usize).0)
+    } else if let Some(input) = state.open_path_prompt.as_ref() {
+        // Open-from-path overlay: a single-line path input in the status row.
+        Line::from(draw_open_path_prompt_spans(input, area.width as usize).0)
     } else if !state.has_editor() {
         // No editor: at boot while `Connecting` the row carries the connection indicator (the
         // same slot that shows "Reconnecting…" mid-session); otherwise just transient feedback.
@@ -4935,7 +4952,13 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // left of the position. When the row is narrow we truncate the right edge of the left
         // segment with `…` so the right segment stays whole and the position never gets
         // painted over.
-        let project_prefix = format!("[{}] ", state.project_name);
+        // Persisted project → `[name] ` chrome; an ephemeral "(no project)" context (or no
+        // project yet) shows just the file label, no bracket.
+        let project_prefix = if aether_client::labels::shows_project_chrome(&state.project_name) {
+            format!("[{}] ", state.project_name)
+        } else {
+            String::new()
+        };
         // Buffer-state dot just after the file label — colour-coded (unsaved / changed / deleted
         // on disk), matching the web client's favicon colours.
         let status_dot = state.buffer_status().map(|kind| {
@@ -5092,6 +5115,25 @@ fn draw_toast_overlay(f: &mut Frame, state: &AppState, area: Rect) {
 ///   (or the raw red filter if it matches nothing). Then a `:` separator once the path is in play;
 /// - the **path** segment — the typed text (red if the parent dir failed to list) plus a gray
 ///   ghost suffix completing the highlighted entry (a trailing `/` only behind a directory).
+/// Status-row spans for the open-from-path prompt (`Space Alt-w`): an ` open: ` prefix then the
+/// typed path. Returns the spans plus the caret's column offset so the terminal cursor lands in
+/// the input. A plain single-line field — no root chips / suggestions, unlike save-as.
+fn draw_open_path_prompt_spans(
+    input: &crate::text_input::TextInput,
+    _total_width: usize,
+) -> (Vec<Span<'static>>, u16) {
+    const PREFIX: &str = " open: ";
+    let prefix_style = Style::default().bg(NORD1).fg(NORD8);
+    let base_style = Style::default().bg(NORD1).fg(NORD4);
+    let spans = vec![
+        Span::styled(PREFIX, prefix_style),
+        Span::styled(input.text.clone(), base_style),
+    ];
+    let cursor_byte = input.cursor.min(input.text.len());
+    let cursor_col = PREFIX.width() + input.text[..cursor_byte].width();
+    (spans, cursor_col as u16)
+}
+
 fn draw_save_prompt_spans(
     prompt: &crate::save_prompt::SavePromptState,
     state: &AppState,
@@ -5642,6 +5684,15 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         // The span builder reports the caret offset of the focused segment (root or path), so the
         // terminal cursor lands in sync with the rendered text.
         let (_, cursor_off) = draw_save_prompt_spans(prompt, state, status_area.width as usize);
+        let max_col = status_area
+            .x
+            .saturating_add(status_area.width.saturating_sub(1));
+        let col = status_area.x.saturating_add(cursor_off).min(max_col);
+        f.set_cursor_position((col, status_area.y));
+        return;
+    }
+    if let Some(input) = state.open_path_prompt.as_ref() {
+        let (_, cursor_off) = draw_open_path_prompt_spans(input, status_area.width as usize);
         let max_col = status_area
             .x
             .saturating_add(status_area.width.saturating_sub(1));

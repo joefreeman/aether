@@ -31,6 +31,7 @@ use aether_protocol::picker::{
 };
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectCreate, ProjectCreateParams, ProjectInfo,
+    ProjectOpenPath, ProjectOpenPathParams,
 };
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{
@@ -94,6 +95,9 @@ pub struct SessionBootstrap {
     /// Set when the CLI path was a directory: the absolute dir to open the file explorer at,
     /// over the transient scratch in `buffer`. `None` for the file / no-path cases.
     pub explorer_dir: Option<String>,
+    /// The session was launched directly onto a file outside any project (ephemeral context) —
+    /// closing it should quit rather than drop to the chooser (see `Session::launched_with_file`).
+    pub launched_with_file: bool,
 }
 
 /// A bare connection for the no-args start: the project picker browses on it, and the picked
@@ -191,6 +195,8 @@ pub enum OverlayField {
     SaveAs,
     /// The save-as prompt's root-filter input (multi-root projects).
     SaveAsRoot,
+    /// The open-from-path prompt's single path input.
+    OpenPath,
     /// The project-settings name field.
     ProjectName,
     /// The project-settings add-root input.
@@ -209,6 +215,7 @@ impl OverlayField {
             OverlayField::Search => "overlay-search",
             OverlayField::SaveAs => "overlay-saveas",
             OverlayField::SaveAsRoot => "overlay-saveas-root",
+            OverlayField::OpenPath => "overlay-openpath",
             OverlayField::ProjectName => "overlay-project-name",
             OverlayField::ProjectAddRoot => "overlay-project-addroot",
             OverlayField::ChipRoot => "overlay-chip-root",
@@ -451,6 +458,7 @@ impl App {
             Bootstrap::Session(b) => {
                 let pump = pump(b.notifications.clone());
                 let mut session = Session::new(b.project, b.project_paths, b.buffer);
+                session.launched_with_file = b.launched_with_file;
                 // Fetch persisted app settings (e.g. the soft-wrap default) as the session comes up.
                 let startup = session.startup();
                 let mut app = shell(
@@ -623,6 +631,7 @@ impl App {
                     },
                 );
             }
+            Some(Prompt::OpenPath(_)) => return Some(OverlayField::OpenPath),
             Some(_) => return None,
             None => {}
         }
@@ -1104,15 +1113,25 @@ impl App {
     /// pump + the chooser's first `picker/view`. Shared by the no-args boot (`Booted` → `Choose`),
     /// the boot-connection reconnect, and [`Self::reconnect_to_chooser`] (project-gone recovery).
     fn enter_boot_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
+        let view = self.raise_boot_chooser(handle, notifications.clone());
+        Task::batch([pump(notifications), view])
+    }
+
+    /// Install the boot-chooser state and fire its first `picker/view`, WITHOUT starting a
+    /// notification pump — for when a pump is already running on this connection. Used by
+    /// [`Self::enter_boot_chooser`] (which adds the pump for a fresh connection) and directly by
+    /// the [`Effect::ToChooser`] handler, which drops to the chooser mid-session (the live pump
+    /// keeps delivering, now routed through `update_boot`).
+    fn raise_boot_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
         self.boot = Some(Boot {
             handle: handle.clone(),
-            notifications: notifications.clone(),
+            notifications,
             picker: PickerState::new(PickerKind::Projects),
             query_cursor: 0,
             opening: false,
             down: false,
         });
-        let view = Task::perform(
+        Task::perform(
             async move {
                 handle
                     .rpc::<PickerView>(PickerViewParams {
@@ -1137,8 +1156,7 @@ impl App {
                     result,
                 })
             },
-        );
-        Task::batch([pump(notifications), view])
+        )
     }
 
     fn reconnect_to_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
@@ -1163,6 +1181,7 @@ impl App {
                 self.handle = b.handle;
                 self.notifications = b.notifications.clone();
                 self.session = Session::new(b.project, b.project_paths, b.buffer);
+                self.session.launched_with_file = b.launched_with_file;
                 // The connecting editor already laid out (recording cell metrics) without
                 // subscribing, so its Layout may not fire again — subscribe explicitly now that
                 // we're Connected. `subscribe_task` is a no-op if no metrics arrived yet, and the
@@ -1506,6 +1525,13 @@ impl App {
                 }
                 Effect::Reconnect { attempt } => tasks.push(self.try_reconnect(attempt)),
                 Effect::Exit => tasks.push(iced::exit()),
+                Effect::ToChooser => {
+                    // Drop to the project chooser over the live connection (no new pump — the
+                    // current one keeps delivering, now routed through `update_boot`).
+                    let (handle, notifications) =
+                        (self.handle.clone(), self.notifications.clone());
+                    tasks.push(self.raise_boot_chooser(handle, notifications));
+                }
                 Effect::ReadClipboard(kind) => tasks.push(self.read_clipboard(kind)),
                 Effect::ShellAction(action) => tasks.push(self.run_shell_action(action)),
                 Effect::RestoreScrollAnchor => {
@@ -1762,6 +1788,7 @@ impl App {
             OverlayField::Search => self.session.search_set_query(value),
             OverlayField::SaveAs => self.session.save_as_set_input(value),
             OverlayField::SaveAsRoot => self.session.save_as_set_root_filter(value),
+            OverlayField::OpenPath => self.session.open_path_set_input(value),
             OverlayField::ProjectName => self.session.project_settings_set_name(value),
             OverlayField::ProjectAddRoot => self.session.project_settings_set_add(value),
             OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
@@ -3317,6 +3344,53 @@ impl App {
                 .spacing(14)
                 .into()
             }
+            Prompt::OpenPath(field) => {
+                // A plain single-line path input — no root chips, unlike save-as. Edits sync via
+                // `OverlayInput`; Enter (open) / Esc (cancel) bubble to `on_key` since `on_submit`
+                // is unset (focused inputs report Enter `Ignored` and Esc is force-forwarded — see
+                // `subscription`).
+                // `on_input` produces `String` (a `Clone` message, which `text_input` requires),
+                // then the element is mapped to `Message`, mirroring the search bar.
+                let inner = iced::widget::text_input("path to open", &field.text)
+                    .id(OverlayField::OpenPath.id())
+                    .on_input(|s| s)
+                    .font(SANS)
+                    .size(13)
+                    .padding(0)
+                    .width(Length::Fill)
+                    .style(|_theme, _status| iced::widget::text_input::Style {
+                        background: iced::Background::Color(iced::Color::TRANSPARENT),
+                        border: iced::Border::default(),
+                        icon: theme::NORD6,
+                        placeholder: theme::NORD3_BRIGHT,
+                        value: theme::NORD6,
+                        selection: theme::NORD8,
+                    });
+                let input: Element<'_, Message> = Element::from(inner)
+                    .map(|s: String| Message::OverlayInput(OverlayField::OpenPath, s));
+                column![
+                    text("Open file").size(13).font(SANS).color(theme::NORD6),
+                    container(input).padding([5, 8]).width(Length::Fill).style(|_| {
+                        container::Style {
+                            background: Some(theme::NORD0.into()),
+                            border: iced::Border {
+                                color: theme::NORD3,
+                                width: 1.0,
+                                radius: 4.0.into(),
+                            },
+                            ..container::Style::default()
+                        }
+                    }),
+                    row![
+                        iced::widget::Space::new().width(Length::Fill),
+                        btn("Cancel", BtnRole::Default, PromptMsg::Cancel),
+                        btn("Open", BtnRole::Primary, PromptMsg::Accept),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(14)
+                .into()
+            }
         };
         let boxed = container(body)
             .width(420)
@@ -3599,9 +3673,10 @@ impl App {
         if let Some(color) = self.buffer_state_color() {
             left = left.push(t("● ".into(), color));
         }
-        // No project (boot/connecting/chooser) → no `[project]` prefix, so the bar stays blank
-        // rather than showing a stray `[]`.
-        if !self.session.project.is_empty() {
+        // Persisted project → `[name] ` prefix. No project (boot/connecting/chooser) or an
+        // ephemeral "(no project)" context → no prefix, so the bar shows just the file label
+        // rather than a stray `[]` or a `[(no project)]` that reads like a real project.
+        if crate::labels::shows_project_chrome(&self.session.project) {
             left = left.push(t(format!("[{}] ", self.session.project), theme::NORD4));
         }
         // Segment-elide long labels to roughly half the bar so the filename survives (the
@@ -4345,8 +4420,38 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
         .map_err(|e| e.to_string())?;
     let notifications = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
 
-    // No project on the CLI: hand back the bare connection; the chooser browses on it.
+    // No project on the CLI. An existing file outside any configured project (`ae /etc/hosts`)
+    // opens directly in an ephemeral "(no project)" context; otherwise hand back the bare
+    // connection so the chooser browses on it.
     let Some(project) = args.project.clone() else {
+        let resolved = match &args.file {
+            Some(f) => Some(resolve_cli_path(f)?),
+            None => None,
+        };
+        if let Some(abs) = resolved.filter(|p| p.is_file()) {
+            let opened = handle
+                .rpc::<ProjectOpenPath>(ProjectOpenPathParams {
+                    path: abs.display().to_string(),
+                    transient: None,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let project_paths = opened.project.paths.clone();
+            let open = opened
+                .opened
+                .ok_or_else(|| "project/open_path returned no buffer".to_string())?;
+            return Ok(Bootstrap::Session(Box::new(SessionBootstrap {
+                handle,
+                notifications,
+                client_version: args.client_version,
+                server_started_at: opened.server_started_at,
+                project: opened.project.name,
+                buffer: buffer_info(open, &project_paths),
+                project_paths,
+                explorer_dir: None,
+                launched_with_file: true,
+            })));
+        }
         return Ok(Bootstrap::Choose(ChooseBootstrap {
             handle,
             notifications,
@@ -4383,16 +4488,27 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
             .map_err(|e| e.to_string())?,
         Some(abs) => {
             let abs_str = abs.display().to_string();
-            let (path_index, relative_path) = strip_longest_root(&abs_str, &project_paths)
-                .ok_or_else(|| format!("{} is outside the project's roots", abs.display()))?;
-            handle
-                .rpc::<BufferOpen>(BufferOpenParams {
-                    path_index: Some(path_index),
-                    relative_path: Some(relative_path),
-                    ..Default::default()
-                })
-                .await
-                .map_err(|e| e.to_string())?
+            match strip_longest_root(&abs_str, &project_paths) {
+                // Inside a project root: ordinary project-relative open.
+                Some((path_index, relative_path)) => handle
+                    .rpc::<BufferOpen>(BufferOpenParams {
+                        path_index: Some(path_index),
+                        relative_path: Some(relative_path),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?,
+                // Outside the named project's roots: open as an external (guest) buffer in it.
+                None => handle
+                    .rpc::<ProjectOpenPath>(ProjectOpenPathParams {
+                        path: abs_str,
+                        transient: None,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .opened
+                    .ok_or_else(|| "project/open_path returned no buffer".to_string())?,
+            }
         }
         // No file: attach to the most recent buffer, or a transient scratch placeholder.
         None => handle
@@ -4419,6 +4535,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
         buffer: buffer_info(open, &project_paths),
         project_paths,
         explorer_dir,
+        launched_with_file: false,
     })))
 }
 

@@ -226,6 +226,9 @@ fn prompt(p: &Option<Prompt>, project_paths: &[String]) -> Value {
         }
         Some(Prompt::SaveAs(ed)) => save_as(ed, project_paths),
         Some(Prompt::LspInfo(status)) => json!({ "kind": "lspinfo", "status": jv(status) }),
+        // Open-from-path: a single plain path field (no root chips). The shell renders an
+        // `<input>` and syncs its value via `open_path_set_input`.
+        Some(Prompt::OpenPath(field)) => json!({ "kind": "openpath", "input": field.text }),
     }
 }
 

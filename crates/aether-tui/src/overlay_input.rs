@@ -23,6 +23,8 @@ pub enum OverlayField {
     SaveAs,
     /// The save-as prompt's root-typeahead segment (multi-root projects only).
     SaveAsRoot,
+    /// The open-from-path prompt's single path field (`Prompt::OpenPath`).
+    OpenPath,
     /// The incremental-search query bar (`Mode::Search`).
     Search,
     /// The project-settings overlay's name field.

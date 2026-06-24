@@ -148,7 +148,8 @@ pub async fn spawn_for_test_multi(
             s.projects.insert(
                 name.clone(),
                 ProjectEntry {
-                    name: name.clone(),
+                    id: name.clone(),
+                    name: Some(name.clone()),
                     paths: paths.clone(),
                     workspace_index,
                     mru_buffers: std::collections::VecDeque::new(),

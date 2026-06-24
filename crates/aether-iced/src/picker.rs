@@ -1230,14 +1230,25 @@ fn render_item<'a>(
             unsaved_buffers,
             match_indices,
         } => {
+            // An ephemeral context renders as an italic "(project N)" — to mark it ephemeral, like
+            // transient buffers slant. Its internal id isn't a meaningful fuzzy-match haystack, so
+            // there are no highlight indices to carry.
+            let label: iced::Element<_> = if aether_protocol::is_ephemeral_project_id(name) {
+                highlighted_owned(
+                    aether_client::labels::project_display(name),
+                    Vec::new(),
+                    theme::NORD6,
+                    SANS_ITALIC,
+                    hovered,
+                )
+            } else {
+                highlighted(name, match_indices, theme::NORD6, SANS, hovered)
+            };
             // Trailing frost-blue dot when the project has unsaved buffers — the same right-aligned
             // dot the buffer picker shows, so the two pickers read alike.
-            let mut r = row![
-                highlighted(name, match_indices, theme::NORD6, SANS, hovered),
-                iced::widget::Space::new().width(Length::Fill),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
+            let mut r = row![label, iced::widget::Space::new().width(Length::Fill),]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
             if *unsaved_buffers > 0 {
                 r = r.push(text("●").size(9).color(theme::NORD9));
             }

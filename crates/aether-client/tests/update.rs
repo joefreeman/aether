@@ -3081,3 +3081,174 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
         "center matched within the framed window"
     );
 }
+
+/// Closing the last buffer of an ephemeral "(project N)" context doesn't spawn a scratch — it
+/// leaves the context. A session *launched* for the file (`ae /path`) quits, vim-like.
+#[test]
+fn ephemeral_last_buffer_close_when_launched_quits() {
+    let mut s = session();
+    s.project = "ephemeral/1".to_string();
+    s.launched_with_file = true;
+
+    let fx = s.close_buffer();
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/close");
+    assert_eq!(
+        params["open_next"],
+        json!(false),
+        "no scratch successor in an ephemeral context"
+    );
+
+    // Server reports nothing left in the project.
+    let fx = s.on_rpc_result(token, Ok(json!({})));
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Exit)),
+        "a file-launched session quits when its only buffer closes"
+    );
+}
+
+/// A session that *navigated into* an ephemeral context (picked it from the switcher, or a second
+/// client that joined it) returns to the project chooser instead of quitting — quitting would be
+/// surprising when the app was already in use. (Web takes this branch too: it never launches with
+/// a file, can't quit a tab, and its chooser is mandatory.)
+#[test]
+fn ephemeral_last_buffer_close_when_navigated_opens_chooser() {
+    let mut s = session();
+    s.project = "ephemeral/1".to_string();
+    s.launched_with_file = false;
+
+    let fx = s.close_buffer();
+    let (token, _, _) = the_request(&fx);
+
+    let fx = s.on_rpc_result(token, Ok(json!({})));
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Exit)),
+        "a navigated-into context must not quit the app on close"
+    );
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::ToChooser)),
+        "it returns to the project chooser (shell-side reset) instead"
+    );
+}
+
+/// When another buffer remains in the ephemeral context (several files opened into one), closing
+/// one attaches to the sibling rather than leaving.
+#[test]
+fn ephemeral_close_with_sibling_attaches_instead_of_leaving() {
+    let mut s = session();
+    s.project = "ephemeral/1".to_string();
+
+    let fx = s.close_buffer();
+    let (token, _, _) = the_request(&fx);
+
+    let fx = s.on_rpc_result(token, Ok(json!({ "next_buffer_id": 5 })));
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Exit)),
+        "a remaining sibling means we stay, not quit"
+    );
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/open");
+    assert_eq!(params["buffer_id"], json!(5), "attach to the remaining sibling");
+}
+
+/// A persisted project is unaffected: closing its last buffer still spawns a scratch successor
+/// (`open_next`), and never quits.
+#[test]
+fn persisted_project_close_keeps_open_next_scratch() {
+    let mut s = session();
+    s.project = "my-project".to_string();
+
+    let fx = s.close_buffer();
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/close");
+    assert_eq!(
+        params["open_next"],
+        json!(true),
+        "persisted projects keep the close-then-scratch behaviour"
+    );
+    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Exit)));
+}
+
+/// `Space Alt-w` open-from-path: typing syncs into the core, Enter submits via `project/open_path`,
+/// and the result is adopted like a project switch (project + buffer).
+#[test]
+fn open_path_prompt_submits_via_open_path_rpc() {
+    use aether_client::session::{Prompt, TextField};
+    use aether_protocol::buffer::BufferOpenResult;
+    use aether_protocol::project::{ProjectActivateResult, ProjectInfo};
+
+    let mut s = session();
+    s.project = "proj".into();
+    // Opening the overlay (what `A::OpenPath` does).
+    s.prompt = Some(Prompt::OpenPath(TextField::new(String::new())));
+
+    // The shell syncs typed text into the core.
+    let _ = s.open_path_set_input("/etc/hosts".into());
+
+    // Enter submits.
+    let fx = s.on_prompt_key(KeyCode::Enter, Mods::NONE, None);
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "project/open_path");
+    assert_eq!(params["path"], json!("/etc/hosts"));
+    assert!(s.prompt.is_none(), "the overlay closes on submit");
+
+    // The result lands like a switch: adopt the (resolved) project + opened buffer.
+    let opened = BufferOpenResult {
+        buffer_id: 9,
+        language: None,
+        line_count: 1,
+        byte_count: 0,
+        revision: 0,
+        saved_revision: 0,
+        path: Some("/etc/hosts".into()),
+        scratch_number: None,
+        cursor: Default::default(),
+        scroll: None,
+        lsp_server: None,
+        transient: false,
+        search_summary: None,
+    };
+    let result = serde_json::to_value(ProjectActivateResult {
+        project: ProjectInfo {
+            name: "proj".into(),
+            paths: vec![],
+        },
+        last_buffer_id: None,
+        opened: Some(opened),
+        server_started_at: 0,
+    })
+    .unwrap();
+    let fx = s.on_rpc_result(token, Ok(result));
+    assert!(!has_error_toast(&fx));
+    assert_eq!(s.buffer.buffer_id, 9, "adopted the opened buffer");
+}
+
+/// Esc cancels the open-from-path overlay without opening anything.
+#[test]
+fn open_path_prompt_esc_cancels() {
+    use aether_client::session::{Prompt, TextField};
+    let mut s = session();
+    s.project = "proj".into();
+    s.prompt = Some(Prompt::OpenPath(TextField::new("/some/path".into())));
+    let fx = s.on_prompt_key(KeyCode::Esc, Mods::NONE, None);
+    assert!(s.prompt.is_none(), "Esc closes the overlay");
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "cancel issues no request"
+    );
+}
+
+/// Submitting an empty path is a no-op that keeps the overlay open (nothing to open yet).
+#[test]
+fn open_path_empty_submit_keeps_overlay_open() {
+    use aether_client::session::{Prompt, TextField};
+    let mut s = session();
+    s.project = "proj".into();
+    s.prompt = Some(Prompt::OpenPath(TextField::new("   ".into()))); // whitespace only
+    let fx = s.on_prompt_key(KeyCode::Enter, Mods::NONE, None);
+    assert!(
+        matches!(s.prompt, Some(Prompt::OpenPath(_))),
+        "an empty submit leaves the overlay open"
+    );
+    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
+}

@@ -91,11 +91,12 @@ fn run_edit(edit: EditArgs, version: String) -> anyhow::Result<()> {
     }
 }
 
-/// Decide which project to open. `--project` always wins. Otherwise infer from the PATH — and since
-/// the user named a specific path, a path that belongs to no project, or to several, is an error
-/// they must resolve rather than something we silently guess past. With no PATH, infer from the
-/// current directory but fall back to the picker (a bare `ae` in an unconfigured dir shouldn't be a
-/// hard error).
+/// Decide which project to open. `--project` always wins. Otherwise infer from the PATH: a path
+/// inside exactly one project opens there; a path inside *several* is an error the user must
+/// disambiguate. A path inside *no* configured project is no longer an error — we return `None`,
+/// and the client opens the file directly in an ephemeral "(no project)" context (`ae /etc/hosts`).
+/// With no PATH, infer from the current directory but fall back to the picker (a bare `ae` in an
+/// unconfigured dir shouldn't be a hard error).
 fn resolve_project(edit: &EditArgs) -> anyhow::Result<Option<String>> {
     use aether_server::ProjectMatch;
 
@@ -106,10 +107,8 @@ fn resolve_project(edit: &EditArgs) -> anyhow::Result<Option<String>> {
     if let Some(path) = &edit.path {
         return match aether_server::infer_project_for_path(std::path::Path::new(path))? {
             ProjectMatch::One(name) => Ok(Some(name)),
-            ProjectMatch::None => anyhow::bail!(
-                "{path} is not within any configured project — pass `--project NAME`, or add it as \
-                 a root to a project's config"
-            ),
+            // Outside every project: open project-lessly (the client falls back to open-from-path).
+            ProjectMatch::None => Ok(None),
             ProjectMatch::Ambiguous(names) => anyhow::bail!(
                 "{path} is within multiple projects ({}) — disambiguate with `--project NAME`",
                 names.join(", ")

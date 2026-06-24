@@ -47,7 +47,7 @@ use aether_protocol::picker::{
 };
 use aether_protocol::project::{
     ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectDelete,
-    ProjectDeleteParams,
+    ProjectDeleteParams, ProjectOpenPath, ProjectOpenPathParams,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavParams, SearchNavResult, SearchNext, SearchPrev,
@@ -20937,6 +20937,231 @@ async fn buffers_picker_reports_transient_flag() {
     assert!(
         flags.contains(&(a.buffer_id, false)),
         "permanent buffer unflagged: {flags:?}"
+    );
+    drop(server);
+}
+
+// ---- external files & ephemeral projects --------------------------------------------------------
+
+type TestWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A project rooted at one dir, plus a file in a *different* dir outside it. Returns the server, a
+/// connected (un-activated) socket, and the external file's canonical absolute path.
+async fn setup_with_external_file() -> (aether_server::ServerHandle, TestWs, String) {
+    let proj_dir = tempfile::tempdir().unwrap();
+    std::fs::write(proj_dir.path().join("inside.rs"), "fn inside() {}\n").unwrap();
+    let ext_dir = tempfile::tempdir().unwrap();
+    let ext_file = ext_dir.path().join("outside.rs");
+    std::fs::write(&ext_file, "fn outside() {}\n").unwrap();
+    let ext_abs = std::fs::canonicalize(&ext_file)
+        .unwrap()
+        .display()
+        .to_string();
+    let proj_path = proj_dir.path().to_path_buf();
+    std::mem::forget(proj_dir);
+    std::mem::forget(ext_dir);
+    let server = spawn_for_test("test-proj", vec![proj_path]).await.unwrap();
+    let (ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    (server, ws, ext_abs)
+}
+
+/// Names of the rows in the project switcher (Projects picker, empty query).
+async fn project_switcher_names(ws: &mut TestWs, id: u64) -> Vec<String> {
+    let view = send_request::<PickerView>(
+        ws,
+        id,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Projects,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+        },
+    )
+    .await;
+    view.update
+        .expect("the view response carries its window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Project { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn open_path_with_no_project_creates_ephemeral() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    // No project/activate first: open-from-path on an external file synthesizes an ephemeral one.
+    let opened: ProjectActivateResult = send_request::<ProjectOpenPath>(
+        &mut ws,
+        1,
+        &ProjectOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+        },
+    )
+    .await;
+    assert!(
+        aether_protocol::is_ephemeral_project_id(&opened.project.name),
+        "expected an ephemeral project id, got {:?}",
+        opened.project.name
+    );
+    assert!(
+        opened.project.paths.is_empty(),
+        "ephemeral project has no roots"
+    );
+    let buf = opened.opened.expect("open_path returns the opened buffer");
+    assert_eq!(buf.path.as_deref(), Some(ext_abs.as_str()));
+    drop(server);
+}
+
+#[tokio::test]
+async fn open_path_external_within_active_project_keeps_project() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    // A file outside the active project's roots attaches as a guest — the project is unchanged.
+    let opened: ProjectActivateResult = send_request::<ProjectOpenPath>(
+        &mut ws,
+        2,
+        &ProjectOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        opened.project.name, "test-proj",
+        "an external open stays in the active project, not a new ephemeral one"
+    );
+    let buf = opened.opened.expect("buffer opened");
+    assert_eq!(buf.path.as_deref(), Some(ext_abs.as_str()));
+    drop(server);
+}
+
+#[tokio::test]
+async fn ephemeral_project_shows_in_switcher_then_auto_removed() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let opened: ProjectActivateResult = send_request::<ProjectOpenPath>(
+        &mut ws,
+        1,
+        &ProjectOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+        },
+    )
+    .await;
+    let ephemeral_id = opened.project.name.clone();
+    let buffer_id = opened.opened.expect("buffer").buffer_id;
+
+    // While it holds a buffer, the ephemeral context appears in the switcher.
+    let names = project_switcher_names(&mut ws, 2).await;
+    assert!(
+        names.contains(&ephemeral_id),
+        "ephemeral should show while it has a buffer: {names:?}"
+    );
+
+    // Switch away to the configured project (the permanent external buffer keeps the ephemeral
+    // alive), then close that buffer — now that no client holds the ephemeral active and it has no
+    // buffers, it's retired and drops out of the switcher.
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        3,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _close: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        4,
+        &BufferCloseParams {
+            buffer_id,
+            open_next: false,
+        },
+    )
+    .await;
+    let names = project_switcher_names(&mut ws, 5).await;
+    assert!(
+        !names.contains(&ephemeral_id),
+        "ephemeral should be retired after its last buffer closes: {names:?}"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
+    // Client A opens an external file → ephemeral context with one buffer.
+    let (server, mut ws_a, ext_abs) = setup_with_external_file().await;
+    let opened: ProjectActivateResult = send_request::<ProjectOpenPath>(
+        &mut ws_a,
+        1,
+        &ProjectOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+        },
+    )
+    .await;
+    let ephemeral_id = opened.project.name.clone();
+    let buffer_id = opened.opened.expect("buffer").buffer_id;
+
+    // Client B joins the same ephemeral context from the switcher (activate by id) and lands on
+    // its buffer — the multi-client case that used to keep the context alive after the file closed.
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let act_b: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws_b,
+        1,
+        &ProjectActivateParams {
+            name: ephemeral_id.clone(),
+            open_last: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        act_b.opened.expect("B lands on the shared file").buffer_id,
+        buffer_id
+    );
+    assert!(project_switcher_names(&mut ws_b, 2)
+        .await
+        .contains(&ephemeral_id));
+
+    // A closes the shared, only buffer. The context has no files left, so it's retired outright —
+    // B is evicted from it and it drops out of the switcher (rather than lingering / re-opening
+    // onto a scratch).
+    let _close: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws_a,
+        2,
+        &BufferCloseParams {
+            buffer_id,
+            open_next: false,
+        },
+    )
+    .await;
+    let names = project_switcher_names(&mut ws_b, 3).await;
+    assert!(
+        !names.contains(&ephemeral_id),
+        "ephemeral context must be retired even with a second client parked in it: {names:?}"
     );
     drop(server);
 }

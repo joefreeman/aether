@@ -26,6 +26,15 @@ pub struct BufferOpenParams {
     pub buffer_id: Option<BufferId>,
     pub path_index: Option<u32>,
     pub relative_path: Option<String>,
+    /// Open a file by absolute path, bypassing the `path_index`/`relative_path` project-root
+    /// resolution. Set only by the project-aware open-from-path flow (`project/open_path`) and the
+    /// goto-definition follow path, where the target may lie *outside* the active project's roots —
+    /// an "external" buffer. Unlike root-relative opens (which are confined to the project boundary
+    /// to block `../` traversal), an absolute-path open is allowed to land outside the roots; the
+    /// server marks the resulting buffer external (no git baseline, trust-restricted LSP). Mutually
+    /// exclusive with `path_index`/`relative_path`. Ignored when `buffer_id` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absolute_path: Option<String>,
     pub language: Option<String>,
     /// When `true` and the target file doesn't exist on disk, the server creates an empty
     /// buffer with the path set but no file on disk yet — the file gets created on the next

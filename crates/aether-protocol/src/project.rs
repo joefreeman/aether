@@ -102,6 +102,39 @@ pub struct ProjectCreateParams {
     pub name: String,
 }
 
+/// Open a file by absolute (or cwd-relative) path, resolving the project context for it. This is
+/// the project-agnostic entry point used by `ae /path/to/file`, the `Space Alt-w` open-from-path
+/// overlay, and goto-definition into a file outside the active project. The server:
+///
+/// - canonicalizes the path;
+/// - if the calling client has an active project whose roots **contain** the path, opens it there
+///   as an ordinary (internal) buffer;
+/// - if a project is active but the path is **outside** its roots, opens it there as an *external*
+///   buffer (the project hosts it as a guest — no git, trust-restricted LSP) — it is **not**
+///   re-homed into whichever other configured project might contain it;
+/// - if **no** project is active, synthesizes a fresh *ephemeral* project (no name, no roots, auto-
+///   removed when its last buffer closes), activates it, and opens the file there.
+///
+/// Returns the (possibly newly-activated) project alongside the opened buffer, so the client adopts
+/// the project id exactly as it does after `project/activate`.
+pub struct ProjectOpenPath;
+impl RpcMethod for ProjectOpenPath {
+    const NAME: &'static str = "project/open_path";
+    type Params = ProjectOpenPathParams;
+    type Result = ProjectActivateResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectOpenPathParams {
+    /// File to open. Absolute, or relative to the server's current working directory. `~/` is
+    /// expanded server-side. Must exist on disk (open-from-path is for existing files).
+    pub path: String,
+    /// Open the buffer as transient (auto-closes once hidden) — used when the open is a preview.
+    /// Defaults to a permanent open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient: Option<bool>,
+}
+
 /// Add a root path to an existing project. Server canonicalizes the path, refuses duplicates,
 /// updates the TOML, watches the new path for external changes, and invalidates the project's
 /// workspace index (so the next picker open re-walks).

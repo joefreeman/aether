@@ -41,8 +41,8 @@ use aether_protocol::picker::{
     PickerGrepNavigate, PickerHide, PickerQuery, PickerSectionJump, PickerSelect, PickerView,
 };
 use aether_protocol::project::{
-    ProjectActivate, ProjectAddRoot, ProjectCreate, ProjectDelete, ProjectList, ProjectRemoveRoot,
-    ProjectRename,
+    ProjectActivate, ProjectAddRoot, ProjectCreate, ProjectDelete, ProjectList, ProjectOpenPath,
+    ProjectRemoveRoot, ProjectRename,
 };
 use aether_protocol::search::{SearchClear, SearchNext, SearchPrev, SearchSet};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
@@ -259,6 +259,12 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
 
     let pushes = {
         let mut s = state.lock().await;
+        // Remember the disconnecting client's project so we can retire it if it was an ephemeral
+        // ("no project") context that nothing else is using once this session's buffers are gone.
+        let disconnecting_project = s
+            .clients
+            .get(&client_id)
+            .and_then(|c| c.active_project.clone());
         s.clients.remove(&client_id);
         // Buffers this client was showing: once its viewports are gone, any transient among
         // them that no other client shows is orphaned and gets closed.
@@ -278,13 +284,21 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_last_scroll_for_client(client_id);
         s.drop_pickers_for_client(client_id);
         s.drop_nav_history_for_client(client_id);
+        let pruned_ephemeral = disconnecting_project
+            .as_deref()
+            .is_some_and(|pid| s.prune_ephemeral_if_empty(pid));
         tracing::debug!(%client_id, "client session removed");
-        // Other clients' buffer pickers should drop the closed transients from their lists.
-        if closed.is_empty() {
+        // Other clients' buffer pickers should drop the closed transients from their lists; a
+        // retired ephemeral project drops out of any open switcher.
+        let mut pushes = if closed.is_empty() {
             Vec::new()
         } else {
             crate::handlers::refresh_buffer_pickers(&mut s)
+        };
+        if pruned_ephemeral {
+            pushes.extend(crate::handlers::refresh_project_pickers(&mut s));
         }
+        pushes
     };
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -366,6 +380,7 @@ async fn dispatch(
         SettingsSet::NAME => run!(SettingsSet, handlers::settings_set),
         ProjectActivate::NAME => run!(ProjectActivate, handlers::project_activate),
         ProjectCreate::NAME => run!(ProjectCreate, handlers::project_create),
+        ProjectOpenPath::NAME => run!(ProjectOpenPath, handlers::project_open_path),
         ProjectAddRoot::NAME => run!(ProjectAddRoot, handlers::project_add_root),
         ProjectRemoveRoot::NAME => run!(ProjectRemoveRoot, handlers::project_remove_root),
         ProjectRename::NAME => run!(ProjectRename, handlers::project_rename),

@@ -34,7 +34,8 @@ use aether_protocol::lsp::{
 };
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::project::{
-    ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectSummary,
+    ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectOpenPath,
+    ProjectOpenPathParams, ProjectSummary,
 };
 use aether_protocol::search::{SearchSet, SearchSetParams};
 use aether_protocol::viewport::ViewportLinesChanged;
@@ -70,6 +71,50 @@ fn request_roundtrip() {
     assert_eq!(v["jsonrpc"], "2.0");
     assert_eq!(v["method"], "project/activate");
     assert_eq!(v["params"]["name"], "aether");
+}
+
+#[test]
+fn project_open_path_roundtrip() {
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id: 9,
+        method: ProjectOpenPath::NAME.into(),
+        params: Some(
+            to_value(ProjectOpenPathParams {
+                path: "/etc/hosts".into(),
+                transient: None,
+            })
+            .unwrap(),
+        ),
+    };
+    let s = serde_json::to_string(&req).unwrap();
+    let v: serde_json::Value = from_str(&s).unwrap();
+    assert_eq!(v["method"], "project/open_path");
+    assert_eq!(v["params"]["path"], "/etc/hosts");
+    // `transient: None` stays off the wire.
+    assert!(v["params"].get("transient").is_none());
+}
+
+#[test]
+fn buffer_open_absolute_path_roundtrips_and_omits_when_absent() {
+    // Present: serialized through.
+    let with = to_value(BufferOpenParams {
+        absolute_path: Some("/tmp/x.rs".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(with["absolute_path"], "/tmp/x.rs");
+    // Absent (the default): skipped, so existing root-relative opens keep their wire shape.
+    let without = to_value(BufferOpenParams::default()).unwrap();
+    assert!(without.get("absolute_path").is_none());
+}
+
+#[test]
+fn ephemeral_project_id_predicate() {
+    assert!(aether_protocol::is_ephemeral_project_id("ephemeral/1"));
+    assert!(!aether_protocol::is_ephemeral_project_id("my-project"));
+    // A real project name can't contain a separator, so the namespaces never collide.
+    assert!(!aether_protocol::is_ephemeral_project_id("ephemeral")); // no slash, not the prefix
 }
 
 #[test]

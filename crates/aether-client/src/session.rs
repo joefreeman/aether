@@ -153,6 +153,12 @@ pub enum Prompt {
     SaveAs(Box<crate::save_as::SaveAsEditor>),
     /// LSP server detail (from the LspServers picker): info rows + `r` to restart.
     LspInfo(Box<LspServerStatus>),
+    /// The open-from-path overlay (`Space Alt-w`): a single, project-agnostic path field. Unlike
+    /// [`Self::SaveAs`] (a root-relative chip editor), this is a plain absolute/relative path —
+    /// `Enter` opens it via `project/open_path` (external buffer outside the roots, or a fresh
+    /// ephemeral context with no project active), `Esc` cancels. Text editing is shell-owned and
+    /// synced via [`super::update`]'s `open_path_set_input`; the core keeps the value.
+    OpenPath(TextField),
 }
 
 /// A single editable text field. The project-settings overlay holds two (name + add-root). Text
@@ -441,6 +447,14 @@ pub struct Session {
 
     pub project: String,
     pub project_paths: Vec<String>,
+    /// True when this session was launched directly to view a file outside any project (`ae
+    /// /path`), landing it in an ephemeral context, and it hasn't switched projects since. It's
+    /// the signal for what to do when the last buffer of an ephemeral context closes: a
+    /// launched-for-a-file session has nothing left to show, so native clients quit (vim-like);
+    /// a session that merely *navigated into* an ephemeral context (via the switcher) returns to
+    /// the chooser instead. Set by the shells at a file-launch bootstrap; cleared on any project
+    /// switch. See [`crate::update`]'s `leave_ephemeral_project`.
+    pub launched_with_file: bool,
     pub buffer: BufferInfo,
     pub mode: Mode,
     pub pending: Pending,
@@ -497,6 +511,7 @@ impl Session {
             next_token: 0,
             project,
             project_paths,
+            launched_with_file: false,
             buffer,
             mode: Mode::Normal,
             pending: Pending::None,

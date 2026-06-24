@@ -440,6 +440,7 @@ impl Shell {
                 }
                 Effect::Reconnect { attempt } => self.spawn_reconnect(attempt),
                 Effect::Exit => self.should_quit = true,
+                Effect::ToChooser => self.to_chooser(),
                 Effect::ShellAction(action) => self.run_shell_action(action),
             }
         }
@@ -705,6 +706,7 @@ impl Shell {
                         OverlayField::SaveAs
                     },
                 ),
+                Prompt::OpenPath(_) => Some(OverlayField::OpenPath),
                 _ => None,
             };
         }
@@ -755,6 +757,10 @@ impl Shell {
                 Some(Prompt::SaveAs(ed)) => ed.root_filter.text.clone(),
                 _ => String::new(),
             },
+            OverlayField::OpenPath => match &self.session.prompt {
+                Some(Prompt::OpenPath(field)) => field.text.clone(),
+                _ => String::new(),
+            },
             OverlayField::Search => self.session.search.query.clone(),
             OverlayField::ProjectName => self
                 .session
@@ -802,6 +808,7 @@ impl Shell {
         match field {
             OverlayField::SaveAs => self.session.save_as_set_input(value),
             OverlayField::SaveAsRoot => self.session.save_as_set_root_filter(value),
+            OverlayField::OpenPath => self.session.open_path_set_input(value),
             OverlayField::Search => self.session.search_set_query(value),
             OverlayField::ProjectName => self.session.project_settings_set_name(value),
             OverlayField::ProjectAddRoot => self.session.project_settings_set_add(value),
@@ -1299,15 +1306,23 @@ impl Shell {
     /// chooser, mirroring a no-args start. Picking a project (the renamed one shows under its new
     /// name) lands a buffer the usual way.
     fn reconnect_to_chooser(&mut self) {
+        self.to_chooser();
+        self.status(StatusMessage::error(
+            "project no longer exists — pick another".to_string(),
+        ));
+    }
+
+    /// Drop to the project chooser over the live connection: swap in a fresh placeholder session
+    /// (no buffer, so nothing stale renders behind the picker) and raise the Projects picker.
+    /// Driven by [`Effect::ToChooser`] when an ephemeral context we navigated into loses its last
+    /// buffer, and reused by [`Self::reconnect_to_chooser`] for project-gone recovery.
+    fn to_chooser(&mut self) {
         use aether_protocol::picker::PickerKind;
         self.session = Session::placeholder(); // conn = Connected, so notifications resume
         let startup = self
             .session
             .open_picker(PickerKind::Projects, None, None, false);
         self.run_effects(startup);
-        self.status(StatusMessage::error(
-            "project no longer exists — pick another".to_string(),
-        ));
     }
 
     /// Push the boot dial (connect + bootstrap) onto the pending set; its `Done::Booted` result
@@ -1674,10 +1689,16 @@ impl Shell {
             .as_ref()
             .filter(|e| e.field == crate::overlay_input::OverlayField::SaveAsRoot)
             .map(|e| e.input.cursor);
+        let open_path_cursor = self
+            .overlay_edit
+            .as_ref()
+            .filter(|e| e.field == crate::overlay_input::OverlayField::OpenPath)
+            .map(|e| e.input.cursor);
         let multi_root = self.session.project_paths.len() > 1;
         let st = &mut self.state;
         st.confirm_prompt = None;
         st.save_prompt = None;
+        st.open_path_prompt = None;
         st.picker.lsp_detail = None;
         match &self.session.prompt {
             Some(Prompt::Confirm { kind, .. }) => {
@@ -1696,6 +1717,12 @@ impl Shell {
                     save_root_cursor,
                     save_path_cursor,
                 ));
+            }
+            Some(Prompt::OpenPath(field)) => {
+                let mut input = crate::text_input::TextInput::default();
+                input.set(field.text.clone());
+                input.cursor = open_path_cursor.unwrap_or(field.text.len());
+                st.open_path_prompt = Some(input);
             }
             Some(Prompt::LspInfo(status)) => {
                 // The dedicated detail pane the LSP-servers picker renders. Scroll is
@@ -2045,18 +2072,54 @@ pub async fn bootstrap(
 ) -> Result<(Session, AppState, Effects)> {
     use aether_protocol::buffer::{BufferOpen, BufferOpenParams};
     use aether_protocol::picker::PickerKind;
-    use aether_protocol::project::{ProjectActivate, ProjectActivateParams};
+    use aether_protocol::project::{
+        ProjectActivate, ProjectActivateParams, ProjectOpenPath, ProjectOpenPathParams,
+    };
 
-    // Project selection is explicit. When none is named on the command line we DON'T activate
-    // one — we start with a placeholder session (no project, no buffer) and raise the Projects
-    // chooser. Nothing is rendered behind it; picking a project activates it and lands the first
-    // buffer (`PickerSelected` → `ProjectActivated` → `adopt_switch`), which is when the editor
-    // first appears. Its `picker/view` request rides the returned effects, run once the shell is up.
+    // Project selection is explicit. When none is named on the command line and no file is given
+    // we DON'T activate one — we start with a placeholder session (no project, no buffer) and
+    // raise the Projects chooser. Nothing is rendered behind it; picking a project activates it
+    // and lands the first buffer (`PickerSelected` → `ProjectActivated` → `adopt_switch`), which
+    // is when the editor first appears. When a file *is* given but no project (a path outside any
+    // configured project, e.g. `ae /etc/hosts`), we open it directly via `project/open_path`,
+    // which lands it in a fresh ephemeral "(no project)" context.
     let (mut session, project_name, project_paths, startup) = match project {
         None => {
-            let mut session = Session::placeholder();
-            let startup = session.open_picker(PickerKind::Projects, None, None, false);
-            (session, String::new(), Vec::new(), startup)
+            let resolved = match file {
+                Some(f) => Some(crate::app::resolve_cli_path(f)?),
+                None => None,
+            };
+            match resolved {
+                // An existing external file: open it in an ephemeral context. (A directory or a
+                // not-yet-existing path with no project has nowhere sensible to root, so fall
+                // through to the chooser.)
+                Some(abs) if abs.is_file() => {
+                    let opened = handle
+                        .rpc::<ProjectOpenPath>(ProjectOpenPathParams {
+                            path: abs.display().to_string(),
+                            transient: None,
+                        })
+                        .await?;
+                    let project_paths = opened.project.paths.clone();
+                    let open = opened.opened.ok_or_else(|| {
+                        anyhow::anyhow!("project/open_path returned no buffer")
+                    })?;
+                    let mut session = Session::new(
+                        opened.project.name.clone(),
+                        project_paths.clone(),
+                        buffer_info(open, &project_paths),
+                    );
+                    // Launched to view this file in an ephemeral context: closing it should quit
+                    // (see `leave_ephemeral_project`), not drop to the chooser.
+                    session.launched_with_file = true;
+                    (session, opened.project.name, project_paths, Effects::none())
+                }
+                _ => {
+                    let mut session = Session::placeholder();
+                    let startup = session.open_picker(PickerKind::Projects, None, None, false);
+                    (session, String::new(), Vec::new(), startup)
+                }
+            }
         }
         Some(project) => {
             let activated = handle
@@ -2086,19 +2149,31 @@ pub async fn bootstrap(
                 }
                 Some(abs) => {
                     let abs = abs.display().to_string();
-                    let (path_index, relative_path) =
-                        aether_client::session::strip_longest_root(&abs, &project_paths)
+                    match aether_client::session::strip_longest_root(&abs, &project_paths) {
+                        // Inside a project root: ordinary project-relative open.
+                        Some((path_index, relative_path)) => {
+                            handle
+                                .rpc::<BufferOpen>(BufferOpenParams {
+                                    path_index: Some(path_index),
+                                    relative_path: Some(relative_path),
+                                    create_if_missing: true,
+                                    ..Default::default()
+                                })
+                                .await?
+                        }
+                        // Outside the named project's roots: open it as an external (guest) buffer
+                        // in that project rather than refusing the launch.
+                        None => handle
+                            .rpc::<ProjectOpenPath>(ProjectOpenPathParams {
+                                path: abs,
+                                transient: None,
+                            })
+                            .await?
+                            .opened
                             .ok_or_else(|| {
-                                anyhow::anyhow!("{abs} is outside the project's roots")
-                            })?;
-                    handle
-                        .rpc::<BufferOpen>(BufferOpenParams {
-                            path_index: Some(path_index),
-                            relative_path: Some(relative_path),
-                            create_if_missing: true,
-                            ..Default::default()
-                        })
-                        .await?
+                                anyhow::anyhow!("project/open_path returned no buffer")
+                            })?,
+                    }
                 }
                 None => activated.opened.ok_or_else(|| {
                     anyhow::anyhow!("project/activate returned no landing buffer")
@@ -2161,6 +2236,7 @@ fn make_state(
         pending_leader: None,
         picker: Default::default(),
         save_prompt: None,
+        open_path_prompt: None,
         confirm_prompt: None,
         editor: None,
         project_settings: None,

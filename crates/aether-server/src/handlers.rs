@@ -58,7 +58,7 @@ use aether_protocol::picker::{
 };
 use aether_protocol::project::{
     ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
-    ProjectDeleteParams, ProjectInfo, ProjectListParams, ProjectListResult,
+    ProjectDeleteParams, ProjectInfo, ProjectListParams, ProjectListResult, ProjectOpenPathParams,
     ProjectRemoveRootParams, ProjectRemoveRootResult, ProjectRenameParams, ProjectRenamed,
     ProjectRenamedParams, ProjectSummary,
 };
@@ -221,7 +221,8 @@ pub async fn project_activate(
         s.projects.insert(
             params.name.clone(),
             crate::state::ProjectEntry {
-                name,
+                id: params.name.clone(),
+                name: Some(name),
                 paths: canonical_paths.clone(),
                 workspace_index,
                 mru_buffers: std::collections::VecDeque::new(),
@@ -245,6 +246,15 @@ pub async fn project_activate(
 
     if let Some(session) = s.clients.get_mut(&client_id) {
         session.active_project = Some(params.name.clone());
+    }
+
+    // Switching away from an ephemeral project can leave it empty (its transient buffers were
+    // closed by the teardown above; any permanent ones keep it alive). Retire it now that this
+    // client no longer holds it active, so a throwaway "(no project)" context doesn't linger.
+    if let Some(prior_id) = &prior {
+        if prior_id != &params.name {
+            s.prune_ephemeral_if_empty(prior_id);
+        }
     }
 
     // Most-recently-used buffer in the newly-active project. The MRU lives on `ProjectEntry`
@@ -356,7 +366,8 @@ pub async fn project_create(
     s.projects.insert(
         name.clone(),
         crate::state::ProjectEntry {
-            name: name.clone(),
+            id: name.clone(),
+            name: Some(name.clone()),
             paths: Vec::new(),
             workspace_index,
             mru_buffers: std::collections::VecDeque::new(),
@@ -364,6 +375,12 @@ pub async fn project_create(
     );
     if let Some(session) = s.clients.get_mut(&client_id) {
         session.active_project = Some(name.clone());
+    }
+    // Creating a project while parked in an ephemeral one retires the ephemeral if now empty.
+    if let Some(prior_id) = &prior {
+        if prior_id != &name {
+            s.prune_ephemeral_if_empty(prior_id);
+        }
     }
     let server_started_at = s.started_at_unix_ms;
 
@@ -382,6 +399,81 @@ pub async fn project_create(
         },
         last_buffer_id: None,
         opened: None,
+        server_started_at,
+    })
+}
+
+/// Open a file by absolute path, resolving the project context (see [`ProjectOpenPath`]). Powers
+/// `ae /path/to/file`, the open-from-path overlay, and goto-definition into a file outside the
+/// active project. Internal when the active project's roots contain the path; external when a
+/// project is active but doesn't; an ephemeral project (activated here) when none is active.
+pub async fn project_open_path(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: ProjectOpenPathParams,
+) -> Result<ProjectActivateResult, RpcError> {
+    let client_id = ctx.client_id;
+    let raw = crate::config::expand_home(std::path::Path::new(&params.path));
+    let canonical = std::fs::canonicalize(&raw)
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
+
+    // Resolve the project this open lands in, activating an ephemeral one if the client has none.
+    // We never re-home the file into some *other* configured project that happens to contain it —
+    // an explicit open attaches to the active project (as a guest, if external) or to a fresh
+    // ephemeral context.
+    let (project_id, project_paths, server_started_at, created_ephemeral) = {
+        let mut s = state.lock().await;
+        let active = s
+            .clients
+            .get(&client_id)
+            .and_then(|c| c.active_project.clone());
+        let (id, created) = match active {
+            Some(id) => (id, false),
+            None => {
+                let id = s.register_ephemeral_project();
+                if let Some(session) = s.clients.get_mut(&client_id) {
+                    session.active_project = Some(id.clone());
+                }
+                tracing::info!(%client_id, project = %id, "activated ephemeral project for open-from-path");
+                (id, true)
+            }
+        };
+        let paths = s
+            .projects
+            .get(&id)
+            .map(|p| p.paths.iter().map(|p| p.display().to_string()).collect())
+            .unwrap_or_default();
+        (id, paths, s.started_at_unix_ms, created)
+    };
+
+    let opened = buffer_open(
+        state,
+        ctx,
+        BufferOpenParams {
+            absolute_path: Some(canonical.display().to_string()),
+            transient: params.transient,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    // A freshly-minted ephemeral project appears in any open switcher.
+    if created_ephemeral {
+        let mut s = state.lock().await;
+        let pushes = refresh_project_pickers(&mut s);
+        drop(s);
+        for (sender, notif) in pushes {
+            let _ = sender.send(notif).await;
+        }
+    }
+
+    Ok(ProjectActivateResult {
+        project: ProjectInfo {
+            name: project_id,
+            paths: project_paths,
+        },
+        last_buffer_id: None,
+        opened: Some(opened),
         server_started_at,
     })
 }
@@ -415,7 +507,7 @@ pub async fn project_add_root(
         project.paths.clone(),
     ));
     let updated = crate::config::ProjectConfig {
-        name: project.name.clone(),
+        name: project.id.clone(),
         paths: project.paths.clone(),
     };
     let entry_paths: Vec<String> = project
@@ -468,7 +560,7 @@ pub async fn project_remove_root(
         .filter(|p| **p != canonical)
         .cloned()
         .collect();
-    let project_name = project.name.clone();
+    let project_name = project.id.clone();
 
     // Find file-backed buffers under the removed root that aren't covered by any remaining
     // root. Scratch buffers (no path) are exempt; they stay alive.
@@ -531,7 +623,7 @@ pub async fn project_remove_root(
         project.paths.clone(),
     ));
     let updated = crate::config::ProjectConfig {
-        name: project.name.clone(),
+        name: project.id.clone(),
         paths: project.paths.clone(),
     };
     let entry_paths: Vec<String> = project
@@ -758,7 +850,7 @@ pub async fn path_delete(
                 canonical.display()
             )));
         }
-        let project_name = project.name.clone();
+        let project_name = project.id.clone();
         let dirty: Vec<BufferId> = s
             .buffers_under_path(&project_name, &canonical)
             .into_iter()
@@ -968,7 +1060,7 @@ async fn buffer_open_inner(
     let client_id = Some(ctx.client_id);
     let active_project_name: String = {
         let s = state.lock().await;
-        s.active_project_or_err(ctx.client_id)?.name.clone()
+        s.active_project_or_err(ctx.client_id)?.id.clone()
     };
 
     // Attach-by-id: shortcut path used by the buffer picker (which needs to switch to scratch
@@ -1019,7 +1111,26 @@ async fn buffer_open_inner(
         return Ok(result);
     }
 
-    let canonical = match (params.path_index, params.relative_path.as_deref()) {
+    let canonical = if let Some(abs) = params.absolute_path.clone() {
+        // Absolute-path open (project/open_path, goto-definition). Resolved directly rather than
+        // against a project root, and — unlike root-relative opens — allowed to land outside the
+        // active project's roots. The boundary check below is skipped for this route; the buffer
+        // is simply marked external.
+        let raw = crate::config::expand_home(std::path::Path::new(&abs));
+        match std::fs::canonicalize(&raw) {
+            Ok(p) => p,
+            Err(_) if params.create_if_missing => canonicalize_partial(&raw).map_err(|e| {
+                RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display()))
+            })?,
+            Err(e) => {
+                return Err(RpcError::invalid_path(format!(
+                    "canonicalizing {}: {e}",
+                    raw.display()
+                )));
+            }
+        }
+    } else {
+        match (params.path_index, params.relative_path.as_deref()) {
         (None, None) => {
             let mut s = state.lock().await;
             let id = s.allocate_buffer_id();
@@ -1106,11 +1217,17 @@ async fn buffer_open_inner(
                 "relative_path provided without path_index",
             ));
         }
+        }
     };
 
     {
         let mut s = state.lock().await;
-        if !s.active_project_or_err(ctx.client_id)?.contains(&canonical) {
+        // Root-relative opens are confined to the project boundary (blocks `../` traversal).
+        // Absolute-path opens (`absolute_path`) are deliberately allowed outside the roots — they
+        // become external buffers — so the boundary check only applies to the relative route.
+        if params.absolute_path.is_none()
+            && !s.active_project_or_err(ctx.client_id)?.contains(&canonical)
+        {
             return Err(RpcError::invalid_path(format!(
                 "{} is outside the project's access boundary",
                 canonical.display()
@@ -1177,52 +1294,73 @@ async fn buffer_open_inner(
     // already have one if a previous server-side session allocated state. Look it up anyway for
     // consistency with the reopen path.
     let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
+    // External buffers (path outside the active project's roots) get no Git integration — by
+    // design git is a project-scoped feature and an external file is only a guest here. Skipping
+    // the baseline load also avoids repo discovery walking up out of the project tree.
+    let external = !s
+        .projects
+        .get(&active_project_name)
+        .is_some_and(|p| p.contains(&canonical));
     // Resolve the Git baseline once (repo discovery + reading the committed blob) and diff the
     // buffer against it, so git-aware views have hunks from the first frame and later edits can
     // re-diff cheaply without touching the repo. Best-effort; untracked / no-repo → empty.
-    let git_baseline = crate::git::load_baseline(&canonical);
-    let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &buf.text);
-    let git_both = crate::git::compose_both(&git_baseline.staged_hunks, &git_unstaged);
+    let git = (!external).then(|| {
+        let git_baseline = crate::git::load_baseline(&canonical);
+        let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &buf.text);
+        let git_both = crate::git::compose_both(&git_baseline.staged_hunks, &git_unstaged);
+        (git_baseline, git_unstaged, git_both)
+    });
     s.buffers.insert(id, buf);
     s.buffer_projects.insert(id, active_project_name.clone());
-    s.git_baseline.insert(id, git_baseline);
-    s.git_unstaged_hunks.insert(id, git_unstaged);
-    s.git_both_hunks.insert(id, git_both);
+    if let Some((git_baseline, git_unstaged, git_both)) = git {
+        s.git_baseline.insert(id, git_baseline);
+        s.git_unstaged_hunks.insert(id, git_unstaged);
+        s.git_both_hunks.insert(id, git_both);
+    }
 
-    // LSP: ensure a language server for this file's language and open the document against it.
+    // LSP, for *internal* files only (under a project root). Discover a workspace root within the
+    // trusted project and ensure a server keyed to that project + root, launching one if needed.
     // `ensure` returns a launch request when it created a fresh (Starting) handle; we spawn the
-    // handshake task after releasing the lock. `notify_open` is a no-op until the server is ready —
-    // the launch task opens every registered buffer once the handshake lands.
+    // handshake after releasing the lock. `notify_open` is a no-op until the server is ready — the
+    // launch task opens every registered buffer once the handshake lands.
+    //
+    // External files (outside every root) get NO language server: we never launch one in untrusted
+    // territory (the workspace-trust boundary), and we don't attach them to another project's
+    // running server either — that would put two buffers (this guest + the owning project's) on one
+    // server for the same URI, the very ambiguity per-project keying exists to avoid.
     let mut lsp_launch: Option<(
         crate::lsp::manager::LspServerKey,
         crate::lsp::config::LspServerSpec,
         u64,
     )> = None;
-    if let Some(language) = s.buffers[&id].language.clone() {
-        if let Some(spec) = crate::lsp::config::server_spec(&language) {
-            let roots = s
-                .projects
-                .get(&active_project_name)
-                .map(|p| p.paths.clone())
-                .unwrap_or_default();
-            let root = crate::lsp::manager::discover_root(
-                &canonical,
-                spec.root_markers,
-                crate::lsp::config::workspace_marker(&language),
-                &roots,
-            );
-            let key = crate::lsp::manager::LspServerKey {
-                root,
-                language: language.clone(),
-            };
-            if let Some(generation) = s.lsp.ensure(&key, spec.command) {
-                lsp_launch = Some((key.clone(), spec, generation));
+    if !external {
+        if let Some(language) = s.buffers[&id].language.clone() {
+            if let Some(spec) = crate::lsp::config::server_spec(&language) {
+                let roots = s
+                    .projects
+                    .get(&active_project_name)
+                    .map(|p| p.paths.clone())
+                    .unwrap_or_default();
+                let root = crate::lsp::manager::discover_root(
+                    &canonical,
+                    spec.root_markers,
+                    crate::lsp::config::workspace_marker(&language),
+                    &roots,
+                );
+                let key = crate::lsp::manager::LspServerKey {
+                    project: active_project_name.clone(),
+                    root,
+                    language: language.clone(),
+                };
+                if let Some(generation) = s.lsp.ensure(&key, spec.command) {
+                    lsp_launch = Some((key.clone(), spec, generation));
+                }
+                s.lsp.register_doc(id, &key);
+                let uri = crate::lsp::uri::path_to_uri(&canonical);
+                let text = s.buffers[&id].text.to_string();
+                let version = s.buffers[&id].revision as i64;
+                s.lsp.notify_open(id, &key, &uri, &language, version, &text);
             }
-            s.lsp.register_doc(id, &key);
-            let uri = crate::lsp::uri::path_to_uri(&canonical);
-            let text = s.buffers[&id].text.to_string();
-            let version = s.buffers[&id].revision as i64;
-            s.lsp.notify_open(id, &key, &uri, &language, version, &text);
         }
     }
 
@@ -1756,9 +1894,9 @@ pub async fn lsp_server_status(
     _params: LspServerStatusParams,
 ) -> Result<LspServerStatusResult, RpcError> {
     let s = state.lock().await;
-    let roots = s.active_project_or_err(ctx.client_id)?.paths.clone();
+    let project = s.active_project_or_err(ctx.client_id)?.id.clone();
     Ok(LspServerStatusResult {
-        servers: s.lsp.status_for_roots(&roots),
+        servers: s.lsp.status_for_project(&project),
     })
 }
 
@@ -1768,11 +1906,11 @@ pub async fn lsp_restart_server(
     ctx: &mut ConnectionCtx,
     params: LspRestartServerParams,
 ) -> Result<(), RpcError> {
-    let roots = {
+    let project = {
         let s = state.lock().await;
-        s.active_project_or_err(ctx.client_id)?.paths.clone()
+        s.active_project_or_err(ctx.client_id)?.id.clone()
     };
-    crate::lsp::manager::restart(state, &params.language, &roots).await;
+    crate::lsp::manager::restart(state, &params.language, &project).await;
     Ok(())
 }
 
@@ -3399,7 +3537,7 @@ fn byte_to_logical(buf: &Buffer, byte_idx: usize) -> aether_protocol::LogicalPos
 /// Shared by `buffer/close` and the deletion paths so the requesting client and any other clients
 /// that were viewing the buffer resolve their next buffer identically.
 fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<BufferId> {
-    let project_name = s.active_project(client_id).map(|p| p.name.clone());
+    let project_name = s.active_project(client_id).map(|p| p.id.clone());
     s.active_project(client_id)
         .and_then(|p| p.mru_buffers.front().copied())
         .or_else(|| {
@@ -3477,14 +3615,30 @@ pub async fn buffer_close(
     // Any *other* client viewing this buffer is about to have it pulled out from under it — capture
     // them before teardown drops their viewports, so we can tell them to switch (see below).
     let affected = clients_viewing_buffers(&s, &[params.buffer_id], client_id);
+    // Remember the owning project before teardown drops the association, so we can retire an
+    // ephemeral project once it loses its last buffer.
+    let owning_project = s.project_for_buffer(params.buffer_id).map(str::to_string);
     // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
     // clears diagnostics, and tears down the language server if this was its last buffer).
     let stopped_server = s.close_buffer(params.buffer_id);
+    // If that was the last buffer of an ephemeral context, retire it — and evict any *other*
+    // client still parked in it (e.g. one that joined it from the switcher). They're told the
+    // buffer closed just below (`buffer_closed_pushes`) and drop to the chooser; the context
+    // mustn't keep lingering in the switcher (or re-open onto a scratch) just because someone had
+    // it selected. The initiating client closed with `open_next:false` (the ephemeral close path),
+    // so no scratch successor is spawned here.
+    let retired_ephemeral = owning_project
+        .as_deref()
+        .is_some_and(|pid| s.retire_ephemeral_if_empty(pid));
     // Pick the next buffer for the requesting client: top of the active project's MRU after
     // cleanup, or — if that's empty — any remaining buffer in the project. The client uses this
     // to attach without an extra RPC round-trip.
     let next_buffer_id = next_buffer_for_client(&s, client_id);
     let mut pushes = refresh_buffer_pickers(&mut s);
+    // A retired ephemeral project drops out of any open switcher.
+    if retired_ephemeral {
+        pushes.extend(refresh_project_pickers(&mut s));
+    }
     // Tell the other clients their active buffer vanished (each switches to its own next buffer).
     pushes.extend(buffer_closed_pushes(&s, &affected));
     // If closing this buffer shut its language server down, refresh any open "LSP servers"
@@ -3587,6 +3741,7 @@ async fn navigate_to(
         buffer_id: if by_path { None } else { Some(entry.buffer_id) },
         path_index: entry.path_index,
         relative_path: entry.relative_path.clone(),
+        absolute_path: None,
         language: None,
         create_if_missing: false,
         jump_to: None,
@@ -4009,7 +4164,7 @@ pub async fn buffer_save(
     // we'd clone the rope, drop the lock, write, then re-lock to update state.
     let (saved_at_unix_ms, revision) = {
         let mut s = state.lock().await;
-        let active_project_name = s.active_project_or_err(ctx.client_id)?.name.clone();
+        let active_project_name = s.active_project_or_err(ctx.client_id)?.id.clone();
         if let Some(existing) = s.buffer_for_path_in_project(&active_project_name, &target) {
             if existing != params.buffer_id {
                 return Err(RpcError::path_owned_by_buffer(existing));
@@ -5431,15 +5586,16 @@ pub fn spawn_symbol_resolve(
     });
 }
 
-/// Build the LSP-servers-picker candidates: one per language server whose workspace root falls
-/// under `project_roots`, sorted by name then language for a stable order.
+/// Build the LSP-servers-picker candidates: one per language server owned by `project_id`, sorted
+/// by name then language for a stable order. `project_roots` is used only for the display labels.
 fn build_lsp_server_candidates(
     s: &ServerState,
+    project_id: &str,
     project_roots: &[std::path::PathBuf],
 ) -> Vec<picker_state::LspServerCandidate> {
     let mut out: Vec<picker_state::LspServerCandidate> = s
         .lsp
-        .status_for_roots(project_roots)
+        .status_for_project(project_id)
         .into_iter()
         .map(|st| picker_state::LspServerCandidate {
             root_label: lsp_root_label(&st.workspace_root, project_roots),
@@ -9334,6 +9490,34 @@ fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) 
     a_start < b_end_excl && b_start < a_end_excl
 }
 
+/// Project-switcher candidates: every persisted project (`names`, read from disk by the caller)
+/// plus every *live* ephemeral project currently in memory. The ephemeral entries carry their id
+/// as `name` — the client renders an ephemeral id as "(no project)". They appear only while they
+/// hold a buffer, since an ephemeral project is auto-removed once its last buffer closes.
+fn project_candidates(s: &ServerState, names: &[String]) -> Vec<picker_state::ProjectCandidate> {
+    let mut out: Vec<picker_state::ProjectCandidate> = names
+        .iter()
+        .map(|name| picker_state::ProjectCandidate {
+            unsaved_buffers: s.unsaved_buffer_count(name),
+            name: name.clone(),
+        })
+        .collect();
+    let mut ephemeral: Vec<String> = s
+        .projects
+        .values()
+        .filter(|p| p.is_ephemeral())
+        .map(|p| p.id.clone())
+        .collect();
+    ephemeral.sort();
+    for id in ephemeral {
+        out.push(picker_state::ProjectCandidate {
+            unsaved_buffers: s.unsaved_buffer_count(&id),
+            name: id,
+        });
+    }
+    out
+}
+
 fn build_lines_changed_notif(
     buffer: &Buffer,
     vp: &Viewport,
@@ -9399,7 +9583,7 @@ fn build_buffer_candidates(
     let Some(project) = s.active_project(client_id) else {
         return Vec::new();
     };
-    let project_name = project.name.clone();
+    let project_name = project.id.clone();
     let roots = project.paths.clone();
     let belongs =
         |id: &BufferId| s.buffer_projects.get(id).map(|s| s.as_str()) == Some(&project_name);
@@ -9537,14 +9721,7 @@ pub(crate) fn refresh_project_pickers(s: &mut ServerState) -> PendingPushes {
     };
     let mut pushes = Vec::new();
     for client_id in client_ids {
-        let candidates = names
-            .iter()
-            .cloned()
-            .map(|name| picker_state::ProjectCandidate {
-                unsaved_buffers: s.unsaved_buffer_count(&name),
-                name,
-            })
-            .collect();
+        let candidates = project_candidates(s, &names);
         let ServerState {
             pickers,
             matcher,
@@ -9586,10 +9763,13 @@ pub fn refresh_lsp_server_pickers(s: &mut ServerState) -> PendingPushes {
         .collect();
     let mut pushes = Vec::new();
     for client_id in client_ids {
-        let Some(roots) = s.active_project(client_id).map(|p| p.paths.clone()) else {
+        let Some((project, roots)) = s
+            .active_project(client_id)
+            .map(|p| (p.id.clone(), p.paths.clone()))
+        else {
             continue;
         };
-        let new_candidates = build_lsp_server_candidates(s, &roots);
+        let new_candidates = build_lsp_server_candidates(s, &project, &roots);
         let ServerState {
             pickers,
             matcher,
@@ -10355,15 +10535,7 @@ pub async fn picker_view(
             let names = crate::config::list_project_names()
                 .map_err(|e| RpcError::internal(format!("listing projects: {e}")))?;
             let s = state.lock().await;
-            picker_state::PickerCandidates::Projects(
-                names
-                    .into_iter()
-                    .map(|name| picker_state::ProjectCandidate {
-                        unsaved_buffers: s.unsaved_buffer_count(&name),
-                        name,
-                    })
-                    .collect(),
-            )
+            picker_state::PickerCandidates::Projects(project_candidates(&s, &names))
         }
         PickerKind::Diagnostics => match params.buffer_id {
             // Fresh open: build from the buffer's current diagnostics.
@@ -10389,8 +10561,13 @@ pub async fn picker_view(
             // Rebuilt every view from the active project's servers — the set is tiny and statuses
             // change, so there's no snapshot to preserve.
             let s = state.lock().await;
-            let roots = s.active_project_or_err(client_id)?.paths.clone();
-            picker_state::PickerCandidates::LspServers(build_lsp_server_candidates(&s, &roots))
+            let project = s.active_project_or_err(client_id)?;
+            let (project_id, roots) = (project.id.clone(), project.paths.clone());
+            picker_state::PickerCandidates::LspServers(build_lsp_server_candidates(
+                &s,
+                &project_id,
+                &roots,
+            ))
         }
         // References always starts empty: the `textDocument/references` resolve is slow (an LSP
         // round-trip), so the picker opens immediately and a spawned task (below, after the lock
@@ -11679,7 +11856,8 @@ mod subscribe_snapshot_tests {
         st.projects.insert(
             "p".to_string(),
             crate::state::ProjectEntry {
-                name: "p".to_string(),
+                id: "p".to_string(),
+                name: Some("p".to_string()),
                 paths: vec![root.clone()],
                 workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
                     vec![root.clone()],
@@ -11763,7 +11941,8 @@ mod subscribe_snapshot_tests {
         st.projects.insert(
             "p".to_string(),
             crate::state::ProjectEntry {
-                name: "p".to_string(),
+                id: "p".to_string(),
+                name: Some("p".to_string()),
                 paths: vec![root.clone()],
                 workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
                     vec![root.clone()],
