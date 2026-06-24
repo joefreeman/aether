@@ -42,12 +42,13 @@ use aether_protocol::git::{
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CountedEditParams, EditResult, InputBackspace, InputChangeLine,
+    BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputBackspace, InputChangeLine,
     InputDecrementNumber, InputDedent, InputDelete, InputDeleteLine, InputIncrementNumber,
     InputIndent, InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent,
     InputOpenLine, InputOpenLineParams, InputRedo, InputReplaceLine, InputReplaceLineParams,
-    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
-    InputUnsurround, InputUnsurroundParams, LineSide, UndoResult,
+    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment,
+    InputTransformCase, InputTransformCaseParams, InputUndo, InputUnsurround, InputUnsurroundParams,
+    LineSide, UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -4493,6 +4494,21 @@ impl Session {
                     target,
                 });
             }
+            Pending::Transform => {
+                self.pending = Pending::None;
+                // The next key picks the transform; an unmapped key (or Esc) just cancels.
+                let kind = text
+                    .as_deref()
+                    .and_then(|t| t.chars().next())
+                    .and_then(CaseKind::from_char);
+                let Some(kind) = kind else {
+                    return Effects::none();
+                };
+                return self.edit::<InputTransformCase>(InputTransformCaseParams {
+                    buffer_id: self.buffer.buffer_id,
+                    kind,
+                });
+            }
             Pending::Leader => {
                 self.pending = Pending::None;
                 if let Some(b) = lookup(KeyContext::Leader, code, mods) {
@@ -4881,6 +4897,10 @@ impl Session {
             }
             A::Unsurround(target) => {
                 self.edit::<InputUnsurround>(InputUnsurroundParams { buffer_id, target })
+            }
+            A::BeginTransform => {
+                self.pending = Pending::Transform;
+                Effects::none()
             }
 
             // ---- search (core methods; the prompt-only actions also route here from

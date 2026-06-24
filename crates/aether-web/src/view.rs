@@ -299,6 +299,7 @@ fn pending(p: &Pending) -> Value {
             "kind": "find", "dir": name(dir), "till": till, "extend": extend, "count": count,
         }),
         Pending::Surround(target) => json!({ "kind": "surround", "target": name(target) }),
+        Pending::Transform => json!({ "kind": "transform" }),
     }
 }
 

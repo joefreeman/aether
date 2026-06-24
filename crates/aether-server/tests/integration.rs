@@ -23,11 +23,12 @@ use aether_protocol::git::{
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CountedEditParams, EditResult, InputBackspace, InputDecrementNumber,
+    BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputBackspace, InputDecrementNumber,
     InputDedent, InputIncrementNumber, InputIndent, InputJoinLines, InputMoveLines,
     InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams, InputRedo,
-    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment, InputUndo,
-    InputUnsurround, InputUnsurroundParams, LineSide, SurroundTarget, UndoResult,
+    InputSurround, InputSurroundParams, InputText, InputTextParams, InputToggleComment,
+    InputTransformCase, InputTransformCaseParams, InputUndo, InputUnsurround, InputUnsurroundParams,
+    LineSide, SurroundTarget, UndoResult,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -2155,6 +2156,158 @@ async fn cursor_set_and_extend_selection() {
     .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 9 });
     assert_eq!(st.anchor, LogicalPosition { line: 0, col: 6 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn transform_case_recases_selection_and_keeps_it_selected() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("fooBar baz\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Select "fooBar" (cols 0..=5, forward — block cursor on the inclusive 'r').
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: p(0, 5),
+            anchor: p(0, 0),
+        },
+    )
+    .await;
+
+    // snake → "foo_bar"; the selection grows to track the new char count and stays selected.
+    let st: EditResult = send_request::<InputTransformCase>(
+        &mut ws,
+        11,
+        &InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Snake,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "foo_bar baz\n");
+    assert_eq!(st.cursor.anchor, p(0, 0));
+    assert_eq!(st.cursor.position, p(0, 6)); // inclusive 'r' of "foo_bar"
+
+    // The selection persisting lets transforms chain: constant → "FOO_BAR".
+    send_request::<InputTransformCase>(
+        &mut ws,
+        13,
+        &InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Constant,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 14, buffer_id).await, "FOO_BAR baz\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn transform_case_point_cursor_targets_the_identifier_under_it() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("fooBar baz\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Point cursor mid-identifier (on the first 'o'), no selection.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: p(0, 2),
+            anchor: p(0, 2),
+        },
+    )
+    .await;
+
+    // snake recases the whole word run, not just the char under the point; the cursor collapses
+    // past the result (no selection sprung) so Insert mode keeps anchor == position.
+    let st: EditResult = send_request::<InputTransformCase>(
+        &mut ws,
+        11,
+        &InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Snake,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "foo_bar baz\n");
+    assert_eq!(st.cursor.anchor, st.cursor.position);
+    assert_eq!(st.cursor.position, p(0, 7)); // just past "foo_bar"
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn transform_case_noop_leaves_the_buffer_unchanged() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("FOO bar\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Select "FOO", already upper-case.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: p(0, 2),
+            anchor: p(0, 0),
+        },
+    )
+    .await;
+
+    // Upper-casing an all-caps selection changes nothing — a no-op that doesn't disturb the buffer.
+    send_request::<InputTransformCase>(
+        &mut ws,
+        11,
+        &InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Upper,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "FOO bar\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn transform_case_words_splits_an_identifier_into_spaced_words() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("getHTTPResponse\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Point cursor anywhere in the identifier.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: p(0, 0),
+            anchor: p(0, 0),
+        },
+    )
+    .await;
+
+    // Acronym tail splits: get|HTTP|Response → "get http response".
+    send_request::<InputTransformCase>(
+        &mut ws,
+        11,
+        &InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Words,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 12, buffer_id).await,
+        "get http response\n"
+    );
 
     drop(server);
 }

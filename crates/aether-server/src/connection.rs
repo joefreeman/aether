@@ -29,7 +29,7 @@ use aether_protocol::input::{
     InputBackspace, InputChangeLine, InputDecrementNumber, InputDedent, InputDelete,
     InputDeleteLine, InputIncrementNumber, InputIndent, InputJoinLines, InputMoveLines,
     InputNewlineAndIndent, InputOpenLine, InputRedo, InputReplaceLine, InputSurround, InputText,
-    InputToggleComment, InputUndo, InputUnsurround,
+    InputToggleComment, InputTransformCase, InputUndo, InputUnsurround,
 };
 use aether_protocol::lsp::{
     LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic, LspRestartServer,
@@ -429,6 +429,7 @@ async fn dispatch(
         InputToggleComment::NAME => run!(InputToggleComment, handlers::input_toggle_comment),
         InputSurround::NAME => run!(InputSurround, handlers::input_surround),
         InputUnsurround::NAME => run!(InputUnsurround, handlers::input_unsurround),
+        InputTransformCase::NAME => run!(InputTransformCase, handlers::input_transform_case),
         PickerView::NAME => run!(PickerView, handlers::picker_view),
         PickerQuery::NAME => run!(PickerQuery, handlers::picker_query),
         PickerSelect::NAME => run!(PickerSelect, handlers::picker_select),

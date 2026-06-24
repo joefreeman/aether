@@ -260,6 +260,9 @@ pub enum Action {
     /// `Ctrl-s ␣` — the next keystroke names the delimiter to wrap the target with.
     BeginSurround(SurroundTarget),
     Unsurround(SurroundTarget),
+    /// `Ctrl-r ␣` — the next keystroke names the case transform (see [`CaseKind::from_char`]).
+    /// Operand: the selection, or the identifier under a point cursor.
+    BeginTransform,
 
     // ---- search ----
     EnterSearch,
@@ -341,7 +344,10 @@ pub enum Action {
 impl Action {
     /// Whether this chord arms a capture (the next keystroke is data, not a binding).
     pub fn awaits_key(&self) -> bool {
-        matches!(self, Action::BeginFind { .. } | Action::BeginSurround(_))
+        matches!(
+            self,
+            Action::BeginFind { .. } | Action::BeginSurround(_) | Action::BeginTransform
+        )
     }
 
     /// Whether `.` replays this action: every cursor/selection motion (absolute ones included)
@@ -680,6 +686,7 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('v'), Exact(Mods::CTRL_ALT), A::ReplaceClipboard, "Clipboard", "Replace selection with clipboard"),
     bind!(N, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Selection), "Edit", "Unsurround selection"),
     bind!(N, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Selection), "Edit", "Surround selection"),
+    bind!(N, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform case (u/l/i/c/p/s/k/w/t/n/d/x)"),
 
     // ---- reveal ----
     bind!(N, KeyCode::Tab, Exact(Mods::NONE), A::Hover, "Code", "Hover (type & docs)"),
@@ -729,6 +736,7 @@ static INSERT: &[Binding] = &[
     bind!(I, ch('v'), Exact(Mods::CTRL_ALT), A::ReplaceLineClipboard, "Clipboard", "Replace line with clipboard"),
     bind!(I, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Line), "Edit", "Unsurround line"),
     bind!(I, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Line), "Edit", "Surround line"),
+    bind!(I, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform identifier case (u/l/i/c/p/s/k/w/t/n/d/x)"),
 ];
 
 #[rustfmt::skip]

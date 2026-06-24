@@ -289,6 +289,82 @@ pub struct InputUnsurroundParams {
     pub target: SurroundTarget,
 }
 
+// ---- input/transform_case -----------------------------------------------------------------------
+
+/// A case/word-shape transform applied to the operand text. The first three are *character*
+/// transforms (they recase every letter verbatim); the rest are *convention* transforms that
+/// split the operand into words — on whitespace, punctuation, `_`/`-`/`.`, and case boundaries
+/// (`fooBar` → `foo`,`bar`; `HTTPServer` → `HTTP`,`Server`) — then re-render them in the target
+/// convention. Round-tripping is lossy only for acronyms (the all-caps run isn't recovered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseKind {
+    /// `aBc` → `ABC`.
+    Upper,
+    /// `aBc` → `abc`.
+    Lower,
+    /// Swap each letter's case: `aBc` → `AbC`.
+    Invert,
+    /// `foo bar`/`foo_bar`/`FooBar` → `fooBar`.
+    Camel,
+    /// `foo bar`/`foo_bar`/`fooBar` → `FooBar`.
+    Pascal,
+    /// `foo bar`/`FooBar` → `foo_bar`.
+    Snake,
+    /// `foo bar`/`FooBar` → `foo-bar`.
+    Kebab,
+    /// `fooBar`/`FooBar` → `foo bar`.
+    Words,
+    /// `foo bar`/`fooBar` → `Foo Bar`.
+    Title,
+    /// `foo bar`/`fooBar` → `Foo bar` (only the first word capitalised).
+    Sentence,
+    /// `foo bar`/`FooBar` → `foo.bar`.
+    Dot,
+    /// `foo bar`/`fooBar` → `FOO_BAR`.
+    Constant,
+}
+
+impl CaseKind {
+    /// The keystroke that selects this transform after the `Ctrl-r` chord. The single source of
+    /// truth for the mnemonic mapping, shared by the client keymap and the help overlay.
+    pub fn from_char(c: char) -> Option<CaseKind> {
+        Some(match c {
+            'u' => CaseKind::Upper,
+            'l' => CaseKind::Lower,
+            'i' => CaseKind::Invert,
+            'c' => CaseKind::Camel,
+            'p' => CaseKind::Pascal,
+            's' => CaseKind::Snake,
+            'k' => CaseKind::Kebab,
+            'w' => CaseKind::Words,
+            't' => CaseKind::Title,
+            'n' => CaseKind::Sentence,
+            'd' => CaseKind::Dot,
+            'x' => CaseKind::Constant,
+            _ => return None,
+        })
+    }
+}
+
+/// Recase the operand (`Ctrl-r <key>`). The operand is the selection when one is active; for a
+/// point cursor (Insert mode, or a Normal-mode block cursor with no selection) it's the
+/// identifier under the cursor — the word run of alphanumeric/`_` chars. A selection operand
+/// stays selected so transforms can be re-applied; a point operand collapses past the result. A
+/// transform that would change nothing (no letters in range) is a no-op.
+pub struct InputTransformCase;
+impl RpcMethod for InputTransformCase {
+    const NAME: &'static str = "input/transform_case";
+    type Params = InputTransformCaseParams;
+    type Result = EditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InputTransformCaseParams {
+    pub buffer_id: BufferId,
+    pub kind: CaseKind,
+}
+
 // ---- input/undo, input/redo ---------------------------------------------------------------------
 
 pub struct InputUndo;

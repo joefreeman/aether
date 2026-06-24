@@ -1,5 +1,6 @@
 //! RPC method handlers. One function per protocol method.
 
+use crate::case;
 use crate::cursor as motion;
 use crate::error::RpcError;
 use crate::grep;
@@ -34,8 +35,9 @@ use aether_protocol::git::{
     GitNavigateHunkParams, GitNavigateHunkResult, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CountedEditParams, EditResult, InputMoveLinesParams, InputOpenLineParams,
-    InputSurroundParams, InputTextParams, InputUnsurroundParams, LineSide, SurroundTarget,
+    BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputMoveLinesParams,
+    InputOpenLineParams, InputSurroundParams, InputTextParams, InputTransformCaseParams,
+    InputUnsurroundParams, LineSide, SurroundTarget,
     UndoResult,
 };
 use aether_protocol::lsp::{
@@ -6591,6 +6593,58 @@ fn current_selection_char_range(buf: &Buffer, cursor: &CursorState) -> (usize, u
     )
 }
 
+/// The resolved operand for a case transform: the char range `[start_char, end_char)` to replace,
+/// its line span, the replacement text, and whether the operand came from a point cursor (which
+/// decides whether the post-edit cursor collapses or re-selects).
+struct TransformEdit {
+    start_char: usize,
+    end_char: usize,
+    first_line: u32,
+    last_line: u32,
+    new_text: String,
+    was_point: bool,
+}
+
+/// Resolve a case transform against the current cursor, or `None` for a no-op (empty operand, or
+/// a transform that leaves the text unchanged — e.g. no letters in range). For a point cursor the
+/// operand is the identifier (word run of alphanumeric/`_`) under the cursor; otherwise it's the
+/// selection. Shared by the no-op precheck and `apply_edit`, so the two always agree.
+fn resolve_transform_case(
+    buf: &Buffer,
+    cursor: &CursorState,
+    kind: CaseKind,
+) -> Option<TransformEdit> {
+    let was_point = cursor.is_point();
+    let total = buf.text.len_chars();
+    let (start_char, end_char, first_line, last_line) = if was_point {
+        let (start_pos, end_pos) = motion::word_run(buf, cursor.position);
+        let sc = motion::pos_to_char(buf, start_pos);
+        let ec = motion::pos_to_char(buf, end_pos).saturating_add(1).min(total);
+        (sc, ec, start_pos.line, end_pos.line)
+    } else {
+        let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
+        let sc = motion::pos_to_char(buf, lo);
+        let ec = motion::pos_to_char(buf, hi).saturating_add(1).min(total);
+        (sc, ec, lo.line, hi.line)
+    };
+    if start_char >= end_char {
+        return None;
+    }
+    let original: String = buf.text.slice(start_char..end_char).chars().collect();
+    let new_text = case::transform(kind, &original);
+    if new_text == original {
+        return None;
+    }
+    Some(TransformEdit {
+        start_char,
+        end_char,
+        first_line,
+        last_line,
+        new_text,
+        was_point,
+    })
+}
+
 /// Whether the single chars immediately outside each end of the selection form a known delimiter
 /// pair — the precondition unsurround strips on. `current_selection_char_range` gives the
 /// selection as `[sc, ec)`, so the hugging chars are at `sc - 1` and `ec`; both must exist.
@@ -6810,6 +6864,39 @@ pub async fn input_unsurround(
         client_id,
         params.buffer_id,
         EditKind::Unsurround { line },
+    )
+    .await
+}
+
+pub async fn input_transform_case(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: InputTransformCaseParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.client_id;
+    // No-op (empty operand, or a transform that changes nothing) short-circuits up front so we
+    // never push a no-op undo entry through `apply_edit`.
+    let is_noop = {
+        let s = state.lock().await;
+        let buf = s
+            .buffers
+            .get(&params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let cursor = s
+            .cursors
+            .get(&(client_id, params.buffer_id))
+            .copied()
+            .unwrap_or_default();
+        resolve_transform_case(buf, &cursor, params.kind).is_none()
+    };
+    if is_noop {
+        return current_edit_result(state, client_id, params.buffer_id).await;
+    }
+    apply_edit(
+        state,
+        client_id,
+        params.buffer_id,
+        EditKind::TransformCase { kind: params.kind },
     )
     .await
 }
@@ -8764,6 +8851,11 @@ enum EditKind {
     /// count and repeated presses stay on the number. `input_increment_number` guarantees a number
     /// exists before issuing this — the no-op case never reaches here.
     AdjustNumber { delta: i64 },
+    /// Recase the operand (`Ctrl-r <key>`). The operand range + replacement text are resolved by
+    /// `resolve_transform_case`: a point cursor recases the identifier under it (post-edit cursor
+    /// collapses past the result); a selection recases its text (and stays selected, so transforms
+    /// can be chained). `input_transform_case` prechecks for a no-op, so this is `Some` in practice.
+    TransformCase { kind: CaseKind },
 }
 
 /// Where the cursor lands after an edit.
@@ -8805,6 +8897,14 @@ async fn apply_edit(
     // defensive no-op.
     let number_edit = match &edit {
         EditKind::AdjustNumber { delta } => resolve_number_edit(buf, &cursor, *delta),
+        _ => None,
+    };
+
+    // Likewise resolve the case-transform operand once so the range and replacement agree.
+    // `input_transform_case` prechecks for a no-op, so this is `Some` in practice; the `None`
+    // arms below are a defensive no-op (matching `AdjustNumber`).
+    let transform_edit = match &edit {
+        EditKind::TransformCase { kind } => resolve_transform_case(buf, &cursor, *kind),
         _ => None,
     };
 
@@ -8979,6 +9079,23 @@ async fn apply_edit(
                 }
             }
         },
+        EditKind::TransformCase { .. } => match &transform_edit {
+            Some(te) => EditRange {
+                start_char: te.start_char,
+                end_char: te.end_char,
+                first_line: te.first_line,
+                last_line: te.last_line,
+            },
+            None => {
+                let c = motion::pos_to_char(buf, cursor.position);
+                EditRange {
+                    start_char: c,
+                    end_char: c,
+                    first_line: cursor.position.line,
+                    last_line: cursor.position.line,
+                }
+            }
+        },
     };
     // `insert_text` is what gets written over `[start_char, end_char)`; `post_edit` decides where
     // the cursor lands (see `PostEdit`).
@@ -9048,6 +9165,20 @@ async fn apply_edit(
             ),
             None => (Cow::Borrowed(""), PostEdit::PointAfter),
         },
+        EditKind::TransformCase { .. } => match &transform_edit {
+            // A selection operand stays selected (chain transforms / see what changed); a point
+            // operand collapses past the result so Insert mode keeps its `anchor == position`
+            // invariant rather than springing a selection.
+            Some(te) => {
+                let post = if te.was_point {
+                    PostEdit::PointAfter
+                } else {
+                    PostEdit::Select { lead: 0, trail: 0 }
+                };
+                (Cow::Owned(te.new_text.clone()), post)
+            }
+            None => (Cow::Borrowed(""), PostEdit::PointAfter),
+        },
     };
 
     let start_char = range.start_char;
@@ -9063,6 +9194,7 @@ async fn apply_edit(
         | EditKind::DeleteLine
         | EditKind::ChangeLine => EditKindTag::Delete,
         EditKind::Surround { .. } | EditKind::Unsurround { .. } => EditKindTag::Surround,
+        EditKind::TransformCase { .. } => EditKindTag::Transform,
     };
 
     // Snapshot all per-client cursors on this buffer so the undo entry can restore them.

@@ -744,6 +744,9 @@ pub enum EditKindTag {
     Format,
     /// Hunk revert (`git/apply_hunk`). Like `Format`: one revert, one undo step.
     Revert,
+    /// Case transform (`input/transform_case`). Distinct so a recase is its own undo step and
+    /// never folds into adjacent typing.
+    Transform,
 }
 
 struct UndoEntry {

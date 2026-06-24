@@ -665,6 +665,30 @@ fn input_surround_params() {
 }
 
 #[test]
+fn input_transform_case_params() {
+    use aether_protocol::envelope::RpcMethod;
+    use aether_protocol::input::{CaseKind, InputTransformCase, InputTransformCaseParams};
+    assert_eq!(InputTransformCase::NAME, "input/transform_case");
+
+    // `kind` serialises snake_case.
+    let v = to_value(InputTransformCaseParams {
+        buffer_id: 3,
+        kind: CaseKind::Constant,
+    })
+    .unwrap();
+    assert_eq!(v, json!({"buffer_id": 3, "kind": "constant"}));
+
+    let back: InputTransformCaseParams = serde_json::from_value(v).unwrap();
+    assert_eq!(back.buffer_id, 3);
+    assert_eq!(back.kind, CaseKind::Constant);
+
+    // The mnemonic map is the single source of truth shared with the keymap.
+    assert_eq!(CaseKind::from_char('i'), Some(CaseKind::Invert));
+    assert_eq!(CaseKind::from_char('w'), Some(CaseKind::Words));
+    assert_eq!(CaseKind::from_char('z'), None);
+}
+
+#[test]
 fn input_adjust_number_methods() {
     use aether_protocol::envelope::RpcMethod;
     assert_eq!(InputIncrementNumber::NAME, "input/increment_number");

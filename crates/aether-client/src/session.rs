@@ -404,6 +404,8 @@ pub enum Pending {
     },
     /// `Ctrl-s` armed: the next keystroke names the surround delimiter.
     Surround(SurroundTarget),
+    /// `Ctrl-r` armed: the next keystroke names the case transform (`CaseKind::from_char`).
+    Transform,
 }
 
 /// What `.` replays: the binding intent for table actions, the resolved motion (with its target
@@ -418,11 +420,11 @@ pub enum RepeatTarget {
 pub enum PasteKind {
     /// Normal-mode `Ctrl-v`: collapse to selection start, insert, select pasted.
     Before { count: u32 },
-    /// Normal-mode `Ctrl-r`: insert over the selection (the server replaces it), select pasted.
+    /// Normal-mode `Ctrl-Alt-v`: insert over the selection (the server replaces it), select pasted.
     Replace { count: u32 },
     /// Insert-mode `Ctrl-v`: plain insert at the caret.
     AtCursor,
-    /// Insert-mode `Ctrl-r`: replace the whole line.
+    /// Insert-mode `Ctrl-Alt-v`: replace the whole line.
     Line,
 }
 
