@@ -1156,7 +1156,7 @@ fn render_item<'a>(
             // smaller cap than grep's — together they can't exceed one visual line.
             let loc = format!(
                 "{}:{}",
-                crate::app::truncate_path_label(display_path, REFERENCE_PATH_MAX_CHARS),
+                crate::labels::truncate_path(display_path, REFERENCE_PATH_MAX_CHARS),
                 line + 1
             );
             row![

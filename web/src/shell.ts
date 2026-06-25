@@ -46,6 +46,10 @@ import type {
 const GUTTER_COLS = 1;
 const TAB_WIDTH = 4;
 const CONTINUATION_MARKER_WIDTH = 2;
+// Fixed char cap for the window/tab-title path label. Mirrors aether-client's `TITLE_LABEL_MAX`: a
+// title bar has no width budget of its own, so long paths (an external goto-def target's absolute
+// path) are segment-elided to this cap, consistently with the native clients.
+const TITLE_LABEL_MAX = 60;
 const BUFFER_PAD = 8; // px of breathing room above the first line / below the last (virtual)
 // Fraction of the viewport above a jumped-to / `;`-placed cursor. Mirrors the core's
 // `CURSOR_REST_FRACTION` (the web jump-reveal + subscribe framing don't cross the wasm boundary).
@@ -3799,11 +3803,16 @@ export class Shell {
 
     this.statusEl.replaceChildren(left, right);
     // Mirror the native clients: "[project] label - Aether"; an ephemeral / no-project context
-    // drops the `[project]` chrome and shows just the label (or "Aether" with no label).
+    // drops the `[project]` chrome and shows just the label (or "Aether" with no label). The label
+    // is segment-elided to the same fixed cap as the native titles (aether-client's TITLE_LABEL_MAX)
+    // so an external file's absolute path doesn't overflow the tab title.
+    const titleLabel = v.buffer.label
+      ? truncatePath(v.buffer.label, undefined, TITLE_LABEL_MAX).display
+      : "";
     document.title = showsProjectChrome(v.project)
-      ? `${v.buffer.label ? `[${v.project}] ${v.buffer.label}` : `[${v.project}]`} - Aether`
-      : v.buffer.label
-        ? `${v.buffer.label} - Aether`
+      ? `${titleLabel ? `[${v.project}] ${titleLabel}` : `[${v.project}]`} - Aether`
+      : titleLabel
+        ? `${titleLabel} - Aether`
         : "Aether";
     this.updateFavicon(v);
   }

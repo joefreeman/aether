@@ -3688,7 +3688,7 @@ impl App {
         // Segment-elide long labels to roughly half the bar so the filename survives (the
         // web's `truncatePath`; chars approximate px since the bar is sans).
         let budget = ((self.view_size.width * 0.5 / 6.5) as usize).max(12);
-        let name = text(truncate_path_label(&self.session.buffer.label, budget))
+        let name = text(crate::labels::truncate_path(&self.session.buffer.label, budget))
             .size(13)
             .color(theme::NORD4)
             .font(
@@ -4310,29 +4310,6 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal) -> Option<f32> 
         Reveal::Minimal if bottom > scroll_y + h => Some(bottom - h),
         Reveal::Minimal => None,
     }
-}
-
-/// Segment-elide a path to `budget` chars, dropping leading directories first so the filename
-/// survives; a still-too-long filename tail-truncates.
-pub(crate) fn truncate_path_label(label: &str, budget: usize) -> String {
-    if label.chars().count() <= budget {
-        return label.to_string();
-    }
-    let mut parts: Vec<&str> = label.split('/').collect();
-    while parts.len() > 1 {
-        parts.remove(0);
-        let cand = format!("…/{}", parts.join("/"));
-        if cand.chars().count() <= budget {
-            return cand;
-        }
-    }
-    let last = parts.last().copied().unwrap_or(label);
-    let tail: String = {
-        let chars: Vec<char> = last.chars().collect();
-        let keep = budget.saturating_sub(1).min(chars.len());
-        chars[chars.len() - keep..].iter().collect()
-    };
-    format!("…{tail}")
 }
 
 /// `3w ago`-style age from a unix timestamp (seconds).

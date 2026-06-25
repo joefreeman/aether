@@ -27,20 +27,83 @@ pub fn shows_project_chrome(project: &str) -> bool {
     !project.is_empty() && !aether_protocol::is_ephemeral_project_id(project)
 }
 
+/// Max characters the window-title path label is shown at before [`truncate_path`] elides it.
+/// Title bars have no width budget of their own (unlike the status bar, which truncates to the row
+/// width), so this is a fixed cap — long enough for a typical project-relative path, short enough
+/// that an absolute external path (goto-definition into a dependency) doesn't blow out the title.
+const TITLE_LABEL_MAX: usize = 60;
+
+/// Shrink a `/`-separated path `label` into `max_chars` via the standardised segment-elision ladder
+/// — the shared shape of the TUI's `truncate_path_with_indices` and the web's `truncatePath`, minus
+/// the match-index bookkeeping those need for picker highlighting:
+///
+///  1. Fits → unchanged.
+///  2. Elide whole *middle* segments to a single `…` (`crates/…/src/handlers.rs`): the last segment
+///     (the filename) always survives, and among the candidates that fit we keep as many segments
+///     as possible, ties broken toward the tail — a file's parents identify it better than leading
+///     dirs do.
+///  3. Floor: char-level left-cut with a leading `…`, keeping the end of the string.
+///
+/// Char-based (a window title has no column budget), matching the web/native status bars. Strings
+/// without `/` skip straight to the floor, so any label passes through safely.
+pub fn truncate_path(label: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if label.chars().count() <= max_chars {
+        return label.to_string();
+    }
+    // Rung 2: segment elision. Candidates keep the first `l` and last `t` segments around one `…`;
+    // pick the fitting candidate with the most segments, preferring tail on ties.
+    let segs: Vec<&str> = label.split('/').collect();
+    let n = segs.len();
+    if n >= 2 {
+        let seg_w: Vec<usize> = segs.iter().map(|s| s.chars().count()).collect();
+        let mut best: Option<(usize, usize)> = None; // (lead, tail), tail ≥ 1
+        for t in 1..n {
+            for l in 0..=(n - 1 - t) {
+                let w: usize = seg_w[..l].iter().sum::<usize>()
+                    + seg_w[n - t..].iter().sum::<usize>()
+                    + (l + t) // one `/` per kept segment (around the `…` part)
+                    + 1; // the `…` itself
+                if w <= max_chars && best.is_none_or(|(bl, bt)| (l + t, t) > (bl + bt, bt)) {
+                    best = Some((l, t));
+                }
+            }
+        }
+        if let Some((l, t)) = best {
+            let lead = segs[..l].join("/");
+            let tail = segs[n - t..].join("/");
+            return if l == 0 {
+                format!("…/{tail}")
+            } else {
+                format!("{lead}/…/{tail}")
+            };
+        }
+    }
+    // Rung 3 (floor): keep chars from the end until `max_chars - 1` is filled (one cell for the `…`).
+    let chars: Vec<char> = label.chars().collect();
+    let keep = max_chars.saturating_sub(1).min(chars.len());
+    let tail: String = chars[chars.len() - keep..].iter().collect();
+    format!("…{tail}")
+}
+
 /// The window/terminal title's *body* for `(project, buffer label)`: `None` before a project is
 /// active (the title is then just the app name), otherwise `[project]` or `[project] label`. The
 /// `[…]` is omitted entirely when there's no real project — a connecting/chooser state (so no
 /// stray `[]`) *and* an ephemeral "(no project)" context, which shows just the buffer label.
-/// Shells append `" - Aether"` (and the TUI prepends a dirty dot).
+/// Long paths are segment-elided (see [`truncate_path`]) so an external file's absolute path doesn't
+/// overflow the title bar. Shells append `" - Aether"` (and the TUI prepends a dirty dot).
 pub fn title_body(project: &str, label: &str) -> Option<String> {
     if project.is_empty() {
         // Boot / connecting / chooser: no project *and* no buffer — the title is just the app name.
         return None;
     }
+    let label = truncate_path(label, TITLE_LABEL_MAX);
     if aether_protocol::is_ephemeral_project_id(project) {
         // Ephemeral "(no project)" context: show the buffer label alone (the filename you're
         // editing), with no `[project]` bracket — or nothing when there's no label.
-        return (!label.is_empty()).then(|| label.to_string());
+        return (!label.is_empty()).then_some(label);
     }
     Some(if label.is_empty() {
         format!("[{project}]")
@@ -168,6 +231,45 @@ mod tests {
             window_title("demo", "src/main.rs"),
             "[demo] src/main.rs - Aether"
         );
+    }
+
+    #[test]
+    fn truncate_path_ladder() {
+        // Rung 1: fits unchanged.
+        assert_eq!(truncate_path("src/main.rs", 60), "src/main.rs");
+        // Rung 2: middle segments elide to a single `…`; the filename always survives, and as many
+        // segments as fit are kept (here lead `crates` + the last three, at 28 ≤ 30).
+        assert_eq!(
+            truncate_path("crates/aether-server/src/handlers/lsp.rs", 30),
+            "crates/…/src/handlers/lsp.rs"
+        );
+        // Tighter budget, ties broken toward the tail: keeping `e/filename.rs` (no lead) beats
+        // keeping `a` + `filename.rs`, since both keep two segments but the tail candidate wins.
+        assert_eq!(truncate_path("a/b/c/d/e/filename.rs", 16), "…/e/filename.rs");
+        // Rung 3 (floor): no `/` to elide, so a long single segment left-cuts to the end (the `…`
+        // plus the last `budget - 1` chars).
+        assert_eq!(truncate_path("supercalifragilistic.rs", 10), "…listic.rs");
+    }
+
+    #[test]
+    fn truncate_path_floor_keeps_the_end() {
+        // A `/`-less label longer than the budget keeps its last `budget-1` chars after the `…`.
+        let out = truncate_path("abcdefghijklmnop", 6);
+        assert_eq!(out.chars().count(), 6);
+        assert_eq!(out, "…lmnop");
+    }
+
+    #[test]
+    fn window_title_elides_a_long_external_path() {
+        // An external goto-def target (absolute path, outside roots) would otherwise overflow the
+        // title bar; the body segment-elides it while keeping the filename.
+        let long = "/home/u/.cargo/registry/src/index.crates.io-abc/serde-1.0.200/src/de/mod.rs";
+        let body = title_body("demo", long).expect("a project with a label has a body");
+        assert!(body.starts_with("[demo] "), "project chrome is preserved");
+        assert!(body.contains('…'), "the long path is elided: {body}");
+        assert!(body.ends_with("mod.rs"), "the filename survives: {body}");
+        // The label portion is capped (project chrome + a bounded label).
+        assert!(body.chars().count() <= "[demo] ".chars().count() + 60);
     }
 
     #[test]
