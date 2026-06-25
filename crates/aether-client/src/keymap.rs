@@ -196,6 +196,13 @@ pub enum Action {
         dir: Direction,
         till: bool,
     },
+    /// `s` / `S` / `Alt-s` / `Shift-Alt-s` — arm sneak word-jump. The next keystrokes build a
+    /// word-prefix query; the server labels matching words and the label keystroke jumps. `big`
+    /// targets whitespace-delimited "big" words (`Alt-s`, like `Alt-w`); `extend` (Shift) is read
+    /// from the key event, like `BeginFind`.
+    BeginSneak {
+        big: bool,
+    },
 
     // ---- selection ----
     SelectWord {
@@ -351,7 +358,10 @@ impl Action {
     pub fn awaits_key(&self) -> bool {
         matches!(
             self,
-            Action::BeginFind { .. } | Action::BeginSurround(_) | Action::BeginTransform
+            Action::BeginFind { .. }
+                | Action::BeginSneak { .. }
+                | Action::BeginSurround(_)
+                | Action::BeginTransform
         )
     }
 
@@ -629,6 +639,8 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('f'), IgnoreShift(Mods::NONE), A::BeginFind { dir: Direction::Forward, till: false }, "Motion", "Find character forward"),
     bind!(N, ch('t'), IgnoreShift(Mods::ALT), A::BeginFind { dir: Direction::Backward, till: true }, "Motion", "Till character backward"),
     bind!(N, ch('t'), IgnoreShift(Mods::NONE), A::BeginFind { dir: Direction::Forward, till: true }, "Motion", "Till character forward"),
+    bind!(N, ch('s'), IgnoreShift(Mods::NONE), A::BeginSneak { big: false }, "Motion", "Sneak to word"),
+    bind!(N, ch('s'), IgnoreShift(Mods::ALT), A::BeginSneak { big: true }, "Motion", "Sneak to big word"),
 
     // ---- motions: brackets / nav units / goto ----
     bind!(N, ch('m'), IgnoreShift(Mods::NONE), A::MatchBracket { inner: false }, "Motion", "Matching bracket"),

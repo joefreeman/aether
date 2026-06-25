@@ -116,6 +116,13 @@ impl WasmSession {
         Ok(())
     }
 
+    /// Report the on-screen line range (the shell owns the pixel scroll) so sneak scopes its labels
+    /// to what's actually visible. `top_visual_row` is absolute; `viewport_rows` is the visible
+    /// height in rows.
+    pub fn set_visible_lines(&mut self, top_visual_row: u32, viewport_rows: u32) {
+        self.inner.set_visible_lines(top_visual_row, viewport_rows);
+    }
+
     /// Pointer press at an already-resolved buffer position (the shell converts pixels → cell).
     /// `granularity` is `"char"`/`"word"`/`"line"`; `extend` is shift-click. Returns `Effect[]`.
     pub fn pointer_press(

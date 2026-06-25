@@ -12,7 +12,7 @@ use super::session::{
     buffer_info, label_for_path, min_pos, severity_label, step_font_size, strip_longest_root,
     AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
     HoverBlock, HoverText, Mode, PasteKind, Pending, ProjectSettings, Prompt, ReloadTry,
-    RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, TextField,
+    RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, SneakState, TextField,
 };
 use super::transport::RpcError;
 use aether_protocol::buffer::{
@@ -78,6 +78,10 @@ use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
     SearchStateChanged, SearchStep, SearchStepParams, SearchSummary,
 };
+use aether_protocol::sneak::{
+    SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
+    SneakUpdateResult,
+};
 use aether_protocol::settings::{
     AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
 };
@@ -119,6 +123,9 @@ pub enum Event {
     /// only, the cursor wasn't moved server-side.
     SearchRestored(Result<SearchSetResult, String>),
     SearchNav(Result<SearchNavResult, String>),
+    /// A `sneak/update` resolved: adopt the live label set so the next keystroke can be classified
+    /// as a label (jump) or a refinement. (The select result routes through [`Event::CursorMsg`].)
+    SneakUpdated(Result<SneakUpdateResult, String>),
     SearchFromSel(Result<Option<(String, SearchSetResult)>, String>),
     NavDone {
         forward: bool,
@@ -375,6 +382,16 @@ impl Session {
                 self.jump_to_cursor(r.cursor)
             }
             Event::SearchNav(Err(e)) => Effects::error(e),
+
+            Event::SneakUpdated(Ok(result)) => {
+                // The session may have ended (label pressed, Esc) before this result landed; only
+                // adopt labels while still sneaking.
+                if let Some(sneak) = self.sneak.as_mut() {
+                    sneak.labels = result.labels;
+                }
+                Effects::none()
+            }
+            Event::SneakUpdated(Err(e)) => Effects::error(e),
 
             Event::SearchFromSel(Ok(Some((query, r)))) => {
                 self.search.query = query.clone();
@@ -1349,6 +1366,19 @@ impl Session {
     /// `resize`). Pure core state; the shell clamps its scroll and reveals the cursor around it.
     pub fn adopt_window(&mut self, res: ViewportWindowResult) {
         self.window = Some(res.window);
+    }
+
+    /// Report the viewport's current scroll position so the core knows what's actually on screen
+    /// (the shell owns the pixel scroll). `top_visual_row` is absolute (whole-buffer); the core maps
+    /// it through the loaded window to a logical-line range that scopes sneak candidates. Cheap —
+    /// safe to call every render/scroll.
+    pub fn set_visible_lines(&mut self, top_visual_row: u32, viewport_rows: u32) {
+        self.visible_lines = self.window.as_ref().map(|w| {
+            let (first, _) = crate::grid::line_at_row(w, top_visual_row);
+            let bottom = top_visual_row.saturating_add(viewport_rows.saturating_sub(1));
+            let (last, _) = crate::grid::line_at_row(w, bottom);
+            (first, last.saturating_add(1))
+        });
     }
 
     /// Close the buffer, then attach to the server-indicated next MRU buffer (or a fresh
@@ -4574,6 +4604,11 @@ impl Session {
             return fx;
         }
 
+        // An active sneak session owns the keyboard: keystrokes refine the query or pick a label.
+        if self.sneak.is_some() {
+            return self.on_sneak_key(code, mods, text);
+        }
+
         // Stateful captures run before table lookup, like the TUI.
         match self.pending {
             Pending::Find {
@@ -4818,6 +4853,16 @@ impl Session {
                     extend,
                     count,
                 };
+                Effects::none()
+            }
+            A::BeginSneak { big } => {
+                // Arm the session; the first typed char triggers the first `sneak/update`. `extend`
+                // (Shift) and `big` (`Alt-s`) are fixed for the whole session.
+                self.sneak = Some(SneakState {
+                    extend,
+                    big,
+                    ..SneakState::default()
+                });
                 Effects::none()
             }
 
@@ -5228,6 +5273,98 @@ impl Session {
                 extend_selection: extend,
             },
             Event::CursorMsg,
+        )
+    }
+
+    /// Handle a keystroke while a sneak (`s`/`S`) session is active: Esc cancels, Backspace unwinds
+    /// the query, a key matching a live label jumps, and any other printable char refines the query.
+    fn on_sneak_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
+        if code == KeyCode::Esc {
+            return self.sneak_cancel();
+        }
+        if code == KeyCode::Backspace {
+            let Some(sneak) = self.sneak.as_mut() else {
+                return Effects::none();
+            };
+            sneak.query.pop();
+            let query = sneak.query.clone();
+            return self.sneak_update(query);
+        }
+        // Only plain printable input is query/label data; ignore chords and non-char keys (they
+        // leave the session armed rather than trapping it — Esc is the explicit exit).
+        if mods.ctrl || mods.alt {
+            return Effects::none();
+        }
+        let Some(ch) = text
+            .as_deref()
+            .and_then(|t| t.chars().next())
+            .filter(|c| !c.is_control())
+        else {
+            return Effects::none();
+        };
+        if self.sneak.as_ref().is_some_and(|s| s.labels.contains(&ch)) {
+            return self.sneak_select(ch);
+        }
+        let Some(sneak) = self.sneak.as_mut() else {
+            return Effects::none();
+        };
+        sneak.query.push(ch);
+        let query = sneak.query.clone();
+        self.sneak_update(query)
+    }
+
+    /// Push the current query to the server, which recomputes labels and refreshes the viewport.
+    fn sneak_update(&mut self, query: String) -> Effects {
+        let Some(viewport_id) = self.viewport_id else {
+            return Effects::none();
+        };
+        let big = self.sneak.as_ref().is_some_and(|s| s.big);
+        // Scope to what's actually on screen (reported by the shell). Fall back to the loaded
+        // window's range until the shell has reported a scroll position.
+        let (first_line, last_line) = self
+            .visible_lines
+            .or_else(|| {
+                self.window
+                    .as_ref()
+                    .map(|w| (w.first_logical_line, w.last_logical_line_exclusive))
+            })
+            .unwrap_or((0, 0));
+        self.request_str::<SneakUpdate>(
+            SneakUpdateParams {
+                buffer_id: self.buffer.buffer_id,
+                viewport_id,
+                query,
+                first_line,
+                last_line,
+                big,
+            },
+            Event::SneakUpdated,
+        )
+    }
+
+    /// Jump to the labelled word (the server selects it / extends to the hull). Ends the session
+    /// locally now; the cursor arrives via [`Event::CursorMsg`].
+    fn sneak_select(&mut self, label: char) -> Effects {
+        let extend = self.sneak.as_ref().is_some_and(|s| s.extend);
+        self.sneak = None;
+        self.request_str::<SneakSelect>(
+            SneakSelectParams {
+                buffer_id: self.buffer.buffer_id,
+                label,
+                extend,
+            },
+            Event::CursorMsg,
+        )
+    }
+
+    /// Abandon the session (Esc). The cursor never moved; just clear the labels server-side.
+    fn sneak_cancel(&mut self) -> Effects {
+        self.sneak = None;
+        self.request::<SneakCancel>(
+            SneakCancelParams {
+                buffer_id: self.buffer.buffer_id,
+            },
+            |_r| Event::Noop,
         )
     }
 

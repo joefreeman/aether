@@ -3280,3 +3280,107 @@ fn open_path_empty_submit_keeps_overlay_open() {
     );
     assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
 }
+
+// ---- sneak (s / S word-jump) --------------------------------------------------------------------
+
+/// A session with a viewport, so `sneak/update` has an id to scope to.
+fn session_with_viewport() -> Session {
+    let mut s = session();
+    s.viewport_id = Some(7);
+    s
+}
+
+#[test]
+fn sneak_arms_then_first_char_requests_update() {
+    let mut s = session_with_viewport();
+    // `s` arms the session but issues no traffic yet.
+    let fx = key(&mut s, 's');
+    assert!(s.sneak.is_some(), "sneak armed");
+    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
+
+    // First char queries the server.
+    let fx = key(&mut s, 'f');
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "sneak/update");
+    assert_eq!(params["query"], json!("f"));
+    assert_eq!(params["viewport_id"], json!(7));
+
+    // The label set (digits) comes back and is adopted for keystroke classification.
+    let fx = s.on_rpc_result(token, Ok(json!({"labels": ["a", "b"], "match_count": 2})));
+    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
+    assert_eq!(s.sneak.as_ref().unwrap().labels, vec!['a', 'b']);
+}
+
+#[test]
+fn sneak_label_key_selects_and_refine_narrows() {
+    let mut s = session_with_viewport();
+    let _ = key(&mut s, 's');
+    let fx = key(&mut s, 'f');
+    let (token, _, _) = the_request(&fx);
+    let _ = s.on_rpc_result(token, Ok(json!({"labels": ["a", "b"], "match_count": 2})));
+
+    // A non-label char (a letter) refines the query, it doesn't jump.
+    let fx = key(&mut s, 'o');
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "sneak/update");
+    assert_eq!(params["query"], json!("fo"), "refined query");
+    let _ = s.on_rpc_result(token, Ok(json!({"labels": ["a"], "match_count": 1})));
+
+    // A label key jumps: a sneak/select with the label, and the session ends locally.
+    let fx = key(&mut s, 'a');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "sneak/select");
+    assert_eq!(params["label"], json!("a"));
+    assert_eq!(params.get("extend"), None, "plain `s` doesn't extend (omitted)");
+    assert!(s.sneak.is_none(), "session ended on label press");
+}
+
+#[test]
+fn sneak_shift_select_extends() {
+    let mut s = session_with_viewport();
+    // `S` (Shift) arms the extend variant.
+    let _ = s.on_key(KeyCode::Char('s'), Mods::SHIFT, Some("S".into()), ROWS);
+    assert!(s.sneak.as_ref().unwrap().extend);
+    let fx = s.on_key(KeyCode::Char('g'), Mods::SHIFT, Some("G".into()), ROWS);
+    let (token, _, _) = the_request(&fx);
+    let _ = s.on_rpc_result(token, Ok(json!({"labels": ["a"], "match_count": 1})));
+
+    let fx = key(&mut s, 'a');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "sneak/select");
+    assert_eq!(params["extend"], json!(true), "S jump extends the selection");
+}
+
+#[test]
+fn sneak_alt_s_targets_big_words() {
+    let mut s = session_with_viewport();
+    // Alt-s arms the big-word variant.
+    let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, Some("s".into()), ROWS);
+    assert!(s.sneak.as_ref().unwrap().big);
+    let fx = key(&mut s, 'f');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "sneak/update");
+    assert_eq!(params["big"], json!(true), "big-word query");
+}
+
+#[test]
+fn sneak_backspace_unwinds_and_esc_cancels() {
+    let mut s = session_with_viewport();
+    let _ = key(&mut s, 's');
+    let fx = key(&mut s, 'f');
+    let (token, _, _) = the_request(&fx);
+    let _ = s.on_rpc_result(token, Ok(json!({"labels": ["a"], "match_count": 1})));
+
+    // Backspace shortens the query (here back to empty) and re-queries.
+    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "sneak/update");
+    assert_eq!(params["query"], json!(""));
+    assert!(s.sneak.is_some(), "still armed after backspace");
+
+    // Esc cancels: a sneak/cancel and the session ends.
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let (_, method, _) = the_request(&fx);
+    assert_eq!(method, "sneak/cancel");
+    assert!(s.sneak.is_none(), "session ended on Esc");
+}

@@ -37,6 +37,10 @@ use aether_protocol::project::{
     ProjectOpenPathParams, ProjectSummary,
 };
 use aether_protocol::search::{SearchSet, SearchSetParams};
+use aether_protocol::sneak::{
+    SneakCancel, SneakSelect, SneakSelectParams, SneakTarget, SneakUpdate, SneakUpdateParams,
+    SneakUpdateResult,
+};
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
@@ -249,11 +253,16 @@ fn logical_line_render_virtual_rows_shape() {
         diff_marker: None,
         diff_stage: DiffStage::Unstaged,
         diagnostics: vec![],
+        sneak_targets: vec![],
     };
     let v = to_value(&bare).unwrap();
     assert!(
         v.get("virtual_rows_above").is_none(),
         "empty omitted from wire"
+    );
+    assert!(
+        v.get("sneak_targets").is_none(),
+        "empty sneak_targets omitted from wire"
     );
     assert!(
         v.get("diff_marker").is_none(),
@@ -285,6 +294,7 @@ fn logical_line_render_virtual_rows_shape() {
             severity: DiagnosticSeverity::Error,
             message: "unused variable".into(),
         }],
+        sneak_targets: vec![],
     };
     let v = to_value(&with_del).unwrap();
     assert_eq!(v["virtual_rows_above"][0]["text"], "old line");
@@ -644,6 +654,98 @@ fn search_set_params() {
     assert!(!p.extend);
     assert!(p.anchor.is_none());
     assert_eq!(p.options, MatchOptions::default());
+}
+
+#[test]
+fn sneak_params_and_result() {
+    use aether_protocol::envelope::RpcMethod;
+    assert_eq!(SneakUpdate::NAME, "sneak/update");
+    assert_eq!(SneakSelect::NAME, "sneak/select");
+    assert_eq!(SneakCancel::NAME, "sneak/cancel");
+
+    let v = to_value(SneakUpdateParams {
+        buffer_id: 3,
+        viewport_id: 9,
+        query: "fu".into(),
+        first_line: 25,
+        last_line: 60,
+        big: false,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 3, "viewport_id": 9, "query": "fu", "first_line": 25, "last_line": 60})
+    );
+    let big = to_value(SneakUpdateParams {
+        buffer_id: 3,
+        viewport_id: 9,
+        query: "fu".into(),
+        first_line: 0,
+        last_line: 40,
+        big: true,
+    })
+    .unwrap();
+    assert_eq!(big["big"], json!(true));
+
+    // Labels are chars on the wire; empty label set is omitted.
+    let v = to_value(SneakUpdateResult {
+        labels: vec!['j', 'k'],
+        match_count: 2,
+    })
+    .unwrap();
+    assert_eq!(v, json!({"labels": ["j", "k"], "match_count": 2}));
+    let deferred = to_value(SneakUpdateResult {
+        labels: vec![],
+        match_count: 40,
+    })
+    .unwrap();
+    assert!(deferred.get("labels").is_none(), "empty labels omitted");
+    assert_eq!(deferred["match_count"], 40);
+
+    // `extend` defaults to false and is omitted.
+    let v = to_value(SneakSelectParams {
+        buffer_id: 3,
+        label: 'j',
+        extend: false,
+    })
+    .unwrap();
+    assert_eq!(v, json!({"buffer_id": 3, "label": "j"}));
+    let p: SneakSelectParams = from_value(json!({"buffer_id": 3, "label": "k"})).unwrap();
+    assert!(!p.extend);
+    assert_eq!(p.label, 'k');
+    // `extend` serializes when set.
+    let v = to_value(SneakSelectParams {
+        buffer_id: 3,
+        label: 'k',
+        extend: true,
+    })
+    .unwrap();
+    assert_eq!(v["extend"], json!(true));
+}
+
+#[test]
+fn sneak_target_shape() {
+    // Labelled target carries the char and a chip spanning the typed prefix.
+    let v = to_value(SneakTarget {
+        start: 4,
+        end: 11,
+        prefix_end: 6,
+        label: Some('j'),
+    })
+    .unwrap();
+    assert_eq!(v, json!({"start": 4, "end": 11, "prefix_end": 6, "label": "j"}));
+    // Unlabelled (deferred): no label, empty chip (prefix_end == start).
+    let v = to_value(SneakTarget {
+        start: 0,
+        end: 3,
+        prefix_end: 0,
+        label: None,
+    })
+    .unwrap();
+    assert!(v.get("label").is_none(), "None label omitted from wire");
+    let back: SneakTarget = from_value(json!({"start": 0, "end": 3, "prefix_end": 0})).unwrap();
+    assert_eq!(back.label, None);
+    assert_eq!(back.prefix_end, 0);
 }
 
 #[test]

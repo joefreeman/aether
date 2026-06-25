@@ -57,6 +57,11 @@ pub struct ServerState {
     /// Per-`(client, buffer)` active search. Set by `search/set`, cleared by `search/clear` or
     /// when the client disconnects / the buffer closes. Re-run whenever the buffer mutates.
     pub searches: HashMap<(ClientId, BufferId), SearchEntry>,
+    /// Per-`(client, buffer)` active sneak (`s`/`S`) word-jump session. Set/refined by
+    /// `sneak/update`, cleared by `sneak/select` / `sneak/cancel` or when the client disconnects /
+    /// the buffer closes. Purely transient view-layer state — no buffer mutation happens during a
+    /// sneak, so unlike searches it never needs an after-edit recompute.
+    pub sneaks: HashMap<(ClientId, BufferId), SneakEntry>,
     /// Per-`(client, buffer)` last-known scroll position. Written whenever the client subscribes
     /// or scrolls a viewport on the buffer, and surfaced on `buffer/open` so the client can
     /// restore the view when it reopens the buffer (e.g. navigating away and back via the file
@@ -148,6 +153,36 @@ pub struct SearchEntry {
     /// client+buffer. Used to dedup cursor-move-driven pushes so we only fire when the cursor
     /// actually crosses a match boundary.
     pub last_pushed_index: u32,
+}
+
+/// Server-side state for one client's active sneak word-jump on a specific buffer. The candidate
+/// list is recomputed on every `sneak/update`; it's kept between updates so label assignment can
+/// stay stable across refinement and so `sneak/select` can resolve a label to its word.
+#[derive(Debug, Clone)]
+pub struct SneakEntry {
+    /// The query typed so far (the word prefix). Empty right after `s`, before any char.
+    pub query: String,
+    /// The viewport whose visible range scoped the candidate search — re-derived each update.
+    pub viewport_id: ViewportId,
+    pub candidates: Vec<SneakCandidate>,
+}
+
+/// One matched word-start in a sneak session.
+#[derive(Debug, Clone, Copy)]
+pub struct SneakCandidate {
+    /// Absolute char index of the word's first char — the stable key used to preserve a word's
+    /// label across refinement (refining only removes candidates, so survivors keep their label).
+    pub start_char: usize,
+    /// Inclusive word start (the cell the label is painted over).
+    pub start: LogicalPosition,
+    /// Exclusive word end — `start`..`end_excl` is the byte range highlighted, and the inclusive
+    /// last char (`end_excl` minus one char) is where a non-extending jump puts the cursor head.
+    pub end_excl: LogicalPosition,
+    /// Position just past the typed query prefix within the word (`start` plus the query's char
+    /// count). `start`..`prefix_end` is the chip the client brightens — one cell per typed char.
+    pub prefix_end: LogicalPosition,
+    /// The assigned label char, or `None` while deferring (more matches than available labels).
+    pub label: Option<char>,
 }
 
 /// Cap on each direction's stack. Bounds memory in pathological cases (e.g. holding down a
@@ -279,6 +314,7 @@ impl ServerState {
             virtual_col: HashMap::new(),
             tree_selection_history: HashMap::new(),
             searches: HashMap::new(),
+            sneaks: HashMap::new(),
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
@@ -560,6 +596,7 @@ impl ServerState {
         self.virtual_col.retain(|(_, b), _| *b != id);
         self.tree_selection_history.retain(|(_, b), _| *b != id);
         self.searches.retain(|(_, b), _| *b != id);
+        self.sneaks.retain(|(_, b), _| *b != id);
         self.last_scroll.retain(|(_, b), _| *b != id);
         self.git_unstaged_hunks.remove(&id);
         self.git_both_hunks.remove(&id);
@@ -684,6 +721,11 @@ impl ServerState {
     /// Remove all search records for the given client. Used on disconnect.
     pub fn drop_searches_for_client(&mut self, client_id: ClientId) {
         self.searches.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Remove all sneak sessions for the given client. Used on disconnect.
+    pub fn drop_sneaks_for_client(&mut self, client_id: ClientId) {
+        self.sneaks.retain(|(c, _), _| *c != client_id);
     }
 
     /// Remove all last-scroll records for the given client. Used on disconnect.
@@ -814,6 +856,7 @@ impl ServerState {
         // don't leak into the UI, but they still let us reattach to "the buffer you last had"
         // when you come back.
         self.searches.retain(|(c, b), _| !in_proj(c, b));
+        self.sneaks.retain(|(c, b), _| !in_proj(c, b));
 
         // Pickers are per-session UI state — their candidate sets/queries reference the prior
         // project so wipe them all on switch.

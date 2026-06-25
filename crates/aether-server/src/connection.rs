@@ -42,6 +42,7 @@ use aether_protocol::project::{
     ProjectRemoveRoot, ProjectRename,
 };
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
+use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
@@ -276,6 +277,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_motion_history_for_client(client_id);
         s.drop_virtual_col_for_client(client_id);
         s.drop_searches_for_client(client_id);
+        s.drop_sneaks_for_client(client_id);
         s.drop_tree_selection_history_for_client(client_id);
         s.drop_last_scroll_for_client(client_id);
         s.drop_pickers_for_client(client_id);
@@ -392,6 +394,9 @@ async fn dispatch(
         SearchSet::NAME => run!(SearchSet, handlers::search_set),
         SearchClear::NAME => run!(SearchClear, handlers::search_clear),
         SearchStep::NAME => run!(SearchStep, handlers::search_step),
+        SneakUpdate::NAME => run!(SneakUpdate, handlers::sneak_update),
+        SneakSelect::NAME => run!(SneakSelect, handlers::sneak_select),
+        SneakCancel::NAME => run!(SneakCancel, handlers::sneak_cancel),
         BufferCopy::NAME => run!(BufferCopy, handlers::buffer_copy),
         BufferCut::NAME => run!(BufferCut, handlers::buffer_cut),
         ViewportSubscribe::NAME => run!(ViewportSubscribe, handlers::viewport_subscribe),

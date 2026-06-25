@@ -366,6 +366,7 @@ interface CoreView {
   blame: { line: number; text: string } | null;
   count: number | null;
   pending: unknown | null;
+  sneak_active: boolean;
   project: string;
   project_paths: string[];
   externally_modified: boolean;
@@ -2208,6 +2209,12 @@ export class Shell {
       cancelAnimationFrame(this.renderRaf);
       this.renderRaf = null;
     }
+    // Report the on-screen line range to the core (it owns no pixel scroll) so sneak scopes its
+    // labels to what's actually visible rather than the overscan-padded window.
+    if (this.session && this.cell) {
+      const topRow = Math.max(0, Math.round((this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h));
+      this.session.set_visible_lines(topRow, this.visibleRows());
+    }
     const v = this.view();
     this.snapshot = v;
     // Adopt the synced editor font size before drawing, so this paint uses the right cell metrics.
@@ -2235,7 +2242,7 @@ export class Shell {
       window: v.window,
       cursor: v.buffer.cursor,
       insertMode: v.mode === "insert",
-      awaitingKey: v.pending !== null || (v.count ?? 0) > 0,
+      awaitingKey: v.pending !== null || (v.count ?? 0) > 0 || v.sneak_active,
       contentWidthPx: v.wrap === "none" ? this.cell.w * (v.window.max_line_width + 2) : 0,
       spacerHeightPx: v.window.total_visual_rows * this.cell.h + BUFFER_PAD * 2,
       contentTopPx: v.window.first_visual_row * this.cell.h + BUFFER_PAD,

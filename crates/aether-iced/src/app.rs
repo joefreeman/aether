@@ -1714,6 +1714,12 @@ impl App {
         // through `OverlayInput`, not here, so this never fights click-to-position-then-type.)
         let query_before = self.session.picker.as_ref().map(|p| p.query.clone());
         let visible_rows = self.visible_rows();
+        // Report the on-screen line range so sneak scopes labels to what's visible (the core owns no
+        // pixel scroll). `scroll_px / cell.height` is the absolute top visual row.
+        if let Some(cell) = self.cell {
+            let top_row = (self.scroll_px / cell.height).round().max(0.0) as u32;
+            self.session.set_visible_lines(top_row, visible_rows);
+        }
         let fx = self.session.on_key(code, mods, text, visible_rows);
         let mut task = self.run_core(fx);
         let chip_after = self.chip_field_snapshot();
@@ -2423,7 +2429,8 @@ impl App {
                 cursor: self.session.buffer.cursor,
                 insert_mode: self.session.mode == Mode::Insert,
                 awaiting_key: !matches!(self.session.pending, Pending::None)
-                    || self.session.count.is_some(),
+                    || self.session.count.is_some()
+                    || self.session.sneak.is_some(),
                 diff_view: self.session.diff_view,
                 scroll_px: self.scroll_px,
                 scroll_x_px: self.scroll_x_px,

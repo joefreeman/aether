@@ -48,6 +48,7 @@ pub fn build_view(s: &Session) -> Value {
         "blame": s.blame.as_ref().map(|(line, text)| json!({ "line": line, "text": text })),
         "count": s.count,
         "pending": pending(&s.pending),
+        "sneak_active": s.sneak.is_some(),
         "search": search(s),
         "prompt": prompt(&s.prompt, &s.project_paths),
         "picker": picker(&s.picker, &s.project_paths),

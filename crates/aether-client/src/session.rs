@@ -133,6 +133,22 @@ pub struct SearchSnapshot {
     pub options: MatchOptions,
 }
 
+/// Client-side state for an active sneak (`s`/`S`) word-jump. Present only while sneaking; the
+/// candidate list + labels themselves are server-owned and ride the viewport render. The core keeps
+/// just enough to classify each keystroke: the query typed so far, the live label set returned by
+/// the last `sneak/update`, and whether this is the extend (`S`) variant.
+#[derive(Default)]
+pub struct SneakState {
+    pub query: String,
+    /// Labels currently painted on screen (from the last `sneak/update`). A keystroke in this set
+    /// is a jump; anything else extends the query. Empty until the first result arrives or while
+    /// the match count exceeds the available labels.
+    pub labels: Vec<char>,
+    pub extend: bool,
+    /// Target "big" words (`Alt-s`) rather than normal word-starts (`s`). Fixed for the session.
+    pub big: bool,
+}
+
 /// A modal dialog owning the keyboard: the `[y/N]`-style confirmation or the save-as path
 /// input. Mirrors the web client's `modal.ts` (Enter/`y` accepts, Esc declines, a click on the
 /// editor behind it cancels).
@@ -461,6 +477,14 @@ pub struct Session {
     pub count: Option<u32>,
     pub last_repeat: Option<RepeatTarget>,
     pub search: SearchState,
+    /// Active sneak word-jump session (`s`/`S`), or `None` when not sneaking. While `Some`, the key
+    /// handler interprets keystrokes as query/label input rather than normal-mode bindings.
+    pub sneak: Option<SneakState>,
+    /// The logical-line range actually on screen (`first`..`last`, last exclusive), kept current by
+    /// the shells (which own the pixel scroll) via [`Session::set_visible_lines`]. Used to scope
+    /// sneak candidates to what's truly visible — the server's window carries a screen of overscan,
+    /// so it can't tell. `None` until a window is loaded.
+    pub visible_lines: Option<(u32, u32)>,
 
     pub viewport_id: Option<ViewportId>,
     pub window: Option<Window>,
@@ -518,6 +542,8 @@ impl Session {
             count: None,
             last_repeat: None,
             search: SearchState::default(),
+            sneak: None,
+            visible_lines: None,
             viewport_id: None,
             window: None,
             wrap: WrapMode::Soft,

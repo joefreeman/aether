@@ -28,6 +28,10 @@ pub const NORD13: Color = rgb(0xebcb8b); // string escapes, warnings
 pub const NORD14: Color = rgb(0xa3be8c); // strings
 pub const NORD15: Color = rgb(0xb48ead); // numbers, constants
 
+/// Sneak typed-prefix band — a brighter, cooler slate than the word tint (NORD3), between it and
+/// the bright label cell in prominence.
+pub const SNEAK_PREFIX_BG: Color = rgb(0x616e88);
+
 /// Current-line tint — between NORD0 and NORD1 (see theme.css for the rationale).
 pub const CURSOR_LINE_BG: Color = rgb(0x343a48);
 

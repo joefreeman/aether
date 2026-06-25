@@ -4,6 +4,7 @@ use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::git::GitBufferStatus;
 use crate::lsp::{DiagnosticCounts, LspServerStatus};
 use crate::search::SearchMatchRange;
+use crate::sneak::SneakTarget;
 use crate::{BufferId, Revision, ViewportId};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,11 @@ pub struct LogicalLineRender {
     /// diagnostics apply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DiagnosticSpan>,
+    /// Active sneak (`s`/`S`) word-jump targets on this logical line: matched word-starts as byte
+    /// ranges, each optionally carrying the label char painted over its first cell. Empty when no
+    /// sneak session is active for this client. See [`crate::sneak`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sneak_targets: Vec<SneakTarget>,
 }
 
 /// One diagnostic's footprint on a single logical line.

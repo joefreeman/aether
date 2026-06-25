@@ -78,6 +78,12 @@ interface CellStyle {
   sel: boolean;
   cursor: boolean;
   bracket: boolean;
+  /** Inside a sneak candidate word (quiet tint). */
+  sneak: boolean;
+  /** Inside a sneak typed-prefix chip (bright; blanked unless it's the label cell). */
+  chip: boolean;
+  /** The sneak label char to paint over this cell, or null. */
+  sneakLabel: string | null;
 }
 
 function sameStyle(a: CellStyle, b: CellStyle): boolean {
@@ -87,7 +93,10 @@ function sameStyle(a: CellStyle, b: CellStyle): boolean {
     a.search === b.search &&
     a.sel === b.sel &&
     a.cursor === b.cursor &&
-    a.bracket === b.bracket
+    a.bracket === b.bracket &&
+    a.sneak === b.sneak &&
+    a.chip === b.chip &&
+    a.sneakLabel === b.sneakLabel
   );
 }
 
@@ -100,11 +109,26 @@ interface LineSelection {
 }
 
 function makeSpan(text: string, style: CellStyle, cursorClass: string): Node {
+  // Sneak typed-prefix chip overrides other styling on its cells (like the terminal/iced clients):
+  // the label glyph on the first cell, blanks on the rest, all on the bright label colour.
+  if (style.sneakLabel) {
+    const span = document.createElement("span");
+    span.className = "sneak-label";
+    span.textContent = style.sneakLabel;
+    return span;
+  }
+  if (style.chip) {
+    const span = document.createElement("span");
+    span.className = "sneak-chip";
+    span.textContent = text;
+    return span;
+  }
   const classes: string[] = [];
   if (style.hl) classes.push(style.hl);
   if (style.bracket) classes.push("match-bracket");
   if (style.diag) classes.push("diag-" + style.diag);
   if (style.search) classes.push("search-hit");
+  if (style.sneak) classes.push("sneak-target");
   if (style.sel) classes.push("sel");
   if (style.cursor) classes.push(cursorClass);
   if (classes.length === 0) return document.createTextNode(text);
@@ -208,6 +232,9 @@ function renderVisualRow(
   const hl: (string | null)[] = new Array(n).fill(null);
   const diag: (DiagnosticSeverity | null)[] = new Array(n).fill(null);
   const search: boolean[] = new Array(n).fill(false);
+  const sneak: boolean[] = new Array(n).fill(false);
+  const chip: boolean[] = new Array(n).fill(false);
+  const sneakLabel: (string | null)[] = new Array(n).fill(null);
   const selected: boolean[] = new Array(n).fill(false);
   const cursor: boolean[] = new Array(n).fill(false);
   const bracket: boolean[] = new Array(n).fill(false);
@@ -243,6 +270,18 @@ function renderVisualRow(
   }
   for (const m of line.search_matches ?? []) {
     markRange(byteStart, n, m.start - row.byte_offset, m.end - row.byte_offset, (i) => (search[i] = true));
+  }
+  // Sneak word-jump targets: tint each candidate word, and put its label on the first cell — but
+  // only when the word's start actually falls in this row (so a word wrapped from a previous row
+  // keeps the tint without a stray label).
+  for (const t of line.sneak_targets ?? []) {
+    const localStart = t.start - row.byte_offset;
+    markRange(byteStart, n, localStart, t.end - row.byte_offset, (i) => (sneak[i] = true));
+    markRange(byteStart, n, localStart, t.prefix_end - row.byte_offset, (i) => (chip[i] = true));
+    if (t.label) {
+      const idx = cpAtByte(byteStart, n, localStart);
+      if (idx >= 0) sneakLabel[idx] = t.label;
+    }
   }
 
   // Selection: inclusive line-local range mapped to this row.
@@ -293,6 +332,9 @@ function renderVisualRow(
     sel: selected[k],
     cursor: cursor[k],
     bracket: bracket[k],
+    sneak: sneak[k],
+    chip: chip[k],
+    sneakLabel: sneakLabel[k],
   });
   let i = 0;
   while (i < n) {
@@ -332,7 +374,17 @@ function renderVisualRow(
     // keeps the glyph and renders the block over it (the `.cursor` rule inverts the `↵` to NORD0),
     // matching the terminal — rather than blanking it out. An end-of-line diagnostic underlines
     // this cell even with no cursor/selection present.
-    const style = { hl: null, diag: eolDiag, search: false, sel: selTrailing, cursor: cursorAtEnd, bracket: false };
+    const style = {
+      hl: null,
+      diag: eolDiag,
+      search: false,
+      sel: selTrailing,
+      cursor: cursorAtEnd,
+      bracket: false,
+      sneak: false,
+      chip: false,
+      sneakLabel: null,
+    };
     textEl.appendChild(
       selTrailing ? wsSpan("↵", style, "nl", cursorClass) : makeSpan(" ", style, cursorClass),
     );

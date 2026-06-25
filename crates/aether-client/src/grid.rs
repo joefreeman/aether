@@ -398,6 +398,7 @@ mod tests {
             diff_marker: None,
             diff_stage: Default::default(),
             diagnostics: vec![],
+            sneak_targets: vec![],
         }
     }
 

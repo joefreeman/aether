@@ -501,6 +501,61 @@ where
                     );
                 }
 
+                // Sneak word-jump targets: a NORD3 tint over each candidate word (like a search
+                // hit), plus a bright NORD13 "chip" over the typed prefix. Tuple is
+                // `(start_dcol, end_dcol, prefix_end_dcol, label)`; the label glyph and chip blanks
+                // are drawn in/after the text pass below.
+                let sneak_spans: Vec<(u32, u32, u32, Option<char>)> = line
+                    .sneak_targets
+                    .iter()
+                    .filter_map(|t| {
+                        let (s, e) = grid::byte_range_span(&cells, t.start, t.end)?;
+                        let pe = if t.prefix_end > t.start {
+                            grid::byte_range_span(&cells, t.start, t.prefix_end)
+                                .map_or(s, |(_, pe)| pe)
+                        } else {
+                            s
+                        };
+                        Some((s, e, pe, t.label))
+                    })
+                    .collect();
+                for &(start, end, prefix_end, _) in &sneak_spans {
+                    fill_content(
+                        renderer,
+                        Rectangle {
+                            x: text_x(start),
+                            y,
+                            width: (end - start) as f32 * cell.width,
+                            height: cell.height,
+                        },
+                        theme::NORD3,
+                    );
+                    if prefix_end > start {
+                        // Typed prefix: a cooler, brighter band over the word tint...
+                        fill_content(
+                            renderer,
+                            Rectangle {
+                                x: text_x(start),
+                                y,
+                                width: (prefix_end - start) as f32 * cell.width,
+                                height: cell.height,
+                            },
+                            theme::SNEAK_PREFIX_BG,
+                        );
+                        // ...with just the label's first cell bright on top.
+                        fill_content(
+                            renderer,
+                            Rectangle {
+                                x: text_x(start),
+                                y,
+                                width: cell.width,
+                                height: cell.height,
+                            },
+                            theme::NORD13,
+                        );
+                    }
+                }
+
                 // Gutter change-bar. Under the diff view, removed lines render as phantom
                 // rows above, so no Deleted marker is needed on the anchor line.
                 let gutter_marker = line
@@ -593,7 +648,14 @@ where
                 // fill — so a match inside one would be invisible. Lift just that text to
                 // the normal foreground (the web's `.search-hit.hl-comment` rule; every
                 // other syntax colour reads fine on NORD3).
-                let in_hit = |dcol: u32| hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e);
+                let in_hit = |dcol: u32| {
+                    hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
+                        || sneak_spans.iter().any(|&(s, e, _, _)| dcol >= s && dcol < e)
+                };
+                // Only the label's first cell is blanked (the label glyph is drawn over it after);
+                // the rest of the typed prefix renders normally on its band.
+                let is_label_cell =
+                    |dcol: u32| sneak_spans.iter().any(|&(s, _, pe, _)| s == dcol && pe > s);
                 let mut run = String::new();
                 let mut run_start: u32 = 0;
                 let mut run_kind: Option<&str> = None;
@@ -671,7 +733,12 @@ where
                         run_kind = c.kind;
                         run_hit = hit;
                     }
-                    if c.ch == '\t' {
+                    if is_label_cell(c.dcol) {
+                        // Blank the label cell; the label glyph is drawn over it after.
+                        for _ in 0..c.width.max(1) {
+                            run.push(' ');
+                        }
+                    } else if c.ch == '\t' {
                         for _ in 0..c.width {
                             run.push(' ');
                         }
@@ -680,6 +747,23 @@ where
                     }
                 }
                 flush(&mut run, run_start, run_kind, run_hit, renderer);
+
+                // Sneak labels: the dark glyph on the bright first cell. The rest of the typed
+                // prefix already rendered in the text pass, over its cooler band.
+                for &(start, _end, prefix_end, label) in &sneak_spans {
+                    if prefix_end > start {
+                        if let Some(lbl) = label {
+                            draw_run(
+                                renderer,
+                                lbl.to_string(),
+                                Point::new(text_x(start), y),
+                                cell,
+                                theme::NORD0,
+                                content_clip,
+                            );
+                        }
+                    }
+                }
 
                 // Selected newline: a muted `↵` at the line's end on its last visual row, when the
                 // consumed `\n` falls in the selection (terminal parity). The fill ensures the

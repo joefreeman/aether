@@ -18,6 +18,7 @@ pub mod picker;
 pub mod project;
 pub mod search;
 pub mod settings;
+pub mod sneak;
 pub mod viewport;
 
 pub type BufferId = u64;

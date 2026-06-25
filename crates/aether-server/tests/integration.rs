@@ -49,6 +49,10 @@ use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
     SearchStep, SearchStepParams,
 };
+use aether_protocol::sneak::{
+    SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
+    SneakUpdateResult,
+};
 use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker};
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
@@ -21199,3 +21203,343 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
     );
     drop(server);
 }
+
+// ---- sneak (s / S word-jump) --------------------------------------------------------------------
+
+/// Open `content` and subscribe a full-height, no-wrap viewport. Returns the viewport id alongside
+/// the usual handles so sneak RPCs can scope to it.
+async fn setup_with_viewport(
+    content: &str,
+) -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u64, // buffer_id
+    u64, // viewport_id
+) {
+    let (server, mut ws, buffer_id) = setup_with_buffer(content).await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        100,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 200,
+            rows: 50,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    (server, ws, buffer_id, sub.viewport_id)
+}
+
+#[tokio::test]
+async fn sneak_update_labels_then_select_word() {
+    // foo(0-2) food(4-7) fish(9-12) on line 0.
+    let (server, mut ws, buffer_id, viewport_id) = setup_with_viewport("foo food fish\n").await;
+
+    // Query "f": three word-starts. The next chars (o,o,i) are excluded from the label alphabet,
+    // so every match still gets a label.
+    let r: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        200,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "f".into(),
+            first_line: 0,
+            last_line: 100,
+            big: false,
+        },
+    )
+    .await;
+    assert_eq!(r.match_count, 3);
+    assert_eq!(r.labels.len(), 3, "all three labelled");
+    assert!(
+        !r.labels.contains(&'o') && !r.labels.contains(&'i'),
+        "labels must avoid valid next-refinement chars: {:?}",
+        r.labels
+    );
+
+    // Refine to "fo": only foo + food survive. Labels are returned in document order.
+    let r2: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        201,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "fo".into(),
+            first_line: 0,
+            last_line: 100,
+            big: false,
+        },
+    )
+    .await;
+    assert_eq!(r2.match_count, 2);
+    let food_label = r2.labels[1]; // foo, food
+
+    // Select "food" → selects the whole word: anchor at its first char, head on its last.
+    let cursor: CursorState = send_request::<SneakSelect>(
+        &mut ws,
+        202,
+        &SneakSelectParams {
+            buffer_id,
+            label: food_label,
+            extend: false,
+        },
+    )
+    .await;
+    assert_eq!(cursor.anchor, LogicalPosition { line: 0, col: 4 });
+    assert_eq!(cursor.position, LogicalPosition { line: 0, col: 7 });
+    drop(server);
+}
+
+#[tokio::test]
+async fn sneak_targets_ride_the_render() {
+    let (server, mut ws, buffer_id, viewport_id) = setup_with_viewport("alpha gamma\n").await;
+
+    // The update pushes a refreshed viewport render carrying the labels (delivered after the RPC
+    // response, like the edit path's lines_changed push).
+    let _r: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        300,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "a".into(), // matches "alpha" only
+            first_line: 0,
+            last_line: 100,
+            big: false,
+        },
+    )
+    .await;
+    let notif: ViewportLinesChangedParams =
+        expect_notification::<ViewportLinesChanged>(&mut ws).await;
+    let targets = &notif.replacement_lines[0].sneak_targets;
+    assert_eq!(targets.len(), 1, "one matched word on line 0");
+    assert_eq!(targets[0].start, 0);
+    assert_eq!(targets[0].end, 5, "covers 'alpha'");
+    assert_eq!(targets[0].prefix_end, 1, "chip covers the one typed char");
+    assert!(targets[0].label.is_some(), "single match is labelled");
+    drop(server);
+}
+
+#[tokio::test]
+async fn sneak_extend_builds_hull_either_direction() {
+    // alpha(0-4) beta(6-9) gamma(11-15).
+    let (server, mut ws, buffer_id, viewport_id) = setup_with_viewport("alpha beta gamma\n").await;
+
+    // Cursor at the origin (a point), then S-jump forward to "gamma": hull spans origin..gamma end.
+    let r: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        400,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "g".into(),
+            first_line: 0,
+            last_line: 100,
+            big: false,
+        },
+    )
+    .await;
+    let cursor: CursorState = send_request::<SneakSelect>(
+        &mut ws,
+        401,
+        &SneakSelectParams {
+            buffer_id,
+            label: r.labels[0], // single match
+            extend: true,
+        },
+    )
+    .await;
+    assert_eq!(cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(cursor.position, LogicalPosition { line: 0, col: 15 });
+
+    // Plain-select "gamma" to set up a selection that sits *after* the next (backward) target.
+    let r: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        402,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "g".into(),
+            first_line: 0,
+            last_line: 100,
+            big: false,
+        },
+    )
+    .await;
+    let _g: CursorState = send_request::<SneakSelect>(
+        &mut ws,
+        403,
+        &SneakSelectParams {
+            buffer_id,
+            label: r.labels[0],
+            extend: false,
+        },
+    )
+    .await; // now selecting gamma: anchor (0,11), head (0,15)
+
+    // S-jump backward to "alpha" (before the selection): the hull spans alpha..gamma, head on the
+    // low (word) end, anchor kept on the far (high) end.
+    let r: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        404,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "a".into(), // "alpha" only ("beta"/"gamma" don't start with a)
+            first_line: 0,
+            last_line: 100,
+            big: false,
+        },
+    )
+    .await;
+    let cursor: CursorState = send_request::<SneakSelect>(
+        &mut ws,
+        405,
+        &SneakSelectParams {
+            buffer_id,
+            label: r.labels[0],
+            extend: true,
+        },
+    )
+    .await;
+    assert_eq!(cursor.anchor, LogicalPosition { line: 0, col: 15 });
+    assert_eq!(cursor.position, LogicalPosition { line: 0, col: 0 });
+    drop(server);
+}
+
+#[tokio::test]
+async fn sneak_labels_what_fits_when_matches_exceed_alphabet() {
+    // 30 identical "ax" words: every next char is 'x', so the alphabet loses only one letter (25
+    // left) — more matches than labels, so we label what fits and leave the overflow highlighted.
+    let content = format!("{}\n", "ax ".repeat(30));
+    let (server, mut ws, buffer_id, viewport_id) = setup_with_viewport(&content).await;
+
+    let r: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        500,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "a".into(),
+            first_line: 0,
+            last_line: 100,
+            big: false,
+        },
+    )
+    .await;
+    assert_eq!(r.match_count, 30);
+    assert!(!r.labels.is_empty(), "labels shown after one char, not deferred");
+    assert!(r.labels.len() < 30, "but only as many as fit");
+    assert!(!r.labels.contains(&'x'), "label never aliases the next-refinement char");
+    drop(server);
+}
+
+#[tokio::test]
+async fn sneak_scopes_to_the_client_visible_range() {
+    // "foo" on line 5 and line 50; everything else blank. The client reports only lines 40..60 as
+    // visible, so only the line-50 match is labelled — even though the server's viewport (with its
+    // screen of overscan) covers more.
+    let mut lines = vec![String::new(); 60];
+    lines[5] = "foo".into();
+    lines[50] = "foo".into();
+    let content = format!("{}\n", lines.join("\n"));
+    let (server, mut ws, buffer_id, viewport_id) = setup_with_viewport(&content).await;
+
+    let r: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        900,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "f".into(),
+            first_line: 40,
+            last_line: 60,
+            big: false,
+        },
+    )
+    .await;
+    assert_eq!(r.match_count, 1, "only the in-view match, not the off-screen one");
+    drop(server);
+}
+
+#[tokio::test]
+async fn sneak_cancel_leaves_cursor_and_disarms() {
+    let (server, mut ws, buffer_id, viewport_id) = setup_with_viewport("alpha gamma\n").await;
+
+    let _r: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        600,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "g".into(),
+            first_line: 0,
+            last_line: 100,
+            big: false,
+        },
+    )
+    .await;
+    send_request::<SneakCancel>(&mut ws, 601, &SneakCancelParams { buffer_id }).await;
+
+    // After cancel the session is gone, so a select is a no-op: cursor stays at the origin.
+    let cursor: CursorState = send_request::<SneakSelect>(
+        &mut ws,
+        602,
+        &SneakSelectParams {
+            buffer_id,
+            label: 'f',
+            extend: false,
+        },
+    )
+    .await;
+    assert_eq!(cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(cursor.position, LogicalPosition { line: 0, col: 0 });
+    drop(server);
+}
+
+#[tokio::test]
+async fn sneak_big_word_selects_whole_run() {
+    // `foo.bar()` is one big word; `baz` follows.
+    let (server, mut ws, buffer_id, viewport_id) = setup_with_viewport("foo.bar() baz\n").await;
+
+    let r: SneakUpdateResult = send_request::<SneakUpdate>(
+        &mut ws,
+        700,
+        &SneakUpdateParams {
+            buffer_id,
+            viewport_id,
+            query: "f".into(),
+            first_line: 0,
+            last_line: 100,
+            big: true,
+        },
+    )
+    .await;
+    assert_eq!(r.match_count, 1, "the whole non-whitespace run is one target");
+
+    let cursor: CursorState = send_request::<SneakSelect>(
+        &mut ws,
+        701,
+        &SneakSelectParams {
+            buffer_id,
+            label: r.labels[0],
+            extend: false,
+        },
+    )
+    .await;
+    // Selects all of "foo.bar()" (cols 0..=8).
+    assert_eq!(cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(cursor.position, LogicalPosition { line: 0, col: 8 });
+    drop(server);
+}
+

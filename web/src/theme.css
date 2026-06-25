@@ -432,6 +432,18 @@ html, body, #app {
 
 /* Matching bracket (cursor on/inside a bracket pair) — bold orange, matching the terminal. */
 .match-bracket { color: var(--nord12); font-weight: bold; }
+
+/* Sneak (s/S) word-jump: candidate words get the same quiet NORD3 tint as a search hit; comment
+   text inside one is lifted to NORD4 so it stays visible (mirrors .search-hit.hl-comment). */
+.sneak-target { background: var(--nord3); }
+.sneak-target.hl-comment { color: var(--nord4); }
+/* The label glyph painted over a word's first cell: a bold dark char on Aurora yellow, the
+   high-contrast "press this to jump" marker (matches the terminal/iced label style). Overrides any
+   syntax colour on that cell. */
+.sneak-label { background: var(--nord13); color: var(--nord0); font-weight: bold; }
+/* The rest of the typed prefix: the typed characters on a cooler, brighter band than the word tint
+   (a lighter slate) — between it and the bright label cell in prominence. */
+.sneak-chip { background: #616e88; }
 /* End-of-line git blame for the cursor line. */
 .blame-eol { color: var(--nord3); font-style: italic; }
 

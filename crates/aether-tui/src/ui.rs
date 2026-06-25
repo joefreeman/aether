@@ -13,6 +13,7 @@ use aether_protocol::git::GitStatus;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{BufferDirtyState, PickerItem};
 use aether_protocol::search::SearchMatchRange;
+use aether_protocol::sneak::SneakTarget;
 use aether_protocol::viewport::{
     DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, Highlight, VisualRow, WrapMode,
 };
@@ -4201,6 +4202,24 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 .filter(|b| **b >= scroll_col)
                 .map(|b| b - scroll_col)
                 .collect();
+            // Sneak targets, row-relative then horizontally scroll-adjusted (no-op when scroll_col
+            // is 0). The label is dropped if its cell scrolled out of view.
+            let clipped_sneak: Vec<(u32, u32, u32, Option<char>)> =
+                sneak_targets_on_visual_row(vrow.byte_offset, row_text_len, &render.sneak_targets)
+                    .into_iter()
+                    .filter_map(|(s, e, pe, label)| {
+                        if e <= scroll_col {
+                            return None;
+                        }
+                        let label = if s >= scroll_col { label } else { None };
+                        Some((
+                            s.saturating_sub(scroll_col),
+                            e - scroll_col,
+                            pe.saturating_sub(scroll_col),
+                            label,
+                        ))
+                    })
+                    .collect();
 
             // Continuation row when byte_offset > 0. Prepend the marker; the server already
             // reserved this width when wrapping.
@@ -4233,6 +4252,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 &clipped_matches,
                 &clipped_brackets,
                 &clipped_diags,
+                &clipped_sneak,
                 body_width,
             ));
             // The EOL cell after the last char: the newline glyph when selected, and/or a
@@ -4514,6 +4534,42 @@ fn matches_on_visual_row(
         .collect()
 }
 
+/// Clip sneak word-jump targets to this visual row, returning row-relative `(start, end, label)`.
+/// The label rides on the entry only when the word's true start falls within the row (so a word
+/// continuing from a previous wrapped row keeps its highlight but not a stray label).
+fn sneak_targets_on_visual_row(
+    row_byte_offset: u32,
+    row_text_len: u32,
+    targets: &[SneakTarget],
+) -> Vec<(u32, u32, u32, Option<char>)> {
+    if row_text_len == 0 {
+        return Vec::new();
+    }
+    let row_end = row_byte_offset + row_text_len;
+    targets
+        .iter()
+        .filter_map(|t| {
+            let s = t.start.max(row_byte_offset);
+            let e = t.end.min(row_end);
+            if s < e {
+                // `clamp` requires min <= max, so only compute it once the target is known to
+                // intersect the row (otherwise `s > e`).
+                let pe = t.prefix_end.clamp(s, e);
+                // Keep the label only if the word actually starts in this row.
+                let label = (t.start >= row_byte_offset).then_some(t.label).flatten();
+                Some((
+                    s - row_byte_offset,
+                    e - row_byte_offset,
+                    pe - row_byte_offset,
+                    label,
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Clip per-logical-line diagnostic spans to this visual row's byte range, returning row-relative
 /// `(start, end, severity)`. A zero-width diagnostic within the row is widened to one cell so it's
 /// visible; a diagnostic ending exactly at the row's end (its `\n`) is dropped (nothing to draw).
@@ -4666,6 +4722,9 @@ fn selection_on_visual_row(
 /// Truncate `text` to fit `max_chars` columns and emit styled spans. Style at each byte is the
 /// combination of the syntax-highlight color (per `highlights`) and, if that byte falls in `sel`,
 /// the `REVERSED` modifier.
+// One per-byte overlay channel per arg (highlights / selection / search / brackets / diagnostics /
+// sneak); bundling them would only obscure the row-render call site.
+#[allow(clippy::too_many_arguments)]
 fn build_spans(
     text: &str,
     highlights: &[Highlight],
@@ -4673,6 +4732,7 @@ fn build_spans(
     matches: &[(u32, u32)],
     match_brackets: &[u32],
     diagnostics: &[(u32, u32, DiagnosticSeverity)],
+    sneak: &[(u32, u32, u32, Option<char>)],
     max_chars: u16,
 ) -> Vec<Span<'static>> {
     let truncated: String = text.chars().take(max_chars as usize).collect();
@@ -4708,6 +4768,29 @@ fn build_spans(
         }
     }
 
+    // Sneak word-jump overlays: a per-byte "candidate word" flag (subtle tint), a "typed-prefix
+    // chip" flag (bright label colour over the chars typed so far), and the label char painted over
+    // the chip's first cell.
+    let mut byte_in_sneak: Vec<bool> = vec![false; trunc_len];
+    let mut byte_sneak_chip: Vec<bool> = vec![false; trunc_len];
+    let mut byte_sneak_label: Vec<Option<char>> = vec![None; trunc_len];
+    for (s, e, pe, label) in sneak {
+        let s = (*s as usize).min(trunc_len);
+        let e = (*e as usize).min(trunc_len);
+        let pe = (*pe as usize).min(trunc_len).max(s);
+        for flag in &mut byte_in_sneak[s..e] {
+            *flag = true;
+        }
+        for flag in &mut byte_sneak_chip[s..pe] {
+            *flag = true;
+        }
+        if let Some(lbl) = label {
+            if s < trunc_len {
+                byte_sneak_label[s] = Some(*lbl);
+            }
+        }
+    }
+
     // Per-byte diagnostic severity (worst wins where they overlap), so we can underline each cell in
     // its severity color.
     let mut byte_diag: Vec<Option<DiagnosticSeverity>> = vec![None; trunc_len];
@@ -4738,6 +4821,22 @@ fn build_spans(
             // Comments are themed NORD3 too, so a match inside one would be invisible (same fg/bg).
             // Lift just that text to the normal foreground; every other syntax color reads fine.
             if style.fg == Some(NORD3) {
+                style = style.fg(NORD4);
+            }
+        }
+        // Sneak candidate word: a quiet NORD3 tint marking the jump targets (the label cell itself
+        // is painted separately, below, in the char loop).
+        if byte_in_sneak[byte_idx] {
+            style = style.bg(NORD3);
+            if style.fg == Some(NORD3) {
+                style = style.fg(NORD4);
+            }
+        }
+        // Typed prefix: a brighter, cooler band (NORD3_BRIGHT) than the word tint — between it and
+        // the bright label cell in prominence. The label cell is painted separately in the char loop.
+        if byte_sneak_chip[byte_idx] {
+            style = style.bg(NORD3_BRIGHT);
+            if style.fg == Some(NORD3) || style.fg == Some(NORD3_BRIGHT) {
                 style = style.fg(NORD4);
             }
         }
@@ -4780,6 +4879,23 @@ fn build_spans(
     let mut current_style: Option<Style> = None;
     let mut display_col: u32 = 0;
     for (byte_idx, c) in truncated.char_indices() {
+        // A sneak label is painted *over* the word's first cell: a bold, high-contrast glyph (dark
+        // on Aurora yellow) that replaces the underlying character. The char it covers is the one
+        // the user already typed, so nothing readable is lost.
+        if let Some(lbl) = byte_sneak_label[byte_idx] {
+            display_col += char_display_width(c, display_col);
+            push_text(
+                &mut spans,
+                &mut current_text,
+                &mut current_style,
+                &lbl.to_string(),
+                Style::default()
+                    .fg(NORD0)
+                    .bg(NORD13)
+                    .add_modifier(Modifier::BOLD),
+            );
+            continue;
+        }
         let style = style_at(byte_idx);
         let in_sel = sel.is_some_and(|(s, e)| byte_idx >= s as usize && byte_idx < e as usize);
         let pad = if c == '\t' {
@@ -7111,10 +7227,64 @@ mod tests {
         out
     }
 
+    /// (char, fg, bg, bold) per column from `build_spans` (ASCII input → col == byte).
+    fn cells_of(spans: &[Span<'static>]) -> Vec<(char, Option<Color>, Option<Color>, bool)> {
+        let mut out = Vec::new();
+        for s in spans {
+            let bold = s.style.add_modifier.contains(Modifier::BOLD);
+            for c in s.content.chars() {
+                out.push((c, s.style.fg, s.style.bg, bold));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sneak_targets_on_visual_row_skips_targets_off_the_row() {
+        // A word on a later wrapped row (byte 200) must not panic or appear when rendering an
+        // earlier row [0,17) — regression for the `clamp(min > max)` panic.
+        let targets = [SneakTarget {
+            start: 200,
+            end: 208,
+            prefix_end: 201,
+            label: Some('j'),
+        }];
+        assert!(sneak_targets_on_visual_row(0, 17, &targets).is_empty());
+
+        // A word starting within the row is clamped and kept, with its chip.
+        let here = [SneakTarget {
+            start: 4,
+            end: 9,
+            prefix_end: 6,
+            label: Some('k'),
+        }];
+        assert_eq!(
+            sneak_targets_on_visual_row(0, 17, &here),
+            vec![(4, 9, 6, Some('k'))]
+        );
+    }
+
+    #[test]
+    fn build_spans_paints_sneak_label_and_bands_the_prefix() {
+        // "function", whole word [0,8), query "fu" → prefix [0,2), label 'j'.
+        let sneak = [(0u32, 8u32, 2u32, Some('j'))];
+        let cells = cells_of(&build_spans("function", &[], None, &[], &[], &[], &sneak, 80));
+        // Col 0: the label glyph, dark-on-yellow.
+        assert_eq!(cells[0].0, 'j', "label glyph painted over the first cell");
+        assert_eq!(cells[0].2, Some(NORD13), "label on Aurora yellow");
+        // Col 1: the rest of the prefix — the typed char on the cooler band (not bold, not yellow).
+        assert_eq!(cells[1].0, 'u', "prefix shows the typed char");
+        assert_eq!(cells[1].2, Some(NORD3_BRIGHT), "cooler band");
+        assert!(!cells[1].3, "not bold");
+        // Col 2 onward: the candidate-word tint (NORD3).
+        assert_eq!(cells[2].0, 'n');
+        assert_eq!(cells[2].2, Some(NORD3));
+    }
+
     #[test]
     fn build_spans_underlines_diagnostic_in_severity_color() {
         let diags = [(2u32, 4u32, DiagnosticSeverity::Warning)];
-        let cells = underline_cols(&build_spans("abcdef", &[], None, &[], &[], &diags, 80));
+        let cells = underline_cols(&build_spans("abcdef", &[], None, &[], &[], &diags, &[], 80));
         for (col, (underlined, color)) in cells.into_iter().enumerate() {
             if col == 2 || col == 3 {
                 assert!(underlined, "cell {col} underlined");
@@ -7132,7 +7302,7 @@ mod tests {
             (0u32, 3u32, DiagnosticSeverity::Hint),
             (1u32, 2u32, DiagnosticSeverity::Error),
         ];
-        let cells = underline_cols(&build_spans("xyz", &[], None, &[], &[], &diags, 80));
+        let cells = underline_cols(&build_spans("xyz", &[], None, &[], &[], &diags, &[], 80));
         assert_eq!(cells[1].1, Some(NORD11), "overlap shows error red");
         assert_eq!(cells[0].1, Some(NORD4), "non-overlap keeps hint colour");
     }

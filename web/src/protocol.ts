@@ -58,6 +58,16 @@ export interface SearchMatchRange {
   end: number;
 }
 
+/** A sneak (s/S) word-jump target: byte range of a matched word within the logical line. The chip
+ *  `start..prefix_end` is the typed-prefix highlight (one cell per char typed), with `label` over
+ *  its first cell (absent — and the chip empty — while deferring labels). */
+export interface SneakTarget {
+  start: number;
+  end: number;
+  prefix_end: number;
+  label?: string | null;
+}
+
 export type VirtualRowKind = "deleted";
 
 export interface VirtualRow {
@@ -103,6 +113,7 @@ export interface LogicalLineRender {
   /** Qualifies diff_marker in the combined view; omitted when "unstaged". */
   diff_stage?: DiffStage;
   diagnostics?: DiagnosticSpan[];
+  sneak_targets?: SneakTarget[];
 }
 
 export interface BufferWindow {

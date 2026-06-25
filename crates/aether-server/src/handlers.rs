@@ -8,7 +8,7 @@ use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
     BlameCache, Buffer, EditKindTag, LineEnding, NavEntry, SearchEntry, ServerState, SharedState,
-    Viewport,
+    SneakCandidate, SneakEntry, Viewport,
 };
 use crate::surround;
 use crate::wrap;
@@ -65,6 +65,9 @@ use aether_protocol::search::{
     SearchStateChanged, SearchStepParams, SearchSummary,
 };
 use aether_protocol::settings::{AppSettings, SettingsChanged, SettingsGetParams};
+use aether_protocol::sneak::{
+    SneakCancelParams, SneakSelectParams, SneakTarget, SneakUpdateParams, SneakUpdateResult,
+};
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSpan, DiffMarker, DiffStage, LogicalLineRange,
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
@@ -1503,6 +1506,7 @@ pub async fn git_set_diff_view(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
+    let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
@@ -1519,6 +1523,7 @@ pub async fn git_set_diff_view(
         rows,
         WindowDecorations {
             search,
+            sneak,
             diff_view: params.enabled,
             hunks,
             diagnostics,
@@ -2991,6 +2996,170 @@ pub async fn search_clear(
     Ok(())
 }
 
+// ---- sneak (s / S word-jump) --------------------------------------------------------------------
+
+/// `sneak/update` — set or refine the sneak query. Recomputes the matching word-starts within the
+/// named viewport's visible range, (re)assigns labels (keeping survivors' labels stable), stores
+/// the session, and pushes refreshed viewport renders carrying the labels. Returns the live label
+/// set so the client can tell a label keystroke (jump) from a refinement keystroke (narrow).
+pub async fn sneak_update(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: SneakUpdateParams,
+) -> Result<SneakUpdateResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let key = (client_id, params.buffer_id);
+
+    // Scope to the client-reported visible range (clamped to the buffer). The viewport's own range
+    // carries a screen of overscan and the native clients pixel-scroll within it, so only the client
+    // knows what's actually on screen.
+    let line_count = buf.line_count();
+    let first = params.first_line.min(line_count);
+    let last_excl = params.last_line.min(line_count).max(first);
+
+    let raw = crate::sneak::compute_candidates(
+        &buf.text,
+        first as usize,
+        last_excl as usize,
+        &params.query,
+        params.big,
+    );
+    let query_char_len = params.query.chars().count();
+    let labels = crate::sneak::assign_labels(&raw);
+
+    let candidates: Vec<SneakCandidate> = raw
+        .iter()
+        .zip(&labels)
+        .map(|(c, label)| SneakCandidate {
+            start_char: c.start_char,
+            start: motion::char_to_pos(buf, c.start_char),
+            end_excl: motion::char_to_pos(buf, c.end_char_excl),
+            // Just past the typed prefix: the word starts with `query`, so the first
+            // `query_char_len` chars are the matched prefix.
+            prefix_end: motion::char_to_pos(buf, c.start_char + query_char_len),
+            label: *label,
+        })
+        .collect();
+
+    let match_count = candidates.len() as u32;
+    let live_labels: Vec<char> = candidates.iter().filter_map(|c| c.label).collect();
+
+    s.sneaks.insert(
+        key,
+        SneakEntry {
+            query: params.query,
+            viewport_id: params.viewport_id,
+            candidates,
+        },
+    );
+    let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(SneakUpdateResult {
+        labels: live_labels,
+        match_count,
+    })
+}
+
+/// `sneak/select` — jump to the labelled word and select it (or extend the current selection to the
+/// hull spanning it and the target word). Clears the session and refreshes the viewport. No-op
+/// (returns the current cursor) when there's no session or the label is unknown.
+pub async fn sneak_select(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: SneakSelectParams,
+) -> Result<CursorState, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let key = (client_id, params.buffer_id);
+    let cursor = s.cursors.get(&key).copied().unwrap_or_default();
+
+    let target = s
+        .sneaks
+        .get(&key)
+        .and_then(|e| e.candidates.iter().find(|c| c.label == Some(params.label)))
+        .copied();
+    let Some(target) = target else {
+        // Unknown label / no session: leave the cursor put.
+        let cursor = wrap_for_response(&s, client_id, params.buffer_id, cursor);
+        return Ok(cursor);
+    };
+
+    let tgt_lo = target.start_char;
+    let tgt_hi = motion::pos_to_char(buf, target.end_excl).saturating_sub(1).max(tgt_lo);
+
+    let (anchor_char, pos_char) = if params.extend {
+        // Bounding hull of the current selection and the target word, so extend never shrinks
+        // coverage. The head lands on the target side (its far edge); the anchor sits on the
+        // opposite end of the hull.
+        let cur_a = motion::pos_to_char(buf, cursor.anchor);
+        let cur_p = motion::pos_to_char(buf, cursor.position);
+        let cur_lo = cur_a.min(cur_p);
+        let cur_hi = cur_a.max(cur_p);
+        let lo = cur_lo.min(tgt_lo);
+        let hi = cur_hi.max(tgt_hi);
+        if tgt_lo < cur_lo {
+            (hi, lo) // target reaches before the selection → head on the low (word) end
+        } else {
+            (lo, hi) // target at/after the selection → head on the high (word) end
+        }
+    } else {
+        (tgt_lo, tgt_hi) // select just the word
+    };
+
+    let new_cursor = CursorState {
+        position: motion::char_to_pos(buf, pos_char),
+        anchor: motion::char_to_pos(buf, anchor_char),
+        match_bracket: None,
+        grep_position: None,
+    };
+    s.cursors.insert(key, new_cursor);
+    s.record_motion(key, cursor, new_cursor);
+    s.virtual_col.remove(&key);
+    s.clear_tree_selection_history(client_id, params.buffer_id);
+    s.sneaks.remove(&key);
+
+    let cursor = wrap_for_response(&s, client_id, params.buffer_id, new_cursor);
+    let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(cursor)
+}
+
+/// `sneak/cancel` — abandon the session (the `Esc` path). The cursor never moved, so just drop the
+/// labels and refresh.
+pub async fn sneak_cancel(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: SneakCancelParams,
+) -> Result<(), RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    if !s.buffers.contains_key(&params.buffer_id) {
+        return Err(RpcError::buffer_not_found(params.buffer_id));
+    }
+    s.sneaks.remove(&(client_id, params.buffer_id));
+    let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(())
+}
+
 /// `search/step` — step `count` matches in `params.direction`, handling the composite params
 /// (docs/protocol-composites.md, I): optional query revive first (skipping the step when it
 /// has no matches — same early-out the clients used), then `count` steps.
@@ -3260,6 +3429,7 @@ fn collect_viewport_refresh(
     };
     let revision = buf.revision;
     let search_entry = s.searches.get(&(client_id, buffer_id));
+    let sneak_entry = s.sneaks.get(&(client_id, buffer_id));
     let diagnostics = buffer_diagnostics(s, buffer_id);
     for vp in s.viewports.values() {
         if vp.client_id != client_id || vp.buffer_id != buffer_id {
@@ -3282,6 +3452,7 @@ fn collect_viewport_refresh(
             vp.rows,
             WindowDecorations {
                 search: search_entry,
+                sneak: sneak_entry,
                 diff_view: vp.diff_view,
                 hunks: buffer_both_hunks(s, buffer_id),
                 diagnostics,
@@ -4355,6 +4526,7 @@ pub async fn viewport_subscribe(
         line_count,
     );
     let search = s.searches.get(&(client_id, params.buffer_id));
+    let sneak = s.sneaks.get(&(client_id, params.buffer_id));
     let hunks = buffer_both_hunks(&s, params.buffer_id);
     let diagnostics = buffer_diagnostics(&s, params.buffer_id);
     let buf = &s.buffers[&params.buffer_id];
@@ -4374,6 +4546,7 @@ pub async fn viewport_subscribe(
         params.rows,
         WindowDecorations {
             search,
+            sneak,
             diff_view: params.diff_view,
             hunks,
             diagnostics,
@@ -4489,6 +4662,7 @@ pub async fn viewport_resize(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
+    let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
@@ -4505,6 +4679,7 @@ pub async fn viewport_resize(
         rows,
         WindowDecorations {
             search,
+            sneak,
             diff_view,
             hunks,
             diagnostics,
@@ -4561,6 +4736,7 @@ pub async fn viewport_scroll_to_row(
     );
     let (first, last_excl) = pushed_range(top_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
+    let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
@@ -4577,6 +4753,7 @@ pub async fn viewport_scroll_to_row(
         rows,
         WindowDecorations {
             search,
+            sneak,
             diff_view,
             hunks,
             diagnostics,
@@ -4632,6 +4809,7 @@ pub async fn viewport_set_wrap(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
+    let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
@@ -4648,6 +4826,7 @@ pub async fn viewport_set_wrap(
         rows,
         WindowDecorations {
             search,
+            sneak,
             diff_view,
             hunks,
             diagnostics,
@@ -4693,6 +4872,7 @@ pub async fn viewport_scroll(
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
     let search = s.searches.get(&(client_id, buffer_id));
+    let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = &s.buffers[&buffer_id];
@@ -4709,6 +4889,7 @@ pub async fn viewport_scroll(
         rows,
         WindowDecorations {
             search,
+            sneak,
             diff_view,
             hunks,
             diagnostics,
@@ -5775,6 +5956,7 @@ fn logical_line_at_visual_row(
 /// `render_window` caller assembles the same set from `ServerState`.
 struct WindowDecorations<'a> {
     search: Option<&'a SearchEntry>,
+    sneak: Option<&'a SneakEntry>,
     diff_view: bool,
     hunks: &'a [crate::git::DiffHunk],
     diagnostics: &'a [crate::lsp::diagnostics::BufferDiagnostic],
@@ -5791,6 +5973,7 @@ fn render_window(
 ) -> Window {
     let WindowDecorations {
         search,
+        sneak,
         diff_view,
         hunks,
         diagnostics,
@@ -5849,6 +6032,9 @@ fn render_window(
             wrap::render_line(&text, i, cols, wrap, marker_width, tab_width, highlights);
         if let Some(entry) = search {
             render.search_matches = matches_on_line(entry, i, text.len() as u32);
+        }
+        if let Some(entry) = sneak {
+            render.sneak_targets = sneak_targets_on_line(entry, i, text.len() as u32);
         }
         if let Some(rows) = deleted_rows.get(&i) {
             render.virtual_rows_above = rows.clone();
@@ -5913,6 +6099,35 @@ fn matches_on_line(entry: &SearchEntry, line_idx: u32, line_len: u32) -> Vec<Sea
         let e = e.min(line_len);
         if s < e {
             out.push(SearchMatchRange { start: s, end: e });
+        }
+    }
+    out
+}
+
+/// Sneak word-jump targets on `line_idx` as byte ranges (clamped to the line), each carrying its
+/// label. Candidate words never span lines, so each contributes to exactly the line it starts on.
+fn sneak_targets_on_line(entry: &SneakEntry, line_idx: u32, line_len: u32) -> Vec<SneakTarget> {
+    let mut out = Vec::new();
+    for cand in &entry.candidates {
+        if cand.start.line != line_idx {
+            continue;
+        }
+        let start = cand.start.col.min(line_len);
+        let end = cand.end_excl.col.min(line_len);
+        // The chip spans the typed prefix, but only for a labelled (jumpable) target; deferred
+        // candidates stay calm with just the word tint, so collapse their chip to empty.
+        let prefix_end = if cand.label.is_some() {
+            cand.prefix_end.col.min(line_len).max(start)
+        } else {
+            start
+        };
+        if start < end {
+            out.push(SneakTarget {
+                start,
+                end,
+                prefix_end,
+                label: cand.label,
+            });
         }
     }
     out
@@ -9402,6 +9617,9 @@ fn build_lines_changed_notif(
         vp.rows,
         WindowDecorations {
             search,
+            // Post-edit / async broadcast path: a sneak session can't coexist with an edit by the
+            // same client, so labels never ride this render. They reappear on the next sneak/update.
+            sneak: None,
             diff_view: vp.diff_view,
             hunks,
             diagnostics,

@@ -1357,6 +1357,10 @@ impl Shell {
     // ---- view sync (Session → the render model ui::draw reads) ---------------------------
 
     fn sync(&mut self) {
+        // Report the current on-screen line range to the core (it owns no pixel scroll), so sneak
+        // scopes its labels to what's actually visible rather than the overscan-padded window.
+        self.session
+            .set_visible_lines(self.top_visual_row, self.visible_rows());
         // Keep the shell-owned overlay editor in step with the focused field before projecting any
         // overlay state into the view model below.
         self.sync_overlay_edit();
@@ -1533,6 +1537,7 @@ impl Shell {
                 Pending::Surround(t) => Some(t),
                 _ => None,
             },
+            sneak_active: s.sneak.is_some(),
             search: self.search_view(),
             blame: BlameState {
                 line: s.blame.as_ref().map(|(l, _)| *l),

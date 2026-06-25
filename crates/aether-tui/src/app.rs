@@ -471,6 +471,9 @@ pub struct EditorState {
     /// binding. The value records the target (selection in Normal, line in Insert). Mirrors
     /// `pending_find`'s next-key-is-data capture.
     pub pending_surround: Option<SurroundTarget>,
+    /// True while a sneak (`s`/`S`/`Alt-s`) session is active — the next keystrokes are query/label
+    /// input, so the cursor renders as the "awaiting key" underscore.
+    pub sneak_active: bool,
     pub search: SearchState,
     /// Git blame for the cursor's line, shown as end-of-line virtual text in Normal mode. Lazily
     /// fetched (see [`refresh_blame`]) when the cursor changes line or the buffer revision
@@ -612,7 +615,10 @@ fn awaiting_key(state: &AppState) -> bool {
     }
     state.has_editor() && {
         let ed = state.ed();
-        ed.pending_find.is_some() || ed.pending_surround.is_some() || ed.pending_count > 0
+        ed.pending_find.is_some()
+            || ed.pending_surround.is_some()
+            || ed.pending_count > 0
+            || ed.sneak_active
     }
 }
 
@@ -991,6 +997,7 @@ mod tests {
             pending_count: 0,
             pending_find: None,
             pending_surround: None,
+            sneak_active: false,
             search: Default::default(),
             blame: Default::default(),
             file_path: None,

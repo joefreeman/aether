@@ -15,6 +15,7 @@ mod lsp;
 mod number;
 mod picker;
 mod server;
+mod sneak;
 mod state;
 mod surround;
 mod syntax;
