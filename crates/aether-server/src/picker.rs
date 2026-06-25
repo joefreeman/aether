@@ -326,6 +326,16 @@ pub struct ReferenceCandidate {
     pub is_definition: bool,
 }
 
+impl ReferenceCandidate {
+    /// True when `pos` falls within this reference's identifier span (start-inclusive, end-inclusive).
+    /// find-references is invoked from *inside* the identifier, so the seeded cursor usually sits
+    /// past the span's start column — a start-only comparison would skip to the next occurrence.
+    pub fn contains(&self, pos: LogicalPosition) -> bool {
+        let p = (pos.line, pos.col);
+        (self.line, self.col) <= p && p <= (self.end_line, self.end_col)
+    }
+}
+
 /// One document-symbols-picker candidate — a single symbol from `textDocument/documentSymbol`,
 /// scoped to the picked buffer. `name` is the fuzzy haystack; `start` (the name position) drives
 /// the `FileAt` jump on select. Hierarchical responses are flattened depth-first, so `depth`

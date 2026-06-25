@@ -5708,6 +5708,36 @@ fn next_async_load_epoch() -> u64 {
     ASYNC_LOAD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Pick the References-picker candidate to seed the initial highlight on, returning its
+/// `(rank, candidate_index)` — `rank` being its position in `ranked` so the window can frame around
+/// it. Among the references in the active file (`cursor_path`), prefer the one whose identifier span
+/// *contains* the cursor: find-references fires from inside the identifier, so the seeded cursor
+/// usually sits past the span's start column, and a start-only test would skip to the next
+/// occurrence (the off-by-one this guards against). Failing containment, take the nearest at-or-after
+/// the cursor, wrapping to that file's first — mirroring the grep cursor-nearest rule.
+fn seed_reference_center(
+    refs: &[picker_state::ReferenceCandidate],
+    ranked: &[u32],
+    cursor_path: Option<&str>,
+    pos: LogicalPosition,
+) -> Option<(u32, usize)> {
+    ranked
+        .iter()
+        .map(|&ci| ci as usize)
+        .filter(|&ci| Some(refs[ci].abs_path.as_str()) == cursor_path)
+        .min_by_key(|&ci| {
+            let r = &refs[ci];
+            let after = (r.line, r.col) >= (pos.line, pos.col);
+            (!r.contains(pos), !after, r.line, r.col)
+        })
+        .and_then(|ci| {
+            ranked
+                .iter()
+                .position(|&r| r as usize == ci)
+                .map(|rank| (rank as u32, ci))
+        })
+}
+
 /// Apply a freshly-resolved async candidate set to its picker, unless a newer open superseded it
 /// (the `pending_async_load` epoch moved past `epoch`) or the picker was hidden/closed. Reranks
 /// against whatever query the user typed while the resolve was in flight, clamps the window, clears
@@ -5760,27 +5790,9 @@ async fn apply_async_candidates(
             })
             .map(|(rank, &ci)| (rank as u32, ci as usize)),
         // References: seed on the occurrence the cursor is on (find-references is invoked from a
-        // use of the symbol). Among the references in the active file, take the nearest at-or-after
-        // the cursor, wrapping to that file's first — mirroring the grep cursor-nearest rule. Then
-        // map that candidate to its rank so the window frames around it.
+        // use of the symbol). See `seed_reference_center`.
         (picker_state::PickerCandidates::References(refs), Some(pos)) => {
-            let path = cursor_path.as_deref();
-            picker
-                .ranked
-                .iter()
-                .map(|&ci| ci as usize)
-                .filter(|&ci| Some(refs[ci].abs_path.as_str()) == path)
-                .min_by_key(|&ci| {
-                    let after = (refs[ci].line, refs[ci].col) >= (pos.line, pos.col);
-                    (!after, refs[ci].line, refs[ci].col)
-                })
-                .and_then(|ci| {
-                    picker
-                        .ranked
-                        .iter()
-                        .position(|&r| r as usize == ci)
-                        .map(|rank| (rank as u32, ci))
-                })
+            seed_reference_center(refs, &picker.ranked, cursor_path.as_deref(), pos)
         }
         _ => None,
     };
@@ -12961,5 +12973,88 @@ mod lsp_parse_tests {
         // Empty / absent edit lists are a no-op (None), not an empty document.
         assert!(apply_lsp_text_edits(&text, &json!([]), PositionEncoding::Utf8).is_none());
         assert!(apply_lsp_text_edits(&text, &json!(null), PositionEncoding::Utf8).is_none());
+    }
+}
+
+#[cfg(test)]
+mod seed_reference_center_tests {
+    use super::*;
+
+    fn at(line: u32, col: u32) -> LogicalPosition {
+        LogicalPosition { line, col }
+    }
+
+    /// `name` spans `[start_col, end_col]` inclusive on a single line, in the given file.
+    fn rf(path: &str, line: u32, start_col: u32, end_col: u32) -> picker_state::ReferenceCandidate {
+        picker_state::ReferenceCandidate {
+            abs_path: path.into(),
+            display_path: path.into(),
+            line,
+            col: start_col,
+            end_line: line,
+            end_col: end_col,
+            preview: String::new(),
+            is_definition: false,
+        }
+    }
+
+    #[test]
+    fn cursor_inside_span_seeds_that_occurrence_not_the_next() {
+        // Two uses of `helper` (cols 4..=9) in the active file, on lines 4 and 8. The cursor rests
+        // mid-identifier on line 4 (col 6) — a start-only "at-or-after" test would reject line 4
+        // (its start col 4 < 6) and skip to line 8. Containment must keep us on line 4.
+        let refs = vec![rf("/a.rs", 4, 4, 9), rf("/a.rs", 8, 4, 9)];
+        let ranked: Vec<u32> = vec![0, 1];
+        let seed = seed_reference_center(&refs, &ranked, Some("/a.rs"), at(4, 6));
+        assert_eq!(seed, Some((0, 0)), "cursor mid-span on line 4 seeds line 4");
+    }
+
+    #[test]
+    fn cursor_at_span_start_seeds_that_occurrence() {
+        // The post-jump "identifier selected" case: leading edge == span start (col 4).
+        let refs = vec![rf("/a.rs", 4, 4, 9), rf("/a.rs", 8, 4, 9)];
+        let ranked: Vec<u32> = vec![0, 1];
+        let seed = seed_reference_center(&refs, &ranked, Some("/a.rs"), at(4, 4));
+        assert_eq!(seed, Some((0, 0)));
+    }
+
+    #[test]
+    fn cursor_between_occurrences_takes_nearest_after() {
+        // Cursor on line 6, contained by neither span → fall back to nearest at-or-after (line 8).
+        let refs = vec![rf("/a.rs", 4, 4, 9), rf("/a.rs", 8, 4, 9)];
+        let ranked: Vec<u32> = vec![0, 1];
+        let seed = seed_reference_center(&refs, &ranked, Some("/a.rs"), at(6, 0));
+        assert_eq!(seed, Some((1, 1)));
+    }
+
+    #[test]
+    fn cursor_past_all_occurrences_wraps_to_first() {
+        // Nothing at-or-after the cursor → wrap to the file's first reference.
+        let refs = vec![rf("/a.rs", 4, 4, 9), rf("/a.rs", 8, 4, 9)];
+        let ranked: Vec<u32> = vec![0, 1];
+        let seed = seed_reference_center(&refs, &ranked, Some("/a.rs"), at(20, 0));
+        assert_eq!(seed, Some((0, 0)));
+    }
+
+    #[test]
+    fn only_active_file_references_are_considered() {
+        // Candidate 0 is in another file; the cursor's containing ref (candidate 1) is in /a.rs.
+        let refs = vec![rf("/b.rs", 4, 4, 9), rf("/a.rs", 4, 4, 9)];
+        let ranked: Vec<u32> = vec![0, 1];
+        let seed = seed_reference_center(&refs, &ranked, Some("/a.rs"), at(4, 6));
+        assert_eq!(seed, Some((1, 1)), "rank/index point at the /a.rs occurrence");
+    }
+
+    #[test]
+    fn rank_reflects_position_in_ranked_not_candidate_index() {
+        // `ranked` is reordered (e.g. definition-first): candidate 2 sits at rank 0.
+        let refs = vec![
+            rf("/a.rs", 8, 4, 9),
+            rf("/a.rs", 12, 4, 9),
+            rf("/a.rs", 4, 4, 9),
+        ];
+        let ranked: Vec<u32> = vec![2, 0, 1];
+        let seed = seed_reference_center(&refs, &ranked, Some("/a.rs"), at(4, 6));
+        assert_eq!(seed, Some((0, 2)), "candidate 2 is at rank 0");
     }
 }
