@@ -1525,6 +1525,12 @@ impl Session {
     /// selections, goto-definition). Records the jump origin onto the nav history first.
     /// `prime_search` (grep flows) also sets the opened buffer's search to that query so
     /// `n`/`Alt-n` step matches.
+    ///
+    /// A path inside one of the project's roots opens as an ordinary root-relative buffer; a path
+    /// outside every root — goto-definition into a dependency's source, say — opens as an *external*
+    /// guest buffer via `absolute_path` (the same mechanism the `Space Alt-w` open-from-path overlay
+    /// uses), rather than refusing with a toast. Either way it lands as a transient preview with the
+    /// jump origin on the nav history, so `Alt-Left` returns.
     pub fn open_path_primed(
         &mut self,
         path: String,
@@ -1532,17 +1538,19 @@ impl Session {
         jump_to_anchor: Option<LogicalPosition>,
         prime: Option<(String, MatchOptions)>,
     ) -> Effects {
-        let Some((path_index, relative_path)) = strip_longest_root(&path, &self.project_paths)
-        else {
-            return Effects::error(format!("{path} is outside the project's roots"));
-        };
+        let (path_index, relative_path, absolute_path) =
+            match strip_longest_root(&path, &self.project_paths) {
+                Some((idx, rel)) => (Some(idx), Some(rel), None),
+                None => (None, None, Some(path)),
+            };
         let prime_search = prime.as_ref().map(|(q, _)| q.clone());
         let prime_search_options = prime.as_ref().map(|(_, o)| *o).unwrap_or_default();
         let prime = prime.clone();
         self.request_str::<BufferOpen>(
             BufferOpenParams {
-                path_index: Some(path_index),
-                relative_path: Some(relative_path),
+                path_index,
+                relative_path,
+                absolute_path,
                 jump_to,
                 jump_to_anchor,
                 transient: Some(true),

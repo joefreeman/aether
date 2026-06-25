@@ -315,6 +315,50 @@ fn goto_definition_lands_the_identifier_selected() {
 }
 
 #[test]
+fn goto_definition_outside_roots_opens_an_external_buffer() {
+    use aether_client::update::Event;
+    use aether_protocol::lsp::LspGotoDefinitionResult;
+    let mut s = session();
+    s.project_paths = vec!["/p".into()];
+
+    // A definition that resolves into a dependency's source — outside every project root — used to
+    // be refused with an "outside the project's roots" toast. It now opens as an *external* guest
+    // buffer via `absolute_path`, still jumping to the identifier and recording nav history.
+    let dep: LspGotoDefinitionResult = serde_json::from_value(json!({
+        "location": {
+            "path": "/home/u/.cargo/registry/src/dep-1.0/src/lib.rs",
+            "position": { "line": 42, "col": 7 },
+            "end": { "line": 42, "col": 12 },
+        },
+        "readiness": "ready",
+    }))
+    .unwrap();
+    let fx = s.on_event(Event::Definition(Ok(dep)));
+    assert!(
+        !has_error_toast(&fx),
+        "an external definition opens rather than erroring"
+    );
+    let params = find_request(&fx, "buffer/open").expect("goto-def opens the external buffer");
+    assert_eq!(
+        params["absolute_path"],
+        json!("/home/u/.cargo/registry/src/dep-1.0/src/lib.rs"),
+        "outside-root paths route through absolute_path (external buffer)"
+    );
+    assert!(
+        params["path_index"].is_null() && params["relative_path"].is_null(),
+        "the root-relative fields are unset for an external open"
+    );
+    // Still a transient preview, still jumps to the identifier, still records the jump origin.
+    assert_eq!(params["transient"], json!(true));
+    assert_eq!(params["jump_to"], json!({ "line": 42, "col": 12 }));
+    assert_eq!(params["jump_to_anchor"], json!({ "line": 42, "col": 7 }));
+    assert!(
+        params["record_nav_from"].is_u64(),
+        "the jump origin is recorded so Alt-Left returns"
+    );
+}
+
+#[test]
 fn goto_definition_into_the_same_buffer_glides_not_resubscribes() {
     use aether_client::effect::RevealStyle;
     use aether_client::update::Event;

@@ -104,8 +104,11 @@ pub struct ProjectCreateParams {
 }
 
 /// Open a file by absolute (or cwd-relative) path, resolving the project context for it. This is
-/// the project-agnostic entry point used by `ae /path/to/file`, the `Space Alt-w` open-from-path
-/// overlay, and goto-definition into a file outside the active project. The server:
+/// the project-agnostic entry point used by `ae /path/to/file` and the `Space Alt-w` open-from-path
+/// overlay — the cases that may need to *activate* a project (an ephemeral one when none is active).
+/// Goto-definition into a file outside the active project doesn't go through here: it already has an
+/// active project to host the guest, so it opens the external buffer directly via `buffer/open`'s
+/// `absolute_path` (same external-buffer machinery, no project activation). The server:
 ///
 /// - canonicalizes the path;
 /// - if the calling client has an active project whose roots **contain** the path, opens it there
