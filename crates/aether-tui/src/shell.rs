@@ -314,22 +314,28 @@ impl Shell {
     }
 
     fn status(&mut self, msg: StatusMessage) {
-        self.push_toast(msg);
+        self.push_toast(msg, None);
     }
 
     /// Push a transient toast onto the bottom-right stack and arm its expiry timer. Empty messages
-    /// are dropped. The stack is capped so a burst can't grow it without bound (oldest fall off).
-    fn push_toast(&mut self, msg: StatusMessage) {
+    /// are dropped. A `group` replaces any existing toast with the same key (so an evolving status
+    /// updates one toast in place); otherwise the stack is capped so a burst can't grow it without
+    /// bound (oldest fall off).
+    fn push_toast(&mut self, msg: StatusMessage, group: Option<String>) {
         if msg.is_empty() {
             return;
         }
         const MAX_TOASTS: usize = 5;
+        if let Some(g) = &group {
+            self.state.toasts.retain(|t| t.group.as_deref() != Some(g.as_str()));
+        }
         let id = self.next_toast_id;
         self.next_toast_id = self.next_toast_id.wrapping_add(1);
         self.state.toasts.push(crate::app::Toast {
             id,
             text: msg.text,
             kind: msg.kind,
+            group,
         });
         if self.state.toasts.len() > MAX_TOASTS {
             self.state.toasts.remove(0);
@@ -361,21 +367,28 @@ impl Shell {
                     self.pending
                         .push(Box::pin(async move { Done::Core(token, fut.await) }));
                 }
-                Effect::Toast(text, kind) => self.status(StatusMessage {
-                    text,
-                    kind: match kind {
-                        ToastKind::Info => StatusKind::Info,
-                        ToastKind::Success => StatusKind::Success,
-                        ToastKind::Warning => StatusKind::Warning,
-                        ToastKind::Error => StatusKind::Error,
+                Effect::Toast {
+                    message,
+                    kind,
+                    group,
+                } => self.push_toast(
+                    StatusMessage {
+                        text: message,
+                        kind: match kind {
+                            ToastKind::Info => StatusKind::Info,
+                            ToastKind::Success => StatusKind::Success,
+                            ToastKind::Warning => StatusKind::Warning,
+                            ToastKind::Error => StatusKind::Error,
+                        },
                     },
-                }),
+                    group,
+                ),
                 Effect::WriteClipboard(text) => {
                     // The core already emits a "copied N bytes" success toast alongside
                     // this effect (see update.rs CopyDone handler), so only report failures
                     // here to avoid a duplicate success message.
                     if let Err(e) = clipboard::copy(&mut self.state.clipboard, text) {
-                        self.status(StatusMessage::error(format!("copy failed: {e}")));
+                        self.status(StatusMessage::error(format!("Copy failed: {e}")));
                     }
                 }
                 Effect::ReadClipboard(kind) => {
@@ -478,7 +491,7 @@ impl Shell {
                 // Diff view rides the subscribe params, so there's nothing to re-apply here.
             }
             Done::Subscribed(_, Err(e)) => {
-                self.status(StatusMessage::error(format!("subscribe failed: {e}")))
+                self.status(StatusMessage::error(format!("Subscribe failed: {e}")))
             }
             Done::Window(Ok(res)) => {
                 self.fetch_in_flight = false;
@@ -502,7 +515,7 @@ impl Shell {
                 // the call landed. The pending newer subscribe reveals the cursor afresh, so
                 // this is expected churn, not a failure worth surfacing.
                 if e.code != aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND.code() {
-                    self.status(StatusMessage::error(format!("viewport update failed: {e}")));
+                    self.status(StatusMessage::error(format!("Viewport update failed: {e}")));
                 }
             }
             Done::Blame {
@@ -590,9 +603,9 @@ impl Shell {
                             let text = h.body.to_plain_text();
                             match clipboard::copy(&mut self.state.clipboard, text) {
                                 Ok(()) => self
-                                    .status(StatusMessage::success("copied popover".to_string())),
+                                    .status(StatusMessage::success("Copied popover".to_string())),
                                 Err(e) => {
-                                    self.status(StatusMessage::error(format!("copy failed: {e}")))
+                                    self.status(StatusMessage::error(format!("Copy failed: {e}")))
                                 }
                             }
                         }

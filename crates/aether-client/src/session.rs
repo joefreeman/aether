@@ -522,6 +522,18 @@ pub struct Session {
     /// restored to the same content afterwards. Set by [`Session::capture_scroll_anchor`] and
     /// consumed by [`Session::resolve_scroll_anchor`]. See [`crate::grid::ScrollAnchor`].
     relayout_anchor: Option<crate::grid::ScrollAnchor>,
+    /// LSP servers (by [`lsp_toast_group`] key) we've asked to restart and are awaiting the
+    /// `Ready`/`Crashed` outcome for. Gates the in-place "restarting → ready" toast so an ordinary
+    /// busy→idle `lsp/status_changed` blip doesn't spuriously toast. See the `LspStatusChanged`
+    /// handler in [`crate::update`].
+    pub(crate) lsp_restart_pending: std::collections::HashSet<String>,
+}
+
+/// The toast group key identifying one LSP *server instance* — `language` + its `workspace_root`,
+/// the same identity halves the picker and status pushes carry. Keeps each server's lifecycle toast
+/// separate (restarting two servers shows two toasts, each updating in place).
+pub fn lsp_toast_group(language: &str, workspace_root: &str) -> String {
+    format!("lsp:{language}:{workspace_root}")
 }
 
 /// Tab stop width used for all cell math (mirrors the value the shells pass to the server on
@@ -563,6 +575,7 @@ impl Session {
             app_settings: None,
             conn: ConnState::Connected,
             relayout_anchor: None,
+            lsp_restart_pending: std::collections::HashSet::new(),
         }
     }
 

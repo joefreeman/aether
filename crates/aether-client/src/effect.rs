@@ -56,8 +56,17 @@ pub enum Effect {
         method: &'static str,
         params: serde_json::Value,
     },
-    /// Show a transient message (display duration and styling are the shell's).
-    Toast(String, ToastKind),
+    /// Show a transient message (display duration and styling are the shell's). When `group` is
+    /// set, the shell replaces any existing toast carrying the same key — refreshing its lifetime —
+    /// instead of stacking a new one, so a status that evolves (an LSP server's "Restarting" →
+    /// "ready", the diff toggle, the reconnect lifecycle) updates a single toast in place. `None`
+    /// (the default, via [`Effects::toast`]/[`Effects::error`]) always stacks a fresh toast — the
+    /// right behaviour for discrete confirmations (saves, copies, deletes).
+    Toast {
+        message: String,
+        kind: ToastKind,
+        group: Option<String>,
+    },
     /// Put text on the system clipboard.
     WriteClipboard(String),
     /// Scroll so the cursor is on-screen — geometry, so the shell owns the how (pixel
@@ -128,7 +137,26 @@ impl Effects {
     }
 
     pub fn toast(message: impl Into<String>, kind: ToastKind) -> Self {
-        Effects::one(Effect::Toast(message.into(), kind))
+        Effects::one(Effect::Toast {
+            message: message.into(),
+            kind,
+            group: None,
+        })
+    }
+
+    /// A toast that *replaces* any existing toast sharing `group` (see [`Effect::Toast`]). Use for a
+    /// status that should update one toast in place rather than stack — keyed so distinct subjects
+    /// (e.g. two LSP servers) still get their own toast.
+    pub fn toast_grouped(
+        message: impl Into<String>,
+        kind: ToastKind,
+        group: impl Into<String>,
+    ) -> Self {
+        Effects::one(Effect::Toast {
+            message: message.into(),
+            kind,
+            group: Some(group.into()),
+        })
     }
 
     pub fn error(message: impl Into<String>) -> Self {

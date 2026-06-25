@@ -537,8 +537,12 @@ fn effect_value(e: Effect) -> Value {
             method,
             params,
         } => json!({ "tag": "Request", "token": token, "method": method, "params": params }),
-        Effect::Toast(message, kind) => {
-            json!({ "tag": "Toast", "message": message, "level": toast_level(kind) })
+        Effect::Toast {
+            message,
+            kind,
+            group,
+        } => {
+            json!({ "tag": "Toast", "message": message, "level": toast_level(kind), "group": group })
         }
         Effect::WriteClipboard(text) => json!({ "tag": "WriteClipboard", "text": text }),
         Effect::ReadClipboard(paste) => {
@@ -762,9 +766,14 @@ mod tests {
         let reveal = effect_value(Effect::RevealCursor(RevealStyle::Jump));
         assert_eq!(reveal["tag"], "RevealCursor");
         assert_eq!(reveal["style"], "jump");
-        let toast = effect_value(Effect::Toast("hi".into(), ToastKind::Error));
+        let toast = effect_value(Effect::Toast {
+            message: "hi".into(),
+            kind: ToastKind::Error,
+            group: Some("connection".into()),
+        });
         assert_eq!(toast["tag"], "Toast");
         assert_eq!(toast["level"], "error");
+        assert_eq!(toast["group"], "connection");
         let req = effect_value(Effect::Request {
             token: 7,
             method: "cursor/move",

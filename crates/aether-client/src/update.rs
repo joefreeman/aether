@@ -338,7 +338,7 @@ impl Session {
                 let mut fx = if r.applied {
                     Effects::none()
                 } else {
-                    Effects::toast("nothing to undo/redo", ToastKind::Info)
+                    Effects::toast("Nothing to undo or redo", ToastKind::Info)
                 };
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
@@ -347,26 +347,26 @@ impl Session {
 
             Event::CopyDone(Ok(r)) => {
                 let mut fx =
-                    Effects::toast(format!("copied {} bytes", r.text.len()), ToastKind::Success);
+                    Effects::toast(format!("Copied {} bytes", r.text.len()), ToastKind::Success);
                 fx.push(Effect::WriteClipboard(r.text));
                 fx
             }
-            Event::CopyDone(Err(e)) => Effects::error(format!("copy failed: {e}")),
+            Event::CopyDone(Err(e)) => Effects::error(format!("Copy failed: {e}")),
 
             Event::CutDone(Ok(r)) => {
                 self.buffer.revision = r.revision;
                 self.buffer.cursor = r.cursor;
                 let mut fx =
-                    Effects::toast(format!("cut {} bytes", r.text.len()), ToastKind::Success);
+                    Effects::toast(format!("Cut {} bytes", r.text.len()), ToastKind::Success);
                 fx.push(Effect::WriteClipboard(r.text));
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
             }
-            Event::CutDone(Err(e)) => Effects::error(format!("cut failed: {e}")),
+            Event::CutDone(Err(e)) => Effects::error(format!("Cut failed: {e}")),
 
             Event::ClipboardRead(kind, text) => {
                 let Some(text) = text.filter(|t| !t.is_empty()) else {
-                    return Effects::error("clipboard is empty");
+                    return Effects::error("Clipboard is empty");
                 };
                 self.paste(kind, text)
             }
@@ -386,7 +386,7 @@ impl Session {
                 )
             }
             Event::EphemeralClosed(Ok(None)) => self.leave_ephemeral_project(),
-            Event::EphemeralClosed(Err(e)) => Effects::error(format!("close failed: {e}")),
+            Event::EphemeralClosed(Err(e)) => Effects::error(format!("Close failed: {e}")),
 
             Event::SwitchedPrimed(Ok(Some((query, options, open)))) => {
                 // Grab the primed summary before `open` is consumed: the equivalent
@@ -405,7 +405,7 @@ impl Session {
                 self.push_history(query);
                 fx
             }
-            Event::SwitchedPrimed(Ok(None)) => Effects::toast("no more grep hits", ToastKind::Info),
+            Event::SwitchedPrimed(Ok(None)) => Effects::toast("No more grep hits", ToastKind::Info),
             Event::SwitchedPrimed(Err(e)) => Effects::error(e),
 
             Event::PromptAccept => self.accept_prompt(),
@@ -432,7 +432,7 @@ impl Session {
                     truncated: false,
                     current_index: 0,
                 });
-                Effects::toast("invalid regex", ToastKind::Warning)
+                Effects::toast("Invalid regex", ToastKind::Warning)
                     .and(self.revert_to_snapshot_cursor())
             }
 
@@ -476,9 +476,9 @@ impl Session {
                 Ok(NavStepResult { target: Some(open) }) => self.adopt_navigation(open),
                 Ok(_) => Effects::toast(
                     if forward {
-                        "no later location in history"
+                        "No later location in history"
                     } else {
-                        "no earlier location in history"
+                        "No earlier location in history"
                     },
                     ToastKind::Info,
                 ),
@@ -506,7 +506,7 @@ impl Session {
             },
             Event::Definition(Err(e)) => Effects::error(e),
 
-            Event::DiagNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "no more diagnostics"),
+            Event::DiagNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "No more diagnostics"),
             Event::DiagNav(Err(e)) => Effects::error(e),
 
             Event::HoverInfo(Ok(r)) => match r.contents {
@@ -526,23 +526,27 @@ impl Session {
                 None => {
                     let msg = lsp_readiness_message(r.readiness).unwrap_or("No hover info");
                     let mut fx = Effects::one(Effect::DismissHover);
-                    fx.push(Effect::Toast(msg.into(), ToastKind::Info));
+                    fx.push(Effect::Toast {
+                        message: msg.into(),
+                        kind: ToastKind::Info,
+                        group: None,
+                    });
                     fx
                 }
             },
-            Event::HoverInfo(Err(e)) => Effects::error(format!("hover failed: {e}")),
+            Event::HoverInfo(Err(e)) => Effects::error(format!("Hover failed: {e}")),
 
             Event::FormatDone(Ok(r)) => {
                 self.buffer.cursor = r.cursor;
                 // Specific feedback per outcome — "nothing happened" has several causes.
                 let note = match r.status {
                     FormatStatus::Applied => None,
-                    FormatStatus::NoChange => Some("already formatted".to_string()),
-                    FormatStatus::NotReady => Some("language server still starting".to_string()),
-                    FormatStatus::Unavailable => Some("language server unavailable".to_string()),
+                    FormatStatus::NoChange => Some("Already formatted".to_string()),
+                    FormatStatus::NotReady => Some("Language server still starting".to_string()),
+                    FormatStatus::Unavailable => Some("Language server unavailable".to_string()),
                     FormatStatus::Unsupported => Some(match self.buffer.language.as_deref() {
-                        Some(lang) => format!("no formatter for {lang}"),
-                        None => "no formatter for this file".to_string(),
+                        Some(lang) => format!("No formatter for {lang}"),
+                        None => "No formatter for this file".to_string(),
                     }),
                 };
                 let mut fx = match note {
@@ -552,7 +556,7 @@ impl Session {
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
             }
-            Event::FormatDone(Err(e)) => Effects::error(format!("format failed: {e}")),
+            Event::FormatDone(Err(e)) => Effects::error(format!("Format failed: {e}")),
 
             Event::CommitLookup(Ok(CommitDetails::Info(info))) => {
                 // Mirror `git show`'s header: commit / Author / Date, blank line, message.
@@ -568,7 +572,7 @@ impl Session {
             Event::CommitLookup(Ok(CommitDetails::Note(note))) => {
                 Effects::toast(note, ToastKind::Info)
             }
-            Event::CommitLookup(Err(e)) => Effects::error(format!("commit info failed: {e}")),
+            Event::CommitLookup(Err(e)) => Effects::error(format!("Commit info failed: {e}")),
 
             Event::BlameLine {
                 buffer_id,
@@ -581,28 +585,28 @@ impl Session {
                 Effects::none()
             }
 
-            Event::HunkNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "no more changes"),
+            Event::HunkNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "No more changes"),
             Event::HunkNav(Err(e)) => Effects::error(e),
 
             Event::HunkApplied { action, result } => match result {
                 Ok(r) => {
                     self.buffer.cursor = r.cursor;
                     let (msg, kind) = match r.status {
-                        ApplyHunkStatus::Staged => ("staged change", ToastKind::Success),
-                        ApplyHunkStatus::Unstaged => ("unstaged change", ToastKind::Success),
-                        ApplyHunkStatus::Reverted => ("reverted change", ToastKind::Success),
+                        ApplyHunkStatus::Staged => ("Staged change", ToastKind::Success),
+                        ApplyHunkStatus::Unstaged => ("Unstaged change", ToastKind::Success),
+                        ApplyHunkStatus::Reverted => ("Reverted change", ToastKind::Success),
                         ApplyHunkStatus::NoChange => (
                             match action {
-                                HunkAction::Toggle => "no change here",
-                                HunkAction::Revert => "no change to revert here",
+                                HunkAction::Toggle => "No change here",
+                                HunkAction::Revert => "No change to revert here",
                             },
                             ToastKind::Info,
                         ),
                         ApplyHunkStatus::DirtyBuffer => {
-                            ("unsaved changes — save first", ToastKind::Warning)
+                            ("Unsaved changes — save first", ToastKind::Warning)
                         }
                         ApplyHunkStatus::Unavailable => {
-                            ("not in a git repository", ToastKind::Info)
+                            ("Not in a git repository", ToastKind::Info)
                         }
                     };
                     Effects::toast(msg, kind)
@@ -615,10 +619,12 @@ impl Session {
                     self.diff_view = enabled;
                     self.window = Some(r.window);
                     let mut fx = Effects::one(Effect::WindowAdopted);
-                    fx.push(Effect::Toast(
-                        format!("diff: {}", if enabled { "on" } else { "off" }),
-                        ToastKind::Info,
-                    ));
+                    // Grouped so repeated toggling updates one toast in place rather than stacking.
+                    fx.push(Effect::Toast {
+                        message: format!("Diff {}", if enabled { "on" } else { "off" }),
+                        kind: ToastKind::Info,
+                        group: Some("diff".into()),
+                    });
                     fx
                 }
                 Err(e) => Effects::error(e),
@@ -678,7 +684,7 @@ impl Session {
                 }
                 Err(e) => {
                     self.picker = None;
-                    Effects::error(format!("picker failed: {e}"))
+                    Effects::error(format!("Picker failed: {e}"))
                 }
             },
 
@@ -728,7 +734,7 @@ impl Session {
                 }
             },
             Event::PickerSelected { result: Err(e), .. } => {
-                Effects::error(format!("select failed: {e}"))
+                Effects::error(format!("Select failed: {e}"))
             }
 
             Event::ProjectActivated(Ok((project, open))) => {
@@ -741,7 +747,7 @@ impl Session {
                 self.adopt_switch(open)
             }
             Event::ProjectActivated(Err(e)) => {
-                Effects::error(format!("project switch failed: {e}"))
+                Effects::error(format!("Project switch failed: {e}"))
             }
 
             Event::ProjectCreated(Ok(activate)) => {
@@ -761,10 +767,11 @@ impl Session {
                         Event::Switched(__r.map_err(|e| e.to_string()))
                     }),
                 };
-                fx.push(Effect::Toast(
-                    format!("created project {}", project.name),
-                    ToastKind::Success,
-                ));
+                fx.push(Effect::Toast {
+                    message: format!("Created project {}", project.name),
+                    kind: ToastKind::Success,
+                    group: None,
+                });
                 // The natural next step for a freshly created (rootless) project is adding a root,
                 // so — unlike the default open, which focuses the name field — land on the add-root
                 // input here.
@@ -774,7 +781,7 @@ impl Session {
                 }
                 fx
             }
-            Event::ProjectCreated(Err(e)) => Effects::error(format!("create project failed: {e}")),
+            Event::ProjectCreated(Err(e)) => Effects::error(format!("Create project failed: {e}")),
 
             Event::ProjectRenamed(result) => {
                 let Some(s) = self.project_settings.as_mut() else {
@@ -789,7 +796,7 @@ impl Session {
                         s.project_name = info.name.clone();
                         s.name.set(info.name);
                         s.error = None;
-                        Effects::toast(format!("renamed project to {new_name}"), ToastKind::Success)
+                        Effects::toast(format!("Renamed project to {new_name}"), ToastKind::Success)
                     }
                     Err(e) => {
                         s.error = Some(e);
@@ -809,7 +816,7 @@ impl Session {
                             // Re-focus the add-root input (now one row further down).
                             s.selected = s.input_index();
                         }
-                        Effects::toast(format!("added root to {name}"), ToastKind::Success)
+                        Effects::toast(format!("Added root to {name}"), ToastKind::Success)
                     }
                     Err(e) => {
                         if let Some(s) = self.project_settings.as_mut() {
@@ -832,10 +839,10 @@ impl Session {
                     }
                     let mut fx = Effects::toast(
                         if closed.is_empty() {
-                            format!("removed root from {name}")
+                            format!("Removed root from {name}")
                         } else {
                             format!(
-                                "removed root from {name}; closed {} buffer(s)",
+                                "Removed root from {name}; closed {} buffer(s)",
                                 closed.len()
                             )
                         },
@@ -859,14 +866,14 @@ impl Session {
                         s.error = Some(e);
                         Effects::none()
                     } else {
-                        Effects::error(format!("remove root failed: {e}"))
+                        Effects::error(format!("Remove root failed: {e}"))
                     }
                 }
             },
             Event::ProjectDeleted(result) => match result {
                 // The switcher stays open; the refreshed list (sans the deleted row) arrives as a
                 // `picker/update` push from the server's `refresh_project_pickers`.
-                Ok(()) => Effects::toast("deleted project", ToastKind::Success),
+                Ok(()) => Effects::toast("Deleted project", ToastKind::Success),
                 // Covers the active-project and dirty-buffer refusals — the server messages are
                 // already user-facing.
                 Err(e) => Effects::error(e),
@@ -899,7 +906,7 @@ impl Session {
 
             Event::AppSettingsSaved(result) => match result {
                 Ok(_) => Effects::none(),
-                Err(e) => Effects::error(format!("couldn't save settings: {e}")),
+                Err(e) => Effects::error(format!("Couldn't save settings: {e}")),
             },
 
             Event::PickerChipListing { abs, result } => {
@@ -971,14 +978,14 @@ impl Session {
                     },
                 )
             }
-            Event::SectionJumped(Err(e)) => Effects::error(format!("file jump failed: {e}")),
+            Event::SectionJumped(Err(e)) => Effects::error(format!("File jump failed: {e}")),
 
             Event::PathDeleted { noun, result } => match result {
-                Err(e) => Effects::error(format!("delete failed: {e}")),
+                Err(e) => Effects::error(format!("Delete failed: {e}")),
                 Ok(_) => {
                     // Any close of *our* buffer rides the `buffer/closed` push (it switches us
                     // to the server's successor). Here we just confirm and re-list the picker.
-                    let mut fx = Effects::toast(format!("trashed {noun}"), ToastKind::Success);
+                    let mut fx = Effects::toast(format!("Trashed {noun}"), ToastKind::Success);
                     if let Some(kind) = self.picker.as_ref().map(|p| p.kind) {
                         if kind == PickerKind::Explorer {
                             // Re-list the current directory but keep the query — re-running it
@@ -993,19 +1000,21 @@ impl Session {
                 }
             },
             Event::KeepToggled(result) => match result {
-                Err(e) => Effects::error(format!("keep toggle failed: {e}")),
-                Ok(transient) => Effects::toast(
+                Err(e) => Effects::error(format!("Keep toggle failed: {e}")),
+                // Grouped: toggling keep/release updates one toast rather than stacking a pair.
+                Ok(transient) => Effects::toast_grouped(
                     if transient {
-                        "buffer released"
+                        "Buffer released"
                     } else {
-                        "buffer kept"
+                        "Buffer kept"
                     },
                     ToastKind::Success,
+                    "transient",
                 ),
             },
-            Event::DirCreated(Err(e)) => Effects::error(format!("create directory failed: {e}")),
+            Event::DirCreated(Err(e)) => Effects::error(format!("Create directory failed: {e}")),
             Event::DirCreated(Ok(r)) => {
-                let mut fx = Effects::toast(format!("created {}", r.path), ToastKind::Success);
+                let mut fx = Effects::toast(format!("Created {}", r.path), ToastKind::Success);
                 // Step into the new directory so the user can keep creating inside it.
                 fx = fx.and(self.explorer_navigate(Some(r.path), false, None));
                 fx
@@ -1030,8 +1039,12 @@ impl Session {
                 // it) — the user re-enters insert deliberately.
                 self.mode = Mode::Normal;
                 tracing::warn!(buffer = %self.buffer.label, "connection lost; reconnecting");
-                let mut fx =
-                    Effects::toast("server disconnected — reconnecting…", ToastKind::Warning);
+                // Grouped "connection": the matching "Reconnected" toast replaces this one in place.
+                let mut fx = Effects::toast_grouped(
+                    "Server disconnected — reconnecting…",
+                    ToastKind::Warning,
+                    "connection",
+                );
                 fx.push(Effect::Reconnect { attempt: 0 });
                 fx
             }
@@ -1045,7 +1058,11 @@ impl Session {
             }
             Event::ReconnectFatal(e) => {
                 self.conn = ConnState::Failed;
-                Effects::error(format!("reconnect failed: {e}"))
+                Effects::toast_grouped(
+                    format!("Reconnect failed: {e}"),
+                    ToastKind::Error,
+                    "connection",
+                )
             }
             Event::Reestablished {
                 project,
@@ -1107,12 +1124,18 @@ impl Session {
                     ));
                 }
                 fx.push(if restarted && had_unsaved {
-                    Effect::Toast(
-                        "reconnected — the server restarted, unsaved changes were lost".into(),
-                        ToastKind::Warning,
-                    )
+                    Effect::Toast {
+                        message: "Reconnected — the server restarted, unsaved changes were lost"
+                            .into(),
+                        kind: ToastKind::Warning,
+                        group: Some("connection".into()),
+                    }
                 } else {
-                    Effect::Toast("reconnected".into(), ToastKind::Success)
+                    Effect::Toast {
+                        message: "Reconnected".into(),
+                        kind: ToastKind::Success,
+                        group: Some("connection".into()),
+                    }
                 });
                 fx
             }
@@ -1131,9 +1154,9 @@ impl Session {
                         self.buffer.path =
                             root.map(|r| format!("{}/{rel}", r.trim_end_matches('/')));
                         self.buffer.label = rel.clone();
-                        format!("saved as {rel} (rev {})", result.revision)
+                        format!("Saved as {rel} (rev {})", result.revision)
                     }
-                    None => format!("saved (rev {})", result.revision),
+                    None => format!("Saved (rev {})", result.revision),
                 };
                 Effects::toast(note, ToastKind::Success)
             }
@@ -1141,7 +1164,7 @@ impl Session {
                 self.prompt = Some(Prompt::Confirm { kind, action });
                 Effects::none()
             }
-            Event::SaveTried(Err(e)) => Effects::error(format!("save failed: {e}")),
+            Event::SaveTried(Err(e)) => Effects::error(format!("Save failed: {e}")),
 
             Event::ReloadTried(Ok(ReloadTry::Reloaded(r))) => {
                 self.buffer.revision = r.revision;
@@ -1149,7 +1172,7 @@ impl Session {
                 self.buffer.transient = false; // reloading promotes, like save
                 self.externally_modified = false;
                 self.externally_deleted = false;
-                Effects::toast(format!("reloaded (rev {})", r.revision), ToastKind::Success)
+                Effects::toast(format!("Reloaded (rev {})", r.revision), ToastKind::Success)
             }
             Event::ReloadTried(Ok(ReloadTry::NeedsConfirm)) => {
                 self.prompt = Some(Prompt::Confirm {
@@ -1158,7 +1181,7 @@ impl Session {
                 });
                 Effects::none()
             }
-            Event::ReloadTried(Err(e)) => Effects::error(format!("reload failed: {e}")),
+            Event::ReloadTried(Err(e)) => Effects::error(format!("Reload failed: {e}")),
         }
     }
 
@@ -1502,20 +1525,22 @@ impl Session {
     /// buffers have no path, so it warns instead.
     fn copy_buffer_path(&mut self, absolute: bool) -> Effects {
         let Some(path) = self.buffer.path.as_deref() else {
-            return Effects::toast("scratch buffer has no path", ToastKind::Warning);
+            return Effects::toast("Scratch buffer has no path", ToastKind::Warning);
         };
         let text = if absolute {
             path.to_string()
         } else {
             label_for_path(path, &self.project_paths)
         };
-        let mut fx = Effects::toast(
+        // Grouped: copying again (absolute vs relative) updates one toast rather than stacking.
+        let mut fx = Effects::toast_grouped(
             if absolute {
-                "copied absolute path"
+                "Copied absolute path"
             } else {
-                "copied relative path"
+                "Copied relative path"
             },
             ToastKind::Success,
+            "copy-path",
         );
         fx.push(Effect::WriteClipboard(text));
         fx
@@ -1584,6 +1609,20 @@ impl Session {
     /// **Enter included** — declines, honouring the capital `N` in the rendered `[y/N]`. Every
     /// confirm we raise is destructive (overwrite / discard / delete / remove), so the safe option
     /// is the default and Enter never silently destroys. Save-as routes to its own editor.
+    /// Mark an LSP server (by its [`lsp_toast_group`](crate::session::lsp_toast_group) key) as
+    /// awaiting a restart and build the in-place "Restarting" toast. The matching `lsp/status_changed`
+    /// Ready/Crashed push resolves it (see the `LspStatusChanged` handler), replacing this toast via
+    /// the shared per-instance group key.
+    fn lsp_restarting_toast(&mut self, name: &str, language: &str, workspace_root: &str) -> Effect {
+        let group = crate::session::lsp_toast_group(language, workspace_root);
+        self.lsp_restart_pending.insert(group.clone());
+        Effect::Toast {
+            message: format!("Restarting {name}"),
+            kind: ToastKind::Info,
+            group: Some(group),
+        }
+    }
+
     pub fn on_prompt_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         let Some(prompt) = self.prompt.take() else {
             return Effects::none();
@@ -1613,9 +1652,10 @@ impl Session {
                             Event::Noop
                         },
                     );
-                    fx.push(Effect::Toast(
-                        format!("restarting {}", info.name),
-                        ToastKind::Info,
+                    fx.push(self.lsp_restarting_toast(
+                        &info.name,
+                        &info.language,
+                        &info.workspace_root,
                     ));
                     // Keep the dialog open so the user can watch the lifecycle — show `Restarting`
                     // at once, then the server's `lsp/status_changed` pushes refresh it through to
@@ -1687,10 +1727,11 @@ impl Session {
             .unwrap_or_default();
         if diags.is_empty() {
             let mut fx = Effects::one(Effect::DismissHover);
-            fx.push(Effect::Toast(
-                "No diagnostics on this line".into(),
-                ToastKind::Info,
-            ));
+            fx.push(Effect::Toast {
+                message: "No diagnostics on this line".into(),
+                kind: ToastKind::Info,
+                group: None,
+            });
             return fx;
         }
         Effects::one(Effect::ShowHover(HoverText::Blocks(
@@ -2872,17 +2913,26 @@ impl Session {
             }
             // LspServers: Ctrl-r restarts the highlighted server in place.
             KeyCode::Char('r') if mods.ctrl && !mods.alt && p.kind == PickerKind::LspServers => {
-                if let Some(PickerItem::LspServer { name, language, .. }) = p.selected_item() {
-                    let (name, language) = (name.clone(), language.clone());
+                if let Some(PickerItem::LspServer {
+                    name,
+                    language,
+                    workspace_root,
+                    ..
+                }) = p.selected_item()
+                {
+                    let (name, language, workspace_root) =
+                        (name.clone(), language.clone(), workspace_root.clone());
 
                     let mut fx = self.request::<LspRestartServer>(
-                        LspRestartServerParams { language },
+                        LspRestartServerParams {
+                            language: language.clone(),
+                        },
                         move |__r| {
                             let _ = __r;
                             Event::Noop
                         },
                     );
-                    fx.push(Effect::Toast(format!("restarting {name}"), ToastKind::Info));
+                    fx.push(self.lsp_restarting_toast(&name, &language, &workspace_root));
                     return fx;
                 }
                 return Effects::none();
@@ -3311,15 +3361,20 @@ impl Session {
                 let was_external = self.externally_modified || self.externally_deleted;
                 self.externally_modified = p.externally_modified;
                 self.externally_deleted = p.externally_deleted;
+                // Grouped per buffer: a deleted-then-modified (or repeated) disk event updates the
+                // one external-change toast rather than stacking.
+                let group = format!("external-change:{}", self.buffer.buffer_id);
                 if !was_external && p.externally_deleted {
-                    Effects::toast(
-                        "file removed on disk — save to recreate, or close",
+                    Effects::toast_grouped(
+                        "File removed on disk — save to recreate, or close",
                         ToastKind::Warning,
+                        group,
                     )
                 } else if !was_external && p.externally_modified {
-                    Effects::toast(
-                        "file changed on disk — save to overwrite, or reload",
+                    Effects::toast_grouped(
+                        "File changed on disk — save to overwrite, or reload",
                         ToastKind::Warning,
+                        group,
                     )
                 } else {
                     Effects::none()
@@ -3374,26 +3429,56 @@ impl Session {
                 Effects::none()
             }
             LspStatusChanged::NAME => {
-                if let Ok(s) = serde_json::from_value::<LspServerStatus>(n.params) {
-                    let matches_current = self.buffer.lsp_server.as_ref().is_some_and(|r| {
-                        r.language == s.language && r.workspace_root == s.workspace_root
-                    });
-                    // Live-update an open LSP info dialog for the same server, so a restart's
-                    // Restarting → Ready transition shows in place without reopening it.
-                    let matches_dialog = matches!(
-                        self.prompt.as_ref(),
-                        Some(Prompt::LspInfo(info))
-                            if info.language == s.language
-                                && info.workspace_root == s.workspace_root
-                    );
-                    if matches_dialog {
-                        self.prompt = Some(Prompt::LspInfo(Box::new(s.clone())));
-                    }
-                    if matches_current {
-                        self.lsp = Some(s);
-                    }
+                let Ok(s) = serde_json::from_value::<LspServerStatus>(n.params) else {
+                    return Effects::none();
+                };
+                let matches_current = self.buffer.lsp_server.as_ref().is_some_and(|r| {
+                    r.language == s.language && r.workspace_root == s.workspace_root
+                });
+                // Live-update an open LSP info dialog for the same server, so a restart's
+                // Restarting → Ready transition shows in place without reopening it.
+                let matches_dialog = matches!(
+                    self.prompt.as_ref(),
+                    Some(Prompt::LspInfo(info))
+                        if info.language == s.language
+                            && info.workspace_root == s.workspace_root
+                );
+                if matches_dialog {
+                    self.prompt = Some(Prompt::LspInfo(Box::new(s.clone())));
                 }
-                Effects::none()
+                // Resolve a pending restart (issued via `Ctrl-r`): the server reaching a terminal
+                // state ends the lifecycle, so replace its "Restarting" toast in place. Gated on the
+                // pending set so an ordinary busy→idle `status_changed` blip doesn't toast.
+                let group = crate::session::lsp_toast_group(&s.language, &s.workspace_root);
+                let restart_toast = if self.lsp_restart_pending.contains(&group) {
+                    use aether_protocol::lsp::LspStatus;
+                    match &s.status {
+                        LspStatus::Ready => {
+                            self.lsp_restart_pending.remove(&group);
+                            Some(Effect::Toast {
+                                message: format!("{} restarted", s.name),
+                                kind: ToastKind::Success,
+                                group: Some(group.clone()),
+                            })
+                        }
+                        LspStatus::Crashed { .. } | LspStatus::Stopped => {
+                            self.lsp_restart_pending.remove(&group);
+                            Some(Effect::Toast {
+                                message: format!("{} failed to restart", s.name),
+                                kind: ToastKind::Error,
+                                group: Some(group.clone()),
+                            })
+                        }
+                        // Starting / Initializing / Restarting: still in flight — keep waiting.
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if matches_current {
+                    self.lsp = Some(s);
+                }
+                restart_toast.map_or_else(Effects::none, Effects::one)
             }
             BufferClosed::NAME => {
                 // Another client (or a path/project deletion) closed a buffer; if it's ours,
@@ -3404,7 +3489,7 @@ impl Session {
                 if p.buffer_id != self.buffer.buffer_id {
                     return Effects::none();
                 }
-                let fx = Effects::toast("buffer closed by another client", ToastKind::Warning);
+                let fx = Effects::toast("Buffer closed by another client", ToastKind::Warning);
 
                 // In an ephemeral context, don't fall back to a fresh scratch when nothing remains
                 // — leave the context, same as closing it ourselves (see `close_buffer`). This is
@@ -3444,7 +3529,7 @@ impl Session {
                     }
                 }
                 Effects::toast(
-                    format!("project renamed to {}", p.new_name),
+                    format!("Project renamed to {}", p.new_name),
                     ToastKind::Info,
                 )
             }
@@ -3456,10 +3541,11 @@ impl Session {
                     return Effects::none();
                 };
                 let mut fx = self.apply_app_settings(settings);
-                fx.push(Effect::Toast(
-                    "settings updated".to_string(),
-                    ToastKind::Info,
-                ));
+                fx.push(Effect::Toast {
+                    message: "Settings updated".to_string(),
+                    kind: ToastKind::Info,
+                    group: None,
+                });
                 fx
             }
             _ => Effects::none(),
@@ -3804,7 +3890,7 @@ impl Session {
                     return Effects::none();
                 };
                 if name == &self.project {
-                    return Effects::error("can't delete the active project — switch away first");
+                    return Effects::error("Can't delete the active project — switch away first");
                 }
                 let name = name.clone();
                 self.prompt = Some(Prompt::Confirm {
@@ -3938,13 +4024,13 @@ impl Session {
             None => (q, false),
         };
         if base.is_empty() {
-            return Effects::error("type a name to create");
+            return Effects::error("Type a name to create");
         }
         if base
             .split('/')
             .any(|seg| seg.is_empty() || seg == "." || seg == "..")
         {
-            return Effects::error("invalid name");
+            return Effects::error("Invalid name");
         }
         let abs = format!("{}/{base}", dir.trim_end_matches('/'));
         if is_dir {
@@ -3956,7 +4042,7 @@ impl Session {
         // File: address it under a project root, then open with create-on-save.
         let Some((path_index, relative_path)) = strip_longest_root(&abs, &self.project_paths)
         else {
-            return Effects::error("path is outside the project's roots");
+            return Effects::error("Path is outside the project's roots");
         };
         let from = self.buffer.buffer_id;
         self.request_str::<BufferOpen>(
@@ -3984,10 +4070,10 @@ impl Session {
             p.query.trim().to_string()
         };
         if name.is_empty() {
-            return Effects::error("type a name to create");
+            return Effects::error("Type a name to create");
         }
         if name.contains('/') || name.contains('\\') {
-            return Effects::error("project name can't contain path separators");
+            return Effects::error("Project name can't contain path separators");
         }
         // Drop the picker first — the create both activates the project and (when it has no roots)
         // opens the settings overlay, so the picker shouldn't linger underneath.
@@ -4844,7 +4930,7 @@ impl Session {
                 A::EnterInsert(_) | A::OpenLineBelow | A::OpenLineAbove | A::Change
             )
         {
-            return Effects::toast("not connected — editing unavailable", ToastKind::Info);
+            return Effects::toast("Not connected — editing unavailable", ToastKind::Info);
         }
         match action {
             // ---- motions ----
@@ -5214,7 +5300,7 @@ impl Session {
             A::Reload => {
                 if self.buffer.path.is_none() {
                     return Effects::toast(
-                        "scratch buffer has no path to reload",
+                        "Scratch buffer has no path to reload",
                         ToastKind::Warning,
                     );
                 }

@@ -147,6 +147,9 @@ pub struct Toast {
     pub id: u64,
     pub text: String,
     pub kind: StatusKind,
+    /// Replacement key (see [`aether_client::effect::Effect::Toast`]). A new grouped toast evicts
+    /// any existing toast sharing this key instead of stacking. `None` toasts always stack.
+    pub group: Option<String>,
 }
 
 /// Top-level UI state. Anything that exists regardless of whether a buffer is open lives on

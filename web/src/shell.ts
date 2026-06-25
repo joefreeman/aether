@@ -168,6 +168,8 @@ interface CoreEffect {
   params?: unknown;
   message?: string;
   level?: ToastLevel;
+  /** Toast replacement key: a grouped toast replaces any existing toast with the same key. */
+  group?: string | null;
   text?: string;
   paste?: unknown;
   action?: ShellActionDesc;
@@ -694,6 +696,11 @@ export class Shell {
   private readonly bufferEl: HTMLElement;
   private readonly statusEl: HTMLElement;
   private readonly toastsEl: HTMLElement;
+  /** Live grouped toasts by key → its node and pending timers, so a replacement evicts the old. */
+  private readonly toastGroups = new Map<
+    string,
+    { el: HTMLElement; fade: number; remove: number }
+  >();
   private readonly connBanner: HTMLElement;
   private readonly searchBar: HTMLElement;
   private readonly searchInput: HTMLInputElement;
@@ -1358,7 +1365,7 @@ export class Shell {
             ...(jump ? { jump_to: jump } : {}),
           });
         } catch {
-          this.toast(`could not open ${urlFile}`, "warning");
+          this.toast(`Could not open ${urlFile}`, "warning");
           open = await lastOrScratch();
         }
       } else if (urlBuffer != null) {
@@ -1381,7 +1388,7 @@ export class Shell {
       this.runEffects(this.session.startup() as CoreEffect[]);
       this.capture.focus(); // ensure the menu-suppressing field has focus once we're live
     } catch (e) {
-      this.toast(`bootstrap failed: ${String(e)}`, "error");
+      this.toast(`Bootstrap failed: ${String(e)}`, "error");
     }
   }
 
@@ -1486,7 +1493,7 @@ export class Shell {
       if (ha?.kind === "copy") {
         e.preventDefault();
         void navigator.clipboard?.writeText(this.hoverPlainText()).catch(() => {});
-        this.toast("copied popover", "success");
+        this.toast("Copied popover", "success");
         return;
       }
       if (ha?.kind === "scroll") {
@@ -1674,7 +1681,7 @@ export class Shell {
       this.runEffects(this.session.startup() as CoreEffect[]);
       this.capture.focus();
     } catch (e) {
-      this.toast(`reconnect failed: ${String(e)}`, "error");
+      this.toast(`Reconnect failed: ${String(e)}`, "error");
     }
   }
 
@@ -1688,7 +1695,7 @@ export class Shell {
           this.sendRequest(e.token!, e.method!, e.params);
           break;
         case "Toast":
-          this.toast(e.message ?? "", e.level ?? "info");
+          this.toast(e.message ?? "", e.level ?? "info", e.group ?? undefined);
           break;
         case "RevealCursor":
           void this.ensureCursorVisible(e.style === "jump" ? "jump" : "follow");
@@ -3843,13 +3850,28 @@ export class Shell {
 
   // ---- toasts ---------------------------------------------------------------------------------
 
-  private toast(message: string, kind: ToastLevel = "info"): void {
+  private toast(message: string, kind: ToastLevel = "info", group?: string): void {
+    // A grouped toast replaces any live toast with the same key (cancelling its timers and removing
+    // its node), so an evolving status — LSP restart → ready, the diff toggle — updates one toast in
+    // place rather than stacking. Mirrors the native shells' group replacement.
+    if (group) {
+      const prev = this.toastGroups.get(group);
+      if (prev) {
+        window.clearTimeout(prev.fade);
+        window.clearTimeout(prev.remove);
+        prev.el.remove();
+      }
+    }
     const t = document.createElement("div");
     t.className = `toast ${kind}`;
     t.textContent = message;
     this.toastsEl.append(t);
-    window.setTimeout(() => t.classList.add("fade"), 3000);
-    window.setTimeout(() => t.remove(), 3600);
+    const fade = window.setTimeout(() => t.classList.add("fade"), 3000);
+    const remove = window.setTimeout(() => {
+      t.remove();
+      if (group && this.toastGroups.get(group)?.el === t) this.toastGroups.delete(group);
+    }, 3600);
+    if (group) this.toastGroups.set(group, { el: t, fade, remove });
   }
 }
 

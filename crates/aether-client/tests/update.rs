@@ -39,7 +39,7 @@ fn the_request(fx: &Effects) -> (u64, &'static str, serde_json::Value) {
 
 fn has_error_toast(fx: &Effects) -> bool {
     fx.0.iter()
-        .any(|e| matches!(e, Effect::Toast(_, ToastKind::Error)))
+        .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Error, .. }))
 }
 
 #[test]
@@ -1149,6 +1149,93 @@ fn lsp_info_restart_is_ctrl_r_not_plain_r() {
     }
 }
 
+/// The `(message, group)` of the first toast in `fx`, if any.
+fn first_toast(fx: &Effects) -> Option<(String, Option<String>)> {
+    fx.0.iter().find_map(|e| match e {
+        Effect::Toast { message, group, .. } => Some((message.clone(), group.clone())),
+        _ => None,
+    })
+}
+
+#[test]
+fn lsp_restart_toasts_are_grouped_per_server_and_resolve_to_ready() {
+    use aether_client::session::{lsp_toast_group, Prompt};
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::lsp::{LspServerStatus, LspStatus, LspStatusChanged};
+
+    let status = |st: LspStatus| {
+        Box::new(LspServerStatus {
+            name: "rust-analyzer".into(),
+            language: "rust".into(),
+            workspace_root: "/p".into(),
+            status: st,
+            progress: vec![],
+        })
+    };
+    let push = |st: LspStatus| {
+        Event::ServerPush(Notification {
+            jsonrpc: JsonRpc,
+            method: LspStatusChanged::NAME.into(),
+            params: serde_json::to_value(&*status(st)).unwrap(),
+        })
+    };
+    let group = lsp_toast_group("rust", "/p");
+
+    let mut s = session();
+
+    // A `status_changed` busy→idle blip with no restart pending must NOT toast.
+    let fx = s.on_event(push(LspStatus::Ready));
+    assert!(first_toast(&fx).is_none(), "no toast without a pending restart");
+
+    // Ctrl-r in the LSP info dialog emits a grouped "Restarting" toast keyed to this server.
+    s.prompt = Some(Prompt::LspInfo(status(LspStatus::Ready)));
+    let fx = s.on_key(KeyCode::Char('r'), Mods::CTRL, None, ROWS);
+    assert_eq!(
+        first_toast(&fx),
+        Some(("Restarting rust-analyzer".into(), Some(group.clone()))),
+        "restart shows a grouped Restarting toast"
+    );
+
+    // The server reaching Ready replaces it in place — same group key, "restarted" message.
+    // "restarted" not "ready" because the server's handshake is done but it may still be indexing.
+    let fx = s.on_event(push(LspStatus::Ready));
+    assert_eq!(
+        first_toast(&fx),
+        Some(("rust-analyzer restarted".into(), Some(group.clone()))),
+        "the ready push resolves the pending restart with a same-group toast"
+    );
+
+    // The pending restart is consumed — a later idle blip is silent again.
+    let fx = s.on_event(push(LspStatus::Ready));
+    assert!(first_toast(&fx).is_none(), "restart resolved; no repeat toast");
+}
+
+#[test]
+fn diff_toggle_toast_is_grouped() {
+    use aether_client::update::Event;
+    use aether_protocol::viewport::{Window, ViewportWindowResult};
+    // A diff toggle result carries a window; the toast is grouped "diff" so repeated toggling
+    // updates one toast instead of stacking on/off pairs.
+    let mut s = session();
+    let window = Window {
+        first_logical_line: 0,
+        last_logical_line_exclusive: 0,
+        line_count: 0,
+        max_scroll_logical_line: 0,
+        total_visual_rows: 0,
+        first_visual_row: 0,
+        max_line_width: 0,
+        git_status: None,
+        lines: vec![],
+    };
+    let fx = s.on_event(Event::DiffViewSet {
+        enabled: true,
+        result: Ok(ViewportWindowResult { window }),
+    });
+    assert_eq!(first_toast(&fx), Some(("Diff on".into(), Some("diff".into()))));
+}
+
 #[test]
 fn editing_is_refused_while_disconnected_and_insert_drops_on_disconnect() {
     use aether_client::session::{ConnState, Mode};
@@ -1162,7 +1249,7 @@ fn editing_is_refused_while_disconnected_and_insert_drops_on_disconnect() {
     assert_eq!(s.mode, Mode::Normal, "insert is refused while connecting");
     assert!(
         fx.0.iter()
-            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Info))),
+            .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Info, .. })),
         "a hint explains why nothing happened"
     );
     assert!(
@@ -2080,7 +2167,7 @@ fn projects_delete_confirms_then_deletes_and_guards_active() {
     assert!(s.prompt.is_none(), "active project can't be staged");
     assert!(
         fx.0.iter()
-            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Error))),
+            .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Error, .. })),
         "refusing the active project surfaces an error toast"
     );
 
@@ -2122,7 +2209,7 @@ fn projects_delete_confirms_then_deletes_and_guards_active() {
     let msg =
         fx.0.iter()
             .find_map(|e| match e {
-                Effect::Toast(m, ToastKind::Error) => Some(m.clone()),
+                Effect::Toast { message: m, kind: ToastKind::Error, .. } => Some(m.clone()),
                 _ => None,
             })
             .expect("an error toast");
@@ -2336,7 +2423,7 @@ fn tab_triggers_hover() {
 /// The single Info-toast message in `fx`, if any.
 fn info_toast(fx: &Effects) -> Option<String> {
     fx.0.iter().find_map(|e| match e {
-        Effect::Toast(m, ToastKind::Info) => Some(m.clone()),
+        Effect::Toast { message: m, kind: ToastKind::Info, .. } => Some(m.clone()),
         _ => None,
     })
 }
@@ -2381,7 +2468,7 @@ fn space_j_shows_diagnostic_at_cursor() {
     let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, Some("j".to_string()), ROWS);
     assert!(
         fx.0.iter()
-            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Info))),
+            .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Info, .. })),
         "Space j with no diagnostics toasts an info message"
     );
 }
@@ -2534,7 +2621,7 @@ fn copy_path_warns_for_scratch_buffer() {
     );
     assert!(
         fx.0.iter()
-            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Warning))),
+            .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Warning, .. })),
         "a scratch buffer warns instead"
     );
 }
@@ -2633,7 +2720,7 @@ fn settings_changed_push_applies_wrap_live() {
     assert!(fx
         .0
         .iter()
-        .any(|e| matches!(e, Effect::Toast(_, ToastKind::Info))));
+        .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Info, .. })));
 
     // A push matching the current wrap doesn't reflow (still toasts).
     let mut s = session();
@@ -2822,7 +2909,7 @@ fn project_created_with_no_roots_opens_a_scratch_and_settings() {
     assert_eq!(ps.selected, ps.input_index());
     assert!(
         fx.0.iter()
-            .any(|e| matches!(e, Effect::Toast(_, ToastKind::Success))),
+            .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Success, .. })),
         "a success toast names the new project"
     );
 }

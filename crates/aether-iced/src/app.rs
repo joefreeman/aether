@@ -270,6 +270,9 @@ struct Toast {
     id: u64,
     message: String,
     kind: ToastKind,
+    /// Replacement key (see [`aether_client::effect::Effect::Toast`]). A new grouped toast evicts
+    /// any existing toast sharing this key instead of stacking. `None` toasts always stack.
+    group: Option<String>,
 }
 
 #[derive(Debug)]
@@ -723,7 +726,7 @@ impl App {
                         }
                         Task::none()
                     }
-                    Err(e) => self.error(format!("project list failed: {e}")),
+                    Err(e) => self.error(format!("Project list failed: {e}")),
                 }
             }
             Message::Notified(Some(n)) => {
@@ -752,7 +755,11 @@ impl App {
                     return Task::none();
                 }
                 boot.down = true;
-                let note = self.toast("server disconnected — reconnecting…", ToastKind::Warning);
+                let note = self.toast(
+                    "Server disconnected — reconnecting…",
+                    ToastKind::Warning,
+                    Some("connection".into()),
+                );
                 Task::batch([note, self.boot_reconnect()])
             }
             Message::BootReconnected(Ok(c)) => {
@@ -793,7 +800,7 @@ impl App {
                         })
                     },
                 );
-                let note = self.toast("reconnected", ToastKind::Success);
+                let note = self.toast("Reconnected", ToastKind::Success, Some("connection".into()));
                 Task::batch([pump(c.notifications), view, note])
             }
             Message::BootReconnected(Err(_)) => self.boot_reconnect(),
@@ -830,7 +837,7 @@ impl App {
                 if let Some(boot) = &mut self.boot {
                     boot.opening = false;
                 }
-                self.error(format!("open failed: {e}"))
+                self.error(format!("Open failed: {e}"))
             }
             Message::Core(CoreEvent::PickerClicked(abs)) => {
                 if let Some(boot) = &mut self.boot {
@@ -943,7 +950,7 @@ impl App {
         if boot.picker.selected_is_create() {
             let name = boot.picker.query.trim().to_string();
             if name.is_empty() || name.contains('/') || name.contains('\\') {
-                return self.error("project name can't be empty or contain path separators".into());
+                return self.error("Project name can't be empty or contain path separators".into());
             }
             if let Some(b) = &mut self.boot {
                 b.opening = true;
@@ -1163,8 +1170,9 @@ impl App {
     fn reconnect_to_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
         let chooser = self.enter_boot_chooser(handle, notifications);
         let toast = self.toast(
-            "project no longer exists — pick another",
+            "Project no longer exists — pick another",
             ToastKind::Warning,
+            None,
         );
         Task::batch([chooser, toast])
     }
@@ -1256,7 +1264,7 @@ impl App {
                 // Diff view rides the subscribe params, so there's nothing to re-apply here.
                 Task::none()
             }
-            Message::Subscribed(Err(e)) => self.error(format!("subscribe failed: {e}")),
+            Message::Subscribed(Err(e)) => self.error(format!("Subscribe failed: {e}")),
 
             Message::WindowUpdate(Ok(res)) => {
                 self.fetch_in_flight = false;
@@ -1291,7 +1299,7 @@ impl App {
             Message::WindowUpdate(Err(e)) => {
                 self.fetch_in_flight = false;
                 self.refetch_queued = false;
-                self.error(format!("viewport update failed: {e}"))
+                self.error(format!("Viewport update failed: {e}"))
             }
 
             Message::Core(ev) => {
@@ -1419,16 +1427,33 @@ impl App {
         }
     }
 
-    fn toast(&mut self, message: impl Into<String>, kind: ToastKind) -> Task<Message> {
+    fn toast(
+        &mut self,
+        message: impl Into<String>,
+        kind: ToastKind,
+        group: Option<String>,
+    ) -> Task<Message> {
         let message = message.into();
-        // Don't stack identical toasts (incremental search can re-report "invalid regex" on
-        // every keystroke).
-        if self.toasts.last().is_some_and(|t| t.message == message) {
-            return Task::none();
+        match &group {
+            // A grouped toast replaces any existing toast with the same key, so an evolving status
+            // (LSP restart → ready, the diff toggle) updates one toast in place.
+            Some(g) => self.toasts.retain(|t| t.group.as_deref() != Some(g.as_str())),
+            // Ungrouped: drop a repeat of the last message (incremental search re-reports "Invalid
+            // regex" on every keystroke).
+            None => {
+                if self.toasts.last().is_some_and(|t| t.message == message) {
+                    return Task::none();
+                }
+            }
         }
         let id = self.next_toast;
         self.next_toast += 1;
-        self.toasts.push(Toast { id, message, kind });
+        self.toasts.push(Toast {
+            id,
+            message,
+            kind,
+            group,
+        });
         Task::perform(
             async move {
                 tokio::time::sleep(std::time::Duration::from_millis(3600)).await;
@@ -1439,7 +1464,7 @@ impl App {
     }
 
     fn error(&mut self, message: String) -> Task<Message> {
-        self.toast(message, ToastKind::Error)
+        self.toast(message, ToastKind::Error, None)
     }
 
     /// Execute a batch of core effects: futures spawn onto iced's executor with their events
@@ -1448,7 +1473,11 @@ impl App {
         let mut tasks = Vec::new();
         for e in fx.0 {
             match e {
-                Effect::Toast(message, kind) => tasks.push(self.toast(message, kind)),
+                Effect::Toast {
+                    message,
+                    kind,
+                    group,
+                } => tasks.push(self.toast(message, kind, group)),
                 Effect::WriteClipboard(text) => tasks.push(iced::clipboard::write(text)),
                 Effect::RevealCursor(style) => tasks.push(self.ensure_cursor_visible(style)),
                 Effect::Resubscribe => {
@@ -1682,7 +1711,7 @@ impl App {
                 // normal copy.
                 Some(HoverAction::Copy) => {
                     let text = self.hover.as_ref().unwrap().to_plain_text();
-                    let note = self.toast("copied popover", ToastKind::Success);
+                    let note = self.toast("Copied popover", ToastKind::Success, None);
                     return Task::batch([iced::clipboard::write(text), note]);
                 }
                 Some(HoverAction::Scroll { dir, unit }) => {
