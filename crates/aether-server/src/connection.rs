@@ -286,7 +286,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         let pruned_ephemeral = disconnecting_project
             .as_deref()
             .is_some_and(|pid| s.prune_ephemeral_if_empty(pid));
-        tracing::debug!(%client_id, "client session removed");
+        tracing::info!(%client_id, "client disconnected");
         // Other clients' buffer pickers should drop the closed transients from their lists; a
         // retired ephemeral project drops out of any open switcher.
         let mut pushes = if closed.is_empty() {

@@ -1405,7 +1405,7 @@ async fn buffer_open_inner(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    tracing::info!(buffer_id = id, path = %canonical.display(), "buffer opened");
+    tracing::debug!(buffer_id = id, path = %canonical.display(), "buffer opened");
     Ok(result)
 }
 
@@ -3987,7 +3987,7 @@ pub async fn buffer_close(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    tracing::info!(buffer_id = params.buffer_id, "buffer closed");
+    tracing::debug!(buffer_id = params.buffer_id, "buffer closed");
     // Composite post-step (docs/protocol-composites.md, B): attach the client to its next
     // buffer (or a fresh scratch) in the same round-trip.
     let opened = if params.open_next {
@@ -4815,7 +4815,7 @@ pub async fn viewport_subscribe(
     let mut pushes = Vec::new();
     if !closed.is_empty() {
         for &id in &closed {
-            tracing::info!(buffer_id = id, "transient buffer closed (hidden)");
+            tracing::debug!(buffer_id = id, "transient buffer closed (hidden)");
         }
         pushes.extend(refresh_buffer_pickers(&mut s));
     }

@@ -804,6 +804,7 @@ impl App {
                     return Task::none();
                 };
                 let (project, open, server_started_at) = *r;
+                tracing::info!(project = %project.name, "session established");
                 // First activation on the boot connection establishes the restart-detection
                 // baseline (it was 0/unknown while only the chooser was up).
                 self.server_started_at = server_started_at;
@@ -1233,7 +1234,7 @@ impl App {
             Message::Key { code, mods, text } => self.on_key(code, mods, text),
 
             Message::Subscribed(Ok(res)) => {
-                tracing::info!(
+                tracing::debug!(
                     viewport_id = res.viewport_id,
                     lines = res.window.lines.len(),
                     total_visual_rows = res.window.total_visual_rows,
