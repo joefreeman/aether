@@ -52,6 +52,7 @@ use aether_protocol::input::{
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
+    LspDocumentHighlight, LspDocumentHighlightParams,
     LspDiagnosticsChangedParams, LspFormat, LspFormatResult, LspGotoDefinition,
     LspGotoDefinitionResult, LspHover, LspHoverResult, LspNavigateDiagnostic,
     LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness, LspRestartServer,
@@ -248,7 +249,71 @@ pub enum Event {
 impl Session {
     /// Dispatch one core event. The shell feeds these from its bridge variant and executes
     /// the returned effects.
+    ///
+    /// Wraps [`Self::dispatch_event`] to drive LSP symbol highlighting (see
+    /// [`Self::after_step_highlight`]). Cursor moves arrive here as `CursorMsg` results, so this
+    /// covers motions, edits, jumps, and undo; the synchronous search-clear paths are caught by the
+    /// twin wrapper on [`Self::on_key`].
     pub fn on_event(&mut self, event: Event) -> Effects {
+        let before = self.highlight_trigger_state();
+        let fx = self.dispatch_event(event);
+        self.after_step_highlight(fx, before)
+    }
+
+    /// Snapshot of the inputs that decide whether a step should re-request symbol highlights: the
+    /// cursor position, whether a search is active, and the mode.
+    fn highlight_trigger_state(&self) -> (LogicalPosition, bool, Mode) {
+        (self.buffer.cursor.position, self.search.active, self.mode)
+    }
+
+    /// After a reducer step, keep the symbol highlight set in sync with the cursor and mode. Leaving
+    /// Normal mode (into Insert or the search prompt) clears the set so a stale highlight can't
+    /// linger; otherwise the set is re-requested when the cursor landed somewhere new, a search just
+    /// ended (its highlights were dropped and the symbol set should return), or we just came back to
+    /// Normal mode. One trigger shared by both reducer entry points so every such transition is
+    /// covered exactly once; the server debounces and only paints when no search is active.
+    fn after_step_highlight(
+        &mut self,
+        fx: Effects,
+        before: (LogicalPosition, bool, Mode),
+    ) -> Effects {
+        let (before_pos, before_search, before_mode) = before;
+        if before_mode == Mode::Normal && self.mode != Mode::Normal {
+            return fx.and(self.set_document_highlight(false));
+        }
+        let moved = self.buffer.cursor.position != before_pos;
+        let search_ended = before_search && !self.search.active;
+        let entered_normal = before_mode != Mode::Normal && self.mode == Mode::Normal;
+        if moved || search_ended || entered_normal {
+            fx.and(self.set_document_highlight(true))
+        } else {
+            fx
+        }
+    }
+
+    /// Sync the server-side symbol highlight set for the current buffer (fire-and-forget; the result
+    /// rides `viewport/lines_changed`). `active` resolves and paints the symbol under the cursor;
+    /// `!active` clears it. Painting is gated to Normal mode with no active search — a search owns
+    /// the highlight layer, and in Insert mode the symbol is mid-edit, so re-highlighting on every
+    /// keystroke would just be noise. Either way it's gated to buffers that actually have a language
+    /// server, so plain-text buffers never round-trip.
+    fn set_document_highlight(&mut self, active: bool) -> Effects {
+        if self.buffer.lsp_server.is_none() {
+            return Effects::none();
+        }
+        if active && (self.mode != Mode::Normal || self.search.active) {
+            return Effects::none();
+        }
+        self.request::<LspDocumentHighlight>(
+            LspDocumentHighlightParams {
+                buffer_id: self.buffer.buffer_id,
+                active,
+            },
+            |_r| Event::Noop,
+        )
+    }
+
+    fn dispatch_event(&mut self, event: Event) -> Effects {
         match event {
             Event::CursorMsg(Ok(cursor)) => {
                 self.buffer.cursor = cursor;
@@ -4567,7 +4632,23 @@ impl Session {
         )
     }
 
+    /// Twin of [`Self::on_event`] for keystrokes: drives symbol highlighting after the keystroke is
+    /// handled. Cursor moves keyed here resolve asynchronously (via `CursorMsg` → `on_event`), so
+    /// what this boundary uniquely catches is the *synchronous* search-clear paths — `drop_search`
+    /// (Esc in Normal), `abort_search` / `commit_search` (the prompt) — which never reach `on_event`.
     pub fn on_key(
+        &mut self,
+        code: KeyCode,
+        mods: Mods,
+        text: Option<String>,
+        visible_rows: u32,
+    ) -> Effects {
+        let before = self.highlight_trigger_state();
+        let fx = self.dispatch_key(code, mods, text, visible_rows);
+        self.after_step_highlight(fx, before)
+    }
+
+    fn dispatch_key(
         &mut self,
         code: KeyCode,
         mods: Mods,

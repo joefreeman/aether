@@ -26,7 +26,8 @@ use aether_protocol::input::{
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
-    LspDiagnosticsChangedParams, LspFormat, LspFormatResult, LspGotoDefinition,
+    LspDiagnosticsChangedParams, LspDocumentHighlight, LspDocumentHighlightParams, LspFormat,
+    LspFormatResult, LspGotoDefinition,
     LspGotoDefinitionResult, LspHover, LspHoverResult, LspLocation, LspNavigateDiagnostic,
     LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness, LspRestartServer,
     LspServerStatus, LspStatus, LspStatusChanged,
@@ -1036,6 +1037,20 @@ fn notification_roundtrip() {
 fn lsp_method_names() {
     assert_eq!(LspRestartServer::NAME, "lsp/restart_server");
     assert_eq!(LspStatusChanged::NAME, "lsp/status_changed");
+}
+
+#[test]
+fn lsp_document_highlight_shape() {
+    assert_eq!(LspDocumentHighlight::NAME, "lsp/document_highlight");
+    // Cursor-relative + fire-and-forget: params carry the buffer and the set/clear flag.
+    let v = to_value(LspDocumentHighlightParams {
+        buffer_id: 7,
+        active: true,
+    })
+    .unwrap();
+    assert_eq!(v, json!({"buffer_id": 7, "active": true}));
+    // Unit result → serializes to JSON null.
+    assert_eq!(to_value(()).unwrap(), json!(null));
 }
 
 #[test]

@@ -30,7 +30,8 @@ use aether_protocol::input::{
     InputToggleComment, InputTransformCase, InputUnsurround,
 };
 use aether_protocol::lsp::{
-    LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic, LspRestartServer,
+    LspDocumentHighlight, LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic,
+    LspRestartServer,
 };
 use aether_protocol::nav::{NavGoto, NavStep};
 use aether_protocol::path::PathDelete;
@@ -451,6 +452,9 @@ async fn dispatch(
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),
         LspGotoDefinition::NAME => run!(LspGotoDefinition, handlers::lsp_goto_definition),
+        LspDocumentHighlight::NAME => {
+            run!(LspDocumentHighlight, handlers::lsp_document_highlight)
+        }
         LspNavigateDiagnostic::NAME => {
             run!(LspNavigateDiagnostic, handlers::lsp_navigate_diagnostic)
         }

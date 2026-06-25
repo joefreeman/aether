@@ -42,7 +42,8 @@ use aether_protocol::input::{
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
-    LspDiagnosticsChangedParams, LspFormatResult, LspGotoDefinitionResult, LspHoverResult,
+    LspDiagnosticsChangedParams, LspDocumentHighlightParams, LspFormatResult,
+    LspGotoDefinitionResult, LspHoverResult,
     LspLocation, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness,
     LspRestartServerParams, LspStatus,
 };
@@ -1505,7 +1506,7 @@ pub async fn git_set_diff_view(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let search = s.searches.get(&(client_id, buffer_id));
+    let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
@@ -2082,6 +2083,166 @@ pub async fn lsp_goto_definition(
     })
 }
 
+/// Debounce window before a settled cursor triggers a `documentHighlight` round-trip. Long enough
+/// to skip the intermediate positions while a motion key is held, short enough to feel immediate.
+const SYMBOL_HIGHLIGHT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Monotonic debounce generation for symbol highlights (see [`ServerState::symbol_highlight_gen`]).
+static SYMBOL_HL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_symbol_hl_epoch() -> u64 {
+    SYMBOL_HL_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Highlight the occurrences of the symbol under the cursor. Cursor-relative and fire-and-forget:
+/// record a fresh debounce generation and spawn the (debounced) refresh, returning immediately so
+/// the request path never blocks on the LSP round-trip. The client fires this as the cursor settles
+/// while no search is active; if a search *is* active we drop any stale symbol set and do nothing —
+/// the search owns the highlight layer. `active: false` is an explicit clear (the client leaving
+/// Normal mode): drop the set and repaint so a stale highlight can't linger in Insert / the prompt.
+pub async fn lsp_document_highlight(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: LspDocumentHighlightParams,
+) -> Result<(), RpcError> {
+    let client_id = ctx.client_id;
+    let buffer_id = params.buffer_id;
+    let key = (client_id, buffer_id);
+    if !params.active {
+        let pushes = {
+            let mut s = state.lock().await;
+            // Invalidate any in-flight refresh, then clear — repainting only if something showed.
+            s.symbol_highlight_gen.remove(&key);
+            if s.symbol_highlights.remove(&key).is_none() {
+                return Ok(());
+            }
+            collect_viewport_refresh(&s, client_id, buffer_id)
+        };
+        for (sender, notif) in pushes {
+            let _ = sender.send(notif).await;
+        }
+        return Ok(());
+    }
+    let epoch = {
+        let mut s = state.lock().await;
+        if s.searches.contains_key(&key) {
+            s.symbol_highlights.remove(&key);
+            s.symbol_highlight_gen.remove(&key);
+            return Ok(());
+        }
+        // No language server attached (the common plain-text case) → nothing to highlight.
+        if !s.lsp.doc_server.contains_key(&buffer_id) {
+            return Ok(());
+        }
+        let epoch = next_symbol_hl_epoch();
+        s.symbol_highlight_gen.insert(key, epoch);
+        epoch
+    };
+    spawn_symbol_highlight_refresh(state.clone(), client_id, buffer_id, epoch);
+    Ok(())
+}
+
+/// The debounced body of [`lsp_document_highlight`]: wait out the settle window, then — if this is
+/// still the latest request — resolve the cursor, round-trip `documentHighlight`, store the
+/// occurrences as the buffer's symbol set, and push the refreshed viewport. Superseded requests
+/// bail without touching the current highlights; a not-ready / empty result clears them.
+/// Detached/fire-and-forget; mirrors [`spawn_reference_resolve`].
+pub fn spawn_symbol_highlight_refresh(
+    state: SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    epoch: u64,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(SYMBOL_HIGHLIGHT_DEBOUNCE).await;
+        let key = (client_id, buffer_id);
+        // Resolve the request at the settled position — but only if no newer move superseded us.
+        let req = {
+            let s = state.lock().await;
+            if s.symbol_highlight_gen.get(&key) != Some(&epoch) {
+                return;
+            }
+            lsp_cursor_request(&s, client_id, buffer_id).ready()
+        };
+        let Some(req) = req else {
+            // Server vanished / not ready: make sure nothing stale lingers.
+            apply_symbol_highlights(&state, client_id, buffer_id, epoch, Vec::new()).await;
+            return;
+        };
+        let params_json = serde_json::json!({
+            "textDocument": { "uri": req.uri },
+            "position": { "line": req.line, "character": req.character },
+        });
+        let raw = match req
+            .client
+            .request("textDocument/documentHighlight", params_json)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "lsp documentHighlight request failed");
+                serde_json::Value::Null
+            }
+        };
+        // Parse against the *current* buffer under the lock (and re-check the generation, since the
+        // buffer may have changed during the round-trip).
+        let ranges = {
+            let s = state.lock().await;
+            if s.symbol_highlight_gen.get(&key) != Some(&epoch) {
+                return;
+            }
+            match s.buffers.get(&buffer_id) {
+                Some(buf) => parse_document_highlights(&raw, buf, req.encoding),
+                None => return,
+            }
+        };
+        apply_symbol_highlights(&state, client_id, buffer_id, epoch, ranges).await;
+    });
+}
+
+/// Store `ranges` as the symbol-highlight set for `(client, buffer)` and push the refreshed
+/// viewport — unless a newer request superseded `epoch`, or the set is unchanged (empty staying
+/// empty), in which case nothing is pushed.
+async fn apply_symbol_highlights(
+    state: &SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    epoch: u64,
+    ranges: Vec<(LogicalPosition, LogicalPosition)>,
+) {
+    let mut s = state.lock().await;
+    let key = (client_id, buffer_id);
+    if s.symbol_highlight_gen.get(&key) != Some(&epoch) {
+        return;
+    }
+    if ranges.is_empty() {
+        if s.symbol_highlights.remove(&key).is_none() {
+            return; // already empty — no visible change, skip the push
+        }
+    } else {
+        // Moving between occurrences of the same symbol resolves to the identical set; skip the
+        // full-window repaint when nothing actually changed.
+        if s.symbol_highlights.get(&key).map(|e| &e.matches) == Some(&ranges) {
+            return;
+        }
+        s.symbol_highlights.insert(
+            key,
+            SearchEntry {
+                query: String::new(),
+                options: MatchOptions::default(),
+                matches: ranges,
+                truncated: false,
+                last_pushed_index: 0,
+            },
+        );
+    }
+    let pushes = collect_viewport_refresh(&s, client_id, buffer_id);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+}
+
 /// Jump the cursor to the next/previous diagnostic in the buffer. The server holds the diagnostics,
 /// so it resolves the target and moves the cursor authoritatively (mirrors [`git_navigate_hunk`]).
 pub async fn lsp_navigate_diagnostic(
@@ -2582,6 +2743,49 @@ fn parse_references(
     }
 }
 
+/// Map an LSP `{line, character}` (in `encoding`) to a buffer byte position, against the *live*
+/// buffer text — correct even with unsaved edits (unlike the disk-reading [`target_byte_col`] that
+/// the cross-file reference/definition paths need). For `documentHighlight`, whose ranges are
+/// always in the current document.
+fn lsp_pos_to_logical(
+    buf: &Buffer,
+    line: u32,
+    character: u32,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> LogicalPosition {
+    let line_text = line_text_no_newline(buf, line);
+    let col = crate::lsp::position::lsp_to_byte(&line_text, character, encoding) as u32;
+    LogicalPosition { line, col }
+}
+
+/// Parse a `textDocument/documentHighlight` response (`DocumentHighlight[]` or null) into the
+/// end-exclusive `(start, end)` ranges of each occurrence, in the buffer's byte coordinates. LSP
+/// ranges are already end-exclusive, matching the `SearchEntry::matches` convention. Entries
+/// without a parseable range, and empty/degenerate ranges, are dropped.
+fn parse_document_highlights(
+    v: &serde_json::Value,
+    buf: &Buffer,
+    encoding: crate::lsp::position::PositionEncoding,
+) -> Vec<(LogicalPosition, LogicalPosition)> {
+    let serde_json::Value::Array(entries) = v else {
+        return Vec::new();
+    };
+    let parse_pos = |p: &serde_json::Value| -> Option<LogicalPosition> {
+        let line = p.get("line")?.as_u64()? as u32;
+        let character = p.get("character")?.as_u64()? as u32;
+        Some(lsp_pos_to_logical(buf, line, character, encoding))
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let range = entry.get("range")?;
+            let start = parse_pos(range.get("start")?)?;
+            let end = parse_pos(range.get("end")?)?;
+            ((start.line, start.col) < (end.line, end.col)).then_some((start, end))
+        })
+        .collect()
+}
+
 /// Parse an LSP `textDocument/documentSymbol` response into a flat, depth-first list of symbol
 /// candidates for `abs_path`. The response is one of two shapes (server capability dependent):
 ///
@@ -2943,6 +3147,11 @@ pub async fn search_set(
         let summary = summary_for(buf_ref, &entry, params.buffer_id, &cursor);
         entry.last_pushed_index = summary.current_index;
         s.searches.insert(key, entry);
+        // A real search owns the highlight layer: drop any symbol-highlight set so it can't show
+        // through, and so it won't reappear stale when this search is later cleared (the client
+        // re-requests highlights on search exit).
+        s.symbol_highlights.remove(&key);
+        s.symbol_highlight_gen.remove(&key);
         let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
         (summary, pushes)
     };
@@ -3428,7 +3637,7 @@ fn collect_viewport_refresh(
         None => return pushes,
     };
     let revision = buf.revision;
-    let search_entry = s.searches.get(&(client_id, buffer_id));
+    let search_entry = render_matches(s, client_id, buffer_id);
     let sneak_entry = s.sneaks.get(&(client_id, buffer_id));
     let diagnostics = buffer_diagnostics(s, buffer_id);
     for vp in s.viewports.values() {
@@ -3608,6 +3817,12 @@ fn refresh_searches_for_buffer(s: &mut ServerState, buffer_id: BufferId) -> Pend
     if !s.buffers.contains_key(&buffer_id) {
         return pushes;
     }
+    // A mutation shifts byte positions, so any symbol-highlight set is now stale. Drop it (and its
+    // debounce generation, which invalidates any in-flight refresh); the client re-requests
+    // highlights when its cursor lands after the edit. The re-rendered windows the mutation already
+    // pushes read `searches` directly, so they correctly show no symbol highlights until then.
+    s.symbol_highlights.retain(|(_, b), _| *b != buffer_id);
+    s.symbol_highlight_gen.retain(|(_, b), _| *b != buffer_id);
     let keys: Vec<(ClientId, BufferId)> = s
         .searches
         .keys()
@@ -4525,7 +4740,7 @@ pub async fn viewport_subscribe(
         params.overscan_rows,
         line_count,
     );
-    let search = s.searches.get(&(client_id, params.buffer_id));
+    let search = render_matches(&s, client_id, params.buffer_id);
     let sneak = s.sneaks.get(&(client_id, params.buffer_id));
     let hunks = buffer_both_hunks(&s, params.buffer_id);
     let diagnostics = buffer_diagnostics(&s, params.buffer_id);
@@ -4661,7 +4876,7 @@ pub async fn viewport_resize(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let search = s.searches.get(&(client_id, buffer_id));
+    let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
@@ -4735,7 +4950,7 @@ pub async fn viewport_scroll_to_row(
         params.top_visual_row,
     );
     let (first, last_excl) = pushed_range(top_line, rows, overscan, line_count);
-    let search = s.searches.get(&(client_id, buffer_id));
+    let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
@@ -4808,7 +5023,7 @@ pub async fn viewport_set_wrap(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let search = s.searches.get(&(client_id, buffer_id));
+    let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
@@ -4871,7 +5086,7 @@ pub async fn viewport_scroll(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let search = s.searches.get(&(client_id, buffer_id));
+    let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
@@ -6079,6 +6294,22 @@ fn render_window(
         git_status,
         lines,
     }
+}
+
+/// The match set to paint for `(client, buffer)`: the active search if there is one, else the LSP
+/// document-highlight set (the symbol under the cursor). Both render through `matches_on_line` with
+/// the identical fill, and a real search always wins — which is exactly what enforces "symbol
+/// highlights only when no search is active". Used by every *view-change* render path (subscribe,
+/// scroll, resize, wrap, diff-view, and the cursor-settle refresh); the post-mutation broadcast
+/// paths keep reading `searches` directly, since a mutation clears the symbol set anyway.
+fn render_matches(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Option<&SearchEntry> {
+    s.searches
+        .get(&(client_id, buffer_id))
+        .or_else(|| s.symbol_highlights.get(&(client_id, buffer_id)))
 }
 
 /// Per-line byte ranges from `entry.matches` clipped to `[0, line_len)` for `line_idx`. Matches
@@ -11541,6 +11772,82 @@ fn symbol_unit_boundary(
             // Already on the header (or none above) → the previous unit's header.
             (0..start).rev().find(|&j| is_top(j))
         }
+    }
+}
+
+#[cfg(test)]
+mod document_highlight_tests {
+    use super::*;
+    use crate::lsp::position::PositionEncoding;
+    use aether_protocol::LogicalPosition;
+
+    fn buf_with(text: &str) -> Buffer {
+        let mut buf = Buffer::scratch(1, None, 1);
+        buf.text = ropey::Rope::from_str(text);
+        buf
+    }
+
+    fn pos(line: u32, col: u32) -> LogicalPosition {
+        LogicalPosition { line, col }
+    }
+
+    #[test]
+    fn parses_ranges_end_exclusive_and_drops_degenerate() {
+        // `foo` twice on line 0; LSP ranges are end-exclusive, matching SearchEntry::matches.
+        let buf = buf_with("foo = foo\n");
+        let v = serde_json::json!([
+            { "range": { "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3} } },
+            { "range": { "start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 9} }, "kind": 2 },
+            // Empty range → dropped.
+            { "range": { "start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 4} } },
+        ]);
+        assert_eq!(
+            parse_document_highlights(&v, &buf, PositionEncoding::Utf8),
+            vec![(pos(0, 0), pos(0, 3)), (pos(0, 6), pos(0, 9))]
+        );
+    }
+
+    #[test]
+    fn non_array_response_yields_nothing() {
+        let buf = buf_with("foo\n");
+        assert!(parse_document_highlights(&serde_json::Value::Null, &buf, PositionEncoding::Utf8)
+            .is_empty());
+    }
+
+    #[test]
+    fn utf16_characters_map_to_byte_columns() {
+        // 'é' is one UTF-16 unit but two bytes, so byte columns sit past the LSP characters.
+        let buf = buf_with("é foo\n");
+        let v = serde_json::json!([
+            { "range": { "start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 5} } },
+        ]);
+        // 'é'(2 bytes) + ' '(1) → "foo" spans bytes 3..6.
+        assert_eq!(
+            parse_document_highlights(&v, &buf, PositionEncoding::Utf16),
+            vec![(pos(0, 3), pos(0, 6))]
+        );
+    }
+
+    #[test]
+    fn render_matches_prefers_search_then_symbol_then_none() {
+        let mut st = ServerState::new();
+        let client = uuid::Uuid::nil();
+        let buffer = 1u64;
+        let entry = |q: &str, n: u32| SearchEntry {
+            query: q.to_string(),
+            options: MatchOptions::default(),
+            matches: (0..n).map(|i| (pos(0, i), pos(0, i + 1))).collect(),
+            truncated: false,
+            last_pushed_index: 0,
+        };
+        // Nothing stored → no highlights.
+        assert!(render_matches(&st, client, buffer).is_none());
+        // Symbol set only → it renders.
+        st.symbol_highlights.insert((client, buffer), entry("", 2));
+        assert_eq!(render_matches(&st, client, buffer).map(|e| e.matches.len()), Some(2));
+        // A real search always wins, enforcing "symbol highlights only when no search is active".
+        st.searches.insert((client, buffer), entry("needle", 5));
+        assert_eq!(render_matches(&st, client, buffer).map(|e| e.query.as_str()), Some("needle"));
     }
 }
 

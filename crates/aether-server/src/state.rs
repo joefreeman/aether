@@ -62,6 +62,17 @@ pub struct ServerState {
     /// the buffer closes. Purely transient view-layer state — no buffer mutation happens during a
     /// sneak, so unlike searches it never needs an after-edit recompute.
     pub sneaks: HashMap<(ClientId, BufferId), SneakEntry>,
+    /// Per-`(client, buffer)` LSP document-highlight set: the occurrences of the symbol under the
+    /// cursor, painted with the same styling as search matches when no search is active. Stored as a
+    /// [`SearchEntry`] so it renders through the very same path (`render_matches` → `matches_on_line`);
+    /// only `matches` is meaningful (the other fields go unused). Refreshed — debounced — as the
+    /// cursor settles, and cleared when a search is set, the cursor leaves a symbol, the buffer
+    /// mutates, or the client disconnects / the buffer closes.
+    pub symbol_highlights: HashMap<(ClientId, BufferId), SearchEntry>,
+    /// Debounce generation for [`symbol_highlights`], bumped per cursor-settle request. A spawned
+    /// refresh applies its result only while the generation still matches — a newer cursor move (or a
+    /// buffer mutation) supersedes any in-flight round-trip. Mirrors the picker async-load epoch.
+    pub symbol_highlight_gen: HashMap<(ClientId, BufferId), u64>,
     /// Per-`(client, buffer)` last-known scroll position. Written whenever the client subscribes
     /// or scrolls a viewport on the buffer, and surfaced on `buffer/open` so the client can
     /// restore the view when it reopens the buffer (e.g. navigating away and back via the file
@@ -315,6 +326,8 @@ impl ServerState {
             tree_selection_history: HashMap::new(),
             searches: HashMap::new(),
             sneaks: HashMap::new(),
+            symbol_highlights: HashMap::new(),
+            symbol_highlight_gen: HashMap::new(),
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
@@ -597,6 +610,8 @@ impl ServerState {
         self.tree_selection_history.retain(|(_, b), _| *b != id);
         self.searches.retain(|(_, b), _| *b != id);
         self.sneaks.retain(|(_, b), _| *b != id);
+        self.symbol_highlights.retain(|(_, b), _| *b != id);
+        self.symbol_highlight_gen.retain(|(_, b), _| *b != id);
         self.last_scroll.retain(|(_, b), _| *b != id);
         self.git_unstaged_hunks.remove(&id);
         self.git_both_hunks.remove(&id);
@@ -721,6 +736,8 @@ impl ServerState {
     /// Remove all search records for the given client. Used on disconnect.
     pub fn drop_searches_for_client(&mut self, client_id: ClientId) {
         self.searches.retain(|(c, _), _| *c != client_id);
+        self.symbol_highlights.retain(|(c, _), _| *c != client_id);
+        self.symbol_highlight_gen.retain(|(c, _), _| *c != client_id);
     }
 
     /// Remove all sneak sessions for the given client. Used on disconnect.
@@ -857,6 +874,8 @@ impl ServerState {
         // when you come back.
         self.searches.retain(|(c, b), _| !in_proj(c, b));
         self.sneaks.retain(|(c, b), _| !in_proj(c, b));
+        self.symbol_highlights.retain(|(c, b), _| !in_proj(c, b));
+        self.symbol_highlight_gen.retain(|(c, b), _| !in_proj(c, b));
 
         // Pickers are per-session UI state — their candidate sets/queries reference the prior
         // project so wipe them all on switch.
