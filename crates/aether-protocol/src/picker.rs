@@ -331,6 +331,12 @@ pub enum PickerItem {
         /// Captured at row-build time, like `status`; an active picker re-pushes on changes.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         transient: bool,
+        /// True for a *dormant* buffer — a file restored from the persisted project session that
+        /// hasn't been loaded into memory yet (no rope/tree-sitter/LSP). It appears in the picker
+        /// greyed out; selecting it materializes the real buffer (via `buffer/open`, which the
+        /// server intercepts by id). Never set together with `transient`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dormant: bool,
     },
     /// One match found by the grep picker. Identity is `(path_index, relative_path, line, col)`.
     /// One row per match (a line with N matches produces N hits) — keeps `match_indices` a flat

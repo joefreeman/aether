@@ -28,6 +28,14 @@ pub async fn run() -> anyhow::Result<()> {
     // `project/activate` for restart detection); the runtime file mirrors the same value, so the
     // file and the wire never disagree about which instance this is.
     let state = Arc::new(Mutex::new(ServerState::new()));
+    // Point the real server at the on-disk session file (project recency + buffer restore). Left
+    // unset by `ServerState::new` so in-process tests and embeddings never touch the user's file;
+    // this is the one place that opts the production daemon in. A resolution failure (no XDG base
+    // dirs) just disables the feature rather than refusing to boot.
+    {
+        let mut s = state.lock().await;
+        s.sessions_path = config::project_sessions_path().ok();
+    }
     let info = RuntimeInfo {
         pid: std::process::id(),
         port,
@@ -130,6 +138,16 @@ pub async fn spawn_for_test(
 pub async fn spawn_for_test_multi(
     projects: Vec<(String, Vec<PathBuf>)>,
 ) -> anyhow::Result<ServerHandle> {
+    spawn_for_test_multi_with_sessions(projects, None).await
+}
+
+/// As [`spawn_for_test_multi`], but points the server at `sessions_path` for the persisted
+/// project-session file (recency + buffer restore). Tests pass a throwaway tempfile so they can
+/// exercise persistence without touching the developer's real `~/.config/aether/sessions.json`.
+pub async fn spawn_for_test_multi_with_sessions(
+    projects: Vec<(String, Vec<PathBuf>)>,
+    sessions_path: Option<PathBuf>,
+) -> anyhow::Result<ServerHandle> {
     use crate::state::ProjectEntry;
     use crate::workspace_index::WorkspaceIndex;
 
@@ -143,6 +161,7 @@ pub async fn spawn_for_test_multi(
     let state = Arc::new(Mutex::new(ServerState::new()));
     {
         let mut s = state.lock().await;
+        s.sessions_path = sessions_path;
         for (name, paths) in &projects {
             let workspace_index = Arc::new(WorkspaceIndex::new(paths.clone()));
             s.projects.insert(
@@ -153,6 +172,7 @@ pub async fn spawn_for_test_multi(
                     paths: paths.clone(),
                     workspace_index,
                     mru_buffers: std::collections::VecDeque::new(),
+                    dormant_buffers: Vec::new(),
                 },
             );
         }

@@ -292,7 +292,7 @@ export type SymbolKind =
  *  are code-point offsets into the row's display string, covered by the fuzzy match. */
 export type PickerItem =
   | { kind: "file"; path_index: number; relative_path: string; match_indices?: number[]; git_status?: GitStatus }
-  | { kind: "buffer"; buffer_id: BufferId; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean }
+  | { kind: "buffer"; buffer_id: BufferId; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean; dormant?: boolean }
   | {
       kind: "grep_hit";
       path_index: number;

@@ -2258,6 +2258,7 @@ fn buffers_picker_ctrl_d_closes_in_place() {
             relative_path: None,
             match_indices: vec![],
             transient: false,
+            dormant: false,
         }
     }
 

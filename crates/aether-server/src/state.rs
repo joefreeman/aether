@@ -135,6 +135,12 @@ pub struct ServerState {
     /// `project/activate` so they can detect a daemon restart across a reconnect. Set once at
     /// construction; the same value is written to the runtime file.
     pub started_at_unix_ms: u64,
+    /// Where to read/write the persisted project-session file
+    /// ([`crate::config::ProjectSessions`]). `Some` in the real server (set at boot in
+    /// `server::run`); `None` everywhere else — in-process tests and embeddings leave it unset so
+    /// they never touch the developer's real `~/.config/aether/sessions.json`. When `None`, session
+    /// recency/restore is simply disabled (all logic short-circuits).
+    pub sessions_path: Option<PathBuf>,
     next_buffer_id: u64,
     next_viewport_id: u64,
 }
@@ -287,6 +293,24 @@ pub struct ProjectEntry {
     /// Lives on the project — not on the client — so it persists across client disconnects.
     /// A new TUI invocation gets a fresh `ClientId` but inherits the project's MRU.
     pub mru_buffers: VecDeque<BufferId>,
+    /// Buffers restored from the persisted session ([`crate::config::ProjectSession`]) on
+    /// activation but not yet loaded into memory — most-recently-used first, mirroring the order
+    /// they were saved in. Each holds a reserved [`BufferId`] (its picker identity) and the file's
+    /// canonical path; it carries no rope/syntax/LSP. The buffer picker lists them greyed out
+    /// after the live buffers; opening one materializes a real buffer (see
+    /// `buffer_open`'s by-id path) and drops it from here. Never contains a path that's also a
+    /// live buffer in this project — promotion removes it.
+    pub dormant_buffers: Vec<DormantBuffer>,
+}
+
+/// A session-restored buffer that hasn't been loaded yet. See [`ProjectEntry::dormant_buffers`].
+#[derive(Debug, Clone)]
+pub struct DormantBuffer {
+    /// Reserved id — the buffer's identity in the picker, so selecting it can route back through
+    /// `buffer/open { buffer_id }`. Not present in `ServerState::buffers` until materialized.
+    pub id: BufferId,
+    /// Canonical path of the file to load when the buffer is materialized.
+    pub path: PathBuf,
 }
 
 impl ProjectEntry {
@@ -344,6 +368,7 @@ impl ServerState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            sessions_path: None,
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
@@ -446,6 +471,7 @@ impl ServerState {
                 paths: Vec::new(),
                 workspace_index,
                 mru_buffers: VecDeque::new(),
+                dormant_buffers: Vec::new(),
             },
         );
         id
@@ -781,6 +807,72 @@ impl ServerState {
         for project in self.projects.values_mut() {
             project.mru_buffers.retain(|&b| b != buffer_id);
         }
+    }
+
+    /// The set of file-backed buffers to persist for `project_name`, most-recently-used first:
+    /// the project's live MRU buffers that have a path, then its still-dormant buffers (already in
+    /// MRU order). Deduplicated by path. This is exactly what a future activation should restore,
+    /// so it's what gets written to the session file.
+    ///
+    /// Two kinds are excluded: scratch buffers (no path), and **transient** buffers — preview
+    /// opens that auto-close once you navigate away (grep/file-picker peeks, goto-def, nav
+    /// revisits). Transient means "ephemeral, don't accumulate me"; persisting previews would
+    /// reintroduce exactly the buffer-list clutter the transient mechanism exists to avoid, so the
+    /// restored set is just the working buffers you edited or explicitly kept (which clears the
+    /// transient flag — promotion — and brings them back in here). It also means a preview's
+    /// open/auto-close never churns the file.
+    pub fn session_buffer_paths(&self, project_name: &str) -> Vec<PathBuf> {
+        let Some(project) = self.projects.get(project_name) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = Vec::new();
+        let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+        for id in &project.mru_buffers {
+            let Some(buf) = self.buffers.get(id) else {
+                continue;
+            };
+            if buf.transient {
+                continue;
+            }
+            if let Some(path) = buf.canonical_path.as_deref() {
+                if seen.insert(path) {
+                    out.push(path.to_path_buf());
+                }
+            }
+        }
+        for d in &project.dormant_buffers {
+            if seen.insert(d.path.as_path()) {
+                out.push(d.path.clone());
+            }
+        }
+        out
+    }
+
+    /// Remove the dormant entry for `canonical` from `project_name`, if present. Called when a live
+    /// buffer for that path opens, so the now-loaded file stops showing as a greyed dormant row.
+    pub fn promote_dormant(&mut self, project_name: &str, canonical: &Path) {
+        if let Some(project) = self.projects.get_mut(project_name) {
+            project.dormant_buffers.retain(|d| d.path.as_path() != canonical);
+        }
+    }
+
+    /// Remove and return the canonical path of the dormant buffer with `id` in `project_name`, if
+    /// any. Used by `buffer/open`'s by-id path to materialize a dormant buffer the picker selected.
+    pub fn take_dormant(&mut self, project_name: &str, id: BufferId) -> Option<PathBuf> {
+        let project = self.projects.get_mut(project_name)?;
+        let pos = project.dormant_buffers.iter().position(|d| d.id == id)?;
+        Some(project.dormant_buffers.remove(pos).path)
+    }
+
+    /// The id of `project_name`'s most-recently-used dormant buffer (front of the list), if any.
+    /// Used as the activation landing target when the project has no live MRU buffer yet (a cold
+    /// restore after a restart).
+    pub fn first_dormant_id(&self, project_name: &str) -> Option<BufferId> {
+        self.projects
+            .get(project_name)?
+            .dormant_buffers
+            .first()
+            .map(|d| d.id)
     }
 
     /// Drop the selection-expansion history for one client+buffer. Called from every cursor RPC
@@ -1494,6 +1586,7 @@ mod project_state_tests {
             paths: paths.clone(),
             workspace_index: Arc::new(WorkspaceIndex::new(paths)),
             mru_buffers: VecDeque::new(),
+            dormant_buffers: Vec::new(),
         }
     }
 
@@ -1572,6 +1665,89 @@ mod project_state_tests {
     fn rename_project_unknown_returns_none() {
         let mut s = ServerState::new();
         assert!(s.rename_project("nope", "new").is_none());
+    }
+
+    /// The paths persisted for a project's session: live MRU buffers first (most-recent-first),
+    /// then dormant ones, deduplicated by path so a dormant entry that's since been loaded doesn't
+    /// double-show.
+    #[test]
+    fn session_buffer_paths_merges_live_mru_then_dormant_deduped() {
+        let mut s = ServerState::new();
+        s.projects
+            .insert("p".into(), project_entry("p", vec![PathBuf::from("/p")]));
+
+        // Two live file-backed buffers; touch so the MRU front is b2.
+        let b1 = s.allocate_buffer_id();
+        s.buffers
+            .insert(b1, Buffer::new_at_path(b1, PathBuf::from("/p/a.rs"), None));
+        s.buffer_projects.insert(b1, "p".into());
+        let b2 = s.allocate_buffer_id();
+        s.buffers
+            .insert(b2, Buffer::new_at_path(b2, PathBuf::from("/p/b.rs"), None));
+        s.buffer_projects.insert(b2, "p".into());
+        s.touch_mru(b1);
+        s.touch_mru(b2);
+
+        // A transient preview at the MRU front: must be excluded (previews don't persist).
+        let bt = s.allocate_buffer_id();
+        let mut tbuf = Buffer::new_at_path(bt, PathBuf::from("/p/preview.rs"), None);
+        tbuf.transient = true;
+        s.buffers.insert(bt, tbuf);
+        s.buffer_projects.insert(bt, "p".into());
+        s.touch_mru(bt);
+
+        // Dormant: a fresh path, plus one that duplicates a live buffer's path (must be dropped).
+        let d1 = s.allocate_buffer_id();
+        let d_dup = s.allocate_buffer_id();
+        s.projects.get_mut("p").unwrap().dormant_buffers = vec![
+            DormantBuffer {
+                id: d1,
+                path: PathBuf::from("/p/c.rs"),
+            },
+            DormantBuffer {
+                id: d_dup,
+                path: PathBuf::from("/p/a.rs"),
+            },
+        ];
+
+        assert_eq!(
+            s.session_buffer_paths("p"),
+            vec![
+                // preview.rs (transient, MRU front) is excluded.
+                PathBuf::from("/p/b.rs"), // most-recent non-transient
+                PathBuf::from("/p/a.rs"),
+                PathBuf::from("/p/c.rs"), // dormant; /p/a.rs dropped as a dup of the live buffer
+            ]
+        );
+    }
+
+    /// The dormant-registry helpers: `first_dormant_id` is the landing target (front of the list),
+    /// `take_dormant` removes and returns a path by id (materialization), and `promote_dormant`
+    /// drops a path once it's loaded.
+    #[test]
+    fn dormant_registry_take_promote_and_first() {
+        let mut s = ServerState::new();
+        s.projects
+            .insert("p".into(), project_entry("p", vec![PathBuf::from("/p")]));
+        let d1 = s.allocate_buffer_id();
+        let d2 = s.allocate_buffer_id();
+        s.projects.get_mut("p").unwrap().dormant_buffers = vec![
+            DormantBuffer {
+                id: d1,
+                path: PathBuf::from("/p/a.rs"),
+            },
+            DormantBuffer {
+                id: d2,
+                path: PathBuf::from("/p/b.rs"),
+            },
+        ];
+
+        assert_eq!(s.first_dormant_id("p"), Some(d1), "front of the list lands");
+        assert_eq!(s.take_dormant("p", d1), Some(PathBuf::from("/p/a.rs")));
+        assert_eq!(s.take_dormant("p", d1), None, "removed; a second take is empty");
+        assert_eq!(s.first_dormant_id("p"), Some(d2));
+        s.promote_dormant("p", Path::new("/p/b.rs"));
+        assert_eq!(s.first_dormant_id("p"), None, "promotion empties the registry");
     }
 
     /// `project_active_anywhere` is the delete guard: true iff *some* client has the project

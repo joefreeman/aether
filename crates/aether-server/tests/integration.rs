@@ -21746,3 +21746,159 @@ async fn change_over_partial_selection_ending_on_newline_still_joins() {
     assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "albeta\n");
     drop(server);
 }
+
+/// The persisted project session (recency + buffer list) is written when a project is activated
+/// and when a buffer is opened: after activating "p" and opening a file in it, the JSON session
+/// file carries that project with a non-zero `last_activated_at` and the file's canonical path in
+/// its `buffers` list. (Cold-path dormant *restore* needs an on-disk project config + a temp XDG
+/// dir and isn't exercised here; the merge/sort logic it relies on is unit-tested in `state`/`config`.)
+#[tokio::test]
+async fn project_session_persisted_on_activate_and_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
+    let sessions_path = root.join("sessions.json");
+
+    let server = aether_server::spawn_for_test_multi_with_sessions(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(sessions_path.clone()),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            buffer_id: None,
+            transient: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // The persist happens off the lock after the RPC result is sent; give it a moment to land.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let raw = std::fs::read_to_string(&sessions_path).expect("session file written");
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let p = &json["projects"]["p"];
+    assert!(
+        p["last_activated_at"].as_u64().unwrap_or(0) > 0,
+        "activation stamps a time: {raw}"
+    );
+    let canonical = std::fs::canonicalize(root.join("a.rs")).unwrap();
+    let buffers: Vec<String> = p["buffers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        buffers,
+        vec![canonical.display().to_string()],
+        "the opened file is recorded in the session: {raw}"
+    );
+
+    drop(server);
+}
+
+/// A transient preview (the default file-picker open) is NOT persisted; pressing `Space k` to keep
+/// it (buffer/set_transient false) promotes it to a permanent working buffer and persists it. This
+/// is the keep→persist path — without the persist hook, kept buffers never reach the session file.
+#[tokio::test]
+async fn keeping_a_transient_buffer_persists_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
+    let sessions_path = root.join("sessions.json");
+
+    let server = aether_server::spawn_for_test_multi_with_sessions(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(sessions_path.clone()),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    // Open as a transient preview (what the file picker does).
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            transient: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(open.transient, "opened as a transient preview");
+
+    let buffers_in_session = |raw: &str| -> Vec<String> {
+        let json: serde_json::Value = serde_json::from_str(raw).unwrap();
+        json["projects"]["p"]["buffers"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    };
+
+    // A transient preview is excluded from the persisted set.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let raw = std::fs::read_to_string(&sessions_path).unwrap();
+    assert!(
+        buffers_in_session(&raw).is_empty(),
+        "transient preview must not be persisted: {raw}"
+    );
+
+    // Keep it (Space k) → promote to permanent.
+    let _kept: BufferSetTransientResult = send_request::<BufferSetTransient>(
+        &mut ws,
+        3,
+        &BufferSetTransientParams {
+            buffer_id: open.buffer_id,
+            transient: false,
+        },
+    )
+    .await;
+
+    // Now it's part of the working set and the session lists it.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let raw = std::fs::read_to_string(&sessions_path).unwrap();
+    let canonical = std::fs::canonicalize(root.join("a.rs")).unwrap();
+    assert_eq!(
+        buffers_in_session(&raw),
+        vec![canonical.display().to_string()],
+        "keeping the buffer persists it: {raw}"
+    );
+
+    drop(server);
+}

@@ -2082,6 +2082,7 @@ fn picker_item_buffer_is_tagged() {
         relative_path: Some("src/main.rs".into()),
         match_indices: vec![0, 4],
         transient: true,
+        dormant: false,
     };
     let v = to_value(&item).unwrap();
     assert_eq!(
@@ -2095,7 +2096,8 @@ fn picker_item_buffer_is_tagged() {
             "relative_path": "src/main.rs",
             "match_indices": [0, 4],
             "transient": true,
-        })
+        }),
+        "a permanent (non-dormant) buffer omits the dormant flag"
     );
 
     // Scratch buffer: no path → both fields skipped; clean status → `status` skipped too;
@@ -2108,9 +2110,14 @@ fn picker_item_buffer_is_tagged() {
         relative_path: None,
         match_indices: vec![],
         transient: false,
+        dormant: false,
     };
     let sv = to_value(&scratch).unwrap();
     assert!(sv.get("status").is_none(), "clean buffer omits status");
+    assert!(
+        sv.get("dormant").is_none(),
+        "a loaded buffer omits the dormant flag"
+    );
     assert!(
         sv.get("path_index").is_none(),
         "scratch buffer omits path_index"
@@ -2130,6 +2137,22 @@ fn picker_item_buffer_is_tagged() {
     }))
     .unwrap();
     assert_eq!(back, scratch);
+
+    // A dormant (session-restored, not-yet-loaded) buffer carries the flag on the wire, and it
+    // round-trips back.
+    let dormant = PickerItem::Buffer {
+        buffer_id: 11,
+        display: "src/lib.rs".into(),
+        status: BufferDirtyState::Clean,
+        path_index: Some(0),
+        relative_path: Some("src/lib.rs".into()),
+        match_indices: vec![],
+        transient: false,
+        dormant: true,
+    };
+    let dv = to_value(&dormant).unwrap();
+    assert_eq!(dv.get("dormant"), Some(&json!(true)));
+    assert_eq!(from_value::<PickerItem>(dv).unwrap(), dormant);
 }
 
 #[test]

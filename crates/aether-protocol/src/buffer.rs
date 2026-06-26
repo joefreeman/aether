@@ -16,7 +16,7 @@ impl RpcMethod for BufferOpen {
     type Result = BufferOpenResult;
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BufferOpenParams {
     /// Attach to an already-open buffer by id. When set, `path_index` / `relative_path` /
     /// `create_if_missing` are ignored — the server returns the existing buffer's state. Errors

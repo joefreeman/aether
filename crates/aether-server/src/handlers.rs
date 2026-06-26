@@ -227,6 +227,7 @@ pub async fn project_activate(
                 paths: canonical_paths.clone(),
                 workspace_index,
                 mru_buffers: std::collections::VecDeque::new(),
+                dormant_buffers: Vec::new(),
             },
         );
         // Hand the new roots to the watcher so its events flow for this project too. Best-effort
@@ -235,6 +236,37 @@ pub async fn project_activate(
         // case.
         if let Some(w) = s.watcher.clone() {
             crate::watcher::watch_project_paths(&w, &canonical_paths);
+        }
+
+        // First activation this session: restore the project's previously-open files from the
+        // persisted session as *dormant* buffers (listed in the picker, loaded lazily). Each gets a
+        // reserved id but no rope/LSP until materialized. Files deleted while the server was down are
+        // dropped. No-op when sessions aren't persisted (`sessions_path` unset) or the file is
+        // unreadable.
+        if let Some(path) = s.sessions_path.clone() {
+            if let Ok(sessions) = crate::config::load_project_sessions_at(&path) {
+                let restore: Vec<std::path::PathBuf> = sessions
+                    .projects
+                    .get(&params.name)
+                    .map(|sess| {
+                        sess.buffers
+                            .iter()
+                            .filter(|p| p.exists())
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let dormant: Vec<crate::state::DormantBuffer> = restore
+                    .into_iter()
+                    .map(|p| crate::state::DormantBuffer {
+                        id: s.allocate_buffer_id(),
+                        path: p,
+                    })
+                    .collect();
+                if let Some(proj) = s.projects.get_mut(&params.name) {
+                    proj.dormant_buffers = dormant;
+                }
+            }
         }
     }
 
@@ -262,12 +294,19 @@ pub async fn project_activate(
     // (not per-client) so it survives client disconnects — a fresh TUI invocation sees the same
     // top-of-MRU buffer the prior session left there. The client uses this to reattach instead
     // of spawning a fresh scratch on every switch.
-    let last_buffer_id = s.projects.get(&params.name).and_then(|p| {
-        p.mru_buffers
-            .iter()
-            .find(|id| s.buffers.contains_key(id))
-            .copied()
-    });
+    // Prefer a still-live MRU buffer; otherwise — a cold restore after a restart, where nothing is
+    // loaded yet — land on the most-recently-used *dormant* buffer, which `buffer_open` materializes
+    // by id. `None` only when the project is genuinely empty (first ever visit), giving a scratch.
+    let last_buffer_id = s
+        .projects
+        .get(&params.name)
+        .and_then(|p| {
+            p.mru_buffers
+                .iter()
+                .find(|id| s.buffers.contains_key(id))
+                .copied()
+        })
+        .or_else(|| s.first_dormant_id(&params.name));
 
     tracing::info!(%client_id, project = %params.name, "client activated project");
     drop(s);
@@ -296,6 +335,10 @@ pub async fn project_activate(
         None
     };
 
+    // Stamp this activation and refresh the persisted buffer list (now that the landing buffer has
+    // materialized). Drives the switcher's recency ordering on the next open.
+    persist_project_session(state, &params.name, true).await;
+
     Ok(ProjectActivateResult {
         project: ProjectInfo {
             name: params.name,
@@ -305,6 +348,42 @@ pub async fn project_activate(
         opened,
         server_started_at,
     })
+}
+
+/// Persist `project_name`'s session — the canonical paths of its open (and still-dormant) buffers,
+/// most-recently-used first, and optionally a fresh `last_activated_at` stamp — to the session file
+/// ([`crate::config::ProjectSessions`]). Best-effort: a no-op when sessions aren't persisted
+/// (`sessions_path` unset) or the project is ephemeral, and it logs rather than fails on I/O error.
+/// Buffer paths are gathered under the lock; the read-modify-write of the file happens after it's
+/// released.
+async fn persist_project_session(state: &SharedState, project_name: &str, touch_activation: bool) {
+    // Hold the state lock across the whole read-modify-write. It's the single server-wide
+    // serialization point, so this makes concurrent persists — and the recency-sort read in
+    // `project_candidates`, which also runs under the lock — mutually exclusive: no lost updates
+    // and no torn file. The session file is tiny, so the blocking I/O held under the lock is
+    // sub-millisecond, and persists are human-paced (open / switch / save / close / activate).
+    // No `.await` between here and the write, so the guard is never yielded mid-critical-section.
+    let s = state.lock().await;
+    let Some(path) = s.sessions_path.clone() else {
+        return;
+    };
+    // Skip ephemeral projects (no `<name>.toml`): nothing to persist for a throwaway context.
+    if s.projects
+        .get(project_name)
+        .is_none_or(|p| p.name.is_none())
+    {
+        return;
+    }
+    let buffers = s.session_buffer_paths(project_name);
+    let mut sessions = crate::config::load_project_sessions_at(&path).unwrap_or_default();
+    let entry = sessions.projects.entry(project_name.to_string()).or_default();
+    entry.buffers = buffers;
+    if touch_activation {
+        entry.last_activated_at = crate::config::now_unix_ms();
+    }
+    if let Err(e) = crate::config::write_project_sessions_at(&path, &sessions) {
+        tracing::warn!(project = %project_name, error = %e, "failed to persist project session");
+    }
 }
 
 /// Validate and normalize a user-supplied project name. Trims surrounding whitespace, then
@@ -372,6 +451,7 @@ pub async fn project_create(
             paths: Vec::new(),
             workspace_index,
             mru_buffers: std::collections::VecDeque::new(),
+            dormant_buffers: Vec::new(),
         },
     );
     if let Some(session) = s.clients.get_mut(&client_id) {
@@ -712,6 +792,18 @@ pub async fn project_rename(
     crate::config::rename_project_config(&old_name, &new_name)
         .map_err(|e| RpcError::internal(format!("renaming project config: {e}")))?;
 
+    // Carry the persisted session across to the new name (recency stamp + restored buffers). Held
+    // under the state lock like every other session-file write, so it can't race a concurrent
+    // persist. Best-effort; the project still works without it, so a failure only logs.
+    {
+        let s = state.lock().await;
+        if let Some(path) = s.sessions_path.clone() {
+            if let Err(e) = crate::config::rename_project_session_at(&path, &old_name, &new_name) {
+                tracing::warn!(old = %old_name, new = %new_name, error = %e, "failed to rename project session");
+            }
+        }
+    }
+
     // Re-key every in-memory reference from the old name to the new one. Projects are never
     // removed from the map at runtime, so the entry we confirmed above is still present.
     let mut s = state.lock().await;
@@ -806,6 +898,18 @@ pub async fn project_delete(
 
     crate::config::delete_project_config(&name)
         .map_err(|e| RpcError::internal(format!("deleting project config: {e}")))?;
+
+    // Drop its persisted session too, so a deleted project doesn't leave an orphan behind. Held
+    // under the state lock like every other session-file write, so it can't race a concurrent
+    // persist. Best-effort; a stale entry is harmless (it'd just never be listed), so we only log.
+    {
+        let s = state.lock().await;
+        if let Some(path) = s.sessions_path.clone() {
+            if let Err(e) = crate::config::remove_project_session_at(&path, &name) {
+                tracing::warn!(project = %name, error = %e, "failed to remove project session");
+            }
+        }
+    }
 
     // Re-take the lock to refresh any open chooser — only now is the project gone from disk (the
     // candidate list is a disk read), so the dropped project disappears from the list.
@@ -974,6 +1078,20 @@ pub async fn buffer_open(
             result.search_summary = Some(summary);
         }
     }
+    // Refresh the persisted session for this buffer's project: the open changed either its
+    // membership (a new file) or its MRU order (a switch), both of which a restart restores from.
+    // Skip transient opens — previews never enter the persisted set (see `session_buffer_paths`),
+    // so persisting on every grep/picker peek would just rewrite identical content. Best-effort and
+    // named-projects-only (the helper guards); a no-op when sessions aren't persisted.
+    if !result.transient {
+        let project = {
+            let s = state.lock().await;
+            s.project_for_buffer(result.buffer_id).map(str::to_string)
+        };
+        if let Some(project) = project {
+            persist_project_session(state, &project, false).await;
+        }
+    }
     Ok(result)
 }
 
@@ -1068,6 +1186,28 @@ async fn buffer_open_inner(
     // buffers too, where there's no path to feed the path-keyed open flow). Ignores the path
     // fields; errors if the id isn't live.
     if let Some(buffer_id) = params.buffer_id {
+        // A dormant (session-restored) buffer the picker selected by id has no live buffer behind
+        // it yet. Materialize it: remove it from the dormant list and re-dispatch as an
+        // absolute-path open, which loads the file and attaches git/LSP exactly like a fresh open.
+        // The reserved dormant id is discarded — the client switches to the freshly-allocated real
+        // buffer in the response.
+        let dormant_path = {
+            let mut s = state.lock().await;
+            if s.buffers.contains_key(&buffer_id) {
+                None
+            } else {
+                s.take_dormant(&active_project_name, buffer_id)
+            }
+        };
+        if let Some(path) = dormant_path {
+            let materialize = BufferOpenParams {
+                buffer_id: None,
+                absolute_path: Some(path.display().to_string()),
+                ..params
+            };
+            return Box::pin(buffer_open_inner(state, ctx, materialize)).await;
+        }
+
         let mut s = state.lock().await;
         let buf = s
             .buffers
@@ -3870,9 +4010,12 @@ fn byte_to_logical(buf: &Buffer, byte_idx: usize) -> aether_protocol::LogicalPos
 }
 
 /// The buffer a client should land on after its current one is closed: the top of its active
-/// project's MRU, else any remaining buffer in that project, else `None` (caller opens a scratch).
-/// Shared by `buffer/close` and the deletion paths so the requesting client and any other clients
-/// that were viewing the buffer resolve their next buffer identically.
+/// project's MRU, else any remaining buffer in that project, else the most-recently-used *dormant*
+/// buffer (a session-restored file `buffer/open` materializes by id), else `None` (caller opens a
+/// scratch). The dormant fallback means closing your last live buffer after a session restore drops
+/// you back onto a restored file rather than a blank scratch. Shared by `buffer/close` and the
+/// deletion paths so the requesting client and any other clients that were viewing the buffer
+/// resolve their next buffer identically.
 fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<BufferId> {
     let project_name = s.active_project(client_id).map(|p| p.id.clone());
     s.active_project(client_id)
@@ -3885,6 +4028,7 @@ fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<Buffer
                     .map(|(id, _)| *id)
             })
         })
+        .or_else(|| project_name.as_deref().and_then(|name| s.first_dormant_id(name)))
 }
 
 /// `(client, buffer)` pairs for every client *other than* `except` that currently has a viewport
@@ -4005,6 +4149,11 @@ pub async fn buffer_close(
     } else {
         None
     };
+    // Closing changed the project's open-buffer set — refresh its persisted session so the closed
+    // file isn't restored next time. No-op for an ephemeral (or already-retired) project.
+    if let Some(project) = &owning_project {
+        persist_project_session(state, project, false).await;
+    }
     Ok(aether_protocol::buffer::BufferCloseResult {
         next_buffer_id,
         opened,
@@ -4555,6 +4704,17 @@ pub async fn buffer_save(
         let _ = sender.send(notif).await;
     }
 
+    // A save promotes the buffer to permanent (above) and is the clearest "this buffer matters"
+    // signal — refresh the persisted session so an edit→save→quit reliably restores the file, even
+    // though its transient open didn't persist it. Best-effort, named-projects-only.
+    let project = {
+        let s = state.lock().await;
+        s.project_for_buffer(params.buffer_id).map(str::to_string)
+    };
+    if let Some(project) = project {
+        persist_project_session(state, &project, false).await;
+    }
+
     Ok(BufferSaveResult {
         saved_at_unix_ms,
         revision,
@@ -4621,6 +4781,16 @@ pub async fn buffer_set_transient(
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
+    }
+    // Keeping/unkeeping changes whether this buffer is part of the persisted working set (the
+    // session lists permanent buffers only) — refresh it. `Space k` is the explicit "this buffer
+    // matters" signal, with no later save/switch to rely on, so it must persist here directly.
+    let project = {
+        let s = state.lock().await;
+        s.project_for_buffer(params.buffer_id).map(str::to_string)
+    };
+    if let Some(project) = project {
+        persist_project_session(state, &project, false).await;
     }
     Ok(BufferSetTransientResult {
         transient: params.transient,
@@ -9877,6 +10047,16 @@ fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) 
 /// as `name` — the client renders an ephemeral id as "(no project)". They appear only while they
 /// hold a buffer, since an ephemeral project is auto-removed once its last buffer closes.
 fn project_candidates(s: &ServerState, names: &[String]) -> Vec<picker_state::ProjectCandidate> {
+    // Reorder the alphabetical disk listing into most-recently-activated-first using the persisted
+    // session stamps. Never-activated projects stay at the end in alphabetical order (see
+    // `sort_names_by_recency`). Disabled (left alphabetical) when sessions aren't persisted — tests
+    // and embeddings with no `sessions_path` — or if the file can't be read.
+    let mut names: Vec<String> = names.to_vec();
+    if let Some(path) = &s.sessions_path {
+        if let Ok(sessions) = crate::config::load_project_sessions_at(path) {
+            crate::config::sort_names_by_recency(&mut names, &sessions);
+        }
+    }
     let mut out: Vec<picker_state::ProjectCandidate> = names
         .iter()
         .map(|name| picker_state::ProjectCandidate {
@@ -9998,7 +10178,41 @@ fn build_buffer_candidates(
     for id in leftovers {
         out.push(buffer_candidate(&s.buffers[&id], &roots));
     }
+    // Dormant buffers (restored from the session, not yet loaded) come last, greyed out — but only
+    // those whose file isn't already open as a live buffer above (a stale dormant entry that was
+    // never pruned shouldn't double-show). MRU order is preserved by the list's own order.
+    let live_paths: std::collections::HashSet<&std::path::Path> = s
+        .buffers
+        .iter()
+        .filter(|(id, _)| belongs(id))
+        .filter_map(|(_, b)| b.canonical_path.as_deref())
+        .collect();
+    for d in &project.dormant_buffers {
+        if !live_paths.contains(d.path.as_path()) {
+            out.push(dormant_candidate(d, &roots));
+        }
+    }
     out
+}
+
+/// Picker candidate for a dormant (session-restored, not-yet-loaded) buffer: it carries the
+/// reserved id as its picker identity and renders greyed out, but has no live buffer behind it —
+/// the display is derived from the path, and the status is always `Clean`.
+fn dormant_candidate(
+    d: &crate::state::DormantBuffer,
+    roots: &[std::path::PathBuf],
+) -> picker_state::BufferCandidate {
+    let display = crate::workspace_index::project_relative_display(&d.path, roots)
+        .unwrap_or_else(|| d.path.display().to_string());
+    let path = crate::workspace_index::project_relative_parts(&d.path, roots);
+    picker_state::BufferCandidate {
+        buffer_id: d.id,
+        display,
+        status: BufferDirtyState::Clean,
+        path,
+        transient: false,
+        dormant: true,
+    }
 }
 
 fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state::BufferCandidate {
@@ -10022,6 +10236,7 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
         status: buffer_dirty_state(buf),
         path,
         transient: buf.transient,
+        dormant: false,
     }
 }
 
@@ -12125,6 +12340,80 @@ mod find_nearest_git_change_tests {
 }
 
 #[cfg(test)]
+mod next_buffer_tests {
+    use super::*;
+
+    /// Build a state with project "p" active for one client; returns the state and client id.
+    fn state_with_active_project() -> (ServerState, ClientId) {
+        let mut st = ServerState::new();
+        let root = std::path::PathBuf::from("/p");
+        st.projects.insert(
+            "p".to_string(),
+            crate::state::ProjectEntry {
+                id: "p".to_string(),
+                name: Some("p".to_string()),
+                paths: vec![root.clone()],
+                workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
+                    vec![root],
+                )),
+                mru_buffers: std::collections::VecDeque::new(),
+                dormant_buffers: Vec::new(),
+            },
+        );
+        let client_id = uuid::Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        std::mem::forget(_rx);
+        st.clients.insert(
+            client_id,
+            crate::state::ClientSession {
+                client_id,
+                outbound: tx,
+                active_project: Some("p".to_string()),
+            },
+        );
+        (st, client_id)
+    }
+
+    /// After a session restore, closing the last live buffer should land on the most-recent dormant
+    /// buffer (which `buffer/open` materializes by id) rather than returning `None` — which is what
+    /// makes the client spawn a blank scratch.
+    #[test]
+    fn next_buffer_falls_back_to_dormant_before_scratch() {
+        let (mut st, client_id) = state_with_active_project();
+        // No live buffers; two dormant ones restored from the session (front = most-recent).
+        let d1 = st.allocate_buffer_id();
+        let d2 = st.allocate_buffer_id();
+        st.projects.get_mut("p").unwrap().dormant_buffers = vec![
+            crate::state::DormantBuffer {
+                id: d1,
+                path: std::path::PathBuf::from("/p/a.rs"),
+            },
+            crate::state::DormantBuffer {
+                id: d2,
+                path: std::path::PathBuf::from("/p/b.rs"),
+            },
+        ];
+        assert_eq!(next_buffer_for_client(&st, client_id), Some(d1));
+
+        // A live buffer still wins over the dormant fallback.
+        let live = st.allocate_buffer_id();
+        let mut buf = Buffer::scratch(live, None, 1);
+        buf.canonical_path = Some(std::path::PathBuf::from("/p/live.rs"));
+        st.buffers.insert(live, buf);
+        st.buffer_projects.insert(live, "p".to_string());
+        st.touch_mru(live);
+        assert_eq!(next_buffer_for_client(&st, client_id), Some(live));
+    }
+
+    /// With neither live nor dormant buffers, `None` falls through so the caller opens a scratch.
+    #[test]
+    fn next_buffer_is_none_when_project_is_empty() {
+        let (st, client_id) = state_with_active_project();
+        assert_eq!(next_buffer_for_client(&st, client_id), None);
+    }
+}
+
+#[cfg(test)]
 mod project_name_tests {
     use super::validate_project_name;
 
@@ -12324,6 +12613,7 @@ mod subscribe_snapshot_tests {
                     vec![root.clone()],
                 )),
                 mru_buffers: std::collections::VecDeque::new(),
+                dormant_buffers: Vec::new(),
             },
         );
         let client_id = uuid::Uuid::new_v4();
@@ -12409,6 +12699,7 @@ mod subscribe_snapshot_tests {
                     vec![root.clone()],
                 )),
                 mru_buffers: std::collections::VecDeque::new(),
+                dormant_buffers: Vec::new(),
             },
         );
         let client_id = uuid::Uuid::new_v4();

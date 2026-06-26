@@ -1805,6 +1805,7 @@ impl Session {
                 relative_path: None,
                 match_indices: Vec::new(),
                 transient: false,
+                dormant: false,
             }),
             PickerKind::Projects => Some(PickerItem::Project {
                 name: self.project.clone(),

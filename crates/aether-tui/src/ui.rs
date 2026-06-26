@@ -2972,12 +2972,13 @@ fn picker_item_spans(
     // rich clients' trailing dot. Rendered after the display so it doesn't shift `match_indices`
     // (which index into the display). `None` = clean. The project picker reuses the same dot to
     // flag projects with unsaved buffers, so the two pickers read alike.
-    let (display_raw, match_indices, dot_color, italic) = match item {
+    let (display_raw, match_indices, dot_color, italic, dim) = match item {
         PickerItem::Buffer {
             display,
             status,
             match_indices,
             transient,
+            dormant,
             ..
         } => (
             display.as_str(),
@@ -2985,6 +2986,8 @@ fn picker_item_spans(
             buffer_dirty_dot_color(*status),
             // Transient buffers slant, like the status-bar label.
             *transient,
+            // Dormant (session-restored, not-yet-loaded) buffers render dimmed.
+            *dormant,
         ),
         PickerItem::Project {
             name,
@@ -3001,6 +3004,7 @@ fn picker_item_spans(
                 // buffer-dot colour; nothing when clean.
                 (*unsaved_buffers > 0).then_some(NORD9),
                 ephemeral,
+                false,
             )
         }
         PickerItem::File { .. }
@@ -3018,6 +3022,13 @@ fn picker_item_spans(
             base.add_modifier(Modifier::ITALIC),
             match_style.add_modifier(Modifier::ITALIC),
         )
+    } else {
+        (base, match_style)
+    };
+    // Dormant rows lose their foreground brightness (keeping the highlight bg), reading as "present
+    // but not loaded" — the terminal analogue of the GUI's greyed text.
+    let (base, match_style) = if dim {
+        (base.fg(NORD3), match_style.fg(NORD3))
     } else {
         (base, match_style)
     };

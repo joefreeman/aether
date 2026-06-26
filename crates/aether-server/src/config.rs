@@ -9,6 +9,7 @@
 
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Fixed loopback port. Single-instance: only one server can bind it. The canonical definition
@@ -98,6 +99,117 @@ fn write_app_settings_at(path: &Path, settings: &AppSettings) -> anyhow::Result<
     std::fs::write(path, body)
         .with_context(|| format!("writing app settings at {}", path.display()))?;
     Ok(())
+}
+
+/// Current wall-clock time in Unix milliseconds. Used to stamp project-session activation times.
+/// Saturates to 0 if the clock is somehow before the epoch.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Machine-managed (not user-authored) state for one project, persisted across server restarts so
+/// the project switcher can sort by recency and a re-activated project can restore the buffers that
+/// were open. Distinct from [`ProjectConfig`] (the user's `paths`) — this never holds anything the
+/// user types, which is why it lives in a JSON file rather than the project's TOML.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSession {
+    /// Wall-clock time (Unix ms) this project was last activated. Drives the switcher's
+    /// most-recent-first ordering. `0` for a project that's only ever had its buffer list written.
+    #[serde(default)]
+    pub last_activated_at: u64,
+    /// Canonical paths of the file-backed buffers that were open in this project, most-recently-used
+    /// first. On re-activation they're restored as *dormant* buffers (listed in the picker, loaded
+    /// lazily). Scratch buffers have no path and are omitted — persisting their unsaved contents is
+    /// future work.
+    #[serde(default)]
+    pub buffers: Vec<PathBuf>,
+}
+
+/// The whole session file: every named project's [`ProjectSession`], keyed by project name. A
+/// `BTreeMap` keeps the on-disk JSON deterministically ordered. Ephemeral projects (no `<name>.toml`)
+/// are never recorded here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSessions {
+    #[serde(default)]
+    pub projects: BTreeMap<String, ProjectSession>,
+}
+
+/// Path to the single machine-managed session file
+/// (`$XDG_CONFIG_HOME/aether/sessions.json`). One file for all projects so the switcher can read
+/// every recency stamp in one go. JSON (not TOML) signals "machine-managed, don't hand-edit".
+pub fn project_sessions_path() -> anyhow::Result<PathBuf> {
+    let base = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
+    Ok(base.config_dir().join("aether").join("sessions.json"))
+}
+
+/// Load the project-session file. A missing file is not an error — a fresh install has none, so we
+/// return an empty map. Path-parameterized so it can be unit-tested against a tempdir and pointed
+/// at a throwaway path in server tests (see [`crate::state::ServerState::sessions_path`]).
+pub fn load_project_sessions_at(path: &Path) -> anyhow::Result<ProjectSessions> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ProjectSessions::default()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading project sessions at {}", path.display()))
+        }
+    };
+    serde_json::from_str(&content)
+        .with_context(|| format!("parsing project sessions at {}", path.display()))
+}
+
+/// Write (or overwrite) the project-session file, creating the config directory if needed.
+pub fn write_project_sessions_at(path: &Path, sessions: &ProjectSessions) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(sessions).context("serializing project sessions")?;
+    std::fs::write(path, body)
+        .with_context(|| format!("writing project sessions at {}", path.display()))?;
+    Ok(())
+}
+
+/// Remove a project's recorded session, if present. Best-effort read-modify-write of the session
+/// file. Called when a project is deleted so its session doesn't linger as an orphan.
+pub fn remove_project_session_at(path: &Path, name: &str) -> anyhow::Result<()> {
+    let mut sessions = load_project_sessions_at(path)?;
+    if sessions.projects.remove(name).is_some() {
+        write_project_sessions_at(path, &sessions)?;
+    }
+    Ok(())
+}
+
+/// Move a project's recorded session from `old` to `new`, if present. Called when a project is
+/// renamed so its restored buffers and recency stamp follow the new name.
+pub fn rename_project_session_at(path: &Path, old: &str, new: &str) -> anyhow::Result<()> {
+    let mut sessions = load_project_sessions_at(path)?;
+    if let Some(sess) = sessions.projects.remove(old) {
+        sessions.projects.insert(new.to_string(), sess);
+        write_project_sessions_at(path, &sessions)?;
+    }
+    Ok(())
+}
+
+/// Reorder an alphabetically-sorted project-name list into most-recently-activated-first, using the
+/// session file's `last_activated_at` stamps. Projects with no recorded session (never activated, or
+/// only ever had buffers written) sort as `0` and stay at the end — and because the sort is stable
+/// over an already-alphabetical input, ties (including all the never-activated ones) keep their
+/// alphabetical order. Pure so it can be unit-tested without disk.
+pub fn sort_names_by_recency(names: &mut [String], sessions: &ProjectSessions) {
+    names.sort_by_key(|name| {
+        // Negate to get descending order from an ascending stable sort key.
+        std::cmp::Reverse(
+            sessions
+                .projects
+                .get(name)
+                .map(|s| s.last_activated_at)
+                .unwrap_or(0),
+        )
+    });
 }
 
 /// Directory containing the per-project `.toml` configs. Used by `list_project_names`.
@@ -491,6 +603,75 @@ mod tests {
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, "").unwrap();
         assert_eq!(load_app_settings_at(&path).unwrap(), AppSettings::default());
+    }
+
+    #[test]
+    fn project_sessions_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        // No file yet → empty map, not an error.
+        assert_eq!(
+            load_project_sessions_at(&path).unwrap(),
+            ProjectSessions::default()
+        );
+    }
+
+    #[test]
+    fn project_sessions_round_trip_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nested path exercises the create-parent branch.
+        let path = dir.path().join("aether").join("sessions.json");
+        let mut sessions = ProjectSessions::default();
+        sessions.projects.insert(
+            "work".into(),
+            ProjectSession {
+                last_activated_at: 1000,
+                buffers: vec![PathBuf::from("/work/a.rs"), PathBuf::from("/work/b.rs")],
+            },
+        );
+        sessions.projects.insert(
+            "dots".into(),
+            ProjectSession {
+                last_activated_at: 2000,
+                buffers: vec![],
+            },
+        );
+        write_project_sessions_at(&path, &sessions).unwrap();
+        assert_eq!(load_project_sessions_at(&path).unwrap(), sessions);
+    }
+
+    #[test]
+    fn recency_sort_orders_most_recent_first_then_alphabetical() {
+        let mut sessions = ProjectSessions::default();
+        sessions.projects.insert(
+            "beta".into(),
+            ProjectSession {
+                last_activated_at: 100,
+                buffers: vec![],
+            },
+        );
+        sessions.projects.insert(
+            "alpha".into(),
+            ProjectSession {
+                last_activated_at: 200,
+                buffers: vec![],
+            },
+        );
+        // `gamma` and `delta` have no recorded session → stamp 0 → they sit at the end, keeping the
+        // alphabetical order they came in with (the input is the alphabetical disk listing).
+        let mut names = vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "delta".to_string(),
+            "gamma".to_string(),
+        ];
+        sort_names_by_recency(&mut names, &sessions);
+        assert_eq!(names, vec!["alpha", "beta", "delta", "gamma"]);
+
+        // Flip the stamps: `beta` is now the most recent.
+        sessions.projects.get_mut("beta").unwrap().last_activated_at = 999;
+        sort_names_by_recency(&mut names, &sessions);
+        assert_eq!(names, vec!["beta", "alpha", "delta", "gamma"]);
     }
 
     #[test]

@@ -1024,14 +1024,16 @@ fn render_item<'a>(
             status,
             match_indices,
             transient,
+            dormant,
             ..
         } => {
-            // Buffer-state dot on the right, matching the web picker and the status bar.
+            // Buffer-state dot on the right, matching the web picker and the status bar. A dormant
+            // (session-restored, not-yet-loaded) buffer renders dimmed to signal it isn't live yet.
             let mut r = row![
                 highlighted(
                     display,
                     match_indices,
-                    theme::NORD4,
+                    if *dormant { theme::NORD3_BRIGHT } else { theme::NORD4 },
                     if *transient { SANS_ITALIC } else { SANS },
                     hovered,
                 ),
