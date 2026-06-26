@@ -103,9 +103,11 @@ pub struct ProjectCreateParams {
     pub name: String,
 }
 
-/// Open a file by absolute (or cwd-relative) path, resolving the project context for it. This is
-/// the project-agnostic entry point used by `ae /path/to/file` and the `Space Alt-w` open-from-path
-/// overlay — the cases that may need to *activate* a project (an ephemeral one when none is active).
+/// Open a file by absolute path, resolving the project context for it. This is the project-agnostic
+/// entry point used by `ae /path/to/file` and the `Space Alt-w` open-from-path overlay — the cases
+/// that may need to *activate* a project (an ephemeral one when none is active). The path must be
+/// absolute (a leading `~/` is fine): the server will **not** resolve it against its own working
+/// directory, which isn't the user's. (`ae path` resolves its arg client-side before sending.)
 /// Goto-definition into a file outside the active project doesn't go through here: it already has an
 /// active project to host the guest, so it opens the external buffer directly via `buffer/open`'s
 /// `absolute_path` (same external-buffer machinery, no project activation). The server:
@@ -130,8 +132,9 @@ impl RpcMethod for ProjectOpenPath {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectOpenPathParams {
-    /// File to open. Absolute, or relative to the server's current working directory. `~/` is
-    /// expanded server-side. Must exist on disk (open-from-path is for existing files).
+    /// File to open. Must be absolute; a leading `~/` is expanded server-side and also counts as
+    /// absolute. A relative path is rejected (the server won't resolve it against its own cwd). Must
+    /// exist on disk (open-from-path is for existing files).
     pub path: String,
     /// Open the buffer as transient (auto-closes once hidden) — used when the open is a preview.
     /// Defaults to a permanent open.

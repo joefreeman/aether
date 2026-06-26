@@ -495,6 +495,17 @@ pub async fn project_open_path(
 ) -> Result<ProjectActivateResult, RpcError> {
     let client_id = ctx.client_id;
     let raw = crate::config::expand_home(std::path::Path::new(&params.path));
+    // Require an absolute path (a leading `~/` counts — `expand_home` already made it absolute).
+    // We deliberately don't resolve a relative path against the *server's* working directory: that
+    // directory is meaningless to the user (the daemon's cwd, not theirs), so a relative open is
+    // almost always a mistake. The CLI (`ae path`) pre-resolves its arg client-side before reaching
+    // here, and goto-definition emits absolute paths, so only the open-from-path overlay can trip this.
+    if !raw.is_absolute() {
+        return Err(RpcError::invalid_path(format!(
+            "open-from-path needs an absolute path (or one starting with ~/); got {:?}",
+            params.path
+        )));
+    }
     let canonical = std::fs::canonicalize(&raw)
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
 

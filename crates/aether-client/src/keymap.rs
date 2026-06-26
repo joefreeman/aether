@@ -296,7 +296,7 @@ pub enum Action {
     Quit,
     Save,
     SaveAs,
-    /// `Space Alt-w` — open a file by typing its path (absolute, or relative to the server's cwd),
+    /// `Space Alt-w` — open a file by typing its absolute path (a leading `~/` is fine),
     /// regardless of the active project. Outside any project root the file opens as an external
     /// buffer; with no project active it lands in a fresh ephemeral context. Pairs with
     /// `Space w` (close buffer). Opens the open-from-path overlay; submit calls `project/open_path`.
@@ -800,7 +800,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenProjectSettings, "Project", "Project settings"),
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
     bind!(L, ch('w'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
-    bind!(L, ch('w'), Exact(Mods::ALT), A::OpenPath, "App", "Open file by path"),
+    bind!(L, ch('w'), Exact(Mods::ALT), A::OpenPath, "App", "Open file by absolute path"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
     bind!(L, ch('k'), Exact(Mods::NONE), A::ToggleKeep, "App", "Keep buffer (toggle transient)"),

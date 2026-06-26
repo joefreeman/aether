@@ -3267,8 +3267,8 @@ impl Session {
         Effects::none()
     }
 
-    /// Submit the open-from-path overlay: open `path` (absolute, or relative to the server's cwd)
-    /// via `project/open_path`. The server resolves the project context — internal if it's under
+    /// Submit the open-from-path overlay: open `path` (absolute, or a leading `~/`) via
+    /// `project/open_path`. The server resolves the project context — internal if it's under
     /// the active project's roots, an external buffer if not, a fresh ephemeral context if no
     /// project is active. The result lands like a project switch (adopt the project + buffer); the
     /// path field is already non-empty (checked by the caller).

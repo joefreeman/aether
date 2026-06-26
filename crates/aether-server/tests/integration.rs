@@ -21077,6 +21077,37 @@ async fn open_path_with_no_project_creates_ephemeral() {
 }
 
 #[tokio::test]
+async fn open_path_rejects_a_relative_path() {
+    // The open-from-path overlay requires an absolute path: the server must NOT resolve a relative
+    // one against its own working directory (which isn't the user's). A `~/`-prefixed path is fine
+    // (it expands to absolute), but a bare relative path is rejected before any disk access.
+    let (server, mut ws, _ext_abs) = setup_with_external_file().await;
+    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+        &mut ws,
+        1,
+        &ProjectActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let err = send_request_expect_err::<ProjectOpenPath>(
+        &mut ws,
+        2,
+        &ProjectOpenPathParams {
+            path: "some/relative/file.rs".into(),
+            transient: None,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("absolute"),
+        "error should explain an absolute path is required, got: {err}"
+    );
+    drop(server);
+}
+
+#[tokio::test]
 async fn open_path_external_within_active_project_keeps_project() {
     let (server, mut ws, ext_abs) = setup_with_external_file().await;
     let _act: ProjectActivateResult = send_request::<ProjectActivate>(
