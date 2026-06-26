@@ -6,7 +6,7 @@
 use super::chips::{self, ChipEditor, ChipEditorField, ChipId};
 use super::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
-use super::picker::{item_key, DefaultSkip, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
+use super::picker::{item_key, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
 use super::session::{
     buffer_info, label_for_path, min_pos, severity_label, step_font_size, strip_longest_root,
@@ -1789,23 +1789,28 @@ impl Session {
         let reset = !kind.preserves_state();
         self.picker = Some(PickerState::new(kind));
         let buffer_id = self.buffer.buffer_id;
-        // Buffers / Projects: default the highlight to the first item that isn't the active
-        // buffer/project, so Enter is a quick flip to the previous one (web/TUI behaviour).
-        // Resolved by the first non-empty push.
-        let skip = match kind {
-            PickerKind::Buffers => Some(DefaultSkip::Buffer(buffer_id)),
-            PickerKind::Projects => Some(DefaultSkip::Project(self.project.clone())),
-            _ => None,
-        };
-        if let Some(p) = &mut self.picker {
-            p.default_skip = skip;
-        }
-        // Explorer: anchor the highlight on the active buffer's filename, so the listing
-        // lands on "where you are" (matched by name via the `effective_center_on` echo).
-        // LspServers: anchor on the active buffer's own language server, so the picker opens with
-        // *your* server selected (matched by `language` + `workspace_root` — the LspServer item
-        // key; the other fields are display-only and ignored by the match).
+        // Buffers / Projects / Explorer / LspServers all open with the highlight on "where you
+        // are" — the active buffer/project/file/language-server — matched by item key via the
+        // `effective_center_on` echo (the display-only fields below are ignored by the match).
+        // Buffers: the active buffer (key is `buffer_id`).
+        // Projects: the active project (key is `name`).
+        // Explorer: the active buffer's filename, so the listing lands on the current file.
+        // LspServers: the active buffer's own language server (key is `language` + `workspace_root`).
         let center_on = match kind {
+            PickerKind::Buffers => Some(PickerItem::Buffer {
+                buffer_id,
+                display: String::new(),
+                status: Default::default(),
+                path_index: None,
+                relative_path: None,
+                match_indices: Vec::new(),
+                transient: false,
+            }),
+            PickerKind::Projects => Some(PickerItem::Project {
+                name: self.project.clone(),
+                unsaved_buffers: 0,
+                match_indices: Vec::new(),
+            }),
             PickerKind::Explorer => self.buffer.path.as_deref().and_then(|path| {
                 let name = std::path::Path::new(path)
                     .file_name()?
@@ -2099,10 +2104,9 @@ impl Session {
         // `picker/update` push arrives, so the shell can show progress in the gap (otherwise a slow
         // grep reads as "no matches" until results stream). The server's pushes refine it from here.
         p.ticking = true;
-        // A query change invalidates any pending pre-selection (centering / skip-the-
-        // active-item default) — the user is steering somewhere new.
+        // A query change invalidates any pending pre-selection (the active-item centering) —
+        // the user is steering somewhere new.
         p.pending_center = None;
-        p.default_skip = None;
         p.reveal_on_update = None;
         let (kind, query, generation) = (p.kind, p.query.clone(), p.generation);
         // An open glob/dir editor folds its in-progress value in for a live preview; otherwise

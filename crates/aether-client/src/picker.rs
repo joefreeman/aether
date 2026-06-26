@@ -10,24 +10,6 @@ pub const VISIBLE_ROWS: usize = 18;
 /// Window size requested from the server (over-fetched so small moves don't refetch).
 pub const FETCH_LIMIT: u32 = 90;
 
-/// The active buffer/project a fresh Buffers/Projects open should skip over when defaulting
-/// its highlight (see [`PickerState::default_skip`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DefaultSkip {
-    Buffer(aether_protocol::BufferId),
-    Project(String),
-}
-
-impl DefaultSkip {
-    fn matches(&self, item: &PickerItem) -> bool {
-        match (self, item) {
-            (DefaultSkip::Buffer(id), PickerItem::Buffer { buffer_id, .. }) => id == buffer_id,
-            (DefaultSkip::Project(active), PickerItem::Project { name, .. }) => active == name,
-            _ => false,
-        }
-    }
-}
-
 /// How to scroll the highlight into view when the next update lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reveal {
@@ -63,11 +45,6 @@ pub struct PickerState {
     /// Matched by identity ([`item_key`]) — the listed item carries live decoration
     /// (git status, match indices) the anchor doesn't.
     pub pending_center: Option<PickerItem>,
-    /// Fresh-open default highlight: land on the first item that *isn't* the client's active
-    /// buffer/project, so Enter is a quick flip to the previous one. By identity, not "row 1"
-    /// — the buffers MRU is shared across clients, so another client's activity can put any
-    /// buffer at the top. One-shot: the first push with items decides and clears it.
-    pub default_skip: Option<DefaultSkip>,
     /// Scroll the highlight into view when the next update lands (set by keyboard moves that
     /// forced a refetch and by centred opens — scroll-driven refetches must NOT yank the view).
     pub reveal_on_update: Option<Reveal>,
@@ -123,7 +100,6 @@ impl PickerState {
             display_offset: 0,
             total_display_rows: 0,
             pending_center: None,
-            default_skip: None,
             reveal_on_update: None,
             hovered: None,
             directory: None,
@@ -453,15 +429,6 @@ impl PickerState {
                 self.selected = self.offset + pos as u32;
             } else {
                 self.pending_center = Some(center); // not in this window yet
-            }
-        } else if !self.items.is_empty() {
-            if let Some(skip) = self.default_skip.take() {
-                let pos = self
-                    .items
-                    .iter()
-                    .position(|i| !skip.matches(i))
-                    .unwrap_or(0); // every item is the active one (single open buffer)
-                self.selected = self.offset + pos as u32;
             }
         }
         // The create row (Explorer) adds one selectable slot past the matches; keep the highlight
@@ -1121,31 +1088,6 @@ mod tests {
             Some(3),
             "first use is below both headers"
         );
-    }
-
-    #[test]
-    fn default_skip_lands_on_first_non_active_item() {
-        // Projects open: the highlight defaults past the active project — by identity, not
-        // "row 1" (the active one needn't be first). One-shot: later pushes leave the
-        // user's selection alone, and unwrap_or(0) covers "every item is the active one".
-        let mut s = PickerState::new(PickerKind::Projects);
-        s.default_skip = Some(DefaultSkip::Project("aether".into()));
-        assert!(s.apply_update(update(PickerKind::Projects, 0, 0, 1, 1)));
-        // Single item p0 ≠ "aether" → selected 0 and the skip is spent.
-        assert_eq!(s.selected, 0);
-        assert!(s.default_skip.is_none());
-
-        let mut s = PickerState::new(PickerKind::Projects);
-        s.default_skip = Some(DefaultSkip::Project("p0".into()));
-        assert!(s.apply_update(update(PickerKind::Projects, 0, 0, 3, 3)));
-        assert_eq!(s.selected, 1, "skips the active project at row 0");
-
-        // Only the active project listed → fall back to row 0.
-        let mut s = PickerState::new(PickerKind::Projects);
-        s.default_skip = Some(DefaultSkip::Project("p0".into()));
-        assert!(s.apply_update(update(PickerKind::Projects, 0, 0, 1, 1)));
-        assert_eq!(s.selected, 0);
-        assert!(s.default_skip.is_none());
     }
 
     #[test]

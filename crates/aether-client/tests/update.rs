@@ -985,6 +985,30 @@ fn lsp_picker_centers_on_the_current_buffers_server() {
 }
 
 #[test]
+fn buffers_picker_centers_on_the_active_buffer() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.buffer.buffer_id = 7;
+    let fx = s.open_picker(PickerKind::Buffers, None, None, false);
+    let params = find_request(&fx, "picker/view").expect("buffers picker opens via picker/view");
+    // The view is anchored on the active buffer (matched by buffer_id), so it opens selected.
+    assert_eq!(params["center_on"]["kind"], "buffer");
+    assert_eq!(params["center_on"]["buffer_id"], 7);
+}
+
+#[test]
+fn projects_picker_centers_on_the_active_project() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.project = "aether".into();
+    let fx = s.open_picker(PickerKind::Projects, None, None, false);
+    let params = find_request(&fx, "picker/view").expect("projects picker opens via picker/view");
+    // The view is anchored on the active project (matched by name), so it opens selected.
+    assert_eq!(params["center_on"]["kind"], "project");
+    assert_eq!(params["center_on"]["name"], "aether");
+}
+
+#[test]
 fn closing_the_lsp_dialog_returns_to_the_picker() {
     use aether_client::session::Prompt;
     use aether_protocol::lsp::LspStatus;
