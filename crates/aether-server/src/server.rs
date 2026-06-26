@@ -10,11 +10,16 @@ use crate::watcher;
 use anyhow::{bail, Context};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// Public entry point: bind the fixed port, manage the runtime file, run the server.
-pub async fn run() -> anyhow::Result<()> {
+///
+/// `idle_timeout` controls the auto-reaper: `Some(d)` makes this a client-conjured instance that
+/// shuts itself down after `d` with no connected clients and no unsaved buffers; `None` (the
+/// `ae server` daemon) runs until signalled. See [`idle_reaper`].
+pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
     let bind_addr = format!("127.0.0.1:{SERVER_PORT}");
     let listener = TcpListener::bind(&bind_addr)
         .await
@@ -51,12 +56,17 @@ pub async fn run() -> anyhow::Result<()> {
     // Drop guard to clean up the runtime file regardless of how we exit.
     let _guard = RuntimeFileGuard(runtime_path);
 
-    run_with_listener(listener, state).await
+    run_with_listener(listener, state, idle_timeout).await
 }
 
 /// Run the accept loop with an already-bound listener and constructed state. Used by tests to
-/// embed the server in-process without touching the filesystem-based runtime file.
-pub async fn run_with_listener(listener: TcpListener, state: SharedState) -> anyhow::Result<()> {
+/// embed the server in-process without touching the filesystem-based runtime file (they pass
+/// `idle_timeout: None` so the test server never reaps itself out from under the test).
+pub async fn run_with_listener(
+    listener: TcpListener,
+    state: SharedState,
+    idle_timeout: Option<Duration>,
+) -> anyhow::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate())?;
 
@@ -67,6 +77,13 @@ pub async fn run_with_listener(listener: TcpListener, state: SharedState) -> any
         if let Err(e) = watcher::spawn(state.clone()).await {
             tracing::warn!(error = %e, "file watcher failed to start; continuing without it");
         }
+    }
+
+    // The reaper signals this when an auto-started server has been idle long enough; the accept
+    // loop treats it exactly like SIGINT/SIGTERM.
+    let idle_shutdown = Arc::new(Notify::new());
+    if let Some(timeout) = idle_timeout {
+        tokio::spawn(idle_reaper(state.clone(), timeout, idle_shutdown.clone()));
     }
 
     loop {
@@ -89,9 +106,41 @@ pub async fn run_with_listener(listener: TcpListener, state: SharedState) -> any
                 tracing::info!("received SIGTERM, shutting down");
                 break;
             }
+            _ = idle_shutdown.notified() => {
+                tracing::info!("idle timeout elapsed with no clients; shutting down");
+                break;
+            }
         }
     }
     Ok(())
+}
+
+/// Watchdog for client-conjured servers: once no clients are connected *and* no buffer has unsaved
+/// edits, start a clock; if that stays true for `timeout`, notify `shutdown` so the accept loop
+/// exits. A reconnecting client (or any new edit) resets the clock. Keeping the server alive while
+/// a buffer is dirty trades a possibly-immortal idle server for never silently dropping unsaved
+/// work — acceptable until unsaved buffers are persisted across server death.
+async fn idle_reaper(state: SharedState, timeout: Duration, shutdown: Arc<Notify>) {
+    // Poll often enough to honour `timeout` without busy-looping; for the long production timeout
+    // this lands at the 15s ceiling, while short test timeouts still get a sub-timeout cadence.
+    let poll = (timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(15));
+    let mut idle_since: Option<Instant> = None;
+    loop {
+        tokio::time::sleep(poll).await;
+        let idle = {
+            let s = state.lock().await;
+            s.clients.is_empty() && !s.has_unsaved_buffers()
+        };
+        if idle {
+            let since = *idle_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= timeout {
+                shutdown.notify_one();
+                return;
+            }
+        } else {
+            idle_since = None;
+        }
+    }
 }
 
 /// Handle to a running server (for in-process embedding by tests). Dropping aborts the server task.
@@ -192,7 +241,7 @@ pub async fn spawn_for_test_multi_with_sessions(
     }
 
     let join = tokio::spawn(async move {
-        let _ = run_with_listener(listener, state).await;
+        let _ = run_with_listener(listener, state, None).await;
     });
     Ok(ServerHandle {
         port,
@@ -236,5 +285,74 @@ struct RuntimeFileGuard(PathBuf);
 impl Drop for RuntimeFileGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Buffer, ServerState};
+    use std::path::PathBuf;
+
+    /// A reapable server with no clients ever connecting shuts itself down once the idle timeout
+    /// elapses — this is the auto-start cleanup path.
+    #[tokio::test]
+    async fn idle_server_reaps_when_no_clients_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = Arc::new(Mutex::new(ServerState::new()));
+        let handle = tokio::spawn(run_with_listener(
+            listener,
+            state,
+            Some(Duration::from_millis(80)),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            handle.is_finished(),
+            "expected the idle server to reap itself after the timeout"
+        );
+    }
+
+    /// A dirty buffer pins the server open even with no clients connected: we never reap unsaved
+    /// work out from under a disconnected (e.g. crashed) client.
+    #[tokio::test]
+    async fn dirty_buffer_prevents_idle_reap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = Arc::new(Mutex::new(ServerState::new()));
+        {
+            let mut s = state.lock().await;
+            let id: aether_protocol::BufferId = 1;
+            let mut buf = Buffer::new_at_path(id, PathBuf::from("/tmp/dirty.txt"), None);
+            buf.dirty = true;
+            s.buffers.insert(id, buf);
+        }
+        let handle = tokio::spawn(run_with_listener(
+            listener,
+            state,
+            Some(Duration::from_millis(80)),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !handle.is_finished(),
+            "server reaped itself despite a dirty buffer"
+        );
+        handle.abort();
+    }
+
+    /// A persistent (`None` timeout) server — the `ae server` daemon — never reaps, even with no
+    /// clients and a clean tree.
+    #[tokio::test]
+    async fn persistent_server_never_reaps() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = Arc::new(Mutex::new(ServerState::new()));
+        let handle = tokio::spawn(run_with_listener(listener, state, None));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !handle.is_finished(),
+            "a persistent server must not shut itself down"
+        );
+        handle.abort();
     }
 }

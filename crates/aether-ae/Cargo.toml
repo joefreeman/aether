@@ -24,3 +24,7 @@ tokio = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+# `setsid` for detaching the auto-started server from the controlling terminal.
+libc = "0.2"

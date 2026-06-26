@@ -33,6 +33,7 @@ dependencies = [
  "aether-tui",
  "anyhow",
  "clap",
+ "libc",
  "tokio",
  "tracing-subscriber",
 ]

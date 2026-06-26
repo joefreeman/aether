@@ -570,6 +570,12 @@ impl ServerState {
             .collect()
     }
 
+    /// Whether any open buffer (in any project) has unsaved edits. The idle reaper consults this so
+    /// an auto-started server never shuts itself down while work is in flight.
+    pub fn has_unsaved_buffers(&self) -> bool {
+        self.buffers.values().any(|b| b.dirty)
+    }
+
     /// How many open buffers in `project` have unsaved edits (`Buffer::dirty`). Drives the
     /// unsaved-count shown on each row of the project picker. `0` for a project with no loaded
     /// buffers (the common case for a configured-but-unvisited project).
