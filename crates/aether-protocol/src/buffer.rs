@@ -26,10 +26,10 @@ pub struct BufferOpenParams {
     pub buffer_id: Option<BufferId>,
     pub path_index: Option<u32>,
     pub relative_path: Option<String>,
-    /// Open a file by absolute path, bypassing the `path_index`/`relative_path` project-root
-    /// resolution. Set only by the project-aware open-from-path flow (`project/open_path`) and the
-    /// goto-definition follow path, where the target may lie *outside* the active project's roots —
-    /// an "external" buffer. Unlike root-relative opens (which are confined to the project boundary
+    /// Open a file by absolute path, bypassing the `path_index`/`relative_path` workspace-root
+    /// resolution. Set only by the workspace-aware open-from-path flow (`workspace/open_path`) and the
+    /// goto-definition follow path, where the target may lie *outside* the active workspace's roots —
+    /// an "external" buffer. Unlike root-relative opens (which are confined to the workspace boundary
     /// to block `../` traversal), an absolute-path open is allowed to land outside the roots; the
     /// server marks the resulting buffer external (no git baseline, trust-restricted LSP). Mutually
     /// exclusive with `path_index`/`relative_path`. Ignored when `buffer_id` is set.
@@ -94,7 +94,7 @@ pub struct BufferOpenResult {
     /// Canonical absolute path of the file on disk, when the buffer is backed by one. `None` for
     /// scratch buffers. Lets the client (e.g. file-browser navigation) work in absolute paths.
     pub path: Option<String>,
-    /// Small per-project display number for a scratch buffer (`(scratch N)`); `None` for
+    /// Small per-workspace display number for a scratch buffer (`(scratch N)`); `None` for
     /// file-backed buffers. The client renders the buffer label from this rather than `buffer_id`,
     /// so the numbers stay small and reset as scratches close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,7 +195,7 @@ pub struct BufferCloseResult {
 // ---- buffer/closed (notification) ---------------------------------------------------------------
 
 /// Pushed to a client when a buffer it currently has open is closed by *another* client (a plain
-/// `buffer/close`, or a path/project deletion that tore the buffer down). The receiving client
+/// `buffer/close`, or a path/workspace deletion that tore the buffer down). The receiving client
 /// switches to `next_buffer_id` (its MRU top after the close), or opens a fresh scratch when
 /// `None` — the same convention as [`BufferCloseResult`]. Only sent to clients that had a viewport
 /// on the buffer; the client that initiated the close learns the outcome from its RPC result
@@ -344,7 +344,7 @@ pub struct BufferStateParams {
     pub transient: bool,
     /// The buffer's current canonical path on disk (`None` for an unsaved scratch). Carried so a
     /// save-as — which renames the *shared* buffer — relabels every other client viewing it: they
-    /// adopt the new path and re-derive their project-relative label. Unchanged on in-place
+    /// adopt the new path and re-derive their workspace-relative label. Unchanged on in-place
     /// save/reload (the client only adopts a differing path).
     #[serde(default)]
     pub path: Option<String>,

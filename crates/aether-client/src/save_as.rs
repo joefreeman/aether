@@ -1,8 +1,8 @@
-//! The save-as prompt's editor (`Alt-s`): a project-relative path field with the same
+//! The save-as prompt's editor (`Alt-s`): a workspace-relative path field with the same
 //! directory-completion UX as the picker's dir-scope chip editor (docs/picker-filters.md § 1.6),
 //! so saving somewhere reuses the muscle memory of scoping a search there.
 //!
-//! It mirrors [`crate::chips::ChipEditor`]'s dir half — a multi-root projects' leading root field
+//! It mirrors [`crate::chips::ChipEditor`]'s dir half — a multi-root workspaces' leading root field
 //! (inline smartcase typeahead, `:` separator) ahead of a `directory/list`-backed path field with
 //! ghost suggestions, `Tab`/`Alt-l` accept, `Alt-j`/`k` cycle, and fish-style `Alt-Backspace`
 //! segment pop — with two deliberate departures, because the path's final segment is a *new
@@ -26,11 +26,11 @@ use crate::chips::{
 use crate::labels::root_labels;
 use aether_protocol::directory::DirectoryEntry;
 
-/// The save-as path editor. In single-root projects only the path field exists (`field` is always
-/// `Path`); multi-root projects add the leading root field.
+/// The save-as path editor. In single-root workspaces only the path field exists (`field` is always
+/// `Path`); multi-root workspaces add the leading root field.
 #[derive(Debug)]
 pub struct SaveAsEditor {
-    /// Which segment has focus. Always `Path` in single-root projects.
+    /// Which segment has focus. Always `Path` in single-root workspaces.
     pub field: ChipEditorField,
     /// The root-relative path being typed (directory portion + filename leaf).
     pub input: Input,
@@ -53,7 +53,7 @@ pub struct SaveAsEditor {
 impl SaveAsEditor {
     /// Open the editor pre-filled with `path` under root `root_index`. `field` is the initially
     /// focused segment (callers focus the root field for a brand-new buffer in a multi-root
-    /// project, the path field otherwise). `listing_dir_abs` starts empty so the caller's first
+    /// workspace, the path field otherwise). `listing_dir_abs` starts empty so the caller's first
     /// [`SaveAsEditor::sync_dir_listing`] always reports a refetch is due.
     pub fn new(path: String, field: ChipEditorField, root_index: u32) -> Self {
         SaveAsEditor {
@@ -109,7 +109,7 @@ impl SaveAsEditor {
     /// Confirm the root field (adopting the ghost completion) and move focus into the path. An
     /// *invalid* root refuses: focus stays on the (red) root field. Returns `true` when the
     /// listing went stale and the caller should refetch.
-    pub fn commit_root_field(&mut self, labels: &[String], project_paths: &[String]) -> bool {
+    pub fn commit_root_field(&mut self, labels: &[String], workspace_paths: &[String]) -> bool {
         let Some((idx, _)) = self.root_ghost(labels) else {
             return false; // no candidate ⇔ root_invalid — stay put
         };
@@ -121,7 +121,7 @@ impl SaveAsEditor {
             .position(|&c| c == idx)
             .unwrap_or(0);
         self.field = ChipEditorField::Path;
-        self.sync_dir_listing(project_paths)
+        self.sync_dir_listing(workspace_paths)
     }
 
     // ---- directory listing ---------------------------------------------------------------------
@@ -129,9 +129,9 @@ impl SaveAsEditor {
     /// The absolute directory the path field's suggestions should list: the dir portion of the
     /// typed path, resolved under the chosen root. `None` under an *invalid* root (suggestions
     /// beneath the fallback root would read as silently defaulting to it).
-    pub fn dir_listing_path(&self, project_paths: &[String]) -> Option<String> {
-        let root = if project_paths.len() > 1 {
-            let labels = root_labels(project_paths);
+    pub fn dir_listing_path(&self, workspace_paths: &[String]) -> Option<String> {
+        let root = if workspace_paths.len() > 1 {
+            let labels = root_labels(workspace_paths);
             if self.root_invalid(&labels) {
                 return None;
             }
@@ -140,7 +140,7 @@ impl SaveAsEditor {
             0
         };
         Some(join_root_relative(
-            project_paths,
+            workspace_paths,
             root,
             dir_of_input(&self.input.text),
         ))
@@ -165,8 +165,8 @@ impl SaveAsEditor {
     /// Reconcile the listing key with the current (root, dir-portion) pair. Returns `true` when
     /// they diverged — the listing was cleared and the caller should fire a fresh `directory/list`
     /// for [`SaveAsEditor::dir_listing_path`].
-    pub fn sync_dir_listing(&mut self, project_paths: &[String]) -> bool {
-        let Some(abs) = self.dir_listing_path(project_paths) else {
+    pub fn sync_dir_listing(&mut self, workspace_paths: &[String]) -> bool {
+        let Some(abs) = self.dir_listing_path(workspace_paths) else {
             return false;
         };
         if abs == self.listing_dir_abs {
@@ -214,33 +214,33 @@ impl SaveAsEditor {
     /// Tab / Alt-l in the path field: absorb the ghost into the input. Returns `true` when the
     /// dir portion grew (a directory was accepted) and the caller should refetch — accepting a
     /// *file* extends only the leaf, so no refetch.
-    pub fn accept_path_suggestion(&mut self, project_paths: &[String]) -> bool {
+    pub fn accept_path_suggestion(&mut self, workspace_paths: &[String]) -> bool {
         let Some(suffix) = self.path_ghost() else {
             return false;
         };
         self.input.push_str(&suffix);
         self.suggestion_idx = 0;
-        self.sync_dir_listing(project_paths)
+        self.sync_dir_listing(workspace_paths)
     }
 
     /// Alt-Backspace in a non-empty path field: drop the rightmost segment, fish-style. Returns
     /// `true` when the dir portion shrank and a refetch is due.
-    pub fn pop_path_segment(&mut self, project_paths: &[String]) -> bool {
+    pub fn pop_path_segment(&mut self, workspace_paths: &[String]) -> bool {
         let popped = pop_segment(&self.input.text);
         self.input.set(popped);
         self.suggestion_idx = 0;
-        self.sync_dir_listing(project_paths)
+        self.sync_dir_listing(workspace_paths)
     }
 
     /// Bookkeeping after a free-form edit to the path field: reset the suggestion highlight and
     /// report whether the dir portion moved.
-    pub fn path_edited(&mut self, project_paths: &[String]) -> bool {
+    pub fn path_edited(&mut self, workspace_paths: &[String]) -> bool {
         self.suggestion_idx = 0;
-        self.sync_dir_listing(project_paths)
+        self.sync_dir_listing(workspace_paths)
     }
 
     /// True when the path is *definitely* unsaveable as typed — the red-worthy condition: the dir
-    /// portion failed to list (its parent directory doesn't exist or sits outside the project
+    /// portion failed to list (its parent directory doesn't exist or sits outside the workspace
     /// boundary). The filename leaf is free, so it never invalidates; a `Pending` listing is
     /// unknown, not invalid.
     pub fn path_invalid(&self) -> bool {
@@ -250,13 +250,13 @@ impl SaveAsEditor {
     /// The `(path_index, relative_path)` a commit should save to — the literal typed path under
     /// the chosen root. `None` for an empty path (nothing to save to). Absolute paths (a leading
     /// `/`) are handled by the caller, which re-resolves them against the roots.
-    pub fn save_target(&self, project_paths: &[String]) -> Option<(u32, String)> {
+    pub fn save_target(&self, workspace_paths: &[String]) -> Option<(u32, String)> {
         let path = self.input.text.trim().to_string();
         if path.is_empty() {
             return None;
         }
-        let path_index = if project_paths.len() > 1 {
-            self.chosen_root(&root_labels(project_paths))
+        let path_index = if workspace_paths.len() > 1 {
+            self.chosen_root(&root_labels(workspace_paths))
         } else {
             0
         };

@@ -297,15 +297,15 @@ pub enum Action {
     Save,
     SaveAs,
     /// `Space Alt-w` — open a file by typing its absolute path (a leading `~/` is fine),
-    /// regardless of the active project. Outside any project root the file opens as an external
-    /// buffer; with no project active it lands in a fresh ephemeral context. Pairs with
-    /// `Space w` (close buffer). Opens the open-from-path overlay; submit calls `project/open_path`.
+    /// regardless of the active workspace. Outside any workspace root the file opens as an external
+    /// buffer; with no workspace active it lands in a fresh ephemeral context. Pairs with `Space w`
+    /// (switch workspace). Opens the open-from-path overlay; submit calls `workspace/open_path`.
     OpenPath,
     Reload,
     /// Toggle the active buffer's transient ("keep") state — pin a preview permanent, or release a
     /// permanent buffer back to transient. Refused for unsaved buffers (auto-close would discard).
     ToggleKeep,
-    /// Copy the active buffer's project-relative path to the system clipboard.
+    /// Copy the active buffer's workspace-relative path to the system clipboard.
     CopyRelativePath,
     /// Copy the active buffer's absolute (canonical) path to the system clipboard.
     CopyAbsolutePath,
@@ -339,15 +339,15 @@ pub enum Action {
     /// `Space Alt-g` — open Grep with the query seeded from the buffer's selection (the grep
     /// equivalent of `Alt-/`). Sticky filters/options carry over; an empty selection just opens grep.
     OpenGrepFromSelection,
-    /// `Space Alt-e` — Explorer at the buffer's project root rather than its directory.
+    /// `Space Alt-e` — Explorer at the buffer's workspace root rather than its directory.
     OpenExplorerAtRoot,
 
     // ---- shell-local overlays (dispatched via `Effect::ShellAction`; a shell without the
     // overlay ignores them) ----
     /// `Space ?` — the keyboard-shortcut help overlay, generated from these tables.
     OpenHelp,
-    /// `Space ,` — the project-settings overlay (roots + rename). TUI-only today.
-    OpenProjectSettings,
+    /// `Space ,` — the workspace-settings overlay (roots + rename). TUI-only today.
+    OpenWorkspaceSettings,
     /// `Space .` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
     /// lives here too (a stepped value row), not on a keybinding.
     OpenAppSettings,
@@ -782,33 +782,33 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('g'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Grep), "Files", "Grep workspace"),
     bind!(L, ch('g'), Exact(Mods::ALT), A::OpenGrepFromSelection, "Files", "Grep for selection"),
     bind!(L, ch('e'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Explorer), "Files", "File explorer"),
-    bind!(L, ch('e'), Exact(Mods::ALT), A::OpenExplorerAtRoot, "Files", "File explorer at project root"),
-    bind!(L, ch('p'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Projects), "Project", "Switch project"),
+    bind!(L, ch('e'), Exact(Mods::ALT), A::OpenExplorerAtRoot, "Files", "File explorer at workspace root"),
+    bind!(L, ch('w'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Workspaces), "Workspace", "Switch workspace"),
     bind!(L, ch('d'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics in current buffer"),
-    bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::DiagnosticsProject), "Code", "Project diagnostics"),
+    bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::DiagnosticsWorkspace), "Code", "Workspace diagnostics"),
     bind!(L, ch('j'), Exact(Mods::NONE), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
     bind!(L, ch('r'), Exact(Mods::NONE), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
     bind!(L, ch('c'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitChangesFile), "Git", "Git changes in current file"),
-    bind!(L, ch('c'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitChanges), "Git", "Project git changes (hunks)"),
+    bind!(L, ch('c'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitChanges), "Git", "Workspace git changes (hunks)"),
     bind!(L, ch('n'), Exact(Mods::NONE), A::GrepNavigate(Direction::Forward), "Search", "Next grep hit"),
     bind!(L, ch('n'), Exact(Mods::ALT), A::GrepNavigate(Direction::Backward), "Search", "Previous grep hit"),
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),
     bind!(L, ch('?'), Any, A::OpenHelp, "App", "Show keyboard shortcuts"),
-    bind!(L, ch(','), Exact(Mods::NONE), A::OpenProjectSettings, "Project", "Project settings"),
+    bind!(L, ch(','), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
-    bind!(L, ch('w'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
+    bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(L, ch('w'), Exact(Mods::ALT), A::OpenPath, "App", "Open file by absolute path"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
     bind!(L, ch('k'), Exact(Mods::NONE), A::ToggleKeep, "App", "Keep buffer (toggle transient)"),
     bind!(L, ch('k'), Exact(Mods::ALT), A::Reload, "App", "Reload from disk"),
-    bind!(L, ch('a'), Exact(Mods::NONE), A::CopyRelativePath, "App", "Copy relative path"),
-    bind!(L, ch('a'), Exact(Mods::ALT), A::CopyAbsolutePath, "App", "Copy absolute path"),
-    bind!(L, ch('y'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
-    bind!(L, ch('y'), Exact(Mods::ALT), A::RevertHunk, "Git", "Revert change"),
+    bind!(L, ch('p'), Exact(Mods::NONE), A::CopyRelativePath, "App", "Copy relative path"),
+    bind!(L, ch('p'), Exact(Mods::ALT), A::CopyAbsolutePath, "App", "Copy absolute path"),
+    bind!(L, ch('a'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
+    bind!(L, ch('a'), Exact(Mods::ALT), A::RevertHunk, "Git", "Revert change"),
     bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
 ];
 
@@ -898,20 +898,20 @@ mod tests {
             lookup(KeyContext::Leader, ch('m'), Mods::NONE).map(|b| b.action),
             Some(Action::ShowCommitInfo)
         ));
-        // Go-to-definition is on Enter; the Space leader's `d` is the project diagnostics list, and
+        // Go-to-definition is on Enter; the Space leader's `d` is the workspace diagnostics list, and
         // `Alt-d` the current buffer's.
         assert!(matches!(
             lookup(KeyContext::Normal, KeyCode::Enter, Mods::NONE).map(|b| b.action),
             Some(Action::GotoDefinition)
         ));
-        // Plain leader is buffer-scoped, Alt widens to the project (diagnostics + git changes).
+        // Plain leader is buffer-scoped, Alt widens to the workspace (diagnostics + git changes).
         assert!(matches!(
             lookup(KeyContext::Leader, ch('d'), Mods::NONE).map(|b| b.action),
             Some(Action::OpenPicker(PickerKind::Diagnostics))
         ));
         assert!(matches!(
             lookup(KeyContext::Leader, ch('d'), Mods::ALT).map(|b| b.action),
-            Some(Action::OpenPicker(PickerKind::DiagnosticsProject))
+            Some(Action::OpenPicker(PickerKind::DiagnosticsWorkspace))
         ));
         assert!(matches!(
             lookup(KeyContext::Leader, ch('c'), Mods::NONE).map(|b| b.action),

@@ -33,7 +33,7 @@ pub struct WasmSession {
 
 #[wasm_bindgen]
 impl WasmSession {
-    /// A placeholder session (no project, empty buffer). Phase 1 uses this to prove the boundary;
+    /// A placeholder session (no workspace, empty buffer). Phase 1 uses this to prove the boundary;
     /// the real constructor takes a bootstrapped buffer once `buffer/open` is wired (Phase 3).
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmSession {
@@ -62,18 +62,18 @@ impl WasmSession {
         to_js(&view::build_view(&self.inner))
     }
 
-    /// Build a real session from the bootstrap landing buffer. `project_paths` is a JSON string
+    /// Build a real session from the bootstrap landing buffer. `workspace_paths` is a JSON string
     /// array; `open` is the `buffer/open` result JSON. (The `new()` placeholder is for tests.)
     pub fn bootstrap(
-        project: String,
-        project_paths: JsValue,
+        workspace: String,
+        workspace_paths: JsValue,
         open: JsValue,
     ) -> Result<WasmSession, JsValue> {
-        let paths: Vec<String> = from_js(project_paths)?;
+        let paths: Vec<String> = from_js(workspace_paths)?;
         let open: BufferOpenResult = from_js(open)?;
         let buffer = buffer_info(open, &paths);
         Ok(WasmSession {
-            inner: Session::new(project, paths, buffer),
+            inner: Session::new(workspace, paths, buffer),
         })
     }
 
@@ -208,11 +208,11 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.close_picker()))
     }
 
-    /// Open the Projects picker — the no-args chooser raised at boot when no project was named (the
+    /// Open the Workspaces picker — the no-args chooser raised at boot when no workspace was named (the
     /// native shells do the same). Returns `Effect[]`.
-    pub fn open_projects(&mut self) -> Result<JsValue, JsValue> {
+    pub fn open_workspaces(&mut self) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.open_picker(
-            aether_protocol::picker::PickerKind::Projects,
+            aether_protocol::picker::PickerKind::Workspaces,
             None,
             None,
             false,
@@ -280,22 +280,22 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.save_as_set_field(root)))
     }
 
-    /// Replace the project-settings name field (native `<input>` owns editing). Returns `Effect[]`.
-    pub fn project_settings_set_name(&mut self, text: String) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.project_settings_set_name(text)))
+    /// Replace the workspace-settings name field (native `<input>` owns editing). Returns `Effect[]`.
+    pub fn workspace_settings_set_name(&mut self, text: String) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.workspace_settings_set_name(text)))
     }
 
-    /// Replace the project-settings add-root input (native `<input>` owns editing). Returns `Effect[]`.
-    pub fn project_settings_set_add(&mut self, text: String) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.project_settings_set_add(text)))
+    /// Replace the workspace-settings add-root input (native `<input>` owns editing). Returns `Effect[]`.
+    pub fn workspace_settings_set_add(&mut self, text: String) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.workspace_settings_set_add(text)))
     }
 
     /// A root row's delete button was clicked (0-based index): open the shared confirm prompt for
     /// that root (same path as the Delete key). Returns `Effect[]`.
-    pub fn project_settings_remove_root(&mut self, index: u32) -> Result<JsValue, JsValue> {
+    pub fn workspace_settings_remove_root(&mut self, index: u32) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(
             self.inner
-                .on_event(Event::ProjectSettingsRemoveRoot(index as usize)),
+                .on_event(Event::WorkspaceSettingsRemoveRoot(index as usize)),
         ))
     }
 

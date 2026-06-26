@@ -19,13 +19,13 @@ use std::collections::HashMap;
 /// pick the slice the renderer actually draws; `selected` is an index into `items` clamped to
 /// keep the highlight inside the visible slice. We only round-trip when the visible window
 /// approaches the cache edge — see `picker_move_selection` for the refetch trigger.
-/// Identity of the client's active entry in a freshly-opened Buffers / Projects picker — what
+/// Identity of the client's active entry in a freshly-opened Buffers / Workspaces picker — what
 /// the initial highlight should step over. See `PickerState::default_skip`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
 pub enum DefaultSkip {
     Buffer(BufferId),
-    Project(String),
+    Workspace(String),
 }
 
 #[derive(Debug, Default)]
@@ -78,10 +78,10 @@ pub struct PickerState {
     /// `visible_start` so the highlight lands at the same row it was at when the picker closed.
     /// Lifecycle mirrors `resume_target`.
     pub resume_row_offset: Option<usize>,
-    /// When set (Buffers / Projects open), the first push with items moves the highlight to the
-    /// first item that *isn't* this client's active buffer/project — the thing you'd flip to.
+    /// When set (Buffers / Workspaces open), the first push with items moves the highlight to the
+    /// first item that *isn't* this client's active buffer/workspace — the thing you'd flip to.
     /// An identity check, not "skip row 0": the list is shared MRU (Buffers) or name-ordered
-    /// (Projects), so another client's activity can put any item at the top. Cleared once
+    /// (Workspaces), so another client's activity can put any item at the top. Cleared once
     /// applied, or by a query change (the user is steering somewhere else).
     pub default_skip: Option<DefaultSkip>,
     /// Per-kind last-selected item and its index offset within the cache, persisted across
@@ -100,21 +100,21 @@ pub struct PickerState {
     /// next `Space e` resumes in the same directory; `None` outside the Explorer picker.
     pub explorer_dir: Option<String>,
     /// Explorer only. The parent of `explorer_dir`, or `None` when the picker is at (or above)
-    /// a project root (Alt-h is then a no-op). Carried alongside `explorer_dir` for the same
+    /// a workspace root (Alt-h is then a no-op). Carried alongside `explorer_dir` for the same
     /// reasons.
     pub explorer_parent: Option<String>,
     /// Explorer only. The tab-completion ghost: the common-prefix suffix `Tab` would append to the
     /// query, rendered dim after the input. `None` when there's nothing to complete.
     pub completion: Option<String>,
-    /// Projects-picker only. When `Some(idx)`, `items[idx]` is a *synthetic* row added
-    /// client-side to offer "create a new project named <query>" — it isn't part of the
-    /// server's candidate set. Selecting it routes through `project/create` instead of
-    /// `picker/select`. `None` when no synthetic row is present (kind isn't Projects, query is
-    /// empty, or an existing project matches the query exactly).
+    /// Workspaces-picker only. When `Some(idx)`, `items[idx]` is a *synthetic* row added
+    /// client-side to offer "create a new workspace named <query>" — it isn't part of the
+    /// server's candidate set. Selecting it routes through `workspace/create` instead of
+    /// `picker/select`. `None` when no synthetic row is present (kind isn't Workspaces, query is
+    /// empty, or an existing workspace matches the query exactly).
     pub synthetic_create_idx: Option<usize>,
     /// When set, a delete is awaiting `[y/N]` confirmation: the target row renders the prompt and
     /// key handling is restricted to confirm/cancel (mirroring the settings overlay's
-    /// `pending_delete`). Cleared on open/hide and on resolve. Covers project deletion (Projects
+    /// `pending_delete`). Cleared on open/hide and on resolve. Covers workspace deletion (Workspaces
     /// picker) and file/directory deletion (Files / Explorer pickers).
     pub pending_delete: Option<PendingDelete>,
     /// LSP-servers picker only. When set, the picker body shows this server's status/error detail
@@ -194,9 +194,9 @@ pub struct Chip {
 }
 
 /// The editor line for a valued chip, revealed below the picker's input row. The dir editor
-/// reads as a single `dir:` field: in multi-root projects a root segment (an inline typeahead —
+/// reads as a single `dir:` field: in multi-root workspaces a root segment (an inline typeahead —
 /// type a prefix, Alt-j/k cycle the matches) leads, separated by `:` from the root-relative
-/// path; single-root projects show only the path. The path segment carries directory-only
+/// path; single-root workspaces show only the path. The path segment carries directory-only
 /// ghost suggestions in the save-as idiom, cached in `listing`. The glob editor is one field.
 #[derive(Debug)]
 #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
@@ -240,7 +240,7 @@ pub enum DirListingState {
     Pending,
     /// `listing` reflects `listing_dir_abs`; the directory exists.
     Loaded,
-    /// The fetch failed — the dir portion doesn't exist (or sits outside the project boundary).
+    /// The fetch failed — the dir portion doesn't exist (or sits outside the workspace boundary).
     Failed,
 }
 
@@ -308,7 +308,7 @@ impl ChipEditor {
 
     /// The root the editor would commit: the highlighted candidate for the current filter,
     /// falling back to the root it opened with when the filter matches nothing. `labels` are
-    /// the project's (disambiguated) root labels.
+    /// the workspace's (disambiguated) root labels.
     pub fn chosen_root(&self, labels: &[String]) -> u32 {
         let candidates = root_candidates(labels, &self.root_filter.text);
         match candidates.get(self.root_selected.min(candidates.len().saturating_sub(1))) {
@@ -349,7 +349,7 @@ impl ChipEditor {
     }
 
     /// Record that the `directory/list` fetch failed: the dir portion names a directory that
-    /// doesn't exist (or one outside the project boundary). The path renders invalid and the
+    /// doesn't exist (or one outside the workspace boundary). The path renders invalid and the
     /// commit gate refuses it until the next path change re-syncs.
     #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
     pub fn set_dir_listing_failed(&mut self) {
@@ -498,7 +498,7 @@ pub struct PendingDelete {
     pub action: PendingDeleteAction,
     /// The picker row the prompt renders over.
     pub item: PickerItem,
-    /// Noun for the prompt — `"project"`, `"file"`, or `"directory"`.
+    /// Noun for the prompt — `"workspace"`, `"file"`, or `"directory"`.
     pub noun: &'static str,
     /// Display name shown inside the quotes in the prompt.
     pub name: String,
@@ -508,8 +508,8 @@ pub struct PendingDelete {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
 pub enum PendingDeleteAction {
-    /// `project/delete { name }`.
-    Project(String),
+    /// `workspace/delete { name }`.
+    Workspace(String),
     /// `path/delete { path }` — the absolute path of a file or directory.
     Path(String),
 }
@@ -521,7 +521,7 @@ impl PickerState {
     /// root's basename), and the flags are two-or-three-char abbreviations (only `wd`
     /// underlines — it reads as a stray token otherwise). The ignored/hidden chips render `+`
     /// (include — Grep) or `-` (hide — Explorer) per the direction stored in the value.
-    pub fn chips(&self, project_paths: &[String]) -> Vec<Chip> {
+    pub fn chips(&self, workspace_paths: &[String]) -> Vec<Chip> {
         self.chips
             .iter()
             .enumerate()
@@ -531,8 +531,8 @@ impl PickerState {
                         // Multi-root scopes read like the status bar: `{root label}:
                         // {path}/`, with the same disambiguated root labels. An empty
                         // relative path is a whole-root scope — just the label.
-                        let label = if project_paths.len() > 1 {
-                            let labels = crate::labels::root_labels(project_paths);
+                        let label = if workspace_paths.len() > 1 {
+                            let labels = crate::labels::root_labels(workspace_paths);
                             let root_label = labels
                                 .get(d.path_index as usize)
                                 .map(|s| s.as_str())
@@ -700,7 +700,7 @@ impl PickerState {
                     self.chips.remove(i);
                     true
                 }
-                None => false, // empty new scope in a single-root project — cancel
+                None => false, // empty new scope in a single-root workspace — cancel
             };
         };
         let value = ChipValue::Dir(d);
@@ -753,8 +753,8 @@ impl PickerState {
         }
     }
 
-    /// True if the highlighted row is the synthetic "create" row (the Projects picker's
-    /// "create new project" affordance). The selector uses this to route to `project/create`
+    /// True if the highlighted row is the synthetic "create" row (the Workspaces picker's
+    /// "create new workspace" affordance). The selector uses this to route to `workspace/create`
     /// instead of the normal `picker/select` flow.
     #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
     pub fn highlighted_is_synthetic_create(&self) -> bool {
@@ -795,7 +795,7 @@ pub enum ItemKey<'a> {
         hunk_index: u32,
     },
     DirEntry(&'a str),
-    Project(&'a str),
+    Workspace(&'a str),
     Root {
         path_index: u32,
     },
@@ -859,7 +859,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             hunk_index: *hunk_index,
         },
         PickerItem::DirEntry { name, .. } => ItemKey::DirEntry(name.as_str()),
-        PickerItem::Project { name, .. } => ItemKey::Project(name.as_str()),
+        PickerItem::Workspace { name, .. } => ItemKey::Workspace(name.as_str()),
         PickerItem::Root { path_index, .. } => ItemKey::Root {
             path_index: *path_index,
         },

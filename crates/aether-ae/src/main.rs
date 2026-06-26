@@ -6,12 +6,12 @@
 //! - `ae server [OPTIONS]`               — run the editor server daemon
 //! - `ae [edit] [PATH]`                  — open a client, auto-detecting terminal vs GUI
 //! - `ae --gui [PATH]` / `ae --tui ...`  — force a specific client
-//! - `ae -p NAME [PATH]`                 — open in a named project, overriding inference
+//! - `ae -w NAME [PATH]`                 — open in a named workspace, overriding inference
 //!
 //! `edit` is the default command: a bare `ae` (or `ae file.rs`) runs it, so the common case needs
-//! no subcommand. With a PATH, the project is inferred by matching it against configured project
-//! roots; a bare `ae` (no PATH) opens the project picker rather than guessing from the working
-//! directory. `-p/--project` overrides inference, and `ae edit ...` is the explicit form for when a
+//! no subcommand. With a PATH, the workspace is inferred by matching it against configured workspace
+//! roots; a bare `ae` (no PATH) opens the workspace picker rather than guessing from the working
+//! directory. `-w/--workspace` overrides inference, and `ae edit ...` is the explicit form for when a
 //! PATH would otherwise collide with the `server` subcommand name.
 //!
 //! Server lifetime: `edit` auto-starts a server if none is listening (see [`ensure_server_running`])
@@ -35,10 +35,11 @@ struct Cli {
     #[command(flatten)]
     edit: EditArgs,
 
-    /// Profile (separate instance) to use: its own config, sessions, and server on its own port —
-    /// like browser profiles, e.g. a `dev` instance alongside your daily one. Defaults to
-    /// `default`; also read from `AETHER_PROFILE`. See `docs/profiles.md`.
-    #[arg(short = 'P', long, global = true, env = "AETHER_PROFILE")]
+    /// Profile (separate instance) to use, e.g. `dev` alongside your daily one [default: default].
+    ///
+    /// Like browser profiles: each has its own config, sessions, and server on its own port. Also
+    /// read from `AETHER_PROFILE`. See `docs/profiles.md`.
+    #[arg(short = 'p', long, global = true, env = "AETHER_PROFILE")]
     profile: Option<String>,
 }
 
@@ -98,15 +99,17 @@ struct EditArgs {
     #[arg(long)]
     tui: bool,
 
-    /// Project name. Overrides inference — the named project must have a config at
-    /// `$XDG_CONFIG_HOME/aether/projects/<name>.toml`. Omit to infer the project from PATH; with no
-    /// PATH (or a PATH outside every configured project), the project picker opens.
-    #[arg(short = 'p', long)]
-    project: Option<String>,
+    /// Workspace to open, overriding inference from PATH.
+    ///
+    /// Config lives at `$XDG_CONFIG_HOME/aether/workspaces/<name>.toml`. Omit to infer from PATH;
+    /// with no PATH (or one outside every workspace), the picker opens.
+    #[arg(short = 'w', long)]
+    workspace: Option<String>,
 
-    /// File or directory to open. Resolved against the current working directory and used to infer
-    /// the project when `--project` is absent. A directory opens the file browser at that location
-    /// with a scratch buffer underneath. Omit to start in a scratch buffer with no file browser.
+    /// File or directory to open. Omit for a scratch buffer.
+    ///
+    /// Resolved against the working directory; infers the workspace when `--workspace` is absent. A
+    /// directory opens the file browser there.
     path: Option<String>,
 }
 
@@ -129,19 +132,19 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Run the default `edit` command: resolve the project (explicit, inferred, or picker), resolve the
+/// Run the default `edit` command: resolve the workspace (explicit, inferred, or picker), resolve the
 /// active profile's port (creating the profile on first use), make sure a server is up on it, then
 /// launch the terminal or GUI client pointed at it.
 fn run_edit(edit: EditArgs, version: String) -> anyhow::Result<()> {
-    let project = resolve_project(&edit)?;
+    let workspace = resolve_workspace(&edit)?;
     let port = aether_server::ensure_profile_port()?;
     let idle_timeout_secs = aether_server::profile_idle_timeout_secs()?;
     ensure_server_running(port, idle_timeout_secs);
     let server_url = format!("ws://127.0.0.1:{port}");
     if want_gui(&edit) {
-        run_gui(project, edit.path, version, server_url)
+        run_gui(workspace, edit.path, version, server_url)
     } else {
-        run_tui(project, edit.path, version, server_url)
+        run_tui(workspace, edit.path, version, server_url)
     }
 }
 
@@ -236,34 +239,34 @@ fn detach(cmd: &mut std::process::Command) {
 #[cfg(not(unix))]
 fn detach(_cmd: &mut std::process::Command) {}
 
-/// Decide which project to open. `--project` always wins. Otherwise infer from the PATH: a path
-/// inside exactly one project opens there; a path inside *several* is an error the user must
-/// disambiguate. A path inside *no* configured project is no longer an error — we return `None`,
-/// and the client opens the file directly in an ephemeral "(no project)" context (`ae /etc/hosts`).
-/// With no PATH at all, we return `None` so a bare `ae` opens the project picker — the working
-/// directory is deliberately *not* used to guess a project (it only resolves relative file paths).
-fn resolve_project(edit: &EditArgs) -> anyhow::Result<Option<String>> {
-    use aether_server::ProjectMatch;
+/// Decide which workspace to open. `--workspace` always wins. Otherwise infer from the PATH: a path
+/// inside exactly one workspace opens there; a path inside *several* is an error the user must
+/// disambiguate. A path inside *no* configured workspace is no longer an error — we return `None`,
+/// and the client opens the file directly in an ephemeral "(no workspace)" context (`ae /etc/hosts`).
+/// With no PATH at all, we return `None` so a bare `ae` opens the workspace picker — the working
+/// directory is deliberately *not* used to guess a workspace (it only resolves relative file paths).
+fn resolve_workspace(edit: &EditArgs) -> anyhow::Result<Option<String>> {
+    use aether_server::WorkspaceMatch;
 
-    if edit.project.is_some() {
-        return Ok(edit.project.clone());
+    if edit.workspace.is_some() {
+        return Ok(edit.workspace.clone());
     }
 
     if let Some(path) = &edit.path {
-        return match aether_server::infer_project_for_path(std::path::Path::new(path))? {
-            ProjectMatch::One(name) => Ok(Some(name)),
-            // Outside every project: open project-lessly (the client falls back to open-from-path).
-            ProjectMatch::None => Ok(None),
-            ProjectMatch::Ambiguous(names) => anyhow::bail!(
-                "{path} is within multiple projects ({}) — disambiguate with `--project NAME`",
+        return match aether_server::infer_workspace_for_path(std::path::Path::new(path))? {
+            WorkspaceMatch::One(name) => Ok(Some(name)),
+            // Outside every workspace: open workspace-lessly (the client falls back to open-from-path).
+            WorkspaceMatch::None => Ok(None),
+            WorkspaceMatch::Ambiguous(names) => anyhow::bail!(
+                "{path} is within multiple workspaces ({}) — disambiguate with `--workspace NAME`",
                 names.join(", ")
             ),
         };
     }
 
-    // No `--project` and no path: open the project picker rather than guessing from the working
+    // No `--workspace` and no path: open the workspace picker rather than guessing from the working
     // directory. The working directory is only meaningful for resolving a relative *file* path
-    // (the `path` branch above, and the open-from-path overlay), not as a standalone project
+    // (the `path` branch above, and the open-from-path overlay), not as a standalone workspace
     // signal — a bare `ae` should land on the (recency-sorted) chooser regardless of where it's
     // launched from.
     Ok(None)
@@ -349,29 +352,29 @@ fn terminate(_pid: u32) -> anyhow::Result<()> {
 }
 
 fn run_tui(
-    project: Option<String>,
+    workspace: Option<String>,
     path: Option<String>,
     version: String,
     server_url: String,
 ) -> anyhow::Result<()> {
-    runtime()?.block_on(aether_tui::run(project, path, version, server_url))
+    runtime()?.block_on(aether_tui::run(workspace, path, version, server_url))
 }
 
 #[cfg(feature = "gui")]
 fn run_gui(
-    project: Option<String>,
+    workspace: Option<String>,
     path: Option<String>,
     version: String,
     server_url: String,
 ) -> anyhow::Result<()> {
     // iced owns the main thread and manages its own tokio runtime, so this is a synchronous call —
     // do not wrap it in `runtime().block_on`, which would panic on a nested runtime.
-    aether_iced::run(project, path, version, server_url)
+    aether_iced::run(workspace, path, version, server_url)
 }
 
 #[cfg(not(feature = "gui"))]
 fn run_gui(
-    _project: Option<String>,
+    _workspace: Option<String>,
     _path: Option<String>,
     _version: String,
     _server_url: String,
@@ -395,18 +398,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bare_invocation_opens_the_picker_not_a_cwd_inferred_project() {
-        // No `--project` and no path → `None`, so the client opens the project chooser. The key
-        // guarantee: this branch never consults the working directory to guess a project.
-        assert_eq!(resolve_project(&EditArgs::default()).unwrap(), None);
+    fn bare_invocation_opens_the_picker_not_a_cwd_inferred_workspace() {
+        // No `--workspace` and no path → `None`, so the client opens the workspace chooser. The key
+        // guarantee: this branch never consults the working directory to guess a workspace.
+        assert_eq!(resolve_workspace(&EditArgs::default()).unwrap(), None);
     }
 
     #[test]
-    fn explicit_project_flag_wins() {
+    fn explicit_workspace_flag_wins() {
         let edit = EditArgs {
-            project: Some("myproj".into()),
+            workspace: Some("myproj".into()),
             ..Default::default()
         };
-        assert_eq!(resolve_project(&edit).unwrap(), Some("myproj".to_string()));
+        assert_eq!(resolve_workspace(&edit).unwrap(), Some("myproj".to_string()));
     }
 }

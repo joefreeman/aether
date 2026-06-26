@@ -3,7 +3,7 @@
 //! Aether-server is itself an LSP *client*: it hosts language-server subprocesses and translates
 //! between them and connected editor clients (see `docs/lsp.md`). The TUI never speaks LSP. These
 //! messages surface language-server *health* to the client — the status of each server in the
-//! active project plus live transitions — and let the client request a restart.
+//! active workspace plus live transitions — and let the client request a restart.
 //!
 //! Defined in Phase 0 ahead of the transport so the wire shape is pinned and the status UI can be
 //! built against it; the server side that emits these lands in Phase 1.

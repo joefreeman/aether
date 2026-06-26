@@ -267,7 +267,7 @@ fn goto_definition_lands_the_identifier_selected() {
     use aether_client::update::Event;
     use aether_protocol::lsp::LspGotoDefinitionResult;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
 
     // A definition with a real identifier span opens the buffer as a selection: cursor on the
     // span's last char, anchor at its start — like the outline / references pickers.
@@ -295,7 +295,7 @@ fn goto_definition_lands_the_identifier_selected() {
 
     // No distinct span (end == position): a point cursor, no anchor.
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let point: LspGotoDefinitionResult = serde_json::from_value(json!({
         "location": {
             "path": "/p/src/lib.rs",
@@ -319,10 +319,10 @@ fn goto_definition_outside_roots_opens_an_external_buffer() {
     use aether_client::update::Event;
     use aether_protocol::lsp::LspGotoDefinitionResult;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
 
-    // A definition that resolves into a dependency's source — outside every project root — used to
-    // be refused with an "outside the project's roots" toast. It now opens as an *external* guest
+    // A definition that resolves into a dependency's source — outside every workspace root — used to
+    // be refused with an "outside the workspace's roots" toast. It now opens as an *external* guest
     // buffer via `absolute_path`, still jumping to the identifier and recording nav history.
     let dep: LspGotoDefinitionResult = serde_json::from_value(json!({
         "location": {
@@ -446,7 +446,7 @@ fn save_as_completes_dir_and_files_then_saves_the_literal_path() {
     use aether_client::update::Event;
     use aether_protocol::directory::{DirectoryEntry, DirectoryListResult};
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     // `Space Alt-s` opens the save-as prompt and fires a directory/list for the root (empty path).
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
     let fx = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
@@ -507,7 +507,7 @@ fn save_as_overwrite_confirms_then_retries_with_the_flag_set() {
     use aether_client::update::Event;
     use aether_protocol::error::ErrorCode;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
     let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
     let _ = s.save_as_set_input("existing.md".into());
@@ -557,7 +557,7 @@ fn declining_save_as_overwrite_reopens_the_prompt_prefilled() {
     use aether_client::update::Event;
     use aether_protocol::error::ErrorCode;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
     let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
     let _ = s.save_as_set_input("existing.md".into());
@@ -628,7 +628,7 @@ fn confirm_enter_declines_and_only_y_accepts() {
 }
 
 /// A `buffer/state` push carrying a *new* path (a save-as on the shared buffer from another
-/// client) is adopted: this client follows the rename, re-deriving its project-relative label. An
+/// client) is adopted: this client follows the rename, re-deriving its workspace-relative label. An
 /// unchanged path (in-place save / reload) leaves the label alone.
 #[test]
 fn buffer_state_push_follows_a_save_as_rename() {
@@ -636,7 +636,7 @@ fn buffer_state_push_follows_a_save_as_rename() {
     use aether_protocol::buffer::{BufferState, BufferStateParams};
     use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     s.buffer.buffer_id = 10;
     s.buffer.path = Some("/p/foo.md".into());
     s.buffer.label = "foo.md".into();
@@ -672,15 +672,15 @@ fn buffer_state_push_follows_a_save_as_rename() {
 }
 
 #[test]
-fn project_renamed_push_adopts_the_new_name() {
+fn workspace_renamed_push_adopts_the_new_name() {
     use aether_client::update::Event;
     use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
-    use aether_protocol::project::{ProjectRenamed, ProjectRenamedParams};
+    use aether_protocol::workspace::{WorkspaceRenamed, WorkspaceRenamedParams};
     let push = |old: &str, new: &str| {
         Event::ServerPush(Notification {
             jsonrpc: JsonRpc,
-            method: ProjectRenamed::NAME.into(),
-            params: serde_json::to_value(ProjectRenamedParams {
+            method: WorkspaceRenamed::NAME.into(),
+            params: serde_json::to_value(WorkspaceRenamedParams {
                 old_name: old.into(),
                 new_name: new.into(),
             })
@@ -688,13 +688,13 @@ fn project_renamed_push_adopts_the_new_name() {
         })
     };
     let mut s = session();
-    s.project = "aether".into();
-    // A rename of our active project is adopted locally (drives display + reconnect baseline).
+    s.workspace = "aether".into();
+    // A rename of our active workspace is adopted locally (drives display + reconnect baseline).
     let _ = s.on_event(push("aether", "aether-next"));
-    assert_eq!(s.project, "aether-next");
-    // A push that doesn't match our project (stale / not ours) is ignored.
+    assert_eq!(s.workspace, "aether-next");
+    // A push that doesn't match our workspace (stale / not ours) is ignored.
     let _ = s.on_event(push("something-else", "whatever"));
-    assert_eq!(s.project, "aether-next");
+    assert_eq!(s.workspace, "aether-next");
 }
 
 #[test]
@@ -702,7 +702,7 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
     use aether_client::update::Event;
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams, PickerViewResult};
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Grep, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
@@ -769,7 +769,7 @@ fn grep_count_only_ticks_keep_the_window_then_the_first_batch_replaces_it() {
     // runs, then the first real batch replaces them — so the list never blanks mid-type.
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Grep, None, None, false);
     let hit = |path: &str, line: u32| PickerItem::GrepHit {
         path_index: 0,
@@ -842,7 +842,7 @@ fn grep_count_only_ticks_keep_the_window_then_the_first_batch_replaces_it() {
 fn picker_query_change_keeps_stale_window_until_the_new_push_lands() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None, false);
     let file = |name: &str| PickerItem::File {
         path_index: 0,
@@ -902,7 +902,7 @@ fn picker_query_change_keeps_stale_window_until_the_new_push_lands() {
 fn chip_editor_is_value_synced_not_keycode_edited() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Grep, None, None, false);
     // Alt-g opens the glob filter editor (a chip-editor line).
     let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
@@ -938,7 +938,7 @@ fn picker_query_is_value_synced_and_chip_row_gestures_work() {
     use aether_client::chips::ChipValue;
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Grep, None, None, false);
     // The shell's input owns query typing and syncs the value; the core re-filters on it.
     let fx = s.picker_set_query("foo".into());
@@ -971,7 +971,7 @@ fn lsp_picker_centers_on_the_current_buffers_server() {
     use aether_protocol::lsp::LspServerRef;
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     s.buffer.lsp_server = Some(LspServerRef {
         language: "rust".into(),
         workspace_root: "/p".into(),
@@ -997,14 +997,14 @@ fn buffers_picker_centers_on_the_active_buffer() {
 }
 
 #[test]
-fn projects_picker_centers_on_the_active_project() {
+fn workspaces_picker_centers_on_the_active_workspace() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project = "aether".into();
-    let fx = s.open_picker(PickerKind::Projects, None, None, false);
-    let params = find_request(&fx, "picker/view").expect("projects picker opens via picker/view");
-    // The view is anchored on the active project (matched by name), so it opens selected.
-    assert_eq!(params["center_on"]["kind"], "project");
+    s.workspace = "aether".into();
+    let fx = s.open_picker(PickerKind::Workspaces, None, None, false);
+    let params = find_request(&fx, "picker/view").expect("workspaces picker opens via picker/view");
+    // The view is anchored on the active workspace (matched by name), so it opens selected.
+    assert_eq!(params["center_on"]["kind"], "workspace");
     assert_eq!(params["center_on"]["name"], "aether");
 }
 
@@ -1014,7 +1014,7 @@ fn closing_the_lsp_dialog_returns_to_the_picker() {
     use aether_protocol::lsp::LspStatus;
     use aether_protocol::picker::{PickerItem, PickerKind};
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::LspServers, None, None, false);
     {
         let p = s.picker.as_mut().expect("picker open");
@@ -1065,7 +1065,7 @@ fn lsp_dialog_working_field_tracks_live_picker_progress() {
     };
 
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::LspServers, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
@@ -1298,7 +1298,7 @@ fn editing_is_refused_while_disconnected_and_insert_drops_on_disconnect() {
 fn glob_editor_live_previews_results_and_reverts_on_cancel() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None, false);
     // Open the glob editor — no chip committed yet, so nothing narrows.
     let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
@@ -1323,7 +1323,7 @@ fn glob_editor_live_previews_results_and_reverts_on_cancel() {
 fn degenerate_glob_preview_does_not_requery() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None, false);
     let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
     // "*" normalizes away (match-everything) → the effective set is unchanged → no wasted
@@ -1341,7 +1341,7 @@ fn dir_editor_holds_while_listing_pending_then_previews_on_load() {
     use aether_protocol::directory::{DirectoryEntry, DirectoryListResult};
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None, false);
     // Alt-p opens the path-scope editor and fires a directory/list for the root.
     let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
@@ -1388,7 +1388,7 @@ fn invalid_dir_path_preview_contributes_nothing() {
     use aether_protocol::directory::{DirectoryEntry, DirectoryListResult};
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None, false);
     let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
     let _ = s.chip_editor_set_input("zzz".into());
@@ -1416,7 +1416,7 @@ fn invalid_dir_path_preview_contributes_nothing() {
 fn space_alt_c_opens_the_buffer_locked_changes_picker() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     s.buffer.path = Some("/p/src/main.rs".into());
     // `Space Alt-c`: the modal file-changes picker — its own kind, locked to the active buffer via
     // `buffer_id` (intrinsic, like Diagnostics), not a filter chip.
@@ -1437,7 +1437,7 @@ fn space_alt_c_opens_the_buffer_locked_changes_picker() {
 #[test]
 fn space_alt_f_seeds_a_removable_directory_chip() {
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     s.buffer.path = Some("/p/src/main.rs".into());
     // `Space Alt-f`: Files pre-scoped to the buffer's directory as an ordinary, composable dir chip.
     let fx = s.open_files_in_buffer_dir();
@@ -1453,7 +1453,7 @@ fn space_alt_f_seeds_a_removable_directory_chip() {
 #[test]
 fn space_alt_f_unscoped_for_scratch_buffer() {
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     s.buffer.path = None; // scratch buffer — no directory to scope to
     let fx = s.open_files_in_buffer_dir();
     let params = find_request(&fx, "picker/view").expect("opens the picker");
@@ -1469,7 +1469,7 @@ fn space_alt_g_opens_grep_from_selection() {
     // The client carries no selection text — it just sets `from_selection` + the buffer id and
     // lets the server slice + search (the query/generation ride back via the `PickerViewed` echo).
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     s.buffer.path = Some("/p/src/main.rs".into());
     let fx = s.open_grep_from_selection();
     let params = find_request(&fx, "picker/view").expect("opens the picker");
@@ -2161,54 +2161,54 @@ fn explorer_delete_confirms_then_trashes_and_relists() {
 }
 
 #[test]
-fn projects_delete_confirms_then_deletes_and_guards_active() {
+fn workspaces_delete_confirms_then_deletes_and_guards_active() {
     use aether_client::session::{ConfirmKind, Prompt};
     use aether_protocol::picker::{PickerItem, PickerKind};
 
     let mut s = session();
-    s.project = "current".into();
-    let _ = s.open_picker(PickerKind::Projects, None, None, false);
+    s.workspace = "current".into();
+    let _ = s.open_picker(PickerKind::Workspaces, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.items = vec![
-            PickerItem::Project {
+            PickerItem::Workspace {
                 name: "current".into(),
                 unsaved_buffers: 0,
                 match_indices: vec![],
             },
-            PickerItem::Project {
+            PickerItem::Workspace {
                 name: "other".into(),
                 unsaved_buffers: 0,
                 match_indices: vec![],
             },
         ];
-        p.selected = 0; // the active project
+        p.selected = 0; // the active workspace
         p.offset = 0;
         p.total_matches = 2;
     }
-    // Ctrl-d on the *active* project refuses client-side — no confirm, no request.
+    // Ctrl-d on the *active* workspace refuses client-side — no confirm, no request.
     let fx = s.picker_stage_delete();
-    assert!(s.prompt.is_none(), "active project can't be staged");
+    assert!(s.prompt.is_none(), "active workspace can't be staged");
     assert!(
         fx.0.iter()
             .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Error, .. })),
-        "refusing the active project surfaces an error toast"
+        "refusing the active workspace surfaces an error toast"
     );
 
-    // Move to a non-active project: Ctrl-d stages a confirm, sends nothing yet.
+    // Move to a non-active workspace: Ctrl-d stages a confirm, sends nothing yet.
     s.picker.as_mut().unwrap().selected = 1;
     let fx = s.picker_stage_delete();
     assert!(fx.0.is_empty(), "delete stages a confirm, sends nothing");
     match &s.prompt {
         Some(Prompt::Confirm { kind, .. }) => match kind {
-            ConfirmKind::DeleteProject { name } => assert_eq!(name, "other"),
-            other => panic!("expected a delete-project confirm, got {other:?}"),
+            ConfirmKind::DeleteWorkspace { name } => assert_eq!(name, "other"),
+            other => panic!("expected a delete-workspace confirm, got {other:?}"),
         },
         other => panic!("expected a confirm prompt, got {other:?}"),
     }
-    // `y` accepts → `project/delete { name }`.
+    // `y` accepts → `workspace/delete { name }`.
     let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
-    let del = find_request(&fx, "project/delete").expect("project/delete fired");
+    let del = find_request(&fx, "workspace/delete").expect("workspace/delete fired");
     assert_eq!(del["name"], json!("other"));
 
     // A server "active in another window" refusal surfaces a clean, tailored toast — not the raw
@@ -2217,16 +2217,16 @@ fn projects_delete_confirms_then_deletes_and_guards_active() {
         .0
         .iter()
         .find_map(|e| match e {
-            Effect::Request { token, method, .. } if *method == "project/delete" => Some(*token),
+            Effect::Request { token, method, .. } if *method == "workspace/delete" => Some(*token),
             _ => None,
         })
-        .expect("project/delete token");
+        .expect("workspace/delete token");
     let fx = s.on_rpc_result(
         token,
         Err(RpcError {
-            method: "project/delete",
-            code: aether_protocol::error::ErrorCode::ACTIVE_PROJECT_PREVENTS_DELETE.code(),
-            message: "project other is active — switch to another project before deleting it"
+            method: "workspace/delete",
+            code: aether_protocol::error::ErrorCode::ACTIVE_WORKSPACE_PREVENTS_DELETE.code(),
+            message: "workspace other is active — switch to another workspace before deleting it"
                 .into(),
         }),
     );
@@ -2331,7 +2331,7 @@ fn explorer_create_makes_a_file_with_create_if_missing() {
     use aether_protocol::picker::PickerKind;
 
     let mut s = session();
-    s.project_paths = vec!["/proj".into()];
+    s.workspace_paths = vec!["/proj".into()];
     let _ = s.open_picker(PickerKind::Explorer, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
@@ -2350,7 +2350,7 @@ fn explorer_create_with_trailing_slash_makes_a_directory() {
     use aether_protocol::picker::PickerKind;
 
     let mut s = session();
-    s.project_paths = vec!["/proj".into()];
+    s.workspace_paths = vec!["/proj".into()];
     let _ = s.open_picker(PickerKind::Explorer, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
@@ -2374,7 +2374,7 @@ fn selecting_the_create_row_creates_the_file() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
 
     let mut s = session();
-    s.project_paths = vec!["/proj".into()];
+    s.workspace_paths = vec!["/proj".into()];
     let _ = s.open_picker(PickerKind::Explorer, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
@@ -2618,19 +2618,19 @@ fn reload_moved_to_space_alt_k() {
 }
 
 #[test]
-fn space_a_copies_relative_and_absolute_paths() {
+fn space_p_copies_relative_and_absolute_paths() {
     let mut s = session();
-    s.project_paths = vec!["/proj".into()];
+    s.workspace_paths = vec!["/proj".into()];
     s.buffer.path = Some("/proj/src/main.rs".into());
 
-    // Space a → project-relative path.
+    // Space p → workspace-relative path.
     let _ = key(&mut s, ' '); // leader
-    let fx = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::NONE, Some("p".into()), ROWS);
     assert_eq!(written_clipboard(&fx).as_deref(), Some("src/main.rs"));
 
-    // Space Alt-a → absolute path.
+    // Space Alt-p → absolute path.
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
     assert_eq!(written_clipboard(&fx).as_deref(), Some("/proj/src/main.rs"));
 }
 
@@ -2639,7 +2639,7 @@ fn copy_path_warns_for_scratch_buffer() {
     let mut s = session();
     s.buffer.path = None; // a scratch buffer
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::NONE, Some("p".into()), ROWS);
     assert!(
         written_clipboard(&fx).is_none(),
         "no path — nothing is copied"
@@ -2662,8 +2662,8 @@ fn app_settings_overlay_opens_via_leader_dot() {
         s.app_settings.is_some(),
         "Space . opens the app-settings overlay"
     );
-    // The project-settings overlay (Space ,) is a distinct chord.
-    assert!(s.project_settings.is_none());
+    // The workspace-settings overlay (Space ,) is a distinct chord.
+    assert!(s.workspace_settings.is_none());
 }
 
 #[test]
@@ -2827,21 +2827,21 @@ fn app_settings_apply_and_toggle_ligatures() {
     assert_eq!(params["ligatures"], json!(true));
 }
 
-// ---- project creation + settings (docs: project creation + project settings) -----------------
+// ---- workspace creation + settings (docs: workspace creation + workspace settings) -----------------
 
 #[test]
-fn project_create_row_appears_for_a_novel_name_in_the_projects_picker() {
+fn workspace_create_row_appears_for_a_novel_name_in_the_workspaces_picker() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
 
     let mut s = session();
-    s.project = "aether".into();
-    let _ = s.open_picker(PickerKind::Projects, None, None, false);
+    s.workspace = "aether".into();
+    let _ = s.open_picker(PickerKind::Workspaces, None, None, false);
     let p = s.picker.as_mut().unwrap();
     p.apply_update(PickerUpdateParams {
-        kind: PickerKind::Projects,
+        kind: PickerKind::Workspaces,
         generation: p.generation,
         offset: 0,
-        items: Some(vec![PickerItem::Project {
+        items: Some(vec![PickerItem::Workspace {
             name: "aether".into(),
             unsaved_buffers: 0,
             match_indices: vec![],
@@ -2866,20 +2866,20 @@ fn project_create_row_appears_for_a_novel_name_in_the_projects_picker() {
 }
 
 #[test]
-fn accepting_the_projects_create_row_emits_project_create() {
+fn accepting_the_workspaces_create_row_emits_workspace_create() {
     use aether_client::update::Event;
     use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams};
 
     let mut s = session();
-    s.project = "aether".into();
-    let _ = s.open_picker(PickerKind::Projects, None, None, false);
+    s.workspace = "aether".into();
+    let _ = s.open_picker(PickerKind::Workspaces, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
         p.apply_update(PickerUpdateParams {
-            kind: PickerKind::Projects,
+            kind: PickerKind::Workspaces,
             generation: p.generation,
             offset: 0,
-            items: Some(vec![PickerItem::Project {
+            items: Some(vec![PickerItem::Workspace {
                 name: "aether".into(),
                 unsaved_buffers: 0,
                 match_indices: vec![],
@@ -2895,23 +2895,23 @@ fn accepting_the_projects_create_row_emits_project_create() {
         p.query = "fresh".into();
         assert_eq!(p.create_row_index(), Some(1));
     }
-    // Click the create row → project/create with the trimmed name; the picker closes (a hide fires).
+    // Click the create row → workspace/create with the trimmed name; the picker closes (a hide fires).
     let fx = s.on_event(Event::PickerClicked(1));
-    let create = find_request(&fx, "project/create").expect("project/create fired");
+    let create = find_request(&fx, "workspace/create").expect("workspace/create fired");
     assert_eq!(create["name"], json!("fresh"));
     assert!(s.picker.is_none(), "the picker closes on create");
 }
 
 #[test]
-fn project_created_with_no_roots_opens_a_scratch_and_settings() {
+fn workspace_created_with_no_roots_opens_a_scratch_and_settings() {
     use aether_client::update::Event;
-    use aether_protocol::project::{ProjectActivateResult, ProjectInfo};
+    use aether_protocol::workspace::{WorkspaceActivateResult, WorkspaceInfo};
 
     let mut s = session();
-    s.project = "old".into();
-    // A fresh project comes back with no roots and no landing buffer.
-    let fx = s.on_event(Event::ProjectCreated(Ok(ProjectActivateResult {
-        project: ProjectInfo {
+    s.workspace = "old".into();
+    // A fresh workspace comes back with no roots and no landing buffer.
+    let fx = s.on_event(Event::WorkspaceCreated(Ok(WorkspaceActivateResult {
+        workspace: WorkspaceInfo {
             name: "fresh".into(),
             paths: vec![],
         },
@@ -2919,37 +2919,37 @@ fn project_created_with_no_roots_opens_a_scratch_and_settings() {
         opened: None,
         server_started_at: 0,
     })));
-    assert_eq!(s.project, "fresh");
-    // Rather than leave the previous project's buffer behind, a scratch is opened (a `buffer/open`
-    // with no buffer_id/path) so the user lands in some editor in the new project.
+    assert_eq!(s.workspace, "fresh");
+    // Rather than leave the previous workspace's buffer behind, a scratch is opened (a `buffer/open`
+    // with no buffer_id/path) so the user lands in some editor in the new workspace.
     let (_, method, _) = the_request(&fx);
     assert_eq!(
         method, "buffer/open",
-        "opens a fresh scratch in the new project"
+        "opens a fresh scratch in the new workspace"
     );
     // The settings overlay auto-opens, focused on the add-root input (index = roots.len() + 1 = 1).
-    let ps = s.project_settings.as_ref().expect("settings opened");
-    assert_eq!(ps.project_name, "fresh");
+    let ps = s.workspace_settings.as_ref().expect("settings opened");
+    assert_eq!(ps.workspace_name, "fresh");
     assert!(ps.roots.is_empty());
     assert_eq!(ps.selected, ps.input_index());
     assert!(
         fx.0.iter()
             .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Success, .. })),
-        "a success toast names the new project"
+        "a success toast names the new workspace"
     );
 }
 
 #[test]
-fn opening_settings_populates_state_from_the_active_project() {
+fn opening_settings_populates_state_from_the_active_workspace() {
     let mut s = session();
-    s.project = "aether".into();
-    s.project_paths = vec!["/a".into(), "/b".into()];
-    s.open_project_settings();
-    let ps = s.project_settings.as_ref().unwrap();
-    assert_eq!(ps.project_name, "aether");
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into(), "/b".into()];
+    s.open_workspace_settings();
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.workspace_name, "aether");
     assert_eq!(ps.name.text, "aether");
     assert_eq!(ps.roots, vec!["/a".to_string(), "/b".to_string()]);
-    // Focus lands on the project-name field (index 0).
+    // Focus lands on the workspace-name field (index 0).
     assert_eq!(ps.selected, 0);
     assert!(ps.on_name());
 }
@@ -2957,29 +2957,29 @@ fn opening_settings_populates_state_from_the_active_project() {
 #[test]
 fn settings_add_root_emits_request_and_its_result_updates_state() {
     use aether_client::update::Event;
-    use aether_protocol::project::ProjectInfo;
+    use aether_protocol::workspace::WorkspaceInfo;
 
     let mut s = session();
-    s.project = "aether".into();
-    s.project_paths = vec!["/a".into()];
-    s.open_project_settings();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
     // Open focuses the name field; move down to the add-root input (Alt-j past the single root).
     s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
     s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
-    assert!(s.project_settings.as_ref().unwrap().on_input());
+    assert!(s.workspace_settings.as_ref().unwrap().on_input());
     // The shell's input owns text entry and syncs the whole value; the core no longer key-edits.
-    let _ = s.project_settings_set_add("/b".into());
+    let _ = s.workspace_settings_set_add("/b".into());
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
-    let add = find_request(&fx, "project/add_root").expect("project/add_root fired");
-    assert_eq!(add["project"], json!("aether"));
+    let add = find_request(&fx, "workspace/add_root").expect("workspace/add_root fired");
+    assert_eq!(add["workspace"], json!("aether"));
     assert_eq!(add["path"], json!("/b"));
     // The result updates the session roots + the overlay's roots and clears the input.
-    let _ = s.on_event(Event::ProjectRootAdded(Ok(ProjectInfo {
+    let _ = s.on_event(Event::WorkspaceRootAdded(Ok(WorkspaceInfo {
         name: "aether".into(),
         paths: vec!["/a".into(), "/b".into()],
     })));
-    assert_eq!(s.project_paths, vec!["/a".to_string(), "/b".to_string()]);
-    let ps = s.project_settings.as_ref().unwrap();
+    assert_eq!(s.workspace_paths, vec!["/a".to_string(), "/b".to_string()]);
+    let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.roots.len(), 2);
     assert!(
         ps.add.text.is_empty(),
@@ -2990,31 +2990,31 @@ fn settings_add_root_emits_request_and_its_result_updates_state() {
 #[test]
 fn settings_rename_emits_request_and_its_result_updates_the_name() {
     use aether_client::update::Event;
-    use aether_protocol::project::ProjectInfo;
+    use aether_protocol::workspace::WorkspaceInfo;
 
     let mut s = session();
-    s.project = "old".into();
-    s.project_paths = vec!["/a".into()];
-    s.open_project_settings();
+    s.workspace = "old".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
     // Move up to the name field (Alt-k from the input row to the single root to the name).
     s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
     s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
-    assert!(s.project_settings.as_ref().unwrap().on_name());
+    assert!(s.workspace_settings.as_ref().unwrap().on_name());
     // The shell's input owns text entry and syncs the whole value; the core no longer key-edits.
-    let _ = s.project_settings_set_name("oldx".into());
+    let _ = s.workspace_settings_set_name("oldx".into());
     // Enter commits the rename.
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
-    let rename = find_request(&fx, "project/rename").expect("project/rename fired");
-    assert_eq!(rename["project"], json!("old"));
+    let rename = find_request(&fx, "workspace/rename").expect("workspace/rename fired");
+    assert_eq!(rename["workspace"], json!("old"));
     assert_eq!(rename["new_name"], json!("oldx"));
     // The result reconciles the committed name in both the session and the overlay.
-    let _ = s.on_event(Event::ProjectRenamed(Ok(ProjectInfo {
+    let _ = s.on_event(Event::WorkspaceRenamed(Ok(WorkspaceInfo {
         name: "oldx".into(),
         paths: vec!["/a".into()],
     })));
-    assert_eq!(s.project, "oldx");
-    let ps = s.project_settings.as_ref().unwrap();
-    assert_eq!(ps.project_name, "oldx");
+    assert_eq!(s.workspace, "oldx");
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.workspace_name, "oldx");
     assert_eq!(ps.name.text, "oldx");
 }
 
@@ -3022,51 +3022,51 @@ fn settings_rename_emits_request_and_its_result_updates_the_name() {
 fn settings_remove_root_needs_confirm_then_emits_request() {
     use aether_client::session::{ConfirmAction, Prompt};
     use aether_client::update::Event;
-    use aether_protocol::project::{ProjectInfo, ProjectRemoveRootResult};
+    use aether_protocol::workspace::{WorkspaceInfo, WorkspaceRemoveRootResult};
 
     let mut s = session();
-    s.project = "aether".into();
-    s.project_paths = vec!["/a".into(), "/b".into()];
-    s.open_project_settings();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into(), "/b".into()];
+    s.open_workspace_settings();
     // Open focuses the name field (index 0); Alt-j down to the first root row (index 1).
     s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
-    assert_eq!(s.project_settings.as_ref().unwrap().selected, 1);
+    assert_eq!(s.workspace_settings.as_ref().unwrap().selected, 1);
     // Delete opens the shared confirm prompt for the highlighted root (no request yet).
     let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
     assert!(
-        find_request(&fx, "project/remove_root").is_none(),
+        find_request(&fx, "workspace/remove_root").is_none(),
         "Delete only raises the confirm prompt"
     );
     match &s.prompt {
         Some(Prompt::Confirm {
-            action: ConfirmAction::RemoveProjectRoot { project, path },
+            action: ConfirmAction::RemoveWorkspaceRoot { workspace, path },
             ..
         }) => {
-            assert_eq!(project, "aether");
+            assert_eq!(workspace, "aether");
             assert_eq!(path, "/a");
         }
-        other => panic!("expected a RemoveProjectRoot confirm prompt, got {other:?}"),
+        other => panic!("expected a RemoveWorkspaceRoot confirm prompt, got {other:?}"),
     }
     // The settings overlay stays open behind the prompt.
-    assert!(s.project_settings.is_some());
+    assert!(s.workspace_settings.is_some());
     // Accepting the prompt fires the remove request for the staged root.
     let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
-    let remove = find_request(&fx, "project/remove_root").expect("project/remove_root fired");
-    assert_eq!(remove["project"], json!("aether"));
+    let remove = find_request(&fx, "workspace/remove_root").expect("workspace/remove_root fired");
+    assert_eq!(remove["workspace"], json!("aether"));
     assert_eq!(remove["path"], json!("/a"));
     assert!(s.prompt.is_none(), "the prompt closes on accept");
     // The result refreshes the roots.
-    let _ = s.on_event(Event::ProjectRootRemoved(Ok(ProjectRemoveRootResult {
-        project: ProjectInfo {
+    let _ = s.on_event(Event::WorkspaceRootRemoved(Ok(WorkspaceRemoveRootResult {
+        workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec!["/b".into()],
         },
         closed_buffer_ids: vec![],
         next_buffer_id: None,
     })));
-    assert_eq!(s.project_paths, vec!["/b".to_string()]);
+    assert_eq!(s.workspace_paths, vec!["/b".to_string()]);
     assert_eq!(
-        s.project_settings.as_ref().unwrap().roots,
+        s.workspace_settings.as_ref().unwrap().roots,
         vec!["/b".to_string()]
     );
 }
@@ -3077,61 +3077,61 @@ fn settings_remove_root_via_click_event() {
     use aether_client::update::Event;
 
     let mut s = session();
-    s.project = "aether".into();
-    s.project_paths = vec!["/a".into(), "/b".into()];
-    s.open_project_settings();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into(), "/b".into()];
+    s.open_workspace_settings();
     // A clicked delete button (0-based index) opens the same confirm prompt.
-    let fx = s.on_event(Event::ProjectSettingsRemoveRoot(1));
-    assert!(find_request(&fx, "project/remove_root").is_none());
+    let fx = s.on_event(Event::WorkspaceSettingsRemoveRoot(1));
+    assert!(find_request(&fx, "workspace/remove_root").is_none());
     match &s.prompt {
         Some(Prompt::Confirm {
-            action: ConfirmAction::RemoveProjectRoot { path, .. },
+            action: ConfirmAction::RemoveWorkspaceRoot { path, .. },
             ..
         }) => assert_eq!(path, "/b"),
-        other => panic!("expected a RemoveProjectRoot confirm prompt, got {other:?}"),
+        other => panic!("expected a RemoveWorkspaceRoot confirm prompt, got {other:?}"),
     }
     // Out-of-range index is a no-op.
     let mut s2 = session();
-    s2.project = "aether".into();
-    s2.project_paths = vec!["/a".into()];
-    s2.open_project_settings();
-    let _ = s2.on_event(Event::ProjectSettingsRemoveRoot(9));
+    s2.workspace = "aether".into();
+    s2.workspace_paths = vec!["/a".into()];
+    s2.open_workspace_settings();
+    let _ = s2.on_event(Event::WorkspaceSettingsRemoveRoot(9));
     assert!(s2.prompt.is_none());
 }
 
 #[test]
 fn settings_set_name_and_add_sync_text() {
     let mut s = session();
-    s.project = "aether".into();
-    s.project_paths = vec!["/a".into()];
-    s.open_project_settings();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
     // The web set methods write the field text wholesale (native <input> parity).
-    s.project_settings_set_name("renamed".into());
-    s.project_settings_set_add("/new/root".into());
-    let ps = s.project_settings.as_ref().unwrap();
+    s.workspace_settings_set_name("renamed".into());
+    s.workspace_settings_set_add("/new/root".into());
+    let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.name.text, "renamed");
     assert_eq!(ps.add.text, "/new/root");
     // No-op outside the overlay.
-    s.project_settings = None;
-    let fx = s.project_settings_set_name("x".into());
+    s.workspace_settings = None;
+    let fx = s.workspace_settings_set_name("x".into());
     assert!(fx.0.is_empty());
 }
 
 #[test]
 fn settings_esc_closes_the_overlay() {
     let mut s = session();
-    s.project = "aether".into();
-    s.open_project_settings();
-    assert!(s.project_settings.is_some());
+    s.workspace = "aether".into();
+    s.open_workspace_settings();
+    assert!(s.workspace_settings.is_some());
     s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
-    assert!(s.project_settings.is_none());
+    assert!(s.workspace_settings.is_none());
 }
 
 #[test]
 fn document_symbols_opens_scoped_to_buffer_with_no_filters() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     // The symbols picker opens unfiltered (the full hierarchy, indented by depth — no top-level
     // collapse) and scoped to the active buffer so the server can resolve symbols + the cursor.
     let fx = s.open_picker(PickerKind::DocumentSymbols, None, None, false);
@@ -3151,7 +3151,7 @@ fn symbol_push_center_on_lands_the_highlight() {
         PickerItem, PickerKind, PickerUpdate, PickerUpdateParams, SymbolKind,
     };
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::DocumentSymbols, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
@@ -3206,7 +3206,7 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
         PickerItem, PickerKind, PickerUpdate, PickerUpdateParams, SymbolKind,
     };
     let mut s = session();
-    s.project_paths = vec!["/p".into()];
+    s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::DocumentSymbols, None, None, false);
     {
         let p = s.picker.as_mut().unwrap();
@@ -3262,12 +3262,12 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
     );
 }
 
-/// Closing the last buffer of an ephemeral "(project N)" context doesn't spawn a scratch — it
+/// Closing the last buffer of an ephemeral "(workspace N)" context doesn't spawn a scratch — it
 /// leaves the context. A session *launched* for the file (`ae /path`) quits, vim-like.
 #[test]
 fn ephemeral_last_buffer_close_when_launched_quits() {
     let mut s = session();
-    s.project = "ephemeral/1".to_string();
+    s.workspace = "ephemeral/1".to_string();
     s.launched_with_file = true;
 
     let fx = s.close_buffer();
@@ -3279,7 +3279,7 @@ fn ephemeral_last_buffer_close_when_launched_quits() {
         "no scratch successor in an ephemeral context"
     );
 
-    // Server reports nothing left in the project.
+    // Server reports nothing left in the workspace.
     let fx = s.on_rpc_result(token, Ok(json!({})));
     assert!(
         fx.0.iter().any(|e| matches!(e, Effect::Exit)),
@@ -3288,13 +3288,13 @@ fn ephemeral_last_buffer_close_when_launched_quits() {
 }
 
 /// A session that *navigated into* an ephemeral context (picked it from the switcher, or a second
-/// client that joined it) returns to the project chooser instead of quitting — quitting would be
+/// client that joined it) returns to the workspace chooser instead of quitting — quitting would be
 /// surprising when the app was already in use. (Web takes this branch too: it never launches with
 /// a file, can't quit a tab, and its chooser is mandatory.)
 #[test]
 fn ephemeral_last_buffer_close_when_navigated_opens_chooser() {
     let mut s = session();
-    s.project = "ephemeral/1".to_string();
+    s.workspace = "ephemeral/1".to_string();
     s.launched_with_file = false;
 
     let fx = s.close_buffer();
@@ -3307,7 +3307,7 @@ fn ephemeral_last_buffer_close_when_navigated_opens_chooser() {
     );
     assert!(
         fx.0.iter().any(|e| matches!(e, Effect::ToChooser)),
-        "it returns to the project chooser (shell-side reset) instead"
+        "it returns to the workspace chooser (shell-side reset) instead"
     );
 }
 
@@ -3316,7 +3316,7 @@ fn ephemeral_last_buffer_close_when_navigated_opens_chooser() {
 #[test]
 fn ephemeral_close_with_sibling_attaches_instead_of_leaving() {
     let mut s = session();
-    s.project = "ephemeral/1".to_string();
+    s.workspace = "ephemeral/1".to_string();
 
     let fx = s.close_buffer();
     let (token, _, _) = the_request(&fx);
@@ -3335,12 +3335,12 @@ fn ephemeral_close_with_sibling_attaches_instead_of_leaving() {
     );
 }
 
-/// A persisted project is unaffected: closing its last buffer still spawns a scratch successor
+/// A persisted workspace is unaffected: closing its last buffer still spawns a scratch successor
 /// (`open_next`), and never quits.
 #[test]
-fn persisted_project_close_keeps_open_next_scratch() {
+fn persisted_workspace_close_keeps_open_next_scratch() {
     let mut s = session();
-    s.project = "my-project".to_string();
+    s.workspace = "my-workspace".to_string();
 
     let fx = s.close_buffer();
     let (_, method, params) = the_request(&fx);
@@ -3348,21 +3348,21 @@ fn persisted_project_close_keeps_open_next_scratch() {
     assert_eq!(
         params["open_next"],
         json!(true),
-        "persisted projects keep the close-then-scratch behaviour"
+        "persisted workspaces keep the close-then-scratch behaviour"
     );
     assert!(!fx.0.iter().any(|e| matches!(e, Effect::Exit)));
 }
 
-/// `Space Alt-w` open-from-path: typing syncs into the core, Enter submits via `project/open_path`,
-/// and the result is adopted like a project switch (project + buffer).
+/// `Space Alt-w` open-from-path: typing syncs into the core, Enter submits via `workspace/open_path`,
+/// and the result is adopted like a workspace switch (workspace + buffer).
 #[test]
 fn open_path_prompt_submits_via_open_path_rpc() {
     use aether_client::session::{Prompt, TextField};
     use aether_protocol::buffer::BufferOpenResult;
-    use aether_protocol::project::{ProjectActivateResult, ProjectInfo};
+    use aether_protocol::workspace::{WorkspaceActivateResult, WorkspaceInfo};
 
     let mut s = session();
-    s.project = "proj".into();
+    s.workspace = "proj".into();
     // Opening the overlay (what `A::OpenPath` does).
     s.prompt = Some(Prompt::OpenPath(TextField::new(String::new())));
 
@@ -3372,11 +3372,11 @@ fn open_path_prompt_submits_via_open_path_rpc() {
     // Enter submits.
     let fx = s.on_prompt_key(KeyCode::Enter, Mods::NONE, None);
     let (token, method, params) = the_request(&fx);
-    assert_eq!(method, "project/open_path");
+    assert_eq!(method, "workspace/open_path");
     assert_eq!(params["path"], json!("/etc/hosts"));
     assert!(s.prompt.is_none(), "the overlay closes on submit");
 
-    // The result lands like a switch: adopt the (resolved) project + opened buffer.
+    // The result lands like a switch: adopt the (resolved) workspace + opened buffer.
     let opened = BufferOpenResult {
         buffer_id: 9,
         language: None,
@@ -3392,8 +3392,8 @@ fn open_path_prompt_submits_via_open_path_rpc() {
         transient: false,
         search_summary: None,
     };
-    let result = serde_json::to_value(ProjectActivateResult {
-        project: ProjectInfo {
+    let result = serde_json::to_value(WorkspaceActivateResult {
+        workspace: WorkspaceInfo {
             name: "proj".into(),
             paths: vec![],
         },
@@ -3412,7 +3412,7 @@ fn open_path_prompt_submits_via_open_path_rpc() {
 fn open_path_prompt_esc_cancels() {
     use aether_client::session::{Prompt, TextField};
     let mut s = session();
-    s.project = "proj".into();
+    s.workspace = "proj".into();
     s.prompt = Some(Prompt::OpenPath(TextField::new("/some/path".into())));
     let fx = s.on_prompt_key(KeyCode::Esc, Mods::NONE, None);
     assert!(s.prompt.is_none(), "Esc closes the overlay");
@@ -3427,7 +3427,7 @@ fn open_path_prompt_esc_cancels() {
 fn open_path_empty_submit_keeps_overlay_open() {
     use aether_client::session::{Prompt, TextField};
     let mut s = session();
-    s.project = "proj".into();
+    s.workspace = "proj".into();
     s.prompt = Some(Prompt::OpenPath(TextField::new("   ".into()))); // whitespace only
     let fx = s.on_prompt_key(KeyCode::Enter, Mods::NONE, None);
     assert!(

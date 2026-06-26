@@ -2,7 +2,7 @@
 //!
 //! A render-side mirror of the core [`aether_client::save_as::SaveAsEditor`], shaped exactly like
 //! the picker's dir [`crate::picker::ChipEditor`] so the two share their look and muscle memory:
-//! a multi-root projects' leading **root** field (smartcase typeahead, `:` separator) ahead of a
+//! a multi-root workspaces' leading **root** field (smartcase typeahead, `:` separator) ahead of a
 //! `directory/list`-backed **path** field with ghost suggestions, `Tab`/`Alt-l` accept, `Alt-j`/`k`
 //! cycle, and `Alt-Backspace` segment pop.
 //!
@@ -29,7 +29,7 @@ use aether_protocol::directory::DirectoryEntry;
 /// One save-prompt instance — the render mirror of [`aether_client::save_as::SaveAsEditor`].
 #[derive(Debug, Clone)]
 pub struct SavePromptState {
-    /// Which segment has focus. Always `Path` in single-root projects.
+    /// Which segment has focus. Always `Path` in single-root workspaces.
     pub field: ChipEditorField,
     /// The root-relative path being typed (directory portion + filename leaf). Caret baked in.
     pub input: TextInput,
@@ -39,7 +39,7 @@ pub struct SavePromptState {
     pub root_selected: usize,
     /// The root the editor opened with — the fallback when the filter matches nothing.
     pub root_index: u32,
-    /// Whether the project has more than one root (so the root field exists at all).
+    /// Whether the workspace has more than one root (so the root field exists at all).
     pub multi_root: bool,
     /// Cached `directory/list` entries (files *and* directories) for the dir portion of `input`.
     pub listing: Vec<DirectoryEntry>,
@@ -58,7 +58,7 @@ impl SavePromptState {
 
     /// The root field's ghost completion: the current match's root index and the part of its label
     /// beyond the typed prefix (rendered gray after the caret). `None` when nothing matches — the
-    /// red typed filter is then the cue. `labels` are the project's disambiguated root labels.
+    /// red typed filter is then the cue. `labels` are the workspace's disambiguated root labels.
     pub fn root_ghost(&self, labels: &[String]) -> Option<(usize, String)> {
         let candidates = matching_root_indices(labels, &self.root_filter.text);
         let &idx = candidates.get(self.root_selected.min(candidates.len().saturating_sub(1)))?;
@@ -105,7 +105,7 @@ impl SavePromptState {
     }
 
     /// True when the path is *definitely* unsaveable as typed — the red-worthy condition: the dir
-    /// portion failed to list (its parent directory doesn't exist or sits outside the project
+    /// portion failed to list (its parent directory doesn't exist or sits outside the workspace
     /// boundary). The filename leaf is free, so it never invalidates; a `Pending` listing is
     /// unknown, not invalid.
     pub fn path_invalid(&self) -> bool {
@@ -151,7 +151,7 @@ pub fn matching_indices(listing: &[DirectoryEntry], filter: &str) -> Vec<usize> 
     out
 }
 
-/// Same matching rule applied to project-root labels.
+/// Same matching rule applied to workspace-root labels.
 pub fn matching_root_indices(root_labels: &[String], filter: &str) -> Vec<usize> {
     let (needle, has_upper) = smartcase_needle(filter);
     if filter.is_empty() {

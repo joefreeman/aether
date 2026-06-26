@@ -34,8 +34,8 @@ import type {
   LspServerStatus,
   PickerItem,
   PickerKind,
-  ProjectActivateResult,
-  ProjectListResult,
+  WorkspaceActivateResult,
+  WorkspaceListResult,
   ScrollPosition,
   SymbolKind,
   ViewportSubscribeResult,
@@ -76,11 +76,11 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   buffers: "Switch buffer…",
   grep: "Grep workspace…",
   git_changes_file: "Changes in current file…",
-  git_changes: "Changes in project…",
+  git_changes: "Changes in workspace…",
   explorer: "Explore files…",
-  projects: "Select project…",
+  workspaces: "Select workspace…",
   diagnostics: "Diagnostics in current file…",
-  diagnostics_project: "Diagnostics in project…",
+  diagnostics_workspace: "Diagnostics in workspace…",
   lsp_servers: "List LSPs…",
   references: "List references…",
   document_symbols: "Go to symbol…",
@@ -99,14 +99,14 @@ const SYMBOL_TAG: Record<SymbolKind, string> = {
 
 interface Config {
   wsBase: string;
-  project: string | undefined;
+  workspace: string | undefined;
 }
 
 function resolveConfig(): Config {
   // No token: the daemon authorizes by loopback Host/Origin (served same-origin; Vite dev points
   // VITE_AETHER_WS at the daemon, whose origin check accepts localhost).
   const wsBase = import.meta.env.VITE_AETHER_WS ?? `ws://${location.host}`;
-  return { wsBase, project: import.meta.env.VITE_AETHER_PROJECT };
+  return { wsBase, workspace: import.meta.env.VITE_AETHER_WORKSPACE };
 }
 
 interface Cell {
@@ -224,7 +224,7 @@ type ConfirmKind =
   | { kind: "discard_close"; label: string }
   | { kind: "delete"; noun: string; name: string }
   | { kind: "remove_root"; path: string }
-  | { kind: "delete_project"; name: string };
+  | { kind: "delete_workspace"; name: string };
 
 type PromptView =
   | { kind: "confirm"; confirm: ConfirmKind }
@@ -245,7 +245,7 @@ type PromptView =
     }
   | { kind: "lspinfo"; status: LspServerStatus }
   /** Open-from-path: a single plain `<input>` path field (no root chips). The core opens it via
-   *  `project/open_path` on Enter and syncs typed text via `open_path_set_input`. */
+   *  `workspace/open_path` on Enter and syncs typed text via `open_path_set_input`. */
   | { kind: "openpath"; input: string };
 
 /** The web client's phrasing for each confirmation reason — a presentational choice, matching the
@@ -266,8 +266,8 @@ function confirmMessage(c: ConfirmKind): string {
       return `Delete ${c.noun} "${c.name}"?`;
     case "remove_root":
       return `Remove root "${c.path}"?`;
-    case "delete_project":
-      return `Delete project "${c.name}"?`;
+    case "delete_workspace":
+      return `Delete workspace "${c.name}"?`;
   }
 }
 
@@ -373,8 +373,8 @@ interface CoreView {
   count: number | null;
   pending: unknown | null;
   sneak_active: boolean;
-  project: string;
-  project_paths: string[];
+  workspace: string;
+  workspace_paths: string[];
   externally_modified: boolean;
   externally_deleted: boolean;
   diagnostics: DiagnosticCounts;
@@ -382,15 +382,15 @@ interface CoreView {
   search: SearchView;
   prompt: PromptView | null;
   picker: PickerView | null;
-  project_settings: ProjectSettingsView | null;
+  workspace_settings: WorkspaceSettingsView | null;
   app_settings: AppSettingsView | null;
 }
 
-/** The project-settings overlay (`Space ,`), when open (view.rs `project_settings`). Core-owned
- *  state + key handling (`on_project_settings_key`); the shell renders this and routes keys through
+/** The workspace-settings overlay (`Space ,`), when open (view.rs `workspace_settings`). Core-owned
+ *  state + key handling (`on_workspace_settings_key`); the shell renders this and routes keys through
  *  the global keydown → `on_key`. Selection: 0 = name field, `1..=roots.length` = root rows,
  *  `input_index` = the add-root input row. */
-interface ProjectSettingsView {
+interface WorkspaceSettingsView {
   name: EditorInput;
   roots: string[];
   selected: number;
@@ -470,26 +470,26 @@ function lspIcon(lsp: LspServerStatus | null): { kind: IconKind; cls: string; sp
   return { kind: cls, cls, spin: cls === "lsp-busy" };
 }
 
-/** Mirrors `aether_protocol::EPHEMERAL_PROJECT_PREFIX`: an ephemeral "(no project)" context's id
- *  is `ephemeral/<n>` (a `/` that can't appear in a real project name). */
-const EPHEMERAL_PROJECT_PREFIX = "ephemeral/";
+/** Mirrors `aether_protocol::EPHEMERAL_WORKSPACE_PREFIX`: an ephemeral "(no workspace)" context's id
+ *  is `ephemeral/<n>` (a `/` that can't appear in a real workspace name). */
+const EPHEMERAL_WORKSPACE_PREFIX = "ephemeral/";
 
-/** Whether to wrap a project id in the `[project]` chrome shown in the status bar / window title.
- *  False for the empty (no project) state and for an ephemeral context — neither is a real, named
- *  project, so we show just the buffer label rather than `[(no project)]`. Mirrors the native
- *  clients' `labels::shows_project_chrome`. */
-function showsProjectChrome(project: string): boolean {
-  return project.length > 0 && !project.startsWith(EPHEMERAL_PROJECT_PREFIX);
+/** Whether to wrap a workspace id in the `[workspace]` chrome shown in the status bar / window title.
+ *  False for the empty (no workspace) state and for an ephemeral context — neither is a real, named
+ *  workspace, so we show just the buffer label rather than `[(no workspace)]`. Mirrors the native
+ *  clients' `labels::shows_workspace_chrome`. */
+function showsWorkspaceChrome(workspace: string): boolean {
+  return workspace.length > 0 && !workspace.startsWith(EPHEMERAL_WORKSPACE_PREFIX);
 }
 
-/** The explorer breadcrumb: the listed directory shown *within* its project root (ported from the
+/** The explorer breadcrumb: the listed directory shown *within* its workspace root (ported from the
  *  old client's `explorerDisplayPath`). Empty at a single root's top; `root: rel/` under multi-root.
  *  (Deferred polish: the disambiguated root label + path-budget elision — uses the basename here.) */
-function explorerPrefix(dir: string | null, projectPaths: string[]): string {
+function explorerPrefix(dir: string | null, workspacePaths: string[]): string {
   if (!dir) return ""; // roots mode — the rows already say "pick a root"
   let best = "";
   let bestIdx = -1;
-  projectPaths.forEach((root, i) => {
+  workspacePaths.forEach((root, i) => {
     const norm = root.endsWith("/") ? root.slice(0, -1) : root;
     if ((dir === norm || dir.startsWith(norm + "/")) && norm.length > best.length) {
       best = norm;
@@ -497,7 +497,7 @@ function explorerPrefix(dir: string | null, projectPaths: string[]): string {
     }
   });
   if (bestIdx < 0) return `${dir}/`;
-  const label = projectPaths.length > 1 ? `${basename(best)}: ` : "";
+  const label = workspacePaths.length > 1 ? `${basename(best)}: ` : "";
   if (dir === best) return label;
   return `${label}${dir.slice(best.length + 1)}/`;
 }
@@ -546,7 +546,7 @@ function matched(text: string, indices?: number[]): DocumentFragment {
  *  (`rootLabels`, "" for single-root); `budget` is the char allowance for paths (segment-elided). */
 function describePickerItem(
   item: PickerItem,
-  projectPaths: string[],
+  workspacePaths: string[],
   labels: string[],
   budget: number,
 ): RowDesc {
@@ -626,18 +626,18 @@ function describePickerItem(
       };
     }
     case "root": {
-      const p = projectPaths[item.path_index];
+      const p = workspacePaths[item.path_index];
       return { primary: `${p ? basename(p) : `root ${item.path_index}`}/`, matches: item.match_indices, dir: true };
     }
-    case "project": {
-      // Trailing frost-blue dot when the project has unsaved buffers — the same dirty indicator
+    case "workspace": {
+      // Trailing frost-blue dot when the workspace has unsaved buffers — the same dirty indicator
       // the buffer picker shows, so the two pickers read alike. An ephemeral context renders as an
-      // italic "(project N)" (mirrors the native clients — `labels::project_display`, slanted like
+      // italic "(workspace N)" (mirrors the native clients — `labels::workspace_display`, slanted like
       // a transient buffer); its id isn't a meaningful match haystack, so drop the highlight indices.
-      const ephemeral = item.name.startsWith(EPHEMERAL_PROJECT_PREFIX);
-      const n = item.name.slice(EPHEMERAL_PROJECT_PREFIX.length);
+      const ephemeral = item.name.startsWith(EPHEMERAL_WORKSPACE_PREFIX);
+      const n = item.name.slice(EPHEMERAL_WORKSPACE_PREFIX.length);
       return {
-        primary: ephemeral ? `(project ${n})` : item.name,
+        primary: ephemeral ? `(workspace ${n})` : item.name,
         matches: ephemeral ? [] : item.match_indices,
         italic: ephemeral,
         dirty: (item.unsaved_buffers ?? 0) > 0 ? "unsaved" : undefined,
@@ -812,11 +812,11 @@ export class Shell {
   private helpTab = 0;
   private helpData: { label: string; sections: { title: string; rows: [string, string][] }[] }[] | null = null;
   private helpTabEls: HTMLElement[] = [];
-  /** The project-settings overlay (Space ,). Core-owned state (`session.project_settings`); the
+  /** The workspace-settings overlay (Space ,). Core-owned state (`session.workspace_settings`); the
    *  name + add-root fields are persistent native `<input>`s (real caret/selection/IME) that own
-   *  text editing and sync to the core (`project_settings_set_name` / `_set_add`); nav/commit/cancel
+   *  text editing and sync to the core (`workspace_settings_set_name` / `_set_add`); nav/commit/cancel
    *  keys route through their keydown → `on_key`. The labels + root rows are rebuilt each render. */
-  private readonly projectSettingsEl: HTMLElement;
+  private readonly workspaceSettingsEl: HTMLElement;
   private readonly psModalEl: HTMLElement;
   /** The `<ul>` of existing roots — rebuilt each render. */
   private readonly psRootsEl: HTMLElement;
@@ -824,7 +824,7 @@ export class Shell {
   private readonly psAddInput: HTMLInputElement;
   /** The in-dialog error line — persistent, shown/hidden per render. */
   private readonly psErrorEl: HTMLElement;
-  /** The currently-open project-settings selection, so `focusTarget` knows what to focus: the name
+  /** The currently-open workspace-settings selection, so `focusTarget` knows what to focus: the name
    *  field, the add-root input, or — for a root row — the capture field (the row's keys route via
    *  the global handler). */
   private psSelected = 0;
@@ -948,7 +948,7 @@ export class Shell {
     saveModal.append(saveMsg, this.saveAsFieldEl, saveButtons);
     this.saveAsEl.append(saveModal);
     // The persistent native inputs (real caret/selection/IME): the path field (dir/file path) and,
-    // for a multi-root project, the root typeahead. Editing stays native and syncs to the core; the
+    // for a multi-root workspace, the root typeahead. Editing stays native and syncs to the core; the
     // core owns the suggestion/validity logic and feeds the ghost + invalid state back via the view.
     this.saveAsRootInput = document.createElement("input");
     this.saveAsPathInput = document.createElement("input");
@@ -1077,7 +1077,7 @@ export class Shell {
     this.pickerEl.addEventListener("mousedown", (e) => {
       if (e.target === this.pickerEl && this.session) {
         e.preventDefault();
-        // No project selected yet: the chooser is mandatory — a click outside it must not close it.
+        // No workspace selected yet: the chooser is mandatory — a click outside it must not close it.
         if (this.snapshot?.buffer.buffer_id === 0) return;
         this.runEffects(this.session.close_picker() as CoreEffect[]);
       }
@@ -1185,21 +1185,21 @@ export class Shell {
     this.helpEl.addEventListener("mousedown", (e) => {
       if (e.target === this.helpEl) this.closeHelp();
     });
-    // The project-settings overlay (Space ,): a persistent modal whose name + add-root fields are
+    // The workspace-settings overlay (Space ,): a persistent modal whose name + add-root fields are
     // native <input>s (so they keep focus + caret across re-renders and handle IME); only the
     // labels + root rows are rebuilt each render. A backdrop click is swallowed (editor stays put).
-    this.projectSettingsEl = document.createElement("div");
-    this.projectSettingsEl.className = "overlay";
-    this.projectSettingsEl.style.display = "none";
-    this.projectSettingsEl.addEventListener("mousedown", (e) => {
+    this.workspaceSettingsEl = document.createElement("div");
+    this.workspaceSettingsEl.className = "overlay";
+    this.workspaceSettingsEl.style.display = "none";
+    this.workspaceSettingsEl.addEventListener("mousedown", (e) => {
       // Swallow backdrop clicks (no fall-through to the editor); clicks on inputs/buttons proceed.
-      if (e.target === this.projectSettingsEl) e.preventDefault();
+      if (e.target === this.workspaceSettingsEl) e.preventDefault();
     });
     this.psModalEl = document.createElement("div");
-    this.psModalEl.className = "modal project-settings";
+    this.psModalEl.className = "modal workspace-settings";
     const psTitle = document.createElement("div");
     psTitle.className = "modal-message";
-    psTitle.textContent = "Project settings";
+    psTitle.textContent = "Workspace settings";
     const psNameLabel = document.createElement("div");
     psNameLabel.className = "ps-label";
     psNameLabel.textContent = "Name";
@@ -1209,9 +1209,9 @@ export class Shell {
     this.psNameInput.autocapitalize = "off";
     this.psNameInput.setAttribute("autocomplete", "off");
     this.psNameInput.addEventListener("input", () => {
-      if (this.session) this.runEffects(this.session.project_settings_set_name(this.psNameInput.value) as CoreEffect[]);
+      if (this.session) this.runEffects(this.session.workspace_settings_set_name(this.psNameInput.value) as CoreEffect[]);
     });
-    this.psNameInput.addEventListener("keydown", (e) => this.onProjectSettingsInputKey(e));
+    this.psNameInput.addEventListener("keydown", (e) => this.onWorkspaceSettingsInputKey(e));
     const psRootsLabel = document.createElement("div");
     psRootsLabel.className = "ps-label";
     psRootsLabel.textContent = "Roots";
@@ -1228,9 +1228,9 @@ export class Shell {
     this.psAddInput.autocapitalize = "off";
     this.psAddInput.setAttribute("autocomplete", "off");
     this.psAddInput.addEventListener("input", () => {
-      if (this.session) this.runEffects(this.session.project_settings_set_add(this.psAddInput.value) as CoreEffect[]);
+      if (this.session) this.runEffects(this.session.workspace_settings_set_add(this.psAddInput.value) as CoreEffect[]);
     });
-    this.psAddInput.addEventListener("keydown", (e) => this.onProjectSettingsInputKey(e));
+    this.psAddInput.addEventListener("keydown", (e) => this.onWorkspaceSettingsInputKey(e));
     const psAddRow = document.createElement("div");
     psAddRow.className = "ps-root ps-add";
     const psAddBullet = document.createElement("span");
@@ -1249,7 +1249,7 @@ export class Shell {
       psAddRow,
       this.psErrorEl,
     );
-    this.projectSettingsEl.append(this.psModalEl);
+    this.workspaceSettingsEl.append(this.psModalEl);
 
     // The application-settings overlay (Space .): a toggle-only modal — its body (rows + hint)
     // is rebuilt each render by `renderAppSettings`. A backdrop click is swallowed (editor stays).
@@ -1276,7 +1276,7 @@ export class Shell {
       // `hoverEl` is not appended here — it's parented into the buffer's spacer while shown (so it
       // can be `position: sticky` relative to the scrolling buffer) and removed on dismiss.
       this.helpEl,
-      this.projectSettingsEl,
+      this.workspaceSettingsEl,
       this.appSettingsEl,
       this.connBanner,
     );
@@ -1315,38 +1315,38 @@ export class Shell {
 
     try {
       await this.client.ready;
-      const list = await this.client.rpc<ProjectListResult>("project/list", {});
-      // The URL drives which project + buffer to open, so a picker link (Ctrl/Cmd-click → new tab)
+      const list = await this.client.rpc<WorkspaceListResult>("workspace/list", {});
+      // The URL drives which workspace + buffer to open, so a picker link (Ctrl/Cmd-click → new tab)
       // lands on the right file, and the tab is reloadable/shareable. Falls back to the configured/
-      // first project and its last (MRU) buffer or a fresh scratch.
+      // first workspace and its last (MRU) buffer or a fresh scratch.
       const sp = new URLSearchParams(location.search);
-      const urlProject = sp.get("project");
+      const urlWorkspace = sp.get("workspace");
       const urlFile = sp.get("file");
       const urlRoot = Number(sp.get("root")) || 0;
       const urlBufferRaw = sp.get("buffer");
       const urlBuffer =
         urlBufferRaw != null && Number.isInteger(Number(urlBufferRaw)) ? Number(urlBufferRaw) : null;
-      const known = list.projects.some((pr) => pr.name === urlProject);
-      const specified = (known ? urlProject : null) ?? cfg.project ?? null;
+      const known = list.workspaces.some((pr) => pr.name === urlWorkspace);
+      const specified = (known ? urlWorkspace : null) ?? cfg.workspace ?? null;
       // A URL-directed open (file/buffer link) opens separately; otherwise `open_last` folds the
       // landing buffer into the activate.
       const directed = Boolean(urlFile) || urlBuffer != null;
-      // Project selection is explicit. With none specified (and not a direct file/buffer link) we
-      // DON'T activate one: keep a placeholder session and raise the Projects chooser — nothing is
-      // rendered behind it. Picking a project activates it (PickerSelected → ProjectActivated →
+      // Workspace selection is explicit. With none specified (and not a direct file/buffer link) we
+      // DON'T activate one: keep a placeholder session and raise the Workspaces chooser — nothing is
+      // rendered behind it. Picking a workspace activates it (PickerSelected → WorkspaceActivated →
       // adopt_switch) and the editor first appears then. Matches the native shells' no-args start.
       if (specified === null && !directed) {
         this.session = new WasmSession();
-        this.runEffects(this.session.open_projects() as CoreEffect[]);
+        this.runEffects(this.session.open_workspaces() as CoreEffect[]);
         this.capture.focus();
         return;
       }
-      const name = specified ?? list.projects[0]?.name;
+      const name = specified ?? list.workspaces[0]?.name;
       if (!name) {
-        this.toast("No projects configured on the server.", "error");
+        this.toast("No workspaces configured on the server.", "error");
         return;
       }
-      const activated = await this.client.rpc<ProjectActivateResult>("project/activate", {
+      const activated = await this.client.rpc<WorkspaceActivateResult>("workspace/activate", {
         name,
         open_last: !directed,
       });
@@ -1384,7 +1384,7 @@ export class Shell {
         open = activated.opened ?? (await lastOrScratch());
       }
 
-      this.session = WasmSession.bootstrap(activated.project.name, activated.project.paths, open);
+      this.session = WasmSession.bootstrap(activated.workspace.name, activated.workspace.paths, open);
       await this.subscribe(); // derives its scroll from the buffer (open.scroll / cursor)
       // Fetch the persisted app settings (e.g. the soft-wrap default) now that the session is live.
       this.runEffects(this.session.startup() as CoreEffect[]);
@@ -1411,7 +1411,7 @@ export class Shell {
         v.mode === "search" ||
         v.prompt?.kind === "saveas" ||
         v.prompt?.kind === "openpath" ||
-        v.project_settings)
+        v.workspace_settings)
     );
   }
 
@@ -1438,12 +1438,12 @@ export class Shell {
         : this.saveAsPathInput;
     }
     if (v?.prompt?.kind === "openpath") return this.openPathInput;
-    // The project-settings overlay: focus the input matching the selected row — the name field, or
+    // The workspace-settings overlay: focus the input matching the selected row — the name field, or
     // the add-root input. A selected *root* row has no text field, so park focus on the hidden
     // capture field (its keys route through the global handler) rather than the add input, which
     // would otherwise show a stray caret and read as focused.
-    if (v?.project_settings) {
-      const ps = v.project_settings;
+    if (v?.workspace_settings) {
+      const ps = v.workspace_settings;
       if (ps.selected === 0) return this.psNameInput;
       if (ps.selected === ps.input_index) return this.psAddInput;
       return this.capture;
@@ -1542,9 +1542,9 @@ export class Shell {
       }
       return;
     }
-    // A project-settings root row is selected: like a selected chip, no text field is focused (see
+    // A workspace-settings root row is selected: like a selected chip, no text field is focused (see
     // `focusTarget`), so route its keys (Alt-j/k to move, Delete/Ctrl-d to remove, Esc to close).
-    const ps = this.snapshot?.project_settings;
+    const ps = this.snapshot?.workspace_settings;
     if (ps && ps.selected !== 0 && ps.selected !== ps.input_index && this.session) {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
         e.preventDefault();
@@ -1641,24 +1641,24 @@ export class Shell {
   }
 
   /** Rebuild the session after the socket reconnects (a fresh client_id ⇒ the server dropped this
-   *  client's cursor/selection/viewport). Re-activate the project and reopen the current buffer (by
-   *  id, restoring the cursor; a server *restart* invalidates the id, so fall back to the project's
+   *  client's cursor/selection/viewport). Re-activate the workspace and reopen the current buffer (by
+   *  id, restoring the cursor; a server *restart* invalidates the id, so fall back to the workspace's
    *  last/scratch). Buffer content + unsaved edits survive a socket drop server-side. */
   private async reestablish(): Promise<void> {
     const snap = this.snapshot;
     if (!snap) return;
-    // Reconnected while still choosing a project (no project activated yet): just re-raise the
-    // chooser on the fresh connection rather than activating an empty-named project.
+    // Reconnected while still choosing a workspace (no workspace activated yet): just re-raise the
+    // chooser on the fresh connection rather than activating an empty-named workspace.
     if (snap.buffer.buffer_id === 0) {
       this.session = new WasmSession();
       this.connBanner.style.display = "none";
-      this.runEffects(this.session.open_projects() as CoreEffect[]);
+      this.runEffects(this.session.open_workspaces() as CoreEffect[]);
       this.capture.focus();
       return;
     }
     try {
-      const activated = await this.client.rpc<ProjectActivateResult>("project/activate", {
-        name: snap.project,
+      const activated = await this.client.rpc<WorkspaceActivateResult>("workspace/activate", {
+        name: snap.workspace,
         open_last: false,
       });
       let open: BufferOpenResult;
@@ -1668,15 +1668,15 @@ export class Shell {
           jump_to: snap.buffer.cursor.position,
         });
       } catch {
-        const relanded = await this.client.rpc<ProjectActivateResult>("project/activate", {
-          name: snap.project,
+        const relanded = await this.client.rpc<WorkspaceActivateResult>("workspace/activate", {
+          name: snap.workspace,
           open_last: true,
         });
         open =
           relanded.opened ??
           (await this.client.rpc<BufferOpenResult>("buffer/open", { transient: true }));
       }
-      this.session = WasmSession.bootstrap(activated.project.name, activated.project.paths, open);
+      this.session = WasmSession.bootstrap(activated.workspace.name, activated.workspace.paths, open);
       this.connBanner.style.display = "none";
       await this.subscribe();
       // The session was rebuilt on the fresh connection — re-fetch the persisted app settings.
@@ -1759,12 +1759,12 @@ export class Shell {
         case "Exit":
           break;
         case "ToChooser":
-          // The last buffer of an ephemeral ("no project") context closed and we navigated into
+          // The last buffer of an ephemeral ("no workspace") context closed and we navigated into
           // it (web never launches with a file, so it always lands here). Discard the now
-          // buffer-less session and re-raise the mandatory Projects chooser — the same reset the
+          // buffer-less session and re-raise the mandatory Workspaces chooser — the same reset the
           // reconnect-while-choosing path uses, so no stale buffer lingers behind the picker.
           this.session = new WasmSession();
-          this.runEffects(this.session.open_projects() as CoreEffect[]);
+          this.runEffects(this.session.open_workspaces() as CoreEffect[]);
           this.capture.focus();
           break;
         default: {
@@ -2235,9 +2235,9 @@ export class Shell {
     this.renderSearch(v);
     this.renderPrompt(v);
     this.renderPicker(v);
-    this.renderProjectSettings(v);
+    this.renderWorkspaceSettings(v);
     this.renderAppSettings(v);
-    // No project yet (placeholder boot session): the mandatory chooser is the whole UI. Render only
+    // No workspace yet (placeholder boot session): the mandatory chooser is the whole UI. Render only
     // a bare backdrop behind it — no buffer, no status bar — and don't sync a bogus `?buffer=0` URL.
     if (v.buffer.buffer_id === 0) {
       this.bufferEl.replaceChildren();
@@ -2541,7 +2541,7 @@ export class Shell {
     this.overlayEl.replaceChildren(modal);
   }
 
-  /** Paint the save-as completion editor (mirrors `renderChipEditor`): a multi-root project shows a
+  /** Paint the save-as completion editor (mirrors `renderChipEditor`): a multi-root workspace shows a
    *  root segment + `:` separator + path segment; single-root shows just the path. The focused segment
    *  is a native `<input>` over a gray ghost-suggestion span; the other is a clickable span. The field
    *  structure is rebuilt only when it changes (open / multi-root / field switch) — never per keystroke,
@@ -2653,22 +2653,22 @@ export class Shell {
     return span;
   }
 
-  /** The project-settings overlay (`Space ,`): the editable project name, the roots list, and an
-   *  add-root input row — all rendered from the core's `session.project_settings`. Keyboard-driven
+  /** The workspace-settings overlay (`Space ,`): the editable workspace name, the roots list, and an
+   *  add-root input row — all rendered from the core's `session.workspace_settings`. Keyboard-driven
    *  (Alt-j/k navigate, Enter rename/add, Del then y remove, Esc close); keys route through the
    *  global keydown → `on_key`, so this only paints. Mirrors the TUI/iced overlays. */
-  private renderProjectSettings(v: CoreView): void {
-    const ps = v.project_settings;
+  private renderWorkspaceSettings(v: CoreView): void {
+    const ps = v.workspace_settings;
     const wasOpen = this.psOpen;
     this.psOpen = !!ps;
     if (!ps) {
       if (wasOpen) {
-        this.projectSettingsEl.style.display = "none";
+        this.workspaceSettingsEl.style.display = "none";
         this.capture.focus();
       }
       return;
     }
-    this.projectSettingsEl.style.display = "";
+    this.workspaceSettingsEl.style.display = "";
     this.psSelected = ps.selected;
     this.psInputIndex = ps.input_index;
 
@@ -2705,7 +2705,7 @@ export class Shell {
       del.title = "Remove root";
       del.addEventListener("mousedown", (e) => {
         e.preventDefault(); // keep focus where it is until the prompt re-targets it
-        if (this.session) this.runEffects(this.session.project_settings_remove_root(i) as CoreEffect[]);
+        if (this.session) this.runEffects(this.session.workspace_settings_remove_root(i) as CoreEffect[]);
       });
       li.append(bullet, path, del);
       items.push(li);
@@ -2810,11 +2810,11 @@ export class Shell {
     this.asModalEl.replaceChildren(...children);
   }
 
-  /** A project-settings input's keydown: text editing stays native (synced via `input` →
-   *  project_settings_set_name / _set_add); nav (Alt-j/k), commit (Enter), cancel (Esc), and — when a
+  /** A workspace-settings input's keydown: text editing stays native (synced via `input` →
+   *  workspace_settings_set_name / _set_add); nav (Alt-j/k), commit (Enter), cancel (Esc), and — when a
    *  root row is selected — the Delete-removes-root chord route to the core. On a root row no text
    *  field is focused, so editing keys (Delete/Backspace/arrows) must go to the core too. */
-  private onProjectSettingsInputKey(e: KeyboardEvent): void {
+  private onWorkspaceSettingsInputKey(e: KeyboardEvent): void {
     // This only fires while the name or add-root input holds focus — a selected root row parks focus
     // on `capture` (see `focusTarget`), so its keys route through the global `onKeyDown` instead.
     // Editing keys stay native; the rest (Alt-j/k, Enter, Esc) go to the core.
@@ -2828,7 +2828,7 @@ export class Shell {
    *  start steps into the chip row, then Left/Right navigate, Enter edits, Backspace/Delete removes. */
   private onPickerInputKey(e: KeyboardEvent): void {
     const p = this.snapshot?.picker;
-    // No project selected yet: the chooser is mandatory. Unlike the native clients (which exit on
+    // No workspace selected yet: the chooser is mandatory. Unlike the native clients (which exit on
     // dismiss), a browser tab has nothing to fall back to, so Esc must not close it.
     if (e.key === "Escape" && this.snapshot?.buffer.buffer_id === 0) {
       e.preventDefault();
@@ -2871,8 +2871,8 @@ export class Shell {
       return;
     }
     this.pickerEl.style.display = "";
-    // Explorer shows the directory being listed *within its project root* as a dim prefix.
-    const prefix = p.kind === "explorer" ? explorerPrefix(p.directory, v.project_paths) : "";
+    // Explorer shows the directory being listed *within its workspace root* as a dim prefix.
+    const prefix = p.kind === "explorer" ? explorerPrefix(p.directory, v.workspace_paths) : "";
     this.pickerPathEl.textContent = prefix;
     this.pickerPathEl.style.display = prefix ? "" : "none";
     // The breadcrumb already says where typing acts; otherwise show the per-kind hint.
@@ -3110,9 +3110,9 @@ export class Shell {
   /** Rebuild just the results list (the persistent input/panel stay, keeping focus + caret). */
   /** Map an absolute path to (root index, root-relative path), or null if it's outside every root —
    *  bootstrap only opens files relative to a root. */
-  private resolvePath(abs: string, projectPaths: string[]): { path_index: number; relative_path: string } | null {
-    for (let i = 0; i < projectPaths.length; i++) {
-      const root = projectPaths[i];
+  private resolvePath(abs: string, workspacePaths: string[]): { path_index: number; relative_path: string } | null {
+    for (let i = 0; i < workspacePaths.length; i++) {
+      const root = workspacePaths[i];
       if (abs === root) return { path_index: i, relative_path: "" };
       const prefix = root.endsWith("/") ? root : root + "/";
       if (abs.startsWith(prefix)) return { path_index: i, relative_path: abs.slice(prefix.length) };
@@ -3134,14 +3134,14 @@ export class Shell {
 
   /** A shareable opener URL for a picker item, so its row can be an `<a>` that opens in a new tab on
    *  Ctrl/Cmd/middle-click (and Ctrl/Cmd-Enter on the selection). Mirrors the old client + the boot
-   *  URL scheme: `?project=&root=&file=` for files (+ `#L:C` for grep hits), `?project=&buffer=<id>`
-   *  for scratch buffers, `?project=` for a project. Returns null for rows with no shareable target
+   *  URL scheme: `?workspace=&root=&file=` for files (+ `#L:C` for grep hits), `?workspace=&buffer=<id>`
+   *  for scratch buffers, `?workspace=` for a workspace. Returns null for rows with no shareable target
    *  (directories, diagnostics, references, LSP servers, items outside any root). */
   private pickerItemUrl(item: PickerItem, v: CoreView): string | null {
-    const project = v.project;
+    const workspace = v.workspace;
     const fileQuery = (pathIndex: number, relativePath: string): string => {
       const params = new URLSearchParams();
-      if (project) params.set("project", project);
+      if (workspace) params.set("workspace", workspace);
       if (pathIndex) params.set("root", String(pathIndex));
       params.set("file", relativePath);
       return params.toString();
@@ -3158,7 +3158,7 @@ export class Shell {
           return fromPath(item.path_index, item.relative_path);
         }
         const params = new URLSearchParams();
-        if (project) params.set("project", project);
+        if (workspace) params.set("workspace", workspace);
         params.set("buffer", String(item.buffer_id));
         return `${location.pathname}?${params.toString()}`;
       }
@@ -3171,18 +3171,18 @@ export class Shell {
         const joined = listingDir.endsWith("/")
           ? listingDir + item.name
           : `${listingDir}/${item.name}`;
-        const r = this.resolvePath(joined, v.project_paths);
+        const r = this.resolvePath(joined, v.workspace_paths);
         return r ? fromPath(r.path_index, r.relative_path) : null;
       }
-      case "project":
-        return `${location.pathname}?${new URLSearchParams({ project: item.name }).toString()}`;
+      case "workspace":
+        return `${location.pathname}?${new URLSearchParams({ workspace: item.name }).toString()}`;
       default:
         return null;
     }
   }
 
   /** Keep the address bar reflecting the current buffer + cursor, the way the boot URL reader consumes
-   *  it (`?project=&root=&file=#L:C`, or `?project=&buffer=<id>` for a scratch), so a reload or a copied
+   *  it (`?workspace=&root=&file=#L:C`, or `?workspace=&buffer=<id>` for a scratch), so a reload or a copied
    *  link reopens where you are. `replaceState`, not `push` — browser back/forward isn't a second nav
    *  system; in-file/cross-file nav is the core's job (Alt-←/→). Debounced so a burst of cursor moves is
    *  one URL write; skipped when unchanged. */
@@ -3196,9 +3196,9 @@ export class Shell {
 
   private buildUrl(v: CoreView): string {
     const params = new URLSearchParams();
-    if (v.project) params.set("project", v.project);
+    if (v.workspace) params.set("workspace", v.workspace);
     const path = v.buffer.path;
-    const r = path ? this.resolvePath(path, v.project_paths) : null;
+    const r = path ? this.resolvePath(path, v.workspace_paths) : null;
     if (r) {
       if (r.path_index) params.set("root", String(r.path_index));
       params.set("file", r.relative_path);
@@ -3432,8 +3432,8 @@ export class Shell {
     const main = document.createElement("span");
     main.className = "picker-main picker-italic";
     main.textContent =
-      p.kind === "projects"
-        ? `+ Create project ${c.name}`
+      p.kind === "workspaces"
+        ? `+ Create workspace ${c.name}`
         : c.is_dir
           ? `+ Create directory ${c.name}/`
           : `+ Create file ${c.name}`;
@@ -3452,7 +3452,7 @@ export class Shell {
   }
 
   private renderPickerList(p: PickerView, v: CoreView): void {
-    const projectPaths = v.project_paths;
+    const workspacePaths = v.workspace_paths;
     const list = this.pickerListEl;
     // No rows to show at all: a status line so a slow search (grep streaming, references resolving)
     // reads as "working", not "broken". Gated on BOTH counts being empty: `total_matches > 0` with
@@ -3504,7 +3504,7 @@ export class Shell {
     // Path budget for the row (chars), and the disambiguated root labels — both computed once.
     const ls = getComputedStyle(list);
     const budget = charBudget(list.clientWidth * 0.6, `${ls.fontSize} ${ls.fontFamily}`);
-    const labels = rootLabels(projectPaths);
+    const labels = rootLabels(workspacePaths);
     // Virtual scroll (matching the native client): a full-height spacer sized to the whole result set
     // (in display rows) holds the loaded window, absolutely positioned `window_base` rows down — so
     // the scrollbar spans every result and scrolling into an unloaded range refetches it
@@ -3516,18 +3516,18 @@ export class Shell {
     let selectedRow: HTMLElement | null = null;
     let prevGrepKey: string | null = null;
     let section: HTMLElement | null = null;
-    // Grep, project git-changes, and project diagnostics group per file with a sticky header; the
+    // Grep, workspace git-changes, and workspace diagnostics group per file with a sticky header; the
     // buffer-locked git_changes_file / diagnostics are flat/single-file (the core emits matching
     // flat display-row offsets/counts).
     const groupByFile =
-      p.kind === "grep" || p.kind === "git_changes" || p.kind === "diagnostics_project";
+      p.kind === "grep" || p.kind === "git_changes" || p.kind === "diagnostics_workspace";
     p.items.forEach((item, i) => {
       if (
         groupByFile &&
         (item.kind === "grep_hit" || item.kind === "git_change" || item.kind === "diagnostic")
       ) {
         // Diagnostic items carry the path optionally (the buffer picker omits it); in the grouped
-        // project picker it's always present.
+        // workspace picker it's always present.
         const pathIndex = item.path_index ?? 0;
         const relPath = item.relative_path ?? "";
         const key = `${pathIndex}\0${relPath}`;
@@ -3585,7 +3585,7 @@ export class Shell {
           if (!(e.ctrlKey || e.metaKey || e.button === 1)) e.preventDefault();
         });
       }
-      const d = describePickerItem(item, projectPaths, labels, budget);
+      const d = describePickerItem(item, workspacePaths, labels, budget);
       if (d.bullet) {
         const b = document.createElement("span");
         if (d.bulletIcon) {
@@ -3699,12 +3699,12 @@ export class Shell {
     // (it arrives a render later), and we want to scroll to it once it does.
   }
 
-  /** The status bar, matching the TUI / old web client: left = buffer-state dot + `[project] label`
+  /** The status bar, matching the TUI / old web client: left = buffer-state dot + `[workspace] label`
    *  + git cluster; right = search/grep counters + diagnostic glyphs + position + LSP glyph. The mode
    *  is shown by the cursor shape (block/I-beam/underscore), not text. */
   private renderStatus(v: CoreView): void {
     // The left side is a flexbox of groups with a gap between them: the file group (state dot +
-    // `[project]` + path) and the git group. The gap (not a per-element margin) is what spaces the
+    // `[workspace]` + path) and the git group. The gap (not a per-element margin) is what spaces the
     // path from the git cluster — a prior `.status-git:first-of-type` margin never applied, since
     // `:first-of-type` keys off the tag (span), and the dot/name spans come first.
     const left = document.createElement("span");
@@ -3719,7 +3719,7 @@ export class Shell {
       dot.textContent = "●";
       fileGroup.append(dot);
     }
-    const proj = showsProjectChrome(v.project) ? `[${v.project}] ` : "";
+    const proj = showsWorkspaceChrome(v.workspace) ? `[${v.workspace}] ` : "";
     fileGroup.append(proj);
     const name = document.createElement("span");
     if (v.buffer.transient) name.className = "status-transient"; // preview buffers slant
@@ -3811,15 +3811,15 @@ export class Shell {
     }
 
     this.statusEl.replaceChildren(left, right);
-    // Mirror the native clients: "[project] label - Aether"; an ephemeral / no-project context
-    // drops the `[project]` chrome and shows just the label (or "Aether" with no label). The label
+    // Mirror the native clients: "[workspace] label - Aether"; an ephemeral / no-workspace context
+    // drops the `[workspace]` chrome and shows just the label (or "Aether" with no label). The label
     // is segment-elided to the same fixed cap as the native titles (aether-client's TITLE_LABEL_MAX)
     // so an external file's absolute path doesn't overflow the tab title.
     const titleLabel = v.buffer.label
       ? truncatePath(v.buffer.label, undefined, TITLE_LABEL_MAX).display
       : "";
-    document.title = showsProjectChrome(v.project)
-      ? `${titleLabel ? `[${v.project}] ${titleLabel}` : `[${v.project}]`} - Aether`
+    document.title = showsWorkspaceChrome(v.workspace)
+      ? `${titleLabel ? `[${v.workspace}] ${titleLabel}` : `[${v.workspace}]`} - Aether`
       : titleLabel
         ? `${titleLabel} - Aether`
         : "Aether";

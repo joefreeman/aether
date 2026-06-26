@@ -16,24 +16,24 @@ impl ErrorCode {
 
     // Aether application errors
     pub const INVALID_TOKEN: Self = Self(-32001);
-    /// The connecting client has not yet activated a project via `project/activate`. Every
-    /// buffer/cursor/viewport/picker/search/input RPC requires an active project; only
-    /// `project/list` and `project/activate` work before activation.
-    pub const NO_ACTIVE_PROJECT: Self = Self(-32002);
-    /// `project/activate` named a project that has no config file under
-    /// `$XDG_CONFIG_HOME/aether/projects/`.
-    pub const UNKNOWN_PROJECT: Self = Self(-32003);
-    /// `project/remove_root` rejected because at least one buffer under the root being removed
+    /// The connecting client has not yet activated a workspace via `workspace/activate`. Every
+    /// buffer/cursor/viewport/picker/search/input RPC requires an active workspace; only
+    /// `workspace/list` and `workspace/activate` work before activation.
+    pub const NO_ACTIVE_WORKSPACE: Self = Self(-32002);
+    /// `workspace/activate` named a workspace that has no config file under
+    /// `$XDG_CONFIG_HOME/aether/workspaces/`.
+    pub const UNKNOWN_WORKSPACE: Self = Self(-32003);
+    /// `workspace/remove_root` rejected because at least one buffer under the root being removed
     /// has unsaved changes. The error's `data` field carries `{ "dirty_buffer_ids": [u64] }` so
     /// the client can name them in a prompt. The user has to save or revert those buffers
     /// before retrying.
     pub const DIRTY_BUFFERS_PREVENT_REMOVE: Self = Self(-32004);
-    /// `project/delete` rejected because the named project is the active project of at least one
-    /// connected client. The client must switch away (activate a different project) before the
-    /// project can be deleted — this is what prevents pulling the rug out from under an open
+    /// `workspace/delete` rejected because the named workspace is the active workspace of at least one
+    /// connected client. The client must switch away (activate a different workspace) before the
+    /// workspace can be deleted — this is what prevents pulling the rug out from under an open
     /// session.
-    pub const ACTIVE_PROJECT_PREVENTS_DELETE: Self = Self(-32005);
-    /// `project/delete` rejected because at least one buffer in the project has unsaved changes.
+    pub const ACTIVE_WORKSPACE_PREVENTS_DELETE: Self = Self(-32005);
+    /// `workspace/delete` rejected because at least one buffer in the workspace has unsaved changes.
     /// Like [`Self::DIRTY_BUFFERS_PREVENT_REMOVE`], the `data` field carries
     /// `{ "dirty_buffer_ids": [u64] }`. The user has to save or revert those buffers first.
     pub const DIRTY_BUFFERS_PREVENT_DELETE: Self = Self(-32006);

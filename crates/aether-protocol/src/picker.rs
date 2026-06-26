@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PickerKind {
-    /// Project files, fuzzy-matched on path.
+    /// Workspace files, fuzzy-matched on path.
     Files,
     /// Open buffers, ordered by most-recently-used. The current buffer sits at position 0 and
     /// selecting it is a no-op switch.
@@ -42,24 +42,24 @@ pub enum PickerKind {
     /// result + push carry the anchor's canonical path (not the peeked listing's), so the
     /// breadcrumb stays put while peeking and backspacing the query walks the peek back.
     Explorer,
-    /// Configured projects under `$XDG_CONFIG_HOME/aether/projects/`. Fuzzy-matched on name.
-    /// Selecting one triggers the client to send `project/activate`. Distinct from the other
-    /// kinds in that this picker is usable *before* a project is active (it's how the user
-    /// gets one active in the first place) — every other picker requires `active_project`.
-    Projects,
+    /// Configured workspaces under `$XDG_CONFIG_HOME/aether/workspaces/`. Fuzzy-matched on name.
+    /// Selecting one triggers the client to send `workspace/activate`. Distinct from the other
+    /// kinds in that this picker is usable *before* a workspace is active (it's how the user
+    /// gets one active in the first place) — every other picker requires `active_workspace`.
+    Workspaces,
     /// The current buffer's LSP diagnostics (`Space Alt-d`), fuzzy-matched on the message. Scoped to
     /// one buffer (`PickerViewParams::buffer_id`), flat (no file header). Selecting one jumps to its
     /// position (via `FileAt`).
     Diagnostics,
-    /// **Project-wide** LSP diagnostics (`Space d`) — the modal sibling of [`Diagnostics`], grouped
-    /// by file. Pulled via `workspace/diagnostic` from every server in the active project that
+    /// **Workspace-wide** LSP diagnostics (`Space d`) — the modal sibling of [`Diagnostics`], grouped
+    /// by file. Pulled via `workspace/diagnostic` from every server in the active workspace that
     /// advertises it, merged with the open buffers' live diagnostics (so servers without pull, and
     /// unsaved edits, still show). A one-shot async snapshot taken on open (like [`References`]):
     /// the picker opens empty + `ticking` and is filled by the spawned resolve. Rows are
     /// [`PickerItem::Diagnostic`] carrying their file; selecting one jumps to the line (via
     /// `FileAt`).
-    DiagnosticsProject,
-    /// The language servers for the active project, fuzzy-matched on server name. Unlike the
+    DiagnosticsWorkspace,
+    /// The language servers for the active workspace, fuzzy-matched on server name. Unlike the
     /// other kinds this isn't a jump target: the client restarts the highlighted server in place
     /// (`Ctrl-r` → `lsp/restart_server`) and the list live-updates as statuses change.
     LspServers,
@@ -78,7 +78,7 @@ pub enum PickerKind {
     /// members; selecting one jumps to its name position (via `FileAt`). Like References/Diagnostics
     /// it's a one-shot LSP snapshot taken on open and preserved across scroll/resume re-views.
     DocumentSymbols,
-    /// The working-tree changes of the active project's repos, one row per hunk grouped by file
+    /// The working-tree changes of the active workspace's repos, one row per hunk grouped by file
     /// (like Grep). Combined staged+unstaged vs HEAD: each hunk carries its [`DiffStage`] so the
     /// row colours like the inline diff. The candidate set is a one-shot snapshot taken on open —
     /// computed from disk + index, but using the *live buffer* text for any file currently open,
@@ -89,13 +89,13 @@ pub enum PickerKind {
     /// by `Space Alt-c`. Locked to the buffer named by [`PickerViewParams::buffer_id`] (the active
     /// one, re-pointed each open), exactly how the [`Diagnostics`] picker locks to its buffer — the
     /// scope is intrinsic, not a filter chip, so there's nothing to add or remove. Its own state
-    /// slot, independent of the project-wide [`GitChanges`]. Rows are the buffer's hunks, under the
+    /// slot, independent of the workspace-wide [`GitChanges`]. Rows are the buffer's hunks, under the
     /// file's header.
     GitChangesFile,
 }
 
 impl PickerKind {
-    /// True for the two changes pickers — the project-wide [`Self::GitChanges`] and the
+    /// True for the two changes pickers — the workspace-wide [`Self::GitChanges`] and the
     /// buffer-locked [`Self::GitChangesFile`] — which share hunk rows / select behaviour but live
     /// in separate slots and build their candidates from a different scope.
     pub fn is_git_changes(self) -> bool {
@@ -113,12 +113,12 @@ impl PickerKind {
         // Grep keeps its (expensive) search results; the changes pickers keep their query +
         // filters so a re-open resumes. All rebuild their candidate set on re-view regardless
         // (the changes pickers re-snapshot the working tree), and the server wipes a client's
-        // pickers on project switch, so persisted state never leaks across projects.
+        // pickers on workspace switch, so persisted state never leaks across workspaces.
         matches!(self, PickerKind::Grep) || self.is_git_changes()
     }
 
     /// Whether this picker groups its rows into per-file sections, rendering a non-selectable file
-    /// header above each file's first row (Grep hits and project Git changes). The single source of
+    /// header above each file's first row (Grep hits and workspace Git changes). The single source of
     /// truth for the file-grouped layout: clients gate their header rendering, sticky-header pin,
     /// header clearance when revealing a row, and virtual-scroll row math on it. The buffer-locked
     /// [`Self::GitChangesFile`] is *not* here — it's a single file, so a header would just repeat it;
@@ -126,7 +126,7 @@ impl PickerKind {
     pub fn groups_by_file(self) -> bool {
         matches!(
             self,
-            PickerKind::Grep | PickerKind::GitChanges | PickerKind::DiagnosticsProject
+            PickerKind::Grep | PickerKind::GitChanges | PickerKind::DiagnosticsWorkspace
         )
     }
 
@@ -141,7 +141,7 @@ impl PickerKind {
             PickerKind::Grep
                 | PickerKind::GitChanges
                 | PickerKind::References
-                | PickerKind::DiagnosticsProject
+                | PickerKind::DiagnosticsWorkspace
         )
     }
 
@@ -289,7 +289,7 @@ impl SymbolKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PickerItem {
     /// A file from the workspace walk. `relative_path` is path-relative to the root at
-    /// `path_index` in the project's root list. The client formats the row by joining its own
+    /// `path_index` in the workspace's root list. The client formats the row by joining its own
     /// disambiguated root label with the relative path; the server stays out of presentation.
     File {
         path_index: u32,
@@ -310,15 +310,15 @@ pub enum PickerItem {
     /// between pushes (an active picker re-pushes on status transitions).
     Buffer {
         buffer_id: BufferId,
-        /// What the row renders: project-relative path for file-backed buffers, `(scratch N)`
+        /// What the row renders: workspace-relative path for file-backed buffers, `(scratch N)`
         /// for scratch buffers. Also the haystack the matcher scores against.
         display: String,
         /// Save/disk state, rendered as a colour-coded dot. Omitted on the wire (and defaulting
         /// to `Clean`) for a clean buffer — the common case.
         #[serde(default, skip_serializing_if = "BufferDirtyState::is_clean")]
         status: BufferDirtyState,
-        /// Project-relative location (root index + path) for a file-backed buffer that lives inside
-        /// a project root — mirrors `File`'s fields so the client can build an opener URL. Both are
+        /// Workspace-relative location (root index + path) for a file-backed buffer that lives inside
+        /// a workspace root — mirrors `File`'s fields so the client can build an opener URL. Both are
         /// `None` for scratch buffers and for files outside every root (no `?file=` URL possible).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path_index: Option<u32>,
@@ -331,7 +331,7 @@ pub enum PickerItem {
         /// Captured at row-build time, like `status`; an active picker re-pushes on changes.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         transient: bool,
-        /// True for a *dormant* buffer — a file restored from the persisted project session that
+        /// True for a *dormant* buffer — a file restored from the persisted workspace session that
         /// hasn't been loaded into memory yet (no rope/tree-sitter/LSP). It appears in the picker
         /// greyed out; selecting it materializes the real buffer (via `buffer/open`, which the
         /// server intercepts by id). Never set together with `transient`.
@@ -342,7 +342,7 @@ pub enum PickerItem {
     /// One row per match (a line with N matches produces N hits) — keeps `match_indices` a flat
     /// list within the preview, same as the other variants.
     GrepHit {
-        /// Index into the project's root list — pairs with `relative_path` to recover the
+        /// Index into the workspace's root list — pairs with `relative_path` to recover the
         /// absolute path.
         path_index: u32,
         /// Path relative to root `path_index` (forward-slash separated).
@@ -365,7 +365,7 @@ pub enum PickerItem {
     /// non-zero → modified, added-only → added, removed-only → deletion — so no separate kind rides
     /// the wire. `line` is the 0-based buffer line the hunk anchors to (the `FileAt` jump target).
     GitChange {
-        /// Index into the project's root list — pairs with `relative_path` for the absolute path.
+        /// Index into the workspace's root list — pairs with `relative_path` for the absolute path.
         path_index: u32,
         /// Path relative to root `path_index` (forward-slash separated). The fuzzy haystack + the
         /// group key the client renders a file header for.
@@ -399,8 +399,8 @@ pub enum PickerItem {
     /// `(line, col)`. `(line, col)` is the range start; `(end_line, end_col)` the (exclusive) end —
     /// the picker shows the full range so distinct diagnostics that read alike are tellable apart.
     Diagnostic {
-        /// The diagnostic's file, as project root index + root-relative path. Used by the
-        /// project-wide picker to group by file; the buffer-scoped picker fills it with the buffer's
+        /// The diagnostic's file, as workspace root index + root-relative path. Used by the
+        /// workspace-wide picker to group by file; the buffer-scoped picker fills it with the buffer's
         /// own path (it renders flat, so the value is unused there).
         #[serde(default)]
         path_index: u32,
@@ -417,13 +417,13 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
-    /// One configured project. Identity is `name` (the file stem of the project's TOML config).
-    /// Selecting a `Project` returns a `PickerSelectResult::Project` and the client follows up
-    /// with `project/activate`.
-    Project {
+    /// One configured workspace. Identity is `name` (the file stem of the workspace's TOML config).
+    /// Selecting a `Workspace` returns a `PickerSelectResult::Workspace` and the client follows up
+    /// with `workspace/activate`.
+    Workspace {
         name: String,
-        /// Number of open buffers in this project with unsaved edits (`revision != saved_revision`).
-        /// `0` when the project has no dirty buffers (or isn't loaded). Absent on the wire when `0`.
+        /// Number of open buffers in this workspace with unsaved edits (`revision != saved_revision`).
+        /// `0` when the workspace has no dirty buffers (or isn't loaded). Absent on the wire when `0`.
         #[serde(default, skip_serializing_if = "is_zero")]
         unsaved_buffers: u32,
         /// Char offsets into `name` covered by fuzzy matches.
@@ -447,9 +447,9 @@ pub enum PickerItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         git_status: Option<GitStatus>,
     },
-    /// One of the project's roots, shown in the Explorer's Roots mode (entered by `Alt-Backspace`
+    /// One of the workspace's roots, shown in the Explorer's Roots mode (entered by `Alt-Backspace`
     /// at the top of a root). Identity is `path_index`; the client knows the absolute path via
-    /// its own copy of `project_paths`. Match indices index into the root's basename — the
+    /// its own copy of `workspace_paths`. Match indices index into the root's basename — the
     /// disambiguator is client-derived and not part of the haystack.
     Root {
         path_index: u32,
@@ -458,14 +458,14 @@ pub enum PickerItem {
     },
     /// One reference location from `textDocument/references`. Identity is `(path, line, col)`.
     /// Cross-file, so it carries its own absolute `path` (fed into `buffer/open` on select) plus a
-    /// server-computed `display_path` for the row label — project-relative when the file lives
+    /// server-computed `display_path` for the row label — workspace-relative when the file lives
     /// inside a root, otherwise the absolute path (references can point into dependencies / stdlib
     /// outside every root, where no `path_index`/root label applies). The matcher haystack is
     /// `preview`; `match_indices` are char offsets into it.
     Reference {
         /// Absolute canonical path to the file containing the reference.
         path: String,
-        /// Row label: project-relative path when inside a root, else the absolute path.
+        /// Row label: workspace-relative path when inside a root, else the absolute path.
         display_path: String,
         /// 0-based line number within the file.
         line: u32,
@@ -518,7 +518,7 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
-    /// One language server for the active project. Identity is `(language, workspace_root)` — the
+    /// One language server for the active workspace. Identity is `(language, workspace_root)` — the
     /// server key. Carries `status` so the client renders the health glyph; the matcher haystack
     /// is `name`. Not a jump target: the client acts on it via `lsp/restart_server`, so there's
     /// no corresponding `PickerSelectResult` variant.
@@ -527,8 +527,8 @@ pub enum PickerItem {
         language: String,
         /// Absolute workspace root — the stable identity half (with `language`).
         workspace_root: String,
-        /// Display-only: `workspace_root` relative to its project root, or empty when the server
-        /// is rooted *at* a project root (so single-root projects show no redundant path; only
+        /// Display-only: `workspace_root` relative to its workspace root, or empty when the server
+        /// is rooted *at* a workspace root (so single-root workspaces show no redundant path; only
         /// monorepo sub-roots get a disambiguating label). Server-computed.
         #[serde(default)]
         root_label: String,
@@ -590,7 +590,7 @@ impl MatchOptions {
     }
 }
 
-/// A path inside one of the project's roots — the scope filter chip. Addressed the same
+/// A path inside one of the workspace's roots — the scope filter chip. Addressed the same
 /// way picker items are (`path_index` + root-relative path) so it survives root reordering no
 /// worse than everything else does. There is deliberately no separate root filter: scoping to
 /// a whole root is this with an empty `relative_path` (a directory always implies its root).
@@ -602,7 +602,7 @@ impl MatchOptions {
 /// file is degenerate).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopedPath {
-    /// Index into the project's root list.
+    /// Index into the workspace's root list.
     pub path_index: u32,
     /// Path relative to `roots[path_index]`, forward-slash separated, no trailing slash.
     /// Empty scopes to the root itself.
@@ -739,11 +739,11 @@ pub struct PickerViewParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center_on_cursor: Option<BufferId>,
     /// Explorer only: absolute path of the directory to list. `None` means "keep whatever
-    /// directory the picker last listed; default to the first project root on first open".
+    /// directory the picker last listed; default to the first workspace root on first open".
     /// Ignored when `explorer_roots` is set, and for other kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_path: Option<String>,
-    /// Explorer only: when true, list the project's roots instead of a filesystem directory.
+    /// Explorer only: when true, list the workspace's roots instead of a filesystem directory.
     /// Wins over `directory_path` when both are set. The client uses this to enter "Roots
     /// mode" by pressing `Alt-Backspace` at the top of a root.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -801,7 +801,7 @@ pub struct PickerViewResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_path: Option<String>,
     /// Explorer only: the canonical absolute path of the anchor's parent, if it's still inside
-    /// the project's access boundary. `None` when at (or above) a project root, and `None` for
+    /// the workspace's access boundary. `None` when at (or above) a workspace root, and `None` for
     /// the other picker kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_parent: Option<String>,
@@ -890,8 +890,8 @@ pub enum PickerSelectResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         anchor: Option<LogicalPosition>,
     },
-    /// A project was selected. The client follows up with `project/activate` to switch.
-    Project {
+    /// A workspace was selected. The client follows up with `workspace/activate` to switch.
+    Workspace {
         name: String,
     },
 }
@@ -928,7 +928,7 @@ pub struct PickerHideParams {
 /// Direction: Forward = next hit, Backward = previous hit. Resolved against the cached
 /// `PickerKind::Grep` candidates:
 ///
-/// - If the current buffer's project-relative path is in the hits, find the next/previous match
+/// - If the current buffer's workspace-relative path is in the hits, find the next/previous match
 ///   *after* / *before* the cursor within the file. When the cursor is past the last (or before
 ///   the first) hit in the file, fall through to the first / last hit of the next / previous
 ///   file in walker order.
@@ -1053,7 +1053,7 @@ pub struct PickerUpdateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center_on: Option<Box<PickerItem>>,
     /// Explorer only: true when the directory the query *peeks into* (the anchor joined with the
-    /// query's path part) doesn't exist as an in-project directory — e.g. mid-typing a not-yet-
+    /// query's path part) doesn't exist as an in-workspace directory — e.g. mid-typing a not-yet-
     /// created path. The client uses it to decide whether a trailing-slash query offers
     /// "+ Create directory" (offered only when the directory is missing — you can't tell from the
     /// listing alone, since a peek lists the directory's *contents*). Absent on the wire (and for

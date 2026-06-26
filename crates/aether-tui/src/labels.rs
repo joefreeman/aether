@@ -1,4 +1,4 @@
-//! Disambiguated labels for project roots. Default is the root's basename; when two roots share
+//! Disambiguated labels for workspace roots. Default is the root's basename; when two roots share
 //! a basename, both labels grow a parenthesized parent component, then grandparent, etc., until
 //! they're unique. Lives client-side because it's a pure presentation concern — the server sends
 //! root indices, the client decides how to print them.
@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Cap on disambiguation passes. Real projects never need more than a couple, but the loop has
+/// Cap on disambiguation passes. Real workspaces never need more than a couple, but the loop has
 /// to terminate when two paths are literally identical (which `add_root` refuses, but defensive
 /// belt-and-braces is cheap).
 const MAX_DEPTH: usize = 16;
@@ -14,7 +14,7 @@ const MAX_DEPTH: usize = 16;
 /// One label per input path, aligned by index. Identical inputs produce identical labels (we
 /// can't disambiguate them); otherwise every label is unique within the result.
 ///
-/// Single-root projects get an empty string — there's nothing to disambiguate against, so
+/// Single-root workspaces get an empty string — there's nothing to disambiguate against, so
 /// renderers omit the label prefix entirely (`"src/main.rs"` instead of `"repo: src/main.rs"`).
 pub fn root_labels(paths: &[String]) -> Vec<String> {
     let n = paths.len();
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn single_root_returns_empty_label() {
-        // Single-root projects don't need a disambiguator — renderers fall through to a label-
+        // Single-root workspaces don't need a disambiguator — renderers fall through to a label-
         // less display when the label is empty.
         assert_eq!(root_labels(&s(&["/home/joe/work/repo"])), vec![""]);
     }

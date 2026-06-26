@@ -1,8 +1,8 @@
-//! Project configuration and runtime discovery files.
+//! Workspace configuration and runtime discovery files.
 //!
-//! - Durable config: `$XDG_CONFIG_HOME/aether/projects/<name>.toml`
+//! - Durable config: `$XDG_CONFIG_HOME/aether/workspaces/<name>.toml`
 //! - Runtime info:   `$XDG_RUNTIME_DIR/aether/server.json` (one file per running server, not per
-//!   project — a single server now hosts many projects, picked per-client via `project/activate`).
+//!   workspace — a single server now hosts many workspaces, picked per-client via `workspace/activate`).
 //!   `$XDG_RUNTIME_DIR` only exists on Linux/BSD; on macOS (and anywhere it's unset) we fall back
 //!   to the user cache dir (`~/Library/Caches/aether/` on macOS), which is the right home for
 //!   per-machine-session bookkeeping that needn't survive a reboot.
@@ -61,7 +61,7 @@ pub fn profiles_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// The active profile's config subtree: `<config>/aether/profiles/<name>/`. Everything durable
-/// (settings, sessions, project configs, `profile.toml`) lives under here.
+/// (settings, sessions, workspace configs, `profile.toml`) lives under here.
 fn profile_config_dir() -> anyhow::Result<PathBuf> {
     Ok(profiles_dir()?.join(active_profile()))
 }
@@ -200,35 +200,35 @@ fn list_profiles_at(dir: &Path) -> anyhow::Result<Vec<ProfileEntry>> {
 pub use aether_protocol::settings::AppSettings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectConfig {
-    /// Project name. Derived from the config *filename* (`<name>.toml`), which is authoritative —
+pub struct WorkspaceConfig {
+    /// Workspace name. Derived from the config *filename* (`<name>.toml`), which is authoritative —
     /// it is not stored in the file. `#[serde(skip)]` keeps it off both the parse and write paths;
-    /// `load_project` injects it after parsing.
+    /// `load_workspace` injects it after parsing.
     #[serde(skip)]
     pub name: String,
     pub paths: Vec<PathBuf>,
 }
 
 
-pub fn load_project(name: &str) -> anyhow::Result<ProjectConfig> {
-    let path = project_config_path(name)?;
+pub fn load_workspace(name: &str) -> anyhow::Result<WorkspaceConfig> {
+    let path = workspace_config_path(name)?;
     let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading project config at {}", path.display()))?;
-    let mut config: ProjectConfig = toml::from_str(&content)
-        .with_context(|| format!("parsing project config at {}", path.display()))?;
-    // The filename is the source of truth for the project name; the file body doesn't carry it.
+        .with_context(|| format!("reading workspace config at {}", path.display()))?;
+    let mut config: WorkspaceConfig = toml::from_str(&content)
+        .with_context(|| format!("parsing workspace config at {}", path.display()))?;
+    // The filename is the source of truth for the workspace name; the file body doesn't carry it.
     config.name = name.to_string();
     Ok(config)
 }
 
-pub fn project_config_path(name: &str) -> anyhow::Result<PathBuf> {
+pub fn workspace_config_path(name: &str) -> anyhow::Result<PathBuf> {
     Ok(profile_config_dir()?
-        .join("projects")
+        .join("workspaces")
         .join(format!("{name}.toml")))
 }
 
 /// Path to the active profile's application-settings file
-/// (`…/profiles/<profile>/settings.toml`). One file per profile, independent of which project is
+/// (`…/profiles/<profile>/settings.toml`). One file per profile, independent of which workspace is
 /// active within it — see `aether_protocol::settings`.
 pub fn app_settings_path() -> anyhow::Result<PathBuf> {
     Ok(profile_config_dir()?.join("settings.toml"))
@@ -271,7 +271,7 @@ fn write_app_settings_at(path: &Path, settings: &AppSettings) -> anyhow::Result<
     Ok(())
 }
 
-/// Current wall-clock time in Unix milliseconds. Used to stamp project-session activation times.
+/// Current wall-clock time in Unix milliseconds. Used to stamp workspace-session activation times.
 /// Saturates to 0 if the clock is somehow before the epoch.
 pub fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -280,17 +280,17 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Machine-managed (not user-authored) state for one project, persisted across server restarts so
-/// the project switcher can sort by recency and a re-activated project can restore the buffers that
-/// were open. Distinct from [`ProjectConfig`] (the user's `paths`) — this never holds anything the
-/// user types, which is why it lives in a JSON file rather than the project's TOML.
+/// Machine-managed (not user-authored) state for one workspace, persisted across server restarts so
+/// the workspace switcher can sort by recency and a re-activated workspace can restore the buffers that
+/// were open. Distinct from [`WorkspaceConfig`] (the user's `paths`) — this never holds anything the
+/// user types, which is why it lives in a JSON file rather than the workspace's TOML.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectSession {
-    /// Wall-clock time (Unix ms) this project was last activated. Drives the switcher's
-    /// most-recent-first ordering. `0` for a project that's only ever had its buffer list written.
+pub struct WorkspaceSession {
+    /// Wall-clock time (Unix ms) this workspace was last activated. Drives the switcher's
+    /// most-recent-first ordering. `0` for a workspace that's only ever had its buffer list written.
     #[serde(default)]
     pub last_activated_at: u64,
-    /// Canonical paths of the file-backed buffers that were open in this project, most-recently-used
+    /// Canonical paths of the file-backed buffers that were open in this workspace, most-recently-used
     /// first. On re-activation they're restored as *dormant* buffers (listed in the picker, loaded
     /// lazily). Scratch buffers have no path and are omitted — persisting their unsaved contents is
     /// future work.
@@ -298,81 +298,81 @@ pub struct ProjectSession {
     pub buffers: Vec<PathBuf>,
 }
 
-/// The whole session file: every named project's [`ProjectSession`], keyed by project name. A
-/// `BTreeMap` keeps the on-disk JSON deterministically ordered. Ephemeral projects (no `<name>.toml`)
+/// The whole session file: every named workspace's [`WorkspaceSession`], keyed by workspace name. A
+/// `BTreeMap` keeps the on-disk JSON deterministically ordered. Ephemeral workspaces (no `<name>.toml`)
 /// are never recorded here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectSessions {
+pub struct WorkspaceSessions {
     #[serde(default)]
-    pub projects: BTreeMap<String, ProjectSession>,
+    pub workspaces: BTreeMap<String, WorkspaceSession>,
 }
 
 /// Path to the single machine-managed session file
-/// (`$XDG_CONFIG_HOME/aether/sessions.json`). One file for all projects so the switcher can read
+/// (`$XDG_CONFIG_HOME/aether/sessions.json`). One file for all workspaces so the switcher can read
 /// every recency stamp in one go. JSON (not TOML) signals "machine-managed, don't hand-edit".
-pub fn project_sessions_path() -> anyhow::Result<PathBuf> {
+pub fn workspace_sessions_path() -> anyhow::Result<PathBuf> {
     Ok(profile_config_dir()?.join("sessions.json"))
 }
 
-/// Load the project-session file. A missing file is not an error — a fresh install has none, so we
+/// Load the workspace-session file. A missing file is not an error — a fresh install has none, so we
 /// return an empty map. Path-parameterized so it can be unit-tested against a tempdir and pointed
 /// at a throwaway path in server tests (see [`crate::state::ServerState::sessions_path`]).
-pub fn load_project_sessions_at(path: &Path) -> anyhow::Result<ProjectSessions> {
+pub fn load_workspace_sessions_at(path: &Path) -> anyhow::Result<WorkspaceSessions> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ProjectSessions::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WorkspaceSessions::default()),
         Err(e) => {
-            return Err(e).with_context(|| format!("reading project sessions at {}", path.display()))
+            return Err(e).with_context(|| format!("reading workspace sessions at {}", path.display()))
         }
     };
     serde_json::from_str(&content)
-        .with_context(|| format!("parsing project sessions at {}", path.display()))
+        .with_context(|| format!("parsing workspace sessions at {}", path.display()))
 }
 
-/// Write (or overwrite) the project-session file, creating the config directory if needed.
-pub fn write_project_sessions_at(path: &Path, sessions: &ProjectSessions) -> anyhow::Result<()> {
+/// Write (or overwrite) the workspace-session file, creating the config directory if needed.
+pub fn write_workspace_sessions_at(path: &Path, sessions: &WorkspaceSessions) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
     }
-    let body = serde_json::to_string_pretty(sessions).context("serializing project sessions")?;
+    let body = serde_json::to_string_pretty(sessions).context("serializing workspace sessions")?;
     std::fs::write(path, body)
-        .with_context(|| format!("writing project sessions at {}", path.display()))?;
+        .with_context(|| format!("writing workspace sessions at {}", path.display()))?;
     Ok(())
 }
 
-/// Remove a project's recorded session, if present. Best-effort read-modify-write of the session
-/// file. Called when a project is deleted so its session doesn't linger as an orphan.
-pub fn remove_project_session_at(path: &Path, name: &str) -> anyhow::Result<()> {
-    let mut sessions = load_project_sessions_at(path)?;
-    if sessions.projects.remove(name).is_some() {
-        write_project_sessions_at(path, &sessions)?;
+/// Remove a workspace's recorded session, if present. Best-effort read-modify-write of the session
+/// file. Called when a workspace is deleted so its session doesn't linger as an orphan.
+pub fn remove_workspace_session_at(path: &Path, name: &str) -> anyhow::Result<()> {
+    let mut sessions = load_workspace_sessions_at(path)?;
+    if sessions.workspaces.remove(name).is_some() {
+        write_workspace_sessions_at(path, &sessions)?;
     }
     Ok(())
 }
 
-/// Move a project's recorded session from `old` to `new`, if present. Called when a project is
+/// Move a workspace's recorded session from `old` to `new`, if present. Called when a workspace is
 /// renamed so its restored buffers and recency stamp follow the new name.
-pub fn rename_project_session_at(path: &Path, old: &str, new: &str) -> anyhow::Result<()> {
-    let mut sessions = load_project_sessions_at(path)?;
-    if let Some(sess) = sessions.projects.remove(old) {
-        sessions.projects.insert(new.to_string(), sess);
-        write_project_sessions_at(path, &sessions)?;
+pub fn rename_workspace_session_at(path: &Path, old: &str, new: &str) -> anyhow::Result<()> {
+    let mut sessions = load_workspace_sessions_at(path)?;
+    if let Some(sess) = sessions.workspaces.remove(old) {
+        sessions.workspaces.insert(new.to_string(), sess);
+        write_workspace_sessions_at(path, &sessions)?;
     }
     Ok(())
 }
 
-/// Reorder an alphabetically-sorted project-name list into most-recently-activated-first, using the
-/// session file's `last_activated_at` stamps. Projects with no recorded session (never activated, or
+/// Reorder an alphabetically-sorted workspace-name list into most-recently-activated-first, using the
+/// session file's `last_activated_at` stamps. Workspaces with no recorded session (never activated, or
 /// only ever had buffers written) sort as `0` and stay at the end — and because the sort is stable
 /// over an already-alphabetical input, ties (including all the never-activated ones) keep their
 /// alphabetical order. Pure so it can be unit-tested without disk.
-pub fn sort_names_by_recency(names: &mut [String], sessions: &ProjectSessions) {
+pub fn sort_names_by_recency(names: &mut [String], sessions: &WorkspaceSessions) {
     names.sort_by_key(|name| {
         // Negate to get descending order from an ascending stable sort key.
         std::cmp::Reverse(
             sessions
-                .projects
+                .workspaces
                 .get(name)
                 .map(|s| s.last_activated_at)
                 .unwrap_or(0),
@@ -380,21 +380,21 @@ pub fn sort_names_by_recency(names: &mut [String], sessions: &ProjectSessions) {
     });
 }
 
-/// Directory containing the per-project `.toml` configs. Used by `list_project_names`.
-pub fn projects_dir() -> anyhow::Result<PathBuf> {
-    Ok(profile_config_dir()?.join("projects"))
+/// Directory containing the per-workspace `.toml` configs. Used by `list_workspace_names`.
+pub fn workspaces_dir() -> anyhow::Result<PathBuf> {
+    Ok(profile_config_dir()?.join("workspaces"))
 }
 
-/// Enumerate the configured project names by scanning `*.toml` files in `projects_dir`. The
-/// file *name* (without extension) is the project name; the body carries only `paths`.
+/// Enumerate the configured workspace names by scanning `*.toml` files in `workspaces_dir`. The
+/// file *name* (without extension) is the workspace name; the body carries only `paths`.
 /// Returns an empty list (not an error) when the directory doesn't exist yet — a fresh
-/// install with no projects configured shouldn't be a server-side fatal.
-pub fn list_project_names() -> anyhow::Result<Vec<String>> {
-    let dir = projects_dir()?;
+/// install with no workspaces configured shouldn't be a server-side fatal.
+pub fn list_workspace_names() -> anyhow::Result<Vec<String>> {
+    let dir = workspaces_dir()?;
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading projects dir {}", dir.display())),
+        Err(e) => return Err(e).with_context(|| format!("reading workspaces dir {}", dir.display())),
     };
     let mut names: Vec<String> = entries
         .flatten()
@@ -412,21 +412,21 @@ pub fn list_project_names() -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-/// Outcome of inferring which configured project owns a given path.
+/// Outcome of inferring which configured workspace owns a given path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProjectMatch {
-    /// Exactly one project (most-specific root wins) owns the path.
+pub enum WorkspaceMatch {
+    /// Exactly one workspace (most-specific root wins) owns the path.
     One(String),
-    /// No configured project's roots contain the path.
+    /// No configured workspace's roots contain the path.
     None,
-    /// Several projects contain the path with equal specificity — the caller must disambiguate.
+    /// Several workspaces contain the path with equal specificity — the caller must disambiguate.
     /// Names are sorted.
     Ambiguous(Vec<String>),
 }
 
 /// Best-effort absolute, symlink-resolved form of a path that may not exist yet (e.g. a file the
 /// user is about to create): canonicalize the longest existing ancestor and re-append the
-/// remaining tail. This lets `ae src/new_file.rs` still resolve into a project even though the
+/// remaining tail. This lets `ae src/new_file.rs` still resolve into a workspace even though the
 /// file isn't on disk. Falls back to a plain absolute path if nothing can be canonicalized.
 pub fn resolve_path_for_match(path: &Path) -> PathBuf {
     let expanded = expand_home(path);
@@ -457,34 +457,34 @@ pub fn resolve_path_for_match(path: &Path) -> PathBuf {
     }
 }
 
-/// Infer which configured project owns `path` by matching it against every project's canonical
-/// roots. The path is resolved (and made absolute) first. Most-specific match wins: the project
-/// with the deepest containing root is chosen, so a project rooted inside another doesn't collide
-/// with its parent. A genuine tie at the deepest root is reported as [`ProjectMatch::Ambiguous`].
-pub fn infer_project_for_path(path: &Path) -> anyhow::Result<ProjectMatch> {
+/// Infer which configured workspace owns `path` by matching it against every workspace's canonical
+/// roots. The path is resolved (and made absolute) first. Most-specific match wins: the workspace
+/// with the deepest containing root is chosen, so a workspace rooted inside another doesn't collide
+/// with its parent. A genuine tie at the deepest root is reported as [`WorkspaceMatch::Ambiguous`].
+pub fn infer_workspace_for_path(path: &Path) -> anyhow::Result<WorkspaceMatch> {
     let target = resolve_path_for_match(path);
-    let mut projects: Vec<(String, Vec<PathBuf>)> = Vec::new();
-    for name in list_project_names()? {
-        // Skip projects whose config won't load — one stale config shouldn't break inference for
+    let mut workspaces: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for name in list_workspace_names()? {
+        // Skip workspaces whose config won't load — one stale config shouldn't break inference for
         // everything else.
-        let Ok(config) = load_project(&name) else {
+        let Ok(config) = load_workspace(&name) else {
             continue;
         };
         let roots = config
             .paths
             .iter()
-            .filter_map(|root| canonicalize_project_path(root).ok())
+            .filter_map(|root| canonicalize_workspace_path(root).ok())
             .collect();
-        projects.push((name, roots));
+        workspaces.push((name, roots));
     }
-    Ok(match_project(&target, &projects))
+    Ok(match_workspace(&target, &workspaces))
 }
 
-/// Pure core of [`infer_project_for_path`]: pick the most-specific project for a resolved target
-/// among each project's canonical roots. Kept free of disk access so it can be unit-tested.
-fn match_project(target: &Path, projects: &[(String, Vec<PathBuf>)]) -> ProjectMatch {
+/// Pure core of [`infer_workspace_for_path`]: pick the most-specific workspace for a resolved target
+/// among each workspace's canonical roots. Kept free of disk access so it can be unit-tested.
+fn match_workspace(target: &Path, workspaces: &[(String, Vec<PathBuf>)]) -> WorkspaceMatch {
     let mut matches: Vec<(String, usize)> = Vec::new();
-    for (name, roots) in projects {
+    for (name, roots) in workspaces {
         let best = roots
             .iter()
             .filter(|root| target == root.as_path() || target.starts_with(root))
@@ -495,7 +495,7 @@ fn match_project(target: &Path, projects: &[(String, Vec<PathBuf>)]) -> ProjectM
         }
     }
     let Some(max_depth) = matches.iter().map(|(_, d)| *d).max() else {
-        return ProjectMatch::None;
+        return WorkspaceMatch::None;
     };
     let mut winners: Vec<String> = matches
         .into_iter()
@@ -504,9 +504,9 @@ fn match_project(target: &Path, projects: &[(String, Vec<PathBuf>)]) -> ProjectM
         .collect();
     winners.sort();
     if winners.len() == 1 {
-        ProjectMatch::One(winners.into_iter().next().unwrap())
+        WorkspaceMatch::One(winners.into_iter().next().unwrap())
     } else {
-        ProjectMatch::Ambiguous(winners)
+        WorkspaceMatch::Ambiguous(winners)
     }
 }
 
@@ -594,49 +594,49 @@ pub fn expand_home(path: &Path) -> PathBuf {
     }
 }
 
-/// Canonicalize a project path. Errors loudly if the path doesn't exist — better to fail at
+/// Canonicalize a workspace path. Errors loudly if the path doesn't exist — better to fail at
 /// startup than silently mis-resolve later.
-pub fn canonicalize_project_path(p: &Path) -> anyhow::Result<PathBuf> {
+pub fn canonicalize_workspace_path(p: &Path) -> anyhow::Result<PathBuf> {
     let expanded = expand_home(p);
     std::fs::canonicalize(&expanded)
-        .with_context(|| format!("canonicalizing project path {}", expanded.display()))
+        .with_context(|| format!("canonicalizing workspace path {}", expanded.display()))
 }
 
-/// Write (or overwrite) a project's TOML config. Creates the projects directory if it doesn't
+/// Write (or overwrite) a workspace's TOML config. Creates the workspaces directory if it doesn't
 /// yet exist. Caller is responsible for refusing to overwrite when not desired (see
-/// `project_config_exists`).
-pub fn write_project_config(config: &ProjectConfig) -> anyhow::Result<()> {
-    let path = project_config_path(&config.name)?;
+/// `workspace_config_exists`).
+pub fn write_workspace_config(config: &WorkspaceConfig) -> anyhow::Result<()> {
+    let path = workspace_config_path(&config.name)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating projects dir {}", parent.display()))?;
+            .with_context(|| format!("creating workspaces dir {}", parent.display()))?;
     }
     let body = toml::to_string_pretty(config)
-        .with_context(|| format!("serializing project config {}", config.name))?;
+        .with_context(|| format!("serializing workspace config {}", config.name))?;
     std::fs::write(&path, body)
-        .with_context(|| format!("writing project config at {}", path.display()))?;
+        .with_context(|| format!("writing workspace config at {}", path.display()))?;
     Ok(())
 }
 
-/// True if `<projects_dir>/<name>.toml` already exists. Used by `project/create` to refuse
+/// True if `<workspaces_dir>/<name>.toml` already exists. Used by `workspace/create` to refuse
 /// overwriting an existing config.
-pub fn project_config_exists(name: &str) -> anyhow::Result<bool> {
-    Ok(project_config_path(name)?.exists())
+pub fn workspace_config_exists(name: &str) -> anyhow::Result<bool> {
+    Ok(workspace_config_path(name)?.exists())
 }
 
-/// Rename a project's TOML config on disk (`<old>.toml` → `<new>.toml`). Used by
-/// `project/rename`. The caller is responsible for refusing when the destination already exists
-/// (see `project_config_exists`) — `fs::rename` would otherwise silently clobber it.
-pub fn rename_project_config(old: &str, new: &str) -> anyhow::Result<()> {
-    let from = project_config_path(old)?;
-    let to = project_config_path(new)?;
+/// Rename a workspace's TOML config on disk (`<old>.toml` → `<new>.toml`). Used by
+/// `workspace/rename`. The caller is responsible for refusing when the destination already exists
+/// (see `workspace_config_exists`) — `fs::rename` would otherwise silently clobber it.
+pub fn rename_workspace_config(old: &str, new: &str) -> anyhow::Result<()> {
+    let from = workspace_config_path(old)?;
+    let to = workspace_config_path(new)?;
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating projects dir {}", parent.display()))?;
+            .with_context(|| format!("creating workspaces dir {}", parent.display()))?;
     }
     std::fs::rename(&from, &to).with_context(|| {
         format!(
-            "renaming project config {} -> {}",
+            "renaming workspace config {} -> {}",
             from.display(),
             to.display()
         )
@@ -644,15 +644,15 @@ pub fn rename_project_config(old: &str, new: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Delete a project's TOML config from disk. Used by `project/delete`. Does not remove the source
-/// files under the project's roots — only the project definition. A missing file is treated as
+/// Delete a workspace's TOML config from disk. Used by `workspace/delete`. Does not remove the source
+/// files under the workspace's roots — only the workspace definition. A missing file is treated as
 /// success (the end state — no config — is what was asked for).
-pub fn delete_project_config(name: &str) -> anyhow::Result<()> {
-    let path = project_config_path(name)?;
+pub fn delete_workspace_config(name: &str) -> anyhow::Result<()> {
+    let path = workspace_config_path(name)?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("deleting project config at {}", path.display())),
+        Err(e) => Err(e).with_context(|| format!("deleting workspace config at {}", path.display())),
     }
 }
 
@@ -660,81 +660,81 @@ pub fn delete_project_config(name: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn proj(name: &str, roots: &[&str]) -> (String, Vec<PathBuf>) {
+    fn wks(name: &str, roots: &[&str]) -> (String, Vec<PathBuf>) {
         (name.to_string(), roots.iter().map(PathBuf::from).collect())
     }
 
     #[test]
-    fn no_project_contains_path() {
-        let projects = [proj("work", &["/home/joe/work"])];
+    fn no_workspace_contains_path() {
+        let workspaces = [wks("work", &["/home/joe/work"])];
         assert_eq!(
-            match_project(Path::new("/tmp/elsewhere/file.rs"), &projects),
-            ProjectMatch::None
+            match_workspace(Path::new("/tmp/elsewhere/file.rs"), &workspaces),
+            WorkspaceMatch::None
         );
     }
 
     #[test]
-    fn single_project_match() {
-        let projects = [
-            proj("work", &["/home/joe/work"]),
-            proj("dots", &["/home/joe/.config"]),
+    fn single_workspace_match() {
+        let workspaces = [
+            wks("work", &["/home/joe/work"]),
+            wks("dots", &["/home/joe/.config"]),
         ];
         assert_eq!(
-            match_project(Path::new("/home/joe/work/src/main.rs"), &projects),
-            ProjectMatch::One("work".to_string())
+            match_workspace(Path::new("/home/joe/work/src/main.rs"), &workspaces),
+            WorkspaceMatch::One("work".to_string())
         );
     }
 
     #[test]
     fn path_equal_to_root_matches() {
-        let projects = [proj("work", &["/home/joe/work"])];
+        let workspaces = [wks("work", &["/home/joe/work"])];
         assert_eq!(
-            match_project(Path::new("/home/joe/work"), &projects),
-            ProjectMatch::One("work".to_string())
+            match_workspace(Path::new("/home/joe/work"), &workspaces),
+            WorkspaceMatch::One("work".to_string())
         );
     }
 
     #[test]
     fn most_specific_nested_root_wins() {
-        // `sub` is rooted inside `work`; a path under `sub` belongs to the deeper project.
-        let projects = [
-            proj("work", &["/home/joe/work"]),
-            proj("sub", &["/home/joe/work/sub"]),
+        // `sub` is rooted inside `work`; a path under `sub` belongs to the deeper workspace.
+        let workspaces = [
+            wks("work", &["/home/joe/work"]),
+            wks("sub", &["/home/joe/work/sub"]),
         ];
         assert_eq!(
-            match_project(Path::new("/home/joe/work/sub/file.rs"), &projects),
-            ProjectMatch::One("sub".to_string())
+            match_workspace(Path::new("/home/joe/work/sub/file.rs"), &workspaces),
+            WorkspaceMatch::One("sub".to_string())
         );
         // A sibling under `work` but outside `sub` still resolves to `work`.
         assert_eq!(
-            match_project(Path::new("/home/joe/work/other/file.rs"), &projects),
-            ProjectMatch::One("work".to_string())
+            match_workspace(Path::new("/home/joe/work/other/file.rs"), &workspaces),
+            WorkspaceMatch::One("work".to_string())
         );
     }
 
     #[test]
     fn equal_depth_tie_is_ambiguous() {
-        // Two projects share the same root — a genuine tie.
-        let projects = [
-            proj("alpha", &["/home/joe/shared"]),
-            proj("beta", &["/home/joe/shared"]),
+        // Two workspaces share the same root — a genuine tie.
+        let workspaces = [
+            wks("alpha", &["/home/joe/shared"]),
+            wks("beta", &["/home/joe/shared"]),
         ];
         assert_eq!(
-            match_project(Path::new("/home/joe/shared/x.rs"), &projects),
-            ProjectMatch::Ambiguous(vec!["alpha".to_string(), "beta".to_string()])
+            match_workspace(Path::new("/home/joe/shared/x.rs"), &workspaces),
+            WorkspaceMatch::Ambiguous(vec!["alpha".to_string(), "beta".to_string()])
         );
     }
 
     #[test]
-    fn deepest_root_across_projects_breaks_what_would_be_a_tie() {
+    fn deepest_root_across_workspaces_breaks_what_would_be_a_tie() {
         // Both contain the path, but `beta`'s root is one level deeper, so it wins outright.
-        let projects = [
-            proj("alpha", &["/home/joe"]),
-            proj("beta", &["/home/joe/work"]),
+        let workspaces = [
+            wks("alpha", &["/home/joe"]),
+            wks("beta", &["/home/joe/work"]),
         ];
         assert_eq!(
-            match_project(Path::new("/home/joe/work/file.rs"), &projects),
-            ProjectMatch::One("beta".to_string())
+            match_workspace(Path::new("/home/joe/work/file.rs"), &workspaces),
+            WorkspaceMatch::One("beta".to_string())
         );
     }
 
@@ -848,53 +848,53 @@ mod tests {
     }
 
     #[test]
-    fn project_sessions_missing_file_is_empty() {
+    fn workspace_sessions_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
         // No file yet → empty map, not an error.
         assert_eq!(
-            load_project_sessions_at(&path).unwrap(),
-            ProjectSessions::default()
+            load_workspace_sessions_at(&path).unwrap(),
+            WorkspaceSessions::default()
         );
     }
 
     #[test]
-    fn project_sessions_round_trip_through_disk() {
+    fn workspace_sessions_round_trip_through_disk() {
         let dir = tempfile::tempdir().unwrap();
         // Nested path exercises the create-parent branch.
         let path = dir.path().join("aether").join("sessions.json");
-        let mut sessions = ProjectSessions::default();
-        sessions.projects.insert(
+        let mut sessions = WorkspaceSessions::default();
+        sessions.workspaces.insert(
             "work".into(),
-            ProjectSession {
+            WorkspaceSession {
                 last_activated_at: 1000,
                 buffers: vec![PathBuf::from("/work/a.rs"), PathBuf::from("/work/b.rs")],
             },
         );
-        sessions.projects.insert(
+        sessions.workspaces.insert(
             "dots".into(),
-            ProjectSession {
+            WorkspaceSession {
                 last_activated_at: 2000,
                 buffers: vec![],
             },
         );
-        write_project_sessions_at(&path, &sessions).unwrap();
-        assert_eq!(load_project_sessions_at(&path).unwrap(), sessions);
+        write_workspace_sessions_at(&path, &sessions).unwrap();
+        assert_eq!(load_workspace_sessions_at(&path).unwrap(), sessions);
     }
 
     #[test]
     fn recency_sort_orders_most_recent_first_then_alphabetical() {
-        let mut sessions = ProjectSessions::default();
-        sessions.projects.insert(
+        let mut sessions = WorkspaceSessions::default();
+        sessions.workspaces.insert(
             "beta".into(),
-            ProjectSession {
+            WorkspaceSession {
                 last_activated_at: 100,
                 buffers: vec![],
             },
         );
-        sessions.projects.insert(
+        sessions.workspaces.insert(
             "alpha".into(),
-            ProjectSession {
+            WorkspaceSession {
                 last_activated_at: 200,
                 buffers: vec![],
             },
@@ -911,7 +911,7 @@ mod tests {
         assert_eq!(names, vec!["alpha", "beta", "delta", "gamma"]);
 
         // Flip the stamps: `beta` is now the most recent.
-        sessions.projects.get_mut("beta").unwrap().last_activated_at = 999;
+        sessions.workspaces.get_mut("beta").unwrap().last_activated_at = 999;
         sort_names_by_recency(&mut names, &sessions);
         assert_eq!(names, vec!["beta", "alpha", "delta", "gamma"]);
     }

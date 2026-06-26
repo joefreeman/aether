@@ -55,11 +55,11 @@ use aether_protocol::picker::{
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
     PickerViewResult,
 };
-use aether_protocol::project::{
-    ProjectActivateParams, ProjectActivateResult, ProjectAddRootParams, ProjectCreateParams,
-    ProjectDeleteParams, ProjectInfo, ProjectListParams, ProjectListResult, ProjectOpenPathParams,
-    ProjectRemoveRootParams, ProjectRemoveRootResult, ProjectRenameParams, ProjectRenamed,
-    ProjectRenamedParams, ProjectSummary,
+use aether_protocol::workspace::{
+    WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddRootParams, WorkspaceCreateParams,
+    WorkspaceDeleteParams, WorkspaceInfo, WorkspaceListParams, WorkspaceListResult, WorkspaceOpenPathParams,
+    WorkspaceRemoveRootParams, WorkspaceRemoveRootResult, WorkspaceRenameParams, WorkspaceRenamed,
+    WorkspaceRenamedParams, WorkspaceSummary,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,
@@ -94,28 +94,28 @@ pub struct ConnectionCtx {
     pub client_id: ClientId,
 }
 
-// ---- project/* --------------------------------------------------------------------------------
+// ---- workspace/* --------------------------------------------------------------------------------
 
-/// Enumerate the projects configured on disk under `$XDG_CONFIG_HOME/aether/projects/`. The
-/// caller uses this to populate the project picker. Doesn't indicate which project (if any) the
+/// Enumerate the workspaces configured on disk under `$XDG_CONFIG_HOME/aether/workspaces/`. The
+/// caller uses this to populate the workspace picker. Doesn't indicate which workspace (if any) the
 /// caller has active — the client tracks that locally.
-pub async fn project_list(
+pub async fn workspace_list(
     _state: &SharedState,
     _ctx: &mut ConnectionCtx,
-    _params: ProjectListParams,
-) -> Result<ProjectListResult, RpcError> {
-    let names = crate::config::list_project_names()
-        .map_err(|e| RpcError::internal(format!("listing projects: {e}")))?;
-    Ok(ProjectListResult {
-        projects: names
+    _params: WorkspaceListParams,
+) -> Result<WorkspaceListResult, RpcError> {
+    let names = crate::config::list_workspace_names()
+        .map_err(|e| RpcError::internal(format!("listing workspaces: {e}")))?;
+    Ok(WorkspaceListResult {
+        workspaces: names
             .into_iter()
-            .map(|name| ProjectSummary { name })
+            .map(|name| WorkspaceSummary { name })
             .collect(),
     })
 }
 
 /// Read the global application settings (`$XDG_CONFIG_HOME/aether/settings.toml`). Returns defaults
-/// when no settings file exists yet. App-wide, so it ignores the caller's active project.
+/// when no settings file exists yet. App-wide, so it ignores the caller's active workspace.
 pub async fn settings_get(
     _state: &SharedState,
     _ctx: &mut ConnectionCtx,
@@ -127,7 +127,7 @@ pub async fn settings_get(
 
 /// Replace the global application settings and persist them. Echoes the stored settings back, so
 /// the caller reconciles against exactly what landed on disk, and pushes `settings/changed` to every
-/// *other* connected client (settings are app-wide, so this ignores active projects) so the change
+/// *other* connected client (settings are app-wide, so this ignores active workspaces) so the change
 /// applies live everywhere rather than only at the next reconnect.
 pub async fn settings_set(
     state: &SharedState,
@@ -162,66 +162,66 @@ pub async fn settings_set(
     Ok(params)
 }
 
-/// Activate a project for this client. Loads the project's config from disk if no client has it
-/// active yet (lazy load). If the client already has a different project active, tears down the
-/// client's per-buffer state for the prior project before switching. Returns the resolved
-/// project info (name + canonical paths) so the client can present buffers relative to those
+/// Activate a workspace for this client. Loads the workspace's config from disk if no client has it
+/// active yet (lazy load). If the client already has a different workspace active, tears down the
+/// client's per-buffer state for the prior workspace before switching. Returns the resolved
+/// workspace info (name + canonical paths) so the client can present buffers relative to those
 /// roots.
-pub async fn project_activate(
+pub async fn workspace_activate(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: ProjectActivateParams,
-) -> Result<ProjectActivateResult, RpcError> {
+    params: WorkspaceActivateParams,
+) -> Result<WorkspaceActivateResult, RpcError> {
     let client_id = ctx.client_id;
 
-    // Cheap path: if the project is already loaded (some other client activated it earlier, or
+    // Cheap path: if the workspace is already loaded (some other client activated it earlier, or
     // it was pre-registered for tests), skip the disk read.
-    let already_loaded = state.lock().await.projects.contains_key(&params.name);
+    let already_loaded = state.lock().await.workspaces.contains_key(&params.name);
 
-    // Cold path: read the project's config from disk *outside* the state lock — file I/O and
+    // Cold path: read the workspace's config from disk *outside* the state lock — file I/O and
     // canonicalization can be slow on cold caches, and we hold the lock for many concurrent
     // operations.
     let cold_load: Option<(String, Vec<std::path::PathBuf>)> = if already_loaded {
         None
     } else {
-        let cfg = match crate::config::load_project(&params.name) {
+        let cfg = match crate::config::load_workspace(&params.name) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(name = %params.name, error = %e, "project/activate: project not found");
-                return Err(RpcError::unknown_project(&params.name));
+                tracing::warn!(name = %params.name, error = %e, "workspace/activate: workspace not found");
+                return Err(RpcError::unknown_workspace(&params.name));
             }
         };
         let canonical_paths: Vec<std::path::PathBuf> = cfg
             .paths
             .iter()
-            .map(|p| crate::config::canonicalize_project_path(p))
+            .map(|p| crate::config::canonicalize_workspace_path(p))
             .collect::<Result<_, _>>()
-            .map_err(|e| RpcError::invalid_path(format!("canonicalizing project path: {e}")))?;
+            .map_err(|e| RpcError::invalid_path(format!("canonicalizing workspace path: {e}")))?;
         Some((cfg.name, canonical_paths))
     };
 
     let mut s = state.lock().await;
 
-    // If the client had a different project active, tear down its prior per-buffer state.
+    // If the client had a different workspace active, tear down its prior per-buffer state.
     let prior = s
         .clients
         .get(&client_id)
-        .and_then(|c| c.active_project.clone());
+        .and_then(|c| c.active_workspace.clone());
     if let Some(prior_name) = &prior {
         if prior_name != &params.name {
-            s.teardown_client_state_for_project(client_id, prior_name);
+            s.teardown_client_state_for_workspace(client_id, prior_name);
         }
     }
 
-    // Install the project entry on the cold path. Reuse the existing entry (and its shared
+    // Install the workspace entry on the cold path. Reuse the existing entry (and its shared
     // `WorkspaceIndex`) on the hot path.
     if let Some((name, canonical_paths)) = cold_load {
         let workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
             canonical_paths.clone(),
         ));
-        s.projects.insert(
+        s.workspaces.insert(
             params.name.clone(),
-            crate::state::ProjectEntry {
+            crate::state::WorkspaceEntry {
                 id: params.name.clone(),
                 name: Some(name),
                 paths: canonical_paths.clone(),
@@ -230,23 +230,23 @@ pub async fn project_activate(
                 dormant_buffers: Vec::new(),
             },
         );
-        // Hand the new roots to the watcher so its events flow for this project too. Best-effort
+        // Hand the new roots to the watcher so its events flow for this workspace too. Best-effort
         // — a watcher failure shouldn't refuse activation. `watcher` is `None` only when the
         // server skipped initializing it (failed at startup); we just skip registration in that
         // case.
         if let Some(w) = s.watcher.clone() {
-            crate::watcher::watch_project_paths(&w, &canonical_paths);
+            crate::watcher::watch_workspace_paths(&w, &canonical_paths);
         }
 
-        // First activation this session: restore the project's previously-open files from the
+        // First activation this session: restore the workspace's previously-open files from the
         // persisted session as *dormant* buffers (listed in the picker, loaded lazily). Each gets a
         // reserved id but no rope/LSP until materialized. Files deleted while the server was down are
         // dropped. No-op when sessions aren't persisted (`sessions_path` unset) or the file is
         // unreadable.
         if let Some(path) = s.sessions_path.clone() {
-            if let Ok(sessions) = crate::config::load_project_sessions_at(&path) {
+            if let Ok(sessions) = crate::config::load_workspace_sessions_at(&path) {
                 let restore: Vec<std::path::PathBuf> = sessions
-                    .projects
+                    .workspaces
                     .get(&params.name)
                     .map(|sess| {
                         sess.buffers
@@ -263,7 +263,7 @@ pub async fn project_activate(
                         path: p,
                     })
                     .collect();
-                if let Some(proj) = s.projects.get_mut(&params.name) {
+                if let Some(proj) = s.workspaces.get_mut(&params.name) {
                     proj.dormant_buffers = dormant;
                 }
             }
@@ -271,34 +271,34 @@ pub async fn project_activate(
     }
 
     let entry_paths: Vec<String> = s
-        .projects
+        .workspaces
         .get(&params.name)
         .map(|p| p.paths.iter().map(|p| p.display().to_string()).collect())
         .unwrap_or_default();
     let server_started_at = s.started_at_unix_ms;
 
     if let Some(session) = s.clients.get_mut(&client_id) {
-        session.active_project = Some(params.name.clone());
+        session.active_workspace = Some(params.name.clone());
     }
 
-    // Switching away from an ephemeral project can leave it empty (its transient buffers were
+    // Switching away from an ephemeral workspace can leave it empty (its transient buffers were
     // closed by the teardown above; any permanent ones keep it alive). Retire it now that this
-    // client no longer holds it active, so a throwaway "(no project)" context doesn't linger.
+    // client no longer holds it active, so a throwaway "(no workspace)" context doesn't linger.
     if let Some(prior_id) = &prior {
         if prior_id != &params.name {
             s.prune_ephemeral_if_empty(prior_id);
         }
     }
 
-    // Most-recently-used buffer in the newly-active project. The MRU lives on `ProjectEntry`
+    // Most-recently-used buffer in the newly-active workspace. The MRU lives on `WorkspaceEntry`
     // (not per-client) so it survives client disconnects — a fresh TUI invocation sees the same
     // top-of-MRU buffer the prior session left there. The client uses this to reattach instead
     // of spawning a fresh scratch on every switch.
     // Prefer a still-live MRU buffer; otherwise — a cold restore after a restart, where nothing is
     // loaded yet — land on the most-recently-used *dormant* buffer, which `buffer_open` materializes
-    // by id. `None` only when the project is genuinely empty (first ever visit), giving a scratch.
+    // by id. `None` only when the workspace is genuinely empty (first ever visit), giving a scratch.
     let last_buffer_id = s
-        .projects
+        .workspaces
         .get(&params.name)
         .and_then(|p| {
             p.mru_buffers
@@ -308,11 +308,11 @@ pub async fn project_activate(
         })
         .or_else(|| s.first_dormant_id(&params.name));
 
-    tracing::info!(%client_id, project = %params.name, "client activated project");
+    tracing::info!(%client_id, workspace = %params.name, "client activated workspace");
     drop(s);
 
     // Composite post-step (docs/protocol-composites.md, C): open the landing buffer — the
-    // project's MRU buffer, or a fresh transient scratch on a first visit — in the same
+    // workspace's MRU buffer, or a fresh transient scratch on a first visit — in the same
     // round-trip. Mirrors the convention every client implemented by hand.
     let opened = if params.open_last {
         Some(
@@ -337,10 +337,10 @@ pub async fn project_activate(
 
     // Stamp this activation and refresh the persisted buffer list (now that the landing buffer has
     // materialized). Drives the switcher's recency ordering on the next open.
-    persist_project_session(state, &params.name, true).await;
+    persist_workspace_session(state, &params.name, true).await;
 
-    Ok(ProjectActivateResult {
-        project: ProjectInfo {
+    Ok(WorkspaceActivateResult {
+        workspace: WorkspaceInfo {
             name: params.name,
             paths: entry_paths,
         },
@@ -350,16 +350,16 @@ pub async fn project_activate(
     })
 }
 
-/// Persist `project_name`'s session — the canonical paths of its open (and still-dormant) buffers,
+/// Persist `workspace_name`'s session — the canonical paths of its open (and still-dormant) buffers,
 /// most-recently-used first, and optionally a fresh `last_activated_at` stamp — to the session file
-/// ([`crate::config::ProjectSessions`]). Best-effort: a no-op when sessions aren't persisted
-/// (`sessions_path` unset) or the project is ephemeral, and it logs rather than fails on I/O error.
+/// ([`crate::config::WorkspaceSessions`]). Best-effort: a no-op when sessions aren't persisted
+/// (`sessions_path` unset) or the workspace is ephemeral, and it logs rather than fails on I/O error.
 /// Buffer paths are gathered under the lock; the read-modify-write of the file happens after it's
 /// released.
-async fn persist_project_session(state: &SharedState, project_name: &str, touch_activation: bool) {
+async fn persist_workspace_session(state: &SharedState, workspace_name: &str, touch_activation: bool) {
     // Hold the state lock across the whole read-modify-write. It's the single server-wide
     // serialization point, so this makes concurrent persists — and the recency-sort read in
-    // `project_candidates`, which also runs under the lock — mutually exclusive: no lost updates
+    // `workspace_candidates`, which also runs under the lock — mutually exclusive: no lost updates
     // and no torn file. The session file is tiny, so the blocking I/O held under the lock is
     // sub-millisecond, and persists are human-paced (open / switch / save / close / activate).
     // No `.await` between here and the write, so the guard is never yielded mid-critical-section.
@@ -367,85 +367,85 @@ async fn persist_project_session(state: &SharedState, project_name: &str, touch_
     let Some(path) = s.sessions_path.clone() else {
         return;
     };
-    // Skip ephemeral projects (no `<name>.toml`): nothing to persist for a throwaway context.
-    if s.projects
-        .get(project_name)
+    // Skip ephemeral workspaces (no `<name>.toml`): nothing to persist for a throwaway context.
+    if s.workspaces
+        .get(workspace_name)
         .is_none_or(|p| p.name.is_none())
     {
         return;
     }
-    let buffers = s.session_buffer_paths(project_name);
-    let mut sessions = crate::config::load_project_sessions_at(&path).unwrap_or_default();
-    let entry = sessions.projects.entry(project_name.to_string()).or_default();
+    let buffers = s.session_buffer_paths(workspace_name);
+    let mut sessions = crate::config::load_workspace_sessions_at(&path).unwrap_or_default();
+    let entry = sessions.workspaces.entry(workspace_name.to_string()).or_default();
     entry.buffers = buffers;
     if touch_activation {
         entry.last_activated_at = crate::config::now_unix_ms();
     }
-    if let Err(e) = crate::config::write_project_sessions_at(&path, &sessions) {
-        tracing::warn!(project = %project_name, error = %e, "failed to persist project session");
+    if let Err(e) = crate::config::write_workspace_sessions_at(&path, &sessions) {
+        tracing::warn!(workspace = %workspace_name, error = %e, "failed to persist workspace session");
     }
 }
 
-/// Validate and normalize a user-supplied project name. Trims surrounding whitespace, then
+/// Validate and normalize a user-supplied workspace name. Trims surrounding whitespace, then
 /// rejects empty names and names containing path separators — the name becomes a `<name>.toml`
-/// filename, so a `/`, `\`, `.`, or `..` could escape the projects dir. Shared by
-/// `project/create` and `project/rename`.
-fn validate_project_name(raw: &str) -> Result<String, RpcError> {
+/// filename, so a `/`, `\`, `.`, or `..` could escape the workspaces dir. Shared by
+/// `workspace/create` and `workspace/rename`.
+fn validate_workspace_name(raw: &str) -> Result<String, RpcError> {
     let name = raw.trim().to_string();
     if name.is_empty() {
-        return Err(RpcError::invalid_params("project name must not be empty"));
+        return Err(RpcError::invalid_params("workspace name must not be empty"));
     }
     if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
         return Err(RpcError::invalid_params(
-            "project name must not contain path separators",
+            "workspace name must not contain path separators",
         ));
     }
     Ok(name)
 }
 
-/// Create a fresh project with no roots. Writes an empty-`paths` TOML to disk, registers the
-/// project in memory, and activates it for the calling client. Refuses if a project of that
+/// Create a fresh workspace with no roots. Writes an empty-`paths` TOML to disk, registers the
+/// workspace in memory, and activates it for the calling client. Refuses if a workspace of that
 /// name already exists, or if the name is empty / contains path separators.
-pub async fn project_create(
+pub async fn workspace_create(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: ProjectCreateParams,
-) -> Result<ProjectActivateResult, RpcError> {
+    params: WorkspaceCreateParams,
+) -> Result<WorkspaceActivateResult, RpcError> {
     let client_id = ctx.client_id;
-    let name = validate_project_name(&params.name)?;
-    let exists = crate::config::project_config_exists(&name)
-        .map_err(|e| RpcError::internal(format!("checking project config: {e}")))?;
+    let name = validate_workspace_name(&params.name)?;
+    let exists = crate::config::workspace_config_exists(&name)
+        .map_err(|e| RpcError::internal(format!("checking workspace config: {e}")))?;
     if exists {
         return Err(RpcError::invalid_params(format!(
-            "project {name} already exists"
+            "workspace {name} already exists"
         )));
     }
     // Write the TOML outside the state lock — file I/O.
-    crate::config::write_project_config(&crate::config::ProjectConfig {
+    crate::config::write_workspace_config(&crate::config::WorkspaceConfig {
         name: name.clone(),
         paths: Vec::new(),
     })
-    .map_err(|e| RpcError::internal(format!("writing project config: {e}")))?;
+    .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
 
     let mut s = state.lock().await;
 
-    // Tear down the client's prior project state (same flow as project_activate).
+    // Tear down the client's prior workspace state (same flow as workspace_activate).
     let prior = s
         .clients
         .get(&client_id)
-        .and_then(|c| c.active_project.clone());
+        .and_then(|c| c.active_workspace.clone());
     if let Some(prior_name) = &prior {
         if prior_name != &name {
-            s.teardown_client_state_for_project(client_id, prior_name);
+            s.teardown_client_state_for_workspace(client_id, prior_name);
         }
     }
 
-    // Register the empty project. No paths → no workspace_index walk to do; the empty Arc
+    // Register the empty workspace. No paths → no workspace_index walk to do; the empty Arc
     // returns an empty file list on access.
     let workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(Vec::new()));
-    s.projects.insert(
+    s.workspaces.insert(
         name.clone(),
-        crate::state::ProjectEntry {
+        crate::state::WorkspaceEntry {
             id: name.clone(),
             name: Some(name.clone()),
             paths: Vec::new(),
@@ -455,9 +455,9 @@ pub async fn project_create(
         },
     );
     if let Some(session) = s.clients.get_mut(&client_id) {
-        session.active_project = Some(name.clone());
+        session.active_workspace = Some(name.clone());
     }
-    // Creating a project while parked in an ephemeral one retires the ephemeral if now empty.
+    // Creating a workspace while parked in an ephemeral one retires the ephemeral if now empty.
     if let Some(prior_id) = &prior {
         if prior_id != &name {
             s.prune_ephemeral_if_empty(prior_id);
@@ -465,16 +465,16 @@ pub async fn project_create(
     }
     let server_started_at = s.started_at_unix_ms;
 
-    // Another client's open chooser should gain the new project.
-    let pushes = refresh_project_pickers(&mut s);
+    // Another client's open chooser should gain the new workspace.
+    let pushes = refresh_workspace_pickers(&mut s);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
 
-    tracing::info!(%client_id, project = %name, "client created project");
-    Ok(ProjectActivateResult {
-        project: ProjectInfo {
+    tracing::info!(%client_id, workspace = %name, "client created workspace");
+    Ok(WorkspaceActivateResult {
+        workspace: WorkspaceInfo {
             name,
             paths: Vec::new(),
         },
@@ -484,15 +484,15 @@ pub async fn project_create(
     })
 }
 
-/// Open a file by absolute path, resolving the project context (see [`ProjectOpenPath`]). Powers
+/// Open a file by absolute path, resolving the workspace context (see [`WorkspaceOpenPath`]). Powers
 /// `ae /path/to/file`, the open-from-path overlay, and goto-definition into a file outside the
-/// active project. Internal when the active project's roots contain the path; external when a
-/// project is active but doesn't; an ephemeral project (activated here) when none is active.
-pub async fn project_open_path(
+/// active workspace. Internal when the active workspace's roots contain the path; external when a
+/// workspace is active but doesn't; an ephemeral workspace (activated here) when none is active.
+pub async fn workspace_open_path(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: ProjectOpenPathParams,
-) -> Result<ProjectActivateResult, RpcError> {
+    params: WorkspaceOpenPathParams,
+) -> Result<WorkspaceActivateResult, RpcError> {
     let client_id = ctx.client_id;
     let raw = crate::config::expand_home(std::path::Path::new(&params.path));
     // Require an absolute path (a leading `~/` counts — `expand_home` already made it absolute).
@@ -509,29 +509,29 @@ pub async fn project_open_path(
     let canonical = std::fs::canonicalize(&raw)
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
 
-    // Resolve the project this open lands in, activating an ephemeral one if the client has none.
-    // We never re-home the file into some *other* configured project that happens to contain it —
-    // an explicit open attaches to the active project (as a guest, if external) or to a fresh
+    // Resolve the workspace this open lands in, activating an ephemeral one if the client has none.
+    // We never re-home the file into some *other* configured workspace that happens to contain it —
+    // an explicit open attaches to the active workspace (as a guest, if external) or to a fresh
     // ephemeral context.
-    let (project_id, project_paths, server_started_at, created_ephemeral) = {
+    let (workspace_id, workspace_paths, server_started_at, created_ephemeral) = {
         let mut s = state.lock().await;
         let active = s
             .clients
             .get(&client_id)
-            .and_then(|c| c.active_project.clone());
+            .and_then(|c| c.active_workspace.clone());
         let (id, created) = match active {
             Some(id) => (id, false),
             None => {
-                let id = s.register_ephemeral_project();
+                let id = s.register_ephemeral_workspace();
                 if let Some(session) = s.clients.get_mut(&client_id) {
-                    session.active_project = Some(id.clone());
+                    session.active_workspace = Some(id.clone());
                 }
-                tracing::info!(%client_id, project = %id, "activated ephemeral project for open-from-path");
+                tracing::info!(%client_id, workspace = %id, "activated ephemeral workspace for open-from-path");
                 (id, true)
             }
         };
         let paths = s
-            .projects
+            .workspaces
             .get(&id)
             .map(|p| p.paths.iter().map(|p| p.display().to_string()).collect())
             .unwrap_or_default();
@@ -549,20 +549,20 @@ pub async fn project_open_path(
     )
     .await?;
 
-    // A freshly-minted ephemeral project appears in any open switcher.
+    // A freshly-minted ephemeral workspace appears in any open switcher.
     if created_ephemeral {
         let mut s = state.lock().await;
-        let pushes = refresh_project_pickers(&mut s);
+        let pushes = refresh_workspace_pickers(&mut s);
         drop(s);
         for (sender, notif) in pushes {
             let _ = sender.send(notif).await;
         }
     }
 
-    Ok(ProjectActivateResult {
-        project: ProjectInfo {
-            name: project_id,
-            paths: project_paths,
+    Ok(WorkspaceActivateResult {
+        workspace: WorkspaceInfo {
+            name: workspace_id,
+            paths: workspace_paths,
         },
         last_buffer_id: None,
         opened: Some(opened),
@@ -570,39 +570,39 @@ pub async fn project_open_path(
     })
 }
 
-/// Add a root path to an existing project. Canonicalizes, refuses duplicates, writes the TOML,
-/// registers with the watcher, rebuilds the workspace index. Returns the updated project info.
-pub async fn project_add_root(
+/// Add a root path to an existing workspace. Canonicalizes, refuses duplicates, writes the TOML,
+/// registers with the watcher, rebuilds the workspace index. Returns the updated workspace info.
+pub async fn workspace_add_root(
     state: &SharedState,
     _ctx: &mut ConnectionCtx,
-    params: ProjectAddRootParams,
-) -> Result<ProjectInfo, RpcError> {
-    let canonical = crate::config::canonicalize_project_path(std::path::Path::new(&params.path))
+    params: WorkspaceAddRootParams,
+) -> Result<WorkspaceInfo, RpcError> {
+    let canonical = crate::config::canonicalize_workspace_path(std::path::Path::new(&params.path))
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing root: {e}")))?;
 
     let mut s = state.lock().await;
-    let project = s
-        .projects
-        .get_mut(&params.project)
-        .ok_or_else(|| RpcError::unknown_project(&params.project))?;
-    if project.paths.iter().any(|p| p == &canonical) {
+    let workspace = s
+        .workspaces
+        .get_mut(&params.workspace)
+        .ok_or_else(|| RpcError::unknown_workspace(&params.workspace))?;
+    if workspace.paths.iter().any(|p| p == &canonical) {
         return Err(RpcError::invalid_params(format!(
-            "{} is already a root of project {}",
+            "{} is already a root of workspace {}",
             canonical.display(),
-            params.project
+            params.workspace
         )));
     }
-    project.paths.push(canonical.clone());
+    workspace.paths.push(canonical.clone());
     // Rebuild workspace_index with the new path list. The old Arc remains alive only for any
     // in-flight reader; subsequent picker opens see the fresh one.
-    project.workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
-        project.paths.clone(),
+    workspace.workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
+        workspace.paths.clone(),
     ));
-    let updated = crate::config::ProjectConfig {
-        name: project.id.clone(),
-        paths: project.paths.clone(),
+    let updated = crate::config::WorkspaceConfig {
+        name: workspace.id.clone(),
+        paths: workspace.paths.clone(),
     };
-    let entry_paths: Vec<String> = project
+    let entry_paths: Vec<String> = workspace
         .paths
         .iter()
         .map(|p| p.display().to_string())
@@ -611,48 +611,48 @@ pub async fn project_add_root(
     drop(s);
 
     // TOML write + watcher registration happen outside the lock.
-    crate::config::write_project_config(&updated)
-        .map_err(|e| RpcError::internal(format!("writing project config: {e}")))?;
+    crate::config::write_workspace_config(&updated)
+        .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
     if let Some(w) = watcher {
-        crate::watcher::watch_project_paths(&w, &[canonical]);
+        crate::watcher::watch_workspace_paths(&w, &[canonical]);
     }
-    Ok(ProjectInfo {
-        name: params.project,
+    Ok(WorkspaceInfo {
+        name: params.workspace,
         paths: entry_paths,
     })
 }
 
-/// Remove a root path from a project. Closes any file-backed buffers under this root that
+/// Remove a root path from a workspace. Closes any file-backed buffers under this root that
 /// aren't covered by another remaining root; refuses with `DIRTY_BUFFERS_PREVENT_REMOVE` if any
-/// such buffer is dirty. Scratch buffers in the project are unaffected.
-pub async fn project_remove_root(
+/// such buffer is dirty. Scratch buffers in the workspace are unaffected.
+pub async fn workspace_remove_root(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: ProjectRemoveRootParams,
-) -> Result<ProjectRemoveRootResult, RpcError> {
+    params: WorkspaceRemoveRootParams,
+) -> Result<WorkspaceRemoveRootResult, RpcError> {
     let client_id = ctx.client_id;
-    let canonical = crate::config::canonicalize_project_path(std::path::Path::new(&params.path))
+    let canonical = crate::config::canonicalize_workspace_path(std::path::Path::new(&params.path))
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing root: {e}")))?;
 
     let mut s = state.lock().await;
-    let project = s
-        .projects
-        .get_mut(&params.project)
-        .ok_or_else(|| RpcError::unknown_project(&params.project))?;
-    if !project.paths.iter().any(|p| p == &canonical) {
+    let workspace = s
+        .workspaces
+        .get_mut(&params.workspace)
+        .ok_or_else(|| RpcError::unknown_workspace(&params.workspace))?;
+    if !workspace.paths.iter().any(|p| p == &canonical) {
         return Err(RpcError::invalid_params(format!(
-            "{} is not a root of project {}",
+            "{} is not a root of workspace {}",
             canonical.display(),
-            params.project
+            params.workspace
         )));
     }
-    let remaining_paths: Vec<std::path::PathBuf> = project
+    let remaining_paths: Vec<std::path::PathBuf> = workspace
         .paths
         .iter()
         .filter(|p| **p != canonical)
         .cloned()
         .collect();
-    let project_name = project.id.clone();
+    let workspace_name = workspace.id.clone();
 
     // Find file-backed buffers under the removed root that aren't covered by any remaining
     // root. Scratch buffers (no path) are exempt; they stay alive.
@@ -674,7 +674,7 @@ pub async fn project_remove_root(
         .buffers
         .iter()
         .filter(|(id, buf)| {
-            s.buffer_projects.get(id).map(|s| s.as_str()) == Some(&project_name)
+            s.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(&workspace_name)
                 && under_removed(buf)
                 && !still_covered(buf)
         })
@@ -705,49 +705,49 @@ pub async fn project_remove_root(
         s.close_buffer(id);
     }
 
-    // Persist the updated path list. Re-grab the project mutably for the write.
-    let project = s
-        .projects
-        .get_mut(&params.project)
-        .expect("project still loaded — we held it above");
-    project.paths.retain(|p| *p != canonical);
-    project.workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
-        project.paths.clone(),
+    // Persist the updated path list. Re-grab the workspace mutably for the write.
+    let workspace = s
+        .workspaces
+        .get_mut(&params.workspace)
+        .expect("workspace still loaded — we held it above");
+    workspace.paths.retain(|p| *p != canonical);
+    workspace.workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
+        workspace.paths.clone(),
     ));
-    let updated = crate::config::ProjectConfig {
-        name: project.id.clone(),
-        paths: project.paths.clone(),
+    let updated = crate::config::WorkspaceConfig {
+        name: workspace.id.clone(),
+        paths: workspace.paths.clone(),
     };
-    let entry_paths: Vec<String> = project
+    let entry_paths: Vec<String> = workspace
         .paths
         .iter()
         .map(|p| p.display().to_string())
         .collect();
 
-    // Next buffer for the requesting client: top of project MRU, else any remaining buffer in
-    // the project. Mirrors buffer/close.
+    // Next buffer for the requesting client: top of workspace MRU, else any remaining buffer in
+    // the workspace. Mirrors buffer/close.
     let next_buffer_id = next_buffer_for_client(&s, client_id);
     let watcher = s.watcher.clone();
     let mut pushes = refresh_buffer_pickers(&mut s);
     pushes.extend(buffer_closed_pushes(&s, &other_clients));
     drop(s);
 
-    crate::config::write_project_config(&updated)
-        .map_err(|e| RpcError::internal(format!("writing project config: {e}")))?;
+    crate::config::write_workspace_config(&updated)
+        .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
     if let Some(w) = watcher {
-        crate::watcher::unwatch_project_paths(&w, &[canonical]);
+        crate::watcher::unwatch_workspace_paths(&w, &[canonical]);
     }
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
     tracing::info!(
-        project = %params.project,
+        workspace = %params.workspace,
         closed = affected.len(),
         "root removed"
     );
-    Ok(ProjectRemoveRootResult {
-        project: ProjectInfo {
-            name: params.project,
+    Ok(WorkspaceRemoveRootResult {
+        workspace: WorkspaceInfo {
+            name: params.workspace,
             paths: entry_paths,
         },
         closed_buffer_ids: affected,
@@ -755,31 +755,31 @@ pub async fn project_remove_root(
     })
 }
 
-/// Rename a project: move its on-disk config, then re-key every in-memory reference to the old
-/// name (the project map, buffer→project associations, and clients' active-project pointers).
+/// Rename a workspace: move its on-disk config, then re-key every in-memory reference to the old
+/// name (the workspace map, buffer→workspace associations, and clients' active-workspace pointers).
 /// Open buffers keep their ids and paths and nothing is closed, so this is safe regardless of
 /// dirty state. Refuses an empty / separator-bearing name or a collision with an existing
-/// project; a no-op when the name is unchanged.
-pub async fn project_rename(
+/// workspace; a no-op when the name is unchanged.
+pub async fn workspace_rename(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: ProjectRenameParams,
-) -> Result<ProjectInfo, RpcError> {
-    let new_name = validate_project_name(&params.new_name)?;
-    let old_name = params.project;
+    params: WorkspaceRenameParams,
+) -> Result<WorkspaceInfo, RpcError> {
+    let new_name = validate_workspace_name(&params.new_name)?;
+    let old_name = params.workspace;
 
-    // Confirm the project is loaded *before* touching disk, so a failure here leaves nothing
-    // half-applied. Projects are never removed from the map at runtime, so this stays true for
+    // Confirm the workspace is loaded *before* touching disk, so a failure here leaves nothing
+    // half-applied. Workspaces are never removed from the map at runtime, so this stays true for
     // the re-key below.
     {
         let s = state.lock().await;
         let entry = s
-            .projects
+            .workspaces
             .get(&old_name)
-            .ok_or_else(|| RpcError::unknown_project(&old_name))?;
+            .ok_or_else(|| RpcError::unknown_workspace(&old_name))?;
         if new_name == old_name {
             // No-op rename — return current info without touching disk or state.
-            return Ok(ProjectInfo {
+            return Ok(WorkspaceInfo {
                 name: old_name,
                 paths: entry
                     .paths
@@ -790,54 +790,54 @@ pub async fn project_rename(
         }
     }
 
-    // Refuse clobbering another project's config; `fs::rename` would otherwise overwrite it.
-    let exists = crate::config::project_config_exists(&new_name)
-        .map_err(|e| RpcError::internal(format!("checking project config: {e}")))?;
+    // Refuse clobbering another workspace's config; `fs::rename` would otherwise overwrite it.
+    let exists = crate::config::workspace_config_exists(&new_name)
+        .map_err(|e| RpcError::internal(format!("checking workspace config: {e}")))?;
     if exists {
         return Err(RpcError::invalid_params(format!(
-            "project {new_name} already exists"
+            "workspace {new_name} already exists"
         )));
     }
 
     // Disk first, outside the lock (file I/O). If this fails, in-memory state is untouched.
-    crate::config::rename_project_config(&old_name, &new_name)
-        .map_err(|e| RpcError::internal(format!("renaming project config: {e}")))?;
+    crate::config::rename_workspace_config(&old_name, &new_name)
+        .map_err(|e| RpcError::internal(format!("renaming workspace config: {e}")))?;
 
     // Carry the persisted session across to the new name (recency stamp + restored buffers). Held
     // under the state lock like every other session-file write, so it can't race a concurrent
-    // persist. Best-effort; the project still works without it, so a failure only logs.
+    // persist. Best-effort; the workspace still works without it, so a failure only logs.
     {
         let s = state.lock().await;
         if let Some(path) = s.sessions_path.clone() {
-            if let Err(e) = crate::config::rename_project_session_at(&path, &old_name, &new_name) {
-                tracing::warn!(old = %old_name, new = %new_name, error = %e, "failed to rename project session");
+            if let Err(e) = crate::config::rename_workspace_session_at(&path, &old_name, &new_name) {
+                tracing::warn!(old = %old_name, new = %new_name, error = %e, "failed to rename workspace session");
             }
         }
     }
 
-    // Re-key every in-memory reference from the old name to the new one. Projects are never
+    // Re-key every in-memory reference from the old name to the new one. Workspaces are never
     // removed from the map at runtime, so the entry we confirmed above is still present.
     let mut s = state.lock().await;
     let entry_paths = s
-        .rename_project(&old_name, &new_name)
-        .ok_or_else(|| RpcError::internal("project vanished during rename"))?;
+        .rename_workspace(&old_name, &new_name)
+        .ok_or_else(|| RpcError::internal("workspace vanished during rename"))?;
 
-    // The re-key above already moved every other connected client on this project to the new name
-    // server-side; push `project/renamed` so each can update its *local* name (display + reconnect
+    // The re-key above already moved every other connected client on this workspace to the new name
+    // server-side; push `workspace/renamed` so each can update its *local* name (display + reconnect
     // baseline). The initiating client learns the new name from this RPC's result instead.
     let mut pushes: PendingPushes = s
         .clients
         .iter()
         .filter(|(id, sess)| {
-            **id != ctx.client_id && sess.active_project.as_deref() == Some(new_name.as_str())
+            **id != ctx.client_id && sess.active_workspace.as_deref() == Some(new_name.as_str())
         })
         .map(|(_, sess)| {
             (
                 sess.outbound.clone(),
                 Notification {
                     jsonrpc: JsonRpc,
-                    method: ProjectRenamed::NAME.into(),
-                    params: serde_json::to_value(ProjectRenamedParams {
+                    method: WorkspaceRenamed::NAME.into(),
+                    params: serde_json::to_value(WorkspaceRenamedParams {
                         old_name: old_name.clone(),
                         new_name: new_name.clone(),
                     })
@@ -847,45 +847,45 @@ pub async fn project_rename(
         })
         .collect();
     // ...and any open chooser elsewhere should show the new name in its list.
-    pushes.extend(refresh_project_pickers(&mut s));
+    pushes.extend(refresh_workspace_pickers(&mut s));
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
 
-    tracing::info!(old = %old_name, new = %new_name, "project renamed");
-    Ok(ProjectInfo {
+    tracing::info!(old = %old_name, new = %new_name, "workspace renamed");
+    Ok(WorkspaceInfo {
         name: new_name,
         paths: entry_paths,
     })
 }
 
-/// Delete a project: drop its in-memory state (closing its buffers) and remove its on-disk config.
-/// Forgets the project *definition* — source files under its roots are untouched. Refuses if the
-/// project is active for any client (the caller must switch away first), or if any of its buffers
+/// Delete a workspace: drop its in-memory state (closing its buffers) and remove its on-disk config.
+/// Forgets the workspace *definition* — source files under its roots are untouched. Refuses if the
+/// workspace is active for any client (the caller must switch away first), or if any of its buffers
 /// is dirty.
-pub async fn project_delete(
+pub async fn workspace_delete(
     state: &SharedState,
     _ctx: &mut ConnectionCtx,
-    params: ProjectDeleteParams,
+    params: WorkspaceDeleteParams,
 ) -> Result<(), RpcError> {
     let name = params.name;
 
     let mut s = state.lock().await;
 
-    // Refuse to delete a project anyone is currently in — that's the rug-pull we promised to
-    // prevent. The switcher already greys out the caller's own active project; this also covers
+    // Refuse to delete a workspace anyone is currently in — that's the rug-pull we promised to
+    // prevent. The switcher already greys out the caller's own active workspace; this also covers
     // other connected clients.
-    if s.project_active_anywhere(&name) {
+    if s.workspace_active_anywhere(&name) {
         return Err(RpcError::new(
-            ErrorCode::ACTIVE_PROJECT_PREVENTS_DELETE,
-            format!("project {name} is active — switch to another project before deleting it"),
+            ErrorCode::ACTIVE_WORKSPACE_PREVENTS_DELETE,
+            format!("workspace {name} is active — switch to another workspace before deleting it"),
         ));
     }
 
-    // Refuse if any buffer in the project has unsaved changes (mirrors `project/remove_root`).
+    // Refuse if any buffer in the workspace has unsaved changes (mirrors `workspace/remove_root`).
     let dirty: Vec<BufferId> = s
-        .buffers_in_project(&name)
+        .buffers_in_workspace(&name)
         .into_iter()
         .filter(|id| s.buffers.get(id).map(|b| b.dirty).unwrap_or(false))
         .collect();
@@ -893,7 +893,7 @@ pub async fn project_delete(
         let mut err = RpcError::new(
             ErrorCode::DIRTY_BUFFERS_PREVENT_DELETE,
             format!(
-                "{} buffer(s) in project {name} have unsaved changes",
+                "{} buffer(s) in workspace {name} have unsaved changes",
                 dirty.len()
             ),
         );
@@ -901,43 +901,43 @@ pub async fn project_delete(
         return Err(err);
     }
 
-    let closed = s.delete_project(&name);
-    // Intentionally leave the (now-orphaned) project roots in the watcher: dropping a watch is
-    // best-effort and a sibling project may share the same root. Stale watches are harmless — the
-    // watcher drops events that don't map to a loaded project.
+    let closed = s.delete_workspace(&name);
+    // Intentionally leave the (now-orphaned) workspace roots in the watcher: dropping a watch is
+    // best-effort and a sibling workspace may share the same root. Stale watches are harmless — the
+    // watcher drops events that don't map to a loaded workspace.
     drop(s);
 
-    crate::config::delete_project_config(&name)
-        .map_err(|e| RpcError::internal(format!("deleting project config: {e}")))?;
+    crate::config::delete_workspace_config(&name)
+        .map_err(|e| RpcError::internal(format!("deleting workspace config: {e}")))?;
 
-    // Drop its persisted session too, so a deleted project doesn't leave an orphan behind. Held
+    // Drop its persisted session too, so a deleted workspace doesn't leave an orphan behind. Held
     // under the state lock like every other session-file write, so it can't race a concurrent
     // persist. Best-effort; a stale entry is harmless (it'd just never be listed), so we only log.
     {
         let s = state.lock().await;
         if let Some(path) = s.sessions_path.clone() {
-            if let Err(e) = crate::config::remove_project_session_at(&path, &name) {
-                tracing::warn!(project = %name, error = %e, "failed to remove project session");
+            if let Err(e) = crate::config::remove_workspace_session_at(&path, &name) {
+                tracing::warn!(workspace = %name, error = %e, "failed to remove workspace session");
             }
         }
     }
 
-    // Re-take the lock to refresh any open chooser — only now is the project gone from disk (the
-    // candidate list is a disk read), so the dropped project disappears from the list.
+    // Re-take the lock to refresh any open chooser — only now is the workspace gone from disk (the
+    // candidate list is a disk read), so the dropped workspace disappears from the list.
     let pushes = {
         let mut s = state.lock().await;
-        refresh_project_pickers(&mut s)
+        refresh_workspace_pickers(&mut s)
     };
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
 
-    tracing::info!(project = %name, closed = closed.len(), "project deleted");
+    tracing::info!(workspace = %name, closed = closed.len(), "workspace deleted");
     Ok(())
 }
 
 /// Delete a file or directory by moving it to the OS trash. Validates the path is inside the
-/// active project (and isn't a root itself), refuses if it — or, for a directory, anything under
+/// active workspace (and isn't a root itself), refuses if it — or, for a directory, anything under
 /// it — has unsaved changes, then trashes it and closes the now-orphaned buffers.
 pub async fn path_delete(
     state: &SharedState,
@@ -953,22 +953,22 @@ pub async fn path_delete(
     // Validate the boundary and screen for unsaved changes under the lock, before touching disk.
     {
         let s = state.lock().await;
-        let project = s.active_project_or_err(client_id)?;
-        if !project.contains(&canonical) {
+        let workspace = s.active_workspace_or_err(client_id)?;
+        if !workspace.contains(&canonical) {
             return Err(RpcError::invalid_path(format!(
-                "{} is outside the project's access boundary",
+                "{} is outside the workspace's access boundary",
                 canonical.display()
             )));
         }
-        if project.paths.iter().any(|p| p == &canonical) {
+        if workspace.paths.iter().any(|p| p == &canonical) {
             return Err(RpcError::invalid_params(format!(
-                "{} is a project root — remove it from project settings instead",
+                "{} is a workspace root — remove it from workspace settings instead",
                 canonical.display()
             )));
         }
-        let project_name = project.id.clone();
+        let workspace_name = workspace.id.clone();
         let dirty: Vec<BufferId> = s
-            .buffers_under_path(&project_name, &canonical)
+            .buffers_under_path(&workspace_name, &canonical)
             .into_iter()
             .filter(|id| s.buffers.get(id).map(|b| b.dirty).unwrap_or(false))
             .collect();
@@ -992,10 +992,10 @@ pub async fn path_delete(
 
     // Close the buffers whose backing file just went to the trash, and refresh.
     let mut s = state.lock().await;
-    let Some(project_name) = s
+    let Some(workspace_name) = s
         .clients
         .get(&client_id)
-        .and_then(|c| c.active_project.clone())
+        .and_then(|c| c.active_workspace.clone())
     else {
         // Client deactivated mid-call — the trash already happened; nothing left to tear down.
         return Ok(PathDeleteResult {
@@ -1003,7 +1003,7 @@ pub async fn path_delete(
             next_buffer_id: None,
         });
     };
-    let closed = s.buffers_under_path(&project_name, &canonical);
+    let closed = s.buffers_under_path(&workspace_name, &canonical);
     // Other clients viewing any of these buffers must be told to switch — capture before teardown.
     let other_clients = clients_viewing_buffers(&s, &closed, client_id);
     for &id in &closed {
@@ -1011,7 +1011,7 @@ pub async fn path_delete(
     }
     // Drop the Files-picker cache so a re-view re-walks without the deleted path. The watcher will
     // also notice the removal, but this keeps the client's immediate refresh consistent.
-    if let Some(p) = s.projects.get(&project_name) {
+    if let Some(p) = s.workspaces.get(&workspace_name) {
         p.workspace_index.invalidate();
     }
     let next_buffer_id = next_buffer_for_client(&s, client_id);
@@ -1089,18 +1089,18 @@ pub async fn buffer_open(
             result.search_summary = Some(summary);
         }
     }
-    // Refresh the persisted session for this buffer's project: the open changed either its
+    // Refresh the persisted session for this buffer's workspace: the open changed either its
     // membership (a new file) or its MRU order (a switch), both of which a restart restores from.
     // Skip transient opens — previews never enter the persisted set (see `session_buffer_paths`),
     // so persisting on every grep/picker peek would just rewrite identical content. Best-effort and
-    // named-projects-only (the helper guards); a no-op when sessions aren't persisted.
+    // named-workspaces-only (the helper guards); a no-op when sessions aren't persisted.
     if !result.transient {
-        let project = {
+        let workspace = {
             let s = state.lock().await;
-            s.project_for_buffer(result.buffer_id).map(str::to_string)
+            s.workspace_for_buffer(result.buffer_id).map(str::to_string)
         };
-        if let Some(project) = project {
-            persist_project_session(state, &project, false).await;
+        if let Some(workspace) = workspace {
+            persist_workspace_session(state, &workspace, false).await;
         }
     }
     Ok(result)
@@ -1188,9 +1188,9 @@ async fn buffer_open_inner(
     // accept). Kept locally so the surrounding code (which threads cursor/scroll lookups through
     // `Option<ClientId>`) stays unchanged.
     let client_id = Some(ctx.client_id);
-    let active_project_name: String = {
+    let active_workspace_name: String = {
         let s = state.lock().await;
-        s.active_project_or_err(ctx.client_id)?.id.clone()
+        s.active_workspace_or_err(ctx.client_id)?.id.clone()
     };
 
     // Attach-by-id: shortcut path used by the buffer picker (which needs to switch to scratch
@@ -1207,7 +1207,7 @@ async fn buffer_open_inner(
             if s.buffers.contains_key(&buffer_id) {
                 None
             } else {
-                s.take_dormant(&active_project_name, buffer_id)
+                s.take_dormant(&active_workspace_name, buffer_id)
             }
         };
         if let Some(path) = dormant_path {
@@ -1264,9 +1264,9 @@ async fn buffer_open_inner(
     }
 
     let canonical = if let Some(abs) = params.absolute_path.clone() {
-        // Absolute-path open (project/open_path, goto-definition). Resolved directly rather than
-        // against a project root, and — unlike root-relative opens — allowed to land outside the
-        // active project's roots. The boundary check below is skipped for this route; the buffer
+        // Absolute-path open (workspace/open_path, goto-definition). Resolved directly rather than
+        // against a workspace root, and — unlike root-relative opens — allowed to land outside the
+        // active workspace's roots. The boundary check below is skipped for this route; the buffer
         // is simply marked external.
         let raw = crate::config::expand_home(std::path::Path::new(&abs));
         match std::fs::canonicalize(&raw) {
@@ -1286,7 +1286,7 @@ async fn buffer_open_inner(
             (None, None) => {
                 let mut s = state.lock().await;
                 let id = s.allocate_buffer_id();
-                let scratch_number = s.next_scratch_number(&active_project_name);
+                let scratch_number = s.next_scratch_number(&active_workspace_name);
                 let mut buf = Buffer::scratch(id, params.language.clone(), scratch_number);
                 buf.transient = params.transient == Some(true);
                 let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
@@ -1312,7 +1312,7 @@ async fn buffer_open_inner(
                     search_summary: None, // set by buffer_open's prime post-step, not here
                 };
                 s.buffers.insert(id, buf);
-                s.buffer_projects.insert(id, active_project_name.clone());
+                s.buffer_workspaces.insert(id, active_workspace_name.clone());
                 s.touch_mru(id);
                 let pushes = refresh_buffer_pickers(&mut s);
                 drop(s);
@@ -1324,7 +1324,7 @@ async fn buffer_open_inner(
             (Some(idx), rel) => {
                 let s = state.lock().await;
                 let base = s
-                    .active_project_or_err(ctx.client_id)?
+                    .active_workspace_or_err(ctx.client_id)?
                     .paths
                     .get(idx as usize)
                     .ok_or_else(|| {
@@ -1376,18 +1376,18 @@ async fn buffer_open_inner(
 
     {
         let mut s = state.lock().await;
-        // Root-relative opens are confined to the project boundary (blocks `../` traversal).
+        // Root-relative opens are confined to the workspace boundary (blocks `../` traversal).
         // Absolute-path opens (`absolute_path`) are deliberately allowed outside the roots — they
         // become external buffers — so the boundary check only applies to the relative route.
         if params.absolute_path.is_none()
-            && !s.active_project_or_err(ctx.client_id)?.contains(&canonical)
+            && !s.active_workspace_or_err(ctx.client_id)?.contains(&canonical)
         {
             return Err(RpcError::invalid_path(format!(
-                "{} is outside the project's access boundary",
+                "{} is outside the workspace's access boundary",
                 canonical.display()
             )));
         }
-        if let Some(existing) = s.buffer_for_path_in_project(&active_project_name, &canonical) {
+        if let Some(existing) = s.buffer_for_path_in_workspace(&active_workspace_name, &canonical) {
             let buf = &s.buffers[&existing];
             let language = buf.language.clone();
             let line_count = buf.line_count();
@@ -1448,12 +1448,12 @@ async fn buffer_open_inner(
     // already have one if a previous server-side session allocated state. Look it up anyway for
     // consistency with the reopen path.
     let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
-    // External buffers (path outside the active project's roots) get no Git integration — by
-    // design git is a project-scoped feature and an external file is only a guest here. Skipping
-    // the baseline load also avoids repo discovery walking up out of the project tree.
+    // External buffers (path outside the active workspace's roots) get no Git integration — by
+    // design git is a workspace-scoped feature and an external file is only a guest here. Skipping
+    // the baseline load also avoids repo discovery walking up out of the workspace tree.
     let external = !s
-        .projects
-        .get(&active_project_name)
+        .workspaces
+        .get(&active_workspace_name)
         .is_some_and(|p| p.contains(&canonical));
     // Resolve the Git baseline once (repo discovery + reading the committed blob) and diff the
     // buffer against it, so git-aware views have hunks from the first frame and later edits can
@@ -1465,23 +1465,23 @@ async fn buffer_open_inner(
         (git_baseline, git_unstaged, git_both)
     });
     s.buffers.insert(id, buf);
-    s.buffer_projects.insert(id, active_project_name.clone());
+    s.buffer_workspaces.insert(id, active_workspace_name.clone());
     if let Some((git_baseline, git_unstaged, git_both)) = git {
         s.git_baseline.insert(id, git_baseline);
         s.git_unstaged_hunks.insert(id, git_unstaged);
         s.git_both_hunks.insert(id, git_both);
     }
 
-    // LSP, for *internal* files only (under a project root). Discover a workspace root within the
-    // trusted project and ensure a server keyed to that project + root, launching one if needed.
+    // LSP, for *internal* files only (under a workspace root). Discover a workspace root within the
+    // trusted workspace and ensure a server keyed to that workspace + root, launching one if needed.
     // `ensure` returns a launch request when it created a fresh (Starting) handle; we spawn the
     // handshake after releasing the lock. `notify_open` is a no-op until the server is ready — the
     // launch task opens every registered buffer once the handshake lands.
     //
     // External files (outside every root) get NO language server: we never launch one in untrusted
-    // territory (the workspace-trust boundary), and we don't attach them to another project's
-    // running server either — that would put two buffers (this guest + the owning project's) on one
-    // server for the same URI, the very ambiguity per-project keying exists to avoid.
+    // territory (the workspace-trust boundary), and we don't attach them to another workspace's
+    // running server either — that would put two buffers (this guest + the owning workspace's) on one
+    // server for the same URI, the very ambiguity per-workspace keying exists to avoid.
     let mut lsp_launch: Option<(
         crate::lsp::manager::LspServerKey,
         crate::lsp::config::LspServerSpec,
@@ -1491,8 +1491,8 @@ async fn buffer_open_inner(
         if let Some(language) = s.buffers[&id].language.clone() {
             if let Some(spec) = crate::lsp::config::server_spec(&language) {
                 let roots = s
-                    .projects
-                    .get(&active_project_name)
+                    .workspaces
+                    .get(&active_workspace_name)
                     .map(|p| p.paths.clone())
                     .unwrap_or_default();
                 let root = crate::lsp::manager::discover_root(
@@ -1502,7 +1502,7 @@ async fn buffer_open_inner(
                     &roots,
                 );
                 let key = crate::lsp::manager::LspServerKey {
-                    project: active_project_name.clone(),
+                    workspace: active_workspace_name.clone(),
                     root,
                     language: language.clone(),
                 };
@@ -2024,17 +2024,17 @@ pub async fn git_apply_hunk(
 
 // ---- lsp/* --------------------------------------------------------------------------------------
 
-/// Restart the language server(s) for a language in the client's active project.
+/// Restart the language server(s) for a language in the client's active workspace.
 pub async fn lsp_restart_server(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: LspRestartServerParams,
 ) -> Result<(), RpcError> {
-    let project = {
+    let workspace = {
         let s = state.lock().await;
-        s.active_project_or_err(ctx.client_id)?.id.clone()
+        s.active_workspace_or_err(ctx.client_id)?.id.clone()
     };
-    crate::lsp::manager::restart(state, &params.language, &project).await;
+    crate::lsp::manager::restart(state, &params.language, &workspace).await;
     Ok(())
 }
 
@@ -4021,25 +4021,25 @@ fn byte_to_logical(buf: &Buffer, byte_idx: usize) -> aether_protocol::LogicalPos
 }
 
 /// The buffer a client should land on after its current one is closed: the top of its active
-/// project's MRU, else any remaining buffer in that project, else the most-recently-used *dormant*
+/// workspace's MRU, else any remaining buffer in that workspace, else the most-recently-used *dormant*
 /// buffer (a session-restored file `buffer/open` materializes by id), else `None` (caller opens a
 /// scratch). The dormant fallback means closing your last live buffer after a session restore drops
 /// you back onto a restored file rather than a blank scratch. Shared by `buffer/close` and the
 /// deletion paths so the requesting client and any other clients that were viewing the buffer
 /// resolve their next buffer identically.
 fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<BufferId> {
-    let project_name = s.active_project(client_id).map(|p| p.id.clone());
-    s.active_project(client_id)
+    let workspace_name = s.active_workspace(client_id).map(|p| p.id.clone());
+    s.active_workspace(client_id)
         .and_then(|p| p.mru_buffers.front().copied())
         .or_else(|| {
-            project_name.as_deref().and_then(|name| {
-                s.buffer_projects
+            workspace_name.as_deref().and_then(|name| {
+                s.buffer_workspaces
                     .iter()
                     .find(|(_, pname)| pname.as_str() == name)
                     .map(|(id, _)| *id)
             })
         })
-        .or_else(|| project_name.as_deref().and_then(|name| s.first_dormant_id(name)))
+        .or_else(|| workspace_name.as_deref().and_then(|name| s.first_dormant_id(name)))
 }
 
 /// `(client, buffer)` pairs for every client *other than* `except` that currently has a viewport
@@ -4107,9 +4107,9 @@ pub async fn buffer_close(
     // Any *other* client viewing this buffer is about to have it pulled out from under it — capture
     // them before teardown drops their viewports, so we can tell them to switch (see below).
     let affected = clients_viewing_buffers(&s, &[params.buffer_id], client_id);
-    // Remember the owning project before teardown drops the association, so we can retire an
-    // ephemeral project once it loses its last buffer.
-    let owning_project = s.project_for_buffer(params.buffer_id).map(str::to_string);
+    // Remember the owning workspace before teardown drops the association, so we can retire an
+    // ephemeral workspace once it loses its last buffer.
+    let owning_workspace = s.workspace_for_buffer(params.buffer_id).map(str::to_string);
     // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
     // clears diagnostics, and tears down the language server if this was its last buffer).
     let stopped_server = s.close_buffer(params.buffer_id);
@@ -4119,17 +4119,17 @@ pub async fn buffer_close(
     // mustn't keep lingering in the switcher (or re-open onto a scratch) just because someone had
     // it selected. The initiating client closed with `open_next:false` (the ephemeral close path),
     // so no scratch successor is spawned here.
-    let retired_ephemeral = owning_project
+    let retired_ephemeral = owning_workspace
         .as_deref()
         .is_some_and(|pid| s.retire_ephemeral_if_empty(pid));
-    // Pick the next buffer for the requesting client: top of the active project's MRU after
-    // cleanup, or — if that's empty — any remaining buffer in the project. The client uses this
+    // Pick the next buffer for the requesting client: top of the active workspace's MRU after
+    // cleanup, or — if that's empty — any remaining buffer in the workspace. The client uses this
     // to attach without an extra RPC round-trip.
     let next_buffer_id = next_buffer_for_client(&s, client_id);
     let mut pushes = refresh_buffer_pickers(&mut s);
-    // A retired ephemeral project drops out of any open switcher.
+    // A retired ephemeral workspace drops out of any open switcher.
     if retired_ephemeral {
-        pushes.extend(refresh_project_pickers(&mut s));
+        pushes.extend(refresh_workspace_pickers(&mut s));
     }
     // Tell the other clients their active buffer vanished (each switches to its own next buffer).
     pushes.extend(buffer_closed_pushes(&s, &affected));
@@ -4160,10 +4160,10 @@ pub async fn buffer_close(
     } else {
         None
     };
-    // Closing changed the project's open-buffer set — refresh its persisted session so the closed
-    // file isn't restored next time. No-op for an ephemeral (or already-retired) project.
-    if let Some(project) = &owning_project {
-        persist_project_session(state, project, false).await;
+    // Closing changed the workspace's open-buffer set — refresh its persisted session so the closed
+    // file isn't restored next time. No-op for an ephemeral (or already-retired) workspace.
+    if let Some(workspace) = &owning_workspace {
+        persist_workspace_session(state, workspace, false).await;
     }
     Ok(aether_protocol::buffer::BufferCloseResult {
         next_buffer_id,
@@ -4174,8 +4174,8 @@ pub async fn buffer_close(
 // ---- nav (jump list) ----------------------------------------------------------------------------
 
 /// Map a buffer's canonical path to a `(path_index, relative_path)` within the client's active
-/// project, so a nav entry can reopen the file even after it's been closed. `(None, None)` for a
-/// scratch buffer (no path) or a buffer outside the active project's roots.
+/// workspace, so a nav entry can reopen the file even after it's been closed. `(None, None)` for a
+/// scratch buffer (no path) or a buffer outside the active workspace's roots.
 fn buffer_path_ref(
     s: &ServerState,
     client_id: ClientId,
@@ -4188,10 +4188,10 @@ fn buffer_path_ref(
     else {
         return (None, None);
     };
-    let Some(project) = s.active_project(client_id) else {
+    let Some(workspace) = s.active_workspace(client_id) else {
         return (None, None);
     };
-    for (i, root) in project.paths.iter().enumerate() {
+    for (i, root) in workspace.paths.iter().enumerate() {
         if canonical == *root {
             return (Some(i as u32), Some(String::new())); // single-file root, or the root itself
         }
@@ -4575,7 +4575,7 @@ pub async fn buffer_save(
         (Some(idx), rel) => {
             let s = state.lock().await;
             let base = s
-                .active_project_or_err(ctx.client_id)?
+                .active_workspace_or_err(ctx.client_id)?
                 .paths
                 .get(idx as usize)
                 .ok_or_else(|| RpcError::invalid_path(format!("path_index {idx} out of range")))?
@@ -4606,9 +4606,9 @@ pub async fn buffer_save(
             let resolved = parent_canonical.join(file_name);
 
             let s = state.lock().await;
-            if !s.active_project_or_err(ctx.client_id)?.contains(&resolved) {
+            if !s.active_workspace_or_err(ctx.client_id)?.contains(&resolved) {
                 return Err(RpcError::invalid_path(format!(
-                    "{} is outside the project's access boundary",
+                    "{} is outside the workspace's access boundary",
                     resolved.display()
                 )));
             }
@@ -4637,8 +4637,8 @@ pub async fn buffer_save(
     // we'd clone the rope, drop the lock, write, then re-lock to update state.
     let (saved_at_unix_ms, revision) = {
         let mut s = state.lock().await;
-        let active_project_name = s.active_project_or_err(ctx.client_id)?.id.clone();
-        if let Some(existing) = s.buffer_for_path_in_project(&active_project_name, &target) {
+        let active_workspace_name = s.active_workspace_or_err(ctx.client_id)?.id.clone();
+        if let Some(existing) = s.buffer_for_path_in_workspace(&active_workspace_name, &target) {
             if existing != params.buffer_id {
                 return Err(RpcError::path_owned_by_buffer(existing));
             }
@@ -4679,7 +4679,7 @@ pub async fn buffer_save(
         //   - in-place save of a buffer that was bound to a multi-segment path via
         //     `buffer/open { create_if_missing }` (the parent dirs deferred from open).
         // Idempotent when the parent already exists. Boundary check ran earlier — this
-        // never creates dirs outside the project.
+        // never creates dirs outside the workspace.
         if let Some(parent) = target.parent() {
             if !parent.exists() {
                 std::fs::create_dir_all(parent).map_err(RpcError::file_io)?;
@@ -4717,13 +4717,13 @@ pub async fn buffer_save(
 
     // A save promotes the buffer to permanent (above) and is the clearest "this buffer matters"
     // signal — refresh the persisted session so an edit→save→quit reliably restores the file, even
-    // though its transient open didn't persist it. Best-effort, named-projects-only.
-    let project = {
+    // though its transient open didn't persist it. Best-effort, named-workspaces-only.
+    let workspace = {
         let s = state.lock().await;
-        s.project_for_buffer(params.buffer_id).map(str::to_string)
+        s.workspace_for_buffer(params.buffer_id).map(str::to_string)
     };
-    if let Some(project) = project {
-        persist_project_session(state, &project, false).await;
+    if let Some(workspace) = workspace {
+        persist_workspace_session(state, &workspace, false).await;
     }
 
     Ok(BufferSaveResult {
@@ -4796,12 +4796,12 @@ pub async fn buffer_set_transient(
     // Keeping/unkeeping changes whether this buffer is part of the persisted working set (the
     // session lists permanent buffers only) — refresh it. `Space k` is the explicit "this buffer
     // matters" signal, with no later save/switch to rely on, so it must persist here directly.
-    let project = {
+    let workspace = {
         let s = state.lock().await;
-        s.project_for_buffer(params.buffer_id).map(str::to_string)
+        s.workspace_for_buffer(params.buffer_id).map(str::to_string)
     };
-    if let Some(project) = project {
-        persist_project_session(state, &project, false).await;
+    if let Some(workspace) = workspace {
+        persist_workspace_session(state, &workspace, false).await;
     }
     Ok(BufferSetTransientResult {
         transient: params.transient,
@@ -5593,30 +5593,30 @@ fn build_diagnostic_candidates(
     out
 }
 
-/// Build the **project-wide** diagnostics candidates (the `Space Alt-d` picker), grouped by file.
+/// Build the **workspace-wide** diagnostics candidates (the `Space Alt-d` picker), grouped by file.
 /// Reads a single source — the path-keyed [`ServerState::path_diagnostics`], which `publishDiagnostics`
 /// fills for every file a server reports (rust-analyzer's flycheck covers the whole build). This is
 /// kept *separate* from the buffer-scoped picker's live byte-precise set ([`ServerState::diagnostics`]),
-/// not merged: every project row is line-granular (`col: 0`, lands on the line start), so the list is
+/// not merged: every workspace row is line-granular (`col: 0`, lands on the line start), so the list is
 /// uniform — "diagnostics as of the last analysis/check" — rather than mixing live and reported rows.
 ///
 /// Synchronous — no LSP round-trip (no configured server answers the workspace pull; everything is
 /// already stored). Sorted by (file, line) so the picker groups rows under their file header.
-fn build_project_diagnostic_candidates(
+fn build_workspace_diagnostic_candidates(
     s: &ServerState,
     client_id: ClientId,
 ) -> Vec<picker_state::DiagnosticCandidate> {
-    let Some(project) = s.active_project(client_id) else {
+    let Some(workspace) = s.active_workspace(client_id) else {
         return Vec::new();
     };
-    let roots = project.paths.clone();
+    let roots = workspace.paths.clone();
 
     let mut out: Vec<picker_state::DiagnosticCandidate> = Vec::new();
     for (path, diags) in &s.path_diagnostics {
         let Some((path_index, relative_path)) =
-            crate::workspace_index::project_relative_parts(path, &roots)
+            crate::workspace_index::workspace_relative_parts(path, &roots)
         else {
-            continue; // outside the active project
+            continue; // outside the active workspace
         };
         let abs_path = path.to_string_lossy().into_owned();
         for d in diags {
@@ -5656,11 +5656,11 @@ async fn build_reference_candidates(
     client_id: ClientId,
     buffer_id: BufferId,
 ) -> Vec<picker_state::ReferenceCandidate> {
-    // Resolve the LSP request and the project roots under the lock, then release it for the I/O.
+    // Resolve the LSP request and the workspace roots under the lock, then release it for the I/O.
     let (req, roots) = {
         let s = state.lock().await;
         let roots = s
-            .active_project(client_id)
+            .active_workspace(client_id)
             .map(|p| p.paths.clone())
             .unwrap_or_default();
         (lsp_cursor_request(&s, client_id, buffer_id).ready(), roots)
@@ -5708,11 +5708,11 @@ async fn build_reference_candidates(
     let mut file_lines: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut out: Vec<picker_state::ReferenceCandidate> = locations
         .into_iter()
-        // Project-only: a reference that doesn't live under any project root (a dependency, the
-        // stdlib, generated code outside the tree) is dropped — `project_relative_parts` is the
+        // Workspace-only: a reference that doesn't live under any workspace root (a dependency, the
+        // stdlib, generated code outside the tree) is dropped — `workspace_relative_parts` is the
         // gate, and its relative path becomes the display label.
         .filter_map(|loc| {
-            let (_, display_path) = crate::workspace_index::project_relative_parts(
+            let (_, display_path) = crate::workspace_index::workspace_relative_parts(
                 std::path::Path::new(&loc.path),
                 &roots,
             )?;
@@ -6064,19 +6064,19 @@ pub fn spawn_symbol_resolve(
     });
 }
 
-/// Build the LSP-servers-picker candidates: one per language server owned by `project_id`, sorted
-/// by name then language for a stable order. `project_roots` is used only for the display labels.
+/// Build the LSP-servers-picker candidates: one per language server owned by `workspace_id`, sorted
+/// by name then language for a stable order. `workspace_roots` is used only for the display labels.
 fn build_lsp_server_candidates(
     s: &ServerState,
-    project_id: &str,
-    project_roots: &[std::path::PathBuf],
+    workspace_id: &str,
+    workspace_roots: &[std::path::PathBuf],
 ) -> Vec<picker_state::LspServerCandidate> {
     let mut out: Vec<picker_state::LspServerCandidate> = s
         .lsp
-        .status_for_project(project_id)
+        .status_for_workspace(workspace_id)
         .into_iter()
         .map(|st| picker_state::LspServerCandidate {
-            root_label: lsp_root_label(&st.workspace_root, project_roots),
+            root_label: lsp_root_label(&st.workspace_root, workspace_roots),
             name: st.name,
             language: st.language,
             workspace_root: st.workspace_root,
@@ -6093,11 +6093,11 @@ fn build_lsp_server_candidates(
 }
 
 /// The picker's display label for a server's workspace root: its path relative to the containing
-/// project root, or empty when the server is rooted *at* a project root (so single-root projects
+/// workspace root, or empty when the server is rooted *at* a workspace root (so single-root workspaces
 /// show no redundant path — only monorepo sub-roots get a disambiguating label).
-fn lsp_root_label(workspace_root: &str, project_roots: &[std::path::PathBuf]) -> String {
+fn lsp_root_label(workspace_root: &str, workspace_roots: &[std::path::PathBuf]) -> String {
     let root = std::path::Path::new(workspace_root);
-    let base = project_roots
+    let base = workspace_roots
         .iter()
         .filter(|r| root.starts_with(r))
         .max_by_key(|r| r.components().count());
@@ -9446,11 +9446,11 @@ fn with_grep_position(
     let Some(buf) = s.buffers.get(&buffer_id) else {
         return cursor;
     };
-    let Some(project) = s.active_project(client_id) else {
+    let Some(workspace) = s.active_workspace(client_id) else {
         return cursor;
     };
     let Some((current_idx, current_rel)) = buf.canonical_path.as_deref().and_then(|p| {
-        crate::workspace_index::project_relative_parts(std::path::Path::new(p), &project.paths)
+        crate::workspace_index::workspace_relative_parts(std::path::Path::new(p), &workspace.paths)
     }) else {
         return cursor;
     };
@@ -10053,37 +10053,37 @@ fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) 
     a_start < b_end_excl && b_start < a_end_excl
 }
 
-/// Project-switcher candidates: every persisted project (`names`, read from disk by the caller)
-/// plus every *live* ephemeral project currently in memory. The ephemeral entries carry their id
-/// as `name` — the client renders an ephemeral id as "(no project)". They appear only while they
-/// hold a buffer, since an ephemeral project is auto-removed once its last buffer closes.
-fn project_candidates(s: &ServerState, names: &[String]) -> Vec<picker_state::ProjectCandidate> {
+/// Workspace-switcher candidates: every persisted workspace (`names`, read from disk by the caller)
+/// plus every *live* ephemeral workspace currently in memory. The ephemeral entries carry their id
+/// as `name` — the client renders an ephemeral id as "(no workspace)". They appear only while they
+/// hold a buffer, since an ephemeral workspace is auto-removed once its last buffer closes.
+fn workspace_candidates(s: &ServerState, names: &[String]) -> Vec<picker_state::WorkspaceCandidate> {
     // Reorder the alphabetical disk listing into most-recently-activated-first using the persisted
-    // session stamps. Never-activated projects stay at the end in alphabetical order (see
+    // session stamps. Never-activated workspaces stay at the end in alphabetical order (see
     // `sort_names_by_recency`). Disabled (left alphabetical) when sessions aren't persisted — tests
     // and embeddings with no `sessions_path` — or if the file can't be read.
     let mut names: Vec<String> = names.to_vec();
     if let Some(path) = &s.sessions_path {
-        if let Ok(sessions) = crate::config::load_project_sessions_at(path) {
+        if let Ok(sessions) = crate::config::load_workspace_sessions_at(path) {
             crate::config::sort_names_by_recency(&mut names, &sessions);
         }
     }
-    let mut out: Vec<picker_state::ProjectCandidate> = names
+    let mut out: Vec<picker_state::WorkspaceCandidate> = names
         .iter()
-        .map(|name| picker_state::ProjectCandidate {
+        .map(|name| picker_state::WorkspaceCandidate {
             unsaved_buffers: s.unsaved_buffer_count(name),
             name: name.clone(),
         })
         .collect();
     let mut ephemeral: Vec<String> = s
-        .projects
+        .workspaces
         .values()
         .filter(|p| p.is_ephemeral())
         .map(|p| p.id.clone())
         .collect();
     ephemeral.sort();
     for id in ephemeral {
-        out.push(picker_state::ProjectCandidate {
+        out.push(picker_state::WorkspaceCandidate {
             unsaved_buffers: s.unsaved_buffer_count(&id),
             name: id,
         });
@@ -10148,26 +10148,26 @@ fn build_lines_changed_notif(
 // ---- picker/* ----------------------------------------------------------------------------------
 
 /// Build the buffer-picker candidate list for `client_id`: every buffer belonging to the
-/// client's active project, MRU first, then any project buffers the client hasn't touched yet
-/// (e.g. opened by another client of the same project) in buffer-id order. `(scratch N)`
+/// client's active workspace, MRU first, then any workspace buffers the client hasn't touched yet
+/// (e.g. opened by another client of the same workspace) in buffer-id order. `(scratch N)`
 /// placeholder display for buffers without a path. Returns an empty list if the client has no
-/// active project (the picker shouldn't be reachable without one, but the lookup stays defensive).
+/// active workspace (the picker shouldn't be reachable without one, but the lookup stays defensive).
 fn build_buffer_candidates(
     s: &ServerState,
     client_id: ClientId,
 ) -> Vec<picker_state::BufferCandidate> {
-    let Some(project) = s.active_project(client_id) else {
+    let Some(workspace) = s.active_workspace(client_id) else {
         return Vec::new();
     };
-    let project_name = project.id.clone();
-    let roots = project.paths.clone();
+    let workspace_name = workspace.id.clone();
+    let roots = workspace.paths.clone();
     let belongs =
-        |id: &BufferId| s.buffer_projects.get(id).map(|s| s.as_str()) == Some(&project_name);
+        |id: &BufferId| s.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(&workspace_name);
 
     let mut out: Vec<picker_state::BufferCandidate> = Vec::with_capacity(s.buffers.len());
     let mut seen: std::collections::HashSet<BufferId> = std::collections::HashSet::new();
 
-    for &id in &project.mru_buffers {
+    for &id in &workspace.mru_buffers {
         if !belongs(&id) {
             continue;
         }
@@ -10177,7 +10177,7 @@ fn build_buffer_candidates(
         out.push(buffer_candidate(buf, &roots));
         seen.insert(id);
     }
-    // Append any project buffers not in the MRU yet so the picker still surfaces them. Stable
+    // Append any workspace buffers not in the MRU yet so the picker still surfaces them. Stable
     // order (by id) so the tail is deterministic.
     let mut leftovers: Vec<BufferId> = s
         .buffers
@@ -10198,7 +10198,7 @@ fn build_buffer_candidates(
         .filter(|(id, _)| belongs(id))
         .filter_map(|(_, b)| b.canonical_path.as_deref())
         .collect();
-    for d in &project.dormant_buffers {
+    for d in &workspace.dormant_buffers {
         if !live_paths.contains(d.path.as_path()) {
             out.push(dormant_candidate(d, &roots));
         }
@@ -10213,9 +10213,9 @@ fn dormant_candidate(
     d: &crate::state::DormantBuffer,
     roots: &[std::path::PathBuf],
 ) -> picker_state::BufferCandidate {
-    let display = crate::workspace_index::project_relative_display(&d.path, roots)
+    let display = crate::workspace_index::workspace_relative_display(&d.path, roots)
         .unwrap_or_else(|| d.path.display().to_string());
-    let path = crate::workspace_index::project_relative_parts(&d.path, roots);
+    let path = crate::workspace_index::workspace_relative_parts(&d.path, roots);
     picker_state::BufferCandidate {
         buffer_id: d.id,
         display,
@@ -10228,7 +10228,7 @@ fn dormant_candidate(
 
 fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state::BufferCandidate {
     let display = match buf.canonical_path.as_deref() {
-        Some(p) => crate::workspace_index::project_relative_display(p, roots)
+        Some(p) => crate::workspace_index::workspace_relative_display(p, roots)
             .unwrap_or_else(|| p.display().to_string()),
         None => format!(
             "(scratch {})",
@@ -10240,7 +10240,7 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
     let path = buf
         .canonical_path
         .as_deref()
-        .and_then(|p| crate::workspace_index::project_relative_parts(p, roots));
+        .and_then(|p| crate::workspace_index::workspace_relative_parts(p, roots));
     picker_state::BufferCandidate {
         buffer_id: buf.id,
         display,
@@ -10310,39 +10310,39 @@ pub(crate) fn refresh_buffer_pickers(s: &mut ServerState) -> PendingPushes {
     pushes
 }
 
-/// Rebuild and re-push every subscribed `Projects` picker. Called after a project is created,
+/// Rebuild and re-push every subscribed `Workspaces` picker. Called after a workspace is created,
 /// renamed, or deleted (by any client) so an open chooser elsewhere reflects the new set live.
 /// Mirrors [`refresh_buffer_pickers`]; the candidate list is a disk read, so callers must have
 /// already written the config change before invoking this.
-pub(crate) fn refresh_project_pickers(s: &mut ServerState) -> PendingPushes {
+pub(crate) fn refresh_workspace_pickers(s: &mut ServerState) -> PendingPushes {
     let client_ids: Vec<ClientId> = s
         .pickers
         .iter()
         .filter_map(|((c, k), p)| {
-            (*k == PickerKind::Projects && p.subscribed.is_some()).then_some(*c)
+            (*k == PickerKind::Workspaces && p.subscribed.is_some()).then_some(*c)
         })
         .collect();
     if client_ids.is_empty() {
         return Vec::new();
     }
-    // One disk read of the projects directory, shared by every subscribed picker.
-    let names = match crate::config::list_project_names() {
+    // One disk read of the workspaces directory, shared by every subscribed picker.
+    let names = match crate::config::list_workspace_names() {
         Ok(n) => n,
         Err(_) => return Vec::new(), // can't enumerate — leave the pickers as they are
     };
     let mut pushes = Vec::new();
     for client_id in client_ids {
-        let candidates = project_candidates(s, &names);
+        let candidates = workspace_candidates(s, &names);
         let ServerState {
             pickers,
             matcher,
             clients,
             ..
         } = &mut *s;
-        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Projects)) else {
+        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Workspaces)) else {
             continue;
         };
-        picker.candidates = picker_state::PickerCandidates::Projects(candidates);
+        picker.candidates = picker_state::PickerCandidates::Workspaces(candidates);
         picker.rerank(matcher);
         if let Some(window) = picker.subscribed.as_mut() {
             let total = picker.ranked.len() as u32;
@@ -10374,13 +10374,13 @@ pub fn refresh_lsp_server_pickers(s: &mut ServerState) -> PendingPushes {
         .collect();
     let mut pushes = Vec::new();
     for client_id in client_ids {
-        let Some((project, roots)) = s
-            .active_project(client_id)
+        let Some((workspace, roots)) = s
+            .active_workspace(client_id)
             .map(|p| (p.id.clone(), p.paths.clone()))
         else {
             continue;
         };
-        let new_candidates = build_lsp_server_candidates(s, &project, &roots);
+        let new_candidates = build_lsp_server_candidates(s, &workspace, &roots);
         let ServerState {
             pickers,
             matcher,
@@ -10409,29 +10409,29 @@ pub fn refresh_lsp_server_pickers(s: &mut ServerState) -> PendingPushes {
     pushes
 }
 
-/// Rebuild every *open* project-diagnostics picker (`Space Alt-d`) from the current
+/// Rebuild every *open* workspace-diagnostics picker (`Space Alt-d`) from the current
 /// `path_diagnostics` and push the update — so it live-updates as servers push diagnostics (while
 /// rust-analyzer indexes the workspace, or after a `cargo check`) instead of showing only the
 /// snapshot from when it opened. Called on every diagnostics push; a no-op (empty, no rebuild) when
 /// no client has the picker open. Mirrors [`refresh_lsp_server_pickers`].
-pub fn refresh_project_diagnostics_pickers(s: &mut ServerState) -> PendingPushes {
+pub fn refresh_workspace_diagnostics_pickers(s: &mut ServerState) -> PendingPushes {
     let client_ids: Vec<ClientId> = s
         .pickers
         .iter()
         .filter_map(|((c, k), p)| {
-            (*k == PickerKind::DiagnosticsProject && p.subscribed.is_some()).then_some(*c)
+            (*k == PickerKind::DiagnosticsWorkspace && p.subscribed.is_some()).then_some(*c)
         })
         .collect();
     let mut pushes = Vec::new();
     for client_id in client_ids {
-        let new_candidates = build_project_diagnostic_candidates(s, client_id);
+        let new_candidates = build_workspace_diagnostic_candidates(s, client_id);
         let ServerState {
             pickers,
             matcher,
             clients,
             ..
         } = &mut *s;
-        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::DiagnosticsProject)) else {
+        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::DiagnosticsWorkspace)) else {
             continue;
         };
         picker.candidates = picker_state::PickerCandidates::Diagnostics(new_candidates);
@@ -10475,23 +10475,23 @@ fn maybe_refresh_dirty(s: &mut ServerState, buffer_id: BufferId, was_dirty: bool
 }
 
 /// Resolve and validate an Explorer *anchor* — the committed directory the query peeks relative
-/// to. Canonicalizes, enforces the project boundary, requires a directory, and computes the
-/// (in-project) parent for Alt-h ascent. Errors propagate to the client (a bad `directory_path`
+/// to. Canonicalizes, enforces the workspace boundary, requires a directory, and computes the
+/// (in-workspace) parent for Alt-h ascent. Errors propagate to the client (a bad `directory_path`
 /// is a real navigation error), unlike a bad *peek* path, which just lists nothing.
 fn resolve_explorer_anchor(
     raw: &std::path::Path,
-    project_paths: &[std::path::PathBuf],
+    workspace_paths: &[std::path::PathBuf],
 ) -> Result<picker_state::ExplorerAnchorInfo, RpcError> {
-    let in_project = |p: &std::path::Path| {
-        project_paths
+    let in_workspace = |p: &std::path::Path| {
+        workspace_paths
             .iter()
             .any(|r| p == r.as_path() || p.starts_with(r))
     };
     let canonical = std::fs::canonicalize(raw)
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
-    if !in_project(&canonical) {
+    if !in_workspace(&canonical) {
         return Err(RpcError::invalid_path(format!(
-            "{} is outside the project's access boundary",
+            "{} is outside the workspace's access boundary",
             canonical.display()
         )));
     }
@@ -10506,7 +10506,7 @@ fn resolve_explorer_anchor(
     }
     let parent = canonical
         .parent()
-        .and_then(|p| in_project(p).then(|| p.display().to_string()));
+        .and_then(|p| in_workspace(p).then(|| p.display().to_string()));
     Ok(picker_state::ExplorerAnchorInfo {
         path: canonical.display().to_string(),
         parent,
@@ -10516,7 +10516,7 @@ fn resolve_explorer_anchor(
 /// Build the Explorer listing for `query`, relative to the committed `anchor`. The query's path
 /// part (everything up to the last `/`) selects the directory to list — `anchor/<path_part>`, the
 /// "peek"; the filter part (after the last `/`) is applied later by the prefix matcher. Returns
-/// the listing plus `peek_missing`: true when the path part doesn't resolve to an in-project
+/// the listing plus `peek_missing`: true when the path part doesn't resolve to an in-workspace
 /// directory (mid-typing a not-yet-created path — the "+ Create" case), in which case the listing
 /// is empty and `path` still names the intended target so a file-watcher refresh can't bind it to
 /// an unrelated real directory. The client reads `peek_missing` to decide whether `dir/` offers
@@ -10524,7 +10524,7 @@ fn resolve_explorer_anchor(
 fn build_explorer_peek(
     anchor: &std::path::Path,
     query: &str,
-    project_paths: &[std::path::PathBuf],
+    workspace_paths: &[std::path::PathBuf],
     filters: &aether_protocol::picker::PickerFilters,
 ) -> (picker_state::ExplorerCandidates, bool) {
     let (path_part, _filter) = picker_state::explorer_query_split(query);
@@ -10535,7 +10535,7 @@ fn build_explorer_peek(
     };
     match std::fs::canonicalize(&target)
         .ok()
-        .and_then(|c| build_explorer_candidates_for_canonical(&c, project_paths, filters).ok())
+        .and_then(|c| build_explorer_candidates_for_canonical(&c, workspace_paths, filters).ok())
     {
         Some(listing) => (listing, false),
         None => (empty_explorer_listing(&target), true),
@@ -10551,9 +10551,9 @@ fn empty_explorer_listing(target: &std::path::Path) -> picker_state::ExplorerCan
 }
 
 /// Build the Explorer's peek listing plus the committed anchor it's relative to. Honors the same
-/// project-boundary rules as `directory_list`. Used by `picker_view` for `PickerKind::Explorer`.
+/// workspace-boundary rules as `directory_list`. Used by `picker_view` for `PickerKind::Explorer`.
 /// The anchor is the requested path *or* the persisted anchor (when the client omitted the path
-/// on a scroll/resume) *or* the first project root (first ever open); the listing peeks from it
+/// on a scroll/resume) *or* the first workspace root (first ever open); the listing peeks from it
 /// using the persisted query (empty on `reset`, since it's being wiped).
 async fn build_explorer_candidates(
     state: &SharedState,
@@ -10569,9 +10569,9 @@ async fn build_explorer_candidates(
     ),
     RpcError,
 > {
-    // One lock pass: project roots + the explorer's committed anchor + its current query (which
+    // One lock pass: workspace roots + the explorer's committed anchor + its current query (which
     // drives the peek). On `reset` the query is being wiped, so peek from the anchor itself.
-    let (project_paths, existing_anchor, query) = {
+    let (workspace_paths, existing_anchor, query) = {
         let s = state.lock().await;
         let picker = s.pickers.get(&(client_id, PickerKind::Explorer));
         let existing_anchor = picker.and_then(|p| p.explorer_anchor.clone());
@@ -10581,7 +10581,7 @@ async fn build_explorer_candidates(
             picker.map(|p| p.query.clone()).unwrap_or_default()
         };
         (
-            s.active_project_or_err(client_id)?.paths.clone(),
+            s.active_workspace_or_err(client_id)?.paths.clone(),
             existing_anchor,
             query,
         )
@@ -10591,22 +10591,22 @@ async fn build_explorer_candidates(
     } else if let Some(a) = &existing_anchor {
         std::path::PathBuf::from(&a.path)
     } else {
-        project_paths
+        workspace_paths
             .first()
             .cloned()
-            .ok_or_else(|| RpcError::invalid_path("no project paths configured"))?
+            .ok_or_else(|| RpcError::invalid_path("no workspace paths configured"))?
     };
-    let anchor = resolve_explorer_anchor(&anchor_raw, &project_paths)?;
+    let anchor = resolve_explorer_anchor(&anchor_raw, &workspace_paths)?;
     let (listing, peek_missing) = build_explorer_peek(
         std::path::Path::new(&anchor.path),
         &query,
-        &project_paths,
+        &workspace_paths,
         filters,
     );
     Ok((listing, anchor, peek_missing))
 }
 
-/// Build the Roots-mode candidate list — one row per project root, sorted by basename. The
+/// Build the Roots-mode candidate list — one row per workspace root, sorted by basename. The
 /// matcher haystack is the basename alone (the disambiguator the client renders is purely
 /// presentational).
 async fn build_explorer_roots(
@@ -10614,8 +10614,8 @@ async fn build_explorer_roots(
     client_id: ClientId,
 ) -> Result<Vec<picker_state::RootCandidate>, RpcError> {
     let s = state.lock().await;
-    let project = s.active_project_or_err(client_id)?;
-    let mut out: Vec<picker_state::RootCandidate> = project
+    let workspace = s.active_workspace_or_err(client_id)?;
+    let mut out: Vec<picker_state::RootCandidate> = workspace
         .paths
         .iter()
         .enumerate()
@@ -10638,17 +10638,17 @@ async fn build_explorer_roots(
 /// the file-watcher's explorer refresh path (which iterates over already-canonical paths).
 pub(crate) fn build_explorer_candidates_for_canonical(
     canonical: &std::path::Path,
-    project_paths: &[std::path::PathBuf],
+    workspace_paths: &[std::path::PathBuf],
     filters: &aether_protocol::picker::PickerFilters,
 ) -> Result<picker_state::ExplorerCandidates, RpcError> {
-    let in_project = |p: &std::path::Path| -> bool {
-        project_paths
+    let in_workspace = |p: &std::path::Path| -> bool {
+        workspace_paths
             .iter()
             .any(|root| p == root.as_path() || p.starts_with(root))
     };
-    if !in_project(canonical) {
+    if !in_workspace(canonical) {
         return Err(RpcError::invalid_path(format!(
-            "{} is outside the project's access boundary",
+            "{} is outside the workspace's access boundary",
             canonical.display()
         )));
     }
@@ -10660,7 +10660,7 @@ pub(crate) fn build_explorer_candidates_for_canonical(
         )));
     }
     let parent = canonical.parent().and_then(|p| {
-        if in_project(p) {
+        if in_workspace(p) {
             Some(p.display().to_string())
         } else {
             None
@@ -10730,9 +10730,9 @@ pub async fn directory_list(
     ctx: &mut ConnectionCtx,
     params: DirectoryListParams,
 ) -> Result<DirectoryListResult, RpcError> {
-    let project_paths = {
+    let workspace_paths = {
         let s = state.lock().await;
-        s.active_project_or_err(ctx.client_id)?.paths.clone()
+        s.active_workspace_or_err(ctx.client_id)?.paths.clone()
     };
     let raw = std::path::PathBuf::from(&params.path);
     let canonical = std::fs::canonicalize(&raw)
@@ -10740,7 +10740,7 @@ pub async fn directory_list(
     // Prompt listings (save-as cycling) are never filter-scoped — pass the no-op default.
     let candidates = build_explorer_candidates_for_canonical(
         &canonical,
-        &project_paths,
+        &workspace_paths,
         &aether_protocol::picker::PickerFilters::default(),
     )?;
     Ok(DirectoryListResult {
@@ -10757,8 +10757,8 @@ pub async fn directory_list(
     })
 }
 
-/// Create a directory (and any missing intermediates), enforcing the project boundary first so
-/// a `../escape/newdir` request can't produce dirs above the project root. Returns the
+/// Create a directory (and any missing intermediates), enforcing the workspace boundary first so
+/// a `../escape/newdir` request can't produce dirs above the workspace root. Returns the
 /// canonical absolute path of the created dir — clients use it to navigate into the new dir.
 pub async fn directory_create(
     state: &SharedState,
@@ -10772,9 +10772,9 @@ pub async fn directory_create(
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
     {
         let s = state.lock().await;
-        if !s.active_project_or_err(ctx.client_id)?.contains(&resolved) {
+        if !s.active_workspace_or_err(ctx.client_id)?.contains(&resolved) {
             return Err(RpcError::invalid_path(format!(
-                "{} is outside the project's access boundary",
+                "{} is outside the workspace's access boundary",
                 resolved.display()
             )));
         }
@@ -10825,15 +10825,15 @@ pub(crate) fn refresh_explorers_for_dirs(
     }
     let mut pushes = Vec::new();
     for (client_id, path, filters) in to_refresh {
-        // Each picker's project may differ — re-fetch per client. Skip silently if the client
-        // somehow lost its active project between subscribe and refresh.
-        let Some(project_paths) = s.active_project(client_id).map(|p| p.paths.clone()) else {
+        // Each picker's workspace may differ — re-fetch per client. Skip silently if the client
+        // somehow lost its active workspace between subscribe and refresh.
+        let Some(workspace_paths) = s.active_workspace(client_id).map(|p| p.paths.clone()) else {
             continue;
         };
         let new_candidates =
-            match build_explorer_candidates_for_canonical(&path, &project_paths, &filters) {
+            match build_explorer_candidates_for_canonical(&path, &workspace_paths, &filters) {
                 Ok(c) => c,
-                Err(_) => continue, // dir removed or no longer in project; skip silently
+                Err(_) => continue, // dir removed or no longer in workspace; skip silently
             };
         let ServerState {
             pickers,
@@ -10889,7 +10889,7 @@ pub(crate) fn explorer_dirs_in_workdirs(
         .collect()
 }
 
-/// Per-file Git status for the Files picker, aligned to `files` by index. Resolves each project
+/// Per-file Git status for the Files picker, aligned to `files` by index. Resolves each workspace
 /// root's repo status once (one `statuses()` per root), then looks each file up by its
 /// root-relative path — no per-file repo discovery. `None` at an index for a clean file, a file
 /// whose root isn't in a repo, or any libgit2 error.
@@ -10972,7 +10972,7 @@ fn rope_line_trimmed(text: &ropey::Rope, line: u32) -> String {
 }
 
 /// Build the Git-changes picker's candidate list: one entry per hunk of every changed file in the
-/// project's roots, grouped by file. Open buffers drive their own files (live combined hunks +
+/// workspace's roots, grouped by file. Open buffers drive their own files (live combined hunks +
 /// text); the rest are diffed off disk (combined staged+unstaged vs HEAD, untracked = whole-file
 /// add). Runs entirely off the lock — `repo_status_for_root` walks the worktree and each file is
 /// re-diffed, so it must not sit on the keystroke path's mutex. Best-effort: a root outside a repo
@@ -11076,13 +11076,13 @@ pub async fn picker_view(
     // Buffers reads ServerState directly. Grep starts empty — the candidate set is generated
     // on demand by `picker/query`'s spawned search. Explorer re-lists the requested directory
     // (or the previously-listed one on resume) every call, like Buffers — directories change.
-    // Per-kind active-project gating. Projects is the *only* kind that's allowed before
-    // activation — it's how the user gets a project active in the first place. Files / Buffers /
-    // Grep / Explorer require an active project; their candidate builders all hit project-scoped
+    // Per-kind active-workspace gating. Workspaces is the *only* kind that's allowed before
+    // activation — it's how the user gets a workspace active in the first place. Files / Buffers /
+    // Grep / Explorer require an active workspace; their candidate builders all hit workspace-scoped
     // data and would error or return nothing without one.
-    if !matches!(params.kind, PickerKind::Projects) {
+    if !matches!(params.kind, PickerKind::Workspaces) {
         let s = state.lock().await;
-        s.active_project_or_err(client_id)?;
+        s.active_workspace_or_err(client_id)?;
     }
     // Explorer carries its committed anchor (path the query peeks relative to) + whether the peek
     // resolved, out of the candidate-building phase so the hydration phase below can persist both.
@@ -11093,11 +11093,11 @@ pub async fn picker_view(
             // The `Arc<WorkspaceIndex>` clone is cheap; the walk itself is memoized inside.
             let (workspace_index, roots) = {
                 let s = state.lock().await;
-                let p = s.active_project_or_err(client_id)?;
+                let p = s.active_workspace_or_err(client_id)?;
                 (p.workspace_index.clone(), p.paths.clone())
             };
             let files = workspace_index.files().await;
-            // One Git status pass per project root, aligned to the file snapshot by index, computed
+            // One Git status pass per workspace root, aligned to the file snapshot by index, computed
             // off the lock (statuses() walks the worktree). Empty for roots that aren't in a repo.
             let git_status = std::sync::Arc::new(build_file_git_status(&files, &roots));
             picker_state::PickerCandidates::Files { files, git_status }
@@ -11140,13 +11140,13 @@ pub async fn picker_view(
                 picker_state::PickerCandidates::Explorer(listing)
             }
         }
-        PickerKind::Projects => {
-            // Configured-project enumeration is a synchronous read of one directory under
-            // `$XDG_CONFIG_HOME/aether/projects/`. No active-project check; works pre-activation.
-            let names = crate::config::list_project_names()
-                .map_err(|e| RpcError::internal(format!("listing projects: {e}")))?;
+        PickerKind::Workspaces => {
+            // Configured-workspace enumeration is a synchronous read of one directory under
+            // `$XDG_CONFIG_HOME/aether/workspaces/`. No active-workspace check; works pre-activation.
+            let names = crate::config::list_workspace_names()
+                .map_err(|e| RpcError::internal(format!("listing workspaces: {e}")))?;
             let s = state.lock().await;
-            picker_state::PickerCandidates::Projects(project_candidates(&s, &names))
+            picker_state::PickerCandidates::Workspaces(workspace_candidates(&s, &names))
         }
         PickerKind::Diagnostics => match params.buffer_id {
             // Fresh open: build from the buffer's current diagnostics.
@@ -11159,24 +11159,24 @@ pub async fn picker_view(
             // Resume / scroll re-view: an empty placeholder; `preserve_existing` keeps the snapshot.
             None => picker_state::PickerCandidates::Diagnostics(Vec::new()),
         },
-        // Modal sibling of GitChanges: project-wide, rebuilt fresh on every view from the stored
+        // Modal sibling of GitChanges: workspace-wide, rebuilt fresh on every view from the stored
         // diagnostics (open buffers' live set + the path-keyed closed-file set). All in-memory, so
         // it's synchronous — there's no slow LSP round-trip (no server answers the workspace pull).
-        PickerKind::DiagnosticsProject => {
+        PickerKind::DiagnosticsWorkspace => {
             let s = state.lock().await;
-            picker_state::PickerCandidates::Diagnostics(build_project_diagnostic_candidates(
+            picker_state::PickerCandidates::Diagnostics(build_workspace_diagnostic_candidates(
                 &s, client_id,
             ))
         }
         PickerKind::LspServers => {
-            // Rebuilt every view from the active project's servers — the set is tiny and statuses
+            // Rebuilt every view from the active workspace's servers — the set is tiny and statuses
             // change, so there's no snapshot to preserve.
             let s = state.lock().await;
-            let project = s.active_project_or_err(client_id)?;
-            let (project_id, roots) = (project.id.clone(), project.paths.clone());
+            let workspace = s.active_workspace_or_err(client_id)?;
+            let (workspace_id, roots) = (workspace.id.clone(), workspace.paths.clone());
             picker_state::PickerCandidates::LspServers(build_lsp_server_candidates(
                 &s,
-                &project_id,
+                &workspace_id,
                 &roots,
             ))
         }
@@ -11195,7 +11195,7 @@ pub async fn picker_view(
             // keystroke path. Rebuilt fresh on every view (a snapshot of the repo at open).
             let (roots, open) = {
                 let s = state.lock().await;
-                let p = s.active_project_or_err(client_id)?;
+                let p = s.active_workspace_or_err(client_id)?;
                 let roots = p.paths.clone();
                 let open: Vec<OpenChange> = s
                     .buffers
@@ -11203,7 +11203,7 @@ pub async fn picker_view(
                     .filter_map(|(id, b)| {
                         let abs = b.canonical_path.as_deref()?;
                         let (path_index, relative_path) =
-                            crate::workspace_index::project_relative_parts(abs, &roots)?;
+                            crate::workspace_index::workspace_relative_parts(abs, &roots)?;
                         // Combined staged+unstaged hunks from the cached baseline + the LIVE buffer
                         // text — recomputed here rather than read from `git_both_hunks`, which only
                         // refreshes while the inline diff view is on, so unsaved edits always show.
@@ -11246,13 +11246,13 @@ pub async fn picker_view(
             let open = match params.buffer_id {
                 Some(buffer_id) => {
                     let s = state.lock().await;
-                    let roots = s.active_project_or_err(client_id)?.paths.clone();
+                    let roots = s.active_workspace_or_err(client_id)?.paths.clone();
                     s.buffers
                         .get(&buffer_id)
                         .and_then(|b| {
                             let abs = b.canonical_path.as_deref()?;
                             let (path_index, relative_path) =
-                                crate::workspace_index::project_relative_parts(abs, &roots)?;
+                                crate::workspace_index::workspace_relative_parts(abs, &roots)?;
                             let (head, index, staged) = s
                                 .git_baseline
                                 .get(&buffer_id)
@@ -11309,11 +11309,11 @@ pub async fn picker_view(
                     cursor.position
                 };
                 let current_key = s.buffers.get(&buffer_id).and_then(|b| {
-                    let project = s.active_project(client_id)?;
+                    let workspace = s.active_workspace(client_id)?;
                     b.canonical_path.as_deref().and_then(|p| {
-                        crate::workspace_index::project_relative_parts(
+                        crate::workspace_index::workspace_relative_parts(
                             std::path::Path::new(p),
-                            &project.paths,
+                            &workspace.paths,
                         )
                     })
                 });
@@ -11399,7 +11399,7 @@ pub async fn picker_view(
                 ) => true,
                 // GitChangesFile: locked to a buffer, so re-views send an empty placeholder — keep
                 // the snapshot then, but a fresh open carries the buffer's hunks and rebuilds.
-                // (Project GitChanges always re-snapshots, so it falls through to `false`.)
+                // (Workspace GitChanges always re-snapshots, so it falls through to `false`.)
                 (
                     picker_state::PickerCandidates::GitChanges(_),
                     picker_state::PickerCandidates::GitChanges(new),
@@ -11568,9 +11568,9 @@ pub async fn picker_view(
     };
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
     // Grab the workspace snapshot for a from-selection grep before releasing the lock (same data
-    // `picker/query` hands to `grep::spawn_search`). `None` if the active project somehow vanished.
+    // `picker/query` hands to `grep::spawn_search`). `None` if the active workspace somehow vanished.
     let grep_workspace = if grep_search_to_spawn.is_some() {
-        s.active_project(client_id)
+        s.active_workspace(client_id)
             .map(|p| (p.workspace_index.clone(), p.paths.clone()))
     } else {
         None
@@ -11622,10 +11622,10 @@ pub async fn picker_query(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let key = (client_id, params.kind);
-    // Explorer re-lists the query-derived peek directory before reranking; grab the project roots
+    // Explorer re-lists the query-derived peek directory before reranking; grab the workspace roots
     // up front (an immutable borrow of `s`, before the split below hands out `pickers`/`matcher`).
-    let explorer_project_paths = if matches!(params.kind, PickerKind::Explorer) {
-        s.active_project(client_id).map(|p| p.paths.clone())
+    let explorer_workspace_paths = if matches!(params.kind, PickerKind::Explorer) {
+        s.active_workspace(client_id).map(|p| p.paths.clone())
     } else {
         None
     };
@@ -11669,16 +11669,16 @@ pub async fn picker_query(
             if let (
                 picker_state::PickerCandidates::Explorer(_),
                 Some(anchor),
-                Some(project_paths),
+                Some(workspace_paths),
             ) = (
                 &picker.candidates,
                 picker.explorer_anchor.clone(),
-                explorer_project_paths.as_ref(),
+                explorer_workspace_paths.as_ref(),
             ) {
                 let (listing, peek_missing) = build_explorer_peek(
                     std::path::Path::new(&anchor.path),
                     &picker.query,
-                    project_paths,
+                    workspace_paths,
                     &picker.filters,
                 );
                 picker.candidates = picker_state::PickerCandidates::Explorer(listing);
@@ -11727,10 +11727,10 @@ pub async fn picker_query(
     }
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
     let workspace_index_for_grep = if matches!(params.kind, PickerKind::Grep) {
-        // Active-project lookup can fail in the (defensively-handled) case where the client
-        // somehow lost its active project between opening the picker and querying it. Skip the
+        // Active-workspace lookup can fail in the (defensively-handled) case where the client
+        // somehow lost its active workspace between opening the picker and querying it. Skip the
         // grep spawn in that case — there's nothing meaningful to search.
-        s.active_project(client_id)
+        s.active_workspace(client_id)
             .map(|p| (p.workspace_index.clone(), p.paths.clone()))
     } else {
         None
@@ -11807,13 +11807,13 @@ pub async fn picker_grep_navigate(
         .buffers
         .get(&params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
-    // None for scratch buffers; otherwise the project-relative display path the grep candidates
-    // are keyed by. Falls back to None if the client somehow lost its active project — the
+    // None for scratch buffers; otherwise the workspace-relative display path the grep candidates
+    // are keyed by. Falls back to None if the client somehow lost its active workspace — the
     // navigate handler then treats this as "no anchor in the file list" the same way scratch
     // buffers do.
-    let current_key: Option<(u32, String)> = s.active_project(client_id).and_then(|project| {
+    let current_key: Option<(u32, String)> = s.active_workspace(client_id).and_then(|workspace| {
         buffer.canonical_path.as_deref().and_then(|p| {
-            crate::workspace_index::project_relative_parts(std::path::Path::new(p), &project.paths)
+            crate::workspace_index::workspace_relative_parts(std::path::Path::new(p), &workspace.paths)
         })
     });
 
@@ -12354,13 +12354,13 @@ mod find_nearest_git_change_tests {
 mod next_buffer_tests {
     use super::*;
 
-    /// Build a state with project "p" active for one client; returns the state and client id.
-    fn state_with_active_project() -> (ServerState, ClientId) {
+    /// Build a state with workspace "p" active for one client; returns the state and client id.
+    fn state_with_active_workspace() -> (ServerState, ClientId) {
         let mut st = ServerState::new();
         let root = std::path::PathBuf::from("/p");
-        st.projects.insert(
+        st.workspaces.insert(
             "p".to_string(),
-            crate::state::ProjectEntry {
+            crate::state::WorkspaceEntry {
                 id: "p".to_string(),
                 name: Some("p".to_string()),
                 paths: vec![root.clone()],
@@ -12379,7 +12379,7 @@ mod next_buffer_tests {
             crate::state::ClientSession {
                 client_id,
                 outbound: tx,
-                active_project: Some("p".to_string()),
+                active_workspace: Some("p".to_string()),
             },
         );
         (st, client_id)
@@ -12390,11 +12390,11 @@ mod next_buffer_tests {
     /// makes the client spawn a blank scratch.
     #[test]
     fn next_buffer_falls_back_to_dormant_before_scratch() {
-        let (mut st, client_id) = state_with_active_project();
+        let (mut st, client_id) = state_with_active_workspace();
         // No live buffers; two dormant ones restored from the session (front = most-recent).
         let d1 = st.allocate_buffer_id();
         let d2 = st.allocate_buffer_id();
-        st.projects.get_mut("p").unwrap().dormant_buffers = vec![
+        st.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
             crate::state::DormantBuffer {
                 id: d1,
                 path: std::path::PathBuf::from("/p/a.rs"),
@@ -12411,34 +12411,34 @@ mod next_buffer_tests {
         let mut buf = Buffer::scratch(live, None, 1);
         buf.canonical_path = Some(std::path::PathBuf::from("/p/live.rs"));
         st.buffers.insert(live, buf);
-        st.buffer_projects.insert(live, "p".to_string());
+        st.buffer_workspaces.insert(live, "p".to_string());
         st.touch_mru(live);
         assert_eq!(next_buffer_for_client(&st, client_id), Some(live));
     }
 
     /// With neither live nor dormant buffers, `None` falls through so the caller opens a scratch.
     #[test]
-    fn next_buffer_is_none_when_project_is_empty() {
-        let (st, client_id) = state_with_active_project();
+    fn next_buffer_is_none_when_workspace_is_empty() {
+        let (st, client_id) = state_with_active_workspace();
         assert_eq!(next_buffer_for_client(&st, client_id), None);
     }
 }
 
 #[cfg(test)]
-mod project_name_tests {
-    use super::validate_project_name;
+mod workspace_name_tests {
+    use super::validate_workspace_name;
 
     #[test]
     fn trims_surrounding_whitespace_and_accepts() {
-        assert_eq!(validate_project_name("  my-proj  ").unwrap(), "my-proj");
-        assert_eq!(validate_project_name("aether").unwrap(), "aether");
+        assert_eq!(validate_workspace_name("  my-proj  ").unwrap(), "my-proj");
+        assert_eq!(validate_workspace_name("aether").unwrap(), "aether");
     }
 
     #[test]
     fn rejects_empty_blank_and_path_separators() {
         for bad in ["", "   ", "a/b", "a\\b", ".", ".."] {
             assert!(
-                validate_project_name(bad).is_err(),
+                validate_workspace_name(bad).is_err(),
                 "expected {bad:?} to be rejected"
             );
         }
@@ -12610,13 +12610,13 @@ mod subscribe_snapshot_tests {
     }
 
     #[test]
-    fn project_diagnostics_read_path_store_not_buffer_set() {
+    fn workspace_diagnostics_read_path_store_not_buffer_set() {
         use crate::lsp::diagnostics::RawDiagnostic;
         let mut st = ServerState::new();
         let root = std::path::PathBuf::from("/proj");
-        st.projects.insert(
+        st.workspaces.insert(
             "p".to_string(),
-            crate::state::ProjectEntry {
+            crate::state::WorkspaceEntry {
                 id: "p".to_string(),
                 name: Some("p".to_string()),
                 paths: vec![root.clone()],
@@ -12635,11 +12635,11 @@ mod subscribe_snapshot_tests {
             crate::state::ClientSession {
                 client_id,
                 outbound: tx,
-                active_project: Some("p".to_string()),
+                active_workspace: Some("p".to_string()),
             },
         );
 
-        // a.rs is open with a diagnostic in the BUFFER-keyed set (line 42). The project picker is a
+        // a.rs is open with a diagnostic in the BUFFER-keyed set (line 42). The workspace picker is a
         // separate lens — it must ignore that set entirely and read only `path_diagnostics`.
         let buffer_id = st.allocate_buffer_id();
         let mut buf = Buffer::scratch(buffer_id, None, 1);
@@ -12648,7 +12648,7 @@ mod subscribe_snapshot_tests {
         st.diagnostics
             .insert(buffer_id, vec![diag(42, DiagnosticSeverity::Error)]);
 
-        // The path-keyed store is the project picker's sole source: a.rs (open) + b.rs (closed).
+        // The path-keyed store is the workspace picker's sole source: a.rs (open) + b.rs (closed).
         st.path_diagnostics.insert(
             root.join("src/a.rs"),
             vec![
@@ -12673,7 +12673,7 @@ mod subscribe_snapshot_tests {
             }],
         );
 
-        let cands = build_project_diagnostic_candidates(&st, client_id);
+        let cands = build_workspace_diagnostic_candidates(&st, client_id);
 
         // Three rows, all from `path_diagnostics`; the buffer-keyed line 42 is NOT merged in.
         assert_eq!(cands.len(), 3);
@@ -12691,18 +12691,18 @@ mod subscribe_snapshot_tests {
         assert_eq!(cands[2].message, "boom");
         assert!(
             cands.iter().all(|c| c.col == 0 && c.end_col == 0),
-            "project rows are line-granular"
+            "workspace rows are line-granular"
         );
     }
 
     #[test]
-    fn open_project_picker_live_refreshes_from_path_diagnostics() {
+    fn open_workspace_picker_live_refreshes_from_path_diagnostics() {
         use crate::lsp::diagnostics::RawDiagnostic;
         let mut st = ServerState::new();
         let root = std::path::PathBuf::from("/proj");
-        st.projects.insert(
+        st.workspaces.insert(
             "p".to_string(),
-            crate::state::ProjectEntry {
+            crate::state::WorkspaceEntry {
                 id: "p".to_string(),
                 name: Some("p".to_string()),
                 paths: vec![root.clone()],
@@ -12721,19 +12721,19 @@ mod subscribe_snapshot_tests {
             crate::state::ClientSession {
                 client_id,
                 outbound: tx,
-                active_project: Some("p".to_string()),
+                active_workspace: Some("p".to_string()),
             },
         );
-        // An OPEN (subscribed), currently-empty project-diagnostics picker.
+        // An OPEN (subscribed), currently-empty workspace-diagnostics picker.
         let mut picker =
             picker_state::PickerState::new(picker_state::PickerCandidates::Diagnostics(Vec::new()));
-        picker.kind = PickerKind::DiagnosticsProject;
+        picker.kind = PickerKind::DiagnosticsWorkspace;
         picker.subscribed = Some(picker_state::SubscribedWindow {
             offset: 0,
             limit: 50,
         });
         st.pickers
-            .insert((client_id, PickerKind::DiagnosticsProject), picker);
+            .insert((client_id, PickerKind::DiagnosticsWorkspace), picker);
 
         // A push lands a never-opened file's diagnostic in `path_diagnostics`...
         st.path_diagnostics.insert(
@@ -12744,7 +12744,7 @@ mod subscribe_snapshot_tests {
                 message: "unexpected `}`".into(),
             }],
         );
-        let pushes = refresh_project_diagnostics_pickers(&mut st);
+        let pushes = refresh_workspace_diagnostics_pickers(&mut st);
 
         // ...and the open picker picks it up live, with an update pushed to the viewing client.
         assert_eq!(
@@ -12752,7 +12752,7 @@ mod subscribe_snapshot_tests {
             1,
             "one update to the client viewing the picker"
         );
-        let picker = &st.pickers[&(client_id, PickerKind::DiagnosticsProject)];
+        let picker = &st.pickers[&(client_id, PickerKind::DiagnosticsWorkspace)];
         let picker_state::PickerCandidates::Diagnostics(rows) = &picker.candidates else {
             panic!("expected Diagnostics candidates");
         };

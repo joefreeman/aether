@@ -1,5 +1,5 @@
 //! Shell-owned text entry for overlay inputs (save-as, and — as later phases land — search,
-//! picker query, project-settings, chip editor).
+//! picker query, workspace-settings, chip editor).
 //!
 //! The split (docs/client-core.md): the core owns *values* and value-derived semantics; the
 //! shell owns *text-entry mechanics*. For a terminal there's no native input widget, so the shell
@@ -21,16 +21,16 @@ use aether_client::keymap::{KeyCode, Mods};
 pub enum OverlayField {
     /// The save-as path prompt's path segment (`Prompt::SaveAs`).
     SaveAs,
-    /// The save-as prompt's root-typeahead segment (multi-root projects only).
+    /// The save-as prompt's root-typeahead segment (multi-root workspaces only).
     SaveAsRoot,
     /// The open-from-path prompt's single path field (`Prompt::OpenPath`).
     OpenPath,
     /// The incremental-search query bar (`Mode::Search`).
     Search,
-    /// The project-settings overlay's name field.
-    ProjectName,
-    /// The project-settings overlay's add-root input row.
-    ProjectAddRoot,
+    /// The workspace-settings overlay's name field.
+    WorkspaceName,
+    /// The workspace-settings overlay's add-root input row.
+    WorkspaceAddRoot,
     /// A picker's query input (Files/Buffers/Grep/Explorer/…).
     PickerQuery,
     /// The filter chip editor's root-typeahead segment (multi-root dir filters).

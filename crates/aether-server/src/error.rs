@@ -52,17 +52,17 @@ impl RpcError {
         )
     }
 
-    pub fn no_active_project() -> Self {
+    pub fn no_active_workspace() -> Self {
         Self::new(
-            ErrorCode::NO_ACTIVE_PROJECT,
-            "no active project — call project/activate first",
+            ErrorCode::NO_ACTIVE_WORKSPACE,
+            "no active workspace — call workspace/activate first",
         )
     }
 
-    pub fn unknown_project(name: impl std::fmt::Display) -> Self {
+    pub fn unknown_workspace(name: impl std::fmt::Display) -> Self {
         Self::new(
-            ErrorCode::UNKNOWN_PROJECT,
-            format!("no configured project named {name}"),
+            ErrorCode::UNKNOWN_WORKSPACE,
+            format!("no configured workspace named {name}"),
         )
     }
 

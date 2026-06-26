@@ -45,7 +45,7 @@ pub struct LspServerSpec {
     pub command: &'static str,
     pub args: &'static [&'static str],
     /// Filenames whose nearest ancestor directory is the workspace root. The first marker found
-    /// walking up from the file wins; if none is found, the project root is used.
+    /// walking up from the file wins; if none is found, the workspace root is used.
     pub root_markers: &'static [&'static str],
     /// Server-specific `initializationOptions` (raw JSON), sent in the `initialize` handshake.
     /// `None` for servers that need none. Used to opt the vscode JSON/CSS/HTML servers into their
@@ -69,7 +69,7 @@ pub fn server_spec(language: &str) -> Option<LspServerSpec> {
         "toml" => LspServerSpec {
             command: "taplo",
             args: &["lsp", "stdio"],
-            // taplo is happy per-file; fall back to the project root when no taplo config exists.
+            // taplo is happy per-file; fall back to the workspace root when no taplo config exists.
             root_markers: &["taplo.toml", ".taplo.toml"],
             init_options: None,
         },
@@ -77,7 +77,7 @@ pub fn server_spec(language: &str) -> Option<LspServerSpec> {
             command: "pyright-langserver",
             args: &["--stdio"],
             root_markers: &[
-                "pyproject.toml",
+                "pyworkspace.toml",
                 "setup.py",
                 "setup.cfg",
                 "requirements.txt",

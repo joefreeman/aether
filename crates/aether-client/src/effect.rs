@@ -109,10 +109,10 @@ pub enum Effect {
     },
     /// Quit the application.
     Exit,
-    /// Return to the project chooser, discarding the current (now buffer-less) session — used when
+    /// Return to the workspace chooser, discarding the current (now buffer-less) session — used when
     /// the last buffer of an ephemeral context closes on a client that *navigated into* it rather
     /// than launching for a file (so it shouldn't quit). The shell resets to its boot-chooser
-    /// state (a placeholder session + the Projects picker); the core can't do this by mutating its
+    /// state (a placeholder session + the Workspaces picker); the core can't do this by mutating its
     /// own fields because each shell presents its chooser differently (the TUI swaps in a
     /// placeholder session, iced has a separate `boot` state, the web rebuilds the session).
     ToChooser,

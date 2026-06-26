@@ -173,14 +173,14 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::Buffers => "Switch buffer…",
         PickerKind::Grep => "Grep workspace…",
         PickerKind::Explorer => "Explore files…",
-        PickerKind::Projects => "Select project…",
+        PickerKind::Workspaces => "Select workspace…",
         PickerKind::Diagnostics => "Diagnostics in current file…",
-        PickerKind::DiagnosticsProject => "Diagnostics in project…",
+        PickerKind::DiagnosticsWorkspace => "Diagnostics in workspace…",
         PickerKind::LspServers => "List LSPs…",
         PickerKind::References => "List references…",
         PickerKind::DocumentSymbols => "Go to symbol…",
         PickerKind::GitChangesFile => "Changes in current file…",
-        PickerKind::GitChanges => "Changes in project…",
+        PickerKind::GitChanges => "Changes in workspace…",
     }
 }
 
@@ -189,8 +189,8 @@ const SANS: iced::Font = iced::Font {
     ..iced::Font::DEFAULT
 };
 
-/// Build the picker panel. `roots` are the project root paths (rows show a root label only in
-/// multi-root projects, like the other clients). `scroll_y` is the shell-tracked scroll
+/// Build the picker panel. `roots` are the workspace root paths (rows show a root label only in
+/// multi-root workspaces, like the other clients). `scroll_y` is the shell-tracked scroll
 /// offset of the results list (for the sticky-header pin).
 /// `controlled` selects the query-input rendering: `true` (the session picker) draws a real
 /// `text_input` synced to the core via [`PickerMsg::Query`]; `false` (the boot chooser, whose
@@ -209,7 +209,7 @@ pub fn overlay<'a>(
 
     // Input row: query (or a dim per-kind placeholder) with beam cursor, match counts on the
     // right. Sits on NORD0 against the panel's NORD1 (web's .picker-input-row). The explorer
-    // leads with a `label: rel/` breadcrumb (project-relative, terminal format), flush
+    // leads with a `label: rel/` breadcrumb (workspace-relative, terminal format), flush
     // against the query; the placeholder only shows when there's no breadcrumb.
     let mut input = row![].align_y(iced::Alignment::Center);
     // Filter chips lead the row, before the explorer breadcrumb (docs/picker-filters.md).
@@ -458,8 +458,8 @@ pub fn overlay<'a>(
             }
             DisplayRow::Create { abs, name, is_dir } => {
                 let selected = abs == state.selected;
-                let label = if state.kind == aether_protocol::picker::PickerKind::Projects {
-                    format!("+ Create project {name}")
+                let label = if state.kind == aether_protocol::picker::PickerKind::Workspaces {
+                    format!("+ Create workspace {name}")
                 } else if is_dir {
                     format!("+ Create directory {name}/")
                 } else {
@@ -526,7 +526,7 @@ pub fn overlay<'a>(
                 .nth(rel as usize)
                 .and_then(|r| match r {
                     DisplayRow::Item { item, .. } => match item {
-                        // The file-grouped kinds (grep hits, Git changes, project diagnostics) carry
+                        // The file-grouped kinds (grep hits, Git changes, workspace diagnostics) carry
                         // the group key.
                         PickerItem::GrepHit {
                             path_index,
@@ -1008,7 +1008,7 @@ fn render_item<'a>(
                 SANS,
                 hovered,
             ));
-            // Multi-root projects: the root's label, dim, after the path (web/terminal style).
+            // Multi-root workspaces: the root's label, dim, after the path (web/terminal style).
             if let Some(label) = root_label(roots, *path_index) {
                 r = r.push(
                     text(label.trim_end_matches('/').to_string())
@@ -1227,17 +1227,17 @@ fn render_item<'a>(
             .align_y(iced::Alignment::Center)
             .into()
         }
-        PickerItem::Project {
+        PickerItem::Workspace {
             name,
             unsaved_buffers,
             match_indices,
         } => {
-            // An ephemeral context renders as an italic "(project N)" — to mark it ephemeral, like
+            // An ephemeral context renders as an italic "(workspace N)" — to mark it ephemeral, like
             // transient buffers slant. Its internal id isn't a meaningful fuzzy-match haystack, so
             // there are no highlight indices to carry.
-            let label: iced::Element<_> = if aether_protocol::is_ephemeral_project_id(name) {
+            let label: iced::Element<_> = if aether_protocol::is_ephemeral_workspace_id(name) {
                 highlighted_owned(
-                    aether_client::labels::project_display(name),
+                    aether_client::labels::workspace_display(name),
                     Vec::new(),
                     theme::NORD6,
                     SANS_ITALIC,
@@ -1246,7 +1246,7 @@ fn render_item<'a>(
             } else {
                 highlighted(name, match_indices, theme::NORD6, SANS, hovered)
             };
-            // Trailing frost-blue dot when the project has unsaved buffers — the same right-aligned
+            // Trailing frost-blue dot when the workspace has unsaved buffers — the same right-aligned
             // dot the buffer picker shows, so the two pickers read alike.
             let mut r = row![label, iced::widget::Space::new().width(Length::Fill),]
                 .spacing(6)
@@ -1423,7 +1423,7 @@ fn highlighted_owned<'a>(
 }
 
 /// The explorer's input-row breadcrumb: `label: rel/` — root label only in multi-root
-/// projects, both parts empty at a root's top, nothing in roots mode (the rows already say
+/// workspaces, both parts empty at a root's top, nothing in roots mode (the rows already say
 /// "pick a root"). Mirrors the TUI's `explorer_path_parts`.
 fn explorer_prefix(state: &PickerState, roots: &[String]) -> Option<String> {
     if state.kind != PickerKind::Explorer {
@@ -1447,7 +1447,7 @@ fn explorer_prefix(state: &PickerState, roots: &[String]) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Root label prefix (`rootname/`) for multi-root projects; `None` with a single root.
+/// Root label prefix (`rootname/`) for multi-root workspaces; `None` with a single root.
 fn root_label(roots: &[String], path_index: u32) -> Option<String> {
     if roots.len() < 2 {
         return None;

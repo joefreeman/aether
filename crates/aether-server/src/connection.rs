@@ -4,9 +4,9 @@
 //! Token mismatch fails the upgrade with HTTP 401 *before* any JSON-RPC traffic flows; valid
 //! tokens get an allocated `ClientId` immediately, so handlers can rely on it being set.
 //!
-//! Project selection: a connected client has no buffer-level capabilities until it calls
-//! `project/activate`. The only RPCs that work without an active project are `project/list` and
-//! `project/activate` itself; everything else returns `NO_ACTIVE_PROJECT`.
+//! Workspace selection: a connected client has no buffer-level capabilities until it calls
+//! `workspace/activate`. The only RPCs that work without an active workspace are `workspace/list` and
+//! `workspace/activate` itself; everything else returns `NO_ACTIVE_WORKSPACE`.
 
 use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
@@ -38,9 +38,9 @@ use aether_protocol::path::PathDelete;
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerHide, PickerQuery, PickerSectionJump, PickerSelect, PickerView,
 };
-use aether_protocol::project::{
-    ProjectActivate, ProjectAddRoot, ProjectCreate, ProjectDelete, ProjectList, ProjectOpenPath,
-    ProjectRemoveRoot, ProjectRename,
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceAddRoot, WorkspaceCreate, WorkspaceDelete, WorkspaceList, WorkspaceOpenPath,
+    WorkspaceRemoveRoot, WorkspaceRename,
 };
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
@@ -169,7 +169,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
             ClientSession {
                 client_id,
                 outbound: outbound_tx.clone(),
-                active_project: None,
+                active_workspace: None,
             },
         );
     }
@@ -257,12 +257,12 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
 
     let pushes = {
         let mut s = state.lock().await;
-        // Remember the disconnecting client's project so we can retire it if it was an ephemeral
-        // ("no project") context that nothing else is using once this session's buffers are gone.
-        let disconnecting_project = s
+        // Remember the disconnecting client's workspace so we can retire it if it was an ephemeral
+        // ("no workspace") context that nothing else is using once this session's buffers are gone.
+        let disconnecting_workspace = s
             .clients
             .get(&client_id)
-            .and_then(|c| c.active_project.clone());
+            .and_then(|c| c.active_workspace.clone());
         s.clients.remove(&client_id);
         // Buffers this client was showing: once its viewports are gone, any transient among
         // them that no other client shows is orphaned and gets closed.
@@ -283,19 +283,19 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_last_scroll_for_client(client_id);
         s.drop_pickers_for_client(client_id);
         s.drop_nav_history_for_client(client_id);
-        let pruned_ephemeral = disconnecting_project
+        let pruned_ephemeral = disconnecting_workspace
             .as_deref()
             .is_some_and(|pid| s.prune_ephemeral_if_empty(pid));
         tracing::info!(%client_id, "client disconnected");
         // Other clients' buffer pickers should drop the closed transients from their lists; a
-        // retired ephemeral project drops out of any open switcher.
+        // retired ephemeral workspace drops out of any open switcher.
         let mut pushes = if closed.is_empty() {
             Vec::new()
         } else {
             crate::handlers::refresh_buffer_pickers(&mut s)
         };
         if pruned_ephemeral {
-            pushes.extend(crate::handlers::refresh_project_pickers(&mut s));
+            pushes.extend(crate::handlers::refresh_workspace_pickers(&mut s));
         }
         pushes
     };
@@ -376,14 +376,14 @@ async fn dispatch(
     match method {
         SettingsGet::NAME => run!(SettingsGet, handlers::settings_get),
         SettingsSet::NAME => run!(SettingsSet, handlers::settings_set),
-        ProjectList::NAME => run!(ProjectList, handlers::project_list),
-        ProjectActivate::NAME => run!(ProjectActivate, handlers::project_activate),
-        ProjectCreate::NAME => run!(ProjectCreate, handlers::project_create),
-        ProjectOpenPath::NAME => run!(ProjectOpenPath, handlers::project_open_path),
-        ProjectAddRoot::NAME => run!(ProjectAddRoot, handlers::project_add_root),
-        ProjectRemoveRoot::NAME => run!(ProjectRemoveRoot, handlers::project_remove_root),
-        ProjectRename::NAME => run!(ProjectRename, handlers::project_rename),
-        ProjectDelete::NAME => run!(ProjectDelete, handlers::project_delete),
+        WorkspaceList::NAME => run!(WorkspaceList, handlers::workspace_list),
+        WorkspaceActivate::NAME => run!(WorkspaceActivate, handlers::workspace_activate),
+        WorkspaceCreate::NAME => run!(WorkspaceCreate, handlers::workspace_create),
+        WorkspaceOpenPath::NAME => run!(WorkspaceOpenPath, handlers::workspace_open_path),
+        WorkspaceAddRoot::NAME => run!(WorkspaceAddRoot, handlers::workspace_add_root),
+        WorkspaceRemoveRoot::NAME => run!(WorkspaceRemoveRoot, handlers::workspace_remove_root),
+        WorkspaceRename::NAME => run!(WorkspaceRename, handlers::workspace_rename),
+        WorkspaceDelete::NAME => run!(WorkspaceDelete, handlers::workspace_delete),
         PathDelete::NAME => run!(PathDelete, handlers::path_delete),
         BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),

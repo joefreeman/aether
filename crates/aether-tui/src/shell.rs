@@ -73,7 +73,7 @@ enum Done {
     /// A reconnect dial attempt (see `Effect::Reconnect`).
     Reconnected(Box<Result<Reestablished, ReconnectError>>),
     /// The initial boot dial: connect + bootstrap from the `Connecting` launch state. `NotUp`
-    /// retries (the daemon may still be coming up); `Fatal` (e.g. a bad CLI project) ends the run.
+    /// retries (the daemon may still be coming up); `Fatal` (e.g. a bad CLI workspace) ends the run.
     Booted(Box<Result<Booted, ReconnectError>>),
     /// A floating toast's time-to-live elapsed; removes the toast with this id from the stack.
     ToastExpired(u64),
@@ -86,11 +86,11 @@ const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 struct Reestablished {
     handle: Handle,
     notifications: mpsc::UnboundedReceiver<Notification>,
-    /// The restored project + landing buffer, or `None` when the project is gone — renamed or
+    /// The restored workspace + landing buffer, or `None` when the workspace is gone — renamed or
     /// removed by another client while we were disconnected. The connection itself is fine, so the
-    /// shell recovers into the project chooser rather than failing.
+    /// shell recovers into the workspace chooser rather than failing.
     restore: Option<(
-        aether_protocol::project::ProjectInfo,
+        aether_protocol::workspace::WorkspaceInfo,
         aether_protocol::buffer::BufferOpenResult,
     )>,
     restarted: bool,
@@ -104,7 +104,7 @@ enum ReconnectError {
 }
 
 /// A successful initial boot: the live connection plus the bootstrapped session/state and any
-/// startup effects (e.g. the no-args Projects chooser's `picker/view`), ready to install in place
+/// startup effects (e.g. the no-args Workspaces chooser's `picker/view`), ready to install in place
 /// of the connecting placeholder.
 struct Booted {
     handle: Handle,
@@ -118,7 +118,7 @@ struct Booted {
 /// shell is in the `Connecting` state.
 #[derive(Clone)]
 struct BootSpec {
-    project: Option<String>,
+    workspace: Option<String>,
     file: Option<String>,
     version: String,
 }
@@ -181,7 +181,7 @@ pub struct Shell {
     boot: Option<BootSpec>,
     /// Boot dial attempt count, for the retry backoff while `boot` is set.
     boot_attempt: u32,
-    /// A fatal boot error (e.g. the named project doesn't exist) — surfaced as the run's `Err`
+    /// A fatal boot error (e.g. the named workspace doesn't exist) — surfaced as the run's `Err`
     /// after the loop unwinds and the terminal is restored.
     fatal: Option<String>,
     /// The (profile-resolved) WebSocket address every boot dial and reconnect dials.
@@ -190,7 +190,7 @@ pub struct Shell {
 
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    project: Option<String>,
+    workspace: Option<String>,
     file: Option<String>,
     version: String,
     server_url: String,
@@ -240,7 +240,7 @@ pub async fn run(
         term,
         next_toast_id: 0,
         boot: Some(BootSpec {
-            project,
+            workspace,
             file,
             version,
         }),
@@ -299,7 +299,7 @@ pub async fn run(
         terminal.draw(|f| ui::draw(f, &shell.state))?;
         crate::app::refresh_terminal_title(&mut shell.state);
     }
-    // A fatal boot failure (bad CLI project, etc.) surfaces as the run's error once the terminal
+    // A fatal boot failure (bad CLI workspace, etc.) surfaces as the run's error once the terminal
     // is restored by the caller.
     match shell.fatal.take() {
         Some(e) => Err(anyhow::anyhow!(e)),
@@ -537,15 +537,15 @@ impl Shell {
                     self.handle = r.handle;
                     self.notifications = r.notifications;
                     match r.restore {
-                        Some((project, open)) => {
+                        Some((workspace, open)) => {
                             let restarted = r.restarted;
                             self.dispatch(CoreEvent::Reestablished {
-                                project,
+                                workspace,
                                 open,
                                 restarted,
                             });
                         }
-                        // The project is gone — drop to the chooser over the fresh connection.
+                        // The workspace is gone — drop to the chooser over the fresh connection.
                         None => self.reconnect_to_chooser(),
                     }
                 }
@@ -572,7 +572,7 @@ impl Shell {
                     self.boot_attempt = self.boot_attempt.saturating_add(1);
                     self.spawn_boot_dial();
                 }
-                // A live server but the bootstrap refused (e.g. unknown CLI project) — end the run
+                // A live server but the bootstrap refused (e.g. unknown CLI workspace) — end the run
                 // with the error once the terminal is restored.
                 Err(ReconnectError::Fatal(e)) => {
                     self.fatal = Some(e);
@@ -640,10 +640,10 @@ impl Shell {
         let Some((code, mods, text)) = translate_key(&k) else {
             return;
         };
-        // The no-project chooser: Esc dismisses it, which — with nothing behind it to fall back to —
-        // exits the app, matching the native client. (Selecting a project instead lands a buffer and
+        // The no-workspace chooser: Esc dismisses it, which — with nothing behind it to fall back to —
+        // exits the app, matching the native client. (Selecting a workspace instead lands a buffer and
         // proceeds; that path goes through `on_key` below.) Handled here, before the core closes the
-        // picker, so it's distinguishable from a project pick (which also closes the picker).
+        // picker, so it's distinguishable from a workspace pick (which also closes the picker).
         if code == KeyCode::Esc && self.session.is_placeholder() && self.session.picker.is_some() {
             self.should_quit = true;
             return;
@@ -713,9 +713,9 @@ impl Shell {
         if let Some(prompt) = &self.session.prompt {
             return match prompt {
                 // Multi-root save-as has a leading root-typeahead segment; focus follows the core
-                // editor's `field`. Single-root projects only ever have the path segment.
+                // editor's `field`. Single-root workspaces only ever have the path segment.
                 Prompt::SaveAs(ed) => Some(
-                    if self.session.project_paths.len() > 1
+                    if self.session.workspace_paths.len() > 1
                         && ed.field == aether_client::chips::ChipEditorField::Root
                     {
                         OverlayField::SaveAsRoot
@@ -751,12 +751,12 @@ impl Shell {
             }
             return None;
         }
-        if let Some(ps) = &self.session.project_settings {
+        if let Some(ps) = &self.session.workspace_settings {
             if ps.on_name() {
-                return Some(OverlayField::ProjectName);
+                return Some(OverlayField::WorkspaceName);
             }
             if ps.on_input() {
-                return Some(OverlayField::ProjectAddRoot);
+                return Some(OverlayField::WorkspaceAddRoot);
             }
         }
         None
@@ -779,15 +779,15 @@ impl Shell {
                 _ => String::new(),
             },
             OverlayField::Search => self.session.search.query.clone(),
-            OverlayField::ProjectName => self
+            OverlayField::WorkspaceName => self
                 .session
-                .project_settings
+                .workspace_settings
                 .as_ref()
                 .map(|s| s.name.text.clone())
                 .unwrap_or_default(),
-            OverlayField::ProjectAddRoot => self
+            OverlayField::WorkspaceAddRoot => self
                 .session
-                .project_settings
+                .workspace_settings
                 .as_ref()
                 .map(|s| s.add.text.clone())
                 .unwrap_or_default(),
@@ -827,8 +827,8 @@ impl Shell {
             OverlayField::SaveAsRoot => self.session.save_as_set_root_filter(value),
             OverlayField::OpenPath => self.session.open_path_set_input(value),
             OverlayField::Search => self.session.search_set_query(value),
-            OverlayField::ProjectName => self.session.project_settings_set_name(value),
-            OverlayField::ProjectAddRoot => self.session.project_settings_set_add(value),
+            OverlayField::WorkspaceName => self.session.workspace_settings_set_name(value),
+            OverlayField::WorkspaceAddRoot => self.session.workspace_settings_set_add(value),
             OverlayField::PickerQuery => self.session.picker_set_query(value),
             OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
             OverlayField::ChipPath => self.session.chip_editor_set_input(value),
@@ -1006,7 +1006,7 @@ impl Shell {
 
     fn subscribe(&mut self) {
         if self.session.is_placeholder() {
-            return; // no buffer to show until a project is picked (the no-project view)
+            return; // no buffer to show until a workspace is picked (the no-workspace view)
         }
         let Some((cols, rows)) = self.sent_grid else {
             return;
@@ -1317,27 +1317,27 @@ impl Shell {
 
     // ---- reconnect (the dial loop; policy lives in the core) ------------------------------
 
-    /// Recovery when a reconnect succeeds but the old project is gone (renamed/removed while we
-    /// were away): reset to a placeholder session over the fresh connection and raise the Projects
-    /// chooser, mirroring a no-args start. Picking a project (the renamed one shows under its new
+    /// Recovery when a reconnect succeeds but the old workspace is gone (renamed/removed while we
+    /// were away): reset to a placeholder session over the fresh connection and raise the Workspaces
+    /// chooser, mirroring a no-args start. Picking a workspace (the renamed one shows under its new
     /// name) lands a buffer the usual way.
     fn reconnect_to_chooser(&mut self) {
         self.to_chooser();
         self.status(StatusMessage::error(
-            "project no longer exists — pick another".to_string(),
+            "workspace no longer exists — pick another".to_string(),
         ));
     }
 
-    /// Drop to the project chooser over the live connection: swap in a fresh placeholder session
-    /// (no buffer, so nothing stale renders behind the picker) and raise the Projects picker.
+    /// Drop to the workspace chooser over the live connection: swap in a fresh placeholder session
+    /// (no buffer, so nothing stale renders behind the picker) and raise the Workspaces picker.
     /// Driven by [`Effect::ToChooser`] when an ephemeral context we navigated into loses its last
-    /// buffer, and reused by [`Self::reconnect_to_chooser`] for project-gone recovery.
+    /// buffer, and reused by [`Self::reconnect_to_chooser`] for workspace-gone recovery.
     fn to_chooser(&mut self) {
         use aether_protocol::picker::PickerKind;
         self.session = Session::placeholder(); // conn = Connected, so notifications resume
         let startup = self
             .session
-            .open_picker(PickerKind::Projects, None, None, false);
+            .open_picker(PickerKind::Workspaces, None, None, false);
         self.run_effects(startup);
     }
 
@@ -1356,7 +1356,7 @@ impl Shell {
     }
 
     fn spawn_reconnect(&mut self, attempt: u32) {
-        let project = self.session.project.clone();
+        let workspace = self.session.workspace.clone();
         let path = self.session.buffer.path.clone();
         let buffer_id = self.session.buffer.buffer_id;
         let transient = self.session.buffer.transient;
@@ -1366,7 +1366,7 @@ impl Shell {
         self.pending.push(Box::pin(async move {
             Done::Reconnected(Box::new(
                 dial(
-                    attempt, project, path, buffer_id, transient, cursor, version, server_url,
+                    attempt, workspace, path, buffer_id, transient, cursor, version, server_url,
                 )
                 .await,
             ))
@@ -1383,15 +1383,15 @@ impl Shell {
         // Keep the shell-owned overlay editor in step with the focused field before projecting any
         // overlay state into the view model below.
         self.sync_overlay_edit();
-        // No editor until a project is picked: the placeholder session renders the no-project
+        // No editor until a workspace is picked: the placeholder session renders the no-workspace
         // view, not a buffer behind the chooser.
         let editor = (!self.session.is_placeholder()).then(|| self.editor_view());
         let s = &self.session;
         let st = &mut self.state;
-        st.project_name = s.project.clone();
-        if st.project_paths != s.project_paths {
-            st.project_paths = s.project_paths.clone();
-            st.root_labels = labels::root_labels(&st.project_paths);
+        st.workspace_name = s.workspace.clone();
+        if st.workspace_paths != s.workspace_paths {
+            st.workspace_paths = s.workspace_paths.clone();
+            st.root_labels = labels::root_labels(&st.workspace_paths);
         }
         let (cols, rows) = self.term;
         st.viewport_cols = cols as u32;
@@ -1421,7 +1421,7 @@ impl Shell {
         st.editor = editor;
         self.sync_picker();
         self.sync_prompts();
-        self.sync_project_settings();
+        self.sync_workspace_settings();
         self.sync_app_settings();
     }
 
@@ -1439,12 +1439,12 @@ impl Shell {
                 });
     }
 
-    /// Mirror the core's project-settings overlay (`session.project_settings`) into the view
+    /// Mirror the core's workspace-settings overlay (`session.workspace_settings`) into the view
     /// model the renderer reads. The core owns the state and key handling now; this is a pure
-    /// projection into the shell's `TextInput`-based struct (`ProjectSettingsState`).
-    fn sync_project_settings(&mut self) {
-        let Some(core) = &self.session.project_settings else {
-            self.state.project_settings = None;
+    /// projection into the shell's `TextInput`-based struct (`WorkspaceSettingsState`).
+    fn sync_workspace_settings(&mut self) {
+        let Some(core) = &self.session.workspace_settings else {
+            self.state.workspace_settings = None;
             return;
         };
         // The caret for the focused field lives in the shell-owned overlay editor (text mechanics
@@ -1459,11 +1459,11 @@ impl Shell {
         };
         let mut name_input = crate::text_input::TextInput::default();
         name_input.set(core.name.text.clone());
-        name_input.cursor = field_cursor(OverlayField::ProjectName, core.name.text.len());
+        name_input.cursor = field_cursor(OverlayField::WorkspaceName, core.name.text.len());
         let mut add_input = crate::text_input::TextInput::default();
         add_input.set(core.add.text.clone());
-        add_input.cursor = field_cursor(OverlayField::ProjectAddRoot, core.add.text.len());
-        self.state.project_settings = Some(crate::app::ProjectSettingsState {
+        add_input.cursor = field_cursor(OverlayField::WorkspaceAddRoot, core.add.text.len());
+        self.state.workspace_settings = Some(crate::app::WorkspaceSettingsState {
             name_input,
             roots: core.roots.clone(),
             selected: core.selected,
@@ -1649,12 +1649,12 @@ impl Shell {
         if let Some(pc) = core.pending_create() {
             if core.offset + core.items.len() as u32 >= core.total_matches {
                 use aether_protocol::picker::PickerItem;
-                let item = if core.kind == aether_protocol::picker::PickerKind::Projects {
-                    // Projects rows carry no leading status-dot cell, so the create row mustn't
-                    // either — render it as a Project, not a DirEntry (which reserves that column
-                    // and would indent it past the real project rows).
-                    PickerItem::Project {
-                        name: format!("+ Create project {}", pc.name),
+                let item = if core.kind == aether_protocol::picker::PickerKind::Workspaces {
+                    // Workspaces rows carry no leading status-dot cell, so the create row mustn't
+                    // either — render it as a Workspace, not a DirEntry (which reserves that column
+                    // and would indent it past the real workspace rows).
+                    PickerItem::Workspace {
+                        name: format!("+ Create workspace {}", pc.name),
                         unsaved_buffers: 0,
                         match_indices: Vec::new(),
                     }
@@ -1717,7 +1717,7 @@ impl Shell {
             .as_ref()
             .filter(|e| e.field == crate::overlay_input::OverlayField::OpenPath)
             .map(|e| e.input.cursor);
-        let multi_root = self.session.project_paths.len() > 1;
+        let multi_root = self.session.workspace_paths.len() > 1;
         let st = &mut self.state;
         st.confirm_prompt = None;
         st.save_prompt = None;
@@ -1777,7 +1777,7 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::DiscardOnClose { label } => format!("Discard unsaved changes in {label}"),
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
-        ConfirmKind::DeleteProject { name } => format!("Delete project \"{name}\""),
+        ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
     }
 }
 
@@ -1799,7 +1799,7 @@ fn chip_value_view(v: &aether_client::chips::ChipValue) -> crate::picker::ChipVa
     }
 }
 
-/// Project the core's chip editor into the TUI view model. `root_cursor` / `path_cursor` carry the
+/// Workspace the core's chip editor into the TUI view model. `root_cursor` / `path_cursor` carry the
 /// shell-owned caret for whichever segment is focused (`None` → render that field's caret at end,
 /// the unfocused convention).
 fn chip_editor_view(
@@ -1840,7 +1840,7 @@ fn chip_editor_view(
     }
 }
 
-/// Project the core's save-as editor into the TUI view model — the save-as counterpart of
+/// Workspace the core's save-as editor into the TUI view model — the save-as counterpart of
 /// [`chip_editor_view`]. `root_cursor` / `path_cursor` carry the shell-owned caret for whichever
 /// segment is focused (`None` → that field's caret at end, the unfocused convention).
 fn save_as_view(
@@ -1952,7 +1952,7 @@ fn translate_key(k: &KeyEvent) -> Option<(KeyCode, Mods, Option<String>)> {
 }
 
 /// One boot dial: after the first attempt back off, dial the fixed address, then run the same
-/// `bootstrap` the synchronous boot used (activate the CLI project + open the file/MRU buffer, or
+/// `bootstrap` the synchronous boot used (activate the CLI workspace + open the file/MRU buffer, or
 /// hand back a placeholder + chooser startup). `NotUp` (server down) retries; a bootstrap refusal
 /// is `Fatal`.
 async fn boot_dial(
@@ -1970,7 +1970,7 @@ async fn boot_dial(
         .map_err(|_| ReconnectError::NotUp)?;
     let (session, state, startup) = bootstrap(
         &handle,
-        spec.project.as_deref(),
+        spec.workspace.as_deref(),
         spec.file.as_deref(),
         cols,
         rows,
@@ -1990,7 +1990,7 @@ async fn boot_dial(
 #[allow(clippy::too_many_arguments)]
 async fn dial(
     attempt: u32,
-    project: String,
+    workspace: String,
     path: Option<String>,
     buffer_id: u64,
     transient: bool,
@@ -1999,22 +1999,22 @@ async fn dial(
     server_url: String,
 ) -> Result<Reestablished, ReconnectError> {
     use aether_protocol::buffer::{BufferOpen, BufferOpenParams};
-    use aether_protocol::project::{ProjectActivate, ProjectActivateParams};
+    use aether_protocol::workspace::{WorkspaceActivate, WorkspaceActivateParams};
 
     tokio::time::sleep(reconnect_backoff(attempt)).await;
     let (handle, notifications) = crate::connection::connect(&server_url, &version)
         .await
         .map_err(|_| ReconnectError::NotUp)?;
     let activated = match handle
-        .rpc::<ProjectActivate>(ProjectActivateParams {
-            name: project,
+        .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
+            name: workspace,
             open_last: false,
         })
         .await
     {
         Ok(a) => a,
-        // Couldn't re-activate the project — it was renamed or removed while we were away. The
-        // socket is up, so hand back a project-less reconnect and let the shell raise the chooser.
+        // Couldn't re-activate the workspace — it was renamed or removed while we were away. The
+        // socket is up, so hand back a workspace-less reconnect and let the shell raise the chooser.
         Err(_) => {
             return Ok(Reestablished {
                 handle,
@@ -2025,7 +2025,7 @@ async fn dial(
         }
     };
     let params = match &path {
-        Some(p) => aether_client::session::strip_longest_root(p, &activated.project.paths).map(
+        Some(p) => aether_client::session::strip_longest_root(p, &activated.workspace.paths).map(
             |(path_index, relative_path)| BufferOpenParams {
                 path_index: Some(path_index),
                 relative_path: Some(relative_path),
@@ -2056,7 +2056,7 @@ async fn dial(
     Ok(Reestablished {
         handle,
         notifications,
-        restore: Some((activated.project, open)),
+        restore: Some((activated.workspace, open)),
         restarted: false,
     })
 }
@@ -2088,25 +2088,25 @@ fn time_ago(unix_secs: i64) -> String {
 /// buffer or a named file) and build the core `Session` + the render model.
 pub async fn bootstrap(
     handle: &Handle,
-    project: Option<&str>,
+    workspace: Option<&str>,
     file: Option<&str>,
     cols: u16,
     rows: u16,
 ) -> Result<(Session, AppState, Effects)> {
     use aether_protocol::buffer::{BufferOpen, BufferOpenParams};
     use aether_protocol::picker::PickerKind;
-    use aether_protocol::project::{
-        ProjectActivate, ProjectActivateParams, ProjectOpenPath, ProjectOpenPathParams,
+    use aether_protocol::workspace::{
+        WorkspaceActivate, WorkspaceActivateParams, WorkspaceOpenPath, WorkspaceOpenPathParams,
     };
 
-    // Project selection is explicit. When none is named on the command line and no file is given
-    // we DON'T activate one — we start with a placeholder session (no project, no buffer) and
-    // raise the Projects chooser. Nothing is rendered behind it; picking a project activates it
-    // and lands the first buffer (`PickerSelected` → `ProjectActivated` → `adopt_switch`), which
-    // is when the editor first appears. When a file *is* given but no project (a path outside any
-    // configured project, e.g. `ae /etc/hosts`), we open it directly via `project/open_path`,
-    // which lands it in a fresh ephemeral "(no project)" context.
-    let (mut session, project_name, project_paths, startup) = match project {
+    // Workspace selection is explicit. When none is named on the command line and no file is given
+    // we DON'T activate one — we start with a placeholder session (no workspace, no buffer) and
+    // raise the Workspaces chooser. Nothing is rendered behind it; picking a workspace activates it
+    // and lands the first buffer (`PickerSelected` → `WorkspaceActivated` → `adopt_switch`), which
+    // is when the editor first appears. When a file *is* given but no workspace (a path outside any
+    // configured workspace, e.g. `ae /etc/hosts`), we open it directly via `workspace/open_path`,
+    // which lands it in a fresh ephemeral "(no workspace)" context.
+    let (mut session, workspace_name, workspace_paths, startup) = match workspace {
         None => {
             let resolved = match file {
                 Some(f) => Some(crate::app::resolve_cli_path(f)?),
@@ -2114,44 +2114,44 @@ pub async fn bootstrap(
             };
             match resolved {
                 // An existing external file: open it in an ephemeral context. (A directory or a
-                // not-yet-existing path with no project has nowhere sensible to root, so fall
+                // not-yet-existing path with no workspace has nowhere sensible to root, so fall
                 // through to the chooser.)
                 Some(abs) if abs.is_file() => {
                     let opened = handle
-                        .rpc::<ProjectOpenPath>(ProjectOpenPathParams {
+                        .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                             path: abs.display().to_string(),
                             transient: None,
                         })
                         .await?;
-                    let project_paths = opened.project.paths.clone();
+                    let workspace_paths = opened.workspace.paths.clone();
                     let open = opened.opened.ok_or_else(|| {
-                        anyhow::anyhow!("project/open_path returned no buffer")
+                        anyhow::anyhow!("workspace/open_path returned no buffer")
                     })?;
                     let mut session = Session::new(
-                        opened.project.name.clone(),
-                        project_paths.clone(),
-                        buffer_info(open, &project_paths),
+                        opened.workspace.name.clone(),
+                        workspace_paths.clone(),
+                        buffer_info(open, &workspace_paths),
                     );
                     // Launched to view this file in an ephemeral context: closing it should quit
-                    // (see `leave_ephemeral_project`), not drop to the chooser.
+                    // (see `leave_ephemeral_workspace`), not drop to the chooser.
                     session.launched_with_file = true;
-                    (session, opened.project.name, project_paths, Effects::none())
+                    (session, opened.workspace.name, workspace_paths, Effects::none())
                 }
                 _ => {
                     let mut session = Session::placeholder();
-                    let startup = session.open_picker(PickerKind::Projects, None, None, false);
+                    let startup = session.open_picker(PickerKind::Workspaces, None, None, false);
                     (session, String::new(), Vec::new(), startup)
                 }
             }
         }
-        Some(project) => {
+        Some(workspace) => {
             let activated = handle
-                .rpc::<ProjectActivate>(ProjectActivateParams {
-                    name: project.to_string(),
+                .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
+                    name: workspace.to_string(),
                     open_last: file.is_none(),
                 })
                 .await?;
-            let project_paths = activated.project.paths.clone();
+            let workspace_paths = activated.workspace.paths.clone();
 
             // Resolve the CLI path once, then branch on file vs directory. A directory lands in a
             // transient scratch and opens the file explorer over it (the `startup` effects below);
@@ -2172,8 +2172,8 @@ pub async fn bootstrap(
                 }
                 Some(abs) => {
                     let abs = abs.display().to_string();
-                    match aether_client::session::strip_longest_root(&abs, &project_paths) {
-                        // Inside a project root: ordinary project-relative open.
+                    match aether_client::session::strip_longest_root(&abs, &workspace_paths) {
+                        // Inside a workspace root: ordinary workspace-relative open.
                         Some((path_index, relative_path)) => {
                             handle
                                 .rpc::<BufferOpen>(BufferOpenParams {
@@ -2184,29 +2184,29 @@ pub async fn bootstrap(
                                 })
                                 .await?
                         }
-                        // Outside the named project's roots: open it as an external (guest) buffer
-                        // in that project rather than refusing the launch.
+                        // Outside the named workspace's roots: open it as an external (guest) buffer
+                        // in that workspace rather than refusing the launch.
                         None => handle
-                            .rpc::<ProjectOpenPath>(ProjectOpenPathParams {
+                            .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                                 path: abs,
                                 transient: None,
                             })
                             .await?
                             .opened
                             .ok_or_else(|| {
-                                anyhow::anyhow!("project/open_path returned no buffer")
+                                anyhow::anyhow!("workspace/open_path returned no buffer")
                             })?,
                     }
                 }
                 None => activated.opened.ok_or_else(|| {
-                    anyhow::anyhow!("project/activate returned no landing buffer")
+                    anyhow::anyhow!("workspace/activate returned no landing buffer")
                 })?,
             };
 
             let mut session = Session::new(
-                activated.project.name.clone(),
-                project_paths.clone(),
-                buffer_info(open, &project_paths),
+                activated.workspace.name.clone(),
+                workspace_paths.clone(),
+                buffer_info(open, &workspace_paths),
             );
             let startup = match &resolved {
                 Some(abs) if abs.is_dir() => session.open_picker(
@@ -2217,15 +2217,15 @@ pub async fn bootstrap(
                 ),
                 _ => Effects::none(),
             };
-            (session, activated.project.name, project_paths, startup)
+            (session, activated.workspace.name, workspace_paths, startup)
         }
     };
 
     // Fetch the persisted app settings (e.g. the soft-wrap default) alongside the boot effects.
     let startup = startup.and(session.startup());
     let state = make_state(
-        project_name,
-        project_paths,
+        workspace_name,
+        workspace_paths,
         cols,
         rows,
         ConnState::Connected,
@@ -2237,16 +2237,16 @@ pub async fn bootstrap(
 /// the boot-time connecting screen ([`connecting_state`]), so the two can't drift on the long
 /// field list.
 fn make_state(
-    project_name: String,
-    project_paths: Vec<String>,
+    workspace_name: String,
+    workspace_paths: Vec<String>,
     cols: u16,
     rows: u16,
     conn: ConnState,
 ) -> AppState {
-    let root_labels = labels::root_labels(&project_paths);
+    let root_labels = labels::root_labels(&workspace_paths);
     AppState {
-        project_name,
-        project_paths,
+        workspace_name,
+        workspace_paths,
         root_labels,
         viewport_cols: cols as u32,
         viewport_rows: (rows as u32).saturating_sub(1),
@@ -2262,7 +2262,7 @@ fn make_state(
         open_path_prompt: None,
         confirm_prompt: None,
         editor: None,
-        project_settings: None,
+        workspace_settings: None,
         app_settings: None,
         help: Default::default(),
         lsp_status: Default::default(),
@@ -2271,8 +2271,8 @@ fn make_state(
     }
 }
 
-/// The view-model for the boot-time "Connecting…" backdrop: no project, no editor, `Connecting`
-/// conn state. `ui::draw` renders its no-project backdrop with the centered indicator.
+/// The view-model for the boot-time "Connecting…" backdrop: no workspace, no editor, `Connecting`
+/// conn state. `ui::draw` renders its no-workspace backdrop with the centered indicator.
 pub fn connecting_state(cols: u16, rows: u16) -> AppState {
     make_state(String::new(), Vec::new(), cols, rows, ConnState::Connecting)
 }

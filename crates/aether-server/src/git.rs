@@ -683,18 +683,18 @@ pub fn dir_statuses(dir: &Path) -> HashMap<String, GitStatus> {
     out
 }
 
-/// A repo's per-file status, scoped to one project root, for the Files picker. Holds the root's
+/// A repo's per-file status, scoped to one workspace root, for the Files picker. Holds the root's
 /// own path within the repo plus a `repo-relative path → status` map, so a file's status is a
 /// single lookup keyed by its root-relative path (no per-file repo discovery or canonicalisation).
 pub struct RepoStatus {
-    /// The project root's path relative to the repo workdir (empty when the root *is* the repo
+    /// The workspace root's path relative to the repo workdir (empty when the root *is* the repo
     /// root). Joined with a file's root-relative path to form its repo-relative key.
     root_rel: PathBuf,
     map: HashMap<PathBuf, GitStatus>,
 }
 
 impl RepoStatus {
-    /// Status of a file given its path relative to the project root (forward-slash separated, as
+    /// Status of a file given its path relative to the workspace root (forward-slash separated, as
     /// stored in the workspace index). `None` when the file is clean.
     pub fn status_of(&self, root_rel_path: &str) -> Option<GitStatus> {
         self.map.get(&self.root_rel.join(root_rel_path)).copied()
@@ -745,7 +745,7 @@ pub struct ChangedFile {
 
 /// Diff every changed file under `root` against HEAD (combined staged+unstaged), opening the repo
 /// **once** — discovery, the HEAD tree, and the index are resolved a single time and reused for
-/// every file, instead of re-discovering the repo per file (the slow part when a project has many
+/// every file, instead of re-discovering the repo per file (the slow part when a workspace has many
 /// changes). Untracked directories are not recursed: a wholly-new directory collapses to one entry
 /// (git's default `git status`), which is a directory and skipped — only individual changed files
 /// are diffable. Files with no net change are dropped. Best-effort: empty on any libgit2 error.
@@ -1613,7 +1613,7 @@ mod tests {
         std::fs::write(root.join("new.rs"), "new\n").unwrap(); // untracked at root
 
         let rs = repo_status_for_root(root).expect("root is in a repo");
-        // Keyed by the path relative to the project root (which == repo root here).
+        // Keyed by the path relative to the workspace root (which == repo root here).
         assert_eq!(rs.status_of("clean.rs"), None, "clean file has no status");
         assert_eq!(rs.status_of("sub/mod.rs"), Some(GitStatus::Modified));
         assert_eq!(rs.status_of("new.rs"), Some(GitStatus::Untracked));
@@ -1621,7 +1621,7 @@ mod tests {
 
     #[test]
     fn repo_status_for_root_keys_relative_to_a_subdir_root() {
-        // When the project root is a subdirectory of the repo, lookups are still keyed by the
+        // When the workspace root is a subdirectory of the repo, lookups are still keyed by the
         // path relative to that root — the repo-relative prefix is handled internally.
         let dir = tempfile::tempdir().unwrap();
         let repo_root = dir.path();

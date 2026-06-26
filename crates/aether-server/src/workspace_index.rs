@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Resolve `abs` to `(root_index, relative_path)` against the project's roots. Returns `None`
+/// Resolve `abs` to `(root_index, relative_path)` against the workspace's roots. Returns `None`
 /// when `abs` is outside every root. The relative path uses forward slashes — UTF-8 only, which
 /// matches every other place we ferry paths over the wire.
 ///
 /// Kept here so the file walker and the buffer-picker candidate builder agree on the shape they
 /// hand to the picker for the same on-disk file.
-pub fn project_relative_parts(abs: &Path, roots: &[PathBuf]) -> Option<(u32, String)> {
+pub fn workspace_relative_parts(abs: &Path, roots: &[PathBuf]) -> Option<(u32, String)> {
     for (i, root) in roots.iter().enumerate() {
         if abs == root {
             return Some((i as u32, String::new()));
@@ -31,11 +31,11 @@ pub fn project_relative_parts(abs: &Path, roots: &[PathBuf]) -> Option<(u32, Str
 
 /// Legacy multi-root display string used by the Buffers picker (its protocol still sends a
 /// flattened `display`, unlike Files/Grep which now ferry `path_index` + `relative_path`). For
-/// multi-root projects, prefixes with the root's basename so two roots' `lib.rs`es don't
+/// multi-root workspaces, prefixes with the root's basename so two roots' `lib.rs`es don't
 /// collide visually; for single-root, returns the bare relative path. Returns `None` if `abs`
 /// is outside every root.
-pub fn project_relative_display(abs: &Path, roots: &[PathBuf]) -> Option<String> {
-    let (idx, rel) = project_relative_parts(abs, roots)?;
+pub fn workspace_relative_display(abs: &Path, roots: &[PathBuf]) -> Option<String> {
+    let (idx, rel) = workspace_relative_parts(abs, roots)?;
     let root = &roots[idx as usize];
     let root_name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if rel.is_empty() {
@@ -55,7 +55,7 @@ pub fn project_relative_display(abs: &Path, roots: &[PathBuf]) -> Option<String>
 pub struct CachedFile {
     /// Canonical absolute path on disk. The `picker/select` action returns this.
     pub abs: String,
-    /// Index into the project's root list this file lives under.
+    /// Index into the workspace's root list this file lives under.
     pub path_index: u32,
     /// Path relative to `roots[path_index]`, forward-slash separated. Used as both the picker
     /// row's display tail and the matcher haystack.

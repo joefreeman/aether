@@ -22,21 +22,21 @@ use tokio::sync::{mpsc, Mutex};
 pub type SharedState = Arc<Mutex<ServerState>>;
 
 pub struct ServerState {
-    /// Loaded projects, keyed by project name. Populated lazily by `project/activate` — a project
-    /// the user has configured but never activated is *not* here. Each entry owns the project's
-    /// canonical paths and workspace index. Never removed at runtime (no project/unload concept);
+    /// Loaded workspaces, keyed by workspace name. Populated lazily by `workspace/activate` — a workspace
+    /// the user has configured but never activated is *not* here. Each entry owns the workspace's
+    /// canonical paths and workspace index. Never removed at runtime (no workspace/unload concept);
     /// dropped only with the server.
-    pub projects: HashMap<String, ProjectEntry>,
+    pub workspaces: HashMap<String, WorkspaceEntry>,
     /// File-system watcher for this server. `None` until [`crate::watcher::spawn`] runs — that
-    /// happens during `run_with_listener`. `project/activate` reaches in to add new project roots
-    /// once a project gets loaded. Per-server (not a global) so tests can spin up multiple servers
+    /// happens during `run_with_listener`. `workspace/activate` reaches in to add new workspace roots
+    /// once a workspace gets loaded. Per-server (not a global) so tests can spin up multiple servers
     /// in the same process without sharing watcher state.
     pub watcher: Option<Arc<std::sync::Mutex<notify::RecommendedWatcher>>>,
     pub buffers: HashMap<BufferId, Buffer>,
-    /// Which project each open buffer belongs to. Populated when a buffer is created
-    /// (`buffer/open`) and looked up when scoping per-buffer state to a project (e.g. on
-    /// `project/activate`, when tearing down a client's state for the previously active project).
-    pub buffer_projects: HashMap<BufferId, String>,
+    /// Which workspace each open buffer belongs to. Populated when a buffer is created
+    /// (`buffer/open`) and looked up when scoping per-buffer state to a workspace (e.g. on
+    /// `workspace/activate`, when tearing down a client's state for the previously active workspace).
+    pub buffer_workspaces: HashMap<BufferId, String>,
     pub clients: HashMap<ClientId, ClientSession>,
     pub viewports: HashMap<ViewportId, Viewport>,
     pub cursors: HashMap<(ClientId, BufferId), CursorState>,
@@ -120,7 +120,7 @@ pub struct ServerState {
     /// Latest diagnostics per file **path**, line-granular (no byte column). Every `publishDiagnostics`
     /// updates this keyed by the file's canonical path — for *every* file a server reports, open or
     /// not (rust-analyzer's `cargo check` / flycheck pushes cover the whole build). This is the sole
-    /// source for the project-wide `Space Alt-d` picker — independent of the buffer-keyed
+    /// source for the workspace-wide `Space Alt-d` picker — independent of the buffer-keyed
     /// [`Self::diagnostics`], not merged with it — and it retains a file's last-known set after its
     /// buffer closes. An empty push removes the entry.
     pub path_diagnostics: HashMap<std::path::PathBuf, Vec<crate::lsp::diagnostics::RawDiagnostic>>,
@@ -132,11 +132,11 @@ pub struct ServerState {
     /// whose language has a server — see `cursor::resolve_navigation_motion`.
     pub document_symbols: HashMap<BufferId, Vec<crate::picker::SymbolCandidate>>,
     /// This server instance's start time (unix ms) — its identity, reported to clients on
-    /// `project/activate` so they can detect a daemon restart across a reconnect. Set once at
+    /// `workspace/activate` so they can detect a daemon restart across a reconnect. Set once at
     /// construction; the same value is written to the runtime file.
     pub started_at_unix_ms: u64,
-    /// Where to read/write the persisted project-session file
-    /// ([`crate::config::ProjectSessions`]). `Some` in the real server (set at boot in
+    /// Where to read/write the persisted workspace-session file
+    /// ([`crate::config::WorkspaceSessions`]). `Some` in the real server (set at boot in
     /// `server::run`); `None` everywhere else — in-process tests and embeddings leave it unset so
     /// they never touch the developer's real `~/.config/aether/sessions.json`. When `None`, session
     /// recency/restore is simply disabled (all logic short-circuits).
@@ -261,49 +261,49 @@ impl NavHistory {
     }
 }
 
-/// One project, loaded and ready to serve. Owns its canonical roots and workspace index (the
-/// picker file cache). One per active project; lives in `ServerState::projects`, keyed by `id`.
+/// One workspace, loaded and ready to serve. Owns its canonical roots and workspace index (the
+/// picker file cache). One per active workspace; lives in `ServerState::workspaces`, keyed by `id`.
 ///
-/// Identity (`id`) is separate from the human name (`name`). A persisted project — one backed by a
+/// Identity (`id`) is separate from the human name (`name`). A persisted workspace — one backed by a
 /// `<name>.toml` on disk — has `name: Some(..)`, and its `id` equals that name. An *ephemeral*
-/// project — synthesized to host files opened outside any configured project (`ae /path/to/file`,
+/// workspace — synthesized to host files opened outside any configured workspace (`ae /path/to/file`,
 /// open-from-path, goto-def into the stdlib) — has `name: None`, a generated reserved `id`, no
 /// config on disk, and is auto-removed once its last buffer closes. So `name.is_some()` *is* the
 /// persistence signal: there's no separate "ephemeral" flag that could fall out of sync.
-pub struct ProjectEntry {
-    /// Stable identity and `projects` map key. For a persisted project this equals its `name`; for
-    /// an ephemeral project it's a generated token (see [`ServerState::ephemeral_project_id`]) that
-    /// can never collide with a valid project name — it contains a path separator, which
-    /// `validate_project_name` forbids.
+pub struct WorkspaceEntry {
+    /// Stable identity and `workspaces` map key. For a persisted workspace this equals its `name`; for
+    /// an ephemeral workspace it's a generated token (see [`ServerState::ephemeral_workspace_id`]) that
+    /// can never collide with a valid workspace name — it contains a path separator, which
+    /// `validate_workspace_name` forbids.
     pub id: String,
-    /// The persisted project name, or `None` for an ephemeral project. `Some` ⇔ a `<name>.toml`
-    /// exists on disk ⇔ this project survives losing its last buffer.
+    /// The persisted workspace name, or `None` for an ephemeral workspace. `Some` ⇔ a `<name>.toml`
+    /// exists on disk ⇔ this workspace survives losing its last buffer.
     pub name: Option<String>,
-    /// Canonicalized project paths. Each is either a file or a directory. Empty for an ephemeral
-    /// project (so every buffer in it is "external" — see [`ProjectEntry::contains`]).
+    /// Canonicalized workspace paths. Each is either a file or a directory. Empty for an ephemeral
+    /// workspace (so every buffer in it is "external" — see [`WorkspaceEntry::contains`]).
     pub paths: Vec<PathBuf>,
-    /// Workspace-wide candidate cache for this project. Walked lazily on first picker access;
+    /// Workspace-wide candidate cache for this workspace. Walked lazily on first picker access;
     /// survives picker hide/show.
     pub workspace_index: Arc<WorkspaceIndex>,
-    /// Most-recently-used buffers in this project, front = most-recent. Bumped on every
+    /// Most-recently-used buffers in this workspace, front = most-recent. Bumped on every
     /// `buffer/open` (fresh open, reopen, or attach-by-id). Drives the buffer picker's empty-
-    /// query ordering, and the `last_buffer_id` returned by `project/activate` (so re-attaching
-    /// to a project drops the user on the buffer they last had).
+    /// query ordering, and the `last_buffer_id` returned by `workspace/activate` (so re-attaching
+    /// to a workspace drops the user on the buffer they last had).
     ///
-    /// Lives on the project — not on the client — so it persists across client disconnects.
-    /// A new TUI invocation gets a fresh `ClientId` but inherits the project's MRU.
+    /// Lives on the workspace — not on the client — so it persists across client disconnects.
+    /// A new TUI invocation gets a fresh `ClientId` but inherits the workspace's MRU.
     pub mru_buffers: VecDeque<BufferId>,
-    /// Buffers restored from the persisted session ([`crate::config::ProjectSession`]) on
+    /// Buffers restored from the persisted session ([`crate::config::WorkspaceSession`]) on
     /// activation but not yet loaded into memory — most-recently-used first, mirroring the order
     /// they were saved in. Each holds a reserved [`BufferId`] (its picker identity) and the file's
     /// canonical path; it carries no rope/syntax/LSP. The buffer picker lists them greyed out
     /// after the live buffers; opening one materializes a real buffer (see
     /// `buffer_open`'s by-id path) and drops it from here. Never contains a path that's also a
-    /// live buffer in this project — promotion removes it.
+    /// live buffer in this workspace — promotion removes it.
     pub dormant_buffers: Vec<DormantBuffer>,
 }
 
-/// A session-restored buffer that hasn't been loaded yet. See [`ProjectEntry::dormant_buffers`].
+/// A session-restored buffer that hasn't been loaded yet. See [`WorkspaceEntry::dormant_buffers`].
 #[derive(Debug, Clone)]
 pub struct DormantBuffer {
     /// Reserved id — the buffer's identity in the picker, so selecting it can route back through
@@ -313,9 +313,9 @@ pub struct DormantBuffer {
     pub path: PathBuf,
 }
 
-impl ProjectEntry {
-    /// True iff the given canonical path falls under one of this project's roots. Always `false`
-    /// for an ephemeral project (no roots), which is exactly what makes every buffer in it
+impl WorkspaceEntry {
+    /// True iff the given canonical path falls under one of this workspace's roots. Always `false`
+    /// for an ephemeral workspace (no roots), which is exactly what makes every buffer in it
     /// "external" — see [`ServerState::buffer_is_external`].
     pub fn contains(&self, canonical: &Path) -> bool {
         self.paths
@@ -338,10 +338,10 @@ impl Default for ServerState {
 impl ServerState {
     pub fn new() -> Self {
         Self {
-            projects: HashMap::new(),
+            workspaces: HashMap::new(),
             watcher: None,
             buffers: HashMap::new(),
-            buffer_projects: HashMap::new(),
+            buffer_workspaces: HashMap::new(),
             clients: HashMap::new(),
             viewports: HashMap::new(),
             cursors: HashMap::new(),
@@ -374,41 +374,41 @@ impl ServerState {
         }
     }
 
-    /// Look up a loaded project by name. Returns `None` if the project hasn't been activated by
+    /// Look up a loaded workspace by name. Returns `None` if the workspace hasn't been activated by
     /// any client yet (or doesn't exist).
-    pub fn project(&self, name: &str) -> Option<&ProjectEntry> {
-        self.projects.get(name)
+    pub fn workspace(&self, name: &str) -> Option<&WorkspaceEntry> {
+        self.workspaces.get(name)
     }
 
-    /// The project the given client currently has activated, if any.
-    pub fn active_project(&self, client_id: ClientId) -> Option<&ProjectEntry> {
+    /// The workspace the given client currently has activated, if any.
+    pub fn active_workspace(&self, client_id: ClientId) -> Option<&WorkspaceEntry> {
         let session = self.clients.get(&client_id)?;
-        let name = session.active_project.as_deref()?;
-        self.projects.get(name)
+        let name = session.active_workspace.as_deref()?;
+        self.workspaces.get(name)
     }
 
-    /// Same as [`Self::active_project`] but surfaces a `NO_ACTIVE_PROJECT` `RpcError` for the
-    /// common handler pattern of "require an active project or bail." Most non-`project/*`
+    /// Same as [`Self::active_workspace`] but surfaces a `NO_ACTIVE_WORKSPACE` `RpcError` for the
+    /// common handler pattern of "require an active workspace or bail." Most non-`workspace/*`
     /// handlers want this.
-    pub fn active_project_or_err(
+    pub fn active_workspace_or_err(
         &self,
         client_id: ClientId,
-    ) -> Result<&ProjectEntry, crate::error::RpcError> {
-        self.active_project(client_id)
-            .ok_or_else(crate::error::RpcError::no_active_project)
+    ) -> Result<&WorkspaceEntry, crate::error::RpcError> {
+        self.active_workspace(client_id)
+            .ok_or_else(crate::error::RpcError::no_active_workspace)
     }
 
-    /// Id of the project a buffer belongs to. `None` if the buffer is unknown or somehow
+    /// Id of the workspace a buffer belongs to. `None` if the buffer is unknown or somehow
     /// untagged (shouldn't happen for live buffers but the lookup is defensive).
-    pub fn project_for_buffer(&self, buffer_id: BufferId) -> Option<&str> {
-        self.buffer_projects.get(&buffer_id).map(|s| s.as_str())
+    pub fn workspace_for_buffer(&self, buffer_id: BufferId) -> Option<&str> {
+        self.buffer_workspaces.get(&buffer_id).map(|s| s.as_str())
     }
 
-    /// Whether a buffer is *external* to its owning project: a file-backed buffer whose path falls
-    /// under none of the project's roots. Computed live from the roots (never stored), so adding or
+    /// Whether a buffer is *external* to its owning workspace: a file-backed buffer whose path falls
+    /// under none of the workspace's roots. Computed live from the roots (never stored), so adding or
     /// removing a root reclassifies open buffers automatically. Scratch buffers (no path) and
-    /// buffers whose project can't be found are not external. Every file-backed buffer in an
-    /// ephemeral project is external (it has no roots). External buffers get no git baseline and a
+    /// buffers whose workspace can't be found are not external. Every file-backed buffer in an
+    /// ephemeral workspace is external (it has no roots). External buffers get no git baseline and a
     /// trust-restricted LSP path (see the LSP manager); the client shows an "external" marker.
     pub fn buffer_is_external(&self, buffer_id: BufferId) -> bool {
         let Some(path) = self
@@ -419,27 +419,27 @@ impl ServerState {
             return false;
         };
         match self
-            .buffer_projects
+            .buffer_workspaces
             .get(&buffer_id)
-            .and_then(|id| self.projects.get(id))
+            .and_then(|id| self.workspaces.get(id))
         {
-            Some(project) => !project.contains(path),
+            Some(workspace) => !workspace.contains(path),
             None => false,
         }
     }
 
-    /// The display number for a *new* ephemeral project: the lowest positive integer not in use by
-    /// another live ephemeral project. Mirrors [`Self::next_scratch_number`] — numbers stay small
-    /// and a freed one is reused once its project is pruned — so the picker shows `(project 1)`,
-    /// `(project 2)`, … rather than an ever-climbing counter. Because ephemeral projects are pruned
+    /// The display number for a *new* ephemeral workspace: the lowest positive integer not in use by
+    /// another live ephemeral workspace. Mirrors [`Self::next_scratch_number`] — numbers stay small
+    /// and a freed one is reused once its workspace is pruned — so the picker shows `(workspace 1)`,
+    /// `(workspace 2)`, … rather than an ever-climbing counter. Because ephemeral workspaces are pruned
     /// the moment they empty, the lowest-free number is always unique among the live set, so it
     /// doubles as the id suffix.
     fn next_ephemeral_number(&self) -> u32 {
         let used: std::collections::HashSet<u32> = self
-            .projects
+            .workspaces
             .values()
             .filter_map(|p| {
-                p.id.strip_prefix(aether_protocol::EPHEMERAL_PROJECT_PREFIX)
+                p.id.strip_prefix(aether_protocol::EPHEMERAL_WORKSPACE_PREFIX)
                     .and_then(|n| n.parse().ok())
             })
             .collect();
@@ -448,24 +448,24 @@ impl ServerState {
             .expect("u32 range is non-empty")
     }
 
-    /// Mint a fresh ephemeral-project id, `ephemeral/<n>`. The `/` can never appear in a valid
-    /// project name (`validate_project_name` rejects separators), so the id never collides with a
-    /// persisted project or resolves to an on-disk config path; `<n>` is the small reusable display
+    /// Mint a fresh ephemeral-workspace id, `ephemeral/<n>`. The `/` can never appear in a valid
+    /// workspace name (`validate_workspace_name` rejects separators), so the id never collides with a
+    /// persisted workspace or resolves to an on-disk config path; `<n>` is the small reusable display
     /// number (see [`Self::next_ephemeral_number`]).
-    pub fn ephemeral_project_id(&mut self) -> String {
+    pub fn ephemeral_workspace_id(&mut self) -> String {
         let n = self.next_ephemeral_number();
-        format!("{}{n}", aether_protocol::EPHEMERAL_PROJECT_PREFIX)
+        format!("{}{n}", aether_protocol::EPHEMERAL_WORKSPACE_PREFIX)
     }
 
-    /// Register a fresh, rootless, nameless project and return its id. The caller activates it for
+    /// Register a fresh, rootless, nameless workspace and return its id. The caller activates it for
     /// a client and opens a buffer in it; it is auto-removed when that last buffer closes (see
     /// [`Self::prune_ephemeral_if_empty`]).
-    pub fn register_ephemeral_project(&mut self) -> String {
-        let id = self.ephemeral_project_id();
+    pub fn register_ephemeral_workspace(&mut self) -> String {
+        let id = self.ephemeral_workspace_id();
         let workspace_index = Arc::new(WorkspaceIndex::new(Vec::new()));
-        self.projects.insert(
+        self.workspaces.insert(
             id.clone(),
-            ProjectEntry {
+            WorkspaceEntry {
                 id: id.clone(),
                 name: None,
                 paths: Vec::new(),
@@ -477,60 +477,60 @@ impl ServerState {
         id
     }
 
-    /// Drop an ephemeral project once it holds no buffers and no client still has it active. A
-    /// no-op for persisted projects and for ephemeral ones that still host a buffer. Call after any
-    /// buffer close so an ephemeral project's lifetime is exactly "while it has a buffer".
-    /// Returns `true` if the project was removed.
-    pub fn prune_ephemeral_if_empty(&mut self, project_id: &str) -> bool {
+    /// Drop an ephemeral workspace once it holds no buffers and no client still has it active. A
+    /// no-op for persisted workspaces and for ephemeral ones that still host a buffer. Call after any
+    /// buffer close so an ephemeral workspace's lifetime is exactly "while it has a buffer".
+    /// Returns `true` if the workspace was removed.
+    pub fn prune_ephemeral_if_empty(&mut self, workspace_id: &str) -> bool {
         let is_ephemeral = self
-            .projects
-            .get(project_id)
+            .workspaces
+            .get(workspace_id)
             .is_some_and(|p| p.is_ephemeral());
         if !is_ephemeral {
             return false;
         }
-        if self.buffers_in_project(project_id).is_empty()
-            && !self.project_active_anywhere(project_id)
+        if self.buffers_in_workspace(workspace_id).is_empty()
+            && !self.workspace_active_anywhere(workspace_id)
         {
-            self.projects.remove(project_id);
+            self.workspaces.remove(workspace_id);
             return true;
         }
         false
     }
 
-    /// Retire an ephemeral project the moment it loses its *last buffer*: remove it and clear it
+    /// Retire an ephemeral workspace the moment it loses its *last buffer*: remove it and clear it
     /// from any client still parked in it. Unlike [`Self::prune_ephemeral_if_empty`] — which keeps
     /// an empty context alive while a client has it active — this *evicts* those clients (their
-    /// `active_project` becomes `None`), because an ephemeral context with no files has no reason
+    /// `active_workspace` becomes `None`), because an ephemeral context with no files has no reason
     /// to linger in the switcher even if a second client had selected it. Call after a user-driven
     /// `buffer/close`; the evicted clients are being told the buffer closed (`buffer/closed`) and
-    /// drop to the chooser. Returns whether the project was removed.
-    pub fn retire_ephemeral_if_empty(&mut self, project_id: &str) -> bool {
+    /// drop to the chooser. Returns whether the workspace was removed.
+    pub fn retire_ephemeral_if_empty(&mut self, workspace_id: &str) -> bool {
         let is_ephemeral = self
-            .projects
-            .get(project_id)
+            .workspaces
+            .get(workspace_id)
             .is_some_and(|p| p.is_ephemeral());
-        if !is_ephemeral || !self.buffers_in_project(project_id).is_empty() {
+        if !is_ephemeral || !self.buffers_in_workspace(workspace_id).is_empty() {
             return false;
         }
         for s in self.clients.values_mut() {
-            if s.active_project.as_deref() == Some(project_id) {
-                s.active_project = None;
+            if s.active_workspace.as_deref() == Some(workspace_id) {
+                s.active_workspace = None;
             }
         }
-        self.projects.remove(project_id);
+        self.workspaces.remove(workspace_id);
         true
     }
 
-    /// Rename a loaded project in place: move its entry to the new key (updating `entry.name`),
-    /// then re-point every buffer association and client active-project that referenced the old
+    /// Rename a loaded workspace in place: move its entry to the new key (updating `entry.name`),
+    /// then re-point every buffer association and client active-workspace that referenced the old
     /// name. Open buffers are otherwise untouched — only the name key changes, nothing is closed —
-    /// so this is safe even with dirty buffers in the project. Returns the project's root paths
-    /// (display form) on success, or `None` if no project was loaded under `old`. The caller is
+    /// so this is safe even with dirty buffers in the workspace. Returns the workspace's root paths
+    /// (display form) on success, or `None` if no workspace was loaded under `old`. The caller is
     /// responsible for renaming the on-disk config and for rejecting name collisions first.
-    pub fn rename_project(&mut self, old: &str, new: &str) -> Option<Vec<String>> {
-        let mut entry = self.projects.remove(old)?;
-        // Rename only applies to persisted projects, whose id tracks their name.
+    pub fn rename_workspace(&mut self, old: &str, new: &str) -> Option<Vec<String>> {
+        let mut entry = self.workspaces.remove(old)?;
+        // Rename only applies to persisted workspaces, whose id tracks their name.
         entry.id = new.to_string();
         entry.name = Some(new.to_string());
         let paths: Vec<String> = entry
@@ -538,64 +538,64 @@ impl ServerState {
             .iter()
             .map(|p| p.display().to_string())
             .collect();
-        self.projects.insert(new.to_string(), entry);
-        for project in self.buffer_projects.values_mut() {
-            if project == old {
-                *project = new.to_string();
+        self.workspaces.insert(new.to_string(), entry);
+        for workspace in self.buffer_workspaces.values_mut() {
+            if workspace == old {
+                *workspace = new.to_string();
             }
         }
         for session in self.clients.values_mut() {
-            if session.active_project.as_deref() == Some(old) {
-                session.active_project = Some(new.to_string());
+            if session.active_workspace.as_deref() == Some(old) {
+                session.active_workspace = Some(new.to_string());
             }
         }
         Some(paths)
     }
 
-    /// True if any connected client currently has `name` as its active project. `project/delete`
+    /// True if any connected client currently has `name` as its active workspace. `workspace/delete`
     /// refuses in that case so deletion can't pull the rug out from under an open session.
-    pub fn project_active_anywhere(&self, name: &str) -> bool {
+    pub fn workspace_active_anywhere(&self, name: &str) -> bool {
         self.clients
             .values()
-            .any(|c| c.active_project.as_deref() == Some(name))
+            .any(|c| c.active_workspace.as_deref() == Some(name))
     }
 
-    /// Buffer ids belonging to `name`. Used by `project/delete` to find what it would close (and
+    /// Buffer ids belonging to `name`. Used by `workspace/delete` to find what it would close (and
     /// to screen them for unsaved changes first).
-    pub fn buffers_in_project(&self, name: &str) -> Vec<BufferId> {
-        self.buffer_projects
+    pub fn buffers_in_workspace(&self, name: &str) -> Vec<BufferId> {
+        self.buffer_workspaces
             .iter()
             .filter(|(_, p)| p.as_str() == name)
             .map(|(id, _)| *id)
             .collect()
     }
 
-    /// Whether any open buffer (in any project) has unsaved edits. The idle reaper consults this so
+    /// Whether any open buffer (in any workspace) has unsaved edits. The idle reaper consults this so
     /// an auto-started server never shuts itself down while work is in flight.
     pub fn has_unsaved_buffers(&self) -> bool {
         self.buffers.values().any(|b| b.dirty)
     }
 
-    /// How many open buffers in `project` have unsaved edits (`Buffer::dirty`). Drives the
-    /// unsaved-count shown on each row of the project picker. `0` for a project with no loaded
-    /// buffers (the common case for a configured-but-unvisited project).
-    pub fn unsaved_buffer_count(&self, project: &str) -> u32 {
-        self.buffer_projects
+    /// How many open buffers in `workspace` have unsaved edits (`Buffer::dirty`). Drives the
+    /// unsaved-count shown on each row of the workspace picker. `0` for a workspace with no loaded
+    /// buffers (the common case for a configured-but-unvisited workspace).
+    pub fn unsaved_buffer_count(&self, workspace: &str) -> u32 {
+        self.buffer_workspaces
             .iter()
             .filter(|(id, p)| {
-                p.as_str() == project && self.buffers.get(id).map(|b| b.dirty).unwrap_or(false)
+                p.as_str() == workspace && self.buffers.get(id).map(|b| b.dirty).unwrap_or(false)
             })
             .count() as u32
     }
 
-    /// The display number to assign a *new* scratch buffer in `project`: the lowest positive
+    /// The display number to assign a *new* scratch buffer in `workspace`: the lowest positive
     /// integer not already in use by another scratch there. Keeps `(scratch N)` numbers small and
     /// stable, reusing one once its buffer closes. Call before inserting the new buffer.
-    pub fn next_scratch_number(&self, project: &str) -> u32 {
+    pub fn next_scratch_number(&self, workspace: &str) -> u32 {
         let used: std::collections::HashSet<u32> = self
-            .buffer_projects
+            .buffer_workspaces
             .iter()
-            .filter(|(_, p)| p.as_str() == project)
+            .filter(|(_, p)| p.as_str() == workspace)
             .filter_map(|(id, _)| self.buffers.get(id))
             .filter_map(|b| b.scratch_number)
             .collect();
@@ -604,14 +604,14 @@ impl ServerState {
             .expect("u32 range is non-empty")
     }
 
-    /// Buffer ids in `project` whose backing file is at or under `canonical` — an exact match for
+    /// Buffer ids in `workspace` whose backing file is at or under `canonical` — an exact match for
     /// a file, or a path-prefix match for a directory. Used by `path/delete` to find the buffers a
     /// deletion would close (and to screen them for unsaved changes first).
-    pub fn buffers_under_path(&self, project: &str, canonical: &Path) -> Vec<BufferId> {
+    pub fn buffers_under_path(&self, workspace: &str, canonical: &Path) -> Vec<BufferId> {
         self.buffers
             .iter()
             .filter(|(id, b)| {
-                self.buffer_projects.get(id).map(|s| s.as_str()) == Some(project)
+                self.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(workspace)
                     && b.canonical_path
                         .as_deref()
                         .is_some_and(|p| p == canonical || p.starts_with(canonical))
@@ -621,7 +621,7 @@ impl ServerState {
     }
 
     /// Close one buffer: drop it and every per-`(client, buffer)` slice keyed to it. This is the
-    /// canonical `buffer/close` teardown, shared by root removal, project deletion, and path
+    /// canonical `buffer/close` teardown, shared by root removal, workspace deletion, and path
     /// deletion so they can't drift out of sync.
     /// Returns the key of a language server that was torn down because this was its last buffer
     /// (so the caller can refresh open status views), or `None`.
@@ -634,7 +634,7 @@ impl ServerState {
             .map(crate::lsp::uri::path_to_uri);
         let stopped_server = lsp_uri.and_then(|uri| self.lsp.notify_close(id, &uri));
         self.buffers.remove(&id);
-        self.buffer_projects.remove(&id);
+        self.buffer_workspaces.remove(&id);
         self.viewports.retain(|_, v| v.buffer_id != id);
         self.cursors.retain(|(_, b), _| *b != id);
         self.motion_history.retain(|(_, b), _| *b != id);
@@ -657,7 +657,7 @@ impl ServerState {
 
     /// Close every buffer in `candidates` that is transient and no longer shown by any viewport.
     /// This is the "hidden ⇒ close" half of transient buffers; callers pass the buffers a client
-    /// just stopped viewing (viewport switch, project switch, disconnect) *after* dropping the
+    /// just stopped viewing (viewport switch, workspace switch, disconnect) *after* dropping the
     /// stale viewports. Dirty buffers are skipped as a guard — the first edit promotes, so a
     /// dirty transient shouldn't exist. Returns the ids closed and the keys of language servers
     /// torn down with them (so callers can refresh picker views).
@@ -684,18 +684,18 @@ impl ServerState {
         (closed, stopped)
     }
 
-    /// Delete a loaded project's in-memory state: drop the project entry and close every buffer
+    /// Delete a loaded workspace's in-memory state: drop the workspace entry and close every buffer
     /// that belonged to it, tearing down all per-buffer state (same teardown as `buffer/close` /
-    /// `project/remove_root`). Returns the closed buffer ids. The caller is responsible for the
-    /// refusal checks ([`Self::project_active_anywhere`], dirty buffers) and for removing the
-    /// on-disk config. A no-op for the project entry when it was never loaded; still closes any
+    /// `workspace/remove_root`). Returns the closed buffer ids. The caller is responsible for the
+    /// refusal checks ([`Self::workspace_active_anywhere`], dirty buffers) and for removing the
+    /// on-disk config. A no-op for the workspace entry when it was never loaded; still closes any
     /// of its buffers that exist.
-    pub fn delete_project(&mut self, name: &str) -> Vec<BufferId> {
-        let closed = self.buffers_in_project(name);
+    pub fn delete_workspace(&mut self, name: &str) -> Vec<BufferId> {
+        let closed = self.buffers_in_workspace(name);
         for &id in &closed {
             self.close_buffer(id);
         }
-        self.projects.remove(name);
+        self.workspaces.remove(name);
         closed
     }
 
@@ -793,30 +793,30 @@ impl ServerState {
         self.nav_history.remove(&client_id);
     }
 
-    /// Bump `buffer_id` to the front of its project's MRU. Called from `buffer/open` every time
+    /// Bump `buffer_id` to the front of its workspace's MRU. Called from `buffer/open` every time
     /// any client lands on a buffer — fresh open, reopen, or attach-by-id. No-op if the buffer
-    /// has no recorded project (shouldn't happen for live buffers but the lookup is defensive).
+    /// has no recorded workspace (shouldn't happen for live buffers but the lookup is defensive).
     pub fn touch_mru(&mut self, buffer_id: BufferId) {
-        let Some(project_name) = self.buffer_projects.get(&buffer_id).cloned() else {
+        let Some(workspace_name) = self.buffer_workspaces.get(&buffer_id).cloned() else {
             return;
         };
-        let Some(project) = self.projects.get_mut(&project_name) else {
+        let Some(workspace) = self.workspaces.get_mut(&workspace_name) else {
             return;
         };
-        project.mru_buffers.retain(|&b| b != buffer_id);
-        project.mru_buffers.push_front(buffer_id);
+        workspace.mru_buffers.retain(|&b| b != buffer_id);
+        workspace.mru_buffers.push_front(buffer_id);
     }
 
-    /// Drop `buffer_id` from every project's MRU. Called from `buffer/close` so a closed buffer
+    /// Drop `buffer_id` from every workspace's MRU. Called from `buffer/close` so a closed buffer
     /// doesn't reappear at the top of the picker on the next open.
     pub fn drop_buffer_from_mru(&mut self, buffer_id: BufferId) {
-        for project in self.projects.values_mut() {
-            project.mru_buffers.retain(|&b| b != buffer_id);
+        for workspace in self.workspaces.values_mut() {
+            workspace.mru_buffers.retain(|&b| b != buffer_id);
         }
     }
 
-    /// The set of file-backed buffers to persist for `project_name`, most-recently-used first:
-    /// the project's live MRU buffers that have a path, then its still-dormant buffers (already in
+    /// The set of file-backed buffers to persist for `workspace_name`, most-recently-used first:
+    /// the workspace's live MRU buffers that have a path, then its still-dormant buffers (already in
     /// MRU order). Deduplicated by path. This is exactly what a future activation should restore,
     /// so it's what gets written to the session file.
     ///
@@ -827,13 +827,13 @@ impl ServerState {
     /// restored set is just the working buffers you edited or explicitly kept (which clears the
     /// transient flag — promotion — and brings them back in here). It also means a preview's
     /// open/auto-close never churns the file.
-    pub fn session_buffer_paths(&self, project_name: &str) -> Vec<PathBuf> {
-        let Some(project) = self.projects.get(project_name) else {
+    pub fn session_buffer_paths(&self, workspace_name: &str) -> Vec<PathBuf> {
+        let Some(workspace) = self.workspaces.get(workspace_name) else {
             return Vec::new();
         };
         let mut out: Vec<PathBuf> = Vec::new();
         let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
-        for id in &project.mru_buffers {
+        for id in &workspace.mru_buffers {
             let Some(buf) = self.buffers.get(id) else {
                 continue;
             };
@@ -846,7 +846,7 @@ impl ServerState {
                 }
             }
         }
-        for d in &project.dormant_buffers {
+        for d in &workspace.dormant_buffers {
             if seen.insert(d.path.as_path()) {
                 out.push(d.path.clone());
             }
@@ -854,28 +854,28 @@ impl ServerState {
         out
     }
 
-    /// Remove the dormant entry for `canonical` from `project_name`, if present. Called when a live
+    /// Remove the dormant entry for `canonical` from `workspace_name`, if present. Called when a live
     /// buffer for that path opens, so the now-loaded file stops showing as a greyed dormant row.
-    pub fn promote_dormant(&mut self, project_name: &str, canonical: &Path) {
-        if let Some(project) = self.projects.get_mut(project_name) {
-            project.dormant_buffers.retain(|d| d.path.as_path() != canonical);
+    pub fn promote_dormant(&mut self, workspace_name: &str, canonical: &Path) {
+        if let Some(workspace) = self.workspaces.get_mut(workspace_name) {
+            workspace.dormant_buffers.retain(|d| d.path.as_path() != canonical);
         }
     }
 
-    /// Remove and return the canonical path of the dormant buffer with `id` in `project_name`, if
+    /// Remove and return the canonical path of the dormant buffer with `id` in `workspace_name`, if
     /// any. Used by `buffer/open`'s by-id path to materialize a dormant buffer the picker selected.
-    pub fn take_dormant(&mut self, project_name: &str, id: BufferId) -> Option<PathBuf> {
-        let project = self.projects.get_mut(project_name)?;
-        let pos = project.dormant_buffers.iter().position(|d| d.id == id)?;
-        Some(project.dormant_buffers.remove(pos).path)
+    pub fn take_dormant(&mut self, workspace_name: &str, id: BufferId) -> Option<PathBuf> {
+        let workspace = self.workspaces.get_mut(workspace_name)?;
+        let pos = workspace.dormant_buffers.iter().position(|d| d.id == id)?;
+        Some(workspace.dormant_buffers.remove(pos).path)
     }
 
-    /// The id of `project_name`'s most-recently-used dormant buffer (front of the list), if any.
-    /// Used as the activation landing target when the project has no live MRU buffer yet (a cold
+    /// The id of `workspace_name`'s most-recently-used dormant buffer (front of the list), if any.
+    /// Used as the activation landing target when the workspace has no live MRU buffer yet (a cold
     /// restore after a restart).
-    pub fn first_dormant_id(&self, project_name: &str) -> Option<BufferId> {
-        self.projects
-            .get(project_name)?
+    pub fn first_dormant_id(&self, workspace_name: &str) -> Option<BufferId> {
+        self.workspaces
+            .get(workspace_name)?
             .dormant_buffers
             .first()
             .map(|d| d.id)
@@ -906,17 +906,17 @@ impl ServerState {
         self.virtual_col.retain(|(_, b), _| *b != buffer_id);
     }
 
-    /// Locate an already-open buffer for the given canonical path, if any. Scoped to a project —
-    /// two projects can independently open the same file as separate buffers, and a path lookup
-    /// during `buffer/open` for project A shouldn't latch onto project B's existing buffer.
-    pub fn buffer_for_path_in_project(
+    /// Locate an already-open buffer for the given canonical path, if any. Scoped to a workspace —
+    /// two workspaces can independently open the same file as separate buffers, and a path lookup
+    /// during `buffer/open` for workspace A shouldn't latch onto workspace B's existing buffer.
+    pub fn buffer_for_path_in_workspace(
         &self,
-        project_name: &str,
+        workspace_name: &str,
         canonical: &Path,
     ) -> Option<BufferId> {
         self.buffers.iter().find_map(|(id, b)| {
             if b.canonical_path.as_deref() == Some(canonical)
-                && self.buffer_projects.get(id).map(|s| s.as_str()) == Some(project_name)
+                && self.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(workspace_name)
             {
                 Some(*id)
             } else {
@@ -925,8 +925,8 @@ impl ServerState {
         })
     }
 
-    /// Locate every open buffer for the given canonical path, across all projects. Used by the
-    /// file watcher, which has a path but not a project context. Plural because projects with
+    /// Locate every open buffer for the given canonical path, across all workspaces. Used by the
+    /// file watcher, which has a path but not a workspace context. Plural because workspaces with
     /// overlapping roots can each hold their own buffer for the same file — a disk change must
     /// reach all of them, not whichever one iteration order yields first.
     pub fn buffers_for_path(&self, canonical: &Path) -> Vec<BufferId> {
@@ -937,37 +937,37 @@ impl ServerState {
             .collect()
     }
 
-    /// Tear down all per-`(client, buffer)` state for buffers that belong to `project_name`,
-    /// limited to one client. Used when the client switches its active project: the buffers
+    /// Tear down all per-`(client, buffer)` state for buffers that belong to `workspace_name`,
+    /// limited to one client. Used when the client switches its active workspace: the buffers
     /// themselves stay alive (other clients may have them open), but this client's viewports,
     /// cursors, history, searches, scroll, and pickers/mru are reset.
-    pub fn teardown_client_state_for_project(&mut self, client_id: ClientId, project_name: &str) {
-        // Snapshot the buffer ids belonging to the project; we'll filter all the per-(client,
+    pub fn teardown_client_state_for_workspace(&mut self, client_id: ClientId, workspace_name: &str) {
+        // Snapshot the buffer ids belonging to the workspace; we'll filter all the per-(client,
         // buffer) maps against this set. Avoids borrowing `buffers` while mutating the maps.
-        let project_buffers: std::collections::HashSet<BufferId> = self
-            .buffer_projects
+        let workspace_buffers: std::collections::HashSet<BufferId> = self
+            .buffer_workspaces
             .iter()
-            .filter_map(|(id, name)| (name == project_name).then_some(*id))
+            .filter_map(|(id, name)| (name == workspace_name).then_some(*id))
             .collect();
 
         let viewed: Vec<BufferId> = self
             .viewports
             .values()
-            .filter(|v| v.client_id == client_id && project_buffers.contains(&v.buffer_id))
+            .filter(|v| v.client_id == client_id && workspace_buffers.contains(&v.buffer_id))
             .map(|v| v.buffer_id)
             .collect();
         self.viewports
-            .retain(|_, v| !(v.client_id == client_id && project_buffers.contains(&v.buffer_id)));
-        // A transient buffer the client was previewing doesn't survive leaving the project —
+            .retain(|_, v| !(v.client_id == client_id && workspace_buffers.contains(&v.buffer_id)));
+        // A transient buffer the client was previewing doesn't survive leaving the workspace —
         // it's hidden now, same as switching buffers. (Permanent buffers stay alive for
         // re-entry, per the comment below.)
         let _ = self.close_orphaned_transients(viewed);
-        let in_proj = |c: &ClientId, b: &BufferId| *c == client_id && project_buffers.contains(b);
+        let in_proj = |c: &ClientId, b: &BufferId| *c == client_id && workspace_buffers.contains(b);
         // Viewports + the live search state get torn down (they're transient view-layer
         // bookkeeping). Cursors / motion history / tree-selection / virtual-col / scroll are
         // *preserved* — they're the user's place-in-the-buffer memory, and re-attaching to a
-        // buffer on project re-entry should restore them. The MRU is preserved for the same
-        // reason: the buffer picker filters by active project, so cross-project MRU entries
+        // buffer on workspace re-entry should restore them. The MRU is preserved for the same
+        // reason: the buffer picker filters by active workspace, so cross-workspace MRU entries
         // don't leak into the UI, but they still let us reattach to "the buffer you last had"
         // when you come back.
         self.searches.retain(|(c, b), _| !in_proj(c, b));
@@ -976,7 +976,7 @@ impl ServerState {
         self.symbol_highlight_gen.retain(|(c, b), _| !in_proj(c, b));
 
         // Pickers are per-session UI state — their candidate sets/queries reference the prior
-        // project so wipe them all on switch.
+        // workspace so wipe them all on switch.
         self.pickers.retain(|(c, _), _| *c != client_id);
     }
 }
@@ -984,8 +984,8 @@ impl ServerState {
 pub struct Buffer {
     pub id: BufferId,
     pub canonical_path: Option<PathBuf>,
-    /// Small per-project display number for a scratch buffer (`(scratch N)`), assigned at creation
-    /// as the lowest positive integer not in use by another scratch in the project — so the numbers
+    /// Small per-workspace display number for a scratch buffer (`(scratch N)`), assigned at creation
+    /// as the lowest positive integer not in use by another scratch in the workspace — so the numbers
     /// stay small, stay stable for the buffer's life, and a freed number gets reused. `None` for
     /// file-backed buffers (which display their path instead).
     pub scratch_number: Option<u32>,
@@ -1542,9 +1542,9 @@ pub struct ClientSession {
     pub client_id: ClientId,
     /// Channel for sending notifications to this client's connection task.
     pub outbound: mpsc::Sender<Notification>,
-    /// The project this client is currently working in. `None` between connect and the first
-    /// successful `project/activate`. Updated on every `project/activate`.
-    pub active_project: Option<String>,
+    /// The workspace this client is currently working in. `None` between connect and the first
+    /// successful `workspace/activate`. Updated on every `workspace/activate`.
+    pub active_workspace: Option<String>,
 }
 
 pub struct Viewport {
@@ -1582,11 +1582,11 @@ impl Viewport {
 }
 
 #[cfg(test)]
-mod project_state_tests {
+mod workspace_state_tests {
     use super::*;
 
-    fn project_entry(name: &str, paths: Vec<PathBuf>) -> ProjectEntry {
-        ProjectEntry {
+    fn workspace_entry(name: &str, paths: Vec<PathBuf>) -> WorkspaceEntry {
+        WorkspaceEntry {
             id: name.to_string(),
             name: Some(name.to_string()),
             paths: paths.clone(),
@@ -1606,91 +1606,91 @@ mod project_state_tests {
             ClientSession {
                 client_id: id,
                 outbound: tx,
-                active_project: Some(active.to_string()),
+                active_workspace: Some(active.to_string()),
             },
         )
     }
 
-    /// The "rename while the project and its buffers are open" path: re-keys the project map (and
-    /// updates `entry.name`), every buffer association, and every client's active-project pointer
-    /// — while leaving buffers and unrelated projects untouched.
+    /// The "rename while the workspace and its buffers are open" path: re-keys the workspace map (and
+    /// updates `entry.name`), every buffer association, and every client's active-workspace pointer
+    /// — while leaving buffers and unrelated workspaces untouched.
     #[test]
-    fn rename_project_rekeys_buffers_and_clients() {
+    fn rename_workspace_rekeys_buffers_and_clients() {
         let mut s = ServerState::new();
-        s.projects.insert(
+        s.workspaces.insert(
             "old".to_string(),
-            project_entry("old", vec![PathBuf::from("/tmp/x")]),
+            workspace_entry("old", vec![PathBuf::from("/tmp/x")]),
         );
-        s.projects
-            .insert("other".to_string(), project_entry("other", vec![]));
+        s.workspaces
+            .insert("other".to_string(), workspace_entry("other", vec![]));
 
-        // A buffer in the renamed project, plus one in an unrelated project.
+        // A buffer in the renamed workspace, plus one in an unrelated workspace.
         let buf = s.allocate_buffer_id();
-        s.buffer_projects.insert(buf, "old".to_string());
+        s.buffer_workspaces.insert(buf, "old".to_string());
         let other_buf = s.allocate_buffer_id();
-        s.buffer_projects.insert(other_buf, "other".to_string());
+        s.buffer_workspaces.insert(other_buf, "other".to_string());
 
         let (c1, sess1) = session("old");
         s.clients.insert(c1, sess1);
         let (c2, sess2) = session("other");
         s.clients.insert(c2, sess2);
 
-        let paths = s.rename_project("old", "new").expect("project was loaded");
+        let paths = s.rename_workspace("old", "new").expect("workspace was loaded");
         assert_eq!(paths, vec!["/tmp/x".to_string()]);
 
-        // Project map re-keyed; the entry's own name field follows.
-        assert!(!s.projects.contains_key("old"));
-        assert_eq!(s.projects.get("new").map(|p| p.id.as_str()), Some("new"));
+        // Workspace map re-keyed; the entry's own name field follows.
+        assert!(!s.workspaces.contains_key("old"));
+        assert_eq!(s.workspaces.get("new").map(|p| p.id.as_str()), Some("new"));
         assert_eq!(
-            s.projects.get("new").and_then(|p| p.name.as_deref()),
+            s.workspaces.get("new").and_then(|p| p.name.as_deref()),
             Some("new")
         );
-        assert!(s.projects.contains_key("other"));
+        assert!(s.workspaces.contains_key("other"));
 
         // The buffer is re-pointed but still present (nothing closed); the unrelated one is left.
-        assert_eq!(s.buffer_projects.get(&buf).map(String::as_str), Some("new"));
+        assert_eq!(s.buffer_workspaces.get(&buf).map(String::as_str), Some("new"));
         assert_eq!(
-            s.buffer_projects.get(&other_buf).map(String::as_str),
+            s.buffer_workspaces.get(&other_buf).map(String::as_str),
             Some("other")
         );
 
-        // Only the matching client's active-project pointer follows the rename.
+        // Only the matching client's active-workspace pointer follows the rename.
         assert_eq!(
-            s.clients.get(&c1).unwrap().active_project.as_deref(),
+            s.clients.get(&c1).unwrap().active_workspace.as_deref(),
             Some("new")
         );
         assert_eq!(
-            s.clients.get(&c2).unwrap().active_project.as_deref(),
+            s.clients.get(&c2).unwrap().active_workspace.as_deref(),
             Some("other")
         );
     }
 
-    /// Renaming a project that isn't loaded returns `None` (the handler maps this to an internal
-    /// error; it can't happen in practice since projects are never unloaded at runtime).
+    /// Renaming a workspace that isn't loaded returns `None` (the handler maps this to an internal
+    /// error; it can't happen in practice since workspaces are never unloaded at runtime).
     #[test]
-    fn rename_project_unknown_returns_none() {
+    fn rename_workspace_unknown_returns_none() {
         let mut s = ServerState::new();
-        assert!(s.rename_project("nope", "new").is_none());
+        assert!(s.rename_workspace("nope", "new").is_none());
     }
 
-    /// The paths persisted for a project's session: live MRU buffers first (most-recent-first),
+    /// The paths persisted for a workspace's session: live MRU buffers first (most-recent-first),
     /// then dormant ones, deduplicated by path so a dormant entry that's since been loaded doesn't
     /// double-show.
     #[test]
     fn session_buffer_paths_merges_live_mru_then_dormant_deduped() {
         let mut s = ServerState::new();
-        s.projects
-            .insert("p".into(), project_entry("p", vec![PathBuf::from("/p")]));
+        s.workspaces
+            .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
 
         // Two live file-backed buffers; touch so the MRU front is b2.
         let b1 = s.allocate_buffer_id();
         s.buffers
             .insert(b1, Buffer::new_at_path(b1, PathBuf::from("/p/a.rs"), None));
-        s.buffer_projects.insert(b1, "p".into());
+        s.buffer_workspaces.insert(b1, "p".into());
         let b2 = s.allocate_buffer_id();
         s.buffers
             .insert(b2, Buffer::new_at_path(b2, PathBuf::from("/p/b.rs"), None));
-        s.buffer_projects.insert(b2, "p".into());
+        s.buffer_workspaces.insert(b2, "p".into());
         s.touch_mru(b1);
         s.touch_mru(b2);
 
@@ -1699,13 +1699,13 @@ mod project_state_tests {
         let mut tbuf = Buffer::new_at_path(bt, PathBuf::from("/p/preview.rs"), None);
         tbuf.transient = true;
         s.buffers.insert(bt, tbuf);
-        s.buffer_projects.insert(bt, "p".into());
+        s.buffer_workspaces.insert(bt, "p".into());
         s.touch_mru(bt);
 
         // Dormant: a fresh path, plus one that duplicates a live buffer's path (must be dropped).
         let d1 = s.allocate_buffer_id();
         let d_dup = s.allocate_buffer_id();
-        s.projects.get_mut("p").unwrap().dormant_buffers = vec![
+        s.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
             DormantBuffer {
                 id: d1,
                 path: PathBuf::from("/p/c.rs"),
@@ -1733,11 +1733,11 @@ mod project_state_tests {
     #[test]
     fn dormant_registry_take_promote_and_first() {
         let mut s = ServerState::new();
-        s.projects
-            .insert("p".into(), project_entry("p", vec![PathBuf::from("/p")]));
+        s.workspaces
+            .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
         let d1 = s.allocate_buffer_id();
         let d2 = s.allocate_buffer_id();
-        s.projects.get_mut("p").unwrap().dormant_buffers = vec![
+        s.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
             DormantBuffer {
                 id: d1,
                 path: PathBuf::from("/p/a.rs"),
@@ -1756,102 +1756,102 @@ mod project_state_tests {
         assert_eq!(s.first_dormant_id("p"), None, "promotion empties the registry");
     }
 
-    /// `project_active_anywhere` is the delete guard: true iff *some* client has the project
+    /// `workspace_active_anywhere` is the delete guard: true iff *some* client has the workspace
     /// active, so deleting it would pull the rug.
     #[test]
-    fn project_active_anywhere_tracks_any_client() {
+    fn workspace_active_anywhere_tracks_any_client() {
         let mut s = ServerState::new();
         let (c1, sess1) = session("alpha");
         s.clients.insert(c1, sess1);
-        assert!(s.project_active_anywhere("alpha"));
-        assert!(!s.project_active_anywhere("beta"));
+        assert!(s.workspace_active_anywhere("alpha"));
+        assert!(!s.workspace_active_anywhere("beta"));
     }
 
-    /// An ephemeral project is retired only once it has no buffers *and* no client still has it
+    /// An ephemeral workspace is retired only once it has no buffers *and* no client still has it
     /// active. This is the multi-client safety property: if a second client joined the ephemeral
-    /// context (via the switcher), closing the first client's buffer must not delete the project
+    /// context (via the switcher), closing the first client's buffer must not delete the workspace
     /// out from under it.
     #[test]
     fn ephemeral_pruned_only_when_empty_and_inactive() {
         let mut s = ServerState::new();
-        let id = s.register_ephemeral_project();
-        assert!(s.projects.contains_key(&id));
-        assert!(s.projects[&id].is_ephemeral());
+        let id = s.register_ephemeral_workspace();
+        assert!(s.workspaces.contains_key(&id));
+        assert!(s.workspaces[&id].is_ephemeral());
 
         // A client is active in the context and it holds a buffer.
         let (client, sess) = session(&id);
         s.clients.insert(client, sess);
         let buf = s.allocate_buffer_id();
-        s.buffer_projects.insert(buf, id.clone());
+        s.buffer_workspaces.insert(buf, id.clone());
         assert!(!s.prune_ephemeral_if_empty(&id), "active + non-empty stays");
 
         // The buffer closes, but the client is still parked here → still not pruned (no rug-pull).
-        s.buffer_projects.remove(&buf);
+        s.buffer_workspaces.remove(&buf);
         assert!(
             !s.prune_ephemeral_if_empty(&id),
             "an active client keeps the context even with no buffers"
         );
-        assert!(s.projects.contains_key(&id));
+        assert!(s.workspaces.contains_key(&id));
 
         // The client switches away → now it's both empty and inactive, so it's retired.
-        s.clients.get_mut(&client).unwrap().active_project = Some("other".to_string());
+        s.clients.get_mut(&client).unwrap().active_workspace = Some("other".to_string());
         assert!(s.prune_ephemeral_if_empty(&id));
-        assert!(!s.projects.contains_key(&id));
+        assert!(!s.workspaces.contains_key(&id));
     }
 
     /// Ephemeral display numbers reuse the lowest free slot (like scratch numbers), so the picker
-    /// shows small, stable `(project N)` labels rather than an ever-climbing counter.
+    /// shows small, stable `(workspace N)` labels rather than an ever-climbing counter.
     #[test]
     fn ephemeral_ids_reuse_the_lowest_free_number() {
         let mut s = ServerState::new();
-        let a = s.register_ephemeral_project();
-        let b = s.register_ephemeral_project();
+        let a = s.register_ephemeral_workspace();
+        let b = s.register_ephemeral_workspace();
         assert_eq!(a, "ephemeral/1");
         assert_eq!(b, "ephemeral/2");
         // Retire #1; the next mint reuses its number rather than climbing to 3.
-        s.projects.remove(&a);
-        let c = s.register_ephemeral_project();
+        s.workspaces.remove(&a);
+        let c = s.register_ephemeral_workspace();
         assert_eq!(c, "ephemeral/1");
     }
 
-    /// Deleting a project drops its entry and closes exactly its buffers (tearing down their
-    /// per-buffer state), leaving unrelated projects and their buffers intact.
+    /// Deleting a workspace drops its entry and closes exactly its buffers (tearing down their
+    /// per-buffer state), leaving unrelated workspaces and their buffers intact.
     #[test]
-    fn delete_project_closes_only_its_buffers() {
+    fn delete_workspace_closes_only_its_buffers() {
         let mut s = ServerState::new();
-        s.projects.insert(
+        s.workspaces.insert(
             "doomed".to_string(),
-            project_entry("doomed", vec![PathBuf::from("/tmp/d")]),
+            workspace_entry("doomed", vec![PathBuf::from("/tmp/d")]),
         );
-        s.projects
-            .insert("keep".to_string(), project_entry("keep", vec![]));
+        s.workspaces
+            .insert("keep".to_string(), workspace_entry("keep", vec![]));
 
         let buf_a = s.allocate_buffer_id();
-        s.buffer_projects.insert(buf_a, "doomed".to_string());
+        s.buffer_workspaces.insert(buf_a, "doomed".to_string());
         let buf_b = s.allocate_buffer_id();
-        s.buffer_projects.insert(buf_b, "doomed".to_string());
+        s.buffer_workspaces.insert(buf_b, "doomed".to_string());
         let survivor = s.allocate_buffer_id();
-        s.buffer_projects.insert(survivor, "keep".to_string());
+        s.buffer_workspaces.insert(survivor, "keep".to_string());
         // Per-buffer state that teardown must also clear (cursors keyed by (client, buffer)).
         let (client, sess) = session("keep");
         s.cursors.insert((client, buf_a), CursorState::default());
         s.cursors.insert((client, survivor), CursorState::default());
         s.clients.insert(client, sess);
 
-        let mut closed = s.delete_project("doomed");
+        let mut closed = s.delete_workspace("doomed");
         closed.sort();
         let mut expected = vec![buf_a, buf_b];
         expected.sort();
         assert_eq!(closed, expected);
 
         // Entry gone; its buffers and their per-buffer state are gone; the unrelated ones remain.
-        assert!(!s.projects.contains_key("doomed"));
-        assert!(s.projects.contains_key("keep"));
-        assert!(!s.buffer_projects.contains_key(&buf_a));
-        assert!(!s.buffer_projects.contains_key(&buf_b));
+        assert!(!s.workspaces.contains_key("doomed"));
+        assert!(s.workspaces.contains_key("keep"));
+        assert!(!s.buffer_workspaces.contains_key(&buf_a));
+        assert!(!s.buffer_workspaces.contains_key(&buf_b));
         assert!(!s.cursors.contains_key(&(client, buf_a)));
         assert_eq!(
-            s.buffer_projects.get(&survivor).map(String::as_str),
+            s.buffer_workspaces.get(&survivor).map(String::as_str),
             Some("keep")
         );
         assert!(s.cursors.contains_key(&(client, survivor)));
@@ -1859,20 +1859,20 @@ mod project_state_tests {
 
     /// `buffers_under_path` (the `path/delete` screen) matches a file exactly and matches a
     /// directory by path-prefix — component-wise, so `/ws/src` doesn't catch `/ws/srcfoo` — and is
-    /// scoped to the named project.
+    /// scoped to the named workspace.
     #[test]
     fn buffers_under_path_matches_file_and_dir_prefix() {
         let mut s = ServerState::new();
-        s.projects.insert(
+        s.workspaces.insert(
             "proj".to_string(),
-            project_entry("proj", vec![PathBuf::from("/ws")]),
+            workspace_entry("proj", vec![PathBuf::from("/ws")]),
         );
 
         let add = |s: &mut ServerState, path: &str| -> BufferId {
             let id = s.allocate_buffer_id();
             s.buffers
                 .insert(id, Buffer::new_at_path(id, PathBuf::from(path), None));
-            s.buffer_projects.insert(id, "proj".to_string());
+            s.buffer_workspaces.insert(id, "proj".to_string());
             id
         };
         let a = add(&mut s, "/ws/src/a.rs");
@@ -1897,21 +1897,21 @@ mod project_state_tests {
         assert!(
             s.buffers_under_path("other-proj", Path::new("/ws/src"))
                 .is_empty(),
-            "scoped to the named project"
+            "scoped to the named workspace"
         );
     }
 
     /// `next_scratch_number` returns the lowest positive integer not used by another scratch in the
-    /// project: small, reuses freed numbers, ignores file buffers, and numbers projects apart.
+    /// workspace: small, reuses freed numbers, ignores file buffers, and numbers workspaces apart.
     #[test]
-    fn next_scratch_number_picks_lowest_unused_per_project() {
+    fn next_scratch_number_picks_lowest_unused_per_workspace() {
         let mut s = ServerState::new();
-        assert_eq!(s.next_scratch_number("proj"), 1, "empty project → 1");
+        assert_eq!(s.next_scratch_number("proj"), 1, "empty workspace → 1");
 
         let add_scratch = |s: &mut ServerState, n: u32| {
             let id = s.allocate_buffer_id();
             s.buffers.insert(id, Buffer::scratch(id, None, n));
-            s.buffer_projects.insert(id, "proj".to_string());
+            s.buffer_workspaces.insert(id, "proj".to_string());
             id
         };
         let s1 = add_scratch(&mut s, 1);
@@ -1922,49 +1922,49 @@ mod project_state_tests {
             file,
             Buffer::new_at_path(file, PathBuf::from("/p/a.rs"), None),
         );
-        s.buffer_projects.insert(file, "proj".to_string());
+        s.buffer_workspaces.insert(file, "proj".to_string());
         assert_eq!(s.next_scratch_number("proj"), 3, "1 and 2 used → 3");
 
         // Free #1 → it's reused rather than handing out 3.
         s.buffers.remove(&s1);
-        s.buffer_projects.remove(&s1);
+        s.buffer_workspaces.remove(&s1);
         assert_eq!(s.next_scratch_number("proj"), 1);
 
-        // A different project numbers independently.
+        // A different workspace numbers independently.
         assert_eq!(s.next_scratch_number("other"), 1);
     }
 
-    /// `unsaved_buffer_count` counts only the dirty buffers belonging to the named project — the
-    /// number the project picker shows. Clean buffers, buffers in other projects, and dangling
+    /// `unsaved_buffer_count` counts only the dirty buffers belonging to the named workspace — the
+    /// number the workspace picker shows. Clean buffers, buffers in other workspaces, and dangling
     /// associations (no buffer entry) don't count.
     #[test]
-    fn unsaved_buffer_count_counts_dirty_buffers_per_project() {
+    fn unsaved_buffer_count_counts_dirty_buffers_per_workspace() {
         let mut s = ServerState::new();
 
-        let add = |s: &mut ServerState, project: &str, dirty: bool| -> BufferId {
+        let add = |s: &mut ServerState, workspace: &str, dirty: bool| -> BufferId {
             let id = s.allocate_buffer_id();
             let mut buf = Buffer::scratch(id, None, 1);
             buf.dirty = dirty;
             s.buffers.insert(id, buf);
-            s.buffer_projects.insert(id, project.to_string());
+            s.buffer_workspaces.insert(id, workspace.to_string());
             id
         };
 
         add(&mut s, "alpha", true);
         add(&mut s, "alpha", true);
         add(&mut s, "alpha", false); // clean — not counted
-        add(&mut s, "beta", true); // other project — not counted for alpha
+        add(&mut s, "beta", true); // other workspace — not counted for alpha
 
-        // A buffer_projects association with no live buffer (defensive: shouldn't panic / count).
+        // A buffer_workspaces association with no live buffer (defensive: shouldn't panic / count).
         let dangling = s.allocate_buffer_id();
-        s.buffer_projects.insert(dangling, "alpha".to_string());
+        s.buffer_workspaces.insert(dangling, "alpha".to_string());
 
         assert_eq!(s.unsaved_buffer_count("alpha"), 2);
         assert_eq!(s.unsaved_buffer_count("beta"), 1);
         assert_eq!(
             s.unsaved_buffer_count("never-loaded"),
             0,
-            "a project with no buffers reports zero"
+            "a workspace with no buffers reports zero"
         );
     }
 }

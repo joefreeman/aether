@@ -1,6 +1,6 @@
-//! Application-level settings — global, not per-project. Persisted server-side at
-//! `$XDG_CONFIG_HOME/aether/settings.toml`. Distinct from project settings (a project's name and
-//! roots): these are app-wide preferences that apply regardless of the active project.
+//! Application-level settings — global, not per-workspace. Persisted server-side at
+//! `$XDG_CONFIG_HOME/aether/settings.toml`. Distinct from workspace settings (a workspace's name and
+//! roots): these are app-wide preferences that apply regardless of the active workspace.
 //!
 //! The client fetches them at boot (`settings/get`) and writes them from the app-settings overlay
 //! (`Space .`) with `settings/set`. Kept deliberately small — this is a personal editor, so a
@@ -66,7 +66,7 @@ impl RpcMethod for SettingsGet {
 pub struct SettingsGetParams {}
 
 /// Replace the application settings and persist them to disk. Returns the settings as stored
-/// (echoing back the new state, like the project RPCs return `ProjectInfo`). The server also pushes
+/// (echoing back the new state, like the workspace RPCs return `WorkspaceInfo`). The server also pushes
 /// [`SettingsChanged`] to every *other* connected client so the change applies live everywhere.
 pub struct SettingsSet;
 impl RpcMethod for SettingsSet {
@@ -76,8 +76,8 @@ impl RpcMethod for SettingsSet {
 }
 
 /// Pushed to every connected client *except* the one that just set them, carrying the new
-/// application settings. Settings are global (app-wide, not per-project), so this goes to all
-/// clients regardless of their active project. The setter learns the new state from its
+/// application settings. Settings are global (app-wide, not per-workspace), so this goes to all
+/// clients regardless of their active workspace. The setter learns the new state from its
 /// `settings/set` result instead.
 pub struct SettingsChanged;
 impl NotificationMethod for SettingsChanged {

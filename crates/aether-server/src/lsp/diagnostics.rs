@@ -75,7 +75,7 @@ fn message_of(d: &Value) -> String {
 }
 
 /// A diagnostic in **LSP-native coordinates** (the `start` line only — no byte-column conversion),
-/// used by the project-diagnostics picker for files that aren't open as a buffer (so there's no
+/// used by the workspace-diagnostics picker for files that aren't open as a buffer (so there's no
 /// buffer text to convert a column against). Selecting one jumps to the line start; the exact
 /// squiggle span resolves once the file opens and becomes a [`BufferDiagnostic`].
 #[derive(Debug, Clone, PartialEq, Eq)]

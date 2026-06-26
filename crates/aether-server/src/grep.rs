@@ -58,7 +58,7 @@ const PREVIEW_LEAD_CHARS: usize = 32;
 /// Spawn an async search for `query` against the workspace. Detached: the returned future is
 /// fire-and-forget. The coordinator self-terminates when the picker's generation moves past
 /// `generation` (the user typed something new) or when the walker exhausts the file list.
-/// `roots` are the project's root paths — needed when `filters` require a relaxed re-walk
+/// `roots` are the workspace's root paths — needed when `filters` require a relaxed re-walk
 /// (`+ignored`/`+hidden`) or a per-root Git status pass (`changed`).
 pub fn spawn_search(
     state: SharedState,

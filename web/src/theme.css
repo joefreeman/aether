@@ -129,7 +129,7 @@ html, body, #app {
 .status-git-group { flex: 0 0 auto; display: flex; align-items: baseline; gap: 5px; white-space: nowrap; }
 /* Buffer-state dot (SVG circle, colour via currentColor). Shared by the status bar and picker. */
 .buffer-status-dot { flex: 0 0 auto; width: 0.7em; height: 0.7em; vertical-align: -0.06em; }
-.status-dot { margin-right: 0.5em; } /* leads the row; a bit of space before the project name. Colour set inline */
+.status-dot { margin-right: 0.5em; } /* leads the row; a bit of space before the workspace name. Colour set inline */
 .status-right { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; }
 .status-diag-group { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; } /* tight diagnostic cluster on the right, by the position */
 .status-transient { font-style: italic; } /* preview buffer: the status-bar file label slants */
@@ -508,9 +508,9 @@ html, body, #app {
 .modal-btn.danger { background: var(--nord11); border-color: var(--nord11); }
 .modal-btn.danger:hover { background: #cf6f77; border-color: #cf6f77; }
 
-/* Pickers + dialogs (save-as, project settings, help) share the picker offset (8vh from .overlay).
+/* Pickers + dialogs (save-as, workspace settings, help) share the picker offset (8vh from .overlay).
    Only confirmations sit lower, so a confirm over a picker doesn't align with it; and they layer
-   above the project-settings dialog (same .overlay z-index, but that overlay sits later in the DOM). */
+   above the workspace-settings dialog (same .overlay z-index, but that overlay sits later in the DOM). */
 .overlay.confirm-overlay { padding-top: 11vh; z-index: 11; }
 
 /* The LSP info dialog drills in *over* the still-open LSP picker, so it needs to sit above
@@ -528,9 +528,9 @@ html, body, #app {
 .lsp-info-val { word-break: break-word; } /* sans-serif (inherits the modal's font) */
 .lsp-info-hint { color: var(--nord3-brighter); font-size: 12px; }
 
-/* Project settings (Space ,). Keyboard-driven — the focused field/row gets a frost-blue accent. */
-.modal.project-settings { width: min(640px, 88vw); }
-.modal.project-settings .modal-message { font-weight: 600; margin-bottom: 10px; }
+/* Workspace settings (Space ,). Keyboard-driven — the focused field/row gets a frost-blue accent. */
+.modal.workspace-settings { width: min(640px, 88vw); }
+.modal.workspace-settings .modal-message { font-weight: 600; margin-bottom: 10px; }
 /* Small gray labels (matching the native client). Tucked tight above their field (~3px) so each
    label+field reads as one group, with a wider gap (8px) above it from the previous group. */
 .ps-label { color: var(--nord3-brighter); font-size: 12px; margin: 8px 0 3px; }
@@ -931,7 +931,7 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-bullet-modified { color: var(--nord13); }
 .picker-bullet-deleted,
 .picker-bullet-conflicted { color: var(--nord11); }
-/* Right-aligned buffer-state dot (buffer + project rows): `margin-left: auto` pushes it to the far
+/* Right-aligned buffer-state dot (buffer + workspace rows): `margin-left: auto` pushes it to the far
    edge. Colours match the editor status bar / favicon. Enlarged to match the status bar's `●`; the
    `line-height: 0` keeps the bigger glyph from growing the row (same trick as `.picker-bullet`). */
 .picker-dirty-dot { margin-left: auto; font-size: 1.4em; line-height: 0; }

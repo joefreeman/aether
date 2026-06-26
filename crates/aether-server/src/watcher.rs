@@ -1,5 +1,5 @@
 //! File-system watcher. One `notify::RecommendedWatcher` per server (lives in `ServerState`)
-//! covers every loaded project's roots recursively; an async task drains events and routes them
+//! covers every loaded workspace's roots recursively; an async task drains events and routes them
 //! to buffers and pickers:
 //!
 //! - A buffer whose canonical path was modified gets either a silent reload (if clean) or
@@ -12,8 +12,8 @@
 //! Self-writes (the server's own `buffer/save`) are filtered out by comparing on-disk mtime
 //! against the buffer's recorded `last_modified_unix_ms`.
 //!
-//! Roots are watched lazily: `project/activate` calls [`watch_project_paths`] for each new
-//! project's roots, so cold projects don't waste an inotify slot.
+//! Roots are watched lazily: `workspace/activate` calls [`watch_workspace_paths`] for each new
+//! workspace's roots, so cold workspaces don't waste an inotify slot.
 
 use crate::handlers::PendingPushes;
 use crate::handlers::{
@@ -29,10 +29,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Spawn the per-server watcher task. Stashes the watcher handle in `ServerState::watcher` so
-/// `project/activate` can register new roots, and starts an async loop that processes events
+/// `workspace/activate` can register new roots, and starts an async loop that processes events
 /// until the channel closes (when the watcher is dropped on shutdown).
 ///
-/// At startup the watcher has no roots — projects register theirs in `project/activate`.
+/// At startup the watcher has no roots — workspaces register theirs in `workspace/activate`.
 pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
 
@@ -58,12 +58,12 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Register a project's roots with the server's live watcher. Called from `project/activate` the
-/// first time a project is loaded, and from `project/add_root` for newly-added roots. Each root
+/// Register a workspace's roots with the server's live watcher. Called from `workspace/activate` the
+/// first time a workspace is loaded, and from `workspace/add_root` for newly-added roots. Each root
 /// gets a recursive watch. Errors are logged, not propagated — losing the watcher on one root
-/// shouldn't fail the whole activation; the project just won't receive external-change
+/// shouldn't fail the whole activation; the workspace just won't receive external-change
 /// notifications for that root.
-pub fn watch_project_paths(watcher: &Arc<Mutex<RecommendedWatcher>>, paths: &[PathBuf]) {
+pub fn watch_workspace_paths(watcher: &Arc<Mutex<RecommendedWatcher>>, paths: &[PathBuf]) {
     let mut watcher = match watcher.lock() {
         Ok(g) => g,
         Err(p) => {
@@ -78,10 +78,10 @@ pub fn watch_project_paths(watcher: &Arc<Mutex<RecommendedWatcher>>, paths: &[Pa
     }
 }
 
-/// Stop watching the given paths. Used by `project/remove_root`. Errors are logged but
+/// Stop watching the given paths. Used by `workspace/remove_root`. Errors are logged but
 /// otherwise ignored — if the watcher had already lost the path (e.g. the directory was deleted
 /// out from under us), there's nothing for the caller to recover from.
-pub fn unwatch_project_paths(watcher: &Arc<Mutex<RecommendedWatcher>>, paths: &[PathBuf]) {
+pub fn unwatch_workspace_paths(watcher: &Arc<Mutex<RecommendedWatcher>>, paths: &[PathBuf]) {
     let mut watcher = match watcher.lock() {
         Ok(g) => g,
         Err(p) => {
@@ -130,7 +130,7 @@ async fn handle_event(state: &SharedState, event: Event) {
                 index_should_invalidate = true;
             }
 
-            // Plural: projects with overlapping roots can each have their own buffer for this
+            // Plural: workspaces with overlapping roots can each have their own buffer for this
             // path, and every one of them needs the reload/flag — not just the first found.
             for buf_id in s.buffers_for_path(path) {
                 handle_buffer_event(&mut s, buf_id, path, category, &mut pushes);
@@ -138,14 +138,14 @@ async fn handle_event(state: &SharedState, event: Event) {
         }
 
         if index_should_invalidate {
-            // Invalidate the workspace index for any project whose roots contain one of the
-            // affected paths. Cheap — we only have a handful of projects loaded at most.
-            for project in s.projects.values() {
+            // Invalidate the workspace index for any workspace whose roots contain one of the
+            // affected paths. Cheap — we only have a handful of workspaces loaded at most.
+            for workspace in s.workspaces.values() {
                 if paths
                     .iter()
-                    .any(|p| project.paths.iter().any(|root| p.starts_with(root)))
+                    .any(|p| workspace.paths.iter().any(|root| p.starts_with(root)))
                 {
-                    project.workspace_index.invalidate();
+                    workspace.workspace_index.invalidate();
                 }
             }
         }
@@ -153,7 +153,7 @@ async fn handle_event(state: &SharedState, event: Event) {
         // External Git operations (commit / checkout / stage) touch files under `.git`. Refresh
         // the baseline + hunks of any open buffer in an affected repo so the gutter and inline
         // diff reflect the new HEAD without needing a buffer edit. (Only sees `.git` changes when
-        // it's within a watched project root — the common repo-root-is-project-root case.)
+        // it's within a watched workspace root — the common repo-root-is-workspace-root case.)
         let git_workdirs: HashSet<PathBuf> =
             paths.iter().filter_map(|p| git_change_workdir(p)).collect();
         if !git_workdirs.is_empty() {

@@ -11,7 +11,7 @@ use super::save_as::SaveAsEditor;
 use super::session::{
     buffer_info, label_for_path, min_pos, severity_label, step_font_size, strip_longest_root,
     AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
-    HoverBlock, HoverText, Mode, PasteKind, Pending, ProjectSettings, Prompt, ReloadTry,
+    HoverBlock, HoverText, Mode, PasteKind, Pending, WorkspaceSettings, Prompt, ReloadTry,
     RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, SneakState, TextField,
 };
 use super::transport::RpcError;
@@ -68,12 +68,12 @@ use aether_protocol::picker::{
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
     PickerViewParams, PickerViewResult, ScopedPath,
 };
-use aether_protocol::project::{
-    ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectAddRoot,
-    ProjectAddRootParams, ProjectCreate, ProjectCreateParams, ProjectDelete, ProjectDeleteParams,
-    ProjectInfo, ProjectOpenPath, ProjectOpenPathParams, ProjectRemoveRoot,
-    ProjectRemoveRootParams, ProjectRemoveRootResult, ProjectRename, ProjectRenameParams,
-    ProjectRenamed, ProjectRenamedParams,
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddRoot,
+    WorkspaceAddRootParams, WorkspaceCreate, WorkspaceCreateParams, WorkspaceDelete, WorkspaceDeleteParams,
+    WorkspaceInfo, WorkspaceOpenPath, WorkspaceOpenPathParams, WorkspaceRemoveRoot,
+    WorkspaceRemoveRootParams, WorkspaceRemoveRootResult, WorkspaceRename, WorkspaceRenameParams,
+    WorkspaceRenamed, WorkspaceRenamedParams,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -167,9 +167,9 @@ pub enum Event {
     PickerClicked(u32),
     /// A filter chip was clicked — select it (virtual selection, like the keyboard path).
     PickerChipClicked(usize),
-    /// A root row's delete button was clicked in the project-settings overlay — open the shared
+    /// A root row's delete button was clicked in the workspace-settings overlay — open the shared
     /// confirm prompt for that root (same path as the Delete key → [`Session::request_remove_root`]).
-    ProjectSettingsRemoveRoot(usize),
+    WorkspaceSettingsRemoveRoot(usize),
     /// A setting's checkbox was clicked in the app-settings overlay (flat row index) — toggle it.
     /// The keyboard path (Enter/Space) doesn't use this; it toggles the focused row directly.
     AppSettingToggle(usize),
@@ -199,27 +199,27 @@ pub enum Event {
     KeepToggled(Result<bool, String>),
     /// `directory/create` (Explorer "+ Create … name/") resolved: navigate into the new directory.
     DirCreated(Result<DirectoryCreateResult, String>),
-    /// Project switch resolved: the activated project + the buffer to land on.
-    ProjectActivated(Result<(ProjectInfo, BufferOpenResult), String>),
-    /// `project/create` resolved: the new project is active. A fresh project has no roots, so
+    /// Workspace switch resolved: the activated workspace + the buffer to land on.
+    WorkspaceActivated(Result<(WorkspaceInfo, BufferOpenResult), String>),
+    /// `workspace/create` resolved: the new workspace is active. A fresh workspace has no roots, so
     /// `opened` may be absent — the handler then keeps the current buffer and opens the settings
     /// overlay to add a root.
-    ProjectCreated(Result<ProjectActivateResult, String>),
-    /// `project/rename` (from the settings overlay) resolved: update the committed name or set
+    WorkspaceCreated(Result<WorkspaceActivateResult, String>),
+    /// `workspace/rename` (from the settings overlay) resolved: update the committed name or set
     /// the overlay's error.
-    ProjectRenamed(Result<ProjectInfo, String>),
-    /// `project/add_root` (from the settings overlay) resolved: refresh the roots or set the error.
-    ProjectRootAdded(Result<ProjectInfo, String>),
-    /// `project/remove_root` (from the settings overlay) resolved: refresh the roots and, when the
+    WorkspaceRenamed(Result<WorkspaceInfo, String>),
+    /// `workspace/add_root` (from the settings overlay) resolved: refresh the roots or set the error.
+    WorkspaceRootAdded(Result<WorkspaceInfo, String>),
+    /// `workspace/remove_root` (from the settings overlay) resolved: refresh the roots and, when the
     /// active buffer was closed, switch to the next one.
-    ProjectRootRemoved(Result<ProjectRemoveRootResult, String>),
-    /// `project/delete` (from the project switcher) resolved: toast success — the refreshed list
+    WorkspaceRootRemoved(Result<WorkspaceRemoveRootResult, String>),
+    /// `workspace/delete` (from the workspace switcher) resolved: toast success — the refreshed list
     /// arrives via a `picker/update` push — or surface the refusal (active / dirty).
-    ProjectDeleted(Result<(), String>),
-    /// `buffer/close` resolved for a buffer in an *ephemeral* ("(project N)") context, closed
-    /// without an `open_next` scratch. Carries the project's next remaining buffer: `Some` →
+    WorkspaceDeleted(Result<(), String>),
+    /// `buffer/close` resolved for a buffer in an *ephemeral* ("(workspace N)") context, closed
+    /// without an `open_next` scratch. Carries the workspace's next remaining buffer: `Some` →
     /// attach to it; `None` → the context is empty, so leave it (quit on native, chooser on web —
-    /// see [`App::leave_ephemeral_project`]).
+    /// see [`App::leave_ephemeral_workspace`]).
     EphemeralClosed(Result<Option<BufferId>, String>),
     /// `settings/get` resolved at boot: seed the session from the persisted app settings (notably
     /// the soft-wrap default). A failure is non-fatal — we keep the defaults.
@@ -238,7 +238,7 @@ pub enum Event {
     /// The shell re-dialled and re-opened; adopt the fresh session. `restarted` compares the
     /// daemon's start stamp (discovery data the shell holds).
     Reestablished {
-        project: ProjectInfo,
+        workspace: WorkspaceInfo,
         open: BufferOpenResult,
         restarted: bool,
     },
@@ -385,7 +385,7 @@ impl Session {
                     Event::Switched,
                 )
             }
-            Event::EphemeralClosed(Ok(None)) => self.leave_ephemeral_project(),
+            Event::EphemeralClosed(Ok(None)) => self.leave_ephemeral_workspace(),
             Event::EphemeralClosed(Err(e)) => Effects::error(format!("Close failed: {e}")),
 
             Event::SwitchedPrimed(Ok(Some((query, options, open)))) => {
@@ -714,20 +714,20 @@ impl Session {
                         Event::Switched,
                     )
                 }
-                PickerSelectResult::Project { name } => {
-                    // Activate and land on the project's last buffer (or a fresh transient
+                PickerSelectResult::Workspace { name } => {
+                    // Activate and land on the workspace's last buffer (or a fresh transient
                     // scratch) — the bootstrap convention, now one server-side composite.
-                    self.request_str::<ProjectActivate>(
-                        ProjectActivateParams {
+                    self.request_str::<WorkspaceActivate>(
+                        WorkspaceActivateParams {
                             name,
                             open_last: true,
                         },
                         |r| {
-                            Event::ProjectActivated(r.and_then(|a| {
+                            Event::WorkspaceActivated(r.and_then(|a| {
                                 let opened = a.opened.ok_or_else(|| {
-                                    "project/activate returned no landing buffer".to_string()
+                                    "workspace/activate returned no landing buffer".to_string()
                                 })?;
-                                Ok((a.project, opened))
+                                Ok((a.workspace, opened))
                             }))
                         },
                     )
@@ -737,66 +737,66 @@ impl Session {
                 Effects::error(format!("Select failed: {e}"))
             }
 
-            Event::ProjectActivated(Ok((project, open))) => {
-                self.project = project.name;
-                self.project_paths = project.paths;
+            Event::WorkspaceActivated(Ok((workspace, open))) => {
+                self.workspace = workspace.name;
+                self.workspace_paths = workspace.paths;
                 // A deliberate switch means we're no longer in the launch context, so closing the
                 // last buffer of an ephemeral context reached this way returns to the chooser
-                // rather than quitting (see `leave_ephemeral_project`).
+                // rather than quitting (see `leave_ephemeral_workspace`).
                 self.launched_with_file = false;
                 self.adopt_switch(open)
             }
-            Event::ProjectActivated(Err(e)) => {
-                Effects::error(format!("Project switch failed: {e}"))
+            Event::WorkspaceActivated(Err(e)) => {
+                Effects::error(format!("Workspace switch failed: {e}"))
             }
 
-            Event::ProjectCreated(Ok(activate)) => {
-                let ProjectActivateResult {
-                    project, opened, ..
+            Event::WorkspaceCreated(Ok(activate)) => {
+                let WorkspaceActivateResult {
+                    workspace, opened, ..
                 } = activate;
-                self.project = project.name.clone();
-                self.project_paths = project.paths;
+                self.workspace = workspace.name.clone();
+                self.workspace_paths = workspace.paths;
                 self.launched_with_file = false;
                 let mut fx = match opened {
-                    // The project came with a landing buffer (it had roots / history). Adopt it.
+                    // The workspace came with a landing buffer (it had roots / history). Adopt it.
                     Some(open) => self.adopt_switch(open),
-                    // A fresh project has no roots and so no landing buffer — open a scratch so the
-                    // user lands in *some* editor (and the previous project's buffer doesn't linger
-                    // behind the new project). `adopt_switch` leaves the settings overlay open.
+                    // A fresh workspace has no roots and so no landing buffer — open a scratch so the
+                    // user lands in *some* editor (and the previous workspace's buffer doesn't linger
+                    // behind the new workspace). `adopt_switch` leaves the settings overlay open.
                     None => self.request::<BufferOpen>(BufferOpenParams::default(), move |__r| {
                         Event::Switched(__r.map_err(|e| e.to_string()))
                     }),
                 };
                 fx.push(Effect::Toast {
-                    message: format!("Created project {}", project.name),
+                    message: format!("Created workspace {}", workspace.name),
                     kind: ToastKind::Success,
                     group: None,
                 });
-                // The natural next step for a freshly created (rootless) project is adding a root,
+                // The natural next step for a freshly created (rootless) workspace is adding a root,
                 // so — unlike the default open, which focuses the name field — land on the add-root
                 // input here.
-                self.open_project_settings();
-                if let Some(s) = self.project_settings.as_mut() {
+                self.open_workspace_settings();
+                if let Some(s) = self.workspace_settings.as_mut() {
                     s.selected = s.input_index();
                 }
                 fx
             }
-            Event::ProjectCreated(Err(e)) => Effects::error(format!("Create project failed: {e}")),
+            Event::WorkspaceCreated(Err(e)) => Effects::error(format!("Create workspace failed: {e}")),
 
-            Event::ProjectRenamed(result) => {
-                let Some(s) = self.project_settings.as_mut() else {
+            Event::WorkspaceRenamed(result) => {
+                let Some(s) = self.workspace_settings.as_mut() else {
                     return Effects::none();
                 };
                 match result {
                     Ok(info) => {
-                        if self.project == s.project_name {
-                            self.project = info.name.clone();
+                        if self.workspace == s.workspace_name {
+                            self.workspace = info.name.clone();
                         }
                         let new_name = info.name.clone();
-                        s.project_name = info.name.clone();
+                        s.workspace_name = info.name.clone();
                         s.name.set(info.name);
                         s.error = None;
-                        Effects::toast(format!("Renamed project to {new_name}"), ToastKind::Success)
+                        Effects::toast(format!("Renamed workspace to {new_name}"), ToastKind::Success)
                     }
                     Err(e) => {
                         s.error = Some(e);
@@ -805,12 +805,12 @@ impl Session {
                 }
             }
 
-            Event::ProjectRootAdded(result) => {
+            Event::WorkspaceRootAdded(result) => {
                 match result {
                     Ok(info) => {
                         let name = info.name.clone();
-                        self.sync_project_info(info);
-                        if let Some(s) = self.project_settings.as_mut() {
+                        self.sync_workspace_info(info);
+                        if let Some(s) = self.workspace_settings.as_mut() {
                             s.add.clear();
                             s.error = None;
                             // Re-focus the add-root input (now one row further down).
@@ -819,7 +819,7 @@ impl Session {
                         Effects::toast(format!("Added root to {name}"), ToastKind::Success)
                     }
                     Err(e) => {
-                        if let Some(s) = self.project_settings.as_mut() {
+                        if let Some(s) = self.workspace_settings.as_mut() {
                             s.error = Some(e);
                         }
                         Effects::none()
@@ -827,12 +827,12 @@ impl Session {
                 }
             }
 
-            Event::ProjectRootRemoved(result) => match result {
+            Event::WorkspaceRootRemoved(result) => match result {
                 Ok(r) => {
-                    let name = r.project.name.clone();
+                    let name = r.workspace.name.clone();
                     let closed = r.closed_buffer_ids.clone();
-                    self.sync_project_info(r.project);
-                    if let Some(s) = self.project_settings.as_mut() {
+                    self.sync_workspace_info(r.workspace);
+                    if let Some(s) = self.workspace_settings.as_mut() {
                         s.error = None;
                         // Keep the selection in range (the removed row is gone).
                         s.selected = s.selected.min(s.input_index());
@@ -862,7 +862,7 @@ impl Session {
                     fx
                 }
                 Err(e) => {
-                    if let Some(s) = self.project_settings.as_mut() {
+                    if let Some(s) = self.workspace_settings.as_mut() {
                         s.error = Some(e);
                         Effects::none()
                     } else {
@@ -870,11 +870,11 @@ impl Session {
                     }
                 }
             },
-            Event::ProjectDeleted(result) => match result {
+            Event::WorkspaceDeleted(result) => match result {
                 // The switcher stays open; the refreshed list (sans the deleted row) arrives as a
-                // `picker/update` push from the server's `refresh_project_pickers`.
-                Ok(()) => Effects::toast("Deleted project", ToastKind::Success),
-                // Covers the active-project and dirty-buffer refusals — the server messages are
+                // `picker/update` push from the server's `refresh_workspace_pickers`.
+                Ok(()) => Effects::toast("Deleted workspace", ToastKind::Success),
+                // Covers the active-workspace and dirty-buffer refusals — the server messages are
                 // already user-facing.
                 Err(e) => Effects::error(e),
             },
@@ -893,7 +893,7 @@ impl Session {
                 Effects::none()
             }
 
-            Event::ProjectSettingsRemoveRoot(index) => self.request_remove_root(index),
+            Event::WorkspaceSettingsRemoveRoot(index) => self.request_remove_root(index),
 
             Event::AppSettingToggle(index) => self.app_settings_toggle(index),
 
@@ -1065,7 +1065,7 @@ impl Session {
                 )
             }
             Event::Reestablished {
-                project,
+                workspace,
                 open,
                 restarted,
             } => {
@@ -1078,10 +1078,10 @@ impl Session {
                 );
                 tracing::info!(restarted, "reconnected");
                 let old_cursor = self.buffer.cursor;
-                self.project = project.name;
-                self.project_paths = project.paths;
+                self.workspace = workspace.name;
+                self.workspace_paths = workspace.paths;
                 let same_file = open.path == self.buffer.path;
-                self.buffer = buffer_info(open, &self.project_paths);
+                self.buffer = buffer_info(open, &self.workspace_paths);
                 self.conn = ConnState::Connected;
                 // Server-side per-client state died with the old connection; drop the client
                 // overlays that fronted it. The frozen window stays rendered until the
@@ -1150,7 +1150,7 @@ impl Session {
                 let note = match target {
                     Some((path_index, rel)) => {
                         // Save-as: the buffer's identity changed — adopt the new path/label.
-                        let root = self.project_paths.get(path_index as usize);
+                        let root = self.workspace_paths.get(path_index as usize);
                         self.buffer.path =
                             root.map(|r| format!("{}/{rel}", r.trim_end_matches('/')));
                         self.buffer.label = rel.clone();
@@ -1398,7 +1398,7 @@ impl Session {
     /// instant jump) and, for a nav-history step, reinstate the *saved* scroll that predates the
     /// jump, stranding the cursor off-screen. A hit in a DIFFERENT buffer is a real switch
     /// ([`Self::adopt_switch`]). One definition so every cursor-moving navigation scrolls its
-    /// target into view the same way; genuine buffer switches (close, new-scratch, project change)
+    /// target into view the same way; genuine buffer switches (close, new-scratch, workspace change)
     /// always land on a different `buffer_id`, so routing them here is just a switch.
     pub fn adopt_navigation(&mut self, open: BufferOpenResult) -> Effects {
         if open.buffer_id == self.buffer.buffer_id {
@@ -1431,7 +1431,7 @@ impl Session {
             history,
             ..SearchState::default()
         };
-        self.buffer = buffer_info(open, &self.project_paths);
+        self.buffer = buffer_info(open, &self.workspace_paths);
         Effects::one(Effect::Resubscribe)
     }
 
@@ -1471,10 +1471,10 @@ impl Session {
 
     /// Close the buffer, then attach to the server-indicated next MRU buffer (or a fresh
     /// scratch). In an *ephemeral* context, never replace it with a scratch — an empty ephemeral
-    /// project is pointless — so we close without `open_next` and either attach to a remaining
-    /// sibling buffer or leave the context entirely (see [`Self::leave_ephemeral_project`]).
+    /// workspace is pointless — so we close without `open_next` and either attach to a remaining
+    /// sibling buffer or leave the context entirely (see [`Self::leave_ephemeral_workspace`]).
     pub fn close_buffer(&mut self) -> Effects {
-        if aether_protocol::is_ephemeral_project_id(&self.project) {
+        if aether_protocol::is_ephemeral_workspace_id(&self.workspace) {
             return self.request_str::<BufferClose>(
                 BufferCloseParams {
                     buffer_id: self.buffer.buffer_id,
@@ -1498,18 +1498,18 @@ impl Session {
         )
     }
 
-    /// Leave an ephemeral ("(project N)") context whose last buffer just closed.
+    /// Leave an ephemeral ("(workspace N)") context whose last buffer just closed.
     ///
     /// If the session was *launched* to view this file (`ae /path` → [`Self::launched_with_file`]),
     /// there's nothing left to show, so we quit — `Effect::Exit`, which native clients honour
     /// (vim `file` → `:q`). A session that merely *navigated into* an ephemeral context (selected
-    /// it from the switcher, or a second client that joined it) instead returns to the project
+    /// it from the switcher, or a second client that joined it) instead returns to the workspace
     /// chooser — quitting would be surprising when the app was already in use for something else.
     ///
     /// The web client never launches with a file and can't quit a tab anyway (it ignores
     /// `Effect::Exit`), and its chooser is mandatory — so it always lands on the chooser, which is
     /// exactly the non-launch branch here.
-    fn leave_ephemeral_project(&mut self) -> Effects {
+    fn leave_ephemeral_workspace(&mut self) -> Effects {
         if self.launched_with_file {
             Effects::one(Effect::Exit)
         } else {
@@ -1521,7 +1521,7 @@ impl Session {
     }
 
     /// Copy the active buffer's path to the system clipboard — `absolute` picks the canonical
-    /// on-disk path (`Space Alt-a`), otherwise the project-relative path (`Space a`). Scratch
+    /// on-disk path (`Space Alt-a`), otherwise the workspace-relative path (`Space a`). Scratch
     /// buffers have no path, so it warns instead.
     fn copy_buffer_path(&mut self, absolute: bool) -> Effects {
         let Some(path) = self.buffer.path.as_deref() else {
@@ -1530,7 +1530,7 @@ impl Session {
         let text = if absolute {
             path.to_string()
         } else {
-            label_for_path(path, &self.project_paths)
+            label_for_path(path, &self.workspace_paths)
         };
         // Grouped: copying again (absolute vs relative) updates one toast rather than stacking.
         let mut fx = Effects::toast_grouped(
@@ -1551,7 +1551,7 @@ impl Session {
     /// `prime_search` (grep flows) also sets the opened buffer's search to that query so
     /// `n`/`Alt-n` step matches.
     ///
-    /// A path inside one of the project's roots opens as an ordinary root-relative buffer; a path
+    /// A path inside one of the workspace's roots opens as an ordinary root-relative buffer; a path
     /// outside every root — goto-definition into a dependency's source, say — opens as an *external*
     /// guest buffer via `absolute_path` (the same mechanism the `Space Alt-w` open-from-path overlay
     /// uses), rather than refusing with a toast. Either way it lands as a transient preview with the
@@ -1564,7 +1564,7 @@ impl Session {
         prime: Option<(String, MatchOptions)>,
     ) -> Effects {
         let (path_index, relative_path, absolute_path) =
-            match strip_longest_root(&path, &self.project_paths) {
+            match strip_longest_root(&path, &self.workspace_paths) {
                 Some((idx, rel)) => (Some(idx), Some(rel), None),
                 None => (None, None, Some(path)),
             };
@@ -1789,11 +1789,11 @@ impl Session {
         let reset = !kind.preserves_state();
         self.picker = Some(PickerState::new(kind));
         let buffer_id = self.buffer.buffer_id;
-        // Buffers / Projects / Explorer / LspServers all open with the highlight on "where you
-        // are" — the active buffer/project/file/language-server — matched by item key via the
+        // Buffers / Workspaces / Explorer / LspServers all open with the highlight on "where you
+        // are" — the active buffer/workspace/file/language-server — matched by item key via the
         // `effective_center_on` echo (the display-only fields below are ignored by the match).
         // Buffers: the active buffer (key is `buffer_id`).
-        // Projects: the active project (key is `name`).
+        // Workspaces: the active workspace (key is `name`).
         // Explorer: the active buffer's filename, so the listing lands on the current file.
         // LspServers: the active buffer's own language server (key is `language` + `workspace_root`).
         let center_on = match kind {
@@ -1807,8 +1807,8 @@ impl Session {
                 transient: false,
                 dormant: false,
             }),
-            PickerKind::Projects => Some(PickerItem::Project {
-                name: self.project.clone(),
+            PickerKind::Workspaces => Some(PickerItem::Workspace {
+                name: self.workspace.clone(),
                 unsaved_buffers: 0,
                 match_indices: Vec::new(),
             }),
@@ -1892,7 +1892,7 @@ impl Session {
             .as_deref()
             .and_then(|p| std::path::Path::new(p).parent())
             .map(|p| p.display().to_string())
-            .and_then(|dir| strip_longest_root(&dir, &self.project_paths))
+            .and_then(|dir| strip_longest_root(&dir, &self.workspace_paths))
             .map(|(path_index, relative_path)| PickerFilters {
                 directories: vec![ScopedPath {
                     path_index,
@@ -1915,7 +1915,7 @@ impl Session {
 
     /// `Ctrl-g` / `Ctrl-f` in the Explorer: switch to the Grep / Files picker scoped to the
     /// directory being browsed ("grep here"), the explorer's filters translated along. In
-    /// Roots mode no dir scope is seeded — the target covers the whole project.
+    /// Roots mode no dir scope is seeded — the target covers the whole workspace.
     fn switch_explorer_picker(&mut self, target: PickerKind) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
@@ -1926,7 +1926,7 @@ impl Session {
         let dir_scope = p
             .directory
             .as_deref()
-            .and_then(|abs| strip_longest_root(abs, &self.project_paths))
+            .and_then(|abs| strip_longest_root(abs, &self.workspace_paths))
             .map(|(path_index, relative_path)| ScopedPath {
                 path_index,
                 relative_path,
@@ -1937,13 +1937,13 @@ impl Session {
         hide.and(self.open_picker(target, None, Some(seeded), false))
     }
 
-    /// `Space e` / `Space Alt-e`: Explorer at the buffer's directory, or at its project root.
+    /// `Space e` / `Space Alt-e`: Explorer at the buffer's directory, or at its workspace root.
     /// Scratch buffers fall through to the server default (last listing / first root).
     pub fn open_explorer(&mut self, at_root: bool) -> Effects {
         let dir = self.buffer.path.as_deref().and_then(|path| {
             if at_root {
-                let (i, _) = strip_longest_root(path, &self.project_paths)?;
-                self.project_paths.get(i as usize).cloned()
+                let (i, _) = strip_longest_root(path, &self.workspace_paths)?;
+                self.workspace_paths.get(i as usize).cloned()
             } else {
                 std::path::Path::new(path)
                     .parent()
@@ -1953,7 +1953,7 @@ impl Session {
         self.open_picker(PickerKind::Explorer, dir, None, false)
     }
 
-    /// Explorer navigation: list a different directory (or the project roots). Clears the
+    /// Explorer navigation: list a different directory (or the workspace roots). Clears the
     /// query — entering a directory starts a fresh listing — but the filter chips ride along.
     /// `pre_select` lands the highlight on the named entry once the listing arrives.
     fn explorer_navigate(
@@ -2084,7 +2084,7 @@ impl Session {
     /// A query edit: bump the generation (stale pushes get discarded), restart the window at
     /// the top, and tell the server.
     fn picker_query_changed(&mut self) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
@@ -2115,7 +2115,7 @@ impl Session {
         // callers that might hold gate on `live_filters` before re-querying — but fall back to
         // the committed set defensively.
         let filters = p
-            .live_filters(&project_paths)
+            .live_filters(&workspace_paths)
             .unwrap_or_else(|| p.wire_filters());
         p.sent_filters = filters.clone();
 
@@ -2165,7 +2165,7 @@ impl Session {
     /// syncs the value here). Re-derives the directory suggestion listing when the dir portion
     /// moved. No-op unless a save-as prompt is open.
     pub fn save_as_set_input(&mut self, text: String) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
             return Effects::none();
         };
@@ -2173,7 +2173,7 @@ impl Session {
             return Effects::none();
         }
         ed.input.set(text);
-        if ed.path_edited(&project_paths) {
+        if ed.path_edited(&workspace_paths) {
             self.refresh_save_as_listing()
         } else {
             Effects::none()
@@ -2184,7 +2184,7 @@ impl Session {
     /// parity). Resets the typeahead highlight to the best match and re-syncs the listing under the
     /// newly chosen root. No-op unless a save-as prompt is open.
     pub fn save_as_set_root_filter(&mut self, text: String) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
             return Effects::none();
         };
@@ -2193,7 +2193,7 @@ impl Session {
         }
         ed.root_filter.set(text);
         ed.root_selected = 0;
-        if ed.sync_dir_listing(&project_paths) {
+        if ed.sync_dir_listing(&workspace_paths) {
             self.refresh_save_as_listing()
         } else {
             Effects::none()
@@ -2204,12 +2204,12 @@ impl Session {
     /// click the unfocused segment). The path can't be entered under an invalid root — focus stays
     /// pinned to the red root. No-op outside a multi-root save-as prompt.
     pub fn save_as_set_field(&mut self, root: bool) -> Effects {
-        let project_paths = self.project_paths.clone();
-        let labels = super::labels::root_labels(&project_paths);
+        let workspace_paths = self.workspace_paths.clone();
+        let labels = super::labels::root_labels(&workspace_paths);
         let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
             return Effects::none();
         };
-        if project_paths.len() <= 1 {
+        if workspace_paths.len() <= 1 {
             return Effects::none();
         }
         ed.field = if root {
@@ -2222,12 +2222,12 @@ impl Session {
         Effects::none()
     }
 
-    /// Replace the project-settings name-field text wholesale (the web client's native `<input>`
+    /// Replace the workspace-settings name-field text wholesale (the web client's native `<input>`
     /// owns editing and syncs the value here). The native shells edit it key-by-key through
-    /// `on_project_settings_key`; this is the web parity entry point. No-op unless the overlay is
+    /// `on_workspace_settings_key`; this is the web parity entry point. No-op unless the overlay is
     /// open. Clears any in-dialog error, matching the key path.
-    pub fn project_settings_set_name(&mut self, text: String) -> Effects {
-        if let Some(s) = self.project_settings.as_mut() {
+    pub fn workspace_settings_set_name(&mut self, text: String) -> Effects {
+        if let Some(s) = self.workspace_settings.as_mut() {
             if s.name.text != text {
                 s.name.set(text);
                 s.error = None;
@@ -2236,10 +2236,10 @@ impl Session {
         Effects::none()
     }
 
-    /// Replace the project-settings add-root input text wholesale (native `<input>` parity, as
+    /// Replace the workspace-settings add-root input text wholesale (native `<input>` parity, as
     /// above). No-op unless the overlay is open.
-    pub fn project_settings_set_add(&mut self, text: String) -> Effects {
-        if let Some(s) = self.project_settings.as_mut() {
+    pub fn workspace_settings_set_add(&mut self, text: String) -> Effects {
+        if let Some(s) = self.workspace_settings.as_mut() {
             if s.add.text != text {
                 s.add.set(text);
                 s.error = None;
@@ -2252,7 +2252,7 @@ impl Session {
     /// editing and syncs the value here). For a dir editor this re-derives the directory suggestion
     /// listing. No-op unless a chip editor is open.
     pub fn chip_editor_set_input(&mut self, text: String) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
@@ -2263,7 +2263,7 @@ impl Session {
             return Effects::none();
         }
         ed.input.set(text);
-        let refresh = ed.is_dir() && ed.path_edited(&project_paths);
+        let refresh = ed.is_dir() && ed.path_edited(&workspace_paths);
         let mut fx = Effects::none();
         if refresh {
             fx = fx.and(self.refresh_chip_editor_listing());
@@ -2277,7 +2277,7 @@ impl Session {
     /// Resets the typeahead highlight to the best match and re-syncs the listing under the newly
     /// chosen root. No-op unless a chip editor is open.
     pub fn chip_editor_set_root_filter(&mut self, text: String) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
@@ -2289,7 +2289,7 @@ impl Session {
         }
         ed.root_filter.set(text);
         ed.root_selected = 0;
-        let refresh = ed.sync_dir_listing(&project_paths);
+        let refresh = ed.sync_dir_listing(&workspace_paths);
         let mut fx = Effects::none();
         if refresh {
             fx = fx.and(self.refresh_chip_editor_listing());
@@ -2302,15 +2302,15 @@ impl Session {
     /// unfocused segment). The path can't be entered under an invalid root — focus stays pinned to
     /// the red root, matching the keyboard gate. No-op outside a multi-root dir editor.
     pub fn chip_editor_set_field(&mut self, root: bool) -> Effects {
-        let project_paths = self.project_paths.clone();
-        let labels = super::labels::root_labels(&project_paths);
+        let workspace_paths = self.workspace_paths.clone();
+        let labels = super::labels::root_labels(&workspace_paths);
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
         let Some(ed) = p.chip_editor.as_mut() else {
             return Effects::none();
         };
-        if !ed.is_dir() || project_paths.len() <= 1 {
+        if !ed.is_dir() || workspace_paths.len() <= 1 {
             return Effects::none();
         }
         ed.field = if root {
@@ -2414,7 +2414,7 @@ impl Session {
     /// when the editor closes: with no editor open `live_filters` is the committed `wire_filters`,
     /// so a cancel that had a preview applied reverts here.
     fn sync_live_filters(&mut self) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &self.picker else {
             return Effects::none();
         };
@@ -2424,7 +2424,7 @@ impl Session {
         ) {
             return Effects::none();
         }
-        let Some(eff) = p.live_filters(&project_paths) else {
+        let Some(eff) = p.live_filters(&workspace_paths) else {
             return Effects::none(); // indeterminate — hold the current results
         };
         if eff == p.sent_filters {
@@ -2484,11 +2484,11 @@ impl Session {
     }
 
     /// Open the directory-scope editor line. `edit: Some(i)` re-opens scope `i` pre-filled
-    /// (path focused); `None` adds a new chip on commit (multi-root projects focus the root
+    /// (path focused); `None` adds a new chip on commit (multi-root workspaces focus the root
     /// segment first). Kicks off a `directory/list` so the path field's ghost suggestions
     /// are ready when focus lands there.
     fn open_dir_prompt(&mut self, edit: Option<usize>) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
@@ -2497,7 +2497,7 @@ impl Session {
         }
         p.chip_selected = None;
         let current = edit.and_then(|i| p.dir_value(i).cloned());
-        let multi_root = project_paths.len() > 1;
+        let multi_root = workspace_paths.len() > 1;
         let root_index = current.as_ref().map(|d| d.path_index).unwrap_or(0);
         let field = if multi_root && current.is_none() {
             ChipEditorField::Root
@@ -2514,7 +2514,7 @@ impl Session {
             edit,
             allow_files,
         );
-        ed.sync_dir_listing(&project_paths);
+        ed.sync_dir_listing(&workspace_paths);
         // Baseline for the live-preview dedup — the currently displayed (committed) set.
         p.sent_filters = p.wire_filters();
         p.chip_editor = Some(ed);
@@ -2525,12 +2525,12 @@ impl Session {
     /// requested path rides on the result event so a stale response (the editor moved on)
     /// can be discarded. No-op for glob editors and invalid roots.
     fn refresh_chip_editor_listing(&mut self) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(path) = self
             .picker
             .as_ref()
             .and_then(|p| p.chip_editor.as_ref())
-            .and_then(|ed| ed.dir_listing_path(&project_paths))
+            .and_then(|ed| ed.dir_listing_path(&workspace_paths))
         else {
             return Effects::none();
         };
@@ -2548,14 +2548,14 @@ impl Session {
     /// matches some label and a path that exists (or is empty); otherwise the editor stays
     /// open with the invalid segment rendered red.
     fn commit_chip_editor(&mut self) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
         if let Some(ed) = p.chip_editor.as_ref() {
             if ed.is_dir() {
-                let root_ok = project_paths.len() < 2 || {
-                    let labels = super::labels::root_labels(&project_paths);
+                let root_ok = workspace_paths.len() < 2 || {
+                    let labels = super::labels::root_labels(&workspace_paths);
                     !ed.root_invalid(&labels)
                 };
                 if !root_ok || !ed.path_valid() {
@@ -2572,11 +2572,11 @@ impl Session {
                 chips::commit_glob_edit(&mut p.chips, normalized, edit)
             }
             chips::ChipEditorKind::Dir { edit } => {
-                // The would-commit scope — `None` for an empty path in a single-root project
+                // The would-commit scope — `None` for an empty path in a single-root workspace
                 // ("the whole root" means "no narrowing"). The validity gate above guarantees
                 // `preview_scope` sees a valid root/path, so this is exactly what the live
                 // preview was already showing.
-                let value = ed.preview_scope(&project_paths);
+                let value = ed.preview_scope(&workspace_paths);
                 chips::commit_dir_edit(&mut p.chips, value, edit)
             }
         };
@@ -2603,7 +2603,7 @@ impl Session {
         }
         // In the roots view (multi-root), descend into the selected root — mirrors Enter.
         if let Some(PickerItem::Root { path_index, .. }) = p.selected_item() {
-            let dir = self.project_paths.get(*path_index as usize).cloned();
+            let dir = self.workspace_paths.get(*path_index as usize).cloned();
             return self.explorer_navigate(dir, false, None);
         }
         Effects::none()
@@ -2611,10 +2611,10 @@ impl Session {
 
     /// Alt-h / Alt-Backspace: progressively unwind — clear the query, then (explorer) pop one
     /// directory segment per press — landing the highlight on the directory just left — into roots
-    /// mode in multi-root projects, and only then pop the rightmost filter chip. The breadcrumb
+    /// mode in multi-root workspaces, and only then pop the rightmost filter chip. The breadcrumb
     /// sits closest to the cursor and unwinds first; chips have their own toggle bindings.
     fn picker_back(&mut self) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
@@ -2637,7 +2637,7 @@ impl Session {
                 }
                 // At a root with siblings: step out into Roots mode (the root name is the last
                 // breadcrumb segment).
-                None if p.directory.is_some() && project_paths.len() > 1 => {
+                None if p.directory.is_some() && workspace_paths.len() > 1 => {
                     return self.explorer_navigate(None, true, None);
                 }
                 // Single-root top, or already in Roots mode: nothing left to unwind — fall through
@@ -2645,7 +2645,7 @@ impl Session {
                 _ => {}
             }
         }
-        if let Some(chip) = p.chip_row(&project_paths).last().map(|c| c.id) {
+        if let Some(chip) = p.chip_row(&workspace_paths).last().map(|c| c.id) {
             chips::remove_chip(&mut p.chips, chip);
             p.chip_selected = None;
             return self.apply_picker_filter_change();
@@ -2660,10 +2660,10 @@ impl Session {
             return Effects::none();
         };
         // The synthetic "+ Create …" row: confirming it creates the named file/dir (Explorer) or
-        // a fresh project (Projects).
+        // a fresh workspace (Workspaces).
         if p.selected_is_create() {
             return match p.kind {
-                PickerKind::Projects => self.project_create_from_query(),
+                PickerKind::Workspaces => self.workspace_create_from_query(),
                 _ => self.explorer_create_from_query(),
             };
         }
@@ -2681,7 +2681,7 @@ impl Session {
                 return self.explorer_navigate(Some(dir), false, None);
             }
             PickerItem::Root { path_index, .. } => {
-                let dir = self.project_paths.get(*path_index as usize).cloned();
+                let dir = self.workspace_paths.get(*path_index as usize).cloned();
                 return self.explorer_navigate(dir, false, None);
             }
             PickerItem::LspServer {
@@ -2735,9 +2735,9 @@ impl Session {
     /// cursor-based entry in [`Self::on_picker_key`]. No-op when there are no chips. Pure selection
     /// state — no effects. Once a chip is selected, the chip-nav keys route through `on_picker_key`.
     pub fn picker_select_last_chip(&mut self) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         if let Some(p) = &mut self.picker {
-            let n = p.chip_row(&project_paths).len();
+            let n = p.chip_row(&workspace_paths).len();
             if n > 0 {
                 p.chip_selected = Some(n - 1);
             }
@@ -2766,7 +2766,7 @@ impl Session {
         {
             return self.on_chip_editor_key(code, mods, text);
         }
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
@@ -2775,7 +2775,7 @@ impl Session {
         // Left/Right walk the row, Esc deselects, typing deselects back into the query).
         // Anything else falls through to the normal picker vocabulary below.
         if let Some(sel) = p.chip_selected {
-            let row = p.chip_row(&project_paths);
+            let row = p.chip_row(&workspace_paths);
             if row.is_empty() {
                 p.chip_selected = None;
             } else {
@@ -2821,7 +2821,7 @@ impl Session {
             KeyCode::Esc => return self.close_picker(),
             KeyCode::Enter => return self.picker_accept(),
             // Ctrl-d: trash the highlighted entry (Files + Explorer) or delete the highlighted
-            // project (Projects), behind a confirm. (Not plain `Delete` — that's a forward-delete
+            // workspace (Workspaces), behind a confirm. (Not plain `Delete` — that's a forward-delete
             // in the query input, owned by the shell; deleting is too destructive to ride a bare
             // editing key.)
             KeyCode::Char('d')
@@ -2829,14 +2829,14 @@ impl Session {
                     && !mods.alt
                     && matches!(
                         p.kind,
-                        PickerKind::Files | PickerKind::Explorer | PickerKind::Projects
+                        PickerKind::Files | PickerKind::Explorer | PickerKind::Workspaces
                     ) =>
             {
                 return self.picker_stage_delete();
             }
             // Ctrl-d in the Buffers picker closes the highlighted buffer in place (no open) —
             // `Ctrl-w` is the obvious mnemonic but the browser swallows it, so `Ctrl-d` matches the
-            // delete-in-picker gesture used by Files/Explorer/Projects above.
+            // delete-in-picker gesture used by Files/Explorer/Workspaces above.
             KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
                 return self.picker_close_buffer();
             }
@@ -2977,8 +2977,8 @@ impl Session {
     /// pops a path segment (then, at an empty path, clears the root selection), and plain
     /// Backspace at an empty path steps back into the root. Enter commits, Esc cancels.
     fn on_chip_editor_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
-        let project_paths = self.project_paths.clone();
-        let labels = super::labels::root_labels(&project_paths);
+        let workspace_paths = self.workspace_paths.clone();
+        let labels = super::labels::root_labels(&workspace_paths);
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
@@ -2986,7 +2986,7 @@ impl Session {
             return Effects::none();
         };
         let is_dir = ed.is_dir();
-        let multi_root_dir = is_dir && project_paths.len() > 1;
+        let multi_root_dir = is_dir && workspace_paths.len() > 1;
         let in_root = multi_root_dir && ed.field == ChipEditorField::Root;
         let no_chord = !mods.ctrl && !mods.alt;
         // Whether the path field's suggestion listing went stale and needs a directory/list.
@@ -3003,16 +3003,16 @@ impl Session {
             // segment (repeated presses walk down the tree).
             KeyCode::Tab if no_chord && is_dir => {
                 if in_root {
-                    refresh = ed.commit_root_field(&labels, &project_paths);
+                    refresh = ed.commit_root_field(&labels, &workspace_paths);
                 } else {
-                    refresh = ed.accept_path_suggestion(&project_paths);
+                    refresh = ed.accept_path_suggestion(&workspace_paths);
                 }
             }
             KeyCode::Char('l') if mods.alt && !mods.ctrl && is_dir => {
                 if in_root {
-                    refresh = ed.commit_root_field(&labels, &project_paths);
+                    refresh = ed.commit_root_field(&labels, &workspace_paths);
                 } else {
-                    refresh = ed.accept_path_suggestion(&project_paths);
+                    refresh = ed.accept_path_suggestion(&workspace_paths);
                 }
             }
             KeyCode::Char('h') if mods.alt && !mods.ctrl && multi_root_dir => {
@@ -3023,7 +3023,7 @@ impl Session {
             // never extend a root-label prefix match).
             KeyCode::Char(':') if !mods.ctrl && !mods.alt && in_root => {
                 if ed.root_complete(&labels) {
-                    refresh = ed.commit_root_field(&labels, &project_paths);
+                    refresh = ed.commit_root_field(&labels, &workspace_paths);
                 }
             }
             // Alt-Backspace: in the dir editor's path it deletes the rightmost segment,
@@ -3038,7 +3038,7 @@ impl Session {
                             ed.root_selected = 0;
                         }
                     } else {
-                        refresh = ed.pop_path_segment(&project_paths);
+                        refresh = ed.pop_path_segment(&workspace_paths);
                     }
                 } else if in_root {
                     ed.root_filter.clear();
@@ -3072,7 +3072,7 @@ impl Session {
                             (sel + n - 1) % n
                         };
                         // The chosen root moved — the path now resolves under it.
-                        refresh = ed.sync_dir_listing(&project_paths);
+                        refresh = ed.sync_dir_listing(&workspace_paths);
                     }
                 } else if is_dir {
                     ed.cycle_path_suggestion(down);
@@ -3103,12 +3103,12 @@ impl Session {
     /// Backspace at an empty path steps back into the root. Enter saves (or, in the root field,
     /// confirms the root and moves on); Esc cancels.
     fn on_save_as_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
-        let project_paths = self.project_paths.clone();
-        let labels = super::labels::root_labels(&project_paths);
+        let workspace_paths = self.workspace_paths.clone();
+        let labels = super::labels::root_labels(&workspace_paths);
         let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
             return Effects::none();
         };
-        let multi_root = project_paths.len() > 1;
+        let multi_root = workspace_paths.len() > 1;
         let in_root = multi_root && ed.field == ChipEditorField::Root;
         let no_chord = !mods.ctrl && !mods.alt;
         // Whether the path field's suggestion listing went stale and needs a directory/list.
@@ -3117,7 +3117,7 @@ impl Session {
             // Enter in the path field saves; in the root field it confirms the root and advances.
             KeyCode::Enter if no_chord && !in_root => return self.commit_save_as(),
             KeyCode::Enter if no_chord => {
-                refresh = ed.commit_root_field(&labels, &project_paths);
+                refresh = ed.commit_root_field(&labels, &workspace_paths);
             }
             KeyCode::Esc => {
                 self.prompt = None;
@@ -3127,16 +3127,16 @@ impl Session {
             // absorb the next directory segment, repeated presses walk down the tree).
             KeyCode::Tab if no_chord => {
                 if in_root {
-                    refresh = ed.commit_root_field(&labels, &project_paths);
+                    refresh = ed.commit_root_field(&labels, &workspace_paths);
                 } else {
-                    refresh = ed.accept_path_suggestion(&project_paths);
+                    refresh = ed.accept_path_suggestion(&workspace_paths);
                 }
             }
             KeyCode::Char('l') if mods.alt && !mods.ctrl => {
                 if in_root {
-                    refresh = ed.commit_root_field(&labels, &project_paths);
+                    refresh = ed.commit_root_field(&labels, &workspace_paths);
                 } else {
-                    refresh = ed.accept_path_suggestion(&project_paths);
+                    refresh = ed.accept_path_suggestion(&workspace_paths);
                 }
             }
             KeyCode::Char('h') if mods.alt && !mods.ctrl && multi_root => {
@@ -3145,7 +3145,7 @@ impl Session {
             // `:` on a completed root value confirms it and moves into the path.
             KeyCode::Char(':') if no_chord && in_root => {
                 if ed.root_complete(&labels) {
-                    refresh = ed.commit_root_field(&labels, &project_paths);
+                    refresh = ed.commit_root_field(&labels, &workspace_paths);
                 }
             }
             // Alt-Backspace: in the path it deletes the rightmost segment, fish-style; at an empty
@@ -3159,7 +3159,7 @@ impl Session {
                             ed.root_selected = 0;
                         }
                     } else {
-                        refresh = ed.pop_path_segment(&project_paths);
+                        refresh = ed.pop_path_segment(&workspace_paths);
                     }
                 } else {
                     ed.root_filter.clear();
@@ -3188,7 +3188,7 @@ impl Session {
                         } else {
                             (sel + n - 1) % n
                         };
-                        refresh = ed.sync_dir_listing(&project_paths);
+                        refresh = ed.sync_dir_listing(&workspace_paths);
                     }
                 } else {
                     ed.cycle_path_suggestion(down);
@@ -3211,9 +3211,9 @@ impl Session {
     /// requested path rides on the result event so a stale response (the editor moved on) can be
     /// discarded. No-op for an invalid root or a closed prompt.
     fn refresh_save_as_listing(&mut self) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let path = match self.prompt.as_ref() {
-            Some(Prompt::SaveAs(ed)) => ed.dir_listing_path(&project_paths),
+            Some(Prompt::SaveAs(ed)) => ed.dir_listing_path(&workspace_paths),
             _ => None,
         };
         let Some(path) = path else {
@@ -3229,24 +3229,24 @@ impl Session {
     }
 
     /// Commit the save-as prompt: save the literal typed path under the chosen root. A leading `/`
-    /// re-resolves against the project roots; an empty path keeps the prompt open. Closes the
+    /// re-resolves against the workspace roots; an empty path keeps the prompt open. Closes the
     /// prompt on submit — the overwrite confirm (if any) re-opens it via [`Self::decline_confirm`].
     fn commit_save_as(&mut self) -> Effects {
-        let project_paths = self.project_paths.clone();
+        let workspace_paths = self.workspace_paths.clone();
         let Some(Prompt::SaveAs(ed)) = self.prompt.as_ref() else {
             return Effects::none();
         };
         let raw = ed.input.text.trim().to_string();
-        let relative_target = ed.save_target(&project_paths);
+        let relative_target = ed.save_target(&workspace_paths);
         if raw.is_empty() {
             return Effects::none(); // nothing typed — keep the prompt open
         }
         let target = if raw.starts_with('/') {
-            match strip_longest_root(&raw, &project_paths) {
+            match strip_longest_root(&raw, &workspace_paths) {
                 Some(target) => target,
                 None => {
                     self.prompt = None;
-                    return Effects::error(format!("{raw} is outside the project's roots"));
+                    return Effects::error(format!("{raw} is outside the workspace's roots"));
                 }
             }
         } else {
@@ -3268,21 +3268,21 @@ impl Session {
     }
 
     /// Submit the open-from-path overlay: open `path` (absolute, or a leading `~/`) via
-    /// `project/open_path`. The server resolves the project context — internal if it's under
-    /// the active project's roots, an external buffer if not, a fresh ephemeral context if no
-    /// project is active. The result lands like a project switch (adopt the project + buffer); the
+    /// `workspace/open_path`. The server resolves the workspace context — internal if it's under
+    /// the active workspace's roots, an external buffer if not, a fresh ephemeral context if no
+    /// workspace is active. The result lands like a workspace switch (adopt the workspace + buffer); the
     /// path field is already non-empty (checked by the caller).
     fn commit_open_path(&mut self, path: String) -> Effects {
         self.prompt = None;
-        self.request_str::<ProjectOpenPath>(
-            ProjectOpenPathParams {
+        self.request_str::<WorkspaceOpenPath>(
+            WorkspaceOpenPathParams {
                 path,
                 transient: None,
             },
             |r| {
-                Event::ProjectActivated(r.and_then(|a| {
+                Event::WorkspaceActivated(r.and_then(|a| {
                     a.opened
-                        .map(|open| (a.project, open))
+                        .map(|open| (a.workspace, open))
                         .ok_or_else(|| "open_path returned no buffer".into())
                 }))
             },
@@ -3359,7 +3359,7 @@ impl Session {
                 if let Some(new_path) = p.path {
                     if self.buffer.path.as_deref() != Some(new_path.as_str()) {
                         self.buffer.label =
-                            super::session::label_for_path(&new_path, &self.project_paths);
+                            super::session::label_for_path(&new_path, &self.workspace_paths);
                         self.buffer.path = Some(new_path);
                     }
                 }
@@ -3486,7 +3486,7 @@ impl Session {
                 restart_toast.map_or_else(Effects::none, Effects::one)
             }
             BufferClosed::NAME => {
-                // Another client (or a path/project deletion) closed a buffer; if it's ours,
+                // Another client (or a path/workspace deletion) closed a buffer; if it's ours,
                 // switch to the server-indicated next buffer (or a fresh scratch).
                 let Ok(p) = serde_json::from_value::<BufferClosedParams>(n.params) else {
                     return Effects::none();
@@ -3500,10 +3500,10 @@ impl Session {
                 // — leave the context, same as closing it ourselves (see `close_buffer`). This is
                 // the multi-client case: another client closed the shared external file we were
                 // both viewing, and there's no other buffer in this throwaway context to land on.
-                if aether_protocol::is_ephemeral_project_id(&self.project)
+                if aether_protocol::is_ephemeral_workspace_id(&self.workspace)
                     && p.next_buffer_id.is_none()
                 {
-                    return fx.and(self.leave_ephemeral_project());
+                    return fx.and(self.leave_ephemeral_workspace());
                 }
 
                 fx.and(self.request::<BufferOpen>(
@@ -3514,27 +3514,27 @@ impl Session {
                     move |__r| Event::Switched(__r.map_err(|e| e.to_string())),
                 ))
             }
-            ProjectRenamed::NAME => {
-                // Another client renamed our active project. The server already re-keyed our
+            WorkspaceRenamed::NAME => {
+                // Another client renamed our active workspace. The server already re-keyed our
                 // server-side state; adopt the new name locally so the display and the reconnect
                 // baseline (reconnect is by name) follow.
-                let Ok(p) = serde_json::from_value::<ProjectRenamedParams>(n.params) else {
+                let Ok(p) = serde_json::from_value::<WorkspaceRenamedParams>(n.params) else {
                     return Effects::none();
                 };
-                if self.project != p.old_name {
+                if self.workspace != p.old_name {
                     return Effects::none();
                 }
-                self.project = p.new_name.clone();
+                self.workspace = p.new_name.clone();
                 // Keep an open settings overlay's committed name in step too, or its next commit
                 // would target the stale name.
-                if let Some(s) = self.project_settings.as_mut() {
-                    if s.project_name == p.old_name {
-                        s.project_name = p.new_name.clone();
+                if let Some(s) = self.workspace_settings.as_mut() {
+                    if s.workspace_name == p.old_name {
+                        s.workspace_name = p.new_name.clone();
                         s.name.set(p.new_name.clone());
                     }
                 }
                 Effects::toast(
-                    format!("Project renamed to {}", p.new_name),
+                    format!("Workspace renamed to {}", p.new_name),
                     ToastKind::Info,
                 )
             }
@@ -3882,25 +3882,25 @@ impl Session {
     // ---- Explorer/Files create + delete --------------------------------------------------
 
     /// Stage a delete confirm for the highlighted picker entry: trash a Files/Explorer file or
-    /// directory (`path/delete`), or forget a project (`project/delete`) from the switcher. The
-    /// absolute path comes from the picker's listed directory (Explorer) or the entry's project
+    /// directory (`path/delete`), or forget a workspace (`workspace/delete`) from the switcher. The
+    /// absolute path comes from the picker's listed directory (Explorer) or the entry's workspace
     /// root (Files). The picker stays open under the confirm; the refreshed listing arrives via a
     /// `buffer/closed` / `picker/update` push.
     pub fn picker_stage_delete(&mut self) -> Effects {
-        // A highlighted project: the server refuses to delete the active one (the rug-pull guard),
+        // A highlighted workspace: the server refuses to delete the active one (the rug-pull guard),
         // so don't even stage a doomed confirm — say why and bail.
         if let Some(p) = &self.picker {
-            if p.kind == PickerKind::Projects {
-                let Some(PickerItem::Project { name, .. }) = p.selected_item() else {
+            if p.kind == PickerKind::Workspaces {
+                let Some(PickerItem::Workspace { name, .. }) = p.selected_item() else {
                     return Effects::none();
                 };
-                if name == &self.project {
-                    return Effects::error("Can't delete the active project — switch away first");
+                if name == &self.workspace {
+                    return Effects::error("Can't delete the active workspace — switch away first");
                 }
                 let name = name.clone();
                 self.prompt = Some(Prompt::Confirm {
-                    kind: ConfirmKind::DeleteProject { name: name.clone() },
-                    action: ConfirmAction::DeleteProject { name },
+                    kind: ConfirmKind::DeleteWorkspace { name: name.clone() },
+                    action: ConfirmAction::DeleteWorkspace { name },
                 });
                 return Effects::none();
             }
@@ -3926,7 +3926,7 @@ impl Session {
                     path_index,
                     relative_path,
                     ..
-                } => self.project_paths.get(*path_index as usize).map(|root| {
+                } => self.workspace_paths.get(*path_index as usize).map(|root| {
                     (
                         format!("{}/{relative_path}", root.trim_end_matches('/')),
                         "file",
@@ -4044,10 +4044,10 @@ impl Session {
                 Event::DirCreated,
             );
         }
-        // File: address it under a project root, then open with create-on-save.
-        let Some((path_index, relative_path)) = strip_longest_root(&abs, &self.project_paths)
+        // File: address it under a workspace root, then open with create-on-save.
+        let Some((path_index, relative_path)) = strip_longest_root(&abs, &self.workspace_paths)
         else {
-            return Effects::error("Path is outside the project's roots");
+            return Effects::error("Path is outside the workspace's roots");
         };
         let from = self.buffer.buffer_id;
         self.request_str::<BufferOpen>(
@@ -4062,14 +4062,14 @@ impl Session {
         )
     }
 
-    /// The Projects picker's synthetic "+ Create project …" row: create a fresh project named by
+    /// The Workspaces picker's synthetic "+ Create workspace …" row: create a fresh workspace named by
     /// the (trimmed) query, then activate it. Mirrors [`explorer_create_from_query`].
-    pub fn project_create_from_query(&mut self) -> Effects {
+    pub fn workspace_create_from_query(&mut self) -> Effects {
         let name = {
             let Some(p) = &self.picker else {
                 return Effects::none();
             };
-            if p.kind != PickerKind::Projects {
+            if p.kind != PickerKind::Workspaces {
                 return Effects::none();
             }
             p.query.trim().to_string()
@@ -4078,50 +4078,50 @@ impl Session {
             return Effects::error("Type a name to create");
         }
         if name.contains('/') || name.contains('\\') {
-            return Effects::error("Project name can't contain path separators");
+            return Effects::error("Workspace name can't contain path separators");
         }
-        // Drop the picker first — the create both activates the project and (when it has no roots)
+        // Drop the picker first — the create both activates the workspace and (when it has no roots)
         // opens the settings overlay, so the picker shouldn't linger underneath.
         let hide = self.close_picker();
         hide.and(
-            self.request_str::<ProjectCreate>(ProjectCreateParams { name }, Event::ProjectCreated),
+            self.request_str::<WorkspaceCreate>(WorkspaceCreateParams { name }, Event::WorkspaceCreated),
         )
     }
 
-    /// Adopt a `ProjectInfo` returned by an add/remove-root RPC: update the session's roots and,
-    /// when the settings overlay is open and for the same project, its roots list too.
-    fn sync_project_info(&mut self, info: ProjectInfo) {
-        if self.project == info.name {
-            self.project_paths = info.paths.clone();
+    /// Adopt a `WorkspaceInfo` returned by an add/remove-root RPC: update the session's roots and,
+    /// when the settings overlay is open and for the same workspace, its roots list too.
+    fn sync_workspace_info(&mut self, info: WorkspaceInfo) {
+        if self.workspace == info.name {
+            self.workspace_paths = info.paths.clone();
         }
-        if let Some(s) = self.project_settings.as_mut() {
-            if s.project_name == info.name {
+        if let Some(s) = self.workspace_settings.as_mut() {
+            if s.workspace_name == info.name {
                 s.roots = info.paths;
             }
         }
     }
 
-    /// Open the project-settings overlay (`Space ,`), seeded from the active project's name and
+    /// Open the workspace-settings overlay (`Space ,`), seeded from the active workspace's name and
     /// roots. Cheap — no RPC. Focus lands on the always-present add-root input row at the bottom,
     /// since most opens (especially the post-create flow) are to add a root; the name field is
-    /// above the roots and reached with Alt-k. Migrated from the TUI's `open_project_settings`.
-    pub fn open_project_settings(&mut self) {
-        let roots = self.project_paths.clone();
-        let project_name = self.project.clone();
-        self.project_settings = Some(ProjectSettings {
-            project_name: project_name.clone(),
-            name: TextField::new(project_name),
+    /// above the roots and reached with Alt-k. Migrated from the TUI's `open_workspace_settings`.
+    pub fn open_workspace_settings(&mut self) {
+        let roots = self.workspace_paths.clone();
+        let workspace_name = self.workspace.clone();
+        self.workspace_settings = Some(WorkspaceSettings {
+            workspace_name: workspace_name.clone(),
+            name: TextField::new(workspace_name),
             roots,
-            selected: 0, // the project-name field
+            selected: 0, // the workspace-name field
             add: TextField::default(),
             error: None,
         });
     }
 
-    /// Keys while the project-settings overlay is open. Migrated from the TUI's
-    /// `handle_project_settings_key`, made sans-IO: rename / add-root / remove-root each emit an
-    /// `Effect::Request`, whose result event ([`Event::ProjectRenamed`] / `ProjectRootAdded` /
-    /// `ProjectRootRemoved`) updates the overlay. The TUI's "commit-rename-then-advance-only-on-
+    /// Keys while the workspace-settings overlay is open. Migrated from the TUI's
+    /// `handle_workspace_settings_key`, made sans-IO: rename / add-root / remove-root each emit an
+    /// `Effect::Request`, whose result event ([`Event::WorkspaceRenamed`] / `WorkspaceRootAdded` /
+    /// `WorkspaceRootRemoved`) updates the overlay. The TUI's "commit-rename-then-advance-only-on-
     /// success" gate is simplified: Enter / blur emits the rename request and navigation is free;
     /// the result event reconciles the name (or sets the error).
     ///
@@ -4129,7 +4129,7 @@ impl Session {
     /// `roots.len() + 1` the add-root input row. Alt-j/k move between fields; Left/Right move the
     /// caret inside a text field. Delete / Ctrl-d on a root row opens the shared confirm prompt
     /// (`request_remove_root`); Enter on the input row commits the add.
-    pub fn on_project_settings_key(
+    pub fn on_workspace_settings_key(
         &mut self,
         code: KeyCode,
         mods: Mods,
@@ -4140,7 +4140,7 @@ impl Session {
             code == KeyCode::Delete || (code == KeyCode::Char('d') && mods.ctrl && !mods.alt);
 
         let Some((selected, roots_len)) = self
-            .project_settings
+            .workspace_settings
             .as_ref()
             .map(|s| (s.selected, s.roots.len()))
         else {
@@ -4158,7 +4158,7 @@ impl Session {
             } else {
                 Effects::none()
             };
-            self.project_settings = None;
+            self.workspace_settings = None;
             return rename;
         }
 
@@ -4166,7 +4166,7 @@ impl Session {
         if mods.alt && !mods.ctrl {
             match code {
                 KeyCode::Char('k') => {
-                    if let Some(s) = self.project_settings.as_mut() {
+                    if let Some(s) = self.workspace_settings.as_mut() {
                         s.selected = s.selected.saturating_sub(1);
                     }
                     return Effects::none();
@@ -4177,7 +4177,7 @@ impl Session {
                     } else {
                         Effects::none()
                     };
-                    if let Some(s) = self.project_settings.as_mut() {
+                    if let Some(s) = self.workspace_settings.as_mut() {
                         s.selected = (s.selected + 1).min(s.roots.len() + 1);
                     }
                     return rename;
@@ -4201,78 +4201,78 @@ impl Session {
         }
 
         // Text editing for the focused field (name / add-root) is owned by each shell's input,
-        // which syncs the value via `project_settings_set_name` / `_set_add`. The core handles only
+        // which syncs the value via `workspace_settings_set_name` / `_set_add`. The core handles only
         // the command keys above; any other key here is a no-op.
         let _ = text;
         Effects::none()
     }
 
-    /// Commit a pending project rename if the name field differs from the committed name. Emits a
-    /// `project/rename` request; [`Event::ProjectRenamed`] reconciles the result. A no-op edit
+    /// Commit a pending workspace rename if the name field differs from the committed name. Emits a
+    /// `workspace/rename` request; [`Event::WorkspaceRenamed`] reconciles the result. A no-op edit
     /// (empty or unchanged) just normalizes the field back to the committed name. Migrated from the
     /// TUI's `commit_rename_if_changed`, minus its success-gating return value (navigation is free
     /// now — the result event updates the name when it lands).
     fn commit_rename_if_changed(&mut self) -> Effects {
         let Some((old_name, new_name)) = self
-            .project_settings
+            .workspace_settings
             .as_ref()
-            .map(|s| (s.project_name.clone(), s.name.text.trim().to_string()))
+            .map(|s| (s.workspace_name.clone(), s.name.text.trim().to_string()))
         else {
             return Effects::none();
         };
         if new_name.is_empty() || new_name == old_name {
-            if let Some(s) = self.project_settings.as_mut() {
+            if let Some(s) = self.workspace_settings.as_mut() {
                 s.name.set(old_name);
             }
             return Effects::none();
         }
-        self.request_str::<ProjectRename>(
-            ProjectRenameParams {
-                project: old_name,
+        self.request_str::<WorkspaceRename>(
+            WorkspaceRenameParams {
+                workspace: old_name,
                 new_name,
             },
-            Event::ProjectRenamed,
+            Event::WorkspaceRenamed,
         )
     }
 
-    /// Commit the add-root input row: emit a `project/add_root` request for the trimmed path.
-    /// [`Event::ProjectRootAdded`] reconciles the result. Migrated from the TUI's `commit_add_root`.
+    /// Commit the add-root input row: emit a `workspace/add_root` request for the trimmed path.
+    /// [`Event::WorkspaceRootAdded`] reconciles the result. Migrated from the TUI's `commit_add_root`.
     fn commit_add_root(&mut self) -> Effects {
-        let Some((project, path)) = self
-            .project_settings
+        let Some((workspace, path)) = self
+            .workspace_settings
             .as_ref()
-            .map(|s| (s.project_name.clone(), s.add.text.trim().to_string()))
+            .map(|s| (s.workspace_name.clone(), s.add.text.trim().to_string()))
         else {
             return Effects::none();
         };
         if path.is_empty() {
             return Effects::none();
         }
-        if let Some(s) = self.project_settings.as_mut() {
+        if let Some(s) = self.workspace_settings.as_mut() {
             s.error = None;
         }
-        self.request_str::<ProjectAddRoot>(
-            ProjectAddRootParams { project, path },
-            Event::ProjectRootAdded,
+        self.request_str::<WorkspaceAddRoot>(
+            WorkspaceAddRootParams { workspace, path },
+            Event::WorkspaceRootAdded,
         )
     }
 
     /// Open the shared confirm prompt for removing root `index` (the `selected - 1` root row, or a
-    /// clicked delete button). The actual `project/remove_root` request fires when the prompt is
-    /// accepted ([`ConfirmAction::RemoveProjectRoot`] → [`Self::run_confirm`]); the result lands as
-    /// [`Event::ProjectRootRemoved`]. No-op if the overlay is closed or the index is out of range.
+    /// clicked delete button). The actual `workspace/remove_root` request fires when the prompt is
+    /// accepted ([`ConfirmAction::RemoveWorkspaceRoot`] → [`Self::run_confirm`]); the result lands as
+    /// [`Event::WorkspaceRootRemoved`]. No-op if the overlay is closed or the index is out of range.
     pub fn request_remove_root(&mut self, index: usize) -> Effects {
-        let Some(s) = self.project_settings.as_mut() else {
+        let Some(s) = self.workspace_settings.as_mut() else {
             return Effects::none();
         };
         let Some(path) = s.roots.get(index).cloned() else {
             return Effects::none();
         };
-        let project = s.project_name.clone();
+        let workspace = s.workspace_name.clone();
         s.error = None;
         self.prompt = Some(Prompt::Confirm {
             kind: ConfirmKind::RemoveRoot { path: path.clone() },
-            action: ConfirmAction::RemoveProjectRoot { project, path },
+            action: ConfirmAction::RemoveWorkspaceRoot { workspace, path },
         });
         Effects::none()
     }
@@ -4291,7 +4291,7 @@ impl Session {
         self.app_settings = Some(AppSettingsOverlay { selected: 0 });
     }
 
-    /// Keys while the app-settings overlay is open (it owns the keyboard, like the project-settings
+    /// Keys while the app-settings overlay is open (it owns the keyboard, like the workspace-settings
     /// overlay). Esc closes; Alt-j/k or Up/Down move between rows; Enter/Space activates the focused
     /// row's toggle. The overlay has no text entry, so any other key is a no-op.
     pub fn on_app_settings_key(
@@ -4635,20 +4635,20 @@ impl Session {
                 .request_str::<PathDelete>(PathDeleteParams { path }, move |result| {
                     Event::PathDeleted { noun, result }
                 }),
-            ConfirmAction::RemoveProjectRoot { project, path } => self
-                .request_str::<ProjectRemoveRoot>(
-                    ProjectRemoveRootParams { project, path },
-                    Event::ProjectRootRemoved,
+            ConfirmAction::RemoveWorkspaceRoot { workspace, path } => self
+                .request_str::<WorkspaceRemoveRoot>(
+                    WorkspaceRemoveRootParams { workspace, path },
+                    Event::WorkspaceRootRemoved,
                 ),
-            ConfirmAction::DeleteProject { name } => {
+            ConfirmAction::DeleteWorkspace { name } => {
                 let display = name.clone();
-                self.request::<ProjectDelete>(ProjectDeleteParams { name }, move |r| {
+                self.request::<WorkspaceDelete>(WorkspaceDeleteParams { name }, move |r| {
                     // Surface the server's *message*, not the stringified `RpcError` (which carries
-                    // a "RPC … returned error -32005:" prefix). The locally-active project is
-                    // already guarded in `picker_stage_delete`, so an active-project refusal here
+                    // a "RPC … returned error -32005:" prefix). The locally-active workspace is
+                    // already guarded in `picker_stage_delete`, so an active-workspace refusal here
                     // means it's open in another window — for which "switch away" is wrong advice.
-                    Event::ProjectDeleted(r.map_err(|e| {
-                        if e.code == ErrorCode::ACTIVE_PROJECT_PREVENTS_DELETE.code() {
+                    Event::WorkspaceDeleted(r.map_err(|e| {
+                        if e.code == ErrorCode::ACTIVE_WORKSPACE_PREVENTS_DELETE.code() {
                             format!(
                                 "\"{display}\" is active in another window — close it there first"
                             )
@@ -4662,18 +4662,18 @@ impl Session {
     }
 
     /// Open the save-as prompt pre-filled with `(path_index, input)`. A brand-new buffer (empty
-    /// input) in a multi-root project starts focused in the root field so you choose where to save;
+    /// input) in a multi-root workspace starts focused in the root field so you choose where to save;
     /// otherwise the path field has focus (the root is known). Kicks off a `directory/list` so the
     /// path field's ghost suggestions are ready.
     fn open_save_as(&mut self, path_index: u32, input: String) -> Effects {
-        let project_paths = self.project_paths.clone();
-        let field = if project_paths.len() > 1 && input.is_empty() {
+        let workspace_paths = self.workspace_paths.clone();
+        let field = if workspace_paths.len() > 1 && input.is_empty() {
             ChipEditorField::Root
         } else {
             ChipEditorField::Path
         };
         let mut ed = SaveAsEditor::new(input, field, path_index);
-        ed.sync_dir_listing(&project_paths);
+        ed.sync_dir_listing(&workspace_paths);
         self.prompt = Some(Prompt::SaveAs(Box::new(ed)));
         self.refresh_save_as_listing()
     }
@@ -4768,9 +4768,9 @@ impl Session {
             let fx = self.on_picker_key(code, mods, text);
             return fx;
         }
-        // The project-settings overlay likewise owns the keyboard while open.
-        if self.project_settings.is_some() {
-            return self.on_project_settings_key(code, mods, text);
+        // The workspace-settings overlay likewise owns the keyboard while open.
+        if self.workspace_settings.is_some() {
+            return self.on_workspace_settings_key(code, mods, text);
         }
         // As does the application-settings overlay.
         if self.app_settings.is_some() {
@@ -5133,14 +5133,14 @@ impl Session {
                 // tables); a shell without it ignores the action.
                 Effects::one(Effect::ShellAction(ShellAction::OpenHelp))
             }
-            A::OpenProjectSettings => {
-                // The project-settings overlay now lives in the core (state + key handling); every
-                // shell renders it from `session.project_settings`.
-                self.open_project_settings();
+            A::OpenWorkspaceSettings => {
+                // The workspace-settings overlay now lives in the core (state + key handling); every
+                // shell renders it from `session.workspace_settings`.
+                self.open_workspace_settings();
                 Effects::none()
             }
             A::OpenAppSettings => {
-                // Like the project-settings overlay, the app-settings overlay lives in the core;
+                // Like the workspace-settings overlay, the app-settings overlay lives in the core;
                 // shells render it from `session.app_settings`.
                 self.open_app_settings();
                 Effects::none()
@@ -5285,18 +5285,18 @@ impl Session {
             A::Quit => Effects::one(Effect::Exit),
             A::Save => self.save(None, false),
             A::SaveAs => {
-                // Prefill with the buffer's current project-relative path, like the web dialog.
+                // Prefill with the buffer's current workspace-relative path, like the web dialog.
                 let (path_index, input) = self
                     .buffer
                     .path
                     .as_deref()
-                    .and_then(|p| strip_longest_root(p, &self.project_paths))
+                    .and_then(|p| strip_longest_root(p, &self.workspace_paths))
                     .unwrap_or((0, String::new()));
                 self.open_save_as(path_index, input)
             }
             A::OpenPath => {
-                // Open the project-agnostic path overlay (empty field). The shell focuses it and
-                // syncs typed text via `open_path_set_input`; Enter opens via `project/open_path`.
+                // Open the workspace-agnostic path overlay (empty field). The shell focuses it and
+                // syncs typed text via `open_path_set_input`; Enter opens via `workspace/open_path`.
                 self.prompt = Some(Prompt::OpenPath(crate::session::TextField::new(
                     String::new(),
                 )));
@@ -5725,7 +5725,7 @@ mod tests {
         let seeded = seeded_filters_for_switch(&hiding, Some(scope), PickerKind::Files);
         assert!(!seeded.include_ignored && !seeded.include_hidden && seeded.changed_only);
 
-        // Roots mode: no dir scope — the target covers the whole project.
+        // Roots mode: no dir scope — the target covers the whole workspace.
         let seeded = seeded_filters_for_switch(&defaults, None, PickerKind::Grep);
         assert!(seeded.directories.is_empty());
     }

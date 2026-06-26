@@ -1,4 +1,4 @@
-//! Disambiguated labels for project roots. Default is the root's basename; when two roots share
+//! Disambiguated labels for workspace roots. Default is the root's basename; when two roots share
 //! a basename, both labels grow a parenthesized parent component, then grandparent, etc., until
 //! they're unique. Lives client-side because it's a pure presentation concern — the server sends
 //! root indices, the client decides how to print them.
@@ -6,30 +6,30 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// How a project id is shown to the user in a *project list* (the switcher). A persisted project
-/// shows its name verbatim; an *ephemeral* one (the synthesized "no project" context that hosts
-/// files opened outside any configured project) shows `(project <n>)` — mirroring scratch buffers'
+/// How a workspace id is shown to the user in a *workspace list* (the switcher). A persisted workspace
+/// shows its name verbatim; an *ephemeral* one (the synthesized "no workspace" context that hosts
+/// files opened outside any configured workspace) shows `(workspace <n>)` — mirroring scratch buffers'
 /// `(scratch <n>)`, so multiple ephemeral contexts are distinguishable — rather than its internal
-/// `ephemeral/<n>` id. The status bar / title use [`shows_project_chrome`] instead: they omit the
+/// `ephemeral/<n>` id. The status bar / title use [`shows_workspace_chrome`] instead: they omit the
 /// `[…]` entirely for an ephemeral context.
-pub fn project_display(project: &str) -> String {
-    match project.strip_prefix(aether_protocol::EPHEMERAL_PROJECT_PREFIX) {
-        Some(n) => format!("(project {n})"),
-        None => project.to_string(),
+pub fn workspace_display(workspace: &str) -> String {
+    match workspace.strip_prefix(aether_protocol::EPHEMERAL_WORKSPACE_PREFIX) {
+        Some(n) => format!("(workspace {n})"),
+        None => workspace.to_string(),
     }
 }
 
-/// Whether a project id should be wrapped in the `[project]` chrome shown in the status bar and
-/// window title. False for the empty (no project active) state *and* for an ephemeral context —
-/// neither is a real, named project, so we show just the buffer label with no bracket rather than
-/// a `[(no project)]` that reads like a project literally named that.
-pub fn shows_project_chrome(project: &str) -> bool {
-    !project.is_empty() && !aether_protocol::is_ephemeral_project_id(project)
+/// Whether a workspace id should be wrapped in the `[workspace]` chrome shown in the status bar and
+/// window title. False for the empty (no workspace active) state *and* for an ephemeral context —
+/// neither is a real, named workspace, so we show just the buffer label with no bracket rather than
+/// a `[(no workspace)]` that reads like a workspace literally named that.
+pub fn shows_workspace_chrome(workspace: &str) -> bool {
+    !workspace.is_empty() && !aether_protocol::is_ephemeral_workspace_id(workspace)
 }
 
 /// Max characters the window-title path label is shown at before [`truncate_path`] elides it.
 /// Title bars have no width budget of their own (unlike the status bar, which truncates to the row
-/// width), so this is a fixed cap — long enough for a typical project-relative path, short enough
+/// width), so this is a fixed cap — long enough for a typical workspace-relative path, short enough
 /// that an absolute external path (goto-definition into a dependency) doesn't blow out the title.
 const TITLE_LABEL_MAX: usize = 60;
 
@@ -88,40 +88,40 @@ pub fn truncate_path(label: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
-/// The window/terminal title's *body* for `(project, buffer label)`: `None` before a project is
-/// active (the title is then just the app name), otherwise `[project]` or `[project] label`. The
-/// `[…]` is omitted entirely when there's no real project — a connecting/chooser state (so no
-/// stray `[]`) *and* an ephemeral "(no project)" context, which shows just the buffer label.
+/// The window/terminal title's *body* for `(workspace, buffer label)`: `None` before a workspace is
+/// active (the title is then just the app name), otherwise `[workspace]` or `[workspace] label`. The
+/// `[…]` is omitted entirely when there's no real workspace — a connecting/chooser state (so no
+/// stray `[]`) *and* an ephemeral "(no workspace)" context, which shows just the buffer label.
 /// Long paths are segment-elided (see [`truncate_path`]) so an external file's absolute path doesn't
 /// overflow the title bar. Shells append `" - Aether"` (and the TUI prepends a dirty dot).
-pub fn title_body(project: &str, label: &str) -> Option<String> {
-    if project.is_empty() {
-        // Boot / connecting / chooser: no project *and* no buffer — the title is just the app name.
+pub fn title_body(workspace: &str, label: &str) -> Option<String> {
+    if workspace.is_empty() {
+        // Boot / connecting / chooser: no workspace *and* no buffer — the title is just the app name.
         return None;
     }
     let label = truncate_path(label, TITLE_LABEL_MAX);
-    if aether_protocol::is_ephemeral_project_id(project) {
-        // Ephemeral "(no project)" context: show the buffer label alone (the filename you're
-        // editing), with no `[project]` bracket — or nothing when there's no label.
+    if aether_protocol::is_ephemeral_workspace_id(workspace) {
+        // Ephemeral "(no workspace)" context: show the buffer label alone (the filename you're
+        // editing), with no `[workspace]` bracket — or nothing when there's no label.
         return (!label.is_empty()).then_some(label);
     }
     Some(if label.is_empty() {
-        format!("[{project}]")
+        format!("[{workspace}]")
     } else {
-        format!("[{project}] {label}")
+        format!("[{workspace}] {label}")
     })
 }
 
 /// The full window title: the [`title_body`] plus `" - Aether"`, or just `"Aether"` when no
-/// project is active (so a fresh/connecting window reads `Aether`, not `[] `).
-pub fn window_title(project: &str, label: &str) -> String {
-    match title_body(project, label) {
+/// workspace is active (so a fresh/connecting window reads `Aether`, not `[] `).
+pub fn window_title(workspace: &str, label: &str) -> String {
+    match title_body(workspace, label) {
         Some(body) => format!("{body} - Aether"),
         None => "Aether".to_string(),
     }
 }
 
-/// Cap on disambiguation passes. Real projects never need more than a couple, but the loop has
+/// Cap on disambiguation passes. Real workspaces never need more than a couple, but the loop has
 /// to terminate when two paths are literally identical (which `add_root` refuses, but defensive
 /// belt-and-braces is cheap).
 const MAX_DEPTH: usize = 16;
@@ -129,7 +129,7 @@ const MAX_DEPTH: usize = 16;
 /// One label per input path, aligned by index. Identical inputs produce identical labels (we
 /// can't disambiguate them); otherwise every label is unique within the result.
 ///
-/// Single-root projects get an empty string — there's nothing to disambiguate against, so
+/// Single-root workspaces get an empty string — there's nothing to disambiguate against, so
 /// renderers omit the label prefix entirely (`"src/main.rs"` instead of `"repo: src/main.rs"`).
 pub fn root_labels(paths: &[String]) -> Vec<String> {
     let n = paths.len();
@@ -220,12 +220,12 @@ mod tests {
     }
 
     #[test]
-    fn window_title_omits_empty_project_and_appends_app_name() {
-        // No project (boot/connecting/chooser): just the app name — never a stray `[]`.
+    fn window_title_omits_empty_workspace_and_appends_app_name() {
+        // No workspace (boot/connecting/chooser): just the app name — never a stray `[]`.
         assert_eq!(window_title("", ""), "Aether");
         assert_eq!(window_title("", "ignored"), "Aether");
         assert_eq!(title_body("", ""), None);
-        // With a project, the `[project] label` body gains the " - Aether" suffix.
+        // With a workspace, the `[workspace] label` body gains the " - Aether" suffix.
         assert_eq!(window_title("demo", ""), "[demo] - Aether");
         assert_eq!(
             window_title("demo", "src/main.rs"),
@@ -264,19 +264,19 @@ mod tests {
         // An external goto-def target (absolute path, outside roots) would otherwise overflow the
         // title bar; the body segment-elides it while keeping the filename.
         let long = "/home/u/.cargo/registry/src/index.crates.io-abc/serde-1.0.200/src/de/mod.rs";
-        let body = title_body("demo", long).expect("a project with a label has a body");
-        assert!(body.starts_with("[demo] "), "project chrome is preserved");
+        let body = title_body("demo", long).expect("a workspace with a label has a body");
+        assert!(body.starts_with("[demo] "), "workspace chrome is preserved");
         assert!(body.contains('…'), "the long path is elided: {body}");
         assert!(body.ends_with("mod.rs"), "the filename survives: {body}");
-        // The label portion is capped (project chrome + a bounded label).
+        // The label portion is capped (workspace chrome + a bounded label).
         assert!(body.chars().count() <= "[demo] ".chars().count() + 60);
     }
 
     #[test]
-    fn ephemeral_project_drops_the_bracket_chrome() {
-        // An ephemeral "(no project)" context shows no `[project]` chrome — just the buffer label,
-        // like there's no project. With no label it's the bare app name.
-        assert!(!shows_project_chrome("ephemeral/3"));
+    fn ephemeral_workspace_drops_the_bracket_chrome() {
+        // An ephemeral "(no workspace)" context shows no `[workspace]` chrome — just the buffer label,
+        // like there's no workspace. With no label it's the bare app name.
+        assert!(!shows_workspace_chrome("ephemeral/3"));
         assert_eq!(
             title_body("ephemeral/3", "outside.rs"),
             Some("outside.rs".into())
@@ -287,13 +287,13 @@ mod tests {
             "outside.rs - Aether"
         );
         assert_eq!(window_title("ephemeral/3", ""), "Aether");
-        // A persisted project still gets the bracket.
-        assert!(shows_project_chrome("demo"));
+        // A persisted workspace still gets the bracket.
+        assert!(shows_workspace_chrome("demo"));
     }
 
     #[test]
     fn single_root_returns_empty_label() {
-        // Single-root projects don't need a disambiguator — renderers fall through to a label-
+        // Single-root workspaces don't need a disambiguator — renderers fall through to a label-
         // less display when the label is empty.
         assert_eq!(root_labels(&s(&["/home/joe/work/repo"])), vec![""]);
     }

@@ -32,8 +32,8 @@ pub fn build_view(s: &Session) -> Value {
     json!({
         "mode": mode(s.mode),
         "conn": conn(&s.conn),
-        "project": s.project,
-        "project_paths": s.project_paths,
+        "workspace": s.workspace,
+        "workspace_paths": s.workspace_paths,
         "buffer": buffer(s),
         "viewport_id": s.viewport_id,
         "window": s.window.as_ref().map(jv),
@@ -50,9 +50,9 @@ pub fn build_view(s: &Session) -> Value {
         "pending": pending(&s.pending),
         "sneak_active": s.sneak.is_some(),
         "search": search(s),
-        "prompt": prompt(&s.prompt, &s.project_paths),
-        "picker": picker(&s.picker, &s.project_paths),
-        "project_settings": project_settings(s),
+        "prompt": prompt(&s.prompt, &s.workspace_paths),
+        "picker": picker(&s.picker, &s.workspace_paths),
+        "workspace_settings": workspace_settings(s),
         "app_settings": app_settings(s),
     })
 }
@@ -89,12 +89,12 @@ fn app_settings(s: &Session) -> Value {
     })
 }
 
-/// The project-settings overlay (`Space ,`), when open. Core-owned state + key handling
-/// (`on_project_settings_key`); the shell renders this projection and routes keys through the
+/// The workspace-settings overlay (`Space ,`), when open. Core-owned state + key handling
+/// (`on_workspace_settings_key`); the shell renders this projection and routes keys through the
 /// global keydown → `on_key`. Selection model: 0 = name field, `1..=roots.len()` = root rows,
 /// `roots.len() + 1` = the add-root input row.
-fn project_settings(s: &Session) -> Value {
-    let Some(ps) = &s.project_settings else {
+fn workspace_settings(s: &Session) -> Value {
+    let Some(ps) = &s.workspace_settings else {
         return Value::Null;
     };
     let field = |f: &aether_client::session::TextField| json!({ "text": f.text });
@@ -113,7 +113,7 @@ fn project_settings(s: &Session) -> Value {
 /// types and serialise verbatim; the shell renders rows from them and drives nav through the global
 /// keydown → `on_picker_key`. (Filter chips + the chip editor are a follow-up slice; the filters
 /// still apply server-side, they're just not drawn yet.)
-fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
+fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
     match p {
         None => Value::Null,
         Some(p) => {
@@ -121,7 +121,7 @@ fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
             // word-boundary chip; exclusion is carried in the label's leading `!` (the shell reads
             // it, matching the old client). The valued-chip editor is a follow-up slice.
             let chips = p
-                .chip_row(project_paths)
+                .chip_row(workspace_paths)
                 .iter()
                 .map(|c| json!({ "label": c.label, "flag": matches!(&c.id, aether_client::chips::ChipId::Word) }))
                 .collect::<Vec<_>>();
@@ -159,7 +159,7 @@ fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
                 })),
                 "chips": chips,
                 "chip_selected": p.chip_selected,
-                "chip_editor": chip_editor(&p.chip_editor, project_paths),
+                "chip_editor": chip_editor(&p.chip_editor, workspace_paths),
             })
         }
     }
@@ -168,9 +168,9 @@ fn picker(p: &Option<PickerState>, project_paths: &[String]) -> Value {
 /// The glob/dir filter-creation editor (the row below the query), when open. The core owns all the
 /// editing logic (`on_chip_editor_key`) and the ghost/validity computation; the shell just renders
 /// this projection. `root_*` fields apply only to a multi-root dir editor.
-fn chip_editor(ce: &Option<ChipEditor>, project_paths: &[String]) -> Value {
+fn chip_editor(ce: &Option<ChipEditor>, workspace_paths: &[String]) -> Value {
     let Some(ed) = ce else { return Value::Null };
-    let labels = aether_client::labels::root_labels(project_paths);
+    let labels = aether_client::labels::root_labels(workspace_paths);
     let input = |i: &aether_client::chips::Input| json!({ "text": i.text });
     json!({
         "is_dir": ed.is_dir(),
@@ -181,7 +181,7 @@ fn chip_editor(ce: &Option<ChipEditor>, project_paths: &[String]) -> Value {
         },
         "input": input(&ed.input),
         "root_filter": input(&ed.root_filter),
-        "multi_root": ed.is_dir() && project_paths.len() > 1,
+        "multi_root": ed.is_dir() && workspace_paths.len() > 1,
         "root_ghost": ed.root_ghost(&labels).map(|(_, suffix)| suffix),
         "root_invalid": ed.root_invalid(&labels),
         "root_display": labels.get(ed.chosen_root(&labels) as usize).cloned().unwrap_or_default(),
@@ -193,9 +193,9 @@ fn chip_editor(ce: &Option<ChipEditor>, project_paths: &[String]) -> Value {
 /// The save-as path editor's projection — same shape as [`chip_editor`]'s dir half, since the UX
 /// mirrors it. The core owns the editing/ghost/validity logic; the shell renders this and syncs
 /// text via `save_as_set_input` / `save_as_set_root_filter`.
-fn save_as(ed: &SaveAsEditor, project_paths: &[String]) -> Value {
-    let labels = aether_client::labels::root_labels(project_paths);
-    let multi_root = project_paths.len() > 1;
+fn save_as(ed: &SaveAsEditor, workspace_paths: &[String]) -> Value {
+    let labels = aether_client::labels::root_labels(workspace_paths);
+    let multi_root = workspace_paths.len() > 1;
     json!({
         "kind": "saveas",
         "field": match ed.field {
@@ -219,13 +219,13 @@ fn save_as(ed: &SaveAsEditor, project_paths: &[String]) -> Value {
 
 /// The modal prompt overlay, when one is open (confirm / save-as / LSP info). Keys flow through the
 /// core's `on_prompt_key` (the shell only renders this); see docs/web-core.md.
-fn prompt(p: &Option<Prompt>, project_paths: &[String]) -> Value {
+fn prompt(p: &Option<Prompt>, workspace_paths: &[String]) -> Value {
     match p {
         None => Value::Null,
         Some(Prompt::Confirm { kind, .. }) => {
             json!({ "kind": "confirm", "confirm": confirm_kind(kind) })
         }
-        Some(Prompt::SaveAs(ed)) => save_as(ed, project_paths),
+        Some(Prompt::SaveAs(ed)) => save_as(ed, workspace_paths),
         Some(Prompt::LspInfo(status)) => json!({ "kind": "lspinfo", "status": jv(status) }),
         // Open-from-path: a single plain path field (no root chips). The shell renders an
         // `<input>` and syncs its value via `open_path_set_input`.
@@ -246,7 +246,7 @@ fn confirm_kind(k: &ConfirmKind) -> Value {
             json!({ "kind": "delete", "noun": noun, "name": name })
         }
         ConfirmKind::RemoveRoot { path } => json!({ "kind": "remove_root", "path": path }),
-        ConfirmKind::DeleteProject { name } => json!({ "kind": "delete_project", "name": name }),
+        ConfirmKind::DeleteWorkspace { name } => json!({ "kind": "delete_workspace", "name": name }),
     }
 }
 

@@ -42,9 +42,9 @@ use aether_protocol::picker::{
     PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
     PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
 };
-use aether_protocol::project::{
-    ProjectActivate, ProjectActivateParams, ProjectActivateResult, ProjectDelete,
-    ProjectDeleteParams, ProjectOpenPath, ProjectOpenPathParams,
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceDelete,
+    WorkspaceDeleteParams, WorkspaceOpenPath, WorkspaceOpenPathParams,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -176,24 +176,24 @@ async fn hello_then_open_file() {
         .await
         .unwrap();
 
-    // Activate the project (replaces the old client/hello handshake — auth is now in the
+    // Activate the workspace (replaces the old client/hello handshake — auth is now in the
     // WebSocket query string).
-    let activated: ProjectActivateResult = send_request::<ProjectActivate>(
+    let activated: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
     )
     .await;
-    assert_eq!(activated.project.name, "test-proj");
-    assert_eq!(activated.project.paths.len(), 1);
+    assert_eq!(activated.workspace.name, "test-proj");
+    assert_eq!(activated.workspace.paths.len(), 1);
     // The instance stamp rides the activation result (clients use it for restart detection
     // instead of reading the discovery file). A running server has a non-zero start time.
     assert_ne!(
         activated.server_started_at, 0,
-        "project/activate reports the server's instance start stamp over the wire"
+        "workspace/activate reports the server's instance start stamp over the wire"
     );
 
     // Open the file.
@@ -243,10 +243,10 @@ async fn hello_then_open_file() {
     drop(server);
 }
 
-/// `project/delete` refuses to delete a project that's any client's active project — the
+/// `workspace/delete` refuses to delete a workspace that's any client's active workspace — the
 /// rug-pull guard, which runs before any on-disk config is touched.
 #[tokio::test]
-async fn project_delete_refuses_the_active_project() {
+async fn workspace_delete_refuses_the_active_workspace() {
     let dir = tempfile::tempdir().unwrap();
     let server = spawn_for_test_multi(vec![
         ("p1".into(), vec![dir.path().to_path_buf()]),
@@ -258,26 +258,26 @@ async fn project_delete_refuses_the_active_project() {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "p1".into(),
             open_last: false,
         },
     )
     .await;
 
-    // Deleting the project we're sitting in is refused, with a message that says why.
-    let msg = send_request_expect_err::<ProjectDelete>(
+    // Deleting the workspace we're sitting in is refused, with a message that says why.
+    let msg = send_request_expect_err::<WorkspaceDelete>(
         &mut ws,
         2,
-        &ProjectDeleteParams { name: "p1".into() },
+        &WorkspaceDeleteParams { name: "p1".into() },
     )
     .await;
     assert!(
         msg.contains("active"),
-        "refusal should explain the project is active, got {msg:?}"
+        "refusal should explain the workspace is active, got {msg:?}"
     );
 
     drop(server);
@@ -300,10 +300,10 @@ async fn buffer_open_restores_cursor_and_scroll() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -419,10 +419,10 @@ async fn buffer_open_restores_scroll_from_scroll_to_row() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "scroll-row-proj".into(),
             open_last: false,
         },
@@ -521,10 +521,10 @@ async fn buffer_open_jump_drops_saved_scroll() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -629,10 +629,10 @@ async fn buffer_open_isolates_scroll_per_client() {
         let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
             .await
             .unwrap();
-        let _: ProjectActivateResult = send_request::<ProjectActivate>(
+        let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
             &mut ws,
             1,
-            &ProjectActivateParams {
+            &WorkspaceActivateParams {
                 name: "test-proj".into(),
                 open_last: false,
             },
@@ -833,9 +833,9 @@ async fn ws_accepts_absent_version() {
 }
 
 #[tokio::test]
-async fn rejects_path_outside_project() {
+async fn rejects_path_outside_workspace() {
     let dir = tempfile::tempdir().unwrap();
-    // File is in /tmp directly, not in the project's path.
+    // File is in /tmp directly, not in the workspace's path.
     let outside = std::env::temp_dir().join("aether-outside-test.txt");
     std::fs::write(&outside, "outside").unwrap();
 
@@ -846,10 +846,10 @@ async fn rejects_path_outside_project() {
         .await
         .unwrap();
 
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -900,10 +900,10 @@ async fn viewport_subscribe_renders_window() {
         .await
         .unwrap();
 
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -972,10 +972,10 @@ async fn viewport_subscribe_wraps_long_line() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -1058,10 +1058,10 @@ async fn viewport_scroll_returns_new_window() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -1143,10 +1143,10 @@ async fn setup_with_buffer(
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -1658,16 +1658,16 @@ async fn buffer_close_open_next_attaches_in_one_trip() {
 }
 
 #[tokio::test]
-async fn project_activate_open_last_lands_in_one_trip() {
+async fn workspace_activate_open_last_lands_in_one_trip() {
     // docs/protocol-composites.md, C: activate + land (MRU buffer, or a fresh transient
     // scratch on first visit) in one message.
     let (_server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
 
     // Re-activating with open_last reattaches to the MRU buffer.
-    let r: ProjectActivateResult = send_request::<ProjectActivate>(
+    let r: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         10,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: true,
         },
@@ -1687,10 +1687,10 @@ async fn project_activate_open_last_lands_in_one_trip() {
         },
     )
     .await;
-    let r: ProjectActivateResult = send_request::<ProjectActivate>(
+    let r: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         12,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: true,
         },
@@ -1809,10 +1809,10 @@ async fn git_blame_line_include_commit_info_resolves_in_one_trip() {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "blame-composite-proj".into(),
             open_last: false,
         },
@@ -2714,10 +2714,10 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -2792,10 +2792,10 @@ async fn match_bracket_motion_jumps_to_pair() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -2869,10 +2869,10 @@ async fn match_bracket_with_extend_selects_to_pair() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -2934,10 +2934,10 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -2998,10 +2998,10 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3078,10 +3078,10 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3142,10 +3142,10 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3213,10 +3213,10 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3286,10 +3286,10 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3413,10 +3413,10 @@ async fn save_as_broadcasts_new_path_to_other_viewers() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3431,10 +3431,10 @@ async fn save_as_broadcasts_new_path_to_other_viewers() {
     let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws2,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3486,10 +3486,10 @@ async fn save_preserves_crlf_endings() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3545,10 +3545,10 @@ async fn save_scratch_returns_buffer_has_no_path() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -6737,10 +6737,10 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -6799,10 +6799,10 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -6870,10 +6870,10 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -6929,10 +6929,10 @@ async fn newline_and_indent_engine_python_def() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -6989,10 +6989,10 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7047,10 +7047,10 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7134,10 +7134,10 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7196,10 +7196,10 @@ async fn toggle_comment_strips_when_already_commented() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7259,10 +7259,10 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7324,10 +7324,10 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7386,10 +7386,10 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7449,10 +7449,10 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7514,10 +7514,10 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7581,10 +7581,10 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7648,10 +7648,10 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7733,10 +7733,10 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7799,10 +7799,10 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7865,10 +7865,10 @@ async fn toggle_comment_round_trip_partial_selection() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7942,10 +7942,10 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8005,10 +8005,10 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8068,10 +8068,10 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8120,10 +8120,10 @@ async fn toggle_comment_is_noop_for_json() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9109,17 +9109,17 @@ async fn setup_picker_workspace() -> (
     std::fs::write(dir_path.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(dir_path.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
     std::fs::write(dir_path.join("docs/intro.md"), "# intro\n").unwrap();
-    std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
+    std::fs::write(dir_path.join("README.md"), "# workspace\n").unwrap();
     std::mem::forget(dir);
 
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9260,10 +9260,10 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "changes-proj".into(),
             open_last: false,
         },
@@ -9360,10 +9360,10 @@ async fn git_changes_picker_collapses_untracked_directories() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "collapse-proj".into(),
             open_last: false,
         },
@@ -9426,10 +9426,10 @@ async fn git_changes_picker_hide_untracked() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "hide-untracked-proj".into(),
             open_last: false,
         },
@@ -9574,7 +9574,7 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
 #[tokio::test]
 async fn git_changes_file_is_locked_to_its_buffer() {
     // The modal `Space Alt-c` picker (GitChangesFile) shows *only* the buffer named by `buffer_id`,
-    // even when the project has other changed files — its scope is intrinsic, not a project filter.
+    // even when the workspace has other changed files — its scope is intrinsic, not a workspace filter.
     let dir = tempfile::tempdir().unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();
     std::fs::write(dir.path().join("a.rs"), "one\ntwo\n").unwrap();
@@ -9642,10 +9642,10 @@ async fn git_changes_file_is_locked_to_its_buffer() {
             .collect()
     };
 
-    // Project changes: both files.
-    let project =
+    // Workspace changes: both files.
+    let workspace =
         send_request::<PickerView>(&mut ws, 5, &view_params(PickerKind::GitChanges, None)).await;
-    let mut p = paths(&project);
+    let mut p = paths(&workspace);
     p.sort();
     assert_eq!(p, vec!["a.rs".to_string(), "b.rs".to_string()]);
 
@@ -9734,10 +9734,10 @@ async fn git_changes_picker_query_greps_diff_content() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "grep-proj".into(),
             open_last: false,
         },
@@ -9823,10 +9823,10 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "jump-proj".into(),
             open_last: false,
         },
@@ -9903,10 +9903,10 @@ async fn git_changes_picker_persists_query_across_reopen() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "persist-proj".into(),
             open_last: false,
         },
@@ -9990,10 +9990,10 @@ async fn git_changes_picker_query_is_a_regex() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "regex-proj".into(),
             open_last: false,
         },
@@ -10076,10 +10076,10 @@ async fn git_changes_picker_filters_by_directory() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "filter-proj".into(),
             open_last: false,
         },
@@ -10162,10 +10162,10 @@ async fn git_changes_picker_filters_by_exact_file() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "file-filter-proj".into(),
             open_last: false,
         },
@@ -10504,16 +10504,16 @@ async fn setup_buffer_picker_workspace() -> (
     std::fs::create_dir_all(dir_path.join("src")).unwrap();
     std::fs::write(dir_path.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(dir_path.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
-    std::fs::write(dir_path.join("README.md"), "# project\n").unwrap();
+    std::fs::write(dir_path.join("README.md"), "# workspace\n").unwrap();
     std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -10605,7 +10605,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
     assert_eq!(displays, vec!["src/main.rs", "src/lib.rs", "README.md"]);
 
     // File-backed buffers also carry their (root index, relative path) so the web client can build
-    // an opener URL. Single-root project here, so the relative path equals the display string.
+    // an opener URL. Single-root workspace here, so the relative path equals the display string.
     let paths: Vec<(Option<u32>, Option<&str>)> = update
         .items()
         .iter()
@@ -10808,11 +10808,11 @@ async fn buffers_picker_renders_scratch_placeholder() {
     drop(server);
 }
 
-/// The displayed scratch number tracks the project's scratch count (lowest-unused), not the global
+/// The displayed scratch number tracks the workspace's scratch count (lowest-unused), not the global
 /// buffer-id counter — so it stays small even after file buffers have bumped the id, and a freed
 /// number is reused.
 #[tokio::test]
-async fn scratch_number_is_per_project_lowest_unused() {
+async fn scratch_number_is_per_workspace_lowest_unused() {
     // `setup_with_buffer` opens a *file* buffer first, so a later scratch won't have buffer_id 1.
     let (server, mut ws, file_id) = setup_with_buffer("hello\n").await;
     let scratch_params = || BufferOpenParams {
@@ -11233,14 +11233,14 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
     drop(server);
 }
 
-/// MRU is per-project (not per-client): a fresh client connecting to a project sees the
-/// project's MRU order populated by any prior session. The MRU survives client disconnects so
+/// MRU is per-workspace (not per-client): a fresh client connecting to a workspace sees the
+/// workspace's MRU order populated by any prior session. The MRU survives client disconnects so
 /// reopening the TUI lands on the buffer the user last had open, rather than resetting to id
 /// order every time.
 #[tokio::test]
-async fn buffers_picker_mru_is_per_project_across_clients() {
+async fn buffers_picker_mru_is_per_workspace_across_clients() {
     let (server, mut ws_a) = setup_buffer_picker_workspace().await;
-    // Client A opens README first, then lib.rs — lib.rs is now most-recent in the project MRU.
+    // Client A opens README first, then lib.rs — lib.rs is now most-recent in the workspace MRU.
     let _: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws_a,
         2,
@@ -11272,14 +11272,14 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
     )
     .await;
 
-    // Client B connects fresh — should inherit the project's MRU, so lib.rs comes first.
+    // Client B connects fresh — should inherit the workspace's MRU, so lib.rs comes first.
     let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws_b,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11317,7 +11317,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
     assert_eq!(
         ids.first().copied(),
         Some(lib_open.buffer_id),
-        "client B should see project MRU (lib.rs first, since it was opened most recently)"
+        "client B should see workspace MRU (lib.rs first, since it was opened most recently)"
     );
 
     drop(server);
@@ -11325,7 +11325,7 @@ async fn buffers_picker_mru_is_per_project_across_clients() {
 
 // -------- save-as --------------------------------------------------------------------------------
 
-/// Save-as: writes a scratch buffer to a new file under the project root. The buffer picks up
+/// Save-as: writes a scratch buffer to a new file under the workspace root. The buffer picks up
 /// a canonical path so subsequent in-place saves work, and dirty flips off.
 #[tokio::test]
 async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
@@ -11338,10 +11338,10 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11394,7 +11394,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     )
     .await;
 
-    // Save-as to "notes.txt" under the project root.
+    // Save-as to "notes.txt" under the workspace root.
     let saved: BufferSaveResult = send_request::<BufferSave>(
         &mut ws,
         5,
@@ -11437,7 +11437,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     drop(server);
 }
 
-/// Save-as into a *non-zero* project root writes the file under that root and the saved
+/// Save-as into a *non-zero* workspace root writes the file under that root and the saved
 /// buffer's canonical path lands under it (not under root 0). Covers the multi-root case the
 /// TUI's save prompt now exposes via root-cycling.
 #[tokio::test]
@@ -11454,10 +11454,10 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11491,7 +11491,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
     )
     .await;
 
-    // Save-as with path_index = 1 — the second project root.
+    // Save-as with path_index = 1 — the second workspace root.
     let saved: BufferSaveResult = send_request::<BufferSave>(
         &mut ws,
         4,
@@ -11559,10 +11559,10 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11641,10 +11641,10 @@ async fn save_as_creates_missing_parent_directories() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11702,27 +11702,27 @@ async fn save_as_creates_missing_parent_directories() {
     drop(server);
 }
 
-/// Save-as into a path *outside* the project boundary is still rejected, even when the missing
-/// dirs are within the project. The boundary check must run before any directory creation —
-/// otherwise a save-as into `../escape/x.txt` could silently create dirs above the project root.
+/// Save-as into a path *outside* the workspace boundary is still rejected, even when the missing
+/// dirs are within the workspace. The boundary check must run before any directory creation —
+/// otherwise a save-as into `../escape/x.txt` could silently create dirs above the workspace root.
 #[tokio::test]
-async fn save_as_does_not_create_dirs_outside_project() {
+async fn save_as_does_not_create_dirs_outside_workspace() {
     let outer = tempfile::tempdir().unwrap();
-    let project = outer.path().join("proj");
-    std::fs::create_dir_all(&project).unwrap();
-    let project_canonical = std::fs::canonicalize(&project).unwrap();
+    let workspace = outer.path().join("proj");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace_canonical = std::fs::canonicalize(&workspace).unwrap();
     std::mem::forget(outer);
 
-    let server = spawn_for_test("test-proj", vec![project_canonical.clone()])
+    let server = spawn_for_test("test-proj", vec![workspace_canonical.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11755,12 +11755,12 @@ async fn save_as_does_not_create_dirs_outside_project() {
     )
     .await;
     assert!(
-        err.contains("outside the project"),
+        err.contains("outside the workspace"),
         "unexpected error: {err}"
     );
     assert!(
-        !project_canonical.parent().unwrap().join("escape").exists(),
-        "must not have created an `escape` dir alongside the project"
+        !workspace_canonical.parent().unwrap().join("escape").exists(),
+        "must not have created an `escape` dir alongside the workspace"
     );
     drop(server);
 }
@@ -11777,10 +11777,10 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11855,10 +11855,10 @@ async fn save_as_to_same_path_is_in_place_save() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11941,10 +11941,10 @@ async fn save_as_rejects_existing_file_without_overwrite() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -12054,10 +12054,10 @@ async fn in_place_save_never_triggers_overwrite_check() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -12149,10 +12149,10 @@ async fn in_place_save_after_save_as_targets_new_path() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -12258,10 +12258,10 @@ async fn buffer_close_drops_buffer() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -12344,10 +12344,10 @@ async fn buffer_close_last_buffer_returns_none() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -12394,10 +12394,10 @@ async fn buffer_close_drops_viewports() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -12613,7 +12613,7 @@ async fn input_replace_line_swaps_content() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("out.txt");
     std::mem::forget(dir);
-    // We don't actually have a project path matching this temp file, so saving would fail.
+    // We don't actually have a workspace path matching this temp file, so saving would fail.
     // Instead just verify by issuing a fresh open and reading the line count.
     let _ = target;
     drop(server);
@@ -12634,10 +12634,10 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -12696,10 +12696,10 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -12755,10 +12755,10 @@ async fn setup_grep_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -13864,10 +13864,10 @@ async fn setup_explorer_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -13876,11 +13876,11 @@ async fn setup_explorer_workspace() -> (
     (server, ws, canonical_root)
 }
 
-/// Opening the Explorer picker without a `directory_path` lists the first project root: the
+/// Opening the Explorer picker without a `directory_path` lists the first workspace root: the
 /// result echoes the canonical path, sets `directory_parent` to `None` (we're *at* a root), and
 /// the push carries one `DirEntry` per child with directories sorted before files.
 #[tokio::test]
-async fn picker_explorer_default_lists_project_root() {
+async fn picker_explorer_default_lists_workspace_root() {
     let (server, mut ws, root) = setup_explorer_workspace().await;
     let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
@@ -13903,7 +13903,7 @@ async fn picker_explorer_default_lists_project_root() {
     assert_eq!(view.directory_path.as_deref(), Some(root.to_str().unwrap()));
     assert!(
         view.directory_parent.is_none(),
-        "at project root → no parent"
+        "at workspace root → no parent"
     );
 
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
@@ -13928,7 +13928,7 @@ async fn picker_explorer_default_lists_project_root() {
 }
 
 /// Passing an explicit `directory_path` lists that directory, and `directory_parent` is the
-/// (in-project) parent so the client can render Alt-h navigation.
+/// (in-workspace) parent so the client can render Alt-h navigation.
 #[tokio::test]
 async fn picker_explorer_navigate_into_subdirectory() {
     let (server, mut ws, root) = setup_explorer_workspace().await;
@@ -13958,7 +13958,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
     assert_eq!(
         view.directory_parent.as_deref(),
         Some(root.to_str().unwrap()),
-        "parent should be the project root"
+        "parent should be the workspace root"
     );
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     let names: Vec<String> = update
@@ -14102,10 +14102,10 @@ async fn setup_peek_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14593,10 +14593,10 @@ async fn picker_explorer_select_directory_errors() {
     drop(server);
 }
 
-/// Asking the explorer to list a directory outside the project boundary is rejected by the
+/// Asking the explorer to list a directory outside the workspace boundary is rejected by the
 /// same access-boundary check `directory/list` uses.
 #[tokio::test]
-async fn picker_explorer_rejects_path_outside_project() {
+async fn picker_explorer_rejects_path_outside_workspace() {
     let (server, mut ws, _root) = setup_explorer_workspace().await;
     let err = send_request_expect_err::<PickerView>(
         &mut ws,
@@ -14617,14 +14617,14 @@ async fn picker_explorer_rejects_path_outside_project() {
     )
     .await;
     assert!(
-        err.contains("outside the project") || err.contains("canonicalizing"),
+        err.contains("outside the workspace") || err.contains("canonicalizing"),
         "unexpected error message: {err}"
     );
     drop(server);
 }
 
 /// `directory/list` returns the canonical directory path, every immediate child, and the parent
-/// when it's still inside the project. The entries are dirs-then-files, alphabetical within each
+/// when it's still inside the workspace. The entries are dirs-then-files, alphabetical within each
 /// — same sort the Explorer picker uses.
 #[tokio::test]
 async fn directory_list_returns_children_and_parent() {
@@ -14643,7 +14643,7 @@ async fn directory_list_returns_children_and_parent() {
     assert_eq!(
         result.parent.as_deref(),
         Some(root.to_str().unwrap()),
-        "parent should be the project root"
+        "parent should be the workspace root"
     );
     let entries: Vec<(String, bool)> = result
         .entries
@@ -14657,7 +14657,7 @@ async fn directory_list_returns_children_and_parent() {
     drop(server);
 }
 
-/// At a project root, `directory/list` returns no parent (the root has no in-project ancestor).
+/// At a workspace root, `directory/list` returns no parent (the root has no in-workspace ancestor).
 /// Dirs come before files in the response.
 #[tokio::test]
 async fn directory_list_at_root_omits_parent_and_sorts_dirs_first() {
@@ -14673,7 +14673,7 @@ async fn directory_list_at_root_omits_parent_and_sorts_dirs_first() {
     .await;
     assert!(
         result.parent.is_none(),
-        "at the project root, parent should be omitted"
+        "at the workspace root, parent should be omitted"
     );
     let entries: Vec<(String, bool)> = result
         .entries
@@ -14691,9 +14691,9 @@ async fn directory_list_at_root_omits_parent_and_sorts_dirs_first() {
     drop(server);
 }
 
-/// Paths outside the project's access boundary are refused — same rule as the Explorer picker.
+/// Paths outside the workspace's access boundary are refused — same rule as the Explorer picker.
 #[tokio::test]
-async fn directory_list_rejects_path_outside_project() {
+async fn directory_list_rejects_path_outside_workspace() {
     use aether_protocol::directory::{DirectoryList, DirectoryListParams};
     let (server, mut ws, _root) = setup_explorer_workspace().await;
     let err = send_request_expect_err::<DirectoryList>(
@@ -14705,7 +14705,7 @@ async fn directory_list_rejects_path_outside_project() {
     )
     .await;
     assert!(
-        err.contains("outside the project") || err.contains("canonicalizing"),
+        err.contains("outside the workspace") || err.contains("canonicalizing"),
         "unexpected error message: {err}"
     );
     drop(server);
@@ -14733,7 +14733,7 @@ async fn directory_list_rejects_missing_path() {
     drop(server);
 }
 
-/// `directory/create` creates the requested directory inside the project and returns its
+/// `directory/create` creates the requested directory inside the workspace and returns its
 /// canonical absolute path. mkdir-p semantics so multi-level paths in one call work too.
 #[tokio::test]
 async fn directory_create_makes_dir_and_returns_canonical_path() {
@@ -14758,34 +14758,34 @@ async fn directory_create_makes_dir_and_returns_canonical_path() {
     drop(server);
 }
 
-/// `directory/create` enforces the project boundary — `../escape/...` requests are refused
+/// `directory/create` enforces the workspace boundary — `../escape/...` requests are refused
 /// and produce no filesystem side effects. Mirrors the equivalent save-as guard so we don't
-/// accidentally have an "anyone with the active project can mkdir anywhere" hole.
+/// accidentally have an "anyone with the active workspace can mkdir anywhere" hole.
 #[tokio::test]
-async fn directory_create_refuses_outside_project_boundary() {
+async fn directory_create_refuses_outside_workspace_boundary() {
     use aether_protocol::directory::{DirectoryCreate, DirectoryCreateParams};
     let outer = tempfile::tempdir().unwrap();
-    let project = outer.path().join("proj");
-    std::fs::create_dir_all(&project).unwrap();
-    let project_canonical = std::fs::canonicalize(&project).unwrap();
+    let workspace = outer.path().join("proj");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace_canonical = std::fs::canonicalize(&workspace).unwrap();
     std::mem::forget(outer);
 
-    let server = spawn_for_test("test-proj", vec![project_canonical.clone()])
+    let server = spawn_for_test("test-proj", vec![workspace_canonical.clone()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
     )
     .await;
-    let escape = project_canonical.parent().unwrap().join("escape");
+    let escape = workspace_canonical.parent().unwrap().join("escape");
     let err = send_request_expect_err::<DirectoryCreate>(
         &mut ws,
         2,
@@ -14795,7 +14795,7 @@ async fn directory_create_refuses_outside_project_boundary() {
     )
     .await;
     assert!(
-        err.contains("outside the project") || err.contains("canonicalizing"),
+        err.contains("outside the workspace") || err.contains("canonicalizing"),
         "unexpected error: {err}"
     );
     assert!(
@@ -14867,7 +14867,7 @@ async fn picker_explorer_resumes_last_directory() {
     drop(server);
 }
 
-/// Set up a project rooted at a Git repo with: a committed-and-clean file, a committed-then-
+/// Set up a workspace rooted at a Git repo with: a committed-and-clean file, a committed-then-
 /// modified file, an untracked file, an ignored file, and a subdirectory whose committed file is
 /// modified on disk. Returns the canonical root so the test can open the Explorer there.
 async fn setup_explorer_git_workspace() -> (
@@ -14910,10 +14910,10 @@ async fn setup_explorer_git_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -15129,10 +15129,10 @@ async fn setup_watched_buffer(
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -15307,21 +15307,21 @@ async fn watcher_flags_deleted_file() {
     drop(server);
 }
 
-/// Connect a client, activate the named project, open `watched.txt` under root 0, and subscribe
+/// Connect a client, activate the named workspace, open `watched.txt` under root 0, and subscribe
 /// a viewport (so the watcher's `buffer/state` pushes reach it). Returns the socket + buffer id.
 async fn connect_and_open_watched(
     ws_url: &str,
-    project: &str,
+    workspace: &str,
 ) -> (
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     u64,
 ) {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
-            name: project.into(),
+        &WorkspaceActivateParams {
+            name: workspace.into(),
             open_last: false,
         },
     )
@@ -15363,10 +15363,10 @@ async fn connect_and_open_watched(
     (ws, open.buffer_id)
 }
 
-/// Two projects sharing one root, one client on each, the same file open in both — two distinct
+/// Two workspaces sharing one root, one client on each, the same file open in both — two distinct
 /// buffers for one canonical path. The watcher must fan disk events out to both, not just the
 /// first buffer iteration happens to find.
-async fn setup_overlapping_projects_watched_buffer(
+async fn setup_overlapping_workspaces_watched_buffer(
     initial: &str,
 ) -> (
     aether_server::ServerHandle,
@@ -15397,12 +15397,12 @@ async fn setup_overlapping_projects_watched_buffer(
 }
 
 #[tokio::test]
-async fn watcher_fans_out_external_write_to_buffers_in_all_projects() {
+async fn watcher_fans_out_external_write_to_buffers_in_all_workspaces() {
     let (server, mut ws_a, buf_a, mut ws_b, buf_b, path) =
-        setup_overlapping_projects_watched_buffer("hello\n").await;
+        setup_overlapping_workspaces_watched_buffer("hello\n").await;
     assert_ne!(
         buf_a, buf_b,
-        "each project should hold its own buffer for the path"
+        "each workspace should hold its own buffer for the path"
     );
 
     std::fs::write(&path, "hello world\n").unwrap();
@@ -15423,11 +15423,11 @@ async fn watcher_fans_out_external_write_to_buffers_in_all_projects() {
 }
 
 #[tokio::test]
-async fn save_in_one_project_reloads_other_projects_buffer() {
+async fn save_in_one_workspace_reloads_other_workspaces_buffer() {
     let (server, mut ws_a, buf_a, mut ws_b, buf_b, path) =
-        setup_overlapping_projects_watched_buffer("hello\n").await;
+        setup_overlapping_workspaces_watched_buffer("hello\n").await;
 
-    // Edit + save in project A. The self-save filter suppresses the event for A's buffer (its
+    // Edit + save in workspace A. The self-save filter suppresses the event for A's buffer (its
     // recorded mtime matches the write) but must not suppress it for B's.
     let _: EditResult = send_request::<InputText>(
         &mut ws_a,
@@ -15564,12 +15564,12 @@ async fn buffer_reload_clean_buffer_does_not_require_force() {
     drop(server);
 }
 
-// -------- project/activate + switching ---------------------------------------------------------
+// -------- workspace/activate + switching ---------------------------------------------------------
 
-/// `project/activate` returns the project's name + paths and lets buffer ops work afterwards.
+/// `workspace/activate` returns the workspace's name + paths and lets buffer ops work afterwards.
 /// (Already covered indirectly by every other test, but pinned explicitly here.)
 #[tokio::test]
-async fn project_activate_returns_info_and_unlocks_buffer_ops() {
+async fn workspace_activate_returns_info_and_unlocks_buffer_ops() {
     let dir = tempfile::tempdir().unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
@@ -15578,7 +15578,7 @@ async fn project_activate_returns_info_and_unlocks_buffer_ops() {
         .await
         .unwrap();
 
-    // Before activation, buffer/open should fail with NO_ACTIVE_PROJECT (-32002).
+    // Before activation, buffer/open should fail with NO_ACTIVE_WORKSPACE (-32002).
     let pre_err = send_request_expect_err::<BufferOpen>(
         &mut ws,
         1,
@@ -15595,21 +15595,21 @@ async fn project_activate_returns_info_and_unlocks_buffer_ops() {
     )
     .await;
     assert!(
-        pre_err.contains("no active project"),
-        "expected NO_ACTIVE_PROJECT before activate, got: {pre_err}"
+        pre_err.contains("no active workspace"),
+        "expected NO_ACTIVE_WORKSPACE before activate, got: {pre_err}"
     );
 
-    let activated: ProjectActivateResult = send_request::<ProjectActivate>(
+    let activated: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         2,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
     )
     .await;
-    assert_eq!(activated.project.name, "test-proj");
-    assert_eq!(activated.project.paths.len(), 1);
+    assert_eq!(activated.workspace.name, "test-proj");
+    assert_eq!(activated.workspace.paths.len(), 1);
 
     // Scratch buffer now works.
     let open: BufferOpenResult = send_request::<BufferOpen>(
@@ -15632,9 +15632,9 @@ async fn project_activate_returns_info_and_unlocks_buffer_ops() {
     drop(server);
 }
 
-/// Activating an unknown project name returns UNKNOWN_PROJECT (-32003).
+/// Activating an unknown workspace name returns UNKNOWN_WORKSPACE (-32003).
 #[tokio::test]
-async fn project_activate_rejects_unknown_name() {
+async fn workspace_activate_rejects_unknown_name() {
     let dir = tempfile::tempdir().unwrap();
     let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
         .await
@@ -15642,26 +15642,26 @@ async fn project_activate_rejects_unknown_name() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let msg = send_request_expect_err::<ProjectActivate>(
+    let msg = send_request_expect_err::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
-            name: "no-such-project-12345".into(),
+        &WorkspaceActivateParams {
+            name: "no-such-workspace-12345".into(),
             open_last: false,
         },
     )
     .await;
     assert!(
-        msg.contains("no configured project"),
-        "expected UNKNOWN_PROJECT, got: {msg}"
+        msg.contains("no configured workspace"),
+        "expected UNKNOWN_WORKSPACE, got: {msg}"
     );
     drop(server);
 }
 
-/// Re-activating the *same* project is idempotent — no error, returns the same paths, and the
+/// Re-activating the *same* workspace is idempotent — no error, returns the same paths, and the
 /// client's per-buffer state survives (no teardown when the name doesn't change).
 #[tokio::test]
-async fn project_activate_same_project_is_idempotent() {
+async fn workspace_activate_same_workspace_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("buf.txt");
     std::fs::write(&path, "hello\n").unwrap();
@@ -15671,10 +15671,10 @@ async fn project_activate_same_project_is_idempotent() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -15696,17 +15696,17 @@ async fn project_activate_same_project_is_idempotent() {
     )
     .await;
 
-    // Activate the same project again — should succeed and not destroy the buffer state.
-    let again: ProjectActivateResult = send_request::<ProjectActivate>(
+    // Activate the same workspace again — should succeed and not destroy the buffer state.
+    let again: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         3,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
     )
     .await;
-    assert_eq!(again.project.name, "test-proj");
+    assert_eq!(again.workspace.name, "test-proj");
 
     // Re-opening the same path returns the same buffer (state preserved).
     let reopen: BufferOpenResult = send_request::<BufferOpen>(
@@ -16283,10 +16283,10 @@ async fn git_blame_line_reports_committed_author() {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "blame-proj".into(),
             open_last: false,
         },
@@ -16337,10 +16337,10 @@ async fn git_blame_line_is_none_without_repo() {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "norepo-proj".into(),
             open_last: false,
         },
@@ -16388,10 +16388,10 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "diff-proj".into(),
             open_last: false,
         },
@@ -16510,10 +16510,10 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "diff-sub-proj".into(),
             open_last: false,
         },
@@ -16617,10 +16617,10 @@ async fn git_status_counts_ride_the_window() {
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "counts-proj".into(),
             open_last: false,
         },
@@ -16727,10 +16727,10 @@ async fn git_status_splits_staged_and_unstaged() {
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "status-proj".into(),
             open_last: false,
         },
@@ -16810,10 +16810,10 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "base-proj".into(),
             open_last: false,
         },
@@ -16880,7 +16880,7 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
 
 // -------- git/apply_hunk (stage / unstage / revert) ----------------------------------------------
 
-/// Spawn a server over `dir`, activate a project, and open `name`. Shared scaffolding for the
+/// Spawn a server over `dir`, activate a workspace, and open `name`. Shared scaffolding for the
 /// `git/apply_hunk` tests, which all start from "a repo-backed buffer is open".
 async fn setup_git_apply(
     dir: &std::path::Path,
@@ -16895,10 +16895,10 @@ async fn setup_git_apply(
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: proj.into(),
             open_last: false,
         },
@@ -17455,10 +17455,10 @@ async fn git_gutter_marker_present_without_diff_view() {
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "gutter-proj".into(),
             open_last: false,
         },
@@ -17536,10 +17536,10 @@ async fn git_navigate_hunk_jumps_between_changes() {
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "nav-proj".into(),
             open_last: false,
         },
@@ -17676,10 +17676,10 @@ async fn git_navigate_hunk_honours_count() {
     let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "nav-count-proj".into(),
             open_last: false,
         },
@@ -17773,7 +17773,7 @@ async fn git_navigate_hunk_honours_count() {
 // These open a file against an actual language server and assert our client integrates with it:
 // `lsp_diag_*` assert a diagnostic rides back on `viewport/lines_changed` (the full inbound path);
 // `lsp_ready_*` assert the server reaches `Ready` via `lsp/status_changed` (handshake only, for
-// servers whose diagnostics need a full project or don't fire on a lone file). All are `#[ignore]`d
+// servers whose diagnostics need a full workspace or don't fire on a lone file). All are `#[ignore]`d
 // (need the server installed) and FAIL — not skip — if a prerequisite is missing, since running
 // them is an explicit opt-in. Provision the whole toolchain with `mise install`; run with:
 //   AETHER_TEST_TYPESCRIPT_DIR="$(mise where npm:typescript)/lib/node_modules/typescript" \
@@ -17798,21 +17798,21 @@ fn require_server_on_path(cmd: &str) {
 /// Spawn a server over `root`, connect, activate, open `rel_path`, subscribe a viewport. Returns the
 /// handle (keep it alive) and the socket.
 async fn open_and_subscribe(
-    project: &str,
+    workspace: &str,
     root: &std::path::Path,
     rel_path: &str,
 ) -> (aether_server::ServerHandle, Ws) {
-    let server = spawn_for_test(project, vec![root.to_path_buf()])
+    let server = spawn_for_test(workspace, vec![root.to_path_buf()])
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
-            name: project.into(),
+        &WorkspaceActivateParams {
+            name: workspace.into(),
             open_last: false,
         },
     )
@@ -17857,13 +17857,13 @@ async fn open_and_subscribe(
 /// Open `rel_path` (in a workspace pre-populated under `root`) and return the first non-empty
 /// diagnostics batch on `viewport/lines_changed`. Panics on timeout.
 async fn run_lsp_diagnostics(
-    project: &str,
+    workspace: &str,
     root: &std::path::Path,
     rel_path: &str,
     timeout_secs: u64,
 ) -> Vec<(DiagnosticSeverity, String)> {
     use std::time::Duration;
-    let (server, mut ws) = open_and_subscribe(project, root, rel_path).await;
+    let (server, mut ws) = open_and_subscribe(workspace, root, rel_path).await;
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         loop {
             let text = next_text(&mut ws).await;
@@ -17887,21 +17887,21 @@ async fn run_lsp_diagnostics(
     })
     .await;
     drop(server);
-    result.unwrap_or_else(|_| panic!("no diagnostics within {timeout_secs}s for {project}"))
+    result.unwrap_or_else(|_| panic!("no diagnostics within {timeout_secs}s for {workspace}"))
 }
 
 /// Open `rel_path` and wait for `language`'s server to reach `Ready` via `lsp/status_changed`.
-/// Panics on timeout. For servers whose diagnostics need a full project / don't fire on a lone file,
+/// Panics on timeout. For servers whose diagnostics need a full workspace / don't fire on a lone file,
 /// this still verifies spawn + handshake + status push.
 async fn run_lsp_until_ready(
-    project: &str,
+    workspace: &str,
     root: &std::path::Path,
     rel_path: &str,
     language: &str,
     timeout_secs: u64,
 ) {
     use std::time::Duration;
-    let (server, mut ws) = open_and_subscribe(project, root, rel_path).await;
+    let (server, mut ws) = open_and_subscribe(workspace, root, rel_path).await;
     let ready = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         loop {
             let text = next_text(&mut ws).await;
@@ -17924,25 +17924,25 @@ async fn run_lsp_until_ready(
 
 /// Write `files` into a fresh temp dir, then [`run_lsp_diagnostics`].
 async fn first_lsp_diagnostics(
-    project: &str,
+    workspace: &str,
     files: &[(&str, &str)],
     rel_path: &str,
     timeout_secs: u64,
 ) -> Vec<(DiagnosticSeverity, String)> {
     let dir = lay_out(files);
-    run_lsp_diagnostics(project, dir.path(), rel_path, timeout_secs).await
+    run_lsp_diagnostics(workspace, dir.path(), rel_path, timeout_secs).await
 }
 
 /// Write `files` into a fresh temp dir, then [`run_lsp_until_ready`].
 async fn first_lsp_ready(
-    project: &str,
+    workspace: &str,
     files: &[(&str, &str)],
     rel_path: &str,
     language: &str,
     timeout_secs: u64,
 ) {
     let dir = lay_out(files);
-    run_lsp_until_ready(project, dir.path(), rel_path, language, timeout_secs).await;
+    run_lsp_until_ready(workspace, dir.path(), rel_path, language, timeout_secs).await;
 }
 
 fn lay_out(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -18081,7 +18081,7 @@ async fn lsp_diag_bash() {
 }
 
 /// typescript-language-server bundles no tsserver — it resolves `typescript` from the workspace's
-/// `node_modules` (as a real project would), so the test symlinks one in. Locates it via
+/// `node_modules` (as a real workspace would), so the test symlinks one in. Locates it via
 /// `AETHER_TEST_TYPESCRIPT_DIR` or node's own resolution; fails (doesn't skip) if neither works.
 #[tokio::test]
 #[ignore = "needs typescript-language-server + a resolvable typescript"]
@@ -18127,7 +18127,7 @@ fn find_typescript_lib() -> Option<std::path::PathBuf> {
 }
 
 // ---- handshake-only tests (server reaches Ready) ----
-// For servers whose diagnostics need a full project (elixir/erlang) or don't fire on a lone file
+// For servers whose diagnostics need a full workspace (elixir/erlang) or don't fire on a lone file
 // (html/markdown). These verify spawn + handshake + status push.
 
 #[tokio::test]
@@ -18165,7 +18165,7 @@ async fn lsp_ready_elixir() {
     first_lsp_ready(
         "ready-ex",
         &[
-            ("mix.exs", "defmodule P.MixProject do\n  use Mix.Project\n  def project, do: [app: :p, version: \"0.1.0\"]\nend\n"),
+            ("mix.exs", "defmodule P.MixWorkspace do\n  use Mix.Workspace\n  def workspace, do: [app: :p, version: \"0.1.0\"]\nend\n"),
             ("lib/p.ex", "defmodule P do\n  def hello, do: :world\nend\n"),
         ],
         "lib/p.ex",
@@ -18465,7 +18465,7 @@ async fn lsp_goto_definition_resolves() {
 /// Phase 6: the References picker resolves `textDocument/references` at the cursor and streams the
 /// candidates in asynchronously — `picker/view` returns immediately with an empty, `ticking` push,
 /// then a spawned task fills it via a follow-up push once the LSP request completes. `helper` is
-/// declared on line 0 and called on line 4, so we expect two project-local hits, each with a line
+/// declared on line 0 and called on line 4, so we expect two workspace-local hits, each with a line
 /// preview. Re-opens until rust-analyzer has indexed enough to answer (the resolve before that
 /// returns empty).
 #[tokio::test]
@@ -18579,7 +18579,7 @@ async fn references_picker_lists_all_uses() {
                 panic!("expected Reference item, got {i:?}")
             };
             assert!(path.ends_with("main.rs"), "unexpected path: {path}");
-            assert_eq!(display_path, "main.rs", "project-relative display path");
+            assert_eq!(display_path, "main.rs", "workspace-relative display path");
             assert!(!preview.is_empty(), "reference rows carry a line preview");
             (*line, *is_definition)
         })
@@ -19103,7 +19103,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
         .await
     }
 
-    let activate = ProjectActivateParams {
+    let activate = WorkspaceActivateParams {
         name: "test-proj".into(),
         open_last: false,
     };
@@ -19112,7 +19112,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     let (mut ws_a, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(&mut ws_a, 1, &activate).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(&mut ws_a, 1, &activate).await;
     let buf_a = open(&mut ws_a, 2, "a.txt").await.buffer_id;
     subscribe(&mut ws_a, 3, buf_a).await;
     let buf_b = open(&mut ws_a, 4, "b.txt").await.buffer_id;
@@ -19121,7 +19121,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(&mut ws_b, 1, &activate).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(&mut ws_b, 1, &activate).await;
     let buf_a_b = open(&mut ws_b, 2, "a.txt").await.buffer_id;
     assert_eq!(
         buf_a_b, buf_a,
@@ -19215,10 +19215,10 @@ async fn nav_back_and_forward_across_files() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -19301,10 +19301,10 @@ async fn nav_back_empty_is_noop() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -19337,10 +19337,10 @@ async fn nav_goto_reopens_by_path() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -19449,10 +19449,10 @@ async fn setup_grep_filter_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -19688,10 +19688,10 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -19769,10 +19769,10 @@ async fn grep_flood_does_not_deadlock_request_dispatch() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -20054,7 +20054,7 @@ async fn grep_view_with_filters_replaces_and_drops_stale_hits() {
     drop(server);
 }
 
-/// Root scoping in a two-root project: a directory filter with an empty `relative_path`
+/// Root scoping in a two-root workspace: a directory filter with an empty `relative_path`
 /// (there is no separate root filter) searches only that root.
 #[tokio::test]
 async fn grep_filter_root_scope() {
@@ -20071,10 +20071,10 @@ async fn grep_filter_root_scope() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -20468,10 +20468,10 @@ async fn setup_transient_workspace() -> (
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -20480,7 +20480,7 @@ async fn setup_transient_workspace() -> (
     (server, ws)
 }
 
-/// `buffer/open` params for a file in the transient-workspace project.
+/// `buffer/open` params for a file in the transient-workspace workspace.
 fn file_open_params(rel: &str, transient: Option<bool>) -> BufferOpenParams {
     BufferOpenParams {
         buffer_id: None,
@@ -20558,10 +20558,10 @@ async fn transient_buffer_closes_on_disconnect() {
     let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws2,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -20826,10 +20826,10 @@ async fn transient_buffer_survives_while_another_client_views_it() {
     let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws2,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -20991,12 +20991,12 @@ async fn buffers_picker_reports_transient_flag() {
     drop(server);
 }
 
-// ---- external files & ephemeral projects --------------------------------------------------------
+// ---- external files & ephemeral workspaces --------------------------------------------------------
 
 type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// A project rooted at one dir, plus a file in a *different* dir outside it. Returns the server, a
+/// A workspace rooted at one dir, plus a file in a *different* dir outside it. Returns the server, a
 /// connected (un-activated) socket, and the external file's canonical absolute path.
 async fn setup_with_external_file() -> (aether_server::ServerHandle, TestWs, String) {
     let proj_dir = tempfile::tempdir().unwrap();
@@ -21018,15 +21018,15 @@ async fn setup_with_external_file() -> (aether_server::ServerHandle, TestWs, Str
     (server, ws, ext_abs)
 }
 
-/// Names of the rows in the project switcher (Projects picker, empty query).
-async fn project_switcher_names(ws: &mut TestWs, id: u64) -> Vec<String> {
+/// Names of the rows in the workspace switcher (Workspaces picker, empty query).
+async fn workspace_switcher_names(ws: &mut TestWs, id: u64) -> Vec<String> {
     let view = send_request::<PickerView>(
         ws,
         id,
         &PickerViewParams {
             from_selection: false,
             filters: None,
-            kind: PickerKind::Projects,
+            kind: PickerKind::Workspaces,
             reset: true,
             offset: 0,
             limit: 50,
@@ -21043,33 +21043,33 @@ async fn project_switcher_names(ws: &mut TestWs, id: u64) -> Vec<String> {
         .items()
         .iter()
         .filter_map(|i| match i {
-            PickerItem::Project { name, .. } => Some(name.clone()),
+            PickerItem::Workspace { name, .. } => Some(name.clone()),
             _ => None,
         })
         .collect()
 }
 
 #[tokio::test]
-async fn open_path_with_no_project_creates_ephemeral() {
+async fn open_path_with_no_workspace_creates_ephemeral() {
     let (server, mut ws, ext_abs) = setup_with_external_file().await;
-    // No project/activate first: open-from-path on an external file synthesizes an ephemeral one.
-    let opened: ProjectActivateResult = send_request::<ProjectOpenPath>(
+    // No workspace/activate first: open-from-path on an external file synthesizes an ephemeral one.
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
         &mut ws,
         1,
-        &ProjectOpenPathParams {
+        &WorkspaceOpenPathParams {
             path: ext_abs.clone(),
             transient: None,
         },
     )
     .await;
     assert!(
-        aether_protocol::is_ephemeral_project_id(&opened.project.name),
-        "expected an ephemeral project id, got {:?}",
-        opened.project.name
+        aether_protocol::is_ephemeral_workspace_id(&opened.workspace.name),
+        "expected an ephemeral workspace id, got {:?}",
+        opened.workspace.name
     );
     assert!(
-        opened.project.paths.is_empty(),
-        "ephemeral project has no roots"
+        opened.workspace.paths.is_empty(),
+        "ephemeral workspace has no roots"
     );
     let buf = opened.opened.expect("open_path returns the opened buffer");
     assert_eq!(buf.path.as_deref(), Some(ext_abs.as_str()));
@@ -21082,19 +21082,19 @@ async fn open_path_rejects_a_relative_path() {
     // one against its own working directory (which isn't the user's). A `~/`-prefixed path is fine
     // (it expands to absolute), but a bare relative path is rejected before any disk access.
     let (server, mut ws, _ext_abs) = setup_with_external_file().await;
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
     )
     .await;
-    let err = send_request_expect_err::<ProjectOpenPath>(
+    let err = send_request_expect_err::<WorkspaceOpenPath>(
         &mut ws,
         2,
-        &ProjectOpenPathParams {
+        &WorkspaceOpenPathParams {
             path: "some/relative/file.rs".into(),
             transient: None,
         },
@@ -21108,30 +21108,30 @@ async fn open_path_rejects_a_relative_path() {
 }
 
 #[tokio::test]
-async fn open_path_external_within_active_project_keeps_project() {
+async fn open_path_external_within_active_workspace_keeps_workspace() {
     let (server, mut ws, ext_abs) = setup_with_external_file().await;
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
     )
     .await;
-    // A file outside the active project's roots attaches as a guest — the project is unchanged.
-    let opened: ProjectActivateResult = send_request::<ProjectOpenPath>(
+    // A file outside the active workspace's roots attaches as a guest — the workspace is unchanged.
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
         &mut ws,
         2,
-        &ProjectOpenPathParams {
+        &WorkspaceOpenPathParams {
             path: ext_abs.clone(),
             transient: None,
         },
     )
     .await;
     assert_eq!(
-        opened.project.name, "test-proj",
-        "an external open stays in the active project, not a new ephemeral one"
+        opened.workspace.name, "test-proj",
+        "an external open stays in the active workspace, not a new ephemeral one"
     );
     let buf = opened.opened.expect("buffer opened");
     assert_eq!(buf.path.as_deref(), Some(ext_abs.as_str()));
@@ -21139,34 +21139,34 @@ async fn open_path_external_within_active_project_keeps_project() {
 }
 
 #[tokio::test]
-async fn ephemeral_project_shows_in_switcher_then_auto_removed() {
+async fn ephemeral_workspace_shows_in_switcher_then_auto_removed() {
     let (server, mut ws, ext_abs) = setup_with_external_file().await;
-    let opened: ProjectActivateResult = send_request::<ProjectOpenPath>(
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
         &mut ws,
         1,
-        &ProjectOpenPathParams {
+        &WorkspaceOpenPathParams {
             path: ext_abs.clone(),
             transient: None,
         },
     )
     .await;
-    let ephemeral_id = opened.project.name.clone();
+    let ephemeral_id = opened.workspace.name.clone();
     let buffer_id = opened.opened.expect("buffer").buffer_id;
 
     // While it holds a buffer, the ephemeral context appears in the switcher.
-    let names = project_switcher_names(&mut ws, 2).await;
+    let names = workspace_switcher_names(&mut ws, 2).await;
     assert!(
         names.contains(&ephemeral_id),
         "ephemeral should show while it has a buffer: {names:?}"
     );
 
-    // Switch away to the configured project (the permanent external buffer keeps the ephemeral
+    // Switch away to the configured workspace (the permanent external buffer keeps the ephemeral
     // alive), then close that buffer — now that no client holds the ephemeral active and it has no
     // buffers, it's retired and drops out of the switcher.
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         3,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "test-proj".into(),
             open_last: false,
         },
@@ -21181,7 +21181,7 @@ async fn ephemeral_project_shows_in_switcher_then_auto_removed() {
         },
     )
     .await;
-    let names = project_switcher_names(&mut ws, 5).await;
+    let names = workspace_switcher_names(&mut ws, 5).await;
     assert!(
         !names.contains(&ephemeral_id),
         "ephemeral should be retired after its last buffer closes: {names:?}"
@@ -21193,16 +21193,16 @@ async fn ephemeral_project_shows_in_switcher_then_auto_removed() {
 async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
     // Client A opens an external file → ephemeral context with one buffer.
     let (server, mut ws_a, ext_abs) = setup_with_external_file().await;
-    let opened: ProjectActivateResult = send_request::<ProjectOpenPath>(
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
         &mut ws_a,
         1,
-        &ProjectOpenPathParams {
+        &WorkspaceOpenPathParams {
             path: ext_abs.clone(),
             transient: None,
         },
     )
     .await;
-    let ephemeral_id = opened.project.name.clone();
+    let ephemeral_id = opened.workspace.name.clone();
     let buffer_id = opened.opened.expect("buffer").buffer_id;
 
     // Client B joins the same ephemeral context from the switcher (activate by id) and lands on
@@ -21210,10 +21210,10 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
     let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let act_b: ProjectActivateResult = send_request::<ProjectActivate>(
+    let act_b: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws_b,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: ephemeral_id.clone(),
             open_last: true,
         },
@@ -21223,7 +21223,7 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
         act_b.opened.expect("B lands on the shared file").buffer_id,
         buffer_id
     );
-    assert!(project_switcher_names(&mut ws_b, 2)
+    assert!(workspace_switcher_names(&mut ws_b, 2)
         .await
         .contains(&ephemeral_id));
 
@@ -21239,7 +21239,7 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
         },
     )
     .await;
-    let names = project_switcher_names(&mut ws_b, 3).await;
+    let names = workspace_switcher_names(&mut ws_b, 3).await;
     assert!(
         !names.contains(&ephemeral_id),
         "ephemeral context must be retired even with a second client parked in it: {names:?}"
@@ -21778,13 +21778,13 @@ async fn change_over_partial_selection_ending_on_newline_still_joins() {
     drop(server);
 }
 
-/// The persisted project session (recency + buffer list) is written when a project is activated
+/// The persisted workspace session (recency + buffer list) is written when a workspace is activated
 /// and when a buffer is opened: after activating "p" and opening a file in it, the JSON session
-/// file carries that project with a non-zero `last_activated_at` and the file's canonical path in
-/// its `buffers` list. (Cold-path dormant *restore* needs an on-disk project config + a temp XDG
+/// file carries that workspace with a non-zero `last_activated_at` and the file's canonical path in
+/// its `buffers` list. (Cold-path dormant *restore* needs an on-disk workspace config + a temp XDG
 /// dir and isn't exercised here; the merge/sort logic it relies on is unit-tested in `state`/`config`.)
 #[tokio::test]
-async fn project_session_persisted_on_activate_and_open() {
+async fn workspace_session_persisted_on_activate_and_open() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
@@ -21800,10 +21800,10 @@ async fn project_session_persisted_on_activate_and_open() {
         .await
         .unwrap();
 
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "p".into(),
             open_last: false,
         },
@@ -21830,7 +21830,7 @@ async fn project_session_persisted_on_activate_and_open() {
 
     let raw = std::fs::read_to_string(&sessions_path).expect("session file written");
     let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    let p = &json["projects"]["p"];
+    let p = &json["workspaces"]["p"];
     assert!(
         p["last_activated_at"].as_u64().unwrap_or(0) > 0,
         "activation stamps a time: {raw}"
@@ -21870,10 +21870,10 @@ async fn keeping_a_transient_buffer_persists_it() {
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: ProjectActivateResult = send_request::<ProjectActivate>(
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
-        &ProjectActivateParams {
+        &WorkspaceActivateParams {
             name: "p".into(),
             open_last: false,
         },
@@ -21896,7 +21896,7 @@ async fn keeping_a_transient_buffer_persists_it() {
 
     let buffers_in_session = |raw: &str| -> Vec<String> {
         let json: serde_json::Value = serde_json::from_str(raw).unwrap();
-        json["projects"]["p"]["buffers"]
+        json["workspaces"]["p"]["buffers"]
             .as_array()
             .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
             .unwrap_or_default()

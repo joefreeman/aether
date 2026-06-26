@@ -15,7 +15,7 @@ pub mod lsp;
 pub mod nav;
 pub mod path;
 pub mod picker;
-pub mod project;
+pub mod workspace;
 pub mod search;
 pub mod settings;
 pub mod sneak;
@@ -30,7 +30,7 @@ pub type ClientId = uuid::Uuid;
 /// is the real mutex (only one process can hold the port), so clients hard-code the address
 /// rather than discovering it — which also lets a client launch *before* the server and wait for
 /// it to come up. The server identifies its instance (for restart detection) over the wire on
-/// `project/activate`, not via a discovery file.
+/// `workspace/activate`, not via a discovery file.
 pub const SERVER_PORT: u16 = 2384;
 
 /// The default loopback WebSocket URL clients connect to ([`SERVER_PORT`]). The connection layer
@@ -39,19 +39,19 @@ pub fn default_server_url() -> String {
     format!("ws://127.0.0.1:{SERVER_PORT}")
 }
 
-/// Prefix marking a project id as *ephemeral* (a "no-project" context synthesized to host files
-/// opened outside any configured project). A project is addressed on the wire by id (the `name`
-/// field of [`project::ProjectInfo`] / [`project::ProjectActivateParams`]); for a persisted project
+/// Prefix marking a workspace id as *ephemeral* (a "no-workspace" context synthesized to host files
+/// opened outside any configured workspace). A workspace is addressed on the wire by id (the `name`
+/// field of [`workspace::WorkspaceInfo`] / [`workspace::WorkspaceActivateParams`]); for a persisted workspace
 /// that id is its human name, for an ephemeral one it's a reserved token of the form
-/// `ephemeral/<n>`. The `/` can't appear in a real project name (the server rejects separators), so
-/// the two namespaces never collide. Clients use [`is_ephemeral_project_id`] to render such a
-/// context as "(no project)" rather than showing the raw token.
-pub const EPHEMERAL_PROJECT_PREFIX: &str = "ephemeral/";
+/// `ephemeral/<n>`. The `/` can't appear in a real workspace name (the server rejects separators), so
+/// the two namespaces never collide. Clients use [`is_ephemeral_workspace_id`] to render such a
+/// context as "(no workspace)" rather than showing the raw token.
+pub const EPHEMERAL_WORKSPACE_PREFIX: &str = "ephemeral/";
 
-/// Whether a project id denotes an ephemeral ("(no project)") context. See
-/// [`EPHEMERAL_PROJECT_PREFIX`].
-pub fn is_ephemeral_project_id(id: &str) -> bool {
-    id.starts_with(EPHEMERAL_PROJECT_PREFIX)
+/// Whether a workspace id denotes an ephemeral ("(no workspace)") context. See
+/// [`EPHEMERAL_WORKSPACE_PREFIX`].
+pub fn is_ephemeral_workspace_id(id: &str) -> bool {
+    id.starts_with(EPHEMERAL_WORKSPACE_PREFIX)
 }
 
 /// The build version a client announces on connect (`?version=`); the server requires an

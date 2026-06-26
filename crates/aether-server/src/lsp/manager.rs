@@ -27,19 +27,19 @@ use super::position::PositionEncoding;
 use super::{lifecycle, process, uri};
 use crate::state::{ServerState, SharedState};
 
-/// Identifies a server instance: one per **project** per workspace root per language.
+/// Identifies a server instance: one per **workspace** per workspace root per language.
 ///
-/// Keying by project (not just root) means two projects never share a server even when they
-/// resolve to the same workspace root (overlapping/nested roots). Combined with the per-project
-/// buffer scope — within a project a file is always exactly one buffer — this makes "one buffer
+/// Keying by workspace (not just root) means two workspaces never share a server even when they
+/// resolve to the same workspace root (overlapping/nested roots). Combined with the per-workspace
+/// buffer scope — within a workspace a file is always exactly one buffer — this makes "one buffer
 /// per URI per server" hold by construction, so LSP document sync (`didOpen`/`didChange`/
-/// `didClose`, diagnostics) is never ambiguous. The cost is a redundant server when two projects
-/// genuinely share a workspace root (uncommon); disjoint projects already had distinct roots and
+/// `didClose`, diagnostics) is never ambiguous. The cost is a redundant server when two workspaces
+/// genuinely share a workspace root (uncommon); disjoint workspaces already had distinct roots and
 /// are unaffected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LspServerKey {
-    /// The owning project's id (`ServerState` project key).
-    pub project: String,
+    /// The owning workspace's id (`ServerState` workspace key).
+    pub workspace: String,
     pub root: PathBuf,
     pub language: String,
 }
@@ -194,13 +194,13 @@ impl LspManager {
         self.servers.get(key).map(handle_status)
     }
 
-    /// Snapshot of every server owned by `project_id` — drives the LSP servers picker.
-    /// Project-keyed (not root-keyed) so a project sees exactly its own servers,
-    /// even when a sibling project shares its workspace root.
-    pub fn status_for_project(&self, project_id: &str) -> Vec<LspServerStatus> {
+    /// Snapshot of every server owned by `workspace_id` — drives the LSP servers picker.
+    /// Workspace-keyed (not root-keyed) so a workspace sees exactly its own servers,
+    /// even when a sibling workspace shares its workspace root.
+    pub fn status_for_workspace(&self, workspace_id: &str) -> Vec<LspServerStatus> {
         self.servers
             .iter()
-            .filter(|(key, _)| key.project == project_id)
+            .filter(|(key, _)| key.workspace == workspace_id)
             .map(|(_, h)| handle_status(h))
             .collect()
     }
@@ -219,32 +219,32 @@ fn handle_status(h: &LspHandle) -> LspServerStatus {
     }
 }
 
-/// Find the server root for `file`, searching ancestors up to (but not above) the project root
+/// Find the server root for `file`, searching ancestors up to (but not above) the workspace root
 /// that contains it. Precedence:
 /// 1. **Workspace root** — the *outermost* ancestor matching `workspace` (a Cargo `[workspace]` /
 ///    `go.work`), so a whole workspace gets one server instead of one per crate/module.
 /// 2. else the **nearest** ancestor holding one of `root_markers`.
-/// 3. else the project root, else the file's own directory.
+/// 3. else the workspace root, else the file's own directory.
 pub fn discover_root(
     file: &Path,
     root_markers: &[&str],
     workspace: WorkspaceMarker,
-    project_roots: &[PathBuf],
+    workspace_roots: &[PathBuf],
 ) -> PathBuf {
-    let project_root = project_roots
+    let workspace_root = workspace_roots
         .iter()
         .filter(|r| file.starts_with(r))
         .max_by_key(|r| r.components().count());
 
-    // Ancestor dirs from the file up to (and including) the project root — nearest first.
+    // Ancestor dirs from the file up to (and including) the workspace root — nearest first.
     let mut dirs: Vec<&Path> = Vec::new();
     let mut dir = file.parent();
     while let Some(d) = dir {
         dirs.push(d);
-        match project_root {
-            Some(pr) if d == pr => break, // don't climb above the project root
+        match workspace_root {
+            Some(pr) if d == pr => break, // don't climb above the workspace root
             Some(_) => dir = d.parent(),
-            None => break, // no project context: only the file's own directory
+            None => break, // no workspace context: only the file's own directory
         }
     }
 
@@ -267,7 +267,7 @@ pub fn discover_root(
     }
 
     // 3. Fallbacks.
-    project_root
+    workspace_root
         .cloned()
         .or_else(|| file.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| file.to_path_buf())
@@ -502,7 +502,7 @@ fn report_due(last: Option<Instant>, now: Instant, min_interval: Duration) -> bo
 /// never saw begin.
 ///
 /// Fan-out is split by kind to keep the socket quiet. `begin`/`end` change the *busy* state (the
-/// progress map goes non-empty / empty), so they broadcast `lsp/status_changed` to every project
+/// progress map goes non-empty / empty), so they broadcast `lsp/status_changed` to every workspace
 /// client (the status-bar glyph) and refresh open LSP pickers. A `report` changes only the
 /// percentage/message — not busy-ness — so it skips the broadcast entirely and only refreshes open
 /// LSP pickers (the detail / dialog), and even that is throttled, since reports stream rapidly.
@@ -585,7 +585,7 @@ async fn handle_progress(
 
     let mut out = Vec::new();
     if !report_only {
-        // Busy ↔ idle changed: tell every project client so their status-bar glyph updates.
+        // Busy ↔ idle changed: tell every workspace client so their status-bar glyph updates.
         out.extend(collect_status_pushes(&guard, key));
     }
     // Refresh the LSP picker for clients that have it open — the only ones showing the detail / %.
@@ -594,7 +594,7 @@ async fn handle_progress(
 }
 
 /// Handle a `publishDiagnostics` payload. Always records the file's diagnostics path-keyed and
-/// line-granular in `path_diagnostics` — the project picker's source, populated for every file a
+/// line-granular in `path_diagnostics` — the workspace picker's source, populated for every file a
 /// server reports (rust-analyzer's flycheck pushes cover the whole build, opened or not). If the
 /// file is also open as a buffer, *separately* converts to byte columns against the buffer text,
 /// stores that as the live buffer-keyed set, and re-renders the buffer's viewports (squiggles). The
@@ -612,7 +612,7 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
         let mut guard = state.lock().await;
         let s = &mut *guard;
 
-        // Path-keyed line-only store (the project picker's source): always updated, for open and
+        // Path-keyed line-only store (the workspace picker's source): always updated, for open and
         // closed files alike. An empty push removes the entry so a fixed file stops showing.
         let raw = super::diagnostics::raw_from_lsp(&diags_json);
         if raw.is_empty() {
@@ -621,21 +621,21 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
             s.path_diagnostics.insert(path.clone(), raw);
         }
         // Live-refresh any open `Space Alt-d`: it reads `path_diagnostics`, so this push may add or
-        // change a file's rows. No-op when no client has the project picker open (the common case),
+        // change a file's rows. No-op when no client has the workspace picker open (the common case),
         // and it fires for closed files too — that's how a never-opened file's diagnostics appear.
-        let mut pushes = crate::handlers::refresh_project_diagnostics_pickers(s);
+        let mut pushes = crate::handlers::refresh_workspace_diagnostics_pickers(s);
 
-        // Route to the buffer in *this server's* project: a file open in two projects has a buffer
-        // in each, and each project's server publishes for its own buffer (with per-project keying
+        // Route to the buffer in *this server's* workspace: a file open in two workspaces has a buffer
+        // in each, and each workspace's server publishes for its own buffer (with per-workspace keying
         // there's exactly one such buffer per server).
-        let owner = key.project.as_str();
+        let owner = key.workspace.as_str();
         let buffer_id = s.buffers.iter().find_map(|(id, b)| {
             (b.canonical_path.as_deref() == Some(path.as_path())
-                && s.buffer_projects.get(id).map(String::as_str) == Some(owner))
+                && s.buffer_workspaces.get(id).map(String::as_str) == Some(owner))
             .then_some(*id)
         });
         match buffer_id {
-            // No open buffer: the path-keyed store + project-picker refresh above are all there is —
+            // No open buffer: the path-keyed store + workspace-picker refresh above are all there is —
             // no squiggles to render and no symbol outline to refresh for a file we don't have open.
             None => (pushes, None),
             Some(buffer_id) => {
@@ -665,17 +665,17 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
     send_all(pushes).await;
 }
 
-/// Restart every server for `language` owned by `project_id`: tear down the old process and
+/// Restart every server for `language` owned by `workspace_id`: tear down the old process and
 /// relaunch, re-registering the documents that were open against it so they reopen once the new
-/// process is ready. Project-keyed, so it never disturbs a sibling project's server.
-pub async fn restart(state: &SharedState, language: &str, project_id: &str) {
+/// process is ready. Workspace-keyed, so it never disturbs a sibling workspace's server.
+pub async fn restart(state: &SharedState, language: &str, workspace_id: &str) {
     let keys: Vec<LspServerKey> = {
         let guard = state.lock().await;
         guard
             .lsp
             .servers
             .keys()
-            .filter(|k| k.language == language && k.project == project_id)
+            .filter(|k| k.language == language && k.workspace == workspace_id)
             .cloned()
             .collect()
     };
@@ -740,7 +740,7 @@ async fn push_status(state: &SharedState, key: &LspServerKey) {
     send_all(pushes).await;
 }
 
-/// Build `lsp/status_changed` notifications for every client whose active project contains `key`'s
+/// Build `lsp/status_changed` notifications for every client whose active workspace contains `key`'s
 /// root.
 fn collect_status_pushes(
     s: &ServerState,
@@ -752,7 +752,7 @@ fn collect_status_pushes(
     let params = serde_json::to_value(handle_status(handle)).expect("infallible");
     s.clients
         .values()
-        .filter(|c| c.active_project.as_deref() == Some(key.project.as_str()))
+        .filter(|c| c.active_workspace.as_deref() == Some(key.workspace.as_str()))
         .map(|c| {
             (
                 c.outbound.clone(),
@@ -824,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_root_falls_back_to_project_root() {
+    fn discover_root_falls_back_to_workspace_root() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let sub = root.join("a/b");
@@ -1030,7 +1030,7 @@ mod tests {
     #[tokio::test]
     async fn progress_begin_report_end_tracks_active_work() {
         let key = LspServerKey {
-            project: "proj".into(),
+            workspace: "proj".into(),
             root: PathBuf::from("/proj"),
             language: "rust".into(),
         };
@@ -1117,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn open_change_close_reach_the_server() {
         let key = LspServerKey {
-            project: "proj".into(),
+            workspace: "proj".into(),
             root: PathBuf::from("/proj"),
             language: "rust".into(),
         };
@@ -1157,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn notify_close_tears_down_idle_server() {
         let key = LspServerKey {
-            project: "proj".into(),
+            workspace: "proj".into(),
             root: PathBuf::from("/proj"),
             language: "rust".into(),
         };
@@ -1180,7 +1180,7 @@ mod tests {
     #[tokio::test]
     async fn notify_close_keeps_server_with_other_buffers() {
         let key = LspServerKey {
-            project: "proj".into(),
+            workspace: "proj".into(),
             root: PathBuf::from("/proj"),
             language: "rust".into(),
         };
@@ -1202,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn change_before_open_is_dropped() {
         let key = LspServerKey {
-            project: "proj".into(),
+            workspace: "proj".into(),
             root: PathBuf::from("/proj"),
             language: "rust".into(),
         };
@@ -1225,12 +1225,12 @@ mod tests {
     fn ensure_is_idempotent_and_bumps_generation() {
         let mut mgr = LspManager::default();
         let a = LspServerKey {
-            project: "proj".into(),
+            workspace: "proj".into(),
             root: PathBuf::from("/a"),
             language: "rust".into(),
         };
         let b = LspServerKey {
-            project: "proj".into(),
+            workspace: "proj".into(),
             root: PathBuf::from("/b"),
             language: "go".into(),
         };
@@ -1244,48 +1244,48 @@ mod tests {
     }
 
     #[test]
-    fn same_root_different_project_are_distinct_servers() {
-        // The same file open in two projects (overlapping/nested roots resolve to one workspace
-        // root) must get a server *per project*, so each holds exactly one buffer for the URI —
+    fn same_root_different_workspace_are_distinct_servers() {
+        // The same file open in two workspaces (overlapping/nested roots resolve to one workspace
+        // root) must get a server *per workspace*, so each holds exactly one buffer for the URI —
         // no double didOpen / premature didClose.
         let mut mgr = LspManager::default();
         let a = LspServerKey {
-            project: "a".into(),
+            workspace: "a".into(),
             root: PathBuf::from("/shared"),
             language: "rust".into(),
         };
         let b = LspServerKey {
-            project: "b".into(),
+            workspace: "b".into(),
             root: PathBuf::from("/shared"),
             language: "rust".into(),
         };
         assert!(mgr.ensure(&a, "rust-analyzer").is_some());
         assert!(
             mgr.ensure(&b, "rust-analyzer").is_some(),
-            "a different project at the same root is a separate server"
+            "a different workspace at the same root is a separate server"
         );
         assert_eq!(mgr.servers.len(), 2);
     }
 
     #[test]
-    fn status_snapshot_filters_by_project() {
+    fn status_snapshot_filters_by_workspace() {
         let mut mgr = LspManager::default();
         let mine = LspServerKey {
-            project: "proj".into(),
+            workspace: "proj".into(),
             root: PathBuf::from("/proj/a"),
             language: "rust".into(),
         };
-        // Same workspace root, *different project* — must not show in `proj`'s snapshot, which is
-        // exactly the per-project isolation (root-keying would have leaked it).
+        // Same workspace root, *different workspace* — must not show in `proj`'s snapshot, which is
+        // exactly the per-workspace isolation (root-keying would have leaked it).
         let other = LspServerKey {
-            project: "other".into(),
+            workspace: "other".into(),
             root: PathBuf::from("/proj/a"),
             language: "go".into(),
         };
         mgr.ensure(&mine, "rust-analyzer");
         mgr.ensure(&other, "gopls");
 
-        let snap = mgr.status_for_project("proj");
+        let snap = mgr.status_for_workspace("proj");
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].language, "rust");
         assert!(matches!(snap[0].status, LspStatus::Starting));

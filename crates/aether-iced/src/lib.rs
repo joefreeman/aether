@@ -18,12 +18,12 @@ pub(crate) use aether_client::{chips, grid, keymap, labels};
 
 use anyhow::anyhow;
 
-/// Run the native GUI client to completion. `project`/`file` are the (optional) CLI positionals,
+/// Run the native GUI client to completion. `workspace`/`file` are the (optional) CLI positionals,
 /// `version` is the handshake version string, and `server_url` is the (profile-resolved) WebSocket
 /// address to dial. iced owns the main thread and manages its own tokio runtime, so unlike the
 /// terminal client this is a synchronous call (not awaited on a runtime the caller provides).
 pub fn run(
-    project: Option<String>,
+    workspace: Option<String>,
     file: Option<String>,
     version: String,
     server_url: String,
@@ -40,7 +40,7 @@ pub fn run(
     // front, so the client can start before the daemon and wait for it immersively. The app dials
     // `server_url` from within, on iced's own runtime, and installs the session once the socket lands.
     app::run(app::Bootstrap::Connecting(app::ConnectingBootstrap {
-        project,
+        workspace,
         file,
         client_version: version,
         server_url,

@@ -29,9 +29,9 @@ use aether_protocol::picker::{
     PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerUpdate, PickerUpdateParams,
     PickerView, PickerViewParams,
 };
-use aether_protocol::project::{
-    ProjectActivate, ProjectActivateParams, ProjectCreate, ProjectCreateParams, ProjectInfo,
-    ProjectOpenPath, ProjectOpenPathParams,
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceCreate, WorkspaceCreateParams, WorkspaceInfo,
+    WorkspaceOpenPath, WorkspaceOpenPathParams,
 };
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{
@@ -45,9 +45,9 @@ use iced::{keyboard, Element, Event, Length, Size, Subscription, Task};
 
 const TAB_WIDTH: u32 = 4;
 
-/// What `main` resolves before iced starts. With a project on the CLI, a live connection and
+/// What `main` resolves before iced starts. With a workspace on the CLI, a live connection and
 /// an opened buffer ([`SessionBootstrap`]); without one, just the connection — the app opens
-/// the project picker and builds the session over it when the user picks ([`ChooseBootstrap`]).
+/// the workspace picker and builds the session over it when the user picks ([`ChooseBootstrap`]).
 #[derive(Clone)]
 pub enum Bootstrap {
     /// No connection yet: the app launches immediately into an immersive "Connecting…" backdrop
@@ -70,11 +70,11 @@ impl std::fmt::Debug for Bootstrap {
     }
 }
 
-/// The CLI args a boot-connect task needs: which project/file to open once connected, and the
+/// The CLI args a boot-connect task needs: which workspace/file to open once connected, and the
 /// client version for the handshake. No live connection — that's what the task establishes.
 #[derive(Clone)]
 pub struct ConnectingBootstrap {
-    pub project: Option<String>,
+    pub workspace: Option<String>,
     pub file: Option<String>,
     pub client_version: String,
     /// The (profile-resolved) WebSocket address every dial and reconnect targets.
@@ -88,23 +88,23 @@ pub struct SessionBootstrap {
     pub notifications: NotifRx,
     pub client_version: String,
     pub server_url: String,
-    /// The daemon's start stamp, learned from the `project/activate` result — reconnects compare
+    /// The daemon's start stamp, learned from the `workspace/activate` result — reconnects compare
     /// it to tell "same daemon, connection blipped" from "daemon restarted" (where unsaved buffer
     /// state died with it).
     pub server_started_at: u64,
-    pub project: String,
-    pub project_paths: Vec<String>,
+    pub workspace: String,
+    pub workspace_paths: Vec<String>,
     pub buffer: BufferInfo,
     /// Set when the CLI path was a directory: the absolute dir to open the file explorer at,
     /// over the transient scratch in `buffer`. `None` for the file / no-path cases.
     pub explorer_dir: Option<String>,
-    /// The session was launched directly onto a file outside any project (ephemeral context) —
+    /// The session was launched directly onto a file outside any workspace (ephemeral context) —
     /// closing it should quit rather than drop to the chooser (see `Session::launched_with_file`).
     pub launched_with_file: bool,
 }
 
-/// A bare connection for the no-args start: the project picker browses on it, and the picked
-/// project's session is built over it.
+/// A bare connection for the no-args start: the workspace picker browses on it, and the picked
+/// workspace's session is built over it.
 #[derive(Clone)]
 pub struct ChooseBootstrap {
     pub handle: Handle,
@@ -118,10 +118,10 @@ pub struct ChooseBootstrap {
 pub struct Reestablished {
     pub handle: Handle,
     pub notifications: NotifRx,
-    /// The restored project + landing buffer, or `None` when the project is gone — renamed or
+    /// The restored workspace + landing buffer, or `None` when the workspace is gone — renamed or
     /// removed by another client while we were disconnected. The socket is fine, so the shell
     /// recovers into the boot chooser rather than failing.
-    pub restore: Option<(ProjectInfo, BufferOpenResult)>,
+    pub restore: Option<(WorkspaceInfo, BufferOpenResult)>,
     pub server_url: String,
     pub server_started_at: u64,
 }
@@ -141,7 +141,7 @@ pub enum ReconnectError {
     Fatal(String),
 }
 
-/// Pre-session state: the project chooser shown on a no-args start. Owns the connection the
+/// Pre-session state: the workspace chooser shown on a no-args start. Owns the connection the
 /// session will be built over; all input routes through `update_boot` while this is set.
 struct Boot {
     handle: Handle,
@@ -151,7 +151,7 @@ struct Boot {
     /// keycode editing (fake-caret rendering) rather than the core's value-synced query — hence the
     /// caret lives here, not on the (now caret-free) `PickerState`.
     query_cursor: usize,
-    /// A project was picked and its activation is in flight — input is parked meanwhile.
+    /// A workspace was picked and its activation is in flight — input is parked meanwhile.
     opening: bool,
     /// The connection died; a retry loop is dialling. Input is parked until it lands.
     down: bool,
@@ -177,11 +177,11 @@ enum PromptMsg {
     Cancel,
 }
 
-/// The project-settings overlay's clickable-affordance message space (buttons need `Clone`, the
+/// The workspace-settings overlay's clickable-affordance message space (buttons need `Clone`, the
 /// app `Message` isn't). Mirrors [`PickerMsg`]: the overlay renders in this space, then `.map`s to
 /// `Message::Core`. Today only the per-root delete button.
 #[derive(Debug, Clone, Copy)]
-enum ProjectSettingsMsg {
+enum WorkspaceSettingsMsg {
     /// The delete button on root row `index` (0-based) was clicked.
     RemoveRoot(usize),
 }
@@ -197,14 +197,14 @@ pub enum OverlayField {
     Search,
     /// The save-as prompt's path input.
     SaveAs,
-    /// The save-as prompt's root-filter input (multi-root projects).
+    /// The save-as prompt's root-filter input (multi-root workspaces).
     SaveAsRoot,
     /// The open-from-path prompt's single path input.
     OpenPath,
-    /// The project-settings name field.
-    ProjectName,
-    /// The project-settings add-root input.
-    ProjectAddRoot,
+    /// The workspace-settings name field.
+    WorkspaceName,
+    /// The workspace-settings add-root input.
+    WorkspaceAddRoot,
     /// The chip editor's root-filter input (multi-root dir editor).
     ChipRoot,
     /// The chip editor's path/glob input.
@@ -220,8 +220,8 @@ impl OverlayField {
             OverlayField::SaveAs => "overlay-saveas",
             OverlayField::SaveAsRoot => "overlay-saveas-root",
             OverlayField::OpenPath => "overlay-openpath",
-            OverlayField::ProjectName => "overlay-project-name",
-            OverlayField::ProjectAddRoot => "overlay-project-addroot",
+            OverlayField::WorkspaceName => "overlay-workspace-name",
+            OverlayField::WorkspaceAddRoot => "overlay-workspace-addroot",
             OverlayField::ChipRoot => "overlay-chip-root",
             OverlayField::ChipPath => "overlay-chip-path",
         })
@@ -281,9 +281,9 @@ struct Toast {
 
 #[derive(Debug)]
 pub enum Message {
-    /// The boot chooser's pick resolved: the activated project, the buffer to land on, and the
+    /// The boot chooser's pick resolved: the activated workspace, the buffer to land on, and the
     /// server instance's start stamp (for restart detection once the session exists).
-    SessionReady(Result<Box<(ProjectInfo, BufferOpenResult, u64)>, String>),
+    SessionReady(Result<Box<(WorkspaceInfo, BufferOpenResult, u64)>, String>),
     /// The boot-connect dial resolved (from the `Connecting` launch state): either a connected
     /// `Session`/`Choose` bootstrap to install, or a failure to retry.
     Booted(Result<Bootstrap, String>),
@@ -325,8 +325,8 @@ pub enum Message {
 }
 
 pub struct App {
-    /// The project chooser (no-args start). While set, `session` is an inert placeholder and
-    /// all messages route through `update_boot`; picking a project builds the real session
+    /// The workspace chooser (no-args start). While set, `session` is an inert placeholder and
+    /// all messages route through `update_boot`; picking a workspace builds the real session
     /// over the boot connection and clears this.
     boot: Option<Boot>,
     /// Set while the app is in the boot-connecting state (`ConnState::Connecting`): the CLI args
@@ -399,7 +399,7 @@ pub struct App {
     /// The overlay `text_input` that currently *should* hold focus (mirrors the web's
     /// `focusTarget`). Recomputed after every update; when it changes, the shell issues an
     /// `operation::focus` so typing lands in the right field the moment an overlay opens (and
-    /// moves between the project-settings name/add inputs as the core's selection changes).
+    /// moves between the workspace-settings name/add inputs as the core's selection changes).
     focused_field: Option<OverlayField>,
 }
 
@@ -469,7 +469,7 @@ impl App {
             }
             Bootstrap::Session(b) => {
                 let pump = pump(b.notifications.clone());
-                let mut session = Session::new(b.project, b.project_paths, b.buffer);
+                let mut session = Session::new(b.workspace, b.workspace_paths, b.buffer);
                 session.launched_with_file = b.launched_with_file;
                 // Fetch persisted app settings (e.g. the soft-wrap default) as the session comes up.
                 let startup = session.startup();
@@ -486,8 +486,8 @@ impl App {
                 (app, Task::batch([pump, startup_task]))
             }
             Bootstrap::Choose(b) => {
-                // Open the Projects picker on the boot connection; the session is built over
-                // that same connection when the user picks a project (`SessionReady`). Until
+                // Open the Workspaces picker on the boot connection; the session is built over
+                // that same connection when the user picks a workspace (`SessionReady`). Until
                 // then `session` is an inert placeholder — `update_boot` owns every message.
                 let pump = pump(b.notifications.clone());
                 let handle = b.handle.clone();
@@ -496,7 +496,7 @@ impl App {
                         handle
                             .rpc::<PickerView>(PickerViewParams {
                                 from_selection: false,
-                                kind: PickerKind::Projects,
+                                kind: PickerKind::Workspaces,
                                 reset: true,
                                 offset: 0,
                                 limit: FETCH_LIMIT,
@@ -520,7 +520,7 @@ impl App {
                 let boot = Boot {
                     handle: b.handle.clone(),
                     notifications: b.notifications.clone(),
-                    picker: PickerState::new(PickerKind::Projects),
+                    picker: PickerState::new(PickerKind::Workspaces),
                     query_cursor: 0,
                     opening: false,
                     down: false,
@@ -541,9 +541,9 @@ impl App {
         }
     }
 
-    /// `[project] file` — mirrors the web client's page title and the TUI's terminal title.
+    /// `[workspace] file` — mirrors the web client's page title and the TUI's terminal title.
     pub fn title(&self) -> String {
-        crate::labels::window_title(&self.session.project, &self.session.buffer.label)
+        crate::labels::window_title(&self.session.workspace, &self.session.buffer.label)
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -608,7 +608,7 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // Boot-connecting (no socket yet): input is parked; only the dial result moves us on.
-        // Then the project chooser (if any) owns every message until `SessionReady` hands off.
+        // Then the workspace chooser (if any) owns every message until `SessionReady` hands off.
         let task = if self.boot_args.is_some() {
             self.update_connecting(message)
         } else if self.boot.is_some() {
@@ -623,7 +623,7 @@ impl App {
     }
 
     /// The overlay `text_input` that should hold focus right now, given session state. Mirrors the
-    /// web's `focusTarget`. The boot chooser drives the project picker through `update_boot` with
+    /// web's `focusTarget`. The boot chooser drives the workspace picker through `update_boot` with
     /// its own [`Boot::picker`] (no `text_input` — its query stays on the fake-caret path), so it
     /// has no focus target here. `None` means "no overlay field" (the editor owns the keyboard).
     fn desired_focus(&self) -> Option<OverlayField> {
@@ -633,10 +633,10 @@ impl App {
         // A confirm / LSP-info prompt has no text field; only the save-as prompt does. Its two
         // segments (root filter / path) are controlled `text_input`s with ghost overlays behind
         // them, exactly like the chip editor — focus the active one so its caret shows and plain
-        // typing flows through `on_input`. The root segment only exists in multi-root projects.
+        // typing flows through `on_input`. The root segment only exists in multi-root workspaces.
         match &self.session.prompt {
             Some(Prompt::SaveAs(ed)) => {
-                let multi_root = self.session.project_paths.len() > 1;
+                let multi_root = self.session.workspace_paths.len() > 1;
                 return Some(
                     if multi_root && ed.field == crate::chips::ChipEditorField::Root {
                         OverlayField::SaveAsRoot
@@ -672,14 +672,14 @@ impl App {
                 .is_none()
                 .then_some(OverlayField::PickerQuery);
         }
-        if let Some(s) = &self.session.project_settings {
+        if let Some(s) = &self.session.workspace_settings {
             // Name field (selection 0) or add-root input (last row) — a highlighted root row in
             // between has no text field, so nothing to focus there.
             if s.on_name() {
-                return Some(OverlayField::ProjectName);
+                return Some(OverlayField::WorkspaceName);
             }
             if s.on_input() {
-                return Some(OverlayField::ProjectAddRoot);
+                return Some(OverlayField::WorkspaceAddRoot);
             }
             return None;
         }
@@ -718,7 +718,7 @@ impl App {
         }
     }
 
-    /// Message handling while the project chooser is up: a reduced picker vocabulary (type to
+    /// Message handling while the workspace chooser is up: a reduced picker vocabulary (type to
     /// filter, Alt-j/k, Enter/click to pick, Esc quits), plus the `SessionReady` hand-off that
     /// builds the session over the boot connection.
     fn update_boot(&mut self, message: Message) -> Task<Message> {
@@ -737,7 +737,7 @@ impl App {
                         }
                         Task::none()
                     }
-                    Err(e) => self.error(format!("Project list failed: {e}")),
+                    Err(e) => self.error(format!("Workspace list failed: {e}")),
                 }
             }
             Message::Notified(Some(n)) => {
@@ -746,8 +746,8 @@ impl App {
                         if let Ok(u) = serde_json::from_value::<PickerUpdateParams>(n.params) {
                             if boot.picker.apply_update(u) {
                                 tracing::debug!(
-                                    projects = boot.picker.total_matches,
-                                    "project chooser updated"
+                                    workspaces = boot.picker.total_matches,
+                                    "workspace chooser updated"
                                 );
                             }
                         }
@@ -779,7 +779,7 @@ impl App {
                 };
                 boot.handle = c.handle.clone();
                 boot.notifications = c.notifications.clone();
-                boot.picker = PickerState::new(PickerKind::Projects);
+                boot.picker = PickerState::new(PickerKind::Workspaces);
                 self.picker_scroll_y = 0.0;
                 boot.opening = false;
                 boot.down = false;
@@ -790,7 +790,7 @@ impl App {
                         handle
                             .rpc::<PickerView>(PickerViewParams {
                                 from_selection: false,
-                                kind: PickerKind::Projects,
+                                kind: PickerKind::Workspaces,
                                 reset: true,
                                 offset: 0,
                                 limit: FETCH_LIMIT,
@@ -821,21 +821,21 @@ impl App {
                 let Some(boot) = self.boot.take() else {
                     return Task::none();
                 };
-                let (project, open, server_started_at) = *r;
-                tracing::info!(project = %project.name, "session established");
+                let (workspace, open, server_started_at) = *r;
+                tracing::info!(workspace = %workspace.name, "session established");
                 // First activation on the boot connection establishes the restart-detection
                 // baseline (it was 0/unknown while only the chooser was up).
                 self.server_started_at = server_started_at;
-                // A rootless project (just created from the chooser) has nowhere to open files —
+                // A rootless workspace (just created from the chooser) has nowhere to open files —
                 // land in settings on the add-root input so the user can give it a root.
-                let rootless = project.paths.is_empty();
-                let buffer = buffer_info(open, &project.paths);
+                let rootless = workspace.paths.is_empty();
+                let buffer = buffer_info(open, &workspace.paths);
                 self.handle = boot.handle;
                 self.notifications = boot.notifications;
-                self.session = Session::new(project.name, project.paths, buffer);
+                self.session = Session::new(workspace.name, workspace.paths, buffer);
                 if rootless {
-                    self.session.open_project_settings();
-                    if let Some(s) = self.session.project_settings.as_mut() {
+                    self.session.open_workspace_settings();
+                    if let Some(s) = self.session.workspace_settings.as_mut() {
                         s.selected = s.input_index();
                     }
                 }
@@ -891,7 +891,7 @@ impl App {
         }
     }
 
-    /// Keys while the project chooser is up.
+    /// Keys while the workspace chooser is up.
     fn on_boot_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Task<Message> {
         let Some(boot) = &mut self.boot else {
             return Task::none();
@@ -948,20 +948,20 @@ impl App {
         Task::none()
     }
 
-    /// Enter / click in the chooser: activate the picked project over the boot connection
+    /// Enter / click in the chooser: activate the picked workspace over the boot connection
     /// and open its last buffer (or a fresh transient scratch) — the bootstrap convention.
     fn boot_accept(&mut self) -> Task<Message> {
         let Some(boot) = &self.boot else {
             return Task::none();
         };
         let handle = boot.handle.clone();
-        // The synthetic "+ Create project …" row: create the project named by the query, then land
+        // The synthetic "+ Create workspace …" row: create the workspace named by the query, then land
         // in it (the session picker reaches this via the core; the boot chooser predates a session,
         // so it drives the RPCs itself).
         if boot.picker.selected_is_create() {
             let name = boot.picker.query.trim().to_string();
             if name.is_empty() || name.contains('/') || name.contains('\\') {
-                return self.error("Project name can't be empty or contain path separators".into());
+                return self.error("Workspace name can't be empty or contain path separators".into());
             }
             if let Some(b) = &mut self.boot {
                 b.opening = true;
@@ -969,10 +969,10 @@ impl App {
             return Task::perform(
                 async move {
                     let created = handle
-                        .rpc::<ProjectCreate>(ProjectCreateParams { name })
+                        .rpc::<WorkspaceCreate>(WorkspaceCreateParams { name })
                         .await
                         .map_err(|e| e.to_string())?;
-                    // A fresh project has no roots, so `project/create` returns no landing buffer —
+                    // A fresh workspace has no roots, so `workspace/create` returns no landing buffer —
                     // open a scratch so the session lands in *some* editor.
                     let open = match created.opened {
                         Some(open) => open,
@@ -981,12 +981,12 @@ impl App {
                             .await
                             .map_err(|e| e.to_string())?,
                     };
-                    Ok(Box::new((created.project, open, created.server_started_at)))
+                    Ok(Box::new((created.workspace, open, created.server_started_at)))
                 },
                 Message::SessionReady,
             );
         }
-        let Some(PickerItem::Project { name, .. }) = boot.picker.selected_item() else {
+        let Some(PickerItem::Workspace { name, .. }) = boot.picker.selected_item() else {
             return Task::none();
         };
         let name = name.clone();
@@ -995,10 +995,10 @@ impl App {
         }
         Task::perform(
             async move {
-                // One composite: activate + land on the project's MRU buffer (or a fresh
+                // One composite: activate + land on the workspace's MRU buffer (or a fresh
                 // transient scratch on first visit).
                 let activated = handle
-                    .rpc::<ProjectActivate>(ProjectActivateParams {
+                    .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
                         name,
                         open_last: true,
                     })
@@ -1006,9 +1006,9 @@ impl App {
                     .map_err(|e| e.to_string())?;
                 let open = activated
                     .opened
-                    .ok_or_else(|| "project/activate returned no landing buffer".to_string())?;
+                    .ok_or_else(|| "workspace/activate returned no landing buffer".to_string())?;
                 Ok(Box::new((
-                    activated.project,
+                    activated.workspace,
                     open,
                     activated.server_started_at,
                 )))
@@ -1050,7 +1050,7 @@ impl App {
         self.picker_scroll_y = 0.0;
         let q = self.boot_rpc::<PickerQuery>(
             PickerQueryParams {
-                kind: PickerKind::Projects,
+                kind: PickerKind::Workspaces,
                 query,
                 generation,
                 filters: Default::default(),
@@ -1069,7 +1069,7 @@ impl App {
         self.boot_rpc::<PickerView>(
             PickerViewParams {
                 from_selection: false,
-                kind: PickerKind::Projects,
+                kind: PickerKind::Workspaces,
                 reset: false,
                 offset,
                 limit: FETCH_LIMIT,
@@ -1102,9 +1102,9 @@ impl App {
     }
 
     /// One paced boot-reconnect attempt: sleep, dial the fixed address. Failures loop back
-    /// through [`Message::BootReconnected`] — indefinitely, like the session's retry. No project
+    /// through [`Message::BootReconnected`] — indefinitely, like the session's retry. No workspace
     /// is active on the boot connection, so there's no instance stamp to learn yet (0); the first
-    /// `project/activate` establishes the baseline (nothing is open to lose in the meantime).
+    /// `workspace/activate` establishes the baseline (nothing is open to lose in the meantime).
     fn boot_reconnect(&self) -> Task<Message> {
         let version = self.client_version.clone();
         let server_url = self.server_url.clone();
@@ -1124,13 +1124,13 @@ impl App {
         )
     }
 
-    /// Recovery when a reconnect succeeds but the old project is gone (renamed/removed while away):
-    /// re-enter the boot chooser over the fresh connection and fetch the project list, mirroring a
-    /// no-args start. Picking a project (the renamed one shows under its new name) builds the
+    /// Recovery when a reconnect succeeds but the old workspace is gone (renamed/removed while away):
+    /// re-enter the boot chooser over the fresh connection and fetch the workspace list, mirroring a
+    /// no-args start. Picking a workspace (the renamed one shows under its new name) builds the
     /// session the usual way.
-    /// Open the Projects chooser over a fresh connection: install the boot state and start the
+    /// Open the Workspaces chooser over a fresh connection: install the boot state and start the
     /// pump + the chooser's first `picker/view`. Shared by the no-args boot (`Booted` → `Choose`),
-    /// the boot-connection reconnect, and [`Self::reconnect_to_chooser`] (project-gone recovery).
+    /// the boot-connection reconnect, and [`Self::reconnect_to_chooser`] (workspace-gone recovery).
     fn enter_boot_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
         let view = self.raise_boot_chooser(handle, notifications.clone());
         Task::batch([pump(notifications), view])
@@ -1145,7 +1145,7 @@ impl App {
         self.boot = Some(Boot {
             handle: handle.clone(),
             notifications,
-            picker: PickerState::new(PickerKind::Projects),
+            picker: PickerState::new(PickerKind::Workspaces),
             query_cursor: 0,
             opening: false,
             down: false,
@@ -1155,7 +1155,7 @@ impl App {
                 handle
                     .rpc::<PickerView>(PickerViewParams {
                         from_selection: false,
-                        kind: PickerKind::Projects,
+                        kind: PickerKind::Workspaces,
                         reset: true,
                         offset: 0,
                         limit: FETCH_LIMIT,
@@ -1181,7 +1181,7 @@ impl App {
     fn reconnect_to_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
         let chooser = self.enter_boot_chooser(handle, notifications);
         let toast = self.toast(
-            "Project no longer exists — pick another",
+            "Workspace no longer exists — pick another",
             ToastKind::Warning,
             None,
         );
@@ -1189,8 +1189,8 @@ impl App {
     }
 
     /// Boot-connecting state (`ConnState::Connecting`): the editor chrome is live but there's no
-    /// socket yet. The dial's `Booted` result installs the real session (project on the CLI) or
-    /// chooser (no project), or retries after a short delay (the daemon may still be starting).
+    /// socket yet. The dial's `Booted` result installs the real session (workspace on the CLI) or
+    /// chooser (no workspace), or retries after a short delay (the daemon may still be starting).
     /// Everything else flows to the normal handler so client-side keys behave as in a reconnect —
     /// the core drops any RPC while not `Connected`, so the dummy transport is never exercised.
     fn update_connecting(&mut self, message: Message) -> Task<Message> {
@@ -1200,7 +1200,7 @@ impl App {
                 self.server_started_at = b.server_started_at;
                 self.handle = b.handle;
                 self.notifications = b.notifications.clone();
-                self.session = Session::new(b.project, b.project_paths, b.buffer);
+                self.session = Session::new(b.workspace, b.workspace_paths, b.buffer);
                 self.session.launched_with_file = b.launched_with_file;
                 // The connecting editor already laid out (recording cell metrics) without
                 // subscribing, so its Layout may not fire again — subscribe explicitly now that
@@ -1412,15 +1412,15 @@ impl App {
                 self.handle = r.handle.clone();
                 self.notifications = r.notifications.clone();
                 match r.restore {
-                    Some((project, open)) => {
+                    Some((workspace, open)) => {
                         let fx = self.session.on_event(CoreEvent::Reestablished {
-                            project,
+                            workspace,
                             open,
                             restarted,
                         });
                         Task::batch([pump(r.notifications), self.run_core(fx)])
                     }
-                    // The project is gone — re-enter the boot chooser over the fresh connection.
+                    // The workspace is gone — re-enter the boot chooser over the fresh connection.
                     None => self.reconnect_to_chooser(r.handle, r.notifications),
                 }
             }
@@ -1550,7 +1550,7 @@ impl App {
                     // The reveal's `scroll_to` drops the query input's focus, and `sync_focus`
                     // won't restore it (the desired field is unchanged, so its change-guard skips).
                     // Re-assert it so the cursor stays — e.g. opening the Explorer in a subdirectory
-                    // centres on the active file, which reveals; the project-root case finds no match
+                    // centres on the active file, which reveals; the workspace-root case finds no match
                     // and never reveals, which is why only the subdir case lost its cursor. Reveals
                     // fire on open-centring and nav, never on typing, so this can't fight an edit.
                     if let Some(field) = self.desired_focus() {
@@ -1567,7 +1567,7 @@ impl App {
                 Effect::Reconnect { attempt } => tasks.push(self.try_reconnect(attempt)),
                 Effect::Exit => tasks.push(iced::exit()),
                 Effect::ToChooser => {
-                    // Drop to the project chooser over the live connection (no new pump — the
+                    // Drop to the workspace chooser over the live connection (no new pump — the
                     // current one keeps delivering, now routed through `update_boot`).
                     let (handle, notifications) =
                         (self.handle.clone(), self.notifications.clone());
@@ -1810,7 +1810,7 @@ impl App {
     /// caret-to-end treatment when the core rewrites them (Tab-complete, cycle, root↔path switch).
     fn chip_field_snapshot(&self) -> Option<(OverlayField, String)> {
         if let Some(Prompt::SaveAs(ed)) = &self.session.prompt {
-            let multi_root = self.session.project_paths.len() > 1;
+            let multi_root = self.session.workspace_paths.len() > 1;
             return Some(
                 if multi_root && ed.field == crate::chips::ChipEditorField::Root {
                     (OverlayField::SaveAsRoot, ed.root_filter.text.clone())
@@ -1836,8 +1836,8 @@ impl App {
             OverlayField::SaveAs => self.session.save_as_set_input(value),
             OverlayField::SaveAsRoot => self.session.save_as_set_root_filter(value),
             OverlayField::OpenPath => self.session.open_path_set_input(value),
-            OverlayField::ProjectName => self.session.project_settings_set_name(value),
-            OverlayField::ProjectAddRoot => self.session.project_settings_set_add(value),
+            OverlayField::WorkspaceName => self.session.workspace_settings_set_name(value),
+            OverlayField::WorkspaceAddRoot => self.session.workspace_settings_set_add(value),
             OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
             OverlayField::ChipPath => self.session.chip_editor_set_input(value),
         }
@@ -2011,7 +2011,7 @@ impl App {
     // ---- RPC helpers ------------------------------------------------------------------------
 
     /// One reconnect attempt, after `attempt`'s backoff: dial the fixed address
-    /// (a restarted daemon rebinds the same port), re-activate the project, and reopen the
+    /// (a restarted daemon rebinds the same port), re-activate the workspace, and reopen the
     /// buffer — by path when it has one (transient flag preserved, cursor as the jump target),
     /// by id otherwise (recovers a scratch's content when the daemon stayed up), falling back
     /// to a fresh transient scratch. Dial failures retry via [`ReconnectError::NotUp`];
@@ -2023,7 +2023,7 @@ impl App {
         }
         let version = self.client_version.clone();
         let server_url = self.server_url.clone();
-        let project = s.project.clone();
+        let workspace = s.workspace.clone();
         let path = s.buffer.path.clone();
         let buffer_id = s.buffer.buffer_id;
         let transient = s.buffer.transient;
@@ -2035,14 +2035,14 @@ impl App {
                     .await
                     .map_err(|_| ReconnectError::NotUp)?;
                 let activated = match handle
-                    .rpc::<ProjectActivate>(ProjectActivateParams {
-                        name: project,
+                    .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
+                        name: workspace,
                         open_last: false,
                     })
                     .await
                 {
                     Ok(a) => a,
-                    // The project is gone (renamed/removed while away) — hand back a project-less
+                    // The workspace is gone (renamed/removed while away) — hand back a workspace-less
                     // reconnect; the shell raises the chooser over this connection.
                     Err(_) => {
                         return Ok(Box::new(Reestablished {
@@ -2050,7 +2050,7 @@ impl App {
                             notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
                             restore: None,
                             server_url,
-                            // No project re-activated, so no fresh instance stamp; treat as
+                            // No workspace re-activated, so no fresh instance stamp; treat as
                             // unknown. The chooser is raised over this connection and the next
                             // activation re-establishes the baseline.
                             server_started_at: 0,
@@ -2058,7 +2058,7 @@ impl App {
                     }
                 };
                 let params = match &path {
-                    Some(p) => strip_longest_root(p, &activated.project.paths).map(
+                    Some(p) => strip_longest_root(p, &activated.workspace.paths).map(
                         |(path_index, relative_path)| BufferOpenParams {
                             path_index: Some(path_index),
                             relative_path: Some(relative_path),
@@ -2095,7 +2095,7 @@ impl App {
                 Ok(Box::new(Reestablished {
                     handle,
                     notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
-                    restore: Some((activated.project, open)),
+                    restore: Some((activated.workspace, open)),
                     server_url,
                     server_started_at: activated.server_started_at,
                 }))
@@ -2500,7 +2500,7 @@ impl App {
             layers.push(
                 Element::from(crate::picker::overlay(
                     p,
-                    &self.session.project_paths,
+                    &self.session.workspace_paths,
                     self.picker_scroll_y,
                     self.spinner_phase,
                     true,
@@ -2519,8 +2519,8 @@ impl App {
                 }),
             );
         }
-        if self.session.project_settings.is_some() {
-            layers.push(self.project_settings_overlay());
+        if self.session.workspace_settings.is_some() {
+            layers.push(self.workspace_settings_overlay());
         }
         if self.session.app_settings.is_some() {
             layers.push(self.app_settings_overlay());
@@ -2683,21 +2683,21 @@ impl App {
         )
     }
 
-    /// The project-settings dialog (`Space ,`): a centred modal with the editable project name,
+    /// The workspace-settings dialog (`Space ,`): a centred modal with the editable workspace name,
     /// the list of roots, and an add-root input row — rendered from the core's
-    /// `session.project_settings`. Keyboard-driven (keys route through `session.on_key`, which the
+    /// `session.workspace_settings`. Keyboard-driven (keys route through `session.on_key`, which the
     /// core handles): Alt-j/k navigate, Enter renames / adds, Delete (then y) removes, Esc closes.
     /// Mirrors `help_overlay`'s NORD modal box + opaque backdrop.
-    fn project_settings_overlay(&self) -> Element<'_, Message> {
-        self.project_settings_body()
+    fn workspace_settings_overlay(&self) -> Element<'_, Message> {
+        self.workspace_settings_body()
     }
 
     /// The dialog content. The name + add-root fields are controlled `text_input`s (web parity,
-    /// syncing via `project_settings_set_name` / `_set_add`); the per-root delete buttons carry
-    /// `ProjectSettingsMsg` mapped inline to `Message` (since the inputs already produce `Message`,
+    /// syncing via `workspace_settings_set_name` / `_set_add`); the per-root delete buttons carry
+    /// `WorkspaceSettingsMsg` mapped inline to `Message` (since the inputs already produce `Message`,
     /// the whole tree is `Message`-typed rather than mapped at the end).
-    fn project_settings_body(&self) -> Element<'_, Message> {
-        let s = self.session.project_settings.as_ref().unwrap();
+    fn workspace_settings_body(&self) -> Element<'_, Message> {
+        let s = self.session.workspace_settings.as_ref().unwrap();
 
         // An editable field: a controlled `text_input` keyed to its core setter. Wrapped in a
         // fixed-height row so the box never resizes between the focused/unfocused states. The
@@ -2751,14 +2751,14 @@ impl App {
         let name_group = column![
             label("Name"),
             boxed_row(
-                field(OverlayField::ProjectName, &s.name.text, ""),
+                field(OverlayField::WorkspaceName, &s.name.text, ""),
                 s.on_name(),
             ),
         ]
         .spacing(3);
 
         let mut col = column![
-            text("Project settings")
+            text("Workspace settings")
                 .size(14)
                 .font(SANS_BOLD_UI)
                 .color(theme::NORD6),
@@ -2814,12 +2814,12 @@ impl App {
                     },
                     ..iced::widget::button::Style::default()
                 })
-                .on_press(ProjectSettingsMsg::RemoveRoot(i));
-            // The delete button is the only `ProjectSettingsMsg` source; map it inline so this row
+                .on_press(WorkspaceSettingsMsg::RemoveRoot(i));
+            // The delete button is the only `WorkspaceSettingsMsg` source; map it inline so this row
             // joins the `Message`-typed tree (the input fields already produce `Message`).
             let delete = Element::from(delete).map(|m| match m {
-                ProjectSettingsMsg::RemoveRoot(i) => {
-                    Message::Core(CoreEvent::ProjectSettingsRemoveRoot(i))
+                WorkspaceSettingsMsg::RemoveRoot(i) => {
+                    Message::Core(CoreEvent::WorkspaceSettingsRemoveRoot(i))
                 }
             });
             // Selection tints just the path text (web/terminal parity), so the background hugs the
@@ -2843,7 +2843,7 @@ impl App {
         // The always-present add-root input row — a borderless input after its bullet, so the caret
         // is the focus cue (web/terminal parity), not a box.
         roots_col = roots_col.push(bulleted(field(
-            OverlayField::ProjectAddRoot,
+            OverlayField::WorkspaceAddRoot,
             &s.add.text,
             "Add root...",
         )));
@@ -2891,7 +2891,7 @@ impl App {
     /// description grouped on the line directly below. Clicking a checkbox toggles that setting
     /// (`AppSettingToggle`); keys also work (Alt-j/k or Up/Down move, Enter/Space toggles, Esc
     /// closes). Only the focused setting's *checkbox* is ringed (not the whole row). Mirrors the
-    /// project-settings modal box + dimmed backdrop.
+    /// workspace-settings modal box + dimmed backdrop.
     fn app_settings_overlay(&self) -> Element<'_, Message> {
         let s = self.session.app_settings.as_ref().unwrap();
         let groups = self.session.app_setting_groups();
@@ -2926,7 +2926,7 @@ impl App {
                     AppSettingControl::Value(v) => {
                         // `button` needs a `Clone` press message and `Message` isn't `Clone`, so the
                         // button carries the row index (a `usize`) and we map it to `Message` — the
-                        // same pattern as the project-settings delete button.
+                        // same pattern as the workspace-settings delete button.
                         let btn = iced::widget::button(
                             text(v.to_string()).size(13).font(SANS).color(theme::NORD6),
                         )
@@ -3021,7 +3021,7 @@ impl App {
         )
     }
 
-    /// The no-args start screen: just the Projects picker over the editor background.
+    /// The no-args start screen: just the Workspaces picker over the editor background.
     fn boot_view<'a>(&'a self, boot: &'a Boot) -> Element<'a, Message> {
         let backdrop = container(iced::widget::Space::new())
             .width(Length::Fill)
@@ -3047,7 +3047,7 @@ impl App {
             PickerMsg::Hovered(abs) => Message::PickerHovered(Some(abs)),
             PickerMsg::Unhovered(abs) => Message::PickerUnhovered(abs),
             PickerMsg::ChipClicked(i) => Message::Core(CoreEvent::PickerChipClicked(i)),
-            // The boot chooser is the Projects picker — no query sync, no chip editor, no chip-row
+            // The boot chooser is the Workspaces picker — no query sync, no chip editor, no chip-row
             // boundary keys — so none of the controlled-input / chip messages can fire here.
             PickerMsg::Query(_)
             | PickerMsg::EditorRoot(_)
@@ -3292,7 +3292,7 @@ impl App {
             .into(),
             Prompt::SaveAs(ed) => {
                 // The save-as editor mirrors the dir chip editor's directory-completion UX: in
-                // multi-root projects a leading root-filter segment (smartcase typeahead + gray
+                // multi-root workspaces a leading root-filter segment (smartcase typeahead + gray
                 // ghost), a `:` separator, then the root-relative path; single-root shows just the
                 // path. Both segments are the controlled-`text_input`-over-ghost-layer shape from
                 // the picker (`field_with_ghost`), so the look stays consistent. Edits sync via
@@ -3300,7 +3300,7 @@ impl App {
                 // Backspace boundaries forward through `CoreKey` (web/TUI parity). The whole row is
                 // built in `PickerMsg` space then mapped to `Message`.
                 use crate::picker::{field_with_ghost, Boundary, PickerMsg};
-                let roots = &self.session.project_paths;
+                let roots = &self.session.workspace_paths;
                 let labels = crate::labels::root_labels(roots);
                 let multi_root = roots.len() > 1;
                 let mut field = row![].align_y(iced::Alignment::Center);
@@ -3710,7 +3710,7 @@ impl App {
     }
 
     /// The status bar mirrors the web client's: persistent state only (messages are toasts, the
-    /// mode lives in the cursor shape). Left: state dot, `[project] file` (italic when
+    /// mode lives in the cursor shape). Left: state dot, `[workspace] file` (italic when
     /// transient), git cluster. Right: grep position, diagnostic counts, cursor position, LSP
     /// health dot.
     fn status_bar(&self) -> Element<'_, Message> {
@@ -3720,11 +3720,11 @@ impl App {
         if let Some(color) = self.buffer_state_color() {
             left = left.push(t("● ".into(), color));
         }
-        // Persisted project → `[name] ` prefix. No project (boot/connecting/chooser) or an
-        // ephemeral "(no project)" context → no prefix, so the bar shows just the file label
-        // rather than a stray `[]` or a `[(no project)]` that reads like a real project.
-        if crate::labels::shows_project_chrome(&self.session.project) {
-            left = left.push(t(format!("[{}] ", self.session.project), theme::NORD4));
+        // Persisted workspace → `[name] ` prefix. No workspace (boot/connecting/chooser) or an
+        // ephemeral "(no workspace)" context → no prefix, so the bar shows just the file label
+        // rather than a stray `[]` or a `[(no workspace)]` that reads like a real workspace.
+        if crate::labels::shows_workspace_chrome(&self.session.workspace) {
+            left = left.push(t(format!("[{}] ", self.session.workspace), theme::NORD4));
         }
         // Segment-elide long labels to roughly half the bar so the filename survives (the
         // web's `truncatePath`; chars approximate px since the bar is sans).
@@ -3966,7 +3966,7 @@ const MONO: iced::Font = iced::Font::MONOSPACE;
 /// NORD3_BRIGHT placeholder, no border or background of its own (the surrounding container draws
 /// the box). `on_submit` is deliberately left unset so a single-line `text_input` lets Enter
 /// bubble (`Ignored`) to the core's key handler — the picker's Enter-to-select, save-as accept,
-/// and project-settings rename/add all stay on the existing `on_key` path.
+/// and workspace-settings rename/add all stay on the existing `on_key` path.
 ///
 /// `iced::widget::text_input`'s builder requires `Message: Clone`, which the app's `Message` is
 /// not, so it's built in the tiny `Clone` [`Typed`] space and `.map`'d to `Message` (the same
@@ -4407,7 +4407,7 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::DiscardOnClose { label } => format!("Discard unsaved changes in {label}"),
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
-        ConfirmKind::DeleteProject { name } => format!("Delete project \"{name}\""),
+        ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
     }
 }
 
@@ -4434,7 +4434,7 @@ fn spawn_connect_delayed(args: ConnectingBootstrap) -> Task<Message> {
     )
 }
 
-/// One boot-connect attempt: dial the fixed address, then (with a CLI project) activate it and
+/// One boot-connect attempt: dial the fixed address, then (with a CLI workspace) activate it and
 /// open the file / MRU buffer, or (without one) hand back a bare connection for the chooser.
 /// Returns the connected [`Bootstrap`] to install, or an error string to retry / surface.
 async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, String> {
@@ -4444,35 +4444,35 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
         .map_err(|e| e.to_string())?;
     let notifications = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
 
-    // No project on the CLI. An existing file outside any configured project (`ae /etc/hosts`)
-    // opens directly in an ephemeral "(no project)" context; otherwise hand back the bare
+    // No workspace on the CLI. An existing file outside any configured workspace (`ae /etc/hosts`)
+    // opens directly in an ephemeral "(no workspace)" context; otherwise hand back the bare
     // connection so the chooser browses on it.
-    let Some(project) = args.project.clone() else {
+    let Some(workspace) = args.workspace.clone() else {
         let resolved = match &args.file {
             Some(f) => Some(resolve_cli_path(f)?),
             None => None,
         };
         if let Some(abs) = resolved.filter(|p| p.is_file()) {
             let opened = handle
-                .rpc::<ProjectOpenPath>(ProjectOpenPathParams {
+                .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                     path: abs.display().to_string(),
                     transient: None,
                 })
                 .await
                 .map_err(|e| e.to_string())?;
-            let project_paths = opened.project.paths.clone();
+            let workspace_paths = opened.workspace.paths.clone();
             let open = opened
                 .opened
-                .ok_or_else(|| "project/open_path returned no buffer".to_string())?;
+                .ok_or_else(|| "workspace/open_path returned no buffer".to_string())?;
             return Ok(Bootstrap::Session(Box::new(SessionBootstrap {
                 handle,
                 notifications,
                 client_version: args.client_version,
                 server_url: args.server_url,
                 server_started_at: opened.server_started_at,
-                project: opened.project.name,
-                buffer: buffer_info(open, &project_paths),
-                project_paths,
+                workspace: opened.workspace.name,
+                buffer: buffer_info(open, &workspace_paths),
+                workspace_paths,
                 explorer_dir: None,
                 launched_with_file: true,
             })));
@@ -4487,14 +4487,14 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
     };
 
     let activated = handle
-        .rpc::<ProjectActivate>(ProjectActivateParams {
-            name: project,
+        .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
+            name: workspace,
             open_last: false,
         })
         .await
         .map_err(|e| e.to_string())?;
     let server_started_at = activated.server_started_at;
-    let project_paths = activated.project.paths.clone();
+    let workspace_paths = activated.workspace.paths.clone();
 
     // Resolve the CLI path once, then branch on file vs directory. A directory lands in a
     // transient scratch and opens the file explorer over it (`explorer_dir`, run once the session
@@ -4514,8 +4514,8 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
             .map_err(|e| e.to_string())?,
         Some(abs) => {
             let abs_str = abs.display().to_string();
-            match strip_longest_root(&abs_str, &project_paths) {
-                // Inside a project root: ordinary project-relative open.
+            match strip_longest_root(&abs_str, &workspace_paths) {
+                // Inside a workspace root: ordinary workspace-relative open.
                 Some((path_index, relative_path)) => handle
                     .rpc::<BufferOpen>(BufferOpenParams {
                         path_index: Some(path_index),
@@ -4524,16 +4524,16 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
                     })
                     .await
                     .map_err(|e| e.to_string())?,
-                // Outside the named project's roots: open as an external (guest) buffer in it.
+                // Outside the named workspace's roots: open as an external (guest) buffer in it.
                 None => handle
-                    .rpc::<ProjectOpenPath>(ProjectOpenPathParams {
+                    .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                         path: abs_str,
                         transient: None,
                     })
                     .await
                     .map_err(|e| e.to_string())?
                     .opened
-                    .ok_or_else(|| "project/open_path returned no buffer".to_string())?,
+                    .ok_or_else(|| "workspace/open_path returned no buffer".to_string())?,
             }
         }
         // No file: attach to the most recent buffer, or a transient scratch placeholder.
@@ -4558,9 +4558,9 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
         client_version: args.client_version,
         server_url: args.server_url,
         server_started_at,
-        project: activated.project.name,
-        buffer: buffer_info(open, &project_paths),
-        project_paths,
+        workspace: activated.workspace.name,
+        buffer: buffer_info(open, &workspace_paths),
+        workspace_paths,
         explorer_dir,
         launched_with_file: false,
     })))
@@ -4669,14 +4669,14 @@ mod tests {
     /// Non-grep pickers have no headers: the first row is revealed flush to the top.
     #[test]
     fn plain_reveal_needs_no_clearance() {
-        let mut s = PickerState::new(PickerKind::Projects);
+        let mut s = PickerState::new(PickerKind::Workspaces);
         assert!(s.apply_update(PickerUpdateParams {
-            kind: PickerKind::Projects,
+            kind: PickerKind::Workspaces,
             generation: 0,
             offset: 0,
             items: Some(
                 (0..30)
-                    .map(|i| PickerItem::Project {
+                    .map(|i| PickerItem::Workspace {
                         name: format!("p{i}"),
                         unsaved_buffers: 0,
                         match_indices: vec![],
@@ -4711,8 +4711,8 @@ mod tests {
             OverlayField::Search,
             OverlayField::SaveAs,
             OverlayField::SaveAsRoot,
-            OverlayField::ProjectName,
-            OverlayField::ProjectAddRoot,
+            OverlayField::WorkspaceName,
+            OverlayField::WorkspaceAddRoot,
             OverlayField::ChipRoot,
             OverlayField::ChipPath,
         ];

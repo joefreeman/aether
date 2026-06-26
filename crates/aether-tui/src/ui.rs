@@ -109,7 +109,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // The status row carries save-as / new-file prompts and the dirty + cursor indicator for an
     // active editor. The add-root prompt lives *inside* the settings overlay, not here. Transient
     // feedback no longer lives here — it floats as a toast (see `draw_toast_overlay`) — so the row
-    // is shown only for an active editor, leaving the no-project view its full vertical space.
+    // is shown only for an active editor, leaving the no-workspace view its full vertical space.
     // The status row shows for an active editor, and also at boot while `Connecting` (no editor
     // yet) so the connection indicator has its familiar home — the chrome is up from the start.
     let show_status = state.has_editor() || state.conn == ConnState::Connecting;
@@ -125,7 +125,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     if state.has_editor() {
         draw_buffer(f, state, chunks[0]);
     } else {
-        draw_no_project_view(f, state, chunks[0]);
+        draw_no_workspace_view(f, state, chunks[0]);
     }
     // Hover popup (Space k): floats over the buffer, below any modal (a keypress that opens a modal
     // first dismisses hover, so they never coexist).
@@ -136,7 +136,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // overlay paints: each overlay `Clear`s and repaints its own box opaquely, so only the area
     // *behind* the dialog ends up dimmed.
     let modal_open = state.picker.open
-        || state.project_settings.is_some()
+        || state.workspace_settings.is_some()
         || state.app_settings.is_some()
         || state.help.open
         || state.picker.lsp_detail.is_some();
@@ -150,13 +150,13 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         dim_backdrop(f.buffer_mut(), chunks[0]);
     }
     // The unified picker overlay sits on top of either screen — same renderer for Files /
-    // Buffers / Grep / Explorer / Projects.
+    // Buffers / Grep / Explorer / Workspaces.
     if state.picker.open {
         draw_picker_overlay(f, state, chunks[0]);
     }
-    // Project settings overlay (Space P): centered modal listing the active project's roots.
-    if state.project_settings.is_some() {
-        draw_project_settings_overlay(f, state, chunks[0]);
+    // Workspace settings overlay (Space P): centered modal listing the active workspace's roots.
+    if state.workspace_settings.is_some() {
+        draw_workspace_settings_overlay(f, state, chunks[0]);
     }
     // Application settings overlay (Space .): centered modal listing global settings.
     if state.app_settings.is_some() {
@@ -176,9 +176,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         draw_help_overlay(f, state, chunks[0]);
     }
     // The settings overlay needs a caret on its input row even when no editor exists (e.g. right
-    // after `project/create`). Fall back to a zero Rect for the status area in that case — the
+    // after `workspace/create`). Fall back to a zero Rect for the status area in that case — the
     // settings branch in `place_terminal_cursor` doesn't read it.
-    if state.has_editor() || state.project_settings.is_some() {
+    if state.has_editor() || state.workspace_settings.is_some() {
         let buffer_area = chunks[0];
         let status_area = chunks.get(1).copied().unwrap_or(Rect::default());
         place_terminal_cursor(f, state, buffer_area, status_area);
@@ -204,13 +204,13 @@ fn dim_backdrop(buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// Project-settings overlay. A bordered modal (no border title) holding, top-to-bottom:
-/// a `Project settings (<name>)` heading, a blank row, a `Project roots:` section label, the
+/// Workspace-settings overlay. A bordered modal (no border title) holding, top-to-bottom:
+/// a `Workspace settings (<name>)` heading, a blank row, a `Workspace roots:` section label, the
 /// list of roots, an always-present "Add root..." input row, and — when the last add/remove
 /// attempt failed — a red error footer. Selection highlights the path text (bold + accent) on
 /// root rows only; the input row carries no highlight (its terminal caret is the focus cue).
-fn draw_project_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
-    let Some(settings) = state.project_settings.as_ref() else {
+fn draw_workspace_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+    let Some(settings) = state.workspace_settings.as_ref() else {
         return;
     };
     let box_area = picker_box_rect(area);
@@ -1461,15 +1461,15 @@ fn factor_common<'a, T: PartialEq>(a: &'a [T], b: &'a [T]) -> (&'a [T], &'a [T],
     )
 }
 
-/// Label above the editable project-name field.
+/// Label above the editable workspace-name field.
 const NAME_LABEL: &str = "Name:";
 
-/// Header block: `Project settings` heading, a blank spacer, the editable name field (a `Name:`
-/// label with the value on the indented line below it), another blank, and the `Project roots:`
+/// Header block: `Workspace settings` heading, a blank spacer, the editable name field (a `Name:`
+/// label with the value on the indented line below it), another blank, and the `Workspace roots:`
 /// label. Degrades gracefully when the header area is shorter than its 6 rows. The value renders
 /// in plain (white) text like the add-root input row; its terminal caret — placed separately — is
 /// the focus cue.
-fn draw_settings_header(f: &mut Frame, settings: &crate::app::ProjectSettingsState, area: Rect) {
+fn draw_settings_header(f: &mut Frame, settings: &crate::app::WorkspaceSettingsState, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1485,7 +1485,7 @@ fn draw_settings_header(f: &mut Frame, settings: &crate::app::ProjectSettingsSta
     let area_w = area.width as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(6);
     if area.height >= 1 {
-        let heading = truncate_right("Project settings", area_w);
+        let heading = truncate_right("Workspace settings", area_w);
         lines.push(Line::from(Span::styled(heading, heading_style)));
     }
     if area.height >= 2 {
@@ -1496,7 +1496,7 @@ fn draw_settings_header(f: &mut Frame, settings: &crate::app::ProjectSettingsSta
     }
     if area.height >= 4 {
         // Value on the line below the label, indented one column to match how roots sit under the
-        // `Project roots:` label.
+        // `Workspace roots:` label.
         let value = truncate_right(&settings.name_input.text, area_w.saturating_sub(1));
         lines.push(Line::from(vec![
             Span::styled(" ", value_style),
@@ -1507,7 +1507,7 @@ fn draw_settings_header(f: &mut Frame, settings: &crate::app::ProjectSettingsSta
         lines.push(Line::from(""));
     }
     if area.height >= 6 {
-        lines.push(Line::from(Span::styled("Project roots:", label_style)));
+        lines.push(Line::from(Span::styled("Workspace roots:", label_style)));
     }
     f.render_widget(
         Paragraph::new(lines).style(Style::default().fg(NORD4).bg(NORD0)),
@@ -1572,13 +1572,13 @@ fn settings_layout(box_area: Rect, has_error: bool) -> Option<SettingsLayout> {
 
 /// Render the roots + input row list. On a root row the path text is bolded in the accent color
 /// when selected (no row-spanning bg bar — keeps the highlight subtle and consistent with the
-/// project picker); the pending-delete row swaps the path for a red `Remove "<path>"? [y/N]`
+/// workspace picker); the pending-delete row swaps the path for a red `Remove "<path>"? [y/N]`
 /// prompt. The input row carries no selection styling — its visible terminal caret is the focus
 /// cue. Each list item is indented one column past the section label.
 fn draw_settings_rows(
     f: &mut Frame,
     state: &AppState,
-    settings: &crate::app::ProjectSettingsState,
+    settings: &crate::app::WorkspaceSettingsState,
     area: Rect,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -1647,7 +1647,7 @@ fn draw_settings_rows(
 /// unset (ratatui hides it).
 fn place_settings_name_cursor(
     f: &mut Frame,
-    settings: &crate::app::ProjectSettingsState,
+    settings: &crate::app::WorkspaceSettingsState,
     buffer_area: Rect,
 ) {
     let box_area = picker_box_rect(buffer_area);
@@ -1668,13 +1668,13 @@ fn place_settings_name_cursor(
 }
 
 /// Place the terminal caret on the settings overlay's input row. Mirrors the layout math in
-/// `draw_project_settings_overlay`: same inner padding, same error-footer split, same scroll
+/// `draw_workspace_settings_overlay`: same inner padding, same error-footer split, same scroll
 /// slide. Only places the caret when the input row is currently visible (with a small list and
 /// a tall box this is almost always true; if it scrolled off, we just leave the caret unset and
 /// ratatui hides it for the frame).
 fn place_settings_input_cursor(
     f: &mut Frame,
-    settings: &crate::app::ProjectSettingsState,
+    settings: &crate::app::WorkspaceSettingsState,
     buffer_area: Rect,
 ) {
     let box_area = picker_box_rect(buffer_area);
@@ -1787,14 +1787,14 @@ fn root_buffer_status(state: &AppState, root: &str) -> Option<BufferStatusKind> 
     (buf_path == root_path || buf_path.starts_with(root_path)).then_some(status)
 }
 
-/// Empty no-project view: a centered hint telling the user how to open the project picker.
+/// Empty no-workspace view: a centered hint telling the user how to open the workspace picker.
 /// Drawn instead of the buffer pane when `state.editor` is `None`. Fills the full pane in the
-/// editor's NORD0 background so the no-project state visually matches an open editor instead of
+/// editor's NORD0 background so the no-workspace state visually matches an open editor instead of
 /// falling through to the terminal's default colors.
-/// The backdrop behind the Projects chooser before any project is selected: a bare NORD0 fill,
+/// The backdrop behind the Workspaces chooser before any workspace is selected: a bare NORD0 fill,
 /// matching the native client's boot view. The chooser is the only UI here — dismissing it exits
 /// the app (the shell sets `should_quit`), so this is only ever a momentary flash.
-fn draw_no_project_view(f: &mut Frame, _state: &AppState, area: Rect) {
+fn draw_no_workspace_view(f: &mut Frame, _state: &AppState, area: Rect) {
     f.render_widget(Paragraph::new("").style(Style::default().bg(NORD0)), area);
 }
 
@@ -2358,15 +2358,15 @@ fn chip_editor_spans(state: &AppState) -> (Vec<Span<'static>>, u16) {
             push(&mut spans, &mut w, ed.input.text.clone(), text_style);
         }
         ChipEditorKind::Dir { .. } => {
-            // One field to the eye: `{tag} {root}: {path}` in multi-root projects (the same
+            // One field to the eye: `{tag} {root}: {path}` in multi-root workspaces (the same
             // `root: path` shape the dir chip and status bar use), `{tag} {path}` in
             // single-root ones — `tag` is `path:` (file-or-dir scope) or `dir:` (Files picker).
             // The root segment while unfocused — and the `:` separator — render in the
             // committed-prefix blue; the focused segment carries the caret; invalid go red.
-            let multi_root = state.project_paths.len() > 1;
+            let multi_root = state.workspace_paths.len() > 1;
             push(&mut spans, &mut w, format!("{} ", ed.tag), label_style);
             if multi_root {
-                let labels = crate::labels::root_labels(&state.project_paths);
+                let labels = crate::labels::root_labels(&state.workspace_paths);
                 let invalid = ed.root_invalid(&labels);
                 if ed.field == ChipEditorField::Root {
                     cursor = w + ed.root_filter.width_to_cursor();
@@ -2468,7 +2468,7 @@ fn search_prompt_lead(search: &SearchState) -> (Vec<Span<'static>>, u16) {
 }
 
 fn picker_chip_spans(state: &AppState, max_w: usize) -> (Vec<Span<'static>>, usize) {
-    let chips = state.picker.chips(&state.project_paths);
+    let chips = state.picker.chips(&state.workspace_paths);
     if chips.is_empty() {
         return (Vec::new(), 0);
     }
@@ -2531,8 +2531,8 @@ fn picker_chip_spans(state: &AppState, max_w: usize) -> (Vec<Span<'static>>, usi
 
 /// The immutable dir-context prefix for the Explorer picker, split into two segments so the
 /// renderer can colour them differently: a `{label}: ` segment (rendered in white, identifies
-/// the root in multi-root projects) and a `{relative}/` segment (rendered in blue). Either may
-/// be empty: the label segment is empty in single-root projects and at the top of a root with no
+/// the root in multi-root workspaces) and a `{relative}/` segment (rendered in blue). Either may
+/// be empty: the label segment is empty in single-root workspaces and at the top of a root with no
 /// label; the path segment is empty at the top of any root. Both empty means no prefix at all
 /// (Roots mode, or the explorer dir is outside every root).
 ///
@@ -2550,7 +2550,7 @@ fn explorer_input_prefix(state: &AppState, available: usize) -> (String, String)
         // Roots mode — rows already communicate "picking a root"; no breadcrumb needed.
         return (String::new(), String::new());
     };
-    let (label_part, path_part) = match crate::app::strip_longest_root(dir, &state.project_paths) {
+    let (label_part, path_part) = match crate::app::strip_longest_root(dir, &state.workspace_paths) {
         Some((idx, rel)) => {
             let label = state.root_labels.get(idx).map(String::as_str).unwrap_or("");
             let label_part = if label.is_empty() {
@@ -2596,14 +2596,14 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Buffers) => "Switch buffer…",
         Some(aether_protocol::picker::PickerKind::Grep) => "Grep workspace…",
         Some(aether_protocol::picker::PickerKind::Explorer) => "Explore files…",
-        Some(aether_protocol::picker::PickerKind::Projects) => "Select project…",
+        Some(aether_protocol::picker::PickerKind::Workspaces) => "Select workspace…",
         Some(aether_protocol::picker::PickerKind::Diagnostics) => "Diagnostics in current file…",
-        Some(aether_protocol::picker::PickerKind::DiagnosticsProject) => "Diagnostics in project…",
+        Some(aether_protocol::picker::PickerKind::DiagnosticsWorkspace) => "Diagnostics in workspace…",
         Some(aether_protocol::picker::PickerKind::LspServers) => "List LSPs…",
         Some(aether_protocol::picker::PickerKind::References) => "List references…",
         Some(aether_protocol::picker::PickerKind::DocumentSymbols) => "Go to symbol…",
         Some(aether_protocol::picker::PickerKind::GitChangesFile) => "Changes in current file…",
-        Some(aether_protocol::picker::PickerKind::GitChanges) => "Changes in project…",
+        Some(aether_protocol::picker::PickerKind::GitChanges) => "Changes in workspace…",
         None => "Search…",
     }
 }
@@ -2961,17 +2961,17 @@ fn picker_item_spans(
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
 
-    // A project row's display label is computed (an ephemeral context becomes "(project N)"), so
+    // A workspace row's display label is computed (an ephemeral context becomes "(workspace N)"), so
     // it's owned here to outlive the borrow taken in the match below.
-    let project_label = match item {
-        PickerItem::Project { name, .. } => aether_client::labels::project_display(name),
+    let workspace_label = match item {
+        PickerItem::Workspace { name, .. } => aether_client::labels::workspace_display(name),
         _ => String::new(),
     };
 
     // Right-aligned buffer-state dot — matches the status bar's colour-coded indicator and the
     // rich clients' trailing dot. Rendered after the display so it doesn't shift `match_indices`
-    // (which index into the display). `None` = clean. The project picker reuses the same dot to
-    // flag projects with unsaved buffers, so the two pickers read alike.
+    // (which index into the display). `None` = clean. The workspace picker reuses the same dot to
+    // flag workspaces with unsaved buffers, so the two pickers read alike.
     let (display_raw, match_indices, dot_color, italic, dim) = match item {
         PickerItem::Buffer {
             display,
@@ -2989,18 +2989,18 @@ fn picker_item_spans(
             // Dormant (session-restored, not-yet-loaded) buffers render dimmed.
             *dormant,
         ),
-        PickerItem::Project {
+        PickerItem::Workspace {
             name,
             unsaved_buffers,
             match_indices,
         } => {
-            // An ephemeral context shows as an italic "(project N)"; its internal id isn't a
+            // An ephemeral context shows as an italic "(workspace N)"; its internal id isn't a
             // meaningful match haystack, so drop the highlight indices for it.
-            let ephemeral = aether_protocol::is_ephemeral_project_id(name);
+            let ephemeral = aether_protocol::is_ephemeral_workspace_id(name);
             (
-                project_label.as_str(),
+                workspace_label.as_str(),
                 if ephemeral { &[][..] } else { match_indices.as_slice() },
-                // Frost-blue dot when the project has unsaved buffers, matching the unsaved
+                // Frost-blue dot when the workspace has unsaved buffers, matching the unsaved
                 // buffer-dot colour; nothing when clean.
                 (*unsaved_buffers > 0).then_some(NORD9),
                 ephemeral,
@@ -3096,7 +3096,7 @@ fn buffer_dirty_dot_color(status: BufferDirtyState) -> Option<Color> {
 }
 
 /// Header row above each file's hits in the Grep picker: `{label}: {relative}` (the label only
-/// for multi-root projects), all in NORD8 (frost blue), bold. Non-selectable; the picker cursor
+/// for multi-root workspaces), all in NORD8 (frost blue), bold. Non-selectable; the picker cursor
 /// lives on the GrepHit rows below.
 fn grep_file_header_spans(
     path_index: u32,
@@ -3141,7 +3141,7 @@ fn picker_dim_fg(highlighted: bool) -> Color {
 }
 
 /// File picker row: `{relative}  {label}` — the relative path styled like other picker items
-/// (fuzzy-match highlight included), then for multi-root projects the root's label in a dim
+/// (fuzzy-match highlight included), then for multi-root workspaces the root's label in a dim
 /// foreground (NORD3) after it. The label is plain text — match indices in the protocol always
 /// index into `relative_path` only.
 fn file_item_spans(
@@ -3712,8 +3712,8 @@ fn lsp_server_item_spans(
     };
     let base = Style::default().fg(NORD4).bg(bg);
     let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
-    // Dim tail: `language · root`, the root only when the server isn't at the project root
-    // (empty `root_label` → omitted, so single-root projects show just the language).
+    // Dim tail: `language · root`, the root only when the server isn't at the workspace root
+    // (empty `root_label` → omitted, so single-root workspaces show just the language).
     let tail = if root_label.is_empty() {
         format!("  {language}")
     } else {
@@ -5074,15 +5074,15 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         }
         Line::from(spans)
     } else {
-        // Project / file / dirty-dot / transient status sit on the left; counter (search and/or
+        // Workspace / file / dirty-dot / transient status sit on the left; counter (search and/or
         // grep, in that order) and cursor position sit on the right, with the counter to the
         // left of the position. When the row is narrow we truncate the right edge of the left
         // segment with `…` so the right segment stays whole and the position never gets
         // painted over.
-        // Persisted project → `[name] ` chrome; an ephemeral "(no project)" context (or no
-        // project yet) shows just the file label, no bracket.
-        let project_prefix = if aether_client::labels::shows_project_chrome(&state.project_name) {
-            format!("[{}] ", state.project_name)
+        // Persisted workspace → `[name] ` chrome; an ephemeral "(no workspace)" context (or no
+        // workspace yet) shows just the file label, no bracket.
+        let workspace_prefix = if aether_client::labels::shows_workspace_chrome(&state.workspace_name) {
+            format!("[{}] ", state.workspace_name)
         } else {
             String::new()
         };
@@ -5152,7 +5152,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         };
         Line::from(build_editor_status_spans(
             StatusLabel {
-                project_prefix: &project_prefix,
+                workspace_prefix: &workspace_prefix,
                 file_label: &state.ed().file_label,
                 transient: state.ed().transient,
             },
@@ -5288,7 +5288,7 @@ fn draw_save_prompt_spans(
     push(&mut spans, &mut w, " save as: ".into(), base_style);
 
     if prompt.multi_root {
-        let labels = crate::labels::root_labels(&state.project_paths);
+        let labels = crate::labels::root_labels(&state.workspace_paths);
         let invalid = prompt.root_invalid(&labels);
         if prompt.field == ChipEditorField::Root {
             cursor = w + prompt.root_filter.width_to_cursor();
@@ -5357,19 +5357,19 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
     Style::default().bg(NORD1).fg(fg)
 }
 
-/// The status row's leading label: an optional `[project] ` prefix, the file label, and whether
+/// The status row's leading label: an optional `[workspace] ` prefix, the file label, and whether
 /// the buffer is transient (which italicises the label).
 struct StatusLabel<'a> {
-    project_prefix: &'a str,
+    workspace_prefix: &'a str,
     file_label: &'a str,
     transient: bool,
 }
 
 /// Build the spans for the default editor status row: an optional leading buffer-state dot, then
-/// `left_pre` (project/file) in the base style, an optional colored status message after a `    `
+/// `left_pre` (workspace/file) in the base style, an optional colored status message after a `    `
 /// separator, then padding pushing the right segment flush to the row edge. When the row is too
 /// narrow:
-/// - the status text truncates first (`…`), preserving the dot and project/file;
+/// - the status text truncates first (`…`), preserving the dot and workspace/file;
 /// - if even `left_pre` can't fit, that gets truncated and the status is dropped entirely.
 ///
 /// The right segment is never truncated — the cursor position is more useful than the message.
@@ -5382,12 +5382,12 @@ fn build_editor_status_spans(
     total_width: usize,
 ) -> Vec<Span<'static>> {
     let StatusLabel {
-        project_prefix,
+        workspace_prefix,
         file_label,
         transient,
     } = label;
     let base_style = Style::default().bg(NORD1).fg(NORD4);
-    // A transient (preview) buffer slants the file label (root + path — not the project name)
+    // A transient (preview) buffer slants the file label (root + path — not the workspace name)
     // instead of spending row width on an explicit marker. Terminals without italic support
     // just show it upright.
     let label_style = if transient {
@@ -5403,7 +5403,7 @@ fn build_editor_status_spans(
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
-    // Buffer-state dot leads the row, before the project name — matching the terminal title and
+    // Buffer-state dot leads the row, before the workspace name — matching the terminal title and
     // the web favicon. Reserve its width (glyph + a trailing space) before laying out the rest.
     if let Some(dot) = status_dot {
         let dot_w = dot.content.width();
@@ -5414,14 +5414,14 @@ fn build_editor_status_spans(
         }
     }
     let pre_budget = left_max.saturating_sub(used);
-    if project_prefix.width() + file_label.width() >= pre_budget {
-        // Even the project/file segment overflows. The file label is the informative part, so
+    if workspace_prefix.width() + file_label.width() >= pre_budget {
+        // Even the workspace/file segment overflows. The file label is the informative part, so
         // it gets the budget first (segment elision keeps the filename end visible); the
-        // project prefix is shown only if it still fits whole — a partially-cut `[pr…` is
+        // workspace prefix is shown only if it still fits whole — a partially-cut `[pr…` is
         // noise. The rest (badges, status) is dropped.
         let (t, _) = truncate_path_with_indices(file_label, &[], pre_budget);
-        let prefix = if project_prefix.width() + t.width() <= pre_budget {
-            project_prefix.to_string()
+        let prefix = if workspace_prefix.width() + t.width() <= pre_budget {
+            workspace_prefix.to_string()
         } else {
             String::new()
         };
@@ -5429,9 +5429,9 @@ fn build_editor_status_spans(
         spans.push(Span::styled(prefix, base_style));
         spans.push(Span::styled(t, label_style));
     } else {
-        spans.push(Span::styled(project_prefix.to_string(), base_style));
+        spans.push(Span::styled(workspace_prefix.to_string(), base_style));
         spans.push(Span::styled(file_label.to_string(), label_style));
-        used += project_prefix.width() + file_label.width();
+        used += workspace_prefix.width() + file_label.width();
         // Git cluster sits after the file label, set off by a 3-space gap.
         let badge_w: usize = left_badges.iter().map(|s| s.content.width()).sum();
         if badge_w > 0 && used + 3 + badge_w <= left_max {
@@ -5715,7 +5715,7 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
     // when a text field is focused — the name field (index 0) or the add-root input row (last
     // index); on a root row the cursor is hidden (no `set_cursor_position` call → ratatui hides
     // it for this frame).
-    if let Some(settings) = state.project_settings.as_ref() {
+    if let Some(settings) = state.workspace_settings.as_ref() {
         if settings.selected == 0 {
             place_settings_name_cursor(f, settings, buffer_area);
         } else if settings.selected == settings.roots.len() + 1 {
@@ -6620,7 +6620,7 @@ mod tests {
         assert!(text.starts_with("• rust-analyzer"));
         assert!(text.ends_with("rust · backend"));
         assert_eq!(spans[0].style.fg, Some(NORD14)); // ready → green dot
-                                                     // At the project root the tail is just the language — no separator.
+                                                     // At the workspace root the tail is just the language — no separator.
         let single = lsp_server_item_spans(
             LspServerRow {
                 name: "rust-analyzer",
@@ -6680,8 +6680,8 @@ mod tests {
         assert_eq!(truncate_path_with_indices(p, &[], 8).0, "…lers.rs");
         // Non-paths skip straight to the floor.
         assert_eq!(
-            truncate_path_with_indices("a long project name", &[], 8).0,
-            "…ct name"
+            truncate_path_with_indices("a long descriptive name", &[], 8).0,
+            "…ve name"
         );
     }
 
@@ -6989,7 +6989,7 @@ mod tests {
         let status = crate::app::StatusMessage::default();
         let spans = build_editor_status_spans(
             StatusLabel {
-                project_prefix: "[proj] ",
+                workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
             },
@@ -7005,14 +7005,14 @@ mod tests {
         assert_eq!(spans_total_width(&spans), 30);
     }
 
-    /// A transient buffer italicises the project/file segment (no explicit marker text); a
+    /// A transient buffer italicises the workspace/file segment (no explicit marker text); a
     /// permanent one doesn't.
     #[test]
     fn editor_status_spans_italicise_transient_label() {
         let status = crate::app::StatusMessage::default();
         let spans = build_editor_status_spans(
             StatusLabel {
-                project_prefix: "[proj] ",
+                workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: true,
             },
@@ -7031,7 +7031,7 @@ mod tests {
 
         let spans = build_editor_status_spans(
             StatusLabel {
-                project_prefix: "[proj] ",
+                workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
             },
@@ -7057,7 +7057,7 @@ mod tests {
         );
         let spans = build_editor_status_spans(
             StatusLabel {
-                project_prefix: "[proj] ",
+                workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
             },
@@ -7067,7 +7067,7 @@ mod tests {
             vec![],
             30,
         );
-        // The dot leads the row, before the project name, in the unsaved (frost-blue) colour.
+        // The dot leads the row, before the workspace name, in the unsaved (frost-blue) colour.
         let text = spans_text(&spans);
         assert!(text.starts_with(&format!("{BUFFER_STATUS_DOT} [proj] file.rs")));
         let dot_span = spans
@@ -7083,7 +7083,7 @@ mod tests {
         let status = crate::app::StatusMessage::success("saved (rev 1)");
         let spans = build_editor_status_spans(
             StatusLabel {
-                project_prefix: "[proj] ",
+                workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
             },
@@ -7116,7 +7116,7 @@ mod tests {
         };
         let spans = build_editor_status_spans(
             StatusLabel {
-                project_prefix: "[proj] ",
+                workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
             },
@@ -7141,12 +7141,12 @@ mod tests {
     #[test]
     fn editor_status_spans_drops_status_when_left_pre_alone_overflows() {
         // total=12, right=4, gap=1 → left_max=7. "[proj] file.rs" (14) > 7: the file label gets
-        // the budget (and fits exactly), the project prefix — which can't fit whole alongside it
+        // the budget (and fits exactly), the workspace prefix — which can't fit whole alongside it
         // — is dropped, and the status is dropped entirely.
         let status = crate::app::StatusMessage::error("save failed: disk full");
         let spans = build_editor_status_spans(
             StatusLabel {
-                project_prefix: "[proj] ",
+                workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
             },
@@ -7176,7 +7176,7 @@ mod tests {
         let status = crate::app::StatusMessage::default();
         let spans = build_editor_status_spans(
             StatusLabel {
-                project_prefix: "[proj] ",
+                workspace_prefix: "[proj] ",
                 file_label: "src/deeply/nested/module/file.rs",
                 transient: false,
             },

@@ -5,8 +5,8 @@ use crate::BufferId;
 use serde::{Deserialize, Serialize};
 
 /// Delete a file or directory, moving it to the OS trash (recoverable). Directories go to the
-/// trash whole, contents and all. The path must resolve inside one of the active project's roots;
-/// a project root itself can't be deleted this way (use project settings to remove a root).
+/// trash whole, contents and all. The path must resolve inside one of the active workspace's roots;
+/// a workspace root itself can't be deleted this way (use workspace settings to remove a root).
 ///
 /// Refuses if the target — or, for a directory, anything under it — is open in a buffer with
 /// unsaved changes (`DIRTY_BUFFERS_PREVENT_DELETE`, with `data.dirty_buffer_ids`). Clean buffers
@@ -22,7 +22,7 @@ impl RpcMethod for PathDelete {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PathDeleteParams {
     /// Absolute path of the file or directory to delete. The server canonicalizes it and checks
-    /// it falls within a project root.
+    /// it falls within a workspace root.
     pub path: String,
 }
 
@@ -33,7 +33,7 @@ pub struct PathDeleteResult {
     #[serde(default)]
     pub closed_buffer_ids: Vec<BufferId>,
     /// If the requesting client's current buffer was one of the closed ones, attach to this next
-    /// id (or spawn a scratch when `None`). Mirrors `project/remove_root`.
+    /// id (or spawn a scratch when `None`). Mirrors `workspace/remove_root`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_buffer_id: Option<BufferId>,
 }

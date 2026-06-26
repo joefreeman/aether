@@ -25,11 +25,11 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct BufferCandidate {
     pub buffer_id: BufferId,
-    /// Display string used for both rendering and fuzzy matching. Project-relative for
+    /// Display string used for both rendering and fuzzy matching. Workspace-relative for
     /// file-backed buffers; `(scratch N)` for scratch buffers.
     pub display: String,
     pub status: BufferDirtyState,
-    /// Project-relative location (root index + path) when the buffer is a file inside a root;
+    /// Workspace-relative location (root index + path) when the buffer is a file inside a root;
     /// `None` for scratch buffers / out-of-root files. Sent so the client can build an opener URL.
     pub path: Option<(u32, String)>,
     /// Buffer is transient (auto-closes once hidden) — the row renders in italics.
@@ -40,14 +40,14 @@ pub struct BufferCandidate {
     pub dormant: bool,
 }
 
-/// One project-picker candidate. Built fresh per `picker/view` from
-/// `config::list_project_names()` — the configured-projects set changes only via the user
-/// editing `~/.config/aether/projects/*.toml` and we re-list on each open anyway.
+/// One workspace-picker candidate. Built fresh per `picker/view` from
+/// `config::list_workspace_names()` — the configured-workspaces set changes only via the user
+/// editing `~/.config/aether/workspaces/*.toml` and we re-list on each open anyway.
 #[derive(Debug, Clone)]
-pub struct ProjectCandidate {
+pub struct WorkspaceCandidate {
     pub name: String,
-    /// Open buffers in this project with unsaved edits, counted when the candidate is built.
-    /// `0` for a project with no loaded/dirty buffers.
+    /// Open buffers in this workspace with unsaved edits, counted when the candidate is built.
+    /// `0` for a workspace with no loaded/dirty buffers.
     pub unsaved_buffers: u32,
 }
 
@@ -65,7 +65,7 @@ pub struct ExplorerEntry {
 
 /// The directory listing the explorer picker is currently matching against. `path` is the
 /// canonical absolute path of the listing; `parent` is the parent's canonical path *if it's
-/// still inside the project boundary* (otherwise `None`, meaning Alt-h is a no-op).
+/// still inside the workspace boundary* (otherwise `None`, meaning Alt-h is a no-op).
 ///
 /// With path-peeking (a query like `src/foo`), this is the *peeked* directory — `anchor` joined
 /// with the query's path part — not necessarily the committed [`ExplorerAnchorInfo`]. Entries the
@@ -103,10 +103,10 @@ pub fn explorer_query_split(query: &str) -> (&str, &str) {
 /// the order ripgrep emitted them — walker order, then line order within each file.
 #[derive(Debug, Clone)]
 pub struct GrepHitCandidate {
-    /// Index into the project's root list this file lives under.
+    /// Index into the workspace's root list this file lives under.
     pub path_index: u32,
     /// Path relative to `roots[path_index]`. Stored separately from `abs_path` so the picker can
-    /// render without re-resolving against project roots on every push.
+    /// render without re-resolving against workspace roots on every push.
     pub relative_path: String,
     /// Absolute canonical path. Returned via `PickerSelectResult::FileAt` for the client to feed
     /// into `buffer/open`.
@@ -128,11 +128,11 @@ pub struct GrepHitCandidate {
 /// One Git-changes-picker candidate — a single hunk of one changed file. The candidates are
 /// grouped by file (contiguous runs, like grep), in `(path_index, relative_path)` order with the
 /// hunks of each file in anchor-line order; `hunk_index` is that position within the file. Built
-/// once on `picker/view` from the project's working-tree changes (combined staged+unstaged vs
+/// once on `picker/view` from the workspace's working-tree changes (combined staged+unstaged vs
 /// HEAD), so positional identity is stable for the picker's lifetime.
 #[derive(Debug, Clone)]
 pub struct GitChangeCandidate {
-    /// Index into the project's root list this file lives under.
+    /// Index into the workspace's root list this file lives under.
     pub path_index: u32,
     /// Path relative to `roots[path_index]` (forward-slash). The file-group key.
     pub relative_path: String,
@@ -292,7 +292,7 @@ pub fn build_match_regex(
 /// fuzzy haystack; `abs_path` + `(line, col)` drive the `FileAt` jump on select.
 #[derive(Debug, Clone)]
 pub struct DiagnosticCandidate {
-    /// The file as project root index + root-relative path — only used by the project-wide picker
+    /// The file as workspace root index + root-relative path — only used by the workspace-wide picker
     /// to group by file (the buffer-scoped picker renders flat).
     pub path_index: u32,
     pub relative_path: String,
@@ -308,12 +308,12 @@ pub struct DiagnosticCandidate {
 /// One references-picker candidate — a single reference location from `textDocument/references`.
 /// `preview` is the fuzzy haystack; `abs_path` + `(line, col)` drive the `FileAt` jump on select.
 /// Cross-file, so it carries its own `abs_path` and a precomputed `display_path` label rather than
-/// a project-root index (references may point outside every root).
+/// a workspace-root index (references may point outside every root).
 #[derive(Debug, Clone)]
 pub struct ReferenceCandidate {
     /// Absolute canonical path of the file containing the reference.
     pub abs_path: String,
-    /// Row label: project-relative when inside a root, else the absolute path.
+    /// Row label: workspace-relative when inside a root, else the absolute path.
     pub display_path: String,
     pub line: u32,
     pub col: u32,
@@ -379,7 +379,7 @@ impl SymbolCandidate {
     }
 }
 
-/// One LSP-servers-picker candidate — a language server for the active project. `name` is the
+/// One LSP-servers-picker candidate — a language server for the active workspace. `name` is the
 /// fuzzy haystack; `language` is the key the client restarts by. Rebuilt on every `picker/view`
 /// and on each `lsp/status_changed` (the list is tiny and the status changes), so the row's
 /// `status` glyph stays live.
@@ -388,7 +388,7 @@ pub struct LspServerCandidate {
     pub name: String,
     pub language: String,
     pub workspace_root: String,
-    /// `workspace_root` relative to its project root, or empty when rooted at a project root.
+    /// `workspace_root` relative to its workspace root, or empty when rooted at a workspace root.
     /// Display-only (see [`PickerItem::LspServer`]).
     pub root_label: String,
     pub status: LspStatus,
@@ -437,17 +437,17 @@ pub enum PickerCandidates {
     /// Filesystem entries of the picker's current directory. Re-listed on every `picker/view`
     /// (directories can mutate underneath us; no point caching).
     Explorer(ExplorerCandidates),
-    /// The project's roots, shown by the Explorer when the client requests Roots mode (via
+    /// The workspace's roots, shown by the Explorer when the client requests Roots mode (via
     /// `picker/view { explorer_roots: true }`). One row per root; selecting one transitions the
     /// explorer back into `Explorer` mode at that root's top.
     ExplorerRoots(Vec<RootCandidate>),
-    /// Configured project names. Re-listed on each `picker/view` — small N, no caching needed,
-    /// and the user may have edited `~/.config/aether/projects/` between opens.
-    Projects(Vec<ProjectCandidate>),
+    /// Configured workspace names. Re-listed on each `picker/view` — small N, no caching needed,
+    /// and the user may have edited `~/.config/aether/workspaces/` between opens.
+    Workspaces(Vec<WorkspaceCandidate>),
     /// The scoped buffer's diagnostics. Built on open; preserved across non-reset re-views (like
     /// Grep) so scrolling doesn't rebuild against a possibly-changed set.
     Diagnostics(Vec<DiagnosticCandidate>),
-    /// The active project's language servers. Rebuilt on every view and on each status change
+    /// The active workspace's language servers. Rebuilt on every view and on each status change
     /// (small N), so it's never preserved — the row glyphs reflect live status.
     LspServers(Vec<LspServerCandidate>),
     /// References to the cursor's symbol. Built on open from a one-shot `textDocument/references`
@@ -458,7 +458,7 @@ pub enum PickerCandidates {
     /// snapshot; preserved across non-reset re-views (like References) so scrolling doesn't rebuild
     /// against a possibly-changed set.
     Symbols(Vec<SymbolCandidate>),
-    /// The project's working-tree hunks, grouped by file. Built fresh on every `picker/view`
+    /// The workspace's working-tree hunks, grouped by file. Built fresh on every `picker/view`
     /// (a snapshot of the repo state at open); the query fuzzy-filters the file path while keeping
     /// the file grouping (document order, like the symbols outline).
     GitChanges(Vec<GitChangeCandidate>),
@@ -466,7 +466,7 @@ pub enum PickerCandidates {
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
 /// select; `basename` is the matcher haystack (the disambiguator the client shows alongside is
-/// derived client-side from `path_index` + the project's root list).
+/// derived client-side from `path_index` + the workspace's root list).
 #[derive(Debug, Clone)]
 pub struct RootCandidate {
     pub path_index: u32,
@@ -482,7 +482,7 @@ impl PickerCandidates {
             PickerCandidates::Grep(v) => v.len(),
             PickerCandidates::Explorer(e) => e.entries.len(),
             PickerCandidates::ExplorerRoots(v) => v.len(),
-            PickerCandidates::Projects(v) => v.len(),
+            PickerCandidates::Workspaces(v) => v.len(),
             PickerCandidates::Diagnostics(v) => v.len(),
             PickerCandidates::LspServers(v) => v.len(),
             PickerCandidates::References(v) => v.len(),
@@ -498,7 +498,7 @@ impl PickerCandidates {
             PickerCandidates::Grep(_) => PickerKind::Grep,
             PickerCandidates::Explorer(_) => PickerKind::Explorer,
             PickerCandidates::ExplorerRoots(_) => PickerKind::Explorer,
-            PickerCandidates::Projects(_) => PickerKind::Projects,
+            PickerCandidates::Workspaces(_) => PickerKind::Workspaces,
             PickerCandidates::Diagnostics(_) => PickerKind::Diagnostics,
             PickerCandidates::LspServers(_) => PickerKind::LspServers,
             PickerCandidates::References(_) => PickerKind::References,
@@ -518,7 +518,7 @@ impl PickerCandidates {
             PickerCandidates::Grep(v) => &v[idx].preview,
             PickerCandidates::Explorer(e) => &e.entries[idx].name,
             PickerCandidates::ExplorerRoots(v) => &v[idx].basename,
-            PickerCandidates::Projects(v) => &v[idx].name,
+            PickerCandidates::Workspaces(v) => &v[idx].name,
             PickerCandidates::Diagnostics(v) => &v[idx].message,
             PickerCandidates::LspServers(v) => &v[idx].name,
             PickerCandidates::References(v) => &v[idx].preview,
@@ -530,7 +530,7 @@ impl PickerCandidates {
     }
 
     /// Build the protocol-level `PickerItem` for candidate `idx`. `match_indices` is supplied by
-    /// the fuzzy matcher for Files/Buffers/Explorer/Projects and ignored for Grep (the candidate
+    /// the fuzzy matcher for Files/Buffers/Explorer/Workspaces and ignored for Grep (the candidate
     /// already carries the ripgrep-computed match positions, which we use verbatim).
     pub fn make_item(&self, idx: usize, match_indices: Vec<u32>) -> PickerItem {
         match self {
@@ -577,7 +577,7 @@ impl PickerCandidates {
                 path_index: v[idx].path_index,
                 match_indices,
             },
-            PickerCandidates::Projects(v) => PickerItem::Project {
+            PickerCandidates::Workspaces(v) => PickerItem::Workspace {
                 name: v[idx].name.clone(),
                 unsaved_buffers: v[idx].unsaved_buffers,
                 match_indices,
@@ -696,7 +696,7 @@ impl PickerCandidates {
             (PickerCandidates::ExplorerRoots(v), PickerItem::Root { path_index, .. }) => {
                 v.iter().position(|c| c.path_index == *path_index)
             }
-            (PickerCandidates::Projects(v), PickerItem::Project { name, .. }) => {
+            (PickerCandidates::Workspaces(v), PickerItem::Workspace { name, .. }) => {
                 v.iter().position(|c| c.name == *name)
             }
             (
@@ -757,7 +757,7 @@ impl PickerCandidates {
         match self {
             PickerCandidates::Files { .. }
             | PickerCandidates::Buffers(_)
-            | PickerCandidates::Projects(_)
+            | PickerCandidates::Workspaces(_)
             | PickerCandidates::Diagnostics(_)
             | PickerCandidates::LspServers(_)
             | PickerCandidates::References(_)
@@ -809,9 +809,9 @@ impl PickerCandidates {
                 }
             }
             // Roots are always "navigate, don't select" — the client looks up the root's
-            // absolute path from its project_paths and fires `picker/view` to enter it.
+            // absolute path from its workspace_paths and fires `picker/view` to enter it.
             PickerCandidates::ExplorerRoots(_) => None,
-            PickerCandidates::Projects(v) => Some(PickerSelectResult::Project {
+            PickerCandidates::Workspaces(v) => Some(PickerSelectResult::Workspace {
                 name: v[idx].name.clone(),
             }),
             PickerCandidates::Diagnostics(v) => {
@@ -900,7 +900,7 @@ pub struct PickerState {
     /// other kind and until the first Explorer `view`.
     pub explorer_anchor: Option<ExplorerAnchorInfo>,
     /// Explorer only: true when the current query's peek directory (anchor + path part) doesn't
-    /// resolve to an in-project directory. Set wherever the peek listing is (re)built; echoed in
+    /// resolve to an in-workspace directory. Set wherever the peek listing is (re)built; echoed in
     /// `picker/update` so the client only offers "+ Create directory" when it's actually missing.
     pub explorer_peek_missing: bool,
     /// `Some` while the client has the picker open and is receiving pushes. `None` after `hide`.
@@ -1494,7 +1494,7 @@ mod tests {
                 assert_eq!(name, "rust-analyzer");
                 assert_eq!(language, "rust");
                 assert_eq!(workspace_root, "/proj");
-                assert_eq!(root_label, ""); // rooted at the project root → no label
+                assert_eq!(root_label, ""); // rooted at the workspace root → no label
                 assert_eq!(status, LspStatus::Ready);
                 assert_eq!(match_indices, vec![0, 1]);
             }
@@ -1719,9 +1719,9 @@ mod tests {
     }
 
     #[test]
-    fn project_diagnostics_count_file_headers_in_display_metrics() {
+    fn workspace_diagnostics_count_file_headers_in_display_metrics() {
         // `PickerCandidates::Diagnostics` backs two kinds: the flat buffer-locked `Diagnostics` and
-        // the file-grouped `DiagnosticsProject`. Only the latter renders headers, so its display
+        // the file-grouped `DiagnosticsWorkspace`. Only the latter renders headers, so its display
         // metrics must include one header per file group (the regression: `key_at` omitted
         // Diagnostics, so this returned `None` and the headers went uncounted).
         let cand = |rel: &str, line: u32| DiagnosticCandidate {
@@ -1748,13 +1748,13 @@ mod tests {
         assert_eq!(flat.kind, PickerKind::Diagnostics);
         assert_eq!(flat.grouped_display_metrics(0), None);
 
-        // Project `DiagnosticsProject` groups by file → headers counted.
+        // Workspace `DiagnosticsWorkspace` groups by file → headers counted.
         let mut proj = PickerState::new(cands);
-        proj.kind = PickerKind::DiagnosticsProject;
+        proj.kind = PickerKind::DiagnosticsWorkspace;
         proj.rerank(&mut make_matcher());
         let (display_offset, total) = proj
             .grouped_display_metrics(0)
-            .expect("project diagnostics are header-grouped");
+            .expect("workspace diagnostics are header-grouped");
         assert_eq!(total, 5, "3 diagnostics + 2 file headers");
         assert_eq!(display_offset, 1, "a.rs's header precedes ranked row 0");
         // A window opening at b.rs's first row (ranked 2) sits below both file headers.

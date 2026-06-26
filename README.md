@@ -16,7 +16,7 @@ buffer, see each other's cursors, and share a single undo stack.
 - Tree-sitter integration (highlighting, indentation, navigation)
 - Surround/unsurround, toggle-comment, join and move lines
 - Undo and redo stacks for edits and cursor/selection motions
-- Fuzzy pickers for files/buffers/projects, file explorer, project-wide grep
+- Fuzzy pickers for files/buffers/workspaces, file explorer, workspace-wide grep
 - Mouse support, soft wrap, system-clipboard integration
 - Git integration (gutter, inline diff, blame, hunk staging)
 - LSP (diagnostics, hover, go-to-definition, format)
@@ -35,33 +35,33 @@ hover info at the cursor.
 | `h`/`l` | Character left/right |
 | `j`/`Alt-j` | Logical/visual line down |
 | `k`/`Alt-k` | Logical/visual line up |
-| `w`/`Alt-w` | Small/big word forward |
+| `w`/`Alt-w` | Select small/big word |
 | `b`/`Alt-b` | Small/big word backward |
 | `e`/`Alt-e` | Small/big word end |
 | `0`, `Home` | Logical line start |
 | `Alt-l`, `End` | Logical line end |
 | `Alt-h` | First non-blank of line |
-| `g`/`Alt-g` | Go to line (count, default 1)/last line |
-| `v`/`Alt-v` | Cursor down/up half a page |
 | `f`/`Alt-f` | Find character forward/backward (next key is the target) |
 | `t`/`Alt-t` | Till character forward/backward |
+| `s`/`Alt-s` | Sneak to small/big word (type two characters to jump) |
 | `m`/`Alt-m` | Matching bracket/inner matching bracket |
-| `p`/`Alt-p` | Next/previous navigation unit |
-| `Shift-p`/`Shift-Alt-p` | Select to end/start of unit |
+| `o`/`Alt-o` | Next/previous symbol |
+| `p`/`Alt-p` | First non-blank of next/previous line |
+| `g`/`Alt-g` | Go to line (count, default 1)/from end (default last) |
+| `v`/`Alt-v` | Cursor down/up half a page |
 | `Backspace`/`Alt-Backspace` | Jump back/forward (cross-file history) |
 
 ### Selection & history (normal mode)
 
 | Key | Action |
 | --- | --- |
-| `,` | Collapse selection |
+| `,`/`Alt-,` | Collapse selection / swap cursor and anchor |
 | `%` | Select whole buffer |
-| `o` | Swap cursor and anchor |
-| `y`/`Alt-y` | Expand/contract selection to syntax node |
+| `q`/`Alt-q` | Expand/contract selection to syntax node |
 | `x`/`Alt-x` | Select line downward/upward |
-| `u`/`Alt-u` | Undo/redo cursor motion |
+| `z`/`Alt-z` | Undo/redo cursor motion |
 | `.` | Repeat last motion |
-| `;` | Center cursor in window |
+| `;`/`Alt-;` | Cursor near top/bottom of window |
 
 ### Search & grep (normal mode)
 
@@ -90,10 +90,12 @@ identical in both.
 | `Ctrl-Alt-v` | Replace selection with clipboard | Replace line with clipboard |
 | `Ctrl-s` | Surround selection (next key = delimiter) | Surround line |
 | `Ctrl-Alt-s` | Unsurround selection | Unsurround line |
-| `Ctrl-u`/`Ctrl-Alt-u` | Undo/redo | Undo/redo |
+| `Ctrl-r` | Transform case (next key = style) | Transform identifier case |
+| `Ctrl-z`/`Ctrl-Alt-z` | Undo/redo | Undo/redo |
 | `Ctrl-l`/`Ctrl-h` | Indent/dedent | Indent/dedent |
 | `Ctrl-j`/`Ctrl-k` | Move line(s) down/up | Move line(s) down/up |
 | `Ctrl-g` | Join lines | Join lines |
+| `Ctrl-e`/`Ctrl-Alt-e` | Increment/decrement number | Increment/decrement number |
 | `Ctrl-y` | Toggle comment | Toggle comment |
 | `Ctrl-f` | Format document | Format document |
 | `Ctrl-o`/`Ctrl-Alt-o` | Open line below/above | Open line below/above |
@@ -111,16 +113,16 @@ identical in both.
 | Chord | Action |
 | --- | --- |
 | `Space f`/`Space Alt-f` | Find files / in buffer's directory |
-| `Space b` | Switch buffer |
-| `Space Alt-b` | New scratch buffer |
+| `Space b`/`Space Alt-b` | Switch buffer / new scratch buffer |
 | `Space g`/`Space Alt-g` | Grep workspace / buffer's directory |
-| `Space e`/`Space Alt-e` | File explorer / at project root |
-| `Space p` | Switch project |
-| `Space ,` | Project settings |
+| `Space e`/`Space Alt-e` | File explorer / at workspace root |
+| `Space w`/`Space Alt-w` | Switch workspace / open file by absolute path |
+| `Space p`/`Space Alt-p` | Copy relative/absolute path |
+| `Space s`/`Space Alt-s` | Save / save as |
+| `Space k`/`Space Alt-k` | Keep buffer (toggle transient) / reload from disk |
+| `Space x` | Close buffer |
+| `Space ,` | Workspace settings |
 | `Space .` | Application settings (soft wrap, …) |
-| `Space s`/`Space Alt-s` | Save/save as |
-| `Space a` | Reload from disk |
-| `Space w` | Close buffer |
 | `Space q` | Quit |
 | `Space ?` | Show keyboard shortcuts |
 
@@ -129,7 +131,8 @@ identical in both.
 | Chord | Action |
 | --- | --- |
 | `c`/`Alt-c` | Next/previous change (hunk) |
-| `Space y`/`Space Alt-y` | Stage-unstage / revert the change under the cursor (or selected lines) |
+| `Space c`/`Space Alt-c` | Git changes in current file / across the workspace (hunks) |
+| `Space a`/`Space Alt-a` | Stage-unstage / revert the change under the cursor (or selected lines) |
 | `Space i` | Toggle inline diff |
 | `Space m` | Blame commit details for the cursor line |
 
@@ -142,7 +145,7 @@ identical in both.
 | `Space r` | Go to references |
 | `d`/`Alt-d` | Next/previous diagnostic |
 | `Space j` | Diagnostic at cursor |
-| `Space d` | Diagnostics list |
+| `Space d`/`Space Alt-d` | Diagnostics: current buffer / workspace |
 | `Space o` | Document symbols |
 | `Space l` | LSP servers (status, restart) |
 | `Ctrl-f` | Format document |
@@ -180,30 +183,30 @@ This produces a single binary:
 
 ## Running
 
-1. **Start the server:**
+Just run `ae` — it opens a client and, if no server is already running, auto-starts one in the
+background:
 
-   ```sh
-   ae --server
-   ```
+```sh
+ae                         # open the workspace picker
+ae src/main.rs             # open a file (workspace inferred from its path)
+ae src/                    # open the file explorer at a directory
+ae -w aether               # open the "aether" workspace
+ae -w aether src/main.rs   # open a file in a named workspace
+```
 
-2. **Start the client**, optionally naming a project and a file/directory to open:
+The first client launches a background server and connects to it; later clients reuse it, and the
+server idle-reaps itself once nothing has been connected for a while. To run a persistent server
+yourself (e.g. to watch its logs), use `ae server`, and stop it with `ae server stop`.
 
-   ```sh
-   ae                     # start with the project picker open
-   ae aether              # open the "aether" project in a scratch buffer
-   ae aether src/main.rs  # open a file
-   ae aether src/         # open the file explorer at a directory
-   ```
+With no `--gui`/`--tui` flag, `ae` picks a client automatically: a terminal on stdout means the
+terminal client; no terminal but a display set (a desktop launcher) means the GUI. Pass `--gui` or
+`--tui` to force one.
 
-   With no `--gui`/`--tui` flag, `ae` picks a client automatically: a terminal on stdout means the
-   terminal client; no terminal but a display set (a desktop launcher) means the GUI. Pass `--gui`
-   or `--tui` to force one.
+A `path` is resolved against the current working directory; if it falls outside every configured
+workspace it opens as a standalone file. A directory opens the file browser there.
 
-   `path` is resolved against the current working directory and must fall within one of the
-   project's roots. A directory opens the file browser there.
-
-   Projects are created and managed from the project picker (`Space p`); running `ae` with no
-   arguments opens it.
+Workspaces are created and managed from the workspace picker (`Space w`); running `ae` with no
+arguments opens it.
 
 ## Web client
 

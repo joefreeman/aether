@@ -1,5 +1,5 @@
-//! Project-root display labels (mirrors the TUI's labels.rs). The status bar and the picker prefix
-//! paths with a disambiguating root label when the project has several roots that would otherwise
+//! Workspace-root display labels (mirrors the TUI's labels.rs). The status bar and the picker prefix
+//! paths with a disambiguating root label when the workspace has several roots that would otherwise
 //! read the same.
 
 /** One label per root, aligned by index. Single root → "" (no prefix needed). Roots that share a

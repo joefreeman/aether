@@ -42,7 +42,7 @@ pub enum ConnState {
         attempt: u32,
         had_unsaved: bool,
     },
-    /// A live server answered but the session couldn't be re-established (the project is
+    /// A live server answered but the session couldn't be re-established (the workspace is
     /// gone). Terminal — the window stays frozen.
     Failed,
 }
@@ -120,7 +120,7 @@ impl SearchState {
         if self.options.regex {
             values.push(crate::chips::ChipValue::Regex);
         }
-        // No Dir chips here, so `project_paths` is irrelevant.
+        // No Dir chips here, so `workspace_paths` is irrelevant.
         crate::chips::derive_chips(&values, &[])
     }
 }
@@ -161,7 +161,7 @@ pub enum Prompt {
         kind: ConfirmKind,
         action: ConfirmAction,
     },
-    /// The save-as path editor (`Alt-s`): a project-relative path field with the picker dir-chip
+    /// The save-as path editor (`Alt-s`): a workspace-relative path field with the picker dir-chip
     /// editor's directory-completion UX (ghost suggestions, `Tab`/`Alt-l` accept, multi-root inline
     /// root field). Text editing is owned by each shell's input, which syncs the value via
     /// [`super::update`]'s `save_as_set_input` / `save_as_set_root_filter`; the core keeps the value
@@ -169,18 +169,18 @@ pub enum Prompt {
     SaveAs(Box<crate::save_as::SaveAsEditor>),
     /// LSP server detail (from the LspServers picker): info rows + `r` to restart.
     LspInfo(Box<LspServerStatus>),
-    /// The open-from-path overlay (`Space Alt-w`): a single, project-agnostic path field. Unlike
+    /// The open-from-path overlay (`Space Alt-w`): a single, workspace-agnostic path field. Unlike
     /// [`Self::SaveAs`] (a root-relative chip editor), this is a plain absolute/relative path —
-    /// `Enter` opens it via `project/open_path` (external buffer outside the roots, or a fresh
-    /// ephemeral context with no project active), `Esc` cancels. Text editing is shell-owned and
+    /// `Enter` opens it via `workspace/open_path` (external buffer outside the roots, or a fresh
+    /// ephemeral context with no workspace active), `Esc` cancels. Text editing is shell-owned and
     /// synced via [`super::update`]'s `open_path_set_input`; the core keeps the value.
     OpenPath(TextField),
 }
 
-/// A single editable text field. The project-settings overlay holds two (name + add-root). Text
+/// A single editable text field. The workspace-settings overlay holds two (name + add-root). Text
 /// editing (caret, insert, delete) is owned by each shell's input — native `text_input`/`<input>`
 /// in the rich clients, a shell-local editor in the TUI — which syncs the whole value via
-/// [`super::update`]'s `project_settings_set_name` / `_set_add`. The core keeps only the value.
+/// [`super::update`]'s `workspace_settings_set_name` / `_set_add`. The core keeps only the value.
 #[derive(Debug, Clone, Default)]
 pub struct TextField {
     pub text: String,
@@ -201,21 +201,21 @@ impl TextField {
     }
 }
 
-/// The project-settings overlay state (`Space ,`), migrated from the TUI's shell-local
-/// `ProjectSettingsState` into the core so every shell renders it. Shows an editable
-/// project-name field, then the active project's roots, then an always-present "add root" input
+/// The workspace-settings overlay state (`Space ,`), migrated from the TUI's shell-local
+/// `WorkspaceSettingsState` into the core so every shell renders it. Shows an editable
+/// workspace-name field, then the active workspace's roots, then an always-present "add root" input
 /// row; `selected` is the focused field.
 ///
 /// Selection model: `selected == 0` is the name field; `1..=roots.len()` are the root rows
 /// (root `i` at index `i + 1`); `roots.len() + 1` is the add-root input row. The input row is
 /// always reachable, which is why we focus it on open — most overlay opens are to add a root.
 #[derive(Debug, Clone, Default)]
-pub struct ProjectSettings {
-    /// The project's *committed* name — the key used for root RPCs and the rename source.
+pub struct WorkspaceSettings {
+    /// The workspace's *committed* name — the key used for root RPCs and the rename source.
     /// Updated only when a rename succeeds; `name` holds the in-progress edit.
-    pub project_name: String,
-    /// Editable buffer for the name field (index 0). Seeded from `project_name` on open;
-    /// committed on blur (focus leaving the field) via `project/rename`.
+    pub workspace_name: String,
+    /// Editable buffer for the name field (index 0). Seeded from `workspace_name` on open;
+    /// committed on blur (focus leaving the field) via `workspace/rename`.
     pub name: TextField,
     pub roots: Vec<String>,
     pub selected: usize,
@@ -226,7 +226,7 @@ pub struct ProjectSettings {
     pub error: Option<String>,
 }
 
-impl ProjectSettings {
+impl WorkspaceSettings {
     /// Selection index of the add-root input row (one past the last root).
     pub fn input_index(&self) -> usize {
         self.roots.len() + 1
@@ -246,9 +246,9 @@ impl ProjectSettings {
     }
 }
 
-/// The application-settings overlay (`Space .`): global preferences (not per-project),
-/// rendered by every shell from `session.app_settings`. Distinct from [`ProjectSettings`], which
-/// edits the active project's name and roots.
+/// The application-settings overlay (`Space .`): global preferences (not per-workspace),
+/// rendered by every shell from `session.app_settings`. Distinct from [`WorkspaceSettings`], which
+/// edits the active workspace's name and roots.
 ///
 /// The setting *values* live on the session (soft wrap is [`Session::wrap`], persisted server-side
 /// via `settings/set`); this overlay holds only the open state and the focused-row cursor. Settings
@@ -360,11 +360,11 @@ pub enum ConfirmKind {
     DiscardOnClose { label: String },
     /// Trashing a file/directory from the Files/Explorer picker. `noun` is "file"/"directory".
     Delete { noun: &'static str, name: String },
-    /// Removing a root from the project-settings overlay.
+    /// Removing a root from the workspace-settings overlay.
     RemoveRoot { path: String },
-    /// Deleting a project (its config) from the project switcher. Forgets the definition, not the
+    /// Deleting a workspace (its config) from the workspace switcher. Forgets the definition, not the
     /// files under its roots.
-    DeleteProject { name: String },
+    DeleteWorkspace { name: String },
 }
 
 /// What accepting a confirmation does.
@@ -385,13 +385,13 @@ pub enum ConfirmAction {
     /// Trash a file/directory from the Files/Explorer picker (`path/delete`). `noun` is
     /// "file"/"directory" for the success toast; the still-open picker is re-listed after.
     DeletePath { path: String, noun: &'static str },
-    /// Remove a root from the project-settings overlay (`project/remove_root`). Carries the
-    /// committed project name and the root path so the request is self-contained — the overlay's
+    /// Remove a root from the workspace-settings overlay (`workspace/remove_root`). Carries the
+    /// committed workspace name and the root path so the request is self-contained — the overlay's
     /// selection may have moved (or the overlay closed) by the time the confirm resolves.
-    RemoveProjectRoot { project: String, path: String },
-    /// Delete a project (`project/delete`) from the switcher. The server refuses if it's active
+    RemoveWorkspaceRoot { workspace: String, path: String },
+    /// Delete a workspace (`workspace/delete`) from the switcher. The server refuses if it's active
     /// anywhere or has dirty buffers; the refreshed picker list rides a `picker/update` push.
-    DeleteProject { name: String },
+    DeleteWorkspace { name: String },
 }
 
 /// Outcome of a `buffer/save` attempt: saved, or refused pending user confirmation.
@@ -461,15 +461,15 @@ pub struct Session {
     /// Token source for `Effect::Request`.
     pub(crate) next_token: u64,
 
-    pub project: String,
-    pub project_paths: Vec<String>,
-    /// True when this session was launched directly to view a file outside any project (`ae
-    /// /path`), landing it in an ephemeral context, and it hasn't switched projects since. It's
+    pub workspace: String,
+    pub workspace_paths: Vec<String>,
+    /// True when this session was launched directly to view a file outside any workspace (`ae
+    /// /path`), landing it in an ephemeral context, and it hasn't switched workspaces since. It's
     /// the signal for what to do when the last buffer of an ephemeral context closes: a
     /// launched-for-a-file session has nothing left to show, so native clients quit (vim-like);
     /// a session that merely *navigated into* an ephemeral context (via the switcher) returns to
-    /// the chooser instead. Set by the shells at a file-launch bootstrap; cleared on any project
-    /// switch. See [`crate::update`]'s `leave_ephemeral_project`.
+    /// the chooser instead. Set by the shells at a file-launch bootstrap; cleared on any workspace
+    /// switch. See [`crate::update`]'s `leave_ephemeral_workspace`.
     pub launched_with_file: bool,
     pub buffer: BufferInfo,
     pub mode: Mode,
@@ -513,8 +513,8 @@ pub struct Session {
     pub prompt: Option<Prompt>,
     /// An open picker overlay; owns the keyboard while open.
     pub picker: Option<PickerState>,
-    /// The project-settings overlay (`Space ,`); owns the keyboard while open.
-    pub project_settings: Option<ProjectSettings>,
+    /// The workspace-settings overlay (`Space ,`); owns the keyboard while open.
+    pub workspace_settings: Option<WorkspaceSettings>,
     /// The application-settings overlay (`Space .`); owns the keyboard while open.
     pub app_settings: Option<AppSettingsOverlay>,
     pub conn: ConnState,
@@ -541,12 +541,12 @@ pub fn lsp_toast_group(language: &str, workspace_root: &str) -> String {
 pub const TAB_WIDTH: u32 = 4;
 
 impl Session {
-    pub fn new(project: String, project_paths: Vec<String>, buffer: BufferInfo) -> Self {
+    pub fn new(workspace: String, workspace_paths: Vec<String>, buffer: BufferInfo) -> Self {
         Session {
             pending_rpcs: std::collections::HashMap::new(),
             next_token: 0,
-            project,
-            project_paths,
+            workspace,
+            workspace_paths,
             launched_with_file: false,
             buffer,
             mode: Mode::Normal,
@@ -571,7 +571,7 @@ impl Session {
             blame_requested: None,
             prompt: None,
             picker: None,
-            project_settings: None,
+            workspace_settings: None,
             app_settings: None,
             conn: ConnState::Connected,
             relayout_anchor: None,
@@ -655,7 +655,7 @@ impl Session {
             .map(|a| a.reference_line(self.buffer.cursor.position))
     }
 
-    /// An inert stand-in for the boot chooser (no project picked yet): never rendered and
+    /// An inert stand-in for the boot chooser (no workspace picked yet): never rendered and
     /// never addressed — `update_boot` owns every message while `App.boot` is set.
     pub fn placeholder() -> Self {
         Session::new(
@@ -676,9 +676,9 @@ impl Session {
         )
     }
 
-    /// A boot placeholder ([`Session::placeholder`]): no project activated and no real buffer
+    /// A boot placeholder ([`Session::placeholder`]): no workspace activated and no real buffer
     /// (the sentinel `buffer_id == 0`, which the server never assigns). Shells render their
-    /// no-project view — no editor, no viewport subscribe — until a project is picked and
+    /// no-workspace view — no editor, no viewport subscribe — until a workspace is picked and
     /// [`Session::adopt_switch`](crate::update) lands the first real buffer.
     pub fn is_placeholder(&self) -> bool {
         self.buffer.buffer_id == 0
@@ -686,7 +686,7 @@ impl Session {
 }
 
 /// Build the client-side buffer record from a `buffer/open` result.
-/// The display label for a saved buffer at `path`: its project-relative path, falling back to the
+/// The display label for a saved buffer at `path`: its workspace-relative path, falling back to the
 /// absolute path when it sits outside every root. Shared by buffer-open and the save-as rename
 /// adoption so both relabel identically.
 pub fn label_for_path(path: &str, roots: &[String]) -> String {
@@ -715,7 +715,7 @@ pub fn buffer_info(open: BufferOpenResult, roots: &[String]) -> BufferInfo {
     }
 }
 
-/// Find the project root that contains `abs` (longest match wins, for nested roots) and return
+/// Find the workspace root that contains `abs` (longest match wins, for nested roots) and return
 /// `(path_index, relative_path)`.
 pub fn strip_longest_root(abs: &str, roots: &[String]) -> Option<(u32, String)> {
     let abs_path = std::path::Path::new(abs);
@@ -765,7 +765,7 @@ pub enum HoverText {
     Markdown(Vec<crate::markdown::Block>),
 }
 
-/// What `Space y`'s blame → commit-info chain resolved to.
+/// What `Space m`'s blame → commit-info chain resolved to.
 #[derive(Debug)]
 pub enum CommitDetails {
     Info(Box<CommitInfo>),

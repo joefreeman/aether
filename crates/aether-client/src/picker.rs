@@ -55,7 +55,7 @@ pub struct PickerState {
     /// backspace walks the peek back). The directory whose entries are actually shown is
     /// [`Self::explorer_listing_dir`] = this joined with the query's path part.
     pub directory: Option<String>,
-    /// Explorer: the anchor's parent, when still inside the project boundary.
+    /// Explorer: the anchor's parent, when still inside the workspace boundary.
     pub directory_parent: Option<String>,
     /// Explorer: true when the query's peek directory (anchor + path part) doesn't exist — pushed
     /// by the server (the listing shows the peeked dir's *contents*, so the client can't tell on
@@ -122,8 +122,8 @@ impl PickerState {
     }
 
     /// The rendered chip row, derived from the stored list.
-    pub fn chip_row(&self, project_paths: &[String]) -> Vec<Chip> {
-        chips::derive_chips(&self.chips, project_paths)
+    pub fn chip_row(&self, workspace_paths: &[String]) -> Vec<Chip> {
+        chips::derive_chips(&self.chips, workspace_paths)
     }
 
     /// The wire filter set the active chips fold into — built per send.
@@ -141,7 +141,7 @@ impl PickerState {
     /// them wider for a frame. An *invalid* in-progress value (a red segment) contributes nothing:
     /// results show as if the half-typed chip weren't there. With no editor open this is just the
     /// committed [`Self::wire_filters`].
-    pub fn live_filters(&self, project_paths: &[String]) -> Option<PickerFilters> {
+    pub fn live_filters(&self, workspace_paths: &[String]) -> Option<PickerFilters> {
         let Some(ed) = &self.chip_editor else {
             return Some(self.wire_filters());
         };
@@ -166,7 +166,7 @@ impl PickerState {
                 if !ed.input.text.is_empty() && ed.listing_state == DirListingState::Pending {
                     return None;
                 }
-                if let Some(scope) = ed.preview_scope(project_paths) {
+                if let Some(scope) = ed.preview_scope(workspace_paths) {
                     base.push(ChipValue::Dir(scope));
                 }
             }
@@ -248,8 +248,8 @@ impl PickerState {
     ///
     /// - **Explorer**: a file (or a directory, when the query ends with `/`) under the current
     ///   directory. Selecting it runs `explorer_create_from_query`.
-    /// - **Projects**: a fresh project by that name. Selecting it runs `project_create_from_query`.
-    ///   `is_dir` is irrelevant for projects (always `false`); names with path separators are
+    /// - **Workspaces**: a fresh workspace by that name. Selecting it runs `workspace_create_from_query`.
+    ///   `is_dir` is irrelevant for workspaces (always `false`); names with path separators are
     ///   rejected (the server forbids them too).
     ///
     /// Returns `None` for any other kind, an empty/invalid name, or when a listed entry already
@@ -258,7 +258,7 @@ impl PickerState {
     pub fn pending_create(&self) -> Option<PendingCreate> {
         match self.kind {
             PickerKind::Explorer => self.explorer_pending_create(),
-            PickerKind::Projects => self.project_pending_create(),
+            PickerKind::Workspaces => self.workspace_pending_create(),
             _ => None,
         }
     }
@@ -360,19 +360,19 @@ impl PickerState {
         })
     }
 
-    fn project_pending_create(&self) -> Option<PendingCreate> {
+    fn workspace_pending_create(&self) -> Option<PendingCreate> {
         let name = self.query.trim();
-        // Project names must be a single non-empty segment (the server stores them as a TOML file
+        // Workspace names must be a single non-empty segment (the server stores them as a TOML file
         // stem and refuses path separators).
         if name.is_empty() || name.contains('/') || name.contains('\\') {
             return None;
         }
-        // Suppress when a listed project already carries this exact name (Enter would activate it).
+        // Suppress when a listed workspace already carries this exact name (Enter would activate it).
         // Case-sensitive, matching the file-stem identity.
         let exact = self
             .items
             .iter()
-            .any(|it| matches!(it, PickerItem::Project { name: n, .. } if n == name));
+            .any(|it| matches!(it, PickerItem::Workspace { name: n, .. } if n == name));
         if exact {
             return None;
         }
@@ -480,7 +480,7 @@ impl PickerState {
         let mut rows = Vec::with_capacity(self.items.len() + 8);
         let mut last_file: Option<(u32, &str)> = None;
         let mut last_section: Option<bool> = None;
-        // The grouped kinds (Grep, project GitChanges, project Diagnostics) emit one file header
+        // The grouped kinds (Grep, workspace GitChanges, workspace Diagnostics) emit one file header
         // before each file's first row. The buffer-locked GitChangesFile / Diagnostics are a single
         // file (or flat) with no header — gated by `groups_by_file`.
         let group_by_file = self.kind.groups_by_file();
@@ -541,7 +541,7 @@ impl PickerState {
 
     /// [`Self::window_base`] from already-built rows — derives "leads with a header" straight from
     /// `display_rows` so the two can never disagree about which kinds emit headers. (They did once:
-    /// project Diagnostics was added to `display_rows` but not to `window_base`'s old hardcoded
+    /// workspace Diagnostics was added to `display_rows` but not to `window_base`'s old hardcoded
     /// variant list, so the window sat one row off.) Callers holding the rows pass them in to avoid
     /// rebuilding.
     fn window_base_of(&self, rows: &[DisplayRow]) -> u32 {
@@ -610,7 +610,7 @@ impl PickerState {
             PickerKind::References => "No references found",
             PickerKind::DocumentSymbols => "No symbols found",
             _ if !self.query.is_empty() => "No matches",
-            PickerKind::Diagnostics | PickerKind::DiagnosticsProject => "No diagnostics",
+            PickerKind::Diagnostics | PickerKind::DiagnosticsWorkspace => "No diagnostics",
             PickerKind::GitChanges | PickerKind::GitChangesFile => "No changes",
             _ => "No results",
         })
@@ -629,7 +629,7 @@ pub enum ItemKey<'a> {
     Diagnostic(u32, u32),
     DirEntry(&'a str),
     Root(u32),
-    Project(&'a str),
+    Workspace(&'a str),
     LspServer(&'a str, &'a str),
     Reference(&'a str, u32, u32),
     Symbol(&'a str, u32, u32),
@@ -669,7 +669,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::Diagnostic { line, col, .. } => ItemKey::Diagnostic(*line, *col),
         PickerItem::DirEntry { name, .. } => ItemKey::DirEntry(name),
         PickerItem::Root { path_index, .. } => ItemKey::Root(*path_index),
-        PickerItem::Project { name, .. } => ItemKey::Project(name),
+        PickerItem::Workspace { name, .. } => ItemKey::Workspace(name),
         PickerItem::LspServer {
             language,
             workspace_root,
@@ -763,7 +763,7 @@ mod tests {
             offset,
             items: Some(
                 (0..n)
-                    .map(|i| PickerItem::Project {
+                    .map(|i| PickerItem::Workspace {
                         name: format!("p{i}"),
                         unsaved_buffers: 0,
                         match_indices: vec![],
@@ -872,8 +872,8 @@ mod tests {
     }
 
     #[test]
-    fn project_diagnostics_count_file_headers_in_window_math() {
-        // Regression: `display_rows` grouped project Diagnostics by file, but `window_base` (and so
+    fn workspace_diagnostics_count_file_headers_in_window_math() {
+        // Regression: `display_rows` grouped workspace Diagnostics by file, but `window_base` (and so
         // `selected_display_row`) used a hardcoded variant list that omitted `Diagnostic`, so the
         // window sat one row off and the geometry undercounted the headers. Both now derive from the
         // same `file_group_key`, so a Diagnostic-bearing window is accounted for like Grep.
@@ -888,10 +888,10 @@ mod tests {
             message: "boom".into(),
             match_indices: vec![],
         };
-        let mut s = PickerState::new(PickerKind::DiagnosticsProject);
+        let mut s = PickerState::new(PickerKind::DiagnosticsWorkspace);
         // Window rows: [0]=hdr a.rs, [1]=diag, [2]=diag, [3]=hdr b.rs, [4]=diag.
         assert!(s.apply_update(PickerUpdateParams {
-            kind: PickerKind::DiagnosticsProject,
+            kind: PickerKind::DiagnosticsWorkspace,
             generation: 0,
             offset: 0,
             items: Some(vec![
@@ -940,7 +940,7 @@ mod tests {
             Some("No diagnostics")
         );
         assert_eq!(
-            settled(PickerKind::DiagnosticsProject, "").empty_note(),
+            settled(PickerKind::DiagnosticsWorkspace, "").empty_note(),
             Some("No diagnostics")
         );
         assert_eq!(
@@ -1005,10 +1005,10 @@ mod tests {
             match_indices: vec![],
         };
         let items = vec![hunk(1), hunk(5)];
-        // Project GitChanges leads each file with a header row...
-        let mut project = PickerState::new(PickerKind::GitChanges);
-        project.items = items.clone();
-        assert!(project
+        // Workspace GitChanges leads each file with a header row...
+        let mut workspace = PickerState::new(PickerKind::GitChanges);
+        workspace.items = items.clone();
+        assert!(workspace
             .display_rows()
             .iter()
             .any(|r| matches!(r, DisplayRow::Header { .. })));
@@ -1169,7 +1169,7 @@ mod tests {
     #[test]
     fn pending_center_resolves_when_its_window_arrives() {
         let mut s = PickerState::new(PickerKind::Grep);
-        s.pending_center = Some(PickerItem::Project {
+        s.pending_center = Some(PickerItem::Workspace {
             name: "p7".into(),
             unsaved_buffers: 0,
             match_indices: vec![],

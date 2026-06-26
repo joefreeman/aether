@@ -107,7 +107,7 @@ pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
             id,
             ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Changed | ChipId::Untracked
         ),
-        // The project Git-changes picker greps content like Grep, so it offers the regex options
+        // The workspace Git-changes picker greps content like Grep, so it offers the regex options
         // (case/word/literal) plus the path-scope chips. Inherently changed-only, but it can still
         // hide untracked files to show only diffs to tracked ones.
         PickerKind::GitChanges => matches!(
@@ -135,7 +135,7 @@ pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
 /// trailing `/` (multi-root labels lead with the disambiguated root label), and the flags are
 /// two-or-three-char abbreviations. The ignored/hidden chips render `+` (include — Grep) or
 /// `-` (hide — Explorer) per the direction stored in the value.
-pub fn derive_chips(values: &[ChipValue], project_paths: &[String]) -> Vec<Chip> {
+pub fn derive_chips(values: &[ChipValue], workspace_paths: &[String]) -> Vec<Chip> {
     values
         .iter()
         .enumerate()
@@ -148,8 +148,8 @@ pub fn derive_chips(values: &[ChipValue], project_paths: &[String]) -> Vec<Chip>
                     } else {
                         format!("{}/", d.relative_path)
                     };
-                    let label = if project_paths.len() > 1 {
-                        let labels = crate::labels::root_labels(project_paths);
+                    let label = if workspace_paths.len() > 1 {
+                        let labels = crate::labels::root_labels(workspace_paths);
                         let root_label = labels
                             .get(d.path_index as usize)
                             .map(|s| s.as_str())
@@ -333,7 +333,7 @@ pub fn commit_dir_edit(
                 values.remove(i);
                 true
             }
-            None => false, // empty new scope in a single-root project — cancel
+            None => false, // empty new scope in a single-root workspace — cancel
         };
     };
     commit_valued(values, ChipValue::Dir(d), edit)
@@ -480,8 +480,8 @@ pub fn pop_segment(input: &str) -> String {
 }
 
 /// Resolve `dir_part` (root-relative, possibly with trailing `/`) under the chosen root.
-pub fn join_root_relative(project_paths: &[String], path_index: u32, dir_part: &str) -> String {
-    let Some(root) = project_paths.get(path_index as usize) else {
+pub fn join_root_relative(workspace_paths: &[String], path_index: u32, dir_part: &str) -> String {
+    let Some(root) = workspace_paths.get(path_index as usize) else {
         return String::new();
     };
     let trimmed = dir_part.trim_end_matches('/');
@@ -504,7 +504,7 @@ pub enum DirListingState {
     Pending,
     /// `listing` reflects `listing_dir_abs`; the directory exists.
     Loaded,
-    /// The fetch failed — the dir portion doesn't exist (or sits outside the project boundary).
+    /// The fetch failed — the dir portion doesn't exist (or sits outside the workspace boundary).
     Failed,
 }
 
@@ -523,8 +523,8 @@ pub enum ChipEditorField {
 }
 
 /// The editor line for a valued chip, revealed below the picker's input row. The dir editor
-/// reads as a single `dir:` field: in multi-root projects a root segment (an inline typeahead)
-/// leads, separated by `:` from the root-relative path; single-root projects show only the
+/// reads as a single `dir:` field: in multi-root workspaces a root segment (an inline typeahead)
+/// leads, separated by `:` from the root-relative path; single-root workspaces show only the
 /// path. The path segment carries directory-only ghost suggestions, cached in `listing`.
 #[derive(Debug)]
 pub struct ChipEditor {
@@ -645,7 +645,7 @@ impl ChipEditor {
     /// Confirm the root field (adopting the ghost completion) and move focus into the path.
     /// An *invalid* root refuses: focus stays on the (red) root field. Returns `true` when the
     /// listing went stale and the caller should refetch.
-    pub fn commit_root_field(&mut self, labels: &[String], project_paths: &[String]) -> bool {
+    pub fn commit_root_field(&mut self, labels: &[String], workspace_paths: &[String]) -> bool {
         let Some((idx, _)) = self.root_ghost(labels) else {
             return false; // no candidate ⇔ root_invalid — stay put
         };
@@ -657,19 +657,19 @@ impl ChipEditor {
             .position(|&c| c == idx)
             .unwrap_or(0);
         self.field = ChipEditorField::Path;
-        self.sync_dir_listing(project_paths)
+        self.sync_dir_listing(workspace_paths)
     }
 
     /// The absolute directory the path field's suggestions should list: the dir portion of the
     /// typed path, resolved under the chosen root. `None` for glob editors — and under an
     /// *invalid* root (suggestions beneath the fallback root would read as silently defaulting
     /// to it).
-    pub fn dir_listing_path(&self, project_paths: &[String]) -> Option<String> {
+    pub fn dir_listing_path(&self, workspace_paths: &[String]) -> Option<String> {
         if !self.is_dir() {
             return None;
         }
-        let root = if project_paths.len() > 1 {
-            let labels = crate::labels::root_labels(project_paths);
+        let root = if workspace_paths.len() > 1 {
+            let labels = crate::labels::root_labels(workspace_paths);
             if self.root_invalid(&labels) {
                 return None;
             }
@@ -678,7 +678,7 @@ impl ChipEditor {
             0
         };
         Some(join_root_relative(
-            project_paths,
+            workspace_paths,
             root,
             dir_of_input(&self.input.text),
         ))
@@ -708,8 +708,8 @@ impl ChipEditor {
     /// Reconcile the listing key with the current (root, dir-portion) pair. Returns `true`
     /// when they diverged — the listing was cleared and the caller should fire a fresh
     /// `directory/list` for [`ChipEditor::dir_listing_path`].
-    pub fn sync_dir_listing(&mut self, project_paths: &[String]) -> bool {
-        let Some(abs) = self.dir_listing_path(project_paths) else {
+    pub fn sync_dir_listing(&mut self, workspace_paths: &[String]) -> bool {
+        let Some(abs) = self.dir_listing_path(workspace_paths) else {
             return false;
         };
         if abs == self.listing_dir_abs {
@@ -775,17 +775,17 @@ impl ChipEditor {
     }
 
     /// The dir scope a commit would adopt *right now*, or `None` when the editor wouldn't commit
-    /// a scope: an invalid root or path, or an empty path in a single-root project (which means
+    /// a scope: an invalid root or path, or an empty path in a single-root workspace (which means
     /// "no narrowing"). This is the single source of truth shared by the commit path
     /// ([`crate::session::Session::commit_chip_editor`]) and the live preview, so what the
     /// results show while you type is exactly what `Enter` would pin (docs/picker-filters.md).
-    pub fn preview_scope(&self, project_paths: &[String]) -> Option<ScopedPath> {
+    pub fn preview_scope(&self, workspace_paths: &[String]) -> Option<ScopedPath> {
         if !self.is_dir() || !self.path_valid() {
             return None;
         }
-        let multi_root = project_paths.len() > 1;
+        let multi_root = workspace_paths.len() > 1;
         let path_index = if multi_root {
-            let labels = crate::labels::root_labels(project_paths);
+            let labels = crate::labels::root_labels(workspace_paths);
             if self.root_invalid(&labels) {
                 return None;
             }
@@ -877,29 +877,29 @@ impl ChipEditor {
 
     /// Tab / Alt-l in the path field: absorb the ghost into the input. The suffix always ends
     /// in `/`, so the dir portion grew — returns `true` so the caller refetches.
-    pub fn accept_path_suggestion(&mut self, project_paths: &[String]) -> bool {
+    pub fn accept_path_suggestion(&mut self, workspace_paths: &[String]) -> bool {
         let Some(suffix) = self.path_ghost() else {
             return false;
         };
         self.input.push_str(&suffix);
         self.suggestion_idx = 0;
-        self.sync_dir_listing(project_paths)
+        self.sync_dir_listing(workspace_paths)
     }
 
     /// Alt-Backspace in a non-empty path field: drop the rightmost segment, fish-style.
     /// Returns `true` when the dir portion shrank and a refetch is due.
-    pub fn pop_path_segment(&mut self, project_paths: &[String]) -> bool {
+    pub fn pop_path_segment(&mut self, workspace_paths: &[String]) -> bool {
         let popped = pop_segment(&self.input.text);
         self.input.set(popped);
         self.suggestion_idx = 0;
-        self.sync_dir_listing(project_paths)
+        self.sync_dir_listing(workspace_paths)
     }
 
     /// Bookkeeping after a free-form edit to the path field: reset the suggestion highlight
     /// and report whether the dir portion moved.
-    pub fn path_edited(&mut self, project_paths: &[String]) -> bool {
+    pub fn path_edited(&mut self, workspace_paths: &[String]) -> bool {
         self.suggestion_idx = 0;
-        self.sync_dir_listing(project_paths)
+        self.sync_dir_listing(workspace_paths)
     }
 }
 

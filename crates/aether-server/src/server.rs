@@ -1,7 +1,7 @@
 //! Server lifecycle: bind the fixed loopback port, write the runtime discovery file, accept
 //! connections, clean up on shutdown.
 //!
-//! The server is multi-project. Projects are loaded lazily by `project/activate` — no project
+//! The server is multi-workspace. Workspaces are loaded lazily by `workspace/activate` — no workspace
 //! is read from disk at startup.
 
 use crate::config::{self};
@@ -39,16 +39,16 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
 
     // The instance's start stamp lives on `ServerState` — it's reported to clients on
-    // `project/activate` for restart detection. The runtime file no longer mirrors it (or the
+    // `workspace/activate` for restart detection. The runtime file no longer mirrors it (or the
     // port): it's now just the pid, the per-profile singleton marker.
     let state = Arc::new(Mutex::new(ServerState::new()));
-    // Point the real server at the on-disk session file (project recency + buffer restore). Left
+    // Point the real server at the on-disk session file (workspace recency + buffer restore). Left
     // unset by `ServerState::new` so in-process tests and embeddings never touch the user's file;
     // this is the one place that opts the production daemon in. A resolution failure (no XDG base
     // dirs) just disables the feature rather than refusing to boot.
     {
         let mut s = state.lock().await;
-        s.sessions_path = config::project_sessions_path().ok();
+        s.sessions_path = config::workspace_sessions_path().ok();
     }
     config::write_runtime_pid(&runtime_path, std::process::id())?;
     // Log the web URL too: the browser client has no config/CLI access, so a human reads (and
@@ -79,7 +79,7 @@ pub async fn run_with_listener(
     let mut sigterm = signal(SignalKind::terminate())?;
 
     // No-op when the watcher's already running (e.g. `spawn_for_test` initialized it ahead of
-    // the run task to register project paths synchronously).
+    // the run task to register workspace paths synchronously).
     let already_started = state.lock().await.watcher.is_some();
     if !already_started {
         if let Err(e) = watcher::spawn(state.clone()).await {
@@ -154,7 +154,7 @@ async fn idle_reaper(state: SharedState, timeout: Duration, shutdown: Arc<Notify
 /// Handle to a running server (for in-process embedding by tests). Dropping aborts the server task.
 pub struct ServerHandle {
     pub port: u16,
-    pub project_name: String,
+    pub workspace_name: String,
     join: tokio::task::JoinHandle<()>,
 }
 
@@ -179,38 +179,38 @@ impl Drop for ServerHandle {
 }
 
 /// Spawn the server in-process for testing or embedding. Skips the filesystem-based runtime
-/// discovery file, binds to an ephemeral port, and pre-registers a project (so tests can skip
-/// laying down `*.toml` files for projects they only need in memory). Tests still send a
-/// `project/activate` RPC on each connection — same shape as the production flow.
+/// discovery file, binds to an ephemeral port, and pre-registers a workspace (so tests can skip
+/// laying down `*.toml` files for workspaces they only need in memory). Tests still send a
+/// `workspace/activate` RPC on each connection — same shape as the production flow.
 pub async fn spawn_for_test(
-    project_name: impl Into<String>,
-    project_paths: Vec<PathBuf>,
+    workspace_name: impl Into<String>,
+    workspace_paths: Vec<PathBuf>,
 ) -> anyhow::Result<ServerHandle> {
-    spawn_for_test_multi(vec![(project_name.into(), project_paths)]).await
+    spawn_for_test_multi(vec![(workspace_name.into(), workspace_paths)]).await
 }
 
-/// Multi-project variant of [`spawn_for_test`]: pre-registers every `(name, paths)` pair on one
-/// server, for tests exercising cross-project behavior (e.g. overlapping roots). The handle's
-/// `project_name` is the first pair's name.
+/// Multi-workspace variant of [`spawn_for_test`]: pre-registers every `(name, paths)` pair on one
+/// server, for tests exercising cross-workspace behavior (e.g. overlapping roots). The handle's
+/// `workspace_name` is the first pair's name.
 pub async fn spawn_for_test_multi(
-    projects: Vec<(String, Vec<PathBuf>)>,
+    workspaces: Vec<(String, Vec<PathBuf>)>,
 ) -> anyhow::Result<ServerHandle> {
-    spawn_for_test_multi_with_sessions(projects, None).await
+    spawn_for_test_multi_with_sessions(workspaces, None).await
 }
 
 /// As [`spawn_for_test_multi`], but points the server at `sessions_path` for the persisted
-/// project-session file (recency + buffer restore). Tests pass a throwaway tempfile so they can
+/// workspace-session file (recency + buffer restore). Tests pass a throwaway tempfile so they can
 /// exercise persistence without touching the developer's real `~/.config/aether/sessions.json`.
 pub async fn spawn_for_test_multi_with_sessions(
-    projects: Vec<(String, Vec<PathBuf>)>,
+    workspaces: Vec<(String, Vec<PathBuf>)>,
     sessions_path: Option<PathBuf>,
 ) -> anyhow::Result<ServerHandle> {
-    use crate::state::ProjectEntry;
+    use crate::state::WorkspaceEntry;
     use crate::workspace_index::WorkspaceIndex;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let project_name = projects
+    let workspace_name = workspaces
         .first()
         .map(|(name, _)| name.clone())
         .unwrap_or_default();
@@ -219,11 +219,11 @@ pub async fn spawn_for_test_multi_with_sessions(
     {
         let mut s = state.lock().await;
         s.sessions_path = sessions_path;
-        for (name, paths) in &projects {
+        for (name, paths) in &workspaces {
             let workspace_index = Arc::new(WorkspaceIndex::new(paths.clone()));
-            s.projects.insert(
+            s.workspaces.insert(
                 name.clone(),
-                ProjectEntry {
+                WorkspaceEntry {
                     id: name.clone(),
                     name: Some(name.clone()),
                     paths: paths.clone(),
@@ -236,14 +236,14 @@ pub async fn spawn_for_test_multi_with_sessions(
     }
 
     // Initialize the watcher synchronously, before spawning the run task, so the test can call
-    // `watch_project_paths` immediately. (The run task also kicks off `watcher::spawn` but it's a
+    // `watch_workspace_paths` immediately. (The run task also kicks off `watcher::spawn` but it's a
     // no-op once `state.watcher` is set.)
     crate::watcher::spawn(state.clone()).await?;
     {
         let s = state.lock().await;
         if let Some(w) = s.watcher.clone() {
-            for (_, paths) in &projects {
-                crate::watcher::watch_project_paths(&w, paths);
+            for (_, paths) in &workspaces {
+                crate::watcher::watch_workspace_paths(&w, paths);
             }
         }
     }
@@ -253,7 +253,7 @@ pub async fn spawn_for_test_multi_with_sessions(
     });
     Ok(ServerHandle {
         port,
-        project_name,
+        workspace_name,
         join,
     })
 }

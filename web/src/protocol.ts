@@ -8,8 +8,8 @@
 //!
 //!   1. Render/view types embedded in the `View` that `view()` returns (the viewport render chain,
 //!      cursor, diagnostics, LSP status, picker items) — consumed by render.ts / shell.ts.
-//!   2. The handful of results from RPCs the shell issues *directly* (bootstrap: project/list,
-//!      project/activate, buffer/open; geometry: viewport/subscribe|scroll|scroll_to_row|resize),
+//!   2. The handful of results from RPCs the shell issues *directly* (bootstrap: workspace/list,
+//!      workspace/activate, buffer/open; geometry: viewport/subscribe|scroll|scroll_to_row|resize),
 //!      because their params need pixels or they run before the core exists.
 //!
 //! Keep field names exactly matching the serde wire format.
@@ -155,21 +155,21 @@ export interface CursorState {
   grep_position?: { current: number; total: number } | null;
 }
 
-// ---- bootstrap RPC results (project/list, project/activate, buffer/open) -------------------------
+// ---- bootstrap RPC results (workspace/list, workspace/activate, buffer/open) -------------------------
 
-export interface ProjectSummary {
+export interface WorkspaceSummary {
   name: string;
 }
-export interface ProjectListResult {
-  projects: ProjectSummary[];
+export interface WorkspaceListResult {
+  workspaces: WorkspaceSummary[];
 }
 
-export interface ProjectInfo {
+export interface WorkspaceInfo {
   name: string;
   paths: string[];
 }
-export interface ProjectActivateResult {
-  project: ProjectInfo;
+export interface WorkspaceActivateResult {
+  workspace: WorkspaceInfo;
   last_buffer_id?: BufferId | null;
   /** With `open_last`: the landing buffer (MRU or fresh transient scratch), fully opened. */
   opened?: BufferOpenResult | null;
@@ -273,9 +273,9 @@ export type PickerKind =
   | "git_changes"
   | "git_changes_file"
   | "explorer"
-  | "projects"
+  | "workspaces"
   | "diagnostics"
-  | "diagnostics_project"
+  | "diagnostics_workspace"
   | "lsp_servers"
   | "references"
   | "document_symbols";
@@ -320,7 +320,7 @@ export type PickerItem =
       match_indices?: number[];
     }
   | { kind: "diagnostic"; path_index?: number; relative_path?: string; line: number; col: number; end_line?: number; end_col?: number; severity: DiagnosticSeverity; message: string; match_indices?: number[] }
-  | { kind: "project"; name: string; unsaved_buffers?: number; match_indices?: number[] }
+  | { kind: "workspace"; name: string; unsaved_buffers?: number; match_indices?: number[] }
   | { kind: "dir_entry"; name: string; is_dir: boolean; match_indices?: number[]; git_status?: GitStatus }
   | { kind: "root"; path_index: number; match_indices?: number[] }
   | {
@@ -337,7 +337,7 @@ export type PickerItem =
       kind: "reference";
       /** Absolute path to the file containing the reference (fed into buffer/open on select). */
       path: string;
-      /** Row label: project-relative path (references are filtered to project roots server-side). */
+      /** Row label: workspace-relative path (references are filtered to workspace roots server-side). */
       display_path: string;
       line: number;
       col: number;

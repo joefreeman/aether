@@ -160,13 +160,13 @@ pub struct Toast {
 /// "return mode" bookkeeping.
 #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
 pub struct AppState {
-    /// Active project name. Empty string before a project is activated — the no-project view
-    /// shows the project picker instead of the editor in that state.
-    pub project_name: String,
-    /// Active project's root paths (absolute, server-canonical). Empty before activation.
-    pub project_paths: Vec<String>,
-    /// One disambiguated label per entry in `project_paths`, aligned by index. Computed by
-    /// `labels::root_labels` and refreshed via `refresh_root_labels` whenever `project_paths`
+    /// Active workspace name. Empty string before a workspace is activated — the no-workspace view
+    /// shows the workspace picker instead of the editor in that state.
+    pub workspace_name: String,
+    /// Active workspace's root paths (absolute, server-canonical). Empty before activation.
+    pub workspace_paths: Vec<String>,
+    /// One disambiguated label per entry in `workspace_paths`, aligned by index. Computed by
+    /// `labels::root_labels` and refreshed via `refresh_root_labels` whenever `workspace_paths`
     /// changes. Used for UI rendering (status bar, picker prefixes, explorer breadcrumb) — the
     /// protocol is unaware.
     pub root_labels: Vec<String>,
@@ -176,7 +176,7 @@ pub struct AppState {
     /// Transient feedback. Carries a `StatusKind` so the renderer can colour the message — "saved"
     /// reads as success, "save failed" reads as error, etc. Constructed via `StatusMessage::info` /
     /// `::success` / `::warning` / `::error`. This is now a *handoff* slot: the shell drains it into
-    /// a [`Toast`] (see [`AppState::toasts`]); only code without shell access (project-settings
+    /// a [`Toast`] (see [`AppState::toasts`]); only code without shell access (workspace-settings
     /// handlers) writes it directly.
     pub status: StatusMessage,
     /// Active floating toasts, stacked bottom-right (newest at the bottom). Each is expired on a
@@ -200,19 +200,19 @@ pub struct AppState {
     pub save_prompt: Option<SavePromptState>,
     /// Active open-from-path prompt (`Space Alt-w`): a single-line path input shown in the status
     /// row. `Some` holds the field's text + caret; text entry is shell-owned (synced into the
-    /// core's `Prompt::OpenPath`), `Enter` opens via `project/open_path`, `Esc` cancels.
+    /// core's `Prompt::OpenPath`), `Enter` opens via `workspace/open_path`, `Esc` cancels.
     pub open_path_prompt: Option<crate::text_input::TextInput>,
     /// Active binary y/N confirmation prompt. Layers on top of any other overlay (including
     /// `save_prompt`, e.g. for the save-as overwrite confirm). Holds the question text and the
     /// action to run on `y`.
     pub confirm_prompt: Option<ConfirmPrompt>,
-    /// `None` before a project is activated, or transiently while switching. Most key handlers
-    /// early-return without touching state in that case; the no-project view (project picker)
+    /// `None` before a workspace is activated, or transiently while switching. Most key handlers
+    /// early-return without touching state in that case; the no-workspace view (workspace picker)
     /// is rendered instead by `ui::draw`.
     pub editor: Option<EditorState>,
-    /// Active project-settings overlay (`Space ,`). When `Some`, draws a centered modal listing
-    /// the project's roots, with a permanent add-root input row at the bottom. Closed by Esc.
-    pub project_settings: Option<ProjectSettingsState>,
+    /// Active workspace-settings overlay (`Space ,`). When `Some`, draws a centered modal listing
+    /// the workspace's roots, with a permanent add-root input row at the bottom. Closed by Esc.
+    pub workspace_settings: Option<WorkspaceSettingsState>,
     /// Active application-settings overlay (`Space .`). When `Some`, draws a centered modal
     /// listing the global settings (e.g. soft wrap). Closed by Esc.
     pub app_settings: Option<AppSettingsState>,
@@ -335,16 +335,16 @@ impl HelpTab {
     }
 }
 
-/// Project-settings overlay view model. A render-only projection of the core's
-/// `Session::project_settings` (which owns the state + key handling): shows an editable
-/// project-name field, then the active project's roots, then an always-present "add root" input
-/// row; `selected` is the focused field. Populated each frame by `Shell::sync_project_settings`.
+/// Workspace-settings overlay view model. A render-only projection of the core's
+/// `Session::workspace_settings` (which owns the state + key handling): shows an editable
+/// workspace-name field, then the active workspace's roots, then an always-present "add root" input
+/// row; `selected` is the focused field. Populated each frame by `Shell::sync_workspace_settings`.
 ///
 /// Selection model: `selected == 0` is the name field; `1..=roots.len()` are the root rows (root
 /// `i` at index `i + 1`); `roots.len() + 1` is the add-root input row. The input row is always
 /// reachable, which is why we focus it on open — most overlay opens are to add a root.
 #[derive(Debug, Clone, Default)]
-pub struct ProjectSettingsState {
+pub struct WorkspaceSettingsState {
     /// Editable buffer for the name field (index 0), mirrored from the core's in-progress edit.
     pub name_input: crate::text_input::TextInput,
     pub roots: Vec<String>,
@@ -490,7 +490,7 @@ pub struct EditorState {
     pub language: Option<String>,
     /// The language server backing this buffer, from `buffer/open` — its `(language,
     /// workspace_root)` key. `None` when no server is attached. Selects *which* server's health the
-    /// status bar shows (language alone is ambiguous when a project runs several same-language
+    /// status bar shows (language alone is ambiguous when a workspace runs several same-language
     /// servers at different roots).
     pub lsp_server: Option<LspServerRef>,
     /// The buffer auto-closes once hidden (server-side flag, from `buffer/open` and `buffer/state`
@@ -530,8 +530,8 @@ pub enum BufferStatusKind {
 }
 
 impl AppState {
-    /// `true` while a buffer is open. False during the no-project view and the brief window
-    /// between switching projects (old editor torn down, new one not yet built).
+    /// `true` while a buffer is open. False during the no-workspace view and the brief window
+    /// between switching workspaces (old editor torn down, new one not yet built).
     pub fn has_editor(&self) -> bool {
         self.editor.is_some()
     }
@@ -583,21 +583,21 @@ pub fn refresh_terminal_title(state: &mut AppState) {
 }
 
 /// Derive the terminal title from the current state. Mirrors the left segment of the editor
-/// status row — `[{project}] {file_label}` — with a leading dot when the buffer is dirty or
+/// status row — `[{workspace}] {file_label}` — with a leading dot when the buffer is dirty or
 /// changed on disk, so the title answers "what am I editing, and is it saved?" at a glance. The
 /// dot leads (not trails) to match the favicon's position in the web client's tab; a terminal
 /// title can't carry colour, so every non-clean state shows the same plain dot (the status bar
-/// colour-codes it). Before any project is active we fall back to a bare `Aether` placeholder;
-/// without a buffer (transient project-switch window) we just show the project name.
+/// colour-codes it). Before any workspace is active we fall back to a bare `Aether` placeholder;
+/// without a buffer (transient workspace-switch window) we just show the workspace name.
 fn terminal_title(state: &AppState) -> String {
-    // The label is only meaningful with an open editor (the transient project-switch window has
-    // none). `title_body` yields `None` before a project is active → the title is just `Aether`.
+    // The label is only meaningful with an open editor (the transient workspace-switch window has
+    // none). `title_body` yields `None` before a workspace is active → the title is just `Aether`.
     let label = if state.has_editor() {
         state.ed().file_label.as_str()
     } else {
         ""
     };
-    let Some(body) = aether_client::labels::title_body(&state.project_name, label) else {
+    let Some(body) = aether_client::labels::title_body(&state.workspace_name, label) else {
         return "Aether".to_string();
     };
     let dot = if state.has_editor() && state.buffer_status().is_some() {
@@ -633,7 +633,7 @@ pub fn apply_cursor_style(state: &AppState) {
     } else if state.picker.open
         || state.save_prompt.is_some()
         || state.confirm_prompt.is_some()
-        || state.project_settings.is_some()
+        || state.workspace_settings.is_some()
         || !state.has_editor()
     {
         // Overlays always use the bar cursor (they're text-prompt UIs). With no editor and no
@@ -650,7 +650,7 @@ pub fn apply_cursor_style(state: &AppState) {
 
 /// Resolve a CLI-supplied file/dir argument to an absolute, canonical path. Relative args are
 /// resolved against the *current working directory* (shell convention), then canonicalized so
-/// any `..` / symlinks line up with the project's canonical roots — without that, prefix
+/// any `..` / symlinks line up with the workspace's canonical roots — without that, prefix
 /// matching against the roots in `strip_longest_root` would miss when the user CDs through a
 /// symlink. Errors surface verbatim (e.g. "No such file or directory") with the original arg
 /// for context — keeps the CLI's failure mode readable.
@@ -666,11 +666,11 @@ pub fn resolve_cli_path(arg: &str) -> Result<std::path::PathBuf> {
     std::fs::canonicalize(&joined).with_context(|| format!("could not resolve {arg}"))
 }
 
-/// Strip the longest matching project root off `abs`. Returns `(root_index, relative_path)`,
+/// Strip the longest matching workspace root off `abs`. Returns `(root_index, relative_path)`,
 /// where `relative_path` is empty if `abs` *is* the root itself.
-pub(crate) fn strip_longest_root(abs: &str, project_paths: &[String]) -> Option<(usize, String)> {
+pub(crate) fn strip_longest_root(abs: &str, workspace_paths: &[String]) -> Option<(usize, String)> {
     let abs_path = std::path::Path::new(abs);
-    project_paths
+    workspace_paths
         .iter()
         .enumerate()
         .filter_map(|(i, p)| {
@@ -786,7 +786,7 @@ mod tests {
     use super::*;
 
     /// `resolve_cli_path` resolves a relative arg against CWD, not against an arbitrary base.
-    /// Tested here because the old (buggy) behaviour joined relative args with `project_paths[0]`
+    /// Tested here because the old (buggy) behaviour joined relative args with `workspace_paths[0]`
     /// — the regression we're guarding against is "user is CD'd into root B but `ae` resolves
     /// their relative arg under root A".
     #[test]
@@ -843,7 +843,7 @@ mod tests {
         std::fs::create_dir_all(file_in_b.parent().unwrap()).unwrap();
         std::fs::write(&file_in_b, "in b").unwrap();
 
-        let project_paths = vec![
+        let workspace_paths = vec![
             std::fs::canonicalize(&root_a)
                 .unwrap()
                 .display()
@@ -854,7 +854,7 @@ mod tests {
                 .to_string(),
         ];
         let abs = resolve_cli_path(file_in_b.to_str().unwrap()).unwrap();
-        let (idx, rel) = strip_longest_root(&abs.display().to_string(), &project_paths)
+        let (idx, rel) = strip_longest_root(&abs.display().to_string(), &workspace_paths)
             .expect("file must classify under one of the roots");
         assert_eq!(idx, 1, "should classify under root B (index 1), not root 0");
         assert_eq!(rel, "sub/file.rs");
@@ -863,10 +863,10 @@ mod tests {
     // ---- terminal_title ----
 
     #[test]
-    fn terminal_title_falls_back_to_aether_before_project_activation() {
+    fn terminal_title_falls_back_to_aether_before_workspace_activation() {
         let state = AppState {
-            project_name: String::new(),
-            project_paths: Vec::new(),
+            workspace_name: String::new(),
+            workspace_paths: Vec::new(),
             root_labels: Vec::new(),
             viewport_cols: 80,
             viewport_rows: 24,
@@ -882,7 +882,7 @@ mod tests {
             open_path_prompt: None,
             confirm_prompt: None,
             editor: None,
-            project_settings: None,
+            workspace_settings: None,
             app_settings: None,
             help: HelpState::default(),
             lsp_status: std::collections::HashMap::new(),
@@ -893,10 +893,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_title_shows_project_only_when_no_editor() {
+    fn terminal_title_shows_workspace_only_when_no_editor() {
         let mut state = AppState {
-            project_name: "demo".into(),
-            project_paths: vec!["/tmp/demo".into()],
+            workspace_name: "demo".into(),
+            workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
             viewport_cols: 80,
             viewport_rows: 24,
@@ -912,7 +912,7 @@ mod tests {
             open_path_prompt: None,
             confirm_prompt: None,
             editor: None,
-            project_settings: None,
+            workspace_settings: None,
             app_settings: None,
             help: HelpState::default(),
             lsp_status: std::collections::HashMap::new(),
@@ -928,8 +928,8 @@ mod tests {
     #[test]
     fn terminal_title_prepends_status_dot() {
         let mut state = AppState {
-            project_name: "demo".into(),
-            project_paths: vec!["/tmp/demo".into()],
+            workspace_name: "demo".into(),
+            workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
             viewport_cols: 80,
             viewport_rows: 24,
@@ -945,7 +945,7 @@ mod tests {
             open_path_prompt: None,
             confirm_prompt: None,
             editor: Some(stub_editor_state("src/main.rs")),
-            project_settings: None,
+            workspace_settings: None,
             app_settings: None,
             help: HelpState::default(),
             lsp_status: std::collections::HashMap::new(),

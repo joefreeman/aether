@@ -1,5 +1,5 @@
 //! Single-line text input with a cursor — the shell-owned editor for overlay inputs (save-as,
-//! search, picker query, project-settings, chip editor). The struct owns the buffer and the
+//! search, picker query, workspace-settings, chip editor). The struct owns the buffer and the
 //! byte-offset cursor; methods keep them in sync and on UTF-8 char boundaries.
 //!
 //! Text editing for overlays lives client-side (docs/client-core.md): the core owns values and

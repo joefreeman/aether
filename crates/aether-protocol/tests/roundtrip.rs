@@ -33,9 +33,9 @@ use aether_protocol::lsp::{
     LspServerStatus, LspStatus, LspStatusChanged,
 };
 use aether_protocol::picker::{CaseMode, MatchOptions};
-use aether_protocol::project::{
-    ProjectActivate, ProjectActivateParams, ProjectInfo, ProjectList, ProjectOpenPath,
-    ProjectOpenPathParams, ProjectSummary,
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceList, WorkspaceOpenPath,
+    WorkspaceOpenPathParams, WorkspaceSummary,
 };
 use aether_protocol::search::{SearchSet, SearchSetParams};
 use aether_protocol::sneak::{
@@ -61,9 +61,9 @@ fn request_roundtrip() {
     let req = Request {
         jsonrpc: JsonRpc,
         id: 7,
-        method: ProjectActivate::NAME.into(),
+        method: WorkspaceActivate::NAME.into(),
         params: Some(
-            to_value(ProjectActivateParams {
+            to_value(WorkspaceActivateParams {
                 name: "aether".into(),
                 open_last: false,
             })
@@ -73,18 +73,18 @@ fn request_roundtrip() {
     let s = serde_json::to_string(&req).unwrap();
     let v: serde_json::Value = from_str(&s).unwrap();
     assert_eq!(v["jsonrpc"], "2.0");
-    assert_eq!(v["method"], "project/activate");
+    assert_eq!(v["method"], "workspace/activate");
     assert_eq!(v["params"]["name"], "aether");
 }
 
 #[test]
-fn project_open_path_roundtrip() {
+fn workspace_open_path_roundtrip() {
     let req = Request {
         jsonrpc: JsonRpc,
         id: 9,
-        method: ProjectOpenPath::NAME.into(),
+        method: WorkspaceOpenPath::NAME.into(),
         params: Some(
-            to_value(ProjectOpenPathParams {
+            to_value(WorkspaceOpenPathParams {
                 path: "/etc/hosts".into(),
                 transient: None,
             })
@@ -93,7 +93,7 @@ fn project_open_path_roundtrip() {
     };
     let s = serde_json::to_string(&req).unwrap();
     let v: serde_json::Value = from_str(&s).unwrap();
-    assert_eq!(v["method"], "project/open_path");
+    assert_eq!(v["method"], "workspace/open_path");
     assert_eq!(v["params"]["path"], "/etc/hosts");
     // `transient: None` stays off the wire.
     assert!(v["params"].get("transient").is_none());
@@ -114,11 +114,11 @@ fn buffer_open_absolute_path_roundtrips_and_omits_when_absent() {
 }
 
 #[test]
-fn ephemeral_project_id_predicate() {
-    assert!(aether_protocol::is_ephemeral_project_id("ephemeral/1"));
-    assert!(!aether_protocol::is_ephemeral_project_id("my-project"));
-    // A real project name can't contain a separator, so the namespaces never collide.
-    assert!(!aether_protocol::is_ephemeral_project_id("ephemeral")); // no slash, not the prefix
+fn ephemeral_workspace_id_predicate() {
+    assert!(aether_protocol::is_ephemeral_workspace_id("ephemeral/1"));
+    assert!(!aether_protocol::is_ephemeral_workspace_id("my-workspace"));
+    // A real workspace name can't contain a separator, so the namespaces never collide.
+    assert!(!aether_protocol::is_ephemeral_workspace_id("ephemeral")); // no slash, not the prefix
 }
 
 #[test]
@@ -935,7 +935,7 @@ fn error_response_shape() {
         id: 3,
         error: ErrorObject {
             code: -32010,
-            message: "path outside project".into(),
+            message: "path outside workspace".into(),
             data: None,
         },
     };
@@ -949,8 +949,8 @@ fn error_response_shape() {
 
 #[test]
 fn method_name_constants() {
-    assert_eq!(ProjectList::NAME, "project/list");
-    assert_eq!(ProjectActivate::NAME, "project/activate");
+    assert_eq!(WorkspaceList::NAME, "workspace/list");
+    assert_eq!(WorkspaceActivate::NAME, "workspace/activate");
     assert_eq!(BufferOpen::NAME, "buffer/open");
     assert_eq!(CursorMove::NAME, "cursor/move");
     assert_eq!(InputText::NAME, "input/text");
@@ -1296,8 +1296,8 @@ fn lsp_status_changed_notification_roundtrip() {
 }
 
 #[test]
-fn project_info_shape() {
-    let p = ProjectInfo {
+fn workspace_info_shape() {
+    let p = WorkspaceInfo {
         name: "aether".into(),
         paths: vec!["/home/joe/x".into()],
     };
@@ -1306,23 +1306,23 @@ fn project_info_shape() {
 }
 
 #[test]
-fn project_list_result_shape() {
-    use aether_protocol::project::ProjectListResult;
-    let r = ProjectListResult {
-        projects: vec![
-            ProjectSummary { name: "a".into() },
-            ProjectSummary { name: "b".into() },
+fn workspace_list_result_shape() {
+    use aether_protocol::workspace::WorkspaceListResult;
+    let r = WorkspaceListResult {
+        workspaces: vec![
+            WorkspaceSummary { name: "a".into() },
+            WorkspaceSummary { name: "b".into() },
         ],
     };
     let v = to_value(&r).unwrap();
-    assert_eq!(v, json!({"projects": [{"name": "a"}, {"name": "b"}]}));
+    assert_eq!(v, json!({"workspaces": [{"name": "a"}, {"name": "b"}]}));
 }
 
 #[test]
-fn project_activate_result_wraps_info() {
-    use aether_protocol::project::ProjectActivateResult;
-    let r = ProjectActivateResult {
-        project: ProjectInfo {
+fn workspace_activate_result_wraps_info() {
+    use aether_protocol::workspace::WorkspaceActivateResult;
+    let r = WorkspaceActivateResult {
+        workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec!["/p".into()],
         },
@@ -1331,8 +1331,8 @@ fn project_activate_result_wraps_info() {
         server_started_at: 0,
     };
     let v = to_value(&r).unwrap();
-    assert_eq!(v["project"]["name"], "aether");
-    assert_eq!(v["project"]["paths"][0], "/p");
+    assert_eq!(v["workspace"]["name"], "aether");
+    assert_eq!(v["workspace"]["paths"][0], "/p");
     assert!(
         v.get("last_buffer_id").is_none(),
         "None last_buffer_id should be skipped"
@@ -1340,10 +1340,10 @@ fn project_activate_result_wraps_info() {
 }
 
 #[test]
-fn project_create_params_round_trip() {
-    use aether_protocol::project::{ProjectCreate, ProjectCreateParams};
-    assert_eq!(ProjectCreate::NAME, "project/create");
-    let p = ProjectCreateParams {
+fn workspace_create_params_round_trip() {
+    use aether_protocol::workspace::{WorkspaceCreate, WorkspaceCreateParams};
+    assert_eq!(WorkspaceCreate::NAME, "workspace/create");
+    let p = WorkspaceCreateParams {
         name: "newproj".into(),
     };
     let v = to_value(&p).unwrap();
@@ -1351,29 +1351,29 @@ fn project_create_params_round_trip() {
 }
 
 #[test]
-fn project_add_root_params_round_trip() {
-    use aether_protocol::project::{ProjectAddRoot, ProjectAddRootParams};
-    assert_eq!(ProjectAddRoot::NAME, "project/add_root");
-    let p = ProjectAddRootParams {
-        project: "aether".into(),
+fn workspace_add_root_params_round_trip() {
+    use aether_protocol::workspace::{WorkspaceAddRoot, WorkspaceAddRootParams};
+    assert_eq!(WorkspaceAddRoot::NAME, "workspace/add_root");
+    let p = WorkspaceAddRootParams {
+        workspace: "aether".into(),
         path: "~/src/aether".into(),
     };
     let v = to_value(&p).unwrap();
-    assert_eq!(v, json!({"project": "aether", "path": "~/src/aether"}));
+    assert_eq!(v, json!({"workspace": "aether", "path": "~/src/aether"}));
 }
 
 #[test]
-fn project_rename_params_round_trip() {
-    use aether_protocol::project::{ProjectRename, ProjectRenameParams};
-    assert_eq!(ProjectRename::NAME, "project/rename");
-    let p = ProjectRenameParams {
-        project: "aether".into(),
+fn workspace_rename_params_round_trip() {
+    use aether_protocol::workspace::{WorkspaceRename, WorkspaceRenameParams};
+    assert_eq!(WorkspaceRename::NAME, "workspace/rename");
+    let p = WorkspaceRenameParams {
+        workspace: "aether".into(),
         new_name: "aether-next".into(),
     };
     let v = to_value(&p).unwrap();
-    assert_eq!(v, json!({"project": "aether", "new_name": "aether-next"}));
-    // Result is a plain ProjectInfo (new name + paths).
-    let info = ProjectInfo {
+    assert_eq!(v, json!({"workspace": "aether", "new_name": "aether-next"}));
+    // Result is a plain WorkspaceInfo (new name + paths).
+    let info = WorkspaceInfo {
         name: "aether-next".into(),
         paths: vec!["/p".into()],
     };
@@ -1381,25 +1381,25 @@ fn project_rename_params_round_trip() {
 }
 
 #[test]
-fn project_renamed_notification_round_trip() {
+fn workspace_renamed_notification_round_trip() {
     use aether_protocol::envelope::NotificationMethod;
-    use aether_protocol::project::{ProjectRenamed, ProjectRenamedParams};
-    assert_eq!(ProjectRenamed::NAME, "project/renamed");
-    let p = ProjectRenamedParams {
+    use aether_protocol::workspace::{WorkspaceRenamed, WorkspaceRenamedParams};
+    assert_eq!(WorkspaceRenamed::NAME, "workspace/renamed");
+    let p = WorkspaceRenamedParams {
         old_name: "aether".into(),
         new_name: "aether-next".into(),
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v, json!({"old_name": "aether", "new_name": "aether-next"}));
-    let back: ProjectRenamedParams = serde_json::from_value(v).unwrap();
+    let back: WorkspaceRenamedParams = serde_json::from_value(v).unwrap();
     assert_eq!(back.new_name, "aether-next");
 }
 
 #[test]
-fn project_delete_params_round_trip() {
-    use aether_protocol::project::{ProjectDelete, ProjectDeleteParams};
-    assert_eq!(ProjectDelete::NAME, "project/delete");
-    let p = ProjectDeleteParams {
+fn workspace_delete_params_round_trip() {
+    use aether_protocol::workspace::{WorkspaceDelete, WorkspaceDeleteParams};
+    assert_eq!(WorkspaceDelete::NAME, "workspace/delete");
+    let p = WorkspaceDeleteParams {
         name: "aether".into(),
     };
     let v = to_value(&p).unwrap();
@@ -1450,11 +1450,11 @@ fn path_delete_round_trips() {
 }
 
 #[test]
-fn project_remove_root_result_shape() {
-    use aether_protocol::project::{ProjectRemoveRoot, ProjectRemoveRootResult};
-    assert_eq!(ProjectRemoveRoot::NAME, "project/remove_root");
-    let r = ProjectRemoveRootResult {
-        project: ProjectInfo {
+fn workspace_remove_root_result_shape() {
+    use aether_protocol::workspace::{WorkspaceRemoveRoot, WorkspaceRemoveRootResult};
+    assert_eq!(WorkspaceRemoveRoot::NAME, "workspace/remove_root");
+    let r = WorkspaceRemoveRootResult {
+        workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec!["/p".into()],
         },
@@ -1462,16 +1462,16 @@ fn project_remove_root_result_shape() {
         next_buffer_id: Some(7),
     };
     let v = to_value(&r).unwrap();
-    assert_eq!(v["project"]["name"], "aether");
+    assert_eq!(v["workspace"]["name"], "aether");
     assert_eq!(v["closed_buffer_ids"], json!([3, 5]));
     assert_eq!(v["next_buffer_id"], 7);
 }
 
 #[test]
-fn project_remove_root_result_skips_none_next_buffer() {
-    use aether_protocol::project::ProjectRemoveRootResult;
-    let r = ProjectRemoveRootResult {
-        project: ProjectInfo {
+fn workspace_remove_root_result_skips_none_next_buffer() {
+    use aether_protocol::workspace::WorkspaceRemoveRootResult;
+    let r = WorkspaceRemoveRootResult {
+        workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec![],
         },
@@ -1483,10 +1483,10 @@ fn project_remove_root_result_skips_none_next_buffer() {
 }
 
 #[test]
-fn project_activate_result_includes_last_buffer_id_when_set() {
-    use aether_protocol::project::ProjectActivateResult;
-    let r = ProjectActivateResult {
-        project: ProjectInfo {
+fn workspace_activate_result_includes_last_buffer_id_when_set() {
+    use aether_protocol::workspace::WorkspaceActivateResult;
+    let r = WorkspaceActivateResult {
+        workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec!["/p".into()],
         },
@@ -1669,7 +1669,7 @@ fn picker_item_git_change_is_tagged() {
         to_value(PickerKind::GitChangesFile).unwrap(),
         json!("git_changes_file")
     );
-    // Both changes pickers preserve state and centre on the cursor's hunk, but only the project one
+    // Both changes pickers preserve state and centre on the cursor's hunk, but only the workspace one
     // renders file headers — the buffer-locked file picker is a single, headerless file.
     assert!(
         PickerKind::GitChanges.preserves_state() && PickerKind::GitChangesFile.preserves_state()
@@ -1734,12 +1734,12 @@ fn picker_item_diagnostic_is_tagged() {
         json!("diagnostics")
     );
     assert_eq!(
-        to_value(PickerKind::DiagnosticsProject).unwrap(),
-        json!("diagnostics_project")
+        to_value(PickerKind::DiagnosticsWorkspace).unwrap(),
+        json!("diagnostics_workspace")
     );
-    // The project picker groups by file; the buffer-scoped one is flat (and centres on neither).
+    // The workspace picker groups by file; the buffer-scoped one is flat (and centres on neither).
     assert!(
-        PickerKind::DiagnosticsProject.groups_by_file()
+        PickerKind::DiagnosticsWorkspace.groups_by_file()
             && !PickerKind::Diagnostics.groups_by_file()
     );
     let item = PickerItem::Diagnostic {
@@ -2252,19 +2252,19 @@ fn picker_kind_explorer_is_snake_case() {
 }
 
 #[test]
-fn picker_kind_projects_is_snake_case() {
+fn picker_kind_workspaces_is_snake_case() {
     use aether_protocol::picker::PickerKind;
-    assert_eq!(to_value(PickerKind::Projects).unwrap(), json!("projects"));
+    assert_eq!(to_value(PickerKind::Workspaces).unwrap(), json!("workspaces"));
     assert_eq!(
-        from_value::<PickerKind>(json!("projects")).unwrap(),
-        PickerKind::Projects,
+        from_value::<PickerKind>(json!("workspaces")).unwrap(),
+        PickerKind::Workspaces,
     );
 }
 
 #[test]
-fn picker_item_project_is_tagged() {
+fn picker_item_workspace_is_tagged() {
     use aether_protocol::picker::PickerItem;
-    let item = PickerItem::Project {
+    let item = PickerItem::Workspace {
         name: "aether".into(),
         unsaved_buffers: 0,
         match_indices: vec![0, 4],
@@ -2273,14 +2273,14 @@ fn picker_item_project_is_tagged() {
     // `unsaved_buffers` is omitted when zero.
     assert_eq!(
         v,
-        json!({"kind": "project", "name": "aether", "match_indices": [0, 4]})
+        json!({"kind": "workspace", "name": "aether", "match_indices": [0, 4]})
     );
 }
 
 #[test]
-fn picker_item_project_carries_unsaved_count() {
+fn picker_item_workspace_carries_unsaved_count() {
     use aether_protocol::picker::PickerItem;
-    let item = PickerItem::Project {
+    let item = PickerItem::Workspace {
         name: "aether".into(),
         unsaved_buffers: 3,
         match_indices: vec![],
@@ -2288,7 +2288,7 @@ fn picker_item_project_carries_unsaved_count() {
     let v = to_value(&item).unwrap();
     assert_eq!(
         v,
-        json!({"kind": "project", "name": "aether", "unsaved_buffers": 3, "match_indices": []})
+        json!({"kind": "workspace", "name": "aether", "unsaved_buffers": 3, "match_indices": []})
     );
     // Round-trips back to the same value.
     let back: PickerItem = serde_json::from_value(v).unwrap();
@@ -2296,14 +2296,14 @@ fn picker_item_project_carries_unsaved_count() {
 }
 
 #[test]
-fn picker_select_result_project_is_tagged() {
+fn picker_select_result_workspace_is_tagged() {
     use aether_protocol::picker::PickerSelectResult;
-    let r = PickerSelectResult::Project {
+    let r = PickerSelectResult::Workspace {
         name: "aether".into(),
     };
     assert_eq!(
         to_value(&r).unwrap(),
-        json!({"kind": "project", "name": "aether"})
+        json!({"kind": "workspace", "name": "aether"})
     );
 }
 
