@@ -9,14 +9,14 @@
 //! - `ae -p NAME [PATH]`                 — open in a named project, overriding inference
 //!
 //! `edit` is the default command: a bare `ae` (or `ae file.rs`) runs it, so the common case needs
-//! no subcommand. The project is inferred from PATH (or the current directory) by matching against
-//! configured project roots; `-p/--project` overrides that, and `ae edit ...` is the explicit form
-//! for when a PATH would otherwise collide with the `server` subcommand name.
+//! no subcommand. With a PATH, the project is inferred by matching it against configured project
+//! roots; a bare `ae` (no PATH) opens the project picker rather than guessing from the working
+//! directory. `-p/--project` overrides inference, and `ae edit ...` is the explicit form for when a
+//! PATH would otherwise collide with the `server` subcommand name.
 //!
 //! iced owns the main thread and its own tokio runtime, so the GUI client is dispatched as a plain
 //! synchronous call; the server and terminal client are `async` and get a runtime built here.
 
-use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -58,8 +58,8 @@ struct EditArgs {
     tui: bool,
 
     /// Project name. Overrides inference — the named project must have a config at
-    /// `$XDG_CONFIG_HOME/aether/projects/<name>.toml`. Omit to infer the project from PATH (or, with
-    /// no PATH, from the current directory); with neither resolving, the project picker opens.
+    /// `$XDG_CONFIG_HOME/aether/projects/<name>.toml`. Omit to infer the project from PATH; with no
+    /// PATH (or a PATH outside every configured project), the project picker opens.
     #[arg(short = 'p', long)]
     project: Option<String>,
 
@@ -95,8 +95,8 @@ fn run_edit(edit: EditArgs, version: String) -> anyhow::Result<()> {
 /// inside exactly one project opens there; a path inside *several* is an error the user must
 /// disambiguate. A path inside *no* configured project is no longer an error — we return `None`,
 /// and the client opens the file directly in an ephemeral "(no project)" context (`ae /etc/hosts`).
-/// With no PATH, infer from the current directory but fall back to the picker (a bare `ae` in an
-/// unconfigured dir shouldn't be a hard error).
+/// With no PATH at all, we return `None` so a bare `ae` opens the project picker — the working
+/// directory is deliberately *not* used to guess a project (it only resolves relative file paths).
 fn resolve_project(edit: &EditArgs) -> anyhow::Result<Option<String>> {
     use aether_server::ProjectMatch;
 
@@ -116,11 +116,12 @@ fn resolve_project(edit: &EditArgs) -> anyhow::Result<Option<String>> {
         };
     }
 
-    let cwd = std::env::current_dir().context("determining the current directory")?;
-    match aether_server::infer_project_for_path(&cwd)? {
-        ProjectMatch::One(name) => Ok(Some(name)),
-        ProjectMatch::None | ProjectMatch::Ambiguous(_) => Ok(None),
-    }
+    // No `--project` and no path: open the project picker rather than guessing from the working
+    // directory. The working directory is only meaningful for resolving a relative *file* path
+    // (the `path` branch above, and the open-from-path overlay), not as a standalone project
+    // signal — a bare `ae` should land on the (recency-sorted) chooser regardless of where it's
+    // launched from.
+    Ok(None)
 }
 
 /// Decide whether to launch the GUI when the user didn't force a client. `--gui`/`--tui` win
@@ -191,4 +192,25 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_invocation_opens_the_picker_not_a_cwd_inferred_project() {
+        // No `--project` and no path → `None`, so the client opens the project chooser. The key
+        // guarantee: this branch never consults the working directory to guess a project.
+        assert_eq!(resolve_project(&EditArgs::default()).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_project_flag_wins() {
+        let edit = EditArgs {
+            project: Some("myproj".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_project(&edit).unwrap(), Some("myproj".to_string()));
+    }
 }
