@@ -6497,6 +6497,18 @@ pub async fn cursor_move(
             nav_anchor = anchor;
             pos
         }
+        // `p` / `Alt-p` (first non-blank of the next/previous line). Unlike the plain motions, an
+        // extending `Shift-p`/`Shift-Alt-p` re-anchors on a direction reversal across the pivot (see
+        // `extend_anchor`), so flipping direction grows the selection from the old cursor instead of
+        // collapsing it across the anchor. Routed through `nav_anchor` so it overrides the default
+        // keep-anchor path below.
+        Motion::LogicalLineFirstNonblank { .. } => {
+            let pos = motion::resolve_motion(buf, current.position, &params.motion);
+            if params.extend_selection {
+                nav_anchor = Some(extend_anchor(&current, pos));
+            }
+            pos
+        }
         _ => motion::resolve_motion(buf, current.position, &params.motion),
     };
     // A navigation motion that supplies its own anchor wins: `o`/`Alt-o` select the identifier, and

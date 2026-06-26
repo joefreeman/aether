@@ -2549,6 +2549,17 @@ async fn logical_line_first_nonblank_motion() {
     assert_eq!(st.anchor, p(1, 4));
     assert_eq!(st.position, p(2, 2));
 
+    // Flip: build a forward selection (anchor above, cursor below)…
+    set_cursor(&mut ws, 24, buffer_id, 2, 2).await;
+    let st = step(&mut ws, 25, buffer_id, motion(Direction::Forward, 1), true).await;
+    assert_eq!(st.anchor, p(2, 2));
+    assert_eq!(st.position, p(3, 0)); // forward selection [2, 3]
+    // …then reverse upward *past* the anchor in one move. Rather than collapsing across the pivot
+    // to [1, 2], the anchor flips to the old cursor (3,0) so the covered span grows to [1, 3].
+    let st = step(&mut ws, 26, buffer_id, motion(Direction::Backward, 2), true).await;
+    assert_eq!(st.anchor, p(3, 0));
+    assert_eq!(st.position, p(1, 4));
+
     drop(server);
 }
 

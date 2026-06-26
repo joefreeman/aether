@@ -603,8 +603,8 @@ static NORMAL: &[Binding] = &[
     bind!(N, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
     bind!(N, ch(','), Exact(Mods::NONE), A::CollapseSelection, "Selection", "Collapse selection"),
     bind!(N, ch(','), Exact(Mods::ALT), A::SwapAnchor, "Selection", "Swap cursor and anchor"),
-    bind!(N, ch('p'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
-    bind!(N, ch('p'), Exact(Mods::ALT), A::TreeContract, "Selection", "Contract selection to child syntax node"),
+    bind!(N, ch('q'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
+    bind!(N, ch('q'), Exact(Mods::ALT), A::TreeContract, "Selection", "Contract selection to child syntax node"),
     bind!(N, ch('z'), Exact(Mods::ALT), A::MotionRedo, "Selection", "Redo cursor/selection motion"),
     bind!(N, ch('z'), Exact(Mods::NONE), A::MotionUndo, "Selection", "Undo cursor/selection motion"),
     bind!(N, ch('.'), Exact(Mods::NONE), A::RepeatMotion, "Selection", "Repeat last motion"),
@@ -620,6 +620,8 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('k'), IgnoreShift(Mods::NONE), A::MoveLogicalLine(Direction::Backward), "Motion", "Logical line up"),
     bind!(N, ch('j'), IgnoreShift(Mods::ALT), A::MoveVisualLine(VerticalDirection::Down), "Motion", "Visual row down"),
     bind!(N, ch('j'), IgnoreShift(Mods::NONE), A::MoveLogicalLine(Direction::Forward), "Motion", "Logical line down"),
+    bind!(N, ch('p'), IgnoreShift(Mods::ALT), A::MoveLogicalLineFirstNonblank(Direction::Backward), "Motion", "First non-blank of previous line"),
+    bind!(N, ch('p'), IgnoreShift(Mods::NONE), A::MoveLogicalLineFirstNonblank(Direction::Forward), "Motion", "First non-blank of next line"),
     bind!(N, ch('0'), IgnoreShift(Mods::NONE), A::MoveLineStart, "Motion", "Logical line start"),
 
     // ---- motions: cursor half-page ----
@@ -1053,6 +1055,54 @@ mod tests {
         }
         .is_repeatable());
         assert!(!Action::RepeatMotion.is_repeatable());
+    }
+
+    #[test]
+    fn p_moves_to_line_first_nonblank_and_q_resizes_tree_selection() {
+        // `p` / `Alt-p` step to the first non-blank char of the next / previous line; Shift is the
+        // extend modifier (resolved at dispatch via `mods.shift`), so the binding still resolves
+        // under Shift to the same motion.
+        assert!(matches!(
+            lookup(KeyContext::Normal, ch('p'), Mods::NONE).map(|b| b.action),
+            Some(Action::MoveLogicalLineFirstNonblank(Direction::Forward))
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Normal, ch('p'), Mods::ALT).map(|b| b.action),
+            Some(Action::MoveLogicalLineFirstNonblank(Direction::Backward))
+        ));
+        assert!(matches!(
+            lookup(
+                KeyContext::Normal,
+                ch('p'),
+                Mods {
+                    shift: true,
+                    ..Mods::NONE
+                }
+            )
+            .map(|b| b.action),
+            Some(Action::MoveLogicalLineFirstNonblank(Direction::Forward))
+        ));
+        assert!(matches!(
+            lookup(
+                KeyContext::Normal,
+                ch('p'),
+                Mods {
+                    shift: true,
+                    ..Mods::ALT
+                }
+            )
+            .map(|b| b.action),
+            Some(Action::MoveLogicalLineFirstNonblank(Direction::Backward))
+        ));
+        // Tree expand / contract moved off `p` onto `q` / `Alt-q`.
+        assert!(matches!(
+            lookup(KeyContext::Normal, ch('q'), Mods::NONE).map(|b| b.action),
+            Some(Action::TreeExpand)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Normal, ch('q'), Mods::ALT).map(|b| b.action),
+            Some(Action::TreeContract)
+        ));
     }
 
     #[test]
