@@ -24,8 +24,8 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{GitApplyHunk, GitBlameLine, GitNavigateHunk, GitSetDiffView};
 use aether_protocol::input::{
-    EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputChangeLine, InputDedent,
-    InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
+    EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputChange, InputChangeLine,
+    InputDedent, InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
     InputNewlineAndIndent, InputOpenLine, InputReplaceLine, InputSurround, InputText,
     InputToggleComment, InputTransformCase, InputUnsurround,
 };
@@ -416,6 +416,7 @@ async fn dispatch(
         CursorRedo::NAME => run!(CursorRedo, handlers::cursor_redo),
         InputText::NAME => run!(InputText, handlers::input_text),
         InputDelete::NAME => run!(InputDelete, handlers::input_delete),
+        InputChange::NAME => run!(InputChange, handlers::input_change),
         InputBackspace::NAME => run!(InputBackspace, handlers::input_backspace),
         InputDeleteLine::NAME => run!(InputDeleteLine, handlers::input_delete_line),
         InputChangeLine::NAME => run!(InputChangeLine, handlers::input_change_line),

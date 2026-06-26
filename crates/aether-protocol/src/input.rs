@@ -57,6 +57,20 @@ impl RpcMethod for InputDelete {
     type Result = EditResult;
 }
 
+// ---- input/change -------------------------------------------------------------------------------
+
+/// Change the current selection: delete it, then the client enters Insert mode. Identical to
+/// `input/delete` *except* for whole-line selections (the line-oriented normal form: anchor at
+/// col 0, cursor on the trailing newline) — there it leaves one empty line to type into rather
+/// than deleting the final newline and joining onto the next line. A multi-line whole-line
+/// selection collapses to a single empty line. Normal-mode `Ctrl-a`.
+pub struct InputChange;
+impl RpcMethod for InputChange {
+    const NAME: &'static str = "input/change";
+    type Params = CountedEditParams;
+    type Result = EditResult;
+}
+
 // ---- counted edits --------------------------------------------------------------------------------
 
 /// Params for counted edits (`3J`, `3>`, `3u`, …): the repeat loop lives server-side, so a

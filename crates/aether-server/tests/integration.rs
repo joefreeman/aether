@@ -23,7 +23,8 @@ use aether_protocol::git::{
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
-    InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputDedent, InputIndent,
+    InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputDedent,
+    InputDelete, InputIndent,
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine,
     InputOpenLineParams, InputSurround, InputSurroundParams, InputText, InputTextParams,
     InputToggleComment, InputTransformCase, InputTransformCaseParams, InputUnsurround,
@@ -21543,3 +21544,194 @@ async fn sneak_big_word_selects_whole_run() {
     drop(server);
 }
 
+
+// ---- input/change (Normal-mode `Ctrl-a`) --------------------------------------------------------
+// `Change` shares `DeleteSelection`'s range *except* over a whole-line selection (the `x` normal
+// form: anchor at col 0, cursor on the trailing newline), where it keeps the final newline so you
+// land on an empty line to type into rather than joining onto the next line. The client flips to
+// Insert mode after the edit; these tests cover the server-side range/cursor outcome.
+
+/// `x Ctrl-a` on a single line blanks it and leaves the cursor on the now-empty line — the
+/// trailing newline survives, so the line below is untouched.
+#[tokio::test]
+async fn change_over_whole_line_selection_leaves_empty_line() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: LogicalPosition { line: 1, col: 0 },
+        },
+    )
+    .await;
+    // `x` — select the whole current line.
+    let sel: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(sel.anchor, LogicalPosition { line: 1, col: 0 });
+    assert_eq!(sel.position, LogicalPosition { line: 1, col: 4 }); // on the trailing newline
+
+    let r: EditResult =
+        send_request::<InputChange>(&mut ws, 12, &CountedEditParams { buffer_id, count: 1 }).await;
+    // Empty line kept; cursor collapsed to col 0 of it.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 0 });
+    assert_eq!(buffer_text(&mut ws, 13, buffer_id).await, "alpha\n\n");
+    drop(server);
+}
+
+/// Control for the above: `x Ctrl-d` over the same selection deletes the line *and* its newline,
+/// pulling the buffer up by a line. This is the existing behaviour we deliberately keep distinct
+/// from `Change`.
+#[tokio::test]
+async fn delete_over_whole_line_selection_removes_the_line() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: LogicalPosition { line: 1, col: 0 },
+        },
+    )
+    .await;
+    send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+            count: 1,
+        },
+    )
+    .await;
+    send_request::<InputDelete>(&mut ws, 12, &CountedEditParams { buffer_id, count: 1 }).await;
+    assert_eq!(buffer_text(&mut ws, 13, buffer_id).await, "alpha\n");
+    drop(server);
+}
+
+/// A multi-line whole-line selection collapses to a *single* empty line — only the last line's
+/// newline sits at the range end, so the interior newlines are deleted with the content.
+#[tokio::test]
+async fn change_over_multi_line_selection_collapses_to_one_empty_line() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
+    // Whole-line normal form spanning lines 0..=1 (anchor at col 0, cursor on line 1's newline).
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 4 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputChange>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "\ngamma\n");
+    drop(server);
+}
+
+/// `x Ctrl-a` on an empty line is a no-op that stays put (ready to type), while `x Ctrl-d` removes
+/// the line. Both run on the same buffer to show the divergence.
+#[tokio::test]
+async fn change_keeps_empty_line_while_delete_removes_it() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n\nbeta\n").await;
+    // An empty line at col 0 with no anchor *is* its own whole-line selection (cursor == anchor ==
+    // the line's normal form), which is exactly what `x` leaves you sitting on. Set it directly —
+    // pressing `x` again would advance off it (see `select_line_forward_on_empty_line_advances`).
+    let on_empty_line = CursorSetParams {
+        granularity: Granularity::Char,
+        buffer_id,
+        position: LogicalPosition { line: 1, col: 0 },
+        anchor: LogicalPosition { line: 1, col: 0 },
+    };
+
+    // Change: empty line preserved, cursor stays put.
+    send_request::<CursorSet>(&mut ws, 10, &on_empty_line).await;
+    let r: EditResult =
+        send_request::<InputChange>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "alpha\n\nbeta\n");
+
+    // Delete on the same empty line: it's gone.
+    send_request::<CursorSet>(&mut ws, 13, &on_empty_line).await;
+    send_request::<InputDelete>(&mut ws, 14, &CountedEditParams { buffer_id, count: 1 }).await;
+    assert_eq!(buffer_text(&mut ws, 15, buffer_id).await, "alpha\nbeta\n");
+    drop(server);
+}
+
+/// On the final line with no trailing newline there's nothing to preserve — the content is deleted
+/// and the now-empty last line remains to type into.
+#[tokio::test]
+async fn change_over_last_line_without_trailing_newline_leaves_empty_line() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: LogicalPosition { line: 1, col: 0 },
+        },
+    )
+    .await;
+    send_request::<CursorSelectLine>(
+        &mut ws,
+        11,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+            count: 1,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputChange>(&mut ws, 12, &CountedEditParams { buffer_id, count: 1 }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
+    assert_eq!(buffer_text(&mut ws, 13, buffer_id).await, "alpha\n");
+    drop(server);
+}
+
+/// Guard on the `anchor.col == 0` half of the predicate: a *partial* selection that happens to end
+/// on a newline (not whole-line) must still sweep the newline in and join — `Change` here behaves
+/// exactly like `Delete`.
+#[tokio::test]
+async fn change_over_partial_selection_ending_on_newline_still_joins() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+    // Anchor mid-line (col 2), cursor clamps onto line 0's trailing newline.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 5 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputChange>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "albeta\n");
+    drop(server);
+}

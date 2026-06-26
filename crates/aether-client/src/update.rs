@@ -43,8 +43,8 @@ use aether_protocol::git::{
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
-    InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChangeLine, InputDedent,
-    InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
+    InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputChangeLine,
+    InputDedent, InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
     InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams,
     InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams, InputText,
     InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
@@ -5240,7 +5240,7 @@ impl Session {
             A::ReplaceLineClipboard => read_clipboard_fx(PasteKind::Line),
             A::Change => {
                 self.mode = Mode::Insert;
-                self.edit::<InputDelete>(CountedEditParams {
+                self.edit::<InputChange>(CountedEditParams {
                     buffer_id,
                     count: 1,
                 })

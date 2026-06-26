@@ -7258,6 +7258,27 @@ pub async fn input_delete(
     Ok(last.expect("count.max(1) iterations"))
 }
 
+pub async fn input_change(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: CountedEditParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut last = None;
+    for _ in 0..params.count.max(1) {
+        last = Some(
+            apply_edit(
+                state,
+                client_id,
+                params.buffer_id,
+                EditKind::ChangeSelection,
+            )
+            .await?,
+        );
+    }
+    Ok(last.expect("count.max(1) iterations"))
+}
+
 pub async fn input_backspace(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -9301,6 +9322,11 @@ enum EditKind {
     /// `position`. Used by Normal-mode `Ctrl-d` / `Delete` / `Ctrl-c`, and by Insert-mode
     /// `Delete` (forward).
     DeleteSelection,
+    /// Change the current selection (Normal-mode `Ctrl-a`): same range as `DeleteSelection`,
+    /// except a whole-line selection (the line-oriented normal form — anchor at col 0, cursor on
+    /// the trailing newline) keeps its final newline, leaving one empty line to type into rather
+    /// than joining onto the next line. The client enters Insert mode after the edit.
+    ChangeSelection,
     /// Delete the char immediately before `cursor.position` and leave the cursor there. Used
     /// by Insert-mode `Backspace` — there's no meaningful selection in Insert mode and "delete
     /// the previous char" is its own gesture.
@@ -9422,6 +9448,29 @@ async fn apply_edit(
             let ec = motion::pos_to_char(buf, hi)
                 .saturating_add(1)
                 .min(buf.text.len_chars());
+            EditRange {
+                start_char: sc,
+                end_char: ec,
+                first_line: lo.line,
+                last_line: hi.line,
+            }
+        }
+        EditKind::ChangeSelection => {
+            let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
+            let sc = motion::pos_to_char(buf, lo);
+            let mut ec = motion::pos_to_char(buf, hi)
+                .saturating_add(1)
+                .min(buf.text.len_chars());
+            // Whole-line selection (the line-oriented normal form): it starts at col 0 and its
+            // cursor sits on a line's trailing newline — `pos_to_char` clamps col to the line's
+            // content, so `ec - 1` is exactly that newline char. A *change* over whole lines
+            // should leave one empty line to type into rather than deleting the final newline and
+            // joining onto the next line, so drop it from the range. Multi-line whole-line
+            // selections collapse to a single empty line for free: only the last line's newline is
+            // at `ec`, and the interior newlines are deleted along with the content.
+            if lo.col == 0 && ec > sc && buf.text.char(ec - 1) == '\n' {
+                ec -= 1;
+            }
             EditRange {
                 start_char: sc,
                 end_char: ec,
@@ -9588,6 +9637,7 @@ async fn apply_edit(
         ),
         EditKind::ReplaceLine { text } => (Cow::Borrowed(text.as_str()), PostEdit::PointAfter),
         EditKind::DeleteSelection
+        | EditKind::ChangeSelection
         | EditKind::Backspace
         | EditKind::DeleteLine
         | EditKind::ChangeLine => (Cow::Borrowed(""), PostEdit::PointAfter),
@@ -9665,6 +9715,7 @@ async fn apply_edit(
         | EditKind::ReplaceLine { .. }
         | EditKind::AdjustNumber { .. } => EditKindTag::Text,
         EditKind::DeleteSelection
+        | EditKind::ChangeSelection
         | EditKind::Backspace
         | EditKind::DeleteLine
         | EditKind::ChangeLine => EditKindTag::Delete,
