@@ -7,14 +7,195 @@
 //!   to the user cache dir (`~/Library/Caches/aether/` on macOS), which is the right home for
 //!   per-machine-session bookkeeping that needn't survive a reboot.
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// Fixed loopback port. Single-instance: only one server can bind it. The canonical definition
-/// (shared with the clients, which hard-code it) lives in `aether_protocol`.
+/// The default profile's port. Named profiles get an allocated port (see [`PORT_BAND`]); the
+/// default profile keeps the well-known port for back-compat. The canonical constant lives in
+/// `aether_protocol` (the clients reference it too).
 pub use aether_protocol::SERVER_PORT;
+
+/// The name of the implicit profile used when none is selected.
+pub const DEFAULT_PROFILE: &str = "default";
+
+/// Band that named profiles allocate their (recorded, reused) port from. Deliberately *below* the
+/// OS ephemeral range so a recorded port doesn't clash with transient outbound sockets later — see
+/// `docs/profiles.md`.
+const PORT_BAND: std::ops::RangeInclusive<u16> = 2385..=2484;
+
+/// How long an auto-started server stays up with no clients before idle-reaping, unless the profile
+/// overrides it via `idle_timeout_secs`. Long enough to ride out swapping one client for another;
+/// a `dev` profile typically sets something much shorter. `ae server` (explicit) ignores this and
+/// runs persistently.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// The active profile for this process, set once at startup from `--profile`/`AETHER_PROFILE`. One
+/// process serves exactly one profile (the singleton is per-profile), so a process-global is the
+/// right shape — every path helper reads it rather than threading a parameter through every caller.
+static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
+
+/// Select the active profile for this process. Call once, early in `main`, before any path helper.
+/// Subsequent calls are ignored (a process never switches profiles).
+pub fn set_active_profile(name: String) {
+    let _ = ACTIVE_PROFILE.set(name);
+}
+
+/// The active profile name (`"default"` until [`set_active_profile`] runs).
+pub fn active_profile() -> &'static str {
+    ACTIVE_PROFILE.get().map(String::as_str).unwrap_or(DEFAULT_PROFILE)
+}
+
+/// `<config>/aether` — the root holding `profiles/` (and, pre-migration, the legacy layout).
+fn aether_config_dir() -> anyhow::Result<PathBuf> {
+    let base = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
+    Ok(base.config_dir().join("aether"))
+}
+
+/// `<config>/aether/profiles` — the parent of every profile's subtree.
+pub fn profiles_dir() -> anyhow::Result<PathBuf> {
+    Ok(aether_config_dir()?.join("profiles"))
+}
+
+/// The active profile's config subtree: `<config>/aether/profiles/<name>/`. Everything durable
+/// (settings, sessions, project configs, `profile.toml`) lives under here.
+fn profile_config_dir() -> anyhow::Result<PathBuf> {
+    Ok(profiles_dir()?.join(active_profile()))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProfileConfig {
+    port: u16,
+    /// Override for the auto-start idle timeout (seconds). Hand-editable; absent ⇒
+    /// [`DEFAULT_IDLE_TIMEOUT_SECS`]. A `dev` profile sets this short so a stopped client's
+    /// auto-started server reaps quickly. Does not affect an explicit `ae server` (always persistent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idle_timeout_secs: Option<u64>,
+}
+
+fn profile_config_path() -> anyhow::Result<PathBuf> {
+    Ok(profile_config_dir()?.join("profile.toml"))
+}
+
+/// Resolve the active profile's port, creating the profile (allocating + recording a port) on first
+/// use. The `default` profile is pinned to [`SERVER_PORT`]; named profiles get the lowest free port
+/// in [`PORT_BAND`], recorded once and reused forever (a stable URL for the web client). The
+/// `create_new` write guards the first-use race between a client and the server it spawns — the
+/// loser just reads the winner's recorded port.
+pub fn ensure_profile_port() -> anyhow::Result<u16> {
+    let path = profile_config_path()?;
+    if let Some(cfg) = read_profile_config(&path)? {
+        return Ok(cfg.port);
+    }
+    let port = if active_profile() == DEFAULT_PROFILE {
+        SERVER_PORT
+    } else {
+        allocate_port()?
+    };
+    std::fs::create_dir_all(profile_config_dir()?)?;
+    let body = toml::to_string(&ProfileConfig {
+        port,
+        idle_timeout_secs: None,
+    })?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(body.as_bytes())?;
+            Ok(port)
+        }
+        // Lost the creation race — adopt whatever the winner recorded.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_profile_config(&path)?
+            .map(|c| c.port)
+            .ok_or_else(|| anyhow!("profile config vanished after creation race")),
+        Err(e) => Err(e).context("writing profile.toml"),
+    }
+}
+
+/// The active profile's auto-start idle timeout, in seconds: its `idle_timeout_secs` if set, else
+/// [`DEFAULT_IDLE_TIMEOUT_SECS`]. The client's auto-start passes this to the spawned server.
+pub fn profile_idle_timeout_secs() -> anyhow::Result<u64> {
+    Ok(read_profile_config(&profile_config_path()?)?
+        .and_then(|c| c.idle_timeout_secs)
+        .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS))
+}
+
+fn read_profile_config(path: &Path) -> anyhow::Result<Option<ProfileConfig>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(toml::from_str(&s).with_context(|| {
+            format!("parsing profile config at {}", path.display())
+        })?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Lowest free port in [`PORT_BAND`] not already recorded by another profile. "Free" is checked by a
+/// throwaway bind — advisory only (the port can be taken later), which the server's bind handles by
+/// failing loudly. Skipping already-recorded ports keeps two new profiles from grabbing the same one.
+fn allocate_port() -> anyhow::Result<u16> {
+    let taken = recorded_ports()?;
+    for port in PORT_BAND {
+        if taken.contains(&port) {
+            continue;
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    bail!(
+        "no free port available in {}..={} for a new profile",
+        PORT_BAND.start(),
+        PORT_BAND.end()
+    );
+}
+
+/// Ports recorded by all existing profiles (for allocation and `profiles list`).
+fn recorded_ports() -> anyhow::Result<std::collections::HashSet<u16>> {
+    Ok(list_profiles()?.into_iter().map(|p| p.port).collect())
+}
+
+/// A profile and its recorded port, for `ae profiles list`.
+#[derive(Debug, Clone)]
+pub struct ProfileEntry {
+    pub name: String,
+    pub port: u16,
+}
+
+/// Enumerate existing profiles (a `profiles/<name>/profile.toml` each), sorted by name. Empty when
+/// nothing's been created yet.
+pub fn list_profiles() -> anyhow::Result<Vec<ProfileEntry>> {
+    list_profiles_at(&profiles_dir()?)
+}
+
+fn list_profiles_at(dir: &Path) -> anyhow::Result<Vec<ProfileEntry>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut out: Vec<ProfileEntry> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(cfg) = read_profile_config(&entry.path().join("profile.toml"))? {
+            out.push(ProfileEntry {
+                name,
+                port: cfg.port,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
 
 pub use aether_protocol::settings::AppSettings;
 
@@ -28,12 +209,6 @@ pub struct ProjectConfig {
     pub paths: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeInfo {
-    pub pid: u32,
-    pub port: u16,
-    pub started_at_unix_ms: u64,
-}
 
 pub fn load_project(name: &str) -> anyhow::Result<ProjectConfig> {
     let path = project_config_path(name)?;
@@ -47,21 +222,16 @@ pub fn load_project(name: &str) -> anyhow::Result<ProjectConfig> {
 }
 
 pub fn project_config_path(name: &str) -> anyhow::Result<PathBuf> {
-    let base = directories::BaseDirs::new()
-        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
-    Ok(base
-        .config_dir()
-        .join("aether")
+    Ok(profile_config_dir()?
         .join("projects")
         .join(format!("{name}.toml")))
 }
 
-/// Path to the global application-settings file (`$XDG_CONFIG_HOME/aether/settings.toml`). One file
-/// per machine, independent of which project is active — see `aether_protocol::settings`.
+/// Path to the active profile's application-settings file
+/// (`…/profiles/<profile>/settings.toml`). One file per profile, independent of which project is
+/// active within it — see `aether_protocol::settings`.
 pub fn app_settings_path() -> anyhow::Result<PathBuf> {
-    let base = directories::BaseDirs::new()
-        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
-    Ok(base.config_dir().join("aether").join("settings.toml"))
+    Ok(profile_config_dir()?.join("settings.toml"))
 }
 
 /// Load the application settings. A missing file is not an error — a fresh install has no
@@ -141,9 +311,7 @@ pub struct ProjectSessions {
 /// (`$XDG_CONFIG_HOME/aether/sessions.json`). One file for all projects so the switcher can read
 /// every recency stamp in one go. JSON (not TOML) signals "machine-managed, don't hand-edit".
 pub fn project_sessions_path() -> anyhow::Result<PathBuf> {
-    let base = directories::BaseDirs::new()
-        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
-    Ok(base.config_dir().join("aether").join("sessions.json"))
+    Ok(profile_config_dir()?.join("sessions.json"))
 }
 
 /// Load the project-session file. A missing file is not an error — a fresh install has none, so we
@@ -214,9 +382,7 @@ pub fn sort_names_by_recency(names: &mut [String], sessions: &ProjectSessions) {
 
 /// Directory containing the per-project `.toml` configs. Used by `list_project_names`.
 pub fn projects_dir() -> anyhow::Result<PathBuf> {
-    let base = directories::BaseDirs::new()
-        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
-    Ok(base.config_dir().join("aether").join("projects"))
+    Ok(profile_config_dir()?.join("projects"))
 }
 
 /// Enumerate the configured project names by scanning `*.toml` files in `projects_dir`. The
@@ -350,15 +516,23 @@ pub fn runtime_info_path() -> anyhow::Result<PathBuf> {
     // `runtime_dir()` is `Some` only where `$XDG_RUNTIME_DIR` is set (Linux/BSD). Elsewhere
     // (notably macOS) fall back to the cache dir — the runtime file is disposable session state.
     let dir = base.runtime_dir().unwrap_or_else(|| base.cache_dir());
-    Ok(dir.join("aether").join("server.json"))
+    // Per-profile: each profile's server is its own singleton, keyed by its own pid file.
+    Ok(dir
+        .join("aether")
+        .join(active_profile())
+        .join("server.json"))
 }
 
-pub fn write_runtime_info(path: &Path, info: &RuntimeInfo) -> anyhow::Result<()> {
+/// Write the running server's pid to its runtime file (0600). The file is the per-profile singleton
+/// marker: its presence with a live pid means a server already owns this profile. It holds only the
+/// pid — the port now lives in the profile config, and restart detection (`server_started_at`)
+/// flows from `ServerState` over the wire, not from here. If a start time is ever needed, the
+/// file's own mtime stands in.
+pub fn write_runtime_pid(path: &Path, pid: u32) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating runtime dir {}", parent.display()))?;
     }
-    let json = serde_json::to_string_pretty(info)?;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
@@ -368,13 +542,25 @@ pub fn write_runtime_info(path: &Path, info: &RuntimeInfo) -> anyhow::Result<()>
         .mode(0o600)
         .open(path)
         .with_context(|| format!("creating runtime file {}", path.display()))?;
-    file.write_all(json.as_bytes())?;
+    file.write_all(pid.to_string().as_bytes())?;
     Ok(())
 }
 
-pub fn read_runtime_info(path: &Path) -> anyhow::Result<RuntimeInfo> {
+pub fn read_runtime_pid(path: &Path) -> anyhow::Result<u32> {
     let content = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content)?)
+    content
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("parsing pid from runtime file {}", path.display()))
+}
+
+/// The pid of the running server for the active profile, or `None` when none is running — no pid
+/// file, or it names a dead process. Drives `ae server stop`.
+pub fn running_server_pid() -> anyhow::Result<Option<u32>> {
+    match read_runtime_pid(&runtime_info_path()?) {
+        Ok(pid) if pid_is_alive(pid) => Ok(Some(pid)),
+        _ => Ok(None),
+    }
 }
 
 /// Whether a process with the given pid is currently alive. Portable across Linux and macOS:
@@ -556,12 +742,68 @@ mod tests {
     fn runtime_info_path_resolves_without_xdg_runtime_dir() {
         // The whole point of the macOS fix: this must not error when `$XDG_RUNTIME_DIR` is unset.
         // We can't reliably unset it here (other tests/threads share the env), so just assert the
-        // path resolves and lands under our `aether/server.json` regardless of which base was used.
+        // path resolves and lands under our per-profile `aether/<profile>/server.json` regardless of
+        // which base was used. (`active_profile()` is `default` unless a test set it.)
         let path = runtime_info_path().expect("runtime_info_path should never fail on a fallback");
         assert!(
-            path.ends_with("aether/server.json"),
+            path.ends_with("server.json") && path.to_string_lossy().contains("/aether/"),
             "unexpected path: {}",
             path.display()
+        );
+    }
+
+    #[test]
+    fn list_profiles_reads_recorded_ports_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("profiles");
+        for (name, port) in [("dev", 2385u16), ("default", SERVER_PORT)] {
+            let p = profiles.join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(
+                p.join("profile.toml"),
+                toml::to_string(&ProfileConfig {
+                    port,
+                    idle_timeout_secs: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        // A directory with no profile.toml is ignored.
+        std::fs::create_dir_all(profiles.join("garbage")).unwrap();
+
+        let got = list_profiles_at(&profiles).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].name.as_str(), got[0].port), ("default", SERVER_PORT));
+        assert_eq!((got[1].name.as_str(), got[1].port), ("dev", 2385));
+    }
+
+    #[test]
+    fn profile_idle_timeout_parses_overrides_and_omits_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        // No override → None (the caller falls back to DEFAULT_IDLE_TIMEOUT_SECS).
+        let bare = dir.path().join("bare.toml");
+        std::fs::write(&bare, "port = 2384\n").unwrap();
+        assert_eq!(
+            read_profile_config(&bare).unwrap().unwrap().idle_timeout_secs,
+            None
+        );
+        // Hand-edited override is honoured.
+        let custom = dir.path().join("custom.toml");
+        std::fs::write(&custom, "port = 2385\nidle_timeout_secs = 15\n").unwrap();
+        assert_eq!(
+            read_profile_config(&custom).unwrap().unwrap().idle_timeout_secs,
+            Some(15)
+        );
+        // Writing with None keeps the file minimal (no empty/null key).
+        let body = toml::to_string(&ProfileConfig {
+            port: 2384,
+            idle_timeout_secs: None,
+        })
+        .unwrap();
+        assert!(
+            !body.contains("idle_timeout_secs"),
+            "None should be omitted, got: {body}"
         );
     }
 

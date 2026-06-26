@@ -184,6 +184,8 @@ pub struct Shell {
     /// A fatal boot error (e.g. the named project doesn't exist) — surfaced as the run's `Err`
     /// after the loop unwinds and the terminal is restored.
     fatal: Option<String>,
+    /// The (profile-resolved) WebSocket address every boot dial and reconnect dials.
+    server_url: String,
 }
 
 pub async fn run(
@@ -191,6 +193,7 @@ pub async fn run(
     project: Option<String>,
     file: Option<String>,
     version: String,
+    server_url: String,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
     tokio::spawn(async move {
@@ -243,6 +246,7 @@ pub async fn run(
         }),
         boot_attempt: 0,
         fatal: None,
+        server_url,
     };
 
     // Kick the boot dial; no subscribe yet (no buffer until it lands).
@@ -1345,8 +1349,9 @@ impl Shell {
         };
         let attempt = self.boot_attempt;
         let (cols, rows) = self.term;
+        let server_url = self.server_url.clone();
         self.pending.push(Box::pin(async move {
-            Done::Booted(Box::new(boot_dial(attempt, spec, cols, rows).await))
+            Done::Booted(Box::new(boot_dial(attempt, spec, cols, rows, server_url).await))
         }));
     }
 
@@ -1357,10 +1362,11 @@ impl Shell {
         let transient = self.session.buffer.transient;
         let cursor = self.session.buffer.cursor.position;
         let version = env!("CARGO_PKG_VERSION").to_string();
+        let server_url = self.server_url.clone();
         self.pending.push(Box::pin(async move {
             Done::Reconnected(Box::new(
                 dial(
-                    attempt, project, path, buffer_id, transient, cursor, version,
+                    attempt, project, path, buffer_id, transient, cursor, version, server_url,
                 )
                 .await,
             ))
@@ -1954,12 +1960,12 @@ async fn boot_dial(
     spec: BootSpec,
     cols: u16,
     rows: u16,
+    server_url: String,
 ) -> Result<Booted, ReconnectError> {
     if attempt > 0 {
         tokio::time::sleep(reconnect_backoff(attempt)).await;
     }
-    let url = aether_protocol::default_server_url();
-    let (handle, notifications) = crate::connection::connect(&url, &spec.version)
+    let (handle, notifications) = crate::connection::connect(&server_url, &spec.version)
         .await
         .map_err(|_| ReconnectError::NotUp)?;
     let (session, state, startup) = bootstrap(
@@ -1980,7 +1986,7 @@ async fn boot_dial(
     })
 }
 
-/// One paced reconnect attempt: back off, dial the fixed address, restore.
+/// One paced reconnect attempt: back off, dial the server, restore.
 #[allow(clippy::too_many_arguments)]
 async fn dial(
     attempt: u32,
@@ -1990,12 +1996,12 @@ async fn dial(
     transient: bool,
     cursor: aether_protocol::LogicalPosition,
     version: String,
+    server_url: String,
 ) -> Result<Reestablished, ReconnectError> {
     use aether_protocol::buffer::{BufferOpen, BufferOpenParams};
     use aether_protocol::project::{ProjectActivate, ProjectActivateParams};
 
     tokio::time::sleep(reconnect_backoff(attempt)).await;
-    let server_url = aether_protocol::default_server_url();
     let (handle, notifications) = crate::connection::connect(&server_url, &version)
         .await
         .map_err(|_| ReconnectError::NotUp)?;

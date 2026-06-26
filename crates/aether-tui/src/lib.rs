@@ -28,13 +28,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{stdout, Stdout};
 
-/// Run the terminal client to completion. `project`/`file` are the (optional) CLI positionals and
-/// `version` is the handshake version string; the caller (`ae`) parses these and provides the
-/// tokio runtime this is awaited on.
+/// Run the terminal client to completion. `project`/`file` are the (optional) CLI positionals,
+/// `version` is the handshake version string, and `server_url` is the (profile-resolved) WebSocket
+/// address to dial; the caller (`ae`) parses these and provides the tokio runtime this is awaited on.
 pub async fn run(
     project: Option<String>,
     file: Option<String>,
     version: String,
+    server_url: String,
 ) -> anyhow::Result<()> {
     // Capture stderr for the lifetime of the program so log/panic/library output never lands
     // mid-frame on the alt-screen TUI. The capture is replayed to the real stderr on drop, which
@@ -55,10 +56,10 @@ pub async fn run(
     install_panic_hook();
 
     // Launch connectionless: the editor chrome comes up immediately in a `Connecting` state
-    // (status row showing "Connecting…", client-side keys live) and `run` dials the fixed loopback
-    // address from within — no discovery file — so the client can start before the daemon and
-    // waits for it without leaving the editor. The boot dial installs the session once it lands.
-    let run_result = shell::run(&mut terminal, project, file, version).await;
+    // (status row showing "Connecting…", client-side keys live) and `run` dials `server_url` from
+    // within — so the client can start before the daemon and waits for it without leaving the
+    // editor. The boot dial installs the session once it lands.
+    let run_result = shell::run(&mut terminal, project, file, version, server_url).await;
     restore_terminal(&mut terminal)?;
     run_result
 }

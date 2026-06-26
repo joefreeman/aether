@@ -77,6 +77,8 @@ pub struct ConnectingBootstrap {
     pub project: Option<String>,
     pub file: Option<String>,
     pub client_version: String,
+    /// The (profile-resolved) WebSocket address every dial and reconnect targets.
+    pub server_url: String,
 }
 
 /// The live connection and opened buffer for the window's session.
@@ -85,6 +87,7 @@ pub struct SessionBootstrap {
     pub handle: Handle,
     pub notifications: NotifRx,
     pub client_version: String,
+    pub server_url: String,
     /// The daemon's start stamp, learned from the `project/activate` result — reconnects compare
     /// it to tell "same daemon, connection blipped" from "daemon restarted" (where unsaved buffer
     /// state died with it).
@@ -107,6 +110,7 @@ pub struct ChooseBootstrap {
     pub handle: Handle,
     pub notifications: NotifRx,
     pub client_version: String,
+    pub server_url: String,
     pub server_started_at: u64,
 }
 
@@ -337,6 +341,8 @@ pub struct App {
     handle: Handle,
     notifications: NotifRx,
     client_version: String,
+    /// The (profile-resolved) WebSocket address every boot dial and reconnect dials.
+    server_url: String,
     /// The connected daemon instance's start stamp (see [`TabBootstrap::server_started_at`]).
     server_started_at: u64,
     cell: Option<Size>,
@@ -404,6 +410,7 @@ impl App {
                      handle: Handle,
                      notifications: NotifRx,
                      client_version: String,
+                     server_url: String,
                      server_started_at: u64| App {
             boot,
             boot_args: None,
@@ -411,6 +418,7 @@ impl App {
             handle,
             notifications,
             client_version,
+            server_url,
             server_started_at,
             cell: None,
             view_size: Size::ZERO,
@@ -453,6 +461,7 @@ impl App {
                     crate::connection::dummy_handle(),
                     crate::connection::dummy_notifications(),
                     args.client_version.clone(),
+                    args.server_url.clone(),
                     0,
                 );
                 app.boot_args = Some(args.clone());
@@ -470,6 +479,7 @@ impl App {
                     b.handle,
                     b.notifications,
                     b.client_version,
+                    b.server_url,
                     b.server_started_at,
                 );
                 let startup_task = app.run_core(startup);
@@ -522,6 +532,7 @@ impl App {
                         b.handle,
                         b.notifications,
                         b.client_version,
+                        b.server_url,
                         b.server_started_at,
                     ),
                     Task::batch([pump, view]),
@@ -1096,10 +1107,10 @@ impl App {
     /// `project/activate` establishes the baseline (nothing is open to lose in the meantime).
     fn boot_reconnect(&self) -> Task<Message> {
         let version = self.client_version.clone();
+        let server_url = self.server_url.clone();
         Task::perform(
             async move {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let server_url = aether_protocol::default_server_url();
                 let (handle, rx) = crate::connection::connect(&server_url, &version)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -2011,6 +2022,7 @@ impl App {
             return Task::none();
         }
         let version = self.client_version.clone();
+        let server_url = self.server_url.clone();
         let project = s.project.clone();
         let path = s.buffer.path.clone();
         let buffer_id = s.buffer.buffer_id;
@@ -2019,7 +2031,6 @@ impl App {
         self.task(
             async move {
                 tokio::time::sleep(reconnect_backoff(attempt)).await;
-                let server_url = aether_protocol::default_server_url();
                 let (handle, rx) = crate::connection::connect(&server_url, &version)
                     .await
                     .map_err(|_| ReconnectError::NotUp)?;
@@ -4427,7 +4438,7 @@ fn spawn_connect_delayed(args: ConnectingBootstrap) -> Task<Message> {
 /// open the file / MRU buffer, or (without one) hand back a bare connection for the chooser.
 /// Returns the connected [`Bootstrap`] to install, or an error string to retry / surface.
 async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, String> {
-    let base_url = aether_protocol::default_server_url();
+    let base_url = args.server_url.clone();
     let (handle, rx) = crate::connection::connect(&base_url, &args.client_version)
         .await
         .map_err(|e| e.to_string())?;
@@ -4457,6 +4468,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
                 handle,
                 notifications,
                 client_version: args.client_version,
+                server_url: args.server_url,
                 server_started_at: opened.server_started_at,
                 project: opened.project.name,
                 buffer: buffer_info(open, &project_paths),
@@ -4469,6 +4481,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
             handle,
             notifications,
             client_version: args.client_version,
+            server_url: args.server_url,
             server_started_at: 0,
         }));
     };
@@ -4543,6 +4556,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
         handle,
         notifications,
         client_version: args.client_version,
+        server_url: args.server_url,
         server_started_at,
         project: activated.project.name,
         buffer: buffer_info(open, &project_paths),

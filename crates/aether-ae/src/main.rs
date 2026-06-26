@@ -22,11 +22,11 @@
 //! iced owns the main thread and its own tokio runtime, so the GUI client is dispatched as a plain
 //! synchronous call; the server and terminal client are `async` and get a runtime built here.
 
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "ae", version, about = "Aether editor")]
-#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -34,6 +34,12 @@ struct Cli {
     /// Arguments for the default `edit` command, used when no subcommand is given.
     #[command(flatten)]
     edit: EditArgs,
+
+    /// Profile (separate instance) to use: its own config, sessions, and server on its own port —
+    /// like browser profiles, e.g. a `dev` instance alongside your daily one. Defaults to
+    /// `default`; also read from `AETHER_PROFILE`. See `docs/profiles.md`.
+    #[arg(short = 'P', long, global = true, env = "AETHER_PROFILE")]
+    profile: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -42,6 +48,20 @@ enum Command {
     Server(ServerArgs),
     /// Open files in a client (the default when no subcommand is given).
     Edit(EditArgs),
+    /// Manage profiles (separate instances).
+    Profiles(ProfilesArgs),
+}
+
+#[derive(Args, Debug)]
+struct ProfilesArgs {
+    #[command(subcommand)]
+    command: ProfilesCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProfilesCommand {
+    /// List profiles and their ports.
+    List,
 }
 
 #[derive(Args, Debug)]
@@ -57,6 +77,15 @@ struct ServerArgs {
     /// not a user-facing knob.
     #[arg(long, value_name = "SECS", hide = true)]
     idle_timeout: Option<u64>,
+
+    #[command(subcommand)]
+    command: Option<ServerCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServerCommand {
+    /// Stop the running server for this profile.
+    Stop,
 }
 
 #[derive(Args, Debug, Default)]
@@ -85,64 +114,99 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let version = env!("CARGO_PKG_VERSION").to_string();
 
+    // Pin the profile for this whole process *before* anything resolves a config path or a port.
+    aether_server::set_active_profile(
+        cli.profile
+            .clone()
+            .unwrap_or_else(|| aether_server::DEFAULT_PROFILE.to_string()),
+    );
+
     match cli.command {
         Some(Command::Server(args)) => run_server(args),
         Some(Command::Edit(edit)) => run_edit(edit, version),
+        Some(Command::Profiles(args)) => run_profiles(args),
         None => run_edit(cli.edit, version),
     }
 }
 
-/// Run the default `edit` command: resolve the project (explicit, inferred, or picker), make sure a
-/// server is up to talk to, then launch the terminal or GUI client.
+/// Run the default `edit` command: resolve the project (explicit, inferred, or picker), resolve the
+/// active profile's port (creating the profile on first use), make sure a server is up on it, then
+/// launch the terminal or GUI client pointed at it.
 fn run_edit(edit: EditArgs, version: String) -> anyhow::Result<()> {
     let project = resolve_project(&edit)?;
-    ensure_server_running();
+    let port = aether_server::ensure_profile_port()?;
+    let idle_timeout_secs = aether_server::profile_idle_timeout_secs()?;
+    ensure_server_running(port, idle_timeout_secs);
+    let server_url = format!("ws://127.0.0.1:{port}");
     if want_gui(&edit) {
-        run_gui(project, edit.path, version)
+        run_gui(project, edit.path, version, server_url)
     } else {
-        run_tui(project, edit.path, version)
+        run_tui(project, edit.path, version, server_url)
     }
 }
 
-/// Idle timeout handed to an auto-started server. Long enough to ride out closing one client and
-/// opening another (e.g. swapping the TUI for the GUI) so the live server — and its in-memory undo
-/// and unsaved edits — survives the hop; short enough that a forgotten server doesn't linger. A
-/// user-run `ae server` ignores this and stays up permanently.
-const AUTOSTART_IDLE_TIMEOUT_SECS: u64 = 300;
+/// `ae profiles list` — show each profile, its recorded port, and whether its server is up.
+fn run_profiles(args: ProfilesArgs) -> anyhow::Result<()> {
+    match args.command {
+        ProfilesCommand::List => {
+            let profiles = aether_server::list_profiles()?;
+            if profiles.is_empty() {
+                println!("no profiles yet — one is created on first use");
+                return Ok(());
+            }
+            for p in profiles {
+                let status = if server_is_up(p.port) {
+                    "running"
+                } else {
+                    "stopped"
+                };
+                println!("{:<16} port {}  {status}", p.name, p.port);
+            }
+            Ok(())
+        }
+    }
+}
 
-/// Make sure a server is listening before we launch a client. The client connects with retry, so we
-/// only need to *start* one if none is up: probe the fixed port, and if nothing answers, spawn a
-/// detached, idle-reapable `ae server`. The spawned server outlives this client (and any later one)
-/// until it idle-reaps itself. A lost race — two clients each spawning, or a stale server still
-/// holding the port — is harmless: the redundant server fails to bind the singleton port and exits.
-/// Best-effort: on failure we warn and let the client's connect loop surface the unreachable server.
-fn ensure_server_running() {
-    if server_is_up() {
+/// Make sure a server is listening on `port` before we launch a client. The client connects with
+/// retry, so we only need to *start* one if none is up: probe the port, and if nothing answers,
+/// spawn a detached, idle-reapable `ae server` for the active profile (reaping after
+/// `idle_timeout_secs`, the profile's setting). The spawned server outlives this client (and any
+/// later one) until it idle-reaps itself. A lost race — two clients each spawning, or a stale
+/// process holding the port — is harmless: the redundant server fails to bind and exits.
+/// Best-effort: on failure we warn and let the client's connect loop surface it.
+fn ensure_server_running(port: u16, idle_timeout_secs: u64) {
+    if server_is_up(port) {
         return;
     }
-    if let Err(e) = spawn_detached_server() {
+    if let Err(e) = spawn_detached_server(idle_timeout_secs) {
         eprintln!("warning: could not auto-start the aether server ({e}); is one running?");
     }
 }
 
-/// Whether something is already listening on the server's loopback port. A short connect probe is
-/// enough — a stale/foreign listener is caught later by the WebSocket version gate, not here.
-fn server_is_up() -> bool {
+/// Whether something is already listening on `port`. A short connect probe is enough — a
+/// stale/foreign listener is caught later by the WebSocket version gate, not here.
+fn server_is_up(port: u16) -> bool {
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, aether_server::SERVER_PORT));
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
 }
 
-/// Spawn `ae server --idle-timeout N` from our own executable, detached so it outlives this client
-/// and is insulated from the controlling terminal (no SIGINT on Ctrl-C, no SIGHUP on terminal
-/// close). stdio goes to the void — a user who wants server logs runs `ae server` by hand.
-fn spawn_detached_server() -> std::io::Result<()> {
+/// Spawn `ae --profile <name> server --idle-timeout N` from our own executable, detached so it
+/// outlives this client and is insulated from the controlling terminal (no SIGINT on Ctrl-C, no
+/// SIGHUP on terminal close). The spawned server resolves its port from the same `profile.toml` we
+/// just read — the port is never passed on the CLI. stdio goes to the void — a user who wants server
+/// logs runs `ae server` by hand.
+fn spawn_detached_server(idle_timeout_secs: u64) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
+    // `ae server --profile X --idle-timeout N` — the spawned server resolves its port from the same
+    // profile.toml we just read (the port is never passed on the CLI).
     cmd.arg("server")
+        .arg("--profile")
+        .arg(aether_server::active_profile())
         .arg("--idle-timeout")
-        .arg(AUTOSTART_IDLE_TIMEOUT_SECS.to_string())
+        .arg(idle_timeout_secs.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -235,6 +299,9 @@ fn has_gui_display() -> bool {
 }
 
 fn run_server(args: ServerArgs) -> anyhow::Result<()> {
+    if let Some(ServerCommand::Stop) = args.command {
+        return stop_server();
+    }
     let filter = match args.log {
         Some(filter) => tracing_subscriber::EnvFilter::new(filter),
         None => tracing_subscriber::EnvFilter::try_from_default_env()
@@ -245,15 +312,61 @@ fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     runtime()?.block_on(aether_server::run(idle_timeout))
 }
 
-fn run_tui(project: Option<String>, path: Option<String>, version: String) -> anyhow::Result<()> {
-    runtime()?.block_on(aether_tui::run(project, path, version))
+/// `ae server stop` — signal the running server for the active profile to shut down (SIGTERM, which
+/// the accept loop handles gracefully), and wait briefly for it to release the port so a follow-up
+/// `ae server` / client can bind immediately.
+fn stop_server() -> anyhow::Result<()> {
+    let profile = aether_server::active_profile();
+    let Some(pid) = aether_server::running_server_pid()? else {
+        println!("no server running for profile '{profile}'");
+        return Ok(());
+    };
+    terminate(pid)?;
+    // Poll for exit (graceful shutdown is near-instant); don't hang forever if it ignores us.
+    for _ in 0..40 {
+        if aether_server::running_server_pid()?.is_none() {
+            println!("stopped server (pid {pid}) for profile '{profile}'");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    println!("sent stop to server (pid {pid}) for profile '{profile}'; still shutting down");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate(pid: u32) -> anyhow::Result<()> {
+    // SAFETY: `kill` with SIGTERM has no effect on this process and just signals `pid`.
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("sending SIGTERM");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate(_pid: u32) -> anyhow::Result<()> {
+    anyhow::bail!("`ae server stop` is not supported on this platform")
+}
+
+fn run_tui(
+    project: Option<String>,
+    path: Option<String>,
+    version: String,
+    server_url: String,
+) -> anyhow::Result<()> {
+    runtime()?.block_on(aether_tui::run(project, path, version, server_url))
 }
 
 #[cfg(feature = "gui")]
-fn run_gui(project: Option<String>, path: Option<String>, version: String) -> anyhow::Result<()> {
+fn run_gui(
+    project: Option<String>,
+    path: Option<String>,
+    version: String,
+    server_url: String,
+) -> anyhow::Result<()> {
     // iced owns the main thread and manages its own tokio runtime, so this is a synchronous call —
     // do not wrap it in `runtime().block_on`, which would panic on a nested runtime.
-    aether_iced::run(project, path, version)
+    aether_iced::run(project, path, version, server_url)
 }
 
 #[cfg(not(feature = "gui"))]
@@ -261,6 +374,7 @@ fn run_gui(
     _project: Option<String>,
     _path: Option<String>,
     _version: String,
+    _server_url: String,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "this build of `ae` was compiled without GUI support — rebuild with `--features gui`, \

@@ -4,7 +4,7 @@
 //! The server is multi-project. Projects are loaded lazily by `project/activate` — no project
 //! is read from disk at startup.
 
-use crate::config::{self, RuntimeInfo, SERVER_PORT};
+use crate::config::{self};
 use crate::state::{ServerState, SharedState};
 use crate::watcher;
 use anyhow::{bail, Context};
@@ -14,24 +14,33 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 
-/// Public entry point: bind the fixed port, manage the runtime file, run the server.
+/// Public entry point: bind the active profile's port, manage the runtime file, run the server.
 ///
-/// `idle_timeout` controls the auto-reaper: `Some(d)` makes this a client-conjured instance that
-/// shuts itself down after `d` with no connected clients and no unsaved buffers; `None` (the
-/// `ae server` daemon) runs until signalled. See [`idle_reaper`].
+/// The profile is read from the process-global set by `main` (`config::set_active_profile`); its
+/// port comes from `profile.toml` (created on first use). `idle_timeout` controls the auto-reaper:
+/// `Some(d)` makes this a client-conjured instance that shuts itself down after `d` with no
+/// connected clients and no unsaved buffers; `None` (the `ae server` daemon) runs until signalled.
+/// See [`idle_reaper`].
 pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
-    let bind_addr = format!("127.0.0.1:{SERVER_PORT}");
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("binding {bind_addr}"))?;
-    let port = listener.local_addr()?.port();
+    let profile = config::active_profile();
+    let port = config::ensure_profile_port()?;
+    let bind_addr = format!("127.0.0.1:{port}");
 
+    // Reject early if the recorded port is already taken: a live server for this profile (the pid
+    // file says so), or some unrelated process squatting it. We fail loudly rather than reallocate
+    // — a recorded port is a stable address (e.g. a bookmarked web URL), so we never move it
+    // silently. See `docs/profiles.md`.
     let runtime_path = config::runtime_info_path()?;
     handle_existing_runtime_file(&runtime_path)?;
 
-    // The instance's start stamp lives on `ServerState` (it's reported to clients on
-    // `project/activate` for restart detection); the runtime file mirrors the same value, so the
-    // file and the wire never disagree about which instance this is.
+    let listener = TcpListener::bind(&bind_addr).await.with_context(|| {
+        format!("binding {bind_addr} for profile '{profile}' — is the port in use by another process?")
+    })?;
+    let port = listener.local_addr()?.port();
+
+    // The instance's start stamp lives on `ServerState` — it's reported to clients on
+    // `project/activate` for restart detection. The runtime file no longer mirrors it (or the
+    // port): it's now just the pid, the per-profile singleton marker.
     let state = Arc::new(Mutex::new(ServerState::new()));
     // Point the real server at the on-disk session file (project recency + buffer restore). Left
     // unset by `ServerState::new` so in-process tests and embeddings never touch the user's file;
@@ -41,14 +50,13 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
         let mut s = state.lock().await;
         s.sessions_path = config::project_sessions_path().ok();
     }
-    let info = RuntimeInfo {
-        pid: std::process::id(),
-        port,
-        started_at_unix_ms: state.lock().await.started_at_unix_ms,
-    };
-    config::write_runtime_info(&runtime_path, &info)?;
+    config::write_runtime_pid(&runtime_path, std::process::id())?;
+    // Log the web URL too: the browser client has no config/CLI access, so a human reads (and
+    // bookmarks) this address — which is why a profile's port, once recorded, never moves.
     tracing::info!(
+        profile,
         port,
+        url = %format!("http://127.0.0.1:{port}/"),
         runtime_file = %runtime_path.display(),
         "aether server listening"
     );
@@ -254,12 +262,9 @@ fn handle_existing_runtime_file(path: &std::path::Path) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    match config::read_runtime_info(path) {
-        Ok(existing) if config::pid_is_alive(existing.pid) => {
-            bail!(
-                "another aether server is already running (pid {})",
-                existing.pid
-            );
+    match config::read_runtime_pid(path) {
+        Ok(pid) if config::pid_is_alive(pid) => {
+            bail!("another aether server is already running (pid {pid})");
         }
         Ok(_) => {
             tracing::warn!(
