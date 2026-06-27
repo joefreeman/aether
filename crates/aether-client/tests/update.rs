@@ -3540,3 +3540,22 @@ fn sneak_backspace_unwinds_and_esc_cancels() {
     assert_eq!(method, "sneak/cancel");
     assert!(s.sneak.is_none(), "session ended on Esc");
 }
+
+#[test]
+fn space_alt_x_asks_the_shell_to_open_a_new_window() {
+    let mut s = session();
+    // `Space Alt-x` — a leader chord distinct from `Space x` (close buffer).
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::ShellAction(ShellAction::NewWindow))),
+        "Space Alt-x should emit ShellAction::NewWindow"
+    );
+    // It's a pure shell hand-off — no server traffic, and crucially not a buffer/close (that's
+    // `Space x`, the un-Alted chord).
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "opening a window issues no RPC"
+    );
+}

@@ -5353,6 +5353,10 @@ impl Session {
 
                 self.close_buffer()
             }
+            // Spawning the new process is irreducibly shell-side (and GUI-only) — the shell reads
+            // the workspace/path from its session and detaches a sibling `ae --gui`. The core just
+            // asks for it; non-GUI shells ignore the action.
+            A::NewWindow => Effects::one(Effect::ShellAction(ShellAction::NewWindow)),
 
             // ---- git ----
             A::ToggleDiffView => {

@@ -999,6 +999,9 @@ impl Shell {
                 self.state.help.open = true;
                 self.state.help.scroll = Default::default();
             }
+            // "Open another window" is GUI-only — a new OS window makes no sense for the terminal
+            // client, which owns the one terminal it was launched in. Ignore it here.
+            ShellAction::NewWindow => {}
         }
     }
 

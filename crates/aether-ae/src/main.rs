@@ -142,7 +142,13 @@ fn run_edit(edit: EditArgs, version: String) -> anyhow::Result<()> {
     ensure_server_running(port, idle_timeout_secs);
     let server_url = format!("ws://127.0.0.1:{port}");
     if want_gui(&edit) {
-        run_gui(workspace, edit.path, version, server_url)
+        run_gui(
+            workspace,
+            edit.path,
+            version,
+            server_url,
+            aether_server::active_profile().to_string(),
+        )
     } else {
         run_tui(workspace, edit.path, version, server_url)
     }
@@ -366,10 +372,11 @@ fn run_gui(
     path: Option<String>,
     version: String,
     server_url: String,
+    profile: String,
 ) -> anyhow::Result<()> {
     // iced owns the main thread and manages its own tokio runtime, so this is a synchronous call —
     // do not wrap it in `runtime().block_on`, which would panic on a nested runtime.
-    aether_iced::run(workspace, path, version, server_url)
+    aether_iced::run(workspace, path, version, server_url, profile)
 }
 
 #[cfg(not(feature = "gui"))]
@@ -378,6 +385,7 @@ fn run_gui(
     _path: Option<String>,
     _version: String,
     _server_url: String,
+    _profile: String,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "this build of `ae` was compiled without GUI support — rebuild with `--features gui`, \

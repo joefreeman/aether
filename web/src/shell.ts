@@ -131,7 +131,7 @@ function measureCell(buffer: HTMLElement): Cell {
 type ToastLevel = "info" | "error" | "warning" | "success";
 
 interface ShellActionDesc {
-  name: "scroll" | "place_cursor" | "toggle_wrap" | "open_help";
+  name: "scroll" | "place_cursor" | "toggle_wrap" | "open_help" | "new_window";
   dir?: string;
   unit?: string;
   fraction?: number;
@@ -1852,6 +1852,13 @@ export class Shell {
         break;
       case "open_help":
         this.openHelp();
+        break;
+      case "new_window":
+        // Open another tab/window onto the same server URL (which carries the workspace): it
+        // connects with its own client_id and lands on the workspace's MRU buffer — the browser
+        // analogue of the native client's "open another window". Keypress-initiated, so it's a
+        // user gesture and isn't popup-blocked.
+        window.open(location.href, "_blank");
         break;
       default: {
         // Exhaustiveness: a new shell-action name fails to build here until it's handled.

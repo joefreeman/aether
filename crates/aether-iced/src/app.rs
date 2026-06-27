@@ -1951,6 +1951,10 @@ impl App {
                     iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
                 )
             }
+            A::NewWindow => {
+                spawn_window(&self.session);
+                Task::none()
+            }
         }
     }
 
@@ -4258,6 +4262,47 @@ fn open_link(url: &str) {
         .arg(url)
         .spawn();
 }
+
+/// Open another native window onto the same workspace as `session`: spawn a detached `ae --gui` for
+/// the *same* profile, so the new process dials the same daemon and (via `workspace/activate`) lands
+/// on the workspace's MRU buffer — i.e. the one this window is showing. Pointed by `--workspace` for
+/// a real workspace; for an ephemeral context (a file opened outside any workspace) we pass the
+/// buffer's path instead, since the ephemeral id isn't CLI-addressable — and a pathless ephemeral
+/// scratch can't be reproduced, so the new window just opens the chooser. Best-effort: a spawn
+/// failure is logged, not surfaced (the user simply gets no new window).
+fn spawn_window(session: &Session) {
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::warn!("cannot open a new window: current exe path is unavailable");
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    // `--profile` (global) before the implicit `edit` so the sibling joins the same daemon.
+    cmd.arg("--profile").arg(crate::active_profile()).arg("--gui");
+    if !aether_protocol::is_ephemeral_workspace_id(&session.workspace) {
+        cmd.arg("--workspace").arg(&session.workspace);
+    } else if let Some(path) = session.buffer.path.as_deref() {
+        cmd.arg(path);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    detach(&mut cmd);
+    if let Err(e) = cmd.spawn() {
+        tracing::warn!("failed to spawn new window: {e}");
+    }
+}
+
+/// Put a spawned window in its own process group, so a signal sent to *our* foreground group (a
+/// terminal Ctrl-C) doesn't reach it — the GUI sibling lives or dies on its own. std's
+/// `process_group` keeps this libc-free; on non-Unix the null stdio already decouples the child.
+#[cfg(unix)]
+fn detach(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach(_cmd: &mut std::process::Command) {}
 
 /// The hover popover's scrollable id, for programmatic `scroll_by` (keyboard panning).
 fn hover_scroll_id() -> iced::advanced::widget::Id {

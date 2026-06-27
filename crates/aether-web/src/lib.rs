@@ -634,6 +634,8 @@ fn action_value(a: &ShellAction) -> Value {
         }
         ShellAction::ToggleWrap => json!({ "name": "toggle_wrap" }),
         ShellAction::OpenHelp => json!({ "name": "open_help" }),
+        // GUI-only (spawns a native OS window); the web shell has no handler and ignores it.
+        ShellAction::NewWindow => json!({ "name": "new_window" }),
     }
 }
 

@@ -311,6 +311,12 @@ pub enum Action {
     CopyAbsolutePath,
     NewScratch,
     CloseBuffer,
+    /// `Space Alt-x` — open another native window onto the same workspace: a fresh detached
+    /// `ae --gui` process dialling the same daemon. A new client lands on the workspace's MRU
+    /// buffer (the one you're on), so it "duplicates" the current view; the two windows are
+    /// independent thereafter (own cursor/selection/viewport, shared buffers server-side).
+    /// GUI-only — the TUI and web shells ignore the [`ShellAction::NewWindow`] it emits.
+    NewWindow,
 
     // ---- git ----
     ToggleDiffView,
@@ -800,6 +806,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
+    bind!(L, ch('x'), Exact(Mods::ALT), A::NewWindow, "App", "Open another window"),
     bind!(L, ch('w'), Exact(Mods::ALT), A::OpenPath, "App", "Open file by absolute path"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
