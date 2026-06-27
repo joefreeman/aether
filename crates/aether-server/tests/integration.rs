@@ -21836,15 +21836,12 @@ async fn workspace_session_persisted_on_activate_and_open() {
         "activation stamps a time: {raw}"
     );
     let canonical = std::fs::canonicalize(root.join("a.rs")).unwrap();
-    let buffers: Vec<String> = p["buffers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
+    let buffers = p["buffers"].as_array().unwrap();
+    assert_eq!(buffers.len(), 1, "one buffer recorded: {raw}");
+    assert_eq!(buffers[0]["kind"], "file");
     assert_eq!(
-        buffers,
-        vec![canonical.display().to_string()],
+        buffers[0]["path"].as_str().unwrap(),
+        canonical.display().to_string(),
         "the opened file is recorded in the session: {raw}"
     );
 
@@ -21898,7 +21895,11 @@ async fn keeping_a_transient_buffer_persists_it() {
         let json: serde_json::Value = serde_json::from_str(raw).unwrap();
         json["workspaces"]["p"]["buffers"]
             .as_array()
-            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|v| v["path"].as_str().unwrap().to_string())
+                    .collect()
+            })
             .unwrap_or_default()
     };
 
@@ -21931,5 +21932,339 @@ async fn keeping_a_transient_buffer_persists_it() {
         "keeping the buffer persists it: {raw}"
     );
 
+    drop(server);
+}
+
+// ---- unsaved-buffer persistence (docs/unsaved-persistence.md) -----------------------------------
+
+/// Poll `dir` until it contains at least one (non-tmp) file, or time out. Used to wait for the
+/// periodic backup flush (≈250ms) to land before simulating a restart.
+async fn wait_for_backup(dir: &std::path::Path) {
+    for _ in 0..120 {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            if rd
+                .flatten()
+                .any(|e| !e.file_name().to_string_lossy().starts_with(".tmp-"))
+            {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("no backup file appeared in {} within timeout", dir.display());
+}
+
+/// End-to-end hot-exit: edit a file without saving, let the flush persist the unsaved content, then
+/// "restart" the server over the same state dir. Reopening the file restores the in-flight edits
+/// (dirty), even though the file on disk was never written.
+#[tokio::test]
+async fn unsaved_file_edits_restored_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
+    let sessions_path = root.join("sessions.json");
+    let backups = root.join("backups");
+
+    {
+        let server = aether_server::spawn_for_test_multi_with_persistence(
+            vec![("p".to_string(), vec![root.clone()])],
+            Some(sessions_path.clone()),
+            Some(backups.clone()),
+        )
+        .await
+        .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+            .await
+            .unwrap();
+        send_request::<WorkspaceActivate>(
+            &mut ws,
+            1,
+            &WorkspaceActivateParams {
+                name: "p".into(),
+                open_last: false,
+            },
+        )
+        .await;
+        let open: BufferOpenResult = send_request::<BufferOpen>(
+            &mut ws,
+            2,
+            &BufferOpenParams {
+                path_index: Some(0),
+                relative_path: Some("a.rs".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        send_request::<InputText>(
+            &mut ws,
+            3,
+            &InputTextParams {
+                buffer_id: open.buffer_id,
+                text: "X".into(),
+                select_pasted: false,
+                at: None,
+            },
+        )
+        .await;
+        wait_for_backup(&backups.join("p").join("files")).await;
+        drop(ws);
+        drop(server);
+    }
+
+    // The on-disk file was never saved.
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "fn main() {}\n"
+    );
+
+    // Restart and reopen — the unsaved edit comes back, dirty.
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(sessions_path.clone()),
+        Some(backups.clone()),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_ne!(
+        reopen.revision, reopen.saved_revision,
+        "restored buffer is dirty (revision diverges from the on-disk baseline)"
+    );
+    assert_eq!(
+        buffer_text(&mut ws, 3, reopen.buffer_id).await,
+        "Xfn main() {}\n",
+        "the unsaved edit is restored over the on-disk content"
+    );
+    drop(server);
+}
+
+/// When the source file changed on disk while the server was down, the restored buffer comes back
+/// flagged `externally_modified` — surfaced via the viewport-subscribe status snapshot, the same
+/// channel an in-session collision uses.
+#[tokio::test]
+async fn restore_flags_externally_modified_when_disk_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("a.rs"), "original\n").unwrap();
+    let sessions_path = root.join("sessions.json");
+    let backups = root.join("backups");
+
+    {
+        let server = aether_server::spawn_for_test_multi_with_persistence(
+            vec![("p".to_string(), vec![root.clone()])],
+            Some(sessions_path.clone()),
+            Some(backups.clone()),
+        )
+        .await
+        .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+            .await
+            .unwrap();
+        send_request::<WorkspaceActivate>(
+            &mut ws,
+            1,
+            &WorkspaceActivateParams {
+                name: "p".into(),
+                open_last: false,
+            },
+        )
+        .await;
+        let open: BufferOpenResult = send_request::<BufferOpen>(
+            &mut ws,
+            2,
+            &BufferOpenParams {
+                path_index: Some(0),
+                relative_path: Some("a.rs".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        send_request::<InputText>(
+            &mut ws,
+            3,
+            &InputTextParams {
+                buffer_id: open.buffer_id,
+                text: "edited ".into(),
+                select_pasted: false,
+                at: None,
+            },
+        )
+        .await;
+        wait_for_backup(&backups.join("p").join("files")).await;
+        drop(ws);
+        drop(server);
+    }
+
+    // Change the file on disk *after* the backup was taken (sleep past coarse mtime granularity so
+    // the source is unambiguously newer than the backup).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    std::fs::write(root.join("a.rs"), "changed on disk\n").unwrap();
+
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(sessions_path.clone()),
+        Some(backups.clone()),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    // Subscribing is where a client seeds buffer-wide state like external-change flags.
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: reopen.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    assert!(
+        sub.buffer_status.externally_modified,
+        "a source file newer than the backup restores as externally-modified"
+    );
+    drop(server);
+}
+
+/// Saving deletes the backup, so a save→restart leaves nothing to restore: the reopened buffer is
+/// clean and matches what's on disk.
+#[tokio::test]
+async fn saving_clears_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("a.rs"), "base\n").unwrap();
+    let sessions_path = root.join("sessions.json");
+    let backups = root.join("backups");
+    let files_dir = backups.join("p").join("files");
+
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(sessions_path.clone()),
+        Some(backups.clone()),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id: open.buffer_id,
+            text: "Y".into(),
+            select_pasted: false,
+            at: None,
+        },
+    )
+    .await;
+    wait_for_backup(&files_dir).await;
+
+    // Save in place — this should delete the backup.
+    send_request::<BufferSave>(
+        &mut ws,
+        4,
+        &BufferSaveParams {
+            buffer_id: open.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+
+    // The backup is gone (give the delete a beat; the save deletes synchronously, but the flush
+    // could also have rewritten — assert it settles empty).
+    let mut empty = false;
+    for _ in 0..40 {
+        let count = std::fs::read_dir(&files_dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp-"))
+                    .count()
+            })
+            .unwrap_or(0);
+        if count == 0 {
+            empty = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(empty, "saving deletes the unsaved backup");
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "Ybase\n",
+        "the save wrote the edited content to disk"
+    );
     drop(server);
 }

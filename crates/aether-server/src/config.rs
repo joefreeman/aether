@@ -60,10 +60,37 @@ pub fn profiles_dir() -> anyhow::Result<PathBuf> {
     Ok(aether_config_dir()?.join("profiles"))
 }
 
-/// The active profile's config subtree: `<config>/aether/profiles/<name>/`. Everything durable
-/// (settings, sessions, workspace configs, `profile.toml`) lives under here.
+/// The active profile's config subtree: `<config>/aether/profiles/<name>/`. User-authored durable
+/// config (settings, workspace configs, `profile.toml`) lives under here. Machine-managed state
+/// (sessions, unsaved-buffer backups) lives under [`profile_state_dir`] instead.
 fn profile_config_dir() -> anyhow::Result<PathBuf> {
     Ok(profiles_dir()?.join(active_profile()))
+}
+
+/// The active profile's **state** subtree: `<state>/aether/profiles/<name>/`. Holds machine-managed,
+/// not-user-authored durable state — the session file and unsaved-buffer backups — kept out of the
+/// config dir so dotfile sync/versioning of `~/.config` never drags along churny session data or
+/// (worse) the contents of unsaved buffers. See `docs/unsaved-persistence.md`.
+///
+/// `state_dir()` is `Some` only where `$XDG_STATE_HOME` exists (Linux/BSD); elsewhere (macOS,
+/// Windows) there's no state-home concept, so fall back to the always-present `data_local_dir()`.
+fn profile_state_dir() -> anyhow::Result<PathBuf> {
+    let base = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
+    let root = base
+        .state_dir()
+        .unwrap_or_else(|| base.data_local_dir())
+        .join("aether")
+        .join("profiles")
+        .join(active_profile());
+    Ok(root)
+}
+
+/// Root directory for this profile's unsaved-buffer backups
+/// (`<state>/aether/profiles/<name>/backups/`). One subtree per workspace beneath it. See
+/// [`crate::backup`] and `docs/unsaved-persistence.md`.
+pub fn backups_dir() -> anyhow::Result<PathBuf> {
+    Ok(profile_state_dir()?.join("backups"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,12 +317,24 @@ pub struct WorkspaceSession {
     /// most-recent-first ordering. `0` for a workspace that's only ever had its buffer list written.
     #[serde(default)]
     pub last_activated_at: u64,
-    /// Canonical paths of the file-backed buffers that were open in this workspace, most-recently-used
-    /// first. On re-activation they're restored as *dormant* buffers (listed in the picker, loaded
-    /// lazily). Scratch buffers have no path and are omitted — persisting their unsaved contents is
-    /// future work.
+    /// The buffers that were open in this workspace, most-recently-used first. On re-activation
+    /// they're restored as *dormant* buffers (listed in the picker, loaded lazily). File buffers
+    /// carry their canonical path; dirty scratch buffers carry their per-workspace number (their
+    /// content is restored from the matching backup — see `docs/unsaved-persistence.md`). Clean
+    /// scratches and transient previews are omitted.
     #[serde(default)]
-    pub buffers: Vec<PathBuf>,
+    pub buffers: Vec<SessionBuffer>,
+}
+
+/// One entry in a workspace's persisted buffer list. A scratch buffer has no path, so the list is a
+/// tagged enum rather than a bare path: a `File` carries its canonical path; a `Scratch` carries the
+/// per-workspace display number that keys its backup. Internally tagged (`{"kind":"file",…}`) to
+/// keep the machine-managed JSON self-describing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionBuffer {
+    File { path: PathBuf },
+    Scratch { number: u32 },
 }
 
 /// The whole session file: every named workspace's [`WorkspaceSession`], keyed by workspace name. A
@@ -308,10 +347,11 @@ pub struct WorkspaceSessions {
 }
 
 /// Path to the single machine-managed session file
-/// (`$XDG_CONFIG_HOME/aether/sessions.json`). One file for all workspaces so the switcher can read
-/// every recency stamp in one go. JSON (not TOML) signals "machine-managed, don't hand-edit".
+/// (`<state>/aether/profiles/<name>/sessions.json`). One file for all workspaces so the switcher can
+/// read every recency stamp in one go. JSON (not TOML) signals "machine-managed, don't hand-edit";
+/// it lives in the state dir (not config) for the same reason — see [`profile_state_dir`].
 pub fn workspace_sessions_path() -> anyhow::Result<PathBuf> {
-    Ok(profile_config_dir()?.join("sessions.json"))
+    Ok(profile_state_dir()?.join("sessions.json"))
 }
 
 /// Load the workspace-session file. A missing file is not an error — a fresh install has none, so we
@@ -868,7 +908,15 @@ mod tests {
             "work".into(),
             WorkspaceSession {
                 last_activated_at: 1000,
-                buffers: vec![PathBuf::from("/work/a.rs"), PathBuf::from("/work/b.rs")],
+                buffers: vec![
+                    SessionBuffer::File {
+                        path: PathBuf::from("/work/a.rs"),
+                    },
+                    SessionBuffer::File {
+                        path: PathBuf::from("/work/b.rs"),
+                    },
+                    SessionBuffer::Scratch { number: 2 },
+                ],
             },
         );
         sessions.workspaces.insert(

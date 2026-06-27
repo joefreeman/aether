@@ -141,6 +141,11 @@ pub struct ServerState {
     /// they never touch the developer's real `~/.config/aether/sessions.json`. When `None`, session
     /// recency/restore is simply disabled (all logic short-circuits).
     pub sessions_path: Option<PathBuf>,
+    /// Root directory for unsaved-buffer backups ([`crate::backup`]). `Some` in the real server (set
+    /// at boot in `server::run`); `None` everywhere else — in-process tests and embeddings leave it
+    /// unset so they never write backups to disk, and the idle reaper keeps its dirty-buffer guard
+    /// (with backups off, reaping a dirty buffer would lose work). See `docs/unsaved-persistence.md`.
+    pub backups_path: Option<PathBuf>,
     next_buffer_id: u64,
     next_viewport_id: u64,
 }
@@ -309,8 +314,28 @@ pub struct DormantBuffer {
     /// Reserved id — the buffer's identity in the picker, so selecting it can route back through
     /// `buffer/open { buffer_id }`. Not present in `ServerState::buffers` until materialized.
     pub id: BufferId,
-    /// Canonical path of the file to load when the buffer is materialized.
-    pub path: PathBuf,
+    /// What to materialize: a file (by path) or a scratch (by per-workspace number, whose unsaved
+    /// content is restored from its backup).
+    pub source: DormantSource,
+}
+
+/// The thing a [`DormantBuffer`] materializes into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DormantSource {
+    /// A file-backed buffer; the canonical path to load when materialized.
+    File(PathBuf),
+    /// A scratch buffer that had unsaved content; its per-workspace display number (and backup key).
+    Scratch { number: u32 },
+}
+
+impl DormantBuffer {
+    /// The canonical path, for a file dormant buffer; `None` for a scratch.
+    pub fn path(&self) -> Option<&Path> {
+        match &self.source {
+            DormantSource::File(p) => Some(p.as_path()),
+            DormantSource::Scratch { .. } => None,
+        }
+    }
 }
 
 impl WorkspaceEntry {
@@ -369,6 +394,7 @@ impl ServerState {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
             sessions_path: None,
+            backups_path: None,
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
@@ -592,13 +618,22 @@ impl ServerState {
     /// integer not already in use by another scratch there. Keeps `(scratch N)` numbers small and
     /// stable, reusing one once its buffer closes. Call before inserting the new buffer.
     pub fn next_scratch_number(&self, workspace: &str) -> u32 {
-        let used: std::collections::HashSet<u32> = self
+        let mut used: std::collections::HashSet<u32> = self
             .buffer_workspaces
             .iter()
             .filter(|(_, p)| p.as_str() == workspace)
             .filter_map(|(id, _)| self.buffers.get(id))
             .filter_map(|b| b.scratch_number)
             .collect();
+        // Also reserve numbers held by *dormant* scratch buffers (restored from the session but not
+        // yet materialized) so a fresh scratch can't grab one out from under a pending restore.
+        if let Some(w) = self.workspaces.get(workspace) {
+            for d in &w.dormant_buffers {
+                if let DormantSource::Scratch { number } = d.source {
+                    used.insert(number);
+                }
+            }
+        }
         (1..)
             .find(|n| !used.contains(n))
             .expect("u32 range is non-empty")
@@ -815,24 +850,24 @@ impl ServerState {
         }
     }
 
-    /// The set of file-backed buffers to persist for `workspace_name`, most-recently-used first:
-    /// the workspace's live MRU buffers that have a path, then its still-dormant buffers (already in
-    /// MRU order). Deduplicated by path. This is exactly what a future activation should restore,
-    /// so it's what gets written to the session file.
+    /// The buffers to persist for `workspace_name`, most-recently-used first: the workspace's live
+    /// MRU buffers, then its still-dormant buffers (already in MRU order). Files are keyed by path,
+    /// scratches by number; deduplicated by each. This is exactly what a future activation should
+    /// restore, so it's what gets written to the session file.
     ///
-    /// Two kinds are excluded: scratch buffers (no path), and **transient** buffers — preview
-    /// opens that auto-close once you navigate away (grep/file-picker peeks, goto-def, nav
-    /// revisits). Transient means "ephemeral, don't accumulate me"; persisting previews would
-    /// reintroduce exactly the buffer-list clutter the transient mechanism exists to avoid, so the
-    /// restored set is just the working buffers you edited or explicitly kept (which clears the
-    /// transient flag — promotion — and brings them back in here). It also means a preview's
-    /// open/auto-close never churns the file.
-    pub fn session_buffer_paths(&self, workspace_name: &str) -> Vec<PathBuf> {
+    /// What's excluded: **transient** buffers — preview opens that auto-close once you navigate away
+    /// (grep/file-picker peeks, goto-def, nav revisits) — and **clean scratch** buffers. Transient
+    /// means "ephemeral, don't accumulate me"; persisting previews would reintroduce exactly the
+    /// buffer-list clutter the transient mechanism exists to avoid. A scratch is only worth restoring
+    /// if it has unsaved content (it's dirty, hence has a backup); an empty scratch is dropped.
+    pub fn session_buffers(&self, workspace_name: &str) -> Vec<crate::config::SessionBuffer> {
+        use crate::config::SessionBuffer;
         let Some(workspace) = self.workspaces.get(workspace_name) else {
             return Vec::new();
         };
-        let mut out: Vec<PathBuf> = Vec::new();
-        let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+        let mut out: Vec<SessionBuffer> = Vec::new();
+        let mut seen_paths: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+        let mut seen_scratch: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for id in &workspace.mru_buffers {
             let Some(buf) = self.buffers.get(id) else {
                 continue;
@@ -841,14 +876,30 @@ impl ServerState {
                 continue;
             }
             if let Some(path) = buf.canonical_path.as_deref() {
-                if seen.insert(path) {
-                    out.push(path.to_path_buf());
+                if seen_paths.insert(path) {
+                    out.push(SessionBuffer::File {
+                        path: path.to_path_buf(),
+                    });
+                }
+            } else if let Some(number) = buf.scratch_number {
+                // Only dirty scratches carry content worth restoring (and therefore a backup).
+                if buf.dirty && seen_scratch.insert(number) {
+                    out.push(SessionBuffer::Scratch { number });
                 }
             }
         }
         for d in &workspace.dormant_buffers {
-            if seen.insert(d.path.as_path()) {
-                out.push(d.path.clone());
+            match &d.source {
+                DormantSource::File(path) => {
+                    if seen_paths.insert(path.as_path()) {
+                        out.push(SessionBuffer::File { path: path.clone() });
+                    }
+                }
+                DormantSource::Scratch { number } => {
+                    if seen_scratch.insert(*number) {
+                        out.push(SessionBuffer::Scratch { number: *number });
+                    }
+                }
             }
         }
         out
@@ -858,16 +909,19 @@ impl ServerState {
     /// buffer for that path opens, so the now-loaded file stops showing as a greyed dormant row.
     pub fn promote_dormant(&mut self, workspace_name: &str, canonical: &Path) {
         if let Some(workspace) = self.workspaces.get_mut(workspace_name) {
-            workspace.dormant_buffers.retain(|d| d.path.as_path() != canonical);
+            workspace
+                .dormant_buffers
+                .retain(|d| d.path() != Some(canonical));
         }
     }
 
-    /// Remove and return the canonical path of the dormant buffer with `id` in `workspace_name`, if
-    /// any. Used by `buffer/open`'s by-id path to materialize a dormant buffer the picker selected.
-    pub fn take_dormant(&mut self, workspace_name: &str, id: BufferId) -> Option<PathBuf> {
+    /// Remove and return the dormant buffer with `id` in `workspace_name`, if any. Used by
+    /// `buffer/open`'s by-id path to materialize a dormant buffer the picker selected — the caller
+    /// inspects [`DormantBuffer::source`] to decide whether to load a file or rebuild a scratch.
+    pub fn take_dormant(&mut self, workspace_name: &str, id: BufferId) -> Option<DormantBuffer> {
         let workspace = self.workspaces.get_mut(workspace_name)?;
         let pos = workspace.dormant_buffers.iter().position(|d| d.id == id)?;
-        Some(workspace.dormant_buffers.remove(pos).path)
+        Some(workspace.dormant_buffers.remove(pos))
     }
 
     /// The id of `workspace_name`'s most-recently-used dormant buffer (front of the list), if any.
@@ -1012,6 +1066,11 @@ pub struct Buffer {
     /// "promoted" — by the buffer's first edit, a save, or a user-initiated reload. Never set
     /// again after creation.
     pub transient: bool,
+    /// The `revision` last written to an on-disk backup ([`crate::backup`]), or `None` if no backup
+    /// is currently on disk for this buffer. The flush task uses it to skip rewriting unchanged
+    /// content and to delete a stale backup once the buffer goes clean. Purely server-internal —
+    /// never sent to clients, not part of `dirty`.
+    pub backed_up_revision: Option<Revision>,
 
     /// Revision at the most recent successful save. `None` only for a never-saved scratch
     /// buffer in its initial empty state — see `Buffer::scratch`.
@@ -1123,6 +1182,7 @@ impl Buffer {
             externally_modified: false,
             transient: false,
             externally_deleted: false,
+            backed_up_revision: None,
         })
     }
 
@@ -1156,6 +1216,7 @@ impl Buffer {
             externally_modified: false,
             transient: false,
             externally_deleted: false,
+            backed_up_revision: None,
         }
     }
 
@@ -1186,6 +1247,7 @@ impl Buffer {
             externally_modified: false,
             transient: false,
             externally_deleted: false,
+            backed_up_revision: None,
         }
     }
 
@@ -1410,6 +1472,21 @@ impl Buffer {
         // is replaced. Matches what undo/redo do.
         self.reparse_full();
         Ok(mtime_ms)
+    }
+
+    /// Overlay restored unsaved content (from a backup) onto a freshly-constructed buffer. The
+    /// buffer's current text/revision — set by `load_from_file` (the on-disk baseline), `new_at_path`
+    /// (empty), or `scratch` (empty) — stays as the **saved** baseline (`saved_revision`); `content`
+    /// becomes the live text at a fresh revision, so the buffer comes back **dirty** with exactly the
+    /// unsaved edits that were in flight. Undo history isn't reconstructed (hot-exit restores content
+    /// and dirty state only). Re-parses syntax from scratch since the whole rope is replaced.
+    pub fn restore_unsaved(&mut self, content: &str) {
+        self.text = ropey::Rope::from_str(content);
+        self.revision = self.next_revision_id;
+        self.next_revision_id += 1;
+        self.active_group = None;
+        self.recompute_dirty();
+        self.reparse_full();
     }
 
     pub fn undo(
@@ -1702,34 +1779,55 @@ mod workspace_state_tests {
         s.buffer_workspaces.insert(bt, "p".into());
         s.touch_mru(bt);
 
+        // A dirty scratch (must persist as a Scratch entry) and a clean scratch (must be dropped).
+        let sc_dirty = s.allocate_buffer_id();
+        let mut scbuf = Buffer::scratch(sc_dirty, None, 1);
+        scbuf.restore_unsaved("unsaved scratch text"); // makes it dirty
+        s.buffers.insert(sc_dirty, scbuf);
+        s.buffer_workspaces.insert(sc_dirty, "p".into());
+        s.touch_mru(sc_dirty);
+        let sc_clean = s.allocate_buffer_id();
+        s.buffers.insert(sc_clean, Buffer::scratch(sc_clean, None, 2));
+        s.buffer_workspaces.insert(sc_clean, "p".into());
+        s.touch_mru(sc_clean);
+
         // Dormant: a fresh path, plus one that duplicates a live buffer's path (must be dropped).
         let d1 = s.allocate_buffer_id();
         let d_dup = s.allocate_buffer_id();
         s.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
             DormantBuffer {
                 id: d1,
-                path: PathBuf::from("/p/c.rs"),
+                source: DormantSource::File(PathBuf::from("/p/c.rs")),
             },
             DormantBuffer {
                 id: d_dup,
-                path: PathBuf::from("/p/a.rs"),
+                source: DormantSource::File(PathBuf::from("/p/a.rs")),
             },
         ];
 
+        use crate::config::SessionBuffer;
         assert_eq!(
-            s.session_buffer_paths("p"),
+            s.session_buffers("p"),
             vec![
-                // preview.rs (transient, MRU front) is excluded.
-                PathBuf::from("/p/b.rs"), // most-recent non-transient
-                PathBuf::from("/p/a.rs"),
-                PathBuf::from("/p/c.rs"), // dormant; /p/a.rs dropped as a dup of the live buffer
+                // clean scratch (2) and preview.rs (transient) are both excluded; the dirty
+                // scratch (MRU front) is kept.
+                SessionBuffer::Scratch { number: 1 },
+                SessionBuffer::File {
+                    path: PathBuf::from("/p/b.rs")
+                }, // most-recent non-transient file
+                SessionBuffer::File {
+                    path: PathBuf::from("/p/a.rs")
+                },
+                SessionBuffer::File {
+                    path: PathBuf::from("/p/c.rs")
+                }, // dormant; /p/a.rs dropped as a dup of the live buffer
             ]
         );
     }
 
     /// The dormant-registry helpers: `first_dormant_id` is the landing target (front of the list),
-    /// `take_dormant` removes and returns a path by id (materialization), and `promote_dormant`
-    /// drops a path once it's loaded.
+    /// `take_dormant` removes and returns the entry by id (materialization), and `promote_dormant`
+    /// drops a file path once it's loaded.
     #[test]
     fn dormant_registry_take_promote_and_first() {
         let mut s = ServerState::new();
@@ -1740,17 +1838,23 @@ mod workspace_state_tests {
         s.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
             DormantBuffer {
                 id: d1,
-                path: PathBuf::from("/p/a.rs"),
+                source: DormantSource::File(PathBuf::from("/p/a.rs")),
             },
             DormantBuffer {
                 id: d2,
-                path: PathBuf::from("/p/b.rs"),
+                source: DormantSource::File(PathBuf::from("/p/b.rs")),
             },
         ];
 
         assert_eq!(s.first_dormant_id("p"), Some(d1), "front of the list lands");
-        assert_eq!(s.take_dormant("p", d1), Some(PathBuf::from("/p/a.rs")));
-        assert_eq!(s.take_dormant("p", d1), None, "removed; a second take is empty");
+        assert_eq!(
+            s.take_dormant("p", d1).map(|d| d.source),
+            Some(DormantSource::File(PathBuf::from("/p/a.rs")))
+        );
+        assert!(
+            s.take_dormant("p", d1).is_none(),
+            "removed; a second take is empty"
+        );
         assert_eq!(s.first_dormant_id("p"), Some(d2));
         s.promote_dormant("p", Path::new("/p/b.rs"));
         assert_eq!(s.first_dormant_id("p"), None, "promotion empties the registry");

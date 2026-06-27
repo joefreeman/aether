@@ -49,6 +49,9 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
     {
         let mut s = state.lock().await;
         s.sessions_path = config::workspace_sessions_path().ok();
+        // Opt the production daemon into unsaved-buffer backups (left unset elsewhere — see
+        // `ServerState::backups_path`). A resolution failure just disables the feature.
+        s.backups_path = config::backups_dir().ok();
     }
     config::write_runtime_pid(&runtime_path, std::process::id())?;
     // Log the web URL too: the browser client has no config/CLI access, so a human reads (and
@@ -94,6 +97,14 @@ pub async fn run_with_listener(
         tokio::spawn(idle_reaper(state.clone(), timeout, idle_shutdown.clone()));
     }
 
+    // When backups are enabled, run the periodic flush that persists unsaved buffer contents (the
+    // single writer — see `handlers::flush_backups`). It crash-protects edits to within one interval;
+    // a graceful exit gets a final flush below.
+    let backups_enabled = state.lock().await.backups_path.is_some();
+    if backups_enabled {
+        tokio::spawn(backup_flush_loop(state.clone()));
+    }
+
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -120,14 +131,36 @@ pub async fn run_with_listener(
             }
         }
     }
+    // Final synchronous flush so a graceful exit (SIGINT/SIGTERM/idle-reap) captures the latest
+    // unsaved content; the periodic loop covers SIGKILL/crash to within one interval. No-op when
+    // backups are disabled.
+    if backups_enabled {
+        crate::handlers::flush_backups(&state).await;
+    }
     Ok(())
 }
 
-/// Watchdog for client-conjured servers: once no clients are connected *and* no buffer has unsaved
-/// edits, start a clock; if that stays true for `timeout`, notify `shutdown` so the accept loop
-/// exits. A reconnecting client (or any new edit) resets the clock. Keeping the server alive while
-/// a buffer is dirty trades a possibly-immortal idle server for never silently dropping unsaved
-/// work — acceptable until unsaved buffers are persisted across server death.
+/// How often the backup flush runs while the server is up. Short enough that a crash loses at most a
+/// fraction of a second of typing, long enough that idle (or untouched-buffer) ticks are nearly free
+/// — the flush only writes buffers whose content actually changed.
+const BACKUP_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Periodically flush unsaved-buffer backups until the task is aborted (on server shutdown). See
+/// [`crate::handlers::flush_backups`].
+async fn backup_flush_loop(state: SharedState) {
+    loop {
+        tokio::time::sleep(BACKUP_FLUSH_INTERVAL).await;
+        crate::handlers::flush_backups(&state).await;
+    }
+}
+
+/// Watchdog for client-conjured servers: once the server is idle, start a clock; if it stays idle
+/// for `timeout`, notify `shutdown` so the accept loop exits. A reconnecting client resets the clock.
+///
+/// "Idle" means no clients connected. When backups are *disabled* (in-process tests/embeddings) a
+/// dirty buffer additionally pins the server open — reaping it would silently drop unsaved work. When
+/// backups are *enabled*, unsaved work is safe on disk (and re-flushed on shutdown), so a dirty
+/// buffer no longer blocks the reap: that interim guard is exactly what backup persistence retires.
 async fn idle_reaper(state: SharedState, timeout: Duration, shutdown: Arc<Notify>) {
     // Poll often enough to honour `timeout` without busy-looping; for the long production timeout
     // this lands at the 15s ceiling, while short test timeouts still get a sub-timeout cadence.
@@ -137,7 +170,8 @@ async fn idle_reaper(state: SharedState, timeout: Duration, shutdown: Arc<Notify
         tokio::time::sleep(poll).await;
         let idle = {
             let s = state.lock().await;
-            s.clients.is_empty() && !s.has_unsaved_buffers()
+            let unsaved_pins = s.backups_path.is_none() && s.has_unsaved_buffers();
+            s.clients.is_empty() && !unsaved_pins
         };
         if idle {
             let since = *idle_since.get_or_insert_with(Instant::now);
@@ -205,6 +239,18 @@ pub async fn spawn_for_test_multi_with_sessions(
     workspaces: Vec<(String, Vec<PathBuf>)>,
     sessions_path: Option<PathBuf>,
 ) -> anyhow::Result<ServerHandle> {
+    spawn_for_test_multi_with_persistence(workspaces, sessions_path, None).await
+}
+
+/// As [`spawn_for_test_multi_with_sessions`], but also points the server at `backups_dir` so tests
+/// can exercise unsaved-buffer backups (write + restore) against a throwaway directory. With
+/// `backups_dir` set the periodic flush task runs, so a test typically types, polls the backup file
+/// into existence, then restarts a second server over the same `sessions_path` + `backups_dir`.
+pub async fn spawn_for_test_multi_with_persistence(
+    workspaces: Vec<(String, Vec<PathBuf>)>,
+    sessions_path: Option<PathBuf>,
+    backups_dir: Option<PathBuf>,
+) -> anyhow::Result<ServerHandle> {
     use crate::state::WorkspaceEntry;
     use crate::workspace_index::WorkspaceIndex;
 
@@ -219,6 +265,7 @@ pub async fn spawn_for_test_multi_with_sessions(
     {
         let mut s = state.lock().await;
         s.sessions_path = sessions_path;
+        s.backups_path = backups_dir;
         for (name, paths) in &workspaces {
             let workspace_index = Arc::new(WorkspaceIndex::new(paths.clone()));
             s.workspaces.insert(

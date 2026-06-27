@@ -213,6 +213,10 @@ pub async fn workspace_activate(
         }
     }
 
+    // Ids of restored buffers that carry unsaved content (a backup) and so should be materialized
+    // eagerly after the lock is released — see the restore block below and the loop after it.
+    let mut eager_restore_ids: Vec<BufferId> = Vec::new();
+
     // Install the workspace entry on the cold path. Reuse the existing entry (and its shared
     // `WorkspaceIndex`) on the hot path.
     if let Some((name, canonical_paths)) = cold_load {
@@ -238,30 +242,45 @@ pub async fn workspace_activate(
             crate::watcher::watch_workspace_paths(&w, &canonical_paths);
         }
 
-        // First activation this session: restore the workspace's previously-open files from the
-        // persisted session as *dormant* buffers (listed in the picker, loaded lazily). Each gets a
-        // reserved id but no rope/LSP until materialized. Files deleted while the server was down are
-        // dropped. No-op when sessions aren't persisted (`sessions_path` unset) or the file is
-        // unreadable.
+        // First activation this session: restore the workspace's previously-open buffers from the
+        // persisted session. Clean files become *dormant* (listed in the picker, loaded lazily — a
+        // reserved id, no rope/LSP until materialized). Buffers carrying unsaved content (those with
+        // a backup) are instead materialized *eagerly* (below, after the lock) so they come back as
+        // live, dirty buffers rather than greyed rows. Files deleted while the server was down with no
+        // backup are dropped. No-op when sessions aren't persisted (`sessions_path` unset).
         if let Some(path) = s.sessions_path.clone() {
             if let Ok(sessions) = crate::config::load_workspace_sessions_at(&path) {
-                let restore: Vec<std::path::PathBuf> = sessions
+                let entries = sessions
                     .workspaces
                     .get(&params.name)
-                    .map(|sess| {
-                        sess.buffers
-                            .iter()
-                            .filter(|p| p.exists())
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let dormant: Vec<crate::state::DormantBuffer> = restore
+                    .map(|sess| sess.buffers.as_slice())
+                    .unwrap_or(&[]);
+                let sources =
+                    restore_dormant_sources(entries, &params.name, s.backups_path.as_deref());
+                let dormant: Vec<crate::state::DormantBuffer> = sources
                     .into_iter()
-                    .map(|p| crate::state::DormantBuffer {
+                    .map(|source| crate::state::DormantBuffer {
                         id: s.allocate_buffer_id(),
-                        path: p,
+                        source,
                     })
+                    .collect();
+                // Which restored entries carry unsaved content (a backup) → eager-materialize.
+                let backups_root = s.backups_path.clone();
+                eager_restore_ids = dormant
+                    .iter()
+                    .filter(|d| match &d.source {
+                        crate::state::DormantSource::Scratch { .. } => true,
+                        crate::state::DormantSource::File(p) => backups_root.as_deref().is_some_and(
+                            |root| {
+                                crate::backup::exists(&crate::backup::file_backup_path(
+                                    root,
+                                    &params.name,
+                                    p,
+                                ))
+                            },
+                        ),
+                    })
+                    .map(|d| d.id)
                     .collect();
                 if let Some(proj) = s.workspaces.get_mut(&params.name) {
                     proj.dormant_buffers = dormant;
@@ -335,6 +354,27 @@ pub async fn workspace_activate(
         None
     };
 
+    // Eagerly materialize the restored buffers that carry unsaved content, so they come back as
+    // live, dirty buffers (visible and marked unsaved in the picker) rather than greyed dormant
+    // rows — the hot-exit promise. Each is opened by id through the normal open path, which loads
+    // the file (or rebuilds the scratch) and overlays the backup. The landing buffer above may have
+    // already materialized one of them; skip it. Best-effort: a single failure mustn't abort
+    // activation (e.g. the rare unreadable file — its content still survives in the backup).
+    for id in eager_restore_ids {
+        if params.open_last && Some(id) == last_buffer_id {
+            continue;
+        }
+        let _ = buffer_open(
+            state,
+            ctx,
+            BufferOpenParams {
+                buffer_id: Some(id),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
     // Stamp this activation and refresh the persisted buffer list (now that the landing buffer has
     // materialized). Drives the switcher's recency ordering on the next open.
     persist_workspace_session(state, &params.name, true).await;
@@ -374,7 +414,7 @@ async fn persist_workspace_session(state: &SharedState, workspace_name: &str, to
     {
         return;
     }
-    let buffers = s.session_buffer_paths(workspace_name);
+    let buffers = s.session_buffers(workspace_name);
     let mut sessions = crate::config::load_workspace_sessions_at(&path).unwrap_or_default();
     let entry = sessions.workspaces.entry(workspace_name.to_string()).or_default();
     entry.buffers = buffers;
@@ -383,6 +423,168 @@ async fn persist_workspace_session(state: &SharedState, workspace_name: &str, to
     }
     if let Err(e) = crate::config::write_workspace_sessions_at(&path, &sessions) {
         tracing::warn!(workspace = %workspace_name, error = %e, "failed to persist workspace session");
+    }
+}
+
+/// Decide what to restore as dormant buffers for `workspace_name`, given its persisted session
+/// `entries` and the backups root (`None` when backups are disabled). Pure except for filesystem
+/// existence checks, so it's unit-testable against a tempdir.
+///
+/// - A **file** is restored while it still exists on disk, or while it has a backup (a file deleted
+///   externally with unsaved content still comes back, flagged externally-deleted at materialize).
+/// - A **scratch** is restored only if its unsaved content survives as a backup — first from its
+///   session entry, then by scanning the scratch backup dir for any number the session didn't record
+///   (a dirty scratch whose session write didn't land before shutdown). Files can't be scanned that
+///   way: their backup filename is an unreversible path hash, so an unrecorded file backup relies on
+///   recover-on-open instead. Order: session entries (MRU) first, then recovered scratches ascending.
+fn restore_dormant_sources(
+    entries: &[crate::config::SessionBuffer],
+    workspace_name: &str,
+    backups_root: Option<&std::path::Path>,
+) -> Vec<crate::state::DormantSource> {
+    use crate::config::SessionBuffer;
+    use crate::state::DormantSource;
+    let mut sources: Vec<DormantSource> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionBuffer::File { path } => {
+                let has_backup = backups_root.is_some_and(|root| {
+                    crate::backup::exists(&crate::backup::file_backup_path(root, workspace_name, path))
+                });
+                (path.exists() || has_backup).then(|| DormantSource::File(path.clone()))
+            }
+            SessionBuffer::Scratch { number } => {
+                let has_backup = backups_root.is_some_and(|root| {
+                    crate::backup::exists(&crate::backup::scratch_backup_path(
+                        root,
+                        workspace_name,
+                        *number,
+                    ))
+                });
+                has_backup.then_some(DormantSource::Scratch { number: *number })
+            }
+        })
+        .collect();
+    if let Some(root) = backups_root {
+        let known: std::collections::HashSet<u32> = sources
+            .iter()
+            .filter_map(|src| match src {
+                DormantSource::Scratch { number } => Some(*number),
+                DormantSource::File(_) => None,
+            })
+            .collect();
+        if let Ok(dir) = std::fs::read_dir(root.join(workspace_name).join("scratch")) {
+            let mut recovered: Vec<u32> = dir
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+                .filter(|n| !known.contains(n))
+                .collect();
+            recovered.sort_unstable();
+            sources.extend(
+                recovered
+                    .into_iter()
+                    .map(|number| DormantSource::Scratch { number }),
+            );
+        }
+    }
+    sources
+}
+
+/// Delete every on-disk backup associated with `buf` in `workspace`. A buffer can in principle have
+/// both keys live at once (a scratch that was saved-as keeps its number *and* gains a path), so we
+/// clear both. Called at the explicit "this content is resolved" edges: save and close. No-op when
+/// backups aren't enabled.
+fn delete_buffer_backups(s: &ServerState, workspace: &str, buf: &Buffer) {
+    let Some(root) = s.backups_path.as_deref() else {
+        return;
+    };
+    if let Some(p) = buf.canonical_path.as_deref() {
+        crate::backup::delete(&crate::backup::file_backup_path(root, workspace, p));
+    }
+    if let Some(n) = buf.scratch_number {
+        crate::backup::delete(&crate::backup::scratch_backup_path(root, workspace, n));
+    }
+}
+
+/// Flush unsaved-buffer backups to disk: write a backup for every dirty buffer in a named workspace
+/// whose content changed since its last backup, and delete the backup for any buffer that's gone
+/// clean again (e.g. undone back to the saved state). This is the single writer of backup files —
+/// deliberately edit-source agnostic, so it captures every kind of edit (typing, format, revert,
+/// surround, …) without hooking each site. Best-effort: a no-op when backups aren't enabled
+/// (`backups_path` unset); logs rather than fails on I/O error. The (potentially large) rope clones
+/// and the file I/O happen off the lock; only the cheap `backed_up_revision` stamp is taken under it.
+/// See `docs/unsaved-persistence.md`.
+pub(crate) async fn flush_backups(state: &SharedState) {
+    enum Action {
+        Write(String, aether_protocol::Revision),
+        Delete,
+    }
+    struct Job {
+        id: aether_protocol::BufferId,
+        path: std::path::PathBuf,
+        action: Action,
+    }
+    let jobs: Vec<Job> = {
+        let s = state.lock().await;
+        let Some(root) = s.backups_path.clone() else {
+            return;
+        };
+        let mut jobs = Vec::new();
+        for (&id, workspace) in &s.buffer_workspaces {
+            // Named workspaces only — ephemeral throwaway contexts aren't persisted (like sessions).
+            if s.workspaces.get(workspace).is_none_or(|w| w.name.is_none()) {
+                continue;
+            }
+            let Some(buf) = s.buffers.get(&id) else {
+                continue;
+            };
+            let Some(path) = buffer_backup_path(&root, workspace, buf) else {
+                continue;
+            };
+            if buf.dirty {
+                if buf.backed_up_revision != Some(buf.revision) {
+                    let content: String = buf.text.chunks().collect();
+                    jobs.push(Job {
+                        id,
+                        path,
+                        action: Action::Write(content, buf.revision),
+                    });
+                }
+            } else if buf.backed_up_revision.is_some() {
+                jobs.push(Job {
+                    id,
+                    path,
+                    action: Action::Delete,
+                });
+            }
+        }
+        jobs
+    };
+    if jobs.is_empty() {
+        return;
+    }
+    let mut stamps: Vec<(aether_protocol::BufferId, Option<aether_protocol::Revision>)> = Vec::new();
+    for job in jobs {
+        match job.action {
+            Action::Write(content, rev) => match crate::backup::write(&job.path, &content) {
+                Ok(()) => stamps.push((job.id, Some(rev))),
+                Err(e) => {
+                    tracing::warn!(buffer_id = job.id, error = %e, "failed to write buffer backup")
+                }
+            },
+            Action::Delete => {
+                crate::backup::delete(&job.path);
+                stamps.push((job.id, None));
+            }
+        }
+    }
+    let mut s = state.lock().await;
+    for (id, stamp) in stamps {
+        if let Some(buf) = s.buffers.get_mut(&id) {
+            // Stamping a revision the buffer may have already moved past is fine: the next flush sees
+            // `revision != backed_up_revision` and rewrites.
+            buf.backed_up_revision = stamp;
+        }
     }
 }
 
@@ -1179,6 +1381,76 @@ fn open_scroll(
     client_id.and_then(|c| s.last_scroll.get(&(c, buffer_id)).copied())
 }
 
+/// On-disk backup path for a buffer in `workspace`, or `None` if it can't be backed up (no path and
+/// no scratch number — shouldn't happen for a live buffer). File buffers key by their canonical
+/// path, scratches by their number. The caller is responsible for only invoking this for buffers in
+/// a *named* workspace (backups are scoped the same way sessions are).
+fn buffer_backup_path(
+    root: &std::path::Path,
+    workspace: &str,
+    buf: &Buffer,
+) -> Option<std::path::PathBuf> {
+    if let Some(p) = buf.canonical_path.as_deref() {
+        Some(crate::backup::file_backup_path(root, workspace, p))
+    } else {
+        buf.scratch_number
+            .map(|n| crate::backup::scratch_backup_path(root, workspace, n))
+    }
+}
+
+/// Materialize a dormant *scratch* buffer (selected by id from the picker, or landed on at activate):
+/// allocate a real buffer, restore its unsaved content from the backup keyed by `number`, and return
+/// the open result. Mirrors the fresh-scratch arm of [`buffer_open_inner`] plus the backup overlay.
+async fn open_restored_scratch(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOpenParams,
+    number: u32,
+) -> Result<BufferOpenResult, RpcError> {
+    let client_id = Some(ctx.client_id);
+    let mut s = state.lock().await;
+    let active_workspace_name = s.active_workspace_or_err(ctx.client_id)?.id.clone();
+    let id = s.allocate_buffer_id();
+    let mut buf = Buffer::scratch(id, None, number);
+    if let Some(root) = s.backups_path.clone() {
+        let path = crate::backup::scratch_backup_path(&root, &active_workspace_name, number);
+        if let Some((content, _mtime)) = crate::backup::read(&path) {
+            buf.restore_unsaved(&content);
+            // The on-disk backup already holds this content — don't let the flush rewrite it.
+            buf.backed_up_revision = Some(buf.revision);
+        }
+    }
+    buf.transient = params.transient == Some(true);
+    let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
+    let clamped_anchor = params.jump_to_anchor.map(|a| motion::clamp_position(&buf, a));
+    let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
+    let scroll = open_scroll(&s, client_id, id, params.jump_to);
+    let result = BufferOpenResult {
+        buffer_id: id,
+        language: buf.language.clone(),
+        line_count: buf.line_count(),
+        byte_count: buf.byte_count(),
+        revision: buf.revision,
+        saved_revision: buf.saved_revision(),
+        path: None,
+        scratch_number: Some(number),
+        cursor,
+        scroll,
+        lsp_server: None, // scratch buffers are never language-server-backed
+        transient: buf.transient,
+        search_summary: None, // set by buffer_open's prime post-step, not here
+    };
+    s.buffers.insert(id, buf);
+    s.buffer_workspaces.insert(id, active_workspace_name.clone());
+    s.touch_mru(id);
+    let pushes = refresh_buffer_pickers(&mut s);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(result)
+}
+
 async fn buffer_open_inner(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -1198,11 +1470,10 @@ async fn buffer_open_inner(
     // fields; errors if the id isn't live.
     if let Some(buffer_id) = params.buffer_id {
         // A dormant (session-restored) buffer the picker selected by id has no live buffer behind
-        // it yet. Materialize it: remove it from the dormant list and re-dispatch as an
-        // absolute-path open, which loads the file and attaches git/LSP exactly like a fresh open.
-        // The reserved dormant id is discarded — the client switches to the freshly-allocated real
+        // it yet. Materialize it: remove it from the dormant list and rebuild the real buffer. The
+        // reserved dormant id is discarded — the client switches to the freshly-allocated real
         // buffer in the response.
-        let dormant_path = {
+        let dormant = {
             let mut s = state.lock().await;
             if s.buffers.contains_key(&buffer_id) {
                 None
@@ -1210,13 +1481,23 @@ async fn buffer_open_inner(
                 s.take_dormant(&active_workspace_name, buffer_id)
             }
         };
-        if let Some(path) = dormant_path {
-            let materialize = BufferOpenParams {
-                buffer_id: None,
-                absolute_path: Some(path.display().to_string()),
-                ..params
-            };
-            return Box::pin(buffer_open_inner(state, ctx, materialize)).await;
+        match dormant.map(|d| d.source) {
+            // A file re-dispatches as an absolute-path open, which loads the file and attaches
+            // git/LSP exactly like a fresh open — and picks up any backup via recover-on-open.
+            Some(crate::state::DormantSource::File(path)) => {
+                let materialize = BufferOpenParams {
+                    buffer_id: None,
+                    absolute_path: Some(path.display().to_string()),
+                    ..params
+                };
+                return Box::pin(buffer_open_inner(state, ctx, materialize)).await;
+            }
+            // A scratch has no path to re-dispatch through — rebuild it directly, restoring its
+            // unsaved content from the backup keyed by its number.
+            Some(crate::state::DormantSource::Scratch { number }) => {
+                return open_restored_scratch(state, ctx, params, number).await;
+            }
+            None => {}
         }
 
         let mut s = state.lock().await;
@@ -1433,12 +1714,51 @@ async fn buffer_open_inner(
 
     let mut s = state.lock().await;
     let id = s.allocate_buffer_id();
+    // Recover-on-open: unsaved content for this path may survive as a backup (hot-exit restore, or a
+    // crash that beat the session write). Backups are scoped to named workspaces, like sessions.
+    let backup = {
+        let named = s
+            .workspaces
+            .get(&active_workspace_name)
+            .is_some_and(|w| w.name.is_some());
+        match (named, s.backups_path.as_deref()) {
+            (true, Some(root)) => crate::backup::read(&crate::backup::file_backup_path(
+                root,
+                &active_workspace_name,
+                &canonical,
+            )),
+            _ => None,
+        }
+    };
     let mut buf = if params.create_if_missing && !canonical.exists() {
         // New file: empty buffer with the target path attached. Save will write to disk.
         Buffer::new_at_path(id, canonical.clone(), params.language.clone())
     } else {
-        Buffer::load_from_file(id, canonical.clone()).map_err(RpcError::file_io)?
+        match Buffer::load_from_file(id, canonical.clone()) {
+            Ok(b) => b,
+            // The file is gone but we still hold unsaved content for it — recover from the backup
+            // and flag it externally-deleted rather than failing the open.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && backup.is_some() => {
+                let mut b = Buffer::new_at_path(id, canonical.clone(), params.language.clone());
+                b.externally_deleted = true;
+                b
+            }
+            Err(e) => return Err(RpcError::file_io(e)),
+        }
     };
+    // Overlay the backup: the disk content loaded above becomes the saved baseline; the backup
+    // becomes the live (dirty) text. A source file newer than the backup means it changed externally
+    // while we were down — surfaced via the same `externally_modified` flag as an in-session collision.
+    if let Some((content, backup_mtime)) = &backup {
+        buf.restore_unsaved(content);
+        buf.backed_up_revision = Some(buf.revision);
+        if buf
+            .last_modified_unix_ms
+            .is_some_and(|disk| disk > *backup_mtime)
+        {
+            buf.externally_modified = true;
+        }
+    }
     buf.transient = params.transient == Some(true);
     let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
     let clamped_anchor = params
@@ -1540,7 +1860,16 @@ async fn buffer_open_inner(
         search_summary: None, // set by buffer_open's prime post-step, not here
     };
     s.touch_mru(id);
-    let pushes = refresh_buffer_pickers(&mut s);
+    let mut pushes = refresh_buffer_pickers(&mut s);
+    // A restored buffer can come back externally-modified/-deleted (the source changed or vanished
+    // while we were down). That state rides a `buffer/state` push, not the open result, so emit one
+    // now — otherwise the client wouldn't learn until some later edit triggered a push.
+    if s.buffers
+        .get(&id)
+        .is_some_and(|b| b.externally_modified || b.externally_deleted)
+    {
+        pushes.extend(collect_buffer_state_pushes(&s, id));
+    }
     drop(s);
     if let Some((key, spec, generation)) = lsp_launch {
         tokio::spawn(crate::lsp::manager::launch(
@@ -4110,6 +4439,14 @@ pub async fn buffer_close(
     // Remember the owning workspace before teardown drops the association, so we can retire an
     // ephemeral workspace once it loses its last buffer.
     let owning_workspace = s.workspace_for_buffer(params.buffer_id).map(str::to_string);
+    // Closing is an explicit discard: drop any unsaved backup now, so the content isn't resurrected
+    // the next time this path is opened (recover-on-open). Done before teardown drops the buffer.
+    if let (Some(ws), Some(buf)) = (
+        owning_workspace.as_deref(),
+        s.buffers.get(&params.buffer_id),
+    ) {
+        delete_buffer_backups(&s, ws, buf);
+    }
     // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
     // clears diagnostics, and tears down the language server if this was its last buffer).
     let stopped_server = s.close_buffer(params.buffer_id);
@@ -4702,6 +5039,16 @@ pub async fn buffer_save(
         // rides the buffer/state push below, so we just flip it.
         if let Some(buf) = s.buffers.get_mut(&params.buffer_id) {
             buf.transient = false;
+            buf.backed_up_revision = None;
+        }
+        // The content is now on disk — drop any unsaved backup (under both the file path and, for a
+        // saved-as scratch, its old number). Cheap and immediate; the flush would otherwise clear it
+        // on its next tick.
+        if let (Some(ws), Some(buf)) = (
+            s.workspace_for_buffer(params.buffer_id).map(str::to_string),
+            s.buffers.get(&params.buffer_id),
+        ) {
+            delete_buffer_backups(&s, &ws, buf);
         }
         let state_pushes = collect_buffer_state_pushes(&s, params.buffer_id);
         let picker_pushes = refresh_buffer_pickers(&mut s);
@@ -10199,7 +10546,9 @@ fn build_buffer_candidates(
         .filter_map(|(_, b)| b.canonical_path.as_deref())
         .collect();
     for d in &workspace.dormant_buffers {
-        if !live_paths.contains(d.path.as_path()) {
+        // A dormant *file* whose path is already open as a live buffer shouldn't double-show; a
+        // dormant scratch (no path) can never collide, so it always shows.
+        if d.path().is_none_or(|p| !live_paths.contains(p)) {
             out.push(dormant_candidate(d, &roots));
         }
     }
@@ -10207,15 +10556,22 @@ fn build_buffer_candidates(
 }
 
 /// Picker candidate for a dormant (session-restored, not-yet-loaded) buffer: it carries the
-/// reserved id as its picker identity and renders greyed out, but has no live buffer behind it —
-/// the display is derived from the path, and the status is always `Clean`.
+/// reserved id as its picker identity and renders greyed out, but has no live buffer behind it. A
+/// file's display/path is derived from its path; a dormant scratch shows `(scratch N)` and has no
+/// opener path. The status is always `Clean` — the dormant row predates loading, so its
+/// unsaved-from-backup state only shows once it's materialized.
 fn dormant_candidate(
     d: &crate::state::DormantBuffer,
     roots: &[std::path::PathBuf],
 ) -> picker_state::BufferCandidate {
-    let display = crate::workspace_index::workspace_relative_display(&d.path, roots)
-        .unwrap_or_else(|| d.path.display().to_string());
-    let path = crate::workspace_index::workspace_relative_parts(&d.path, roots);
+    let (display, path) = match &d.source {
+        crate::state::DormantSource::File(p) => (
+            crate::workspace_index::workspace_relative_display(p, roots)
+                .unwrap_or_else(|| p.display().to_string()),
+            crate::workspace_index::workspace_relative_parts(p, roots),
+        ),
+        crate::state::DormantSource::Scratch { number } => (format!("(scratch {number})"), None),
+    };
     picker_state::BufferCandidate {
         buffer_id: d.id,
         display,
@@ -12351,6 +12707,89 @@ mod find_nearest_git_change_tests {
 }
 
 #[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use crate::config::SessionBuffer;
+    use crate::state::DormantSource;
+
+    /// `restore_dormant_sources` decides what comes back as dormant buffers after a restart. Files
+    /// need to still exist (or have a backup); scratches need a backup — from the session entry, or
+    /// recovered by scanning the backups dir for numbers the session never recorded.
+    #[test]
+    fn restore_dormant_sources_files_and_scratches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let backups = root.join("backups");
+
+        // An existing file on disk; a deleted file that still has a backup; a deleted file with no
+        // backup (dropped).
+        let present = root.join("present.rs");
+        std::fs::write(&present, "x\n").unwrap();
+        let deleted_with_backup = root.join("gone_kept.rs");
+        let deleted_no_backup = root.join("gone_dropped.rs");
+        crate::backup::write(
+            &crate::backup::file_backup_path(&backups, "p", &deleted_with_backup),
+            "unsaved\n",
+        )
+        .unwrap();
+
+        // Scratch 1 recorded in the session with a backup; scratch 2 recorded but with NO backup
+        // (dropped); scratch 5 NOT in the session but present on disk (recovered by the scan).
+        crate::backup::write(&crate::backup::scratch_backup_path(&backups, "p", 1), "s1").unwrap();
+        crate::backup::write(&crate::backup::scratch_backup_path(&backups, "p", 5), "s5").unwrap();
+
+        let entries = vec![
+            SessionBuffer::File {
+                path: present.clone(),
+            },
+            SessionBuffer::File {
+                path: deleted_with_backup.clone(),
+            },
+            SessionBuffer::File {
+                path: deleted_no_backup.clone(),
+            },
+            SessionBuffer::Scratch { number: 1 },
+            SessionBuffer::Scratch { number: 2 },
+        ];
+
+        let sources = restore_dormant_sources(&entries, "p", Some(&backups));
+        assert_eq!(
+            sources,
+            vec![
+                DormantSource::File(present),
+                DormantSource::File(deleted_with_backup),
+                // deleted_no_backup dropped; scratch 2 (no backup) dropped.
+                DormantSource::Scratch { number: 1 },
+                // scratch 5 recovered from the backup dir scan, after the session entries.
+                DormantSource::Scratch { number: 5 },
+            ]
+        );
+    }
+
+    /// With backups disabled, a file is restorable only if it still exists, and no scratch is ever
+    /// restorable (no backup to read).
+    #[test]
+    fn restore_dormant_sources_without_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("a.rs");
+        std::fs::write(&present, "x\n").unwrap();
+        let entries = vec![
+            SessionBuffer::File {
+                path: present.clone(),
+            },
+            SessionBuffer::File {
+                path: dir.path().join("missing.rs"),
+            },
+            SessionBuffer::Scratch { number: 1 },
+        ];
+        assert_eq!(
+            restore_dormant_sources(&entries, "p", None),
+            vec![DormantSource::File(present)]
+        );
+    }
+}
+
+#[cfg(test)]
 mod next_buffer_tests {
     use super::*;
 
@@ -12397,11 +12836,11 @@ mod next_buffer_tests {
         st.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
             crate::state::DormantBuffer {
                 id: d1,
-                path: std::path::PathBuf::from("/p/a.rs"),
+                source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/a.rs")),
             },
             crate::state::DormantBuffer {
                 id: d2,
-                path: std::path::PathBuf::from("/p/b.rs"),
+                source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/b.rs")),
             },
         ];
         assert_eq!(next_buffer_for_client(&st, client_id), Some(d1));

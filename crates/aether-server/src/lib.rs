@@ -1,5 +1,6 @@
 //! Aether editor server.
 
+mod backup;
 mod brackets;
 mod case;
 mod config;
@@ -30,5 +31,5 @@ pub use config::{
 };
 pub use server::{
     run, run_with_listener, spawn_for_test, spawn_for_test_multi,
-    spawn_for_test_multi_with_sessions, ServerHandle,
+    spawn_for_test_multi_with_persistence, spawn_for_test_multi_with_sessions, ServerHandle,
 };
