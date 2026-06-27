@@ -65,6 +65,7 @@ pub struct InjectionLayer {
 
 static RUST: OnceLock<LanguageConfig> = OnceLock::new();
 static MARKDOWN: OnceLock<LanguageConfig> = OnceLock::new();
+static MARKDOWN_INLINE: OnceLock<LanguageConfig> = OnceLock::new();
 static TOML: OnceLock<LanguageConfig> = OnceLock::new();
 static HTML: OnceLock<LanguageConfig> = OnceLock::new();
 static JAVASCRIPT: OnceLock<LanguageConfig> = OnceLock::new();
@@ -188,6 +189,30 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: None,
                 block_comment: Some(("<!--", "-->")),
+            }
+        })),
+        // `tree-sitter-md` is two grammars: the block grammar above parses document structure
+        // (headings, fenced-code fences, lists), and its injection query injects this inline
+        // grammar over every `(inline)` node — that's where emphasis, strong, code spans, and
+        // links come from. Registered here so [`compute_injections`] can resolve the
+        // `markdown_inline` injection language rather than silently skipping it. Its own
+        // injection query (html/latex over inline spans) is wired up too, though it only fires
+        // for languages we also have registered.
+        "markdown_inline" => Some(MARKDOWN_INLINE.get_or_init(|| {
+            let language: Language = tree_sitter_md::INLINE_LANGUAGE.into();
+            let query = Query::new(&language, tree_sitter_md::HIGHLIGHT_QUERY_INLINE)
+                .expect("markdown inline highlights query compiles");
+            let injection_query = Query::new(&language, tree_sitter_md::INJECTION_QUERY_INLINE)
+                .expect("markdown inline injection query compiles");
+            LanguageConfig {
+                name: "markdown_inline",
+                language,
+                query,
+                injection_query: Some(injection_query),
+                indent_query: None,
+                default_indent: IndentStyle::Spaces(2),
+                line_comment: None,
+                block_comment: None,
             }
         })),
         "toml" => Some(simple(
@@ -695,9 +720,12 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
 
         let injections = compute_injections(cfg, &tree, source);
-        assert_eq!(injections.len(), 1, "expected one rust injection layer");
-        assert_eq!(injections[0].config.name, "rust");
-        let content = &source[injections[0].range.clone()];
+        // The heading text also injects a `markdown_inline` layer, so filter to the rust fence.
+        let rust = injections
+            .iter()
+            .find(|l| l.config.name == "rust")
+            .expect("expected a rust injection layer");
+        let content = &source[rust.range.clone()];
         assert!(content.contains("fn main"));
         assert!(!content.contains("```"));
 
@@ -710,6 +738,61 @@ mod tests {
         assert!(
             fn_kw.is_some(),
             "expected rust keyword highlight for 'fn' in fence"
+        );
+    }
+
+    #[test]
+    fn markdown_inline_injects_emphasis_strong_and_code_span() {
+        // The block grammar emits an `(inline)` injection over running text; resolving it to the
+        // `markdown_inline` grammar is what produces emphasis / strong / code-span captures.
+        let cfg = get_config("markdown").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "Some *italic*, **bold**, and `code` here.\n";
+        let tree = parser.parse(source, None).unwrap();
+
+        let injections = compute_injections(cfg, &tree, source);
+        assert!(
+            injections.iter().any(|l| l.config.name == "markdown_inline"),
+            "expected a markdown_inline injection layer, got {:?}",
+            injections.iter().map(|l| l.config.name).collect::<Vec<_>>()
+        );
+
+        let highlights = highlights_for_range(cfg, &tree, &injections, source, 0, source.len());
+        let kind_at = |needle: &str| {
+            let pos = source.find(needle).unwrap() as u32;
+            highlights
+                .iter()
+                .find(|h| h.start <= pos && h.end > pos)
+                .map(|h| h.kind.clone())
+        };
+        assert!(
+            kind_at("italic").is_some_and(|k| k == "text.emphasis"),
+            "*italic* → text.emphasis, got {:?}",
+            kind_at("italic")
+        );
+        assert!(
+            kind_at("bold").is_some_and(|k| k == "text.strong"),
+            "**bold** → text.strong, got {:?}",
+            kind_at("bold")
+        );
+        assert!(
+            kind_at("code").is_some_and(|k| k == "text.literal"),
+            "`code` → text.literal, got {:?}",
+            kind_at("code")
+        );
+    }
+
+    #[test]
+    fn markdown_inline_resolves_as_its_own_language() {
+        // Registered so the injection path finds it; standalone it highlights inline constructs.
+        let cfg = get_config("markdown_inline").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "**bold**";
+        let tree = parser.parse(source, None).unwrap();
+        let highlights = highlights_for_range(cfg, &tree, &[], source, 0, source.len());
+        assert!(
+            highlights.iter().any(|h| h.kind == "text.strong"),
+            "standalone markdown_inline should highlight strong, got {highlights:?}"
         );
     }
 

@@ -38,6 +38,29 @@ const CONTINUATION_MARKER: &str = "↪ ";
 /// the cell grid never shifts. The UI chrome stays on `Font::MONOSPACE`.
 const EDITOR_FONT: Font = Font::with_name("Fira Code");
 
+/// Bold / italic Fira Code, for markdown `text.strong` / `text.emphasis` runs. Only the Regular
+/// face is bundled, so cosmic-text synthesises the weight/slant — but synthetic embolden and
+/// oblique preserve glyph advance widths, so the monospace cell grid is unaffected.
+const EDITOR_FONT_BOLD: Font = Font {
+    weight: iced::font::Weight::Bold,
+    ..EDITOR_FONT
+};
+const EDITOR_FONT_ITALIC: Font = Font {
+    style: iced::font::Style::Italic,
+    ..EDITOR_FONT
+};
+
+/// Pick the editor font face for a highlight kind: markdown strong → bold, emphasis → italic,
+/// everything else → the regular face. Mirrors the TUI's `BOLD`/`ITALIC` modifiers for the same
+/// `text.strong` / `text.emphasis` captures.
+fn highlight_font(kind: Option<&str>) -> Font {
+    match kind {
+        Some("text.strong") => EDITOR_FONT_BOLD,
+        Some("text.emphasis") => EDITOR_FONT_ITALIC,
+        _ => EDITOR_FONT,
+    }
+}
+
 /// Line height for buffer text — the web client's `14px/1.4`; the measured cell height (and
 /// therefore every row) includes this spacing. Relative, so it scales with the font size.
 const LINE_HEIGHT_FACTOR: f32 = 1.4;
@@ -422,6 +445,7 @@ where
                     Point::new(text_x(0), y),
                     cell,
                     fg,
+                    EDITOR_FONT,
                     content_clip,
                     text_shaping,
                 );
@@ -680,6 +704,7 @@ where
                         Point::new(text_x(start), y),
                         cell,
                         color,
+                        highlight_font(kind),
                         content_clip,
                         text_shaping,
                     );
@@ -1225,6 +1250,7 @@ fn draw_text_run<Renderer: text::Renderer<Font = Font>>(
     position: Point,
     cell: Size,
     color: Color,
+    font: Font,
     clip: Rectangle,
     shaping: text::Shaping,
 ) {
@@ -1237,7 +1263,7 @@ fn draw_text_run<Renderer: text::Renderer<Font = Font>>(
             // without threading the size through every draw call.
             size: iced::Pixels(cell.height / LINE_HEIGHT_FACTOR),
             line_height: EDITOR_LINE_HEIGHT,
-            font: EDITOR_FONT,
+            font,
             align_x: text::Alignment::Left,
             align_y: iced::alignment::Vertical::Top,
             shaping,
@@ -1265,6 +1291,7 @@ fn draw_run<Renderer: text::Renderer<Font = Font>>(
         position,
         cell,
         color,
+        EDITOR_FONT,
         clip,
         text::Shaping::Advanced,
     );
