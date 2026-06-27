@@ -664,10 +664,15 @@ pub fn dir_statuses(dir: &Path) -> HashMap<String, GitStatus> {
             if suffix.components().nth(1).is_some() {
                 continue;
             }
-            // libgit2 also reports untracked *empty* directories as IGNORED (git can't track
-            // them), which would grey a bare empty folder. Keep an Ignored child only when
-            // an actual ignore rule matches its path.
-            if !repo.is_path_ignored(Path::new(path)).unwrap_or(true) {
+            // libgit2 reports two different things as IGNORED that `is_path_ignored` (a
+            // rule-by-path query) disagrees with, because it won't consult a `.gitignore`
+            // *inside* the directory: (a) bare untracked *empty* dirs git can't track, which
+            // we must NOT grey, and (b) self-ignoring dirs whose only ignore rule is a
+            // contained `.gitignore` of `*` (pytest/ruff caches), which we DO want greyed.
+            // Tell them apart by emptiness: drop only the empty-no-rule false positive.
+            if !repo.is_path_ignored(Path::new(path)).unwrap_or(true)
+                && dir_is_empty(&canonical.join(child))
+            {
                 continue;
             }
         }
@@ -681,6 +686,16 @@ pub fn dir_statuses(dir: &Path) -> HashMap<String, GitStatus> {
             .or_insert(status);
     }
     out
+}
+
+/// Whether `path` is a directory with no entries. A non-directory or unreadable path counts as
+/// non-empty so callers fall back to their default (keeping a flagged entry rather than dropping
+/// it). Short-circuits on the first entry — never a full walk.
+fn dir_is_empty(path: &Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => false,
+    }
 }
 
 /// A repo's per-file status, scoped to one workspace root, for the Files picker. Holds the root's
@@ -1527,6 +1542,29 @@ mod tests {
         std::fs::write(root.join("build/out.o"), "obj\n").unwrap();
         let st = dir_statuses(root);
         assert_eq!(st.get("build"), Some(&GitStatus::Ignored));
+    }
+
+    /// A directory ignored only by a `.gitignore` *inside itself* (a single `*`, as pytest and
+    /// ruff write into their cache dirs) must grey out. libgit2 reports it as IGNORED but
+    /// `is_path_ignored` returns false — no ancestor rule names it — so the entry is kept on the
+    /// strength of being non-empty, distinguishing it from an empty-dir false positive.
+    #[test]
+    fn dir_statuses_self_ignoring_dir_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(root, &[("code.rs", "fine\n")]);
+        // The pytest/ruff idiom: the cache dir carries its own `.gitignore` of `*`.
+        std::fs::create_dir(root.join(".pytest_cache")).unwrap();
+        std::fs::write(root.join(".pytest_cache/.gitignore"), "*\n").unwrap();
+        std::fs::write(root.join(".pytest_cache/CACHEDIR.TAG"), "x").unwrap();
+
+        let st = dir_statuses(root);
+        assert_eq!(
+            st.get(".pytest_cache"),
+            Some(&GitStatus::Ignored),
+            "a dir ignored by its own contained .gitignore greys out"
+        );
+        assert_eq!(st.get("code.rs"), None);
     }
 
     /// The `__pycache__` case: a clean tracked folder whose only status entries are ignored
