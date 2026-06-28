@@ -22,7 +22,7 @@ use aether_protocol::git::{
 };
 use aether_protocol::input::{
     CountedEditParams, InputAdjustNumber, InputAdjustNumberParams, InputSurround,
-    InputSurroundParams, InputText, InputTextParams,
+    InputSurroundParams, InputText, InputTextParams, UndoRedoParams,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -855,6 +855,31 @@ fn input_adjust_number_methods() {
     // `count` defaults to 1 when omitted on the wire.
     let back: CountedEditParams = serde_json::from_value(json!({"buffer_id": 3})).unwrap();
     assert_eq!(back.count, 1);
+
+    // Undo/redo carry `collapse_selection`; both it and a `count` of 1 are omitted when unset.
+    let plain = to_value(UndoRedoParams {
+        buffer_id: 3,
+        count: 1,
+        collapse_selection: false,
+    })
+    .unwrap();
+    assert_eq!(plain, json!({"buffer_id": 3}));
+
+    let collapsing = to_value(UndoRedoParams {
+        buffer_id: 3,
+        count: 2,
+        collapse_selection: true,
+    })
+    .unwrap();
+    assert_eq!(
+        collapsing,
+        json!({"buffer_id": 3, "count": 2, "collapse_selection": true})
+    );
+
+    // Both fields default when omitted on the wire.
+    let back: UndoRedoParams = serde_json::from_value(json!({"buffer_id": 3})).unwrap();
+    assert_eq!(back.count, 1);
+    assert!(!back.collapse_selection);
 }
 
 #[test]

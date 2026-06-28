@@ -386,15 +386,32 @@ pub struct InputTransformCaseParams {
 pub struct EditUndo;
 impl RpcMethod for EditUndo {
     const NAME: &'static str = "edit/undo";
-    type Params = CountedEditParams;
+    type Params = UndoRedoParams;
     type Result = UndoResult;
 }
 
 pub struct EditRedo;
 impl RpcMethod for EditRedo {
     const NAME: &'static str = "edit/redo";
-    type Params = CountedEditParams;
+    type Params = UndoRedoParams;
     type Result = UndoResult;
+}
+
+/// Params for counted undo/redo. Like `CountedEditParams` but with `collapse_selection`: undo
+/// restores the cursor state saved before the edit, which re-selects undone text (deleting a
+/// selection, then undoing, brings the selection back). That's wanted in Normal mode but breaks
+/// the Insert-mode invariant that there's never a selection, so the client sets the flag when
+/// undoing/redoing in Insert mode to collapse the restored cursor to a point.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UndoRedoParams {
+    pub buffer_id: BufferId,
+    #[serde(
+        default = "crate::count_one",
+        skip_serializing_if = "crate::count_is_one"
+    )]
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapse_selection: bool,
 }
 
 // ---- input/join_lines ---------------------------------------------------------------------------

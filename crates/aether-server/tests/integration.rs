@@ -28,7 +28,7 @@ use aether_protocol::input::{
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine,
     InputOpenLineParams, InputSurround, InputSurroundParams, InputText, InputTextParams,
     InputToggleComment, InputTransformCase, InputTransformCaseParams, InputUnsurround,
-    InputUnsurroundParams, LineSide, SurroundTarget, UndoResult,
+    InputUnsurroundParams, LineSide, SurroundTarget, UndoRedoParams, UndoResult,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -2006,9 +2006,10 @@ async fn counted_edits_run_server_side() {
     let r: UndoResult = send_request::<EditUndo>(
         &mut ws,
         12,
-        &CountedEditParams {
+        &UndoRedoParams {
             buffer_id,
             count: 10,
+            collapse_selection: false,
         },
     )
     .await;
@@ -3838,9 +3839,10 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     let undo: UndoResult = send_request::<EditUndo>(
         &mut ws,
         13,
-        &CountedEditParams {
+        &UndoRedoParams {
             buffer_id,
             count: 1,
+            collapse_selection: false,
         },
     )
     .await;
@@ -3858,9 +3860,10 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     let redo: UndoResult = send_request::<EditRedo>(
         &mut ws,
         14,
-        &CountedEditParams {
+        &UndoRedoParams {
             buffer_id,
             count: 1,
+            collapse_selection: false,
         },
     )
     .await;
@@ -3882,13 +3885,76 @@ async fn undo_on_empty_stack_returns_applied_false() {
     let r: UndoResult = send_request::<EditUndo>(
         &mut ws,
         10,
-        &CountedEditParams {
+        &UndoRedoParams {
             buffer_id,
             count: 1,
+            collapse_selection: false,
         },
     )
     .await;
     assert!(!r.applied);
+    drop(server);
+}
+
+#[tokio::test]
+async fn undo_restores_selection_unless_collapse_requested() {
+    // Deleting a selection then undoing re-selects the restored text (Normal mode wants this).
+    // The `collapse_selection` flag — set by the client in Insert mode, where selections aren't
+    // allowed — drops that selection, collapsing the cursor to a point.
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+
+    // Select "abc" (anchor col 0, cursor col 2 — inclusive on both ends).
+    let select = || CursorSetParams {
+        buffer_id,
+        position: LogicalPosition { line: 0, col: 2 },
+        anchor: LogicalPosition { line: 0, col: 0 },
+        granularity: Granularity::Char,
+    };
+    let st: CursorState = send_request::<CursorSet>(&mut ws, 9, &select()).await;
+    assert_ne!(st.anchor, st.position, "selection is active before delete");
+
+    // Delete the selection.
+    let _: EditResult =
+        send_request::<InputDelete>(&mut ws, 10, &CountedEditParams { buffer_id, count: 1 }).await;
+
+    // Undo without the flag: the selection comes back (Normal-mode behaviour).
+    let undo: UndoResult = send_request::<EditUndo>(
+        &mut ws,
+        11,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await;
+    assert!(undo.applied);
+    assert_eq!(undo.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(undo.cursor.position, LogicalPosition { line: 0, col: 2 });
+
+    // Re-select and re-delete to set up the same undo entry again.
+    let _: CursorState = send_request::<CursorSet>(&mut ws, 12, &select()).await;
+    let _: EditResult =
+        send_request::<InputDelete>(&mut ws, 13, &CountedEditParams { buffer_id, count: 1 }).await;
+
+    // Undo with the flag: the cursor collapses to a point (no selection in Insert mode).
+    let undo: UndoResult = send_request::<EditUndo>(
+        &mut ws,
+        14,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: true,
+        },
+    )
+    .await;
+    assert!(undo.applied);
+    assert_eq!(
+        undo.cursor.anchor, undo.cursor.position,
+        "collapse_selection drops the restored selection"
+    );
+    assert_eq!(undo.cursor.position, LogicalPosition { line: 0, col: 2 });
+
     drop(server);
 }
 
@@ -3965,9 +4031,10 @@ async fn dirty_clears_when_undoing_back_past_save() {
     let undo: UndoResult = send_request::<EditUndo>(
         &mut ws,
         15,
-        &CountedEditParams {
+        &UndoRedoParams {
             buffer_id,
             count: 1,
+            collapse_selection: false,
         },
     )
     .await;
@@ -6571,9 +6638,10 @@ async fn increment_count_applies_in_one_step() {
     let _: aether_protocol::input::UndoResult = send_request::<EditUndo>(
         &mut ws,
         13,
-        &CountedEditParams {
+        &UndoRedoParams {
             buffer_id,
             count: 1,
+            collapse_selection: false,
         },
     )
     .await;
@@ -17165,9 +17233,10 @@ async fn apply_hunk_reverts_modification_and_is_undoable() {
     let _: UndoResult = send_request::<EditUndo>(
         &mut ws,
         7,
-        &CountedEditParams {
+        &UndoRedoParams {
             buffer_id,
             count: 1,
+            collapse_selection: false,
         },
     )
     .await;
@@ -18283,9 +18352,10 @@ async fn lsp_diagnostics_clear_on_undo() {
     let undo: UndoResult = send_request::<EditUndo>(
         &mut ws,
         13,
-        &CountedEditParams {
+        &UndoRedoParams {
             buffer_id,
             count: 1,
+            collapse_selection: false,
         },
     )
     .await;

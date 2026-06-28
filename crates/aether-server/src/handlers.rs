@@ -38,7 +38,8 @@ use aether_protocol::git::{
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputAdjustNumberParams,
     InputMoveLinesParams, InputOpenLineParams, InputSurroundParams, InputTextParams,
-    InputTransformCaseParams, InputUnsurroundParams, LineSide, SurroundTarget, UndoResult,
+    InputTransformCaseParams, InputUnsurroundParams, LineSide, SurroundTarget, UndoRedoParams,
+    UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -7957,7 +7958,7 @@ pub async fn input_transform_case(
 pub async fn edit_undo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: CountedEditParams,
+    params: UndoRedoParams,
 ) -> Result<UndoResult, RpcError> {
     undo_redo_counted(state, ctx, params, UndoDirection::Undo).await
 }
@@ -7965,7 +7966,7 @@ pub async fn edit_undo(
 pub async fn edit_redo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: CountedEditParams,
+    params: UndoRedoParams,
 ) -> Result<UndoResult, RpcError> {
     undo_redo_counted(state, ctx, params, UndoDirection::Redo).await
 }
@@ -7975,12 +7976,14 @@ pub async fn edit_redo(
 async fn undo_redo_counted(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: CountedEditParams,
+    params: UndoRedoParams,
     direction: UndoDirection,
 ) -> Result<UndoResult, RpcError> {
     let mut last = None;
     for _ in 0..params.count.max(1) {
-        let r = apply_undo_or_redo(state, ctx, params.buffer_id, direction).await?;
+        let r =
+            apply_undo_or_redo(state, ctx, params.buffer_id, direction, params.collapse_selection)
+                .await?;
         let applied = r.applied;
         last = Some(r);
         if !applied {
@@ -9611,6 +9614,7 @@ async fn apply_undo_or_redo(
     ctx: &mut ConnectionCtx,
     buffer_id: BufferId,
     direction: UndoDirection,
+    collapse_selection: bool,
 ) -> Result<UndoResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -9675,6 +9679,14 @@ async fn apply_undo_or_redo(
             if let Some(cursor) = s.cursors.get(&(cid, buffer_id)).copied() {
                 e.insert(clamp_cursor(buf, cursor));
             }
+        }
+    }
+    // In Insert mode the client requests the restored selection be dropped — undo would otherwise
+    // re-select the undone text, breaking the no-selection-in-Insert invariant. Only the requesting
+    // client's cursor is collapsed; the flag reflects *its* mode, not other clients'.
+    if collapse_selection {
+        if let Some(cursor) = new_cursors.get_mut(&client_id) {
+            cursor.anchor = cursor.position;
         }
     }
     for (cid, cursor) in &new_cursors {

@@ -48,7 +48,7 @@ use aether_protocol::input::{
     InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams,
     InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams, InputText,
     InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
-    InputUnsurround, InputUnsurroundParams, LineSide, UndoResult,
+    InputUnsurround, InputUnsurroundParams, LineSide, UndoRedoParams, UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -5614,12 +5614,14 @@ impl Session {
     /// Counted undo/redo — repeats server-side, stopping when the stack is exhausted.
     fn undo_redo<M>(&mut self, count: u32) -> Effects
     where
-        M: RpcMethod<Params = CountedEditParams, Result = UndoResult> + 'static,
+        M: RpcMethod<Params = UndoRedoParams, Result = UndoResult> + 'static,
     {
         self.request_str::<M>(
-            CountedEditParams {
+            UndoRedoParams {
                 buffer_id: self.buffer.buffer_id,
                 count,
+                // Insert mode forbids selections — drop the one undo would otherwise restore.
+                collapse_selection: self.mode == Mode::Insert,
             },
             Event::UndoRedoDone,
         )
