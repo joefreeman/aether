@@ -1988,6 +1988,27 @@ fn pointer_selection_in_insert_mode_drops_to_normal() {
     assert_eq!(s.mode, Mode::Normal, "dragging out a selection → Normal");
 }
 
+#[test]
+fn ctrl_alt_x_cuts_the_selection_and_enters_insert() {
+    use aether_client::session::Mode;
+
+    let mut s = session();
+    let ctrl_alt = Mods {
+        ctrl: true,
+        alt: true,
+        shift: false,
+    };
+    let fx = s.on_key(KeyCode::Char('x'), ctrl_alt, None, ROWS);
+
+    // Cuts via the same RPC as a plain Ctrl-x...
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/cut");
+    assert_eq!(params["scope"], json!("selection"));
+
+    // ...but unlike Ctrl-x (which stays in Normal) it leaves us in Insert at the gap.
+    assert_eq!(s.mode, Mode::Insert);
+}
+
 /// Find the first `Effect::Request` whose method matches (the multi-request flows — re-list,
 /// create — emit more than one, so `the_request`'s exactly-one assertion doesn't fit).
 fn find_request<'a>(fx: &'a Effects, method: &str) -> Option<&'a serde_json::Value> {

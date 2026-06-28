@@ -255,6 +255,9 @@ pub enum Action {
     // Selection-scoped (Normal) vs line-scoped (Insert) clipboard/edit pairs.
     Copy,
     Cut,
+    /// `Ctrl-Alt-x` — cut the selection (like [`Action::Cut`]) and then enter Insert mode at the
+    /// gap left behind, mirroring [`Action::Change`] but keeping the removed text on the clipboard.
+    CutChange,
     Paste,
     Change,
     ReplaceClipboard,
@@ -707,6 +710,7 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('d'), Exact(Mods::CTRL), A::DeleteSelection, "Edit", "Delete selection"),
     bind!(N, ch('c'), Exact(Mods::CTRL), A::Copy, "Clipboard", "Copy selection"),
     bind!(N, ch('x'), Exact(Mods::CTRL), A::Cut, "Clipboard", "Cut selection"),
+    bind!(N, ch('x'), Exact(Mods::CTRL_ALT), A::CutChange, "Clipboard", "Cut selection and insert"),
     bind!(N, ch('v'), Exact(Mods::CTRL), A::Paste, "Clipboard", "Paste before selection"),
     bind!(N, ch('v'), Exact(Mods::CTRL_ALT), A::ReplaceClipboard, "Clipboard", "Replace selection with clipboard"),
     bind!(N, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Selection), "Edit", "Unsurround selection"),

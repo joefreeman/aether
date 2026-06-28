@@ -4932,7 +4932,7 @@ impl Session {
         if self.conn != ConnState::Connected
             && matches!(
                 action,
-                A::EnterInsert(_) | A::OpenLineBelow | A::OpenLineAbove | A::Change
+                A::EnterInsert(_) | A::OpenLineBelow | A::OpenLineAbove | A::Change | A::CutChange
             )
         {
             return Effects::toast("Not connected — editing unavailable", ToastKind::Info);
@@ -5238,6 +5238,12 @@ impl Session {
             A::Copy => self.copy(CopyScope::Selection),
             A::CopyLine => self.copy(CopyScope::Line),
             A::Cut => self.cut(CopyScope::Selection),
+            // Cut to the clipboard, then drop into Insert at the resulting gap — the server's cut
+            // collapses the selection and parks the cursor there, so all that's left is the mode flip.
+            A::CutChange => {
+                self.mode = Mode::Insert;
+                self.cut(CopyScope::Selection)
+            }
             A::CutLine => self.cut(CopyScope::Line),
             A::Paste => read_clipboard_fx(PasteKind::Before { count }),
             A::ReplaceClipboard => read_clipboard_fx(PasteKind::Replace { count }),
