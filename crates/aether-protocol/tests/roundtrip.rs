@@ -824,18 +824,28 @@ fn input_adjust_number_methods() {
     assert_eq!(InputAdjustNumber::NAME, "input/adjust_number");
 
     // Signed delta rides on the wire both ways (increment is `+count`, decrement `-count`).
+    // `scan_at_cursor` is omitted when false (Normal mode) and present in Insert mode.
     let inc = to_value(InputAdjustNumberParams {
         buffer_id: 3,
         delta: 1,
+        scan_at_cursor: false,
     })
     .unwrap();
     assert_eq!(inc, json!({"buffer_id": 3, "delta": 1}));
     let dec = to_value(InputAdjustNumberParams {
         buffer_id: 3,
         delta: -4,
+        scan_at_cursor: false,
     })
     .unwrap();
     assert_eq!(dec, json!({"buffer_id": 3, "delta": -4}));
+    let scan = to_value(InputAdjustNumberParams {
+        buffer_id: 3,
+        delta: 1,
+        scan_at_cursor: true,
+    })
+    .unwrap();
+    assert_eq!(scan, json!({"buffer_id": 3, "delta": 1, "scan_at_cursor": true}));
 
     // The shared counted-edit shape omits `count` when it's 1, and carries it otherwise.
     let one = to_value(CountedEditParams {

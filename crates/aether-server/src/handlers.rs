@@ -38,8 +38,8 @@ use aether_protocol::git::{
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputAdjustNumberParams,
     InputMoveLinesParams, InputOpenLineParams, InputSurroundParams, InputTextParams,
-    InputTransformCaseParams, InputUnsurroundParams, LineSide, SurroundTarget, UndoRedoParams,
-    UndoResult,
+    InputTransformCaseParams, InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams,
+    UndoRedoParams, UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -8218,9 +8218,9 @@ fn previous_line_indent(buf: &Buffer, line_idx: usize) -> String {
 pub async fn input_toggle_comment(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: BufferOnlyParams,
+    params: ToggleCommentParams,
 ) -> Result<EditResult, RpcError> {
-    apply_toggle_comment(state, ctx, params.buffer_id).await
+    apply_toggle_comment(state, ctx, params.buffer_id, params.collapse_selection).await
 }
 
 /// Toggle comment status on the cursor/selection.
@@ -8240,6 +8240,7 @@ async fn apply_toggle_comment(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     buffer_id: BufferId,
+    collapse_selection: bool,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -8298,10 +8299,16 @@ async fn apply_toggle_comment(
                 return Some((s, e, span, open, close));
             }
         }
-        // Fallback: the selection's text *exactly* equals a wrapped span. Catches incomplete
-        // parses where tree-sitter doesn't recognise the comment yet (e.g. the user just
-        // typed an opener without a closer).
-        let (start_pos, end_pos) = ordered_selection_or_cursor_line(&cursor);
+        // Fallback: the operand's text *exactly* equals a wrapped span. Catches cases the
+        // tree-sitter detector misses — incomplete parses (an opener typed without a closer), or
+        // grammars that don't expose a `comment` node for the wrap (e.g. markdown's embedded HTML
+        // comments). The operand is the selection in Normal mode; in Insert mode there's none, and
+        // a point caret wraps the whole line, so detect a wrap on the whole line to round-trip.
+        let (start_pos, end_pos) = if collapse_selection && cursor.is_point() {
+            current_line_content_endpoints(buf, cursor.position.line)?
+        } else {
+            ordered_selection_or_cursor_line(&cursor)
+        };
         let start_char = motion::pos_to_char(buf, start_pos);
         let end_char_excl = motion::pos_to_char(buf, end_pos)
             .saturating_add(1)
@@ -8417,14 +8424,16 @@ async fn apply_toggle_comment(
         Plan::LineUncomment { prefix } => {
             let (start_char, end_char) = line_edit_char_range(buf, a, b);
             let (text, shifts, insert_cols) = build_line_uncomment(&line_strings, a, prefix);
-            let nc = shift_cursor_by_line_map(cursor, a, b, &shifts, &insert_cols);
+            let nc =
+                shift_cursor_by_line_map(cursor, a, b, &shifts, &insert_cols, collapse_selection);
             Some((start_char, end_char, text, nc, a, b))
         }
         Plan::LineComment { prefix, min_indent } => {
             let (start_char, end_char) = line_edit_char_range(buf, a, b);
             let (text, shifts, insert_cols) =
                 build_line_comment(&line_strings, a, prefix, min_indent);
-            let nc = shift_cursor_by_line_map(cursor, a, b, &shifts, &insert_cols);
+            let nc =
+                shift_cursor_by_line_map(cursor, a, b, &shifts, &insert_cols, collapse_selection);
             Some((start_char, end_char, text, nc, a, b))
         }
         Plan::BlockUnwrap {
@@ -8440,8 +8449,12 @@ async fn apply_toggle_comment(
             let inner_start = open.len();
             let inner_end = span.len() - close.len();
             let mut inner = &span[inner_start..inner_end];
+            // Chars stripped *before* the inner content (`open` + an optional space) — the caret
+            // shifts left by this much in Insert mode to track its character.
+            let mut removed_lead = open.len();
             if inner.starts_with(' ') {
                 inner = &inner[1..];
+                removed_lead += 1;
             }
             if inner.ends_with(' ') {
                 inner = &inner[..inner.len() - 1];
@@ -8470,7 +8483,32 @@ async fn apply_toggle_comment(
                     },
                 }
             };
-            let nc = if start_pos == new_position {
+            // Re-select the uncommented content (Normal mode). In Insert mode (`collapse_selection`)
+            // there's no selection to spring: keep the caret on the character it was on by shifting
+            // it left past the removed leading delimiter (clamped to the content). Single-line is
+            // the only Insert-mode case; a multi-line strip falls back to the content end.
+            let nc = if collapse_selection {
+                let pos = if inner.contains('\n') {
+                    new_position
+                } else {
+                    let content_end = start_pos.col + inner.chars().count() as u32;
+                    let col = cursor
+                        .position
+                        .col
+                        .saturating_sub(removed_lead as u32)
+                        .clamp(start_pos.col, content_end);
+                    aether_protocol::LogicalPosition {
+                        line: start_pos.line,
+                        col,
+                    }
+                };
+                CursorState {
+                    position: pos,
+                    anchor: pos,
+                    match_bracket: None,
+                    grep_position: None,
+                }
+            } else if start_pos == new_position {
                 CursorState {
                     position: new_position,
                     anchor: new_position,
@@ -8527,7 +8565,27 @@ async fn apply_toggle_comment(
                     col: last_line_bytes.saturating_sub(1),
                 }
             };
-            let nc = if start_pos == new_position {
+            // Select the wrapped span (Normal mode). In Insert mode (`collapse_selection`) there's
+            // no selection to spring — a point caret wraps its current line — so keep the caret on
+            // the character it was on: the leading `open + " "` shifts everything after the wrap's
+            // start rightward, so the caret moves right by that prefix. Single-line is the only
+            // Insert-mode case; a multi-line wrap falls back to the content end.
+            let nc = if collapse_selection {
+                let pos = if newlines == 0 {
+                    aether_protocol::LogicalPosition {
+                        line: cursor.position.line,
+                        col: cursor.position.col + open.len() as u32 + 1,
+                    }
+                } else {
+                    new_position
+                };
+                CursorState {
+                    position: pos,
+                    anchor: pos,
+                    match_bracket: None,
+                    grep_position: None,
+                }
+            } else if start_pos == new_position {
                 CursorState {
                     position: new_position,
                     anchor: new_position,
@@ -8886,11 +8944,16 @@ fn shift_cursor_by_line_map(
     b: u32,
     shifts: &HashMap<u32, i32>,
     insert_cols: &HashMap<u32, usize>,
+    caret_follows_content: bool,
 ) -> CursorState {
     // When a selection exists, treat its endpoints asymmetrically so the selection *extends*
     // to cover any prefix we just added (rather than sliding with the content and leaving the
     // new prefix outside the selection). The lower endpoint stays put when it sits exactly at
     // the insert column; the upper endpoint shifts forward to follow the content.
+    //
+    // In Insert mode (`caret_follows_content`) there's no selection to grow — the lone caret
+    // should stay glued to the character it was on, so it shifts forward even when it sits
+    // exactly at the insert column (otherwise it'd be left behind, sitting on the new prefix).
     let lower = motion::ordered(cursor.position, cursor.anchor).0;
 
     let shift_pos = |p: aether_protocol::LogicalPosition, is_lower_endpoint: bool| {
@@ -8905,7 +8968,7 @@ fn shift_cursor_by_line_map(
         let col = if shift >= 0 {
             // The endpoint that anchors the selection's *start* stays at insert_col so the
             // selection grows; everything else (including cursor-only) shifts forward.
-            if is_lower_endpoint && p.col == insert_col {
+            if is_lower_endpoint && p.col == insert_col && !caret_follows_content {
                 p.col
             } else {
                 p.col.saturating_add(shift as u32)
@@ -8950,22 +9013,35 @@ pub async fn input_dedent(
 }
 
 /// Resolve what an `AdjustNumber` by `delta` targets: `(start_char, end_char, line, new_text)` in
-/// absolute char offsets, or `None` for a no-op. A point cursor scans the whole number at/after the
-/// cursor (Vim `Ctrl-A`); an active selection adjusts only the selected text, and only when it's a
-/// strictly valid integer (so a partial number shifts just the selected part). Shared by the
-/// no-op precheck in `adjust_number` and the edit itself in `apply_edit`.
+/// absolute char offsets, or `None` for a no-op. With `scan` (Insert mode) the operand is inferred
+/// by scanning the caret's line for the number at/after the cursor (Vim `Ctrl-A`); without it
+/// (Normal mode) the operand is exactly the selected chars (a point cursor being the single char
+/// under the block). Either way the operand must be a strictly valid integer. Shared by the no-op
+/// precheck in `adjust_number` and the edit itself in `apply_edit`.
 fn resolve_number_edit(
     buf: &Buffer,
     cursor: &CursorState,
     delta: i64,
+    scan: bool,
 ) -> Option<(usize, usize, u32, String)> {
-    // Increment/decrement is selection-only: the operand is exactly the selected chars (a point
-    // cursor being the single char under the block). No scanning outward — a `-` or extra digits
-    // that aren't selected stay out, so the adjustment can never invert by sweeping up a sign.
-    let (sc, ec) = current_selection_char_range(buf, cursor);
+    let (sc, ec) = if scan {
+        // Insert mode: there's no selection, so infer the number by scanning the line. Outward
+        // scanning is safe here precisely because there's no selection edge to respect.
+        let line = cursor.position.line;
+        let line_text: String = buf.text.line(line as usize).chars().collect();
+        let (s_col, e_col) = crate::number::find_number(&line_text, cursor.position.col as usize)?;
+        (
+            motion::pos_to_char(buf, LogicalPosition { line, col: s_col as u32 }),
+            motion::pos_to_char(buf, LogicalPosition { line, col: e_col as u32 }),
+        )
+    } else {
+        // Normal mode: the operand is exactly the selected chars (a point cursor being the single
+        // char under the block). No scanning — a `-` or extra digits that aren't selected stay
+        // out, so the adjustment can never invert by sweeping up a sign.
+        current_selection_char_range(buf, cursor)
+    };
     let selected: String = buf.text.slice(sc..ec).chars().collect();
-    crate::number::adjust_exact(&selected, delta)
-        .map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
+    crate::number::adjust_exact(&selected, delta).map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
 }
 
 /// `Ctrl-e` / `Ctrl-Alt-e`: shift the cursor's number by `delta` in a single edit (so `3` +
@@ -8978,6 +9054,7 @@ pub async fn input_adjust_number(
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
     let delta = i64::from(params.delta);
+    let scan = params.scan_at_cursor;
     {
         let s = state.lock().await;
         let buf = s
@@ -8989,7 +9066,7 @@ pub async fn input_adjust_number(
             .get(&(client_id, params.buffer_id))
             .copied()
             .unwrap_or_default();
-        if resolve_number_edit(buf, &cursor, delta).is_none() {
+        if resolve_number_edit(buf, &cursor, delta, scan).is_none() {
             let revision = buf.revision;
             let cursor = wrap_for_response(&s, client_id, params.buffer_id, cursor);
             return Ok(EditResult { revision, cursor });
@@ -8999,7 +9076,7 @@ pub async fn input_adjust_number(
         state,
         client_id,
         params.buffer_id,
-        EditKind::AdjustNumber { delta },
+        EditKind::AdjustNumber { delta, scan },
     )
     .await
 }
@@ -9903,7 +9980,7 @@ enum EditKind {
     /// in place; the post-edit cursor selects the whole result, so the selection tracks the digit
     /// count and repeated presses stay on the number. `input_increment_number` guarantees a number
     /// exists before issuing this — the no-op case never reaches here.
-    AdjustNumber { delta: i64 },
+    AdjustNumber { delta: i64, scan: bool },
     /// Recase the operand (`Ctrl-r <key>`). The operand range + replacement text are resolved by
     /// `resolve_transform_case`: a point cursor recases the identifier under it (post-edit cursor
     /// collapses past the result); a selection recases its text (and stays selected, so transforms
@@ -9949,7 +10026,7 @@ async fn apply_edit(
     // prechecks that a number exists, so this is `Some` in practice; the `None` arms below are a
     // defensive no-op.
     let number_edit = match &edit {
-        EditKind::AdjustNumber { delta } => resolve_number_edit(buf, &cursor, *delta),
+        EditKind::AdjustNumber { delta, scan } => resolve_number_edit(buf, &cursor, *delta, *scan),
         _ => None,
     };
 
@@ -10232,14 +10309,19 @@ async fn apply_edit(
             };
             (Cow::Owned(inner), post)
         }
-        EditKind::AdjustNumber { .. } => match &number_edit {
-            // Keep the whole re-rendered number selected. `Select` spans the entire replacement, so
-            // the selection tracks the digit count automatically (`9` → `10` grows, `100` → `99`
-            // shrinks) and repeated presses stay on the number.
-            Some((_, _, _, text)) => (
-                Cow::Owned(text.clone()),
-                PostEdit::Select { lead: 0, trail: 0 },
-            ),
+        EditKind::AdjustNumber { scan, .. } => match &number_edit {
+            // Normal mode (`!scan`): keep the whole re-rendered number selected. `Select` spans the
+            // entire replacement, so the selection tracks the digit count automatically (`9` → `10`
+            // grows, `100` → `99` shrinks) and repeated presses stay on the number. Insert mode
+            // (`scan`) collapses past the result — it has no selection and must not spring one.
+            Some((_, _, _, text)) => {
+                let post = if *scan {
+                    PostEdit::PointAfter
+                } else {
+                    PostEdit::Select { lead: 0, trail: 0 }
+                };
+                (Cow::Owned(text.clone()), post)
+            }
             None => (Cow::Borrowed(""), PostEdit::PointAfter),
         },
         EditKind::TransformCase { .. } => match &transform_edit {

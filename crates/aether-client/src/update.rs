@@ -48,7 +48,8 @@ use aether_protocol::input::{
     InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams,
     InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams, InputText,
     InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
-    InputUnsurround, InputUnsurroundParams, LineSide, UndoRedoParams, UndoResult,
+    InputUnsurround, InputUnsurroundParams, LineSide, ToggleCommentParams, UndoRedoParams,
+    UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -4865,7 +4866,9 @@ impl Session {
             }
         }
         let count = self.count.take().unwrap_or(1).max(1);
-        let extend = mods.shift;
+        // Insert mode never holds a selection, so Shift+motion must not extend one (the arrow
+        // bindings match any modifier). It just moves the caret.
+        let extend = mods.shift && self.mode != Mode::Insert;
 
         // Global table first (mode-identical Ctrl shortcuts), then the mode's own.
         let ctx = match self.mode {
@@ -5213,15 +5216,22 @@ impl Session {
             A::JoinLines => self.repeat_edit::<InputJoinLines>(count),
             A::Indent => self.repeat_edit::<InputIndent>(count),
             A::Dedent => self.repeat_edit::<InputDedent>(count),
+            // Insert mode has no selection: scan for the number at the caret rather than acting on
+            // the (nonexistent) selection, and collapse afterwards.
             A::IncrementNumber => self.edit::<InputAdjustNumber>(InputAdjustNumberParams {
                 buffer_id,
                 delta: count as i32,
+                scan_at_cursor: self.mode == Mode::Insert,
             }),
             A::DecrementNumber => self.edit::<InputAdjustNumber>(InputAdjustNumberParams {
                 buffer_id,
                 delta: -(count as i32),
+                scan_at_cursor: self.mode == Mode::Insert,
             }),
-            A::ToggleComment => self.edit::<InputToggleComment>(BufferOnlyParams { buffer_id }),
+            A::ToggleComment => self.edit::<InputToggleComment>(ToggleCommentParams {
+                buffer_id,
+                collapse_selection: self.mode == Mode::Insert,
+            }),
             A::OpenLineBelow | A::OpenLineAbove => {
                 // Vim's `o`/`O` as one server-side edit (park, open, land — smart indent
                 // below, unindented above); stay in Insert (TUI semantics).

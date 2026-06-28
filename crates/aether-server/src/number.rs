@@ -1,12 +1,51 @@
-//! Increment/decrement the selected number (`Ctrl-e` / `Ctrl-Alt-e`).
+//! Increment/decrement a number (`Ctrl-e` / `Ctrl-Alt-e`).
 //!
-//! Selection-only, single mode: the caller passes the exact selected text (a point cursor being the
-//! one char under the block) and we shift it by `delta`, but only when that text is a strictly valid
-//! integer. There is no line scan — the operand never grows beyond the selection, so an unselected
-//! `-` or neighbouring digit can't be swept in and invert the direction. A leading `-` *within* the
-//! selection is the number's sign, and a number written with a leading zero keeps its field width
-//! (`007` → `008`, `100` → `99`). The handler leaves the whole result selected, so the selection
-//! follows the new digit count.
+//! Two operand modes, chosen by the caller (see `handlers::resolve_number_edit`):
+//! - **Normal mode**: the caller passes the exact selected text (a point cursor being the one char
+//!   under the block) to [`adjust_exact`]. There is no scan — the operand never grows beyond the
+//!   selection, so an unselected `-` or neighbouring digit can't be swept in and invert the
+//!   direction. A leading `-` *within* the selection is the number's sign.
+//! - **Insert mode**: there's no selection, so [`find_number`] scans the caret's line for the
+//!   number at/after the cursor (Vim `Ctrl-A`) and the caller adjusts that.
+//!
+//! Either way [`adjust_exact`] only shifts a strictly valid integer, and a number written with a
+//! leading zero keeps its field width (`007` → `008`, `100` → `99`).
+
+/// Scan `line` for the integer to adjust at or after char column `col` (Vim `Ctrl-A`): the digit
+/// run containing the caret, or the next run after it, plus an immediately-preceding `-` sign (only
+/// when that `-` isn't itself preceded by a digit, so the `-` in `1-2` reads as subtraction, not a
+/// sign). Returns the operand's char range `[start, end)` within the line, or `None` when no number
+/// sits at/after the caret. Used by Insert-mode adjust, where there's no selection to act on.
+pub fn find_number(line: &str, col: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        while end < n && chars[end].is_ascii_digit() {
+            end += 1;
+        }
+        // The caret is inside this run, or this is the first run after the caret.
+        if end >= col {
+            let signed_start = if start > 0
+                && chars[start - 1] == '-'
+                && !(start >= 2 && chars[start - 2].is_ascii_digit())
+            {
+                start - 1
+            } else {
+                start
+            };
+            return Some((signed_start, end));
+        }
+        i = end;
+    }
+    None
+}
 
 /// Shift `s` by `delta` as an exact integer. Returns `None` unless `s` is a strictly valid integer —
 /// an optional leading `-` then one or more ASCII digits and nothing else — so a non-numeric (or
@@ -113,5 +152,35 @@ mod tests {
         ] {
             assert_eq!(adjust_exact(s, 1), None, "{s:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn find_number_grabs_the_run_under_the_caret() {
+        // Caret anywhere inside (or just past) "123" → the whole run.
+        for col in 0..=3 {
+            assert_eq!(find_number("ab123cd", col + 2), Some((2, 5)), "col {col}");
+        }
+    }
+
+    #[test]
+    fn find_number_jumps_to_the_next_number_after_the_caret() {
+        // Caret before the number → scan forward to it.
+        assert_eq!(find_number("  42", 0), Some((2, 4)));
+        // Caret past the first number → the second one.
+        assert_eq!(find_number("1 22", 2), Some((2, 4)));
+    }
+
+    #[test]
+    fn find_number_includes_a_leading_sign() {
+        assert_eq!(find_number("x-5", 2), Some((1, 3)));
+        // ...but a `-` after a digit is subtraction, not a sign: caret on the `2` grabs just "2".
+        assert_eq!(find_number("1-2", 2), Some((2, 3)));
+    }
+
+    #[test]
+    fn find_number_returns_none_when_no_number_at_or_after_caret() {
+        assert_eq!(find_number("abc", 0), None);
+        // The only number is entirely behind the caret.
+        assert_eq!(find_number("12 ab", 3), None);
     }
 }

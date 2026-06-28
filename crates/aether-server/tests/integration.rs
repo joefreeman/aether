@@ -28,7 +28,8 @@ use aether_protocol::input::{
     InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine,
     InputOpenLineParams, InputSurround, InputSurroundParams, InputText, InputTextParams,
     InputToggleComment, InputTransformCase, InputTransformCaseParams, InputUnsurround,
-    InputUnsurroundParams, LineSide, SurroundTarget, UndoRedoParams, UndoResult,
+    InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams, UndoRedoParams,
+    UndoResult,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -6335,6 +6336,7 @@ async fn increment_number_selects_the_result() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6371,6 +6373,7 @@ async fn increment_point_adjusts_only_the_selected_char() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6378,6 +6381,41 @@ async fn increment_point_adjusts_only_the_selected_char() {
     // The single-char result stays selected.
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 4 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 4 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn increment_scan_at_cursor_infers_whole_number_and_collapses() {
+    // Insert mode (`scan_at_cursor`): there's no selection, so the operand is inferred by scanning
+    // the line. A point cursor anywhere before/inside `42` adjusts the *whole* number, and the
+    // result collapses to a point (Insert mode never holds a selection).
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo 42 bar\n").await;
+    // Caret at line start — scanning jumps forward to `42`.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputAdjustNumber>(
+        &mut ws,
+        11,
+        &InputAdjustNumberParams {
+            buffer_id,
+            delta: 1,
+            scan_at_cursor: true,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "foo 43 bar\n");
+    // No selection: the cursor is a point.
+    assert_eq!(r.cursor.anchor, r.cursor.position);
 
     drop(server);
 }
@@ -6404,6 +6442,7 @@ async fn increment_selection_grows_with_digit_count() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6418,6 +6457,7 @@ async fn increment_selection_grows_with_digit_count() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6449,6 +6489,7 @@ async fn decrement_selection_shrinks_with_digit_count() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: -1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6480,6 +6521,7 @@ async fn increment_partial_selection_adjusts_only_selected_digits() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6512,6 +6554,7 @@ async fn increment_non_integer_selection_is_a_noop() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6542,6 +6585,7 @@ async fn increment_never_scans_to_a_number_elsewhere() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6573,6 +6617,7 @@ async fn increment_single_digit_after_unselected_minus_is_not_inverted() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6601,6 +6646,7 @@ async fn decrement_crosses_zero_into_negative() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: -1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6631,6 +6677,7 @@ async fn increment_count_applies_in_one_step() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 5,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -6670,6 +6717,7 @@ async fn increment_with_no_number_is_a_noop() {
         &InputAdjustNumberParams {
             buffer_id,
             delta: 1,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -7242,8 +7290,9 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
     send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7303,8 +7352,9 @@ async fn toggle_comment_strips_when_already_commented() {
     send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7368,8 +7418,9 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
     send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7431,8 +7482,9 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
     send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7494,8 +7546,9 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
     send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7557,8 +7610,9 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
     send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7622,8 +7676,9 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
     let r: EditResult = send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7689,8 +7744,9 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
     let r: EditResult = send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7757,8 +7813,9 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
     let r: EditResult = send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7774,8 +7831,9 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
     let r2: EditResult = send_request::<InputToggleComment>(
         &mut ws,
         6,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7841,8 +7899,9 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
     let r: EditResult = send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7908,8 +7967,9 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
     send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7973,8 +8033,9 @@ async fn toggle_comment_round_trip_partial_selection() {
     send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -7986,8 +8047,9 @@ async fn toggle_comment_round_trip_partial_selection() {
     send_request::<InputToggleComment>(
         &mut ws,
         6,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -8047,16 +8109,230 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
         },
     )
     .await;
-    send_request::<InputToggleComment>(
+    let r: EditResult = send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "const x = foo + bar;\n");
+    // Normal mode re-selects the uncommented `foo` (anchor where `/*` was, cursor on the last char).
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 10 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 12 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_block_unwrap_collapses_in_insert_mode() {
+    // Same as above but `collapse_selection` (Insert mode): stripping the block must not spring a
+    // selection — the caret collapses onto the uncommented content instead.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.js");
+    std::fs::write(&path, "const x = /* foo */ + bar;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.js".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 13 },
+            anchor: LogicalPosition { line: 0, col: 13 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &ToggleCommentParams {
+            buffer_id: open.buffer_id,
+            collapse_selection: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 5, open.buffer_id).await,
+        "const x = foo + bar;\n"
+    );
+    // No selection sprung: the cursor is a point.
+    assert_eq!(r.cursor.anchor, r.cursor.position);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_insert_round_trips_in_markdown() {
+    // Regression: markdown's grammar doesn't expose a `comment` node for embedded HTML comments,
+    // so the tree-sitter detector misses and detection falls back to the operand text. With no
+    // selection (Insert mode) the fallback must check the whole *line* — a point caret wraps the
+    // line, so it has to detect that wrap to round-trip. Otherwise a second `Ctrl-y` nests another
+    // `<!-- ... -->` instead of stripping the first.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.md");
+    std::fs::write(&path, "hello world\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.md".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let set_caret = |id| CursorSetParams {
+        granularity: Granularity::Char,
+        buffer_id: open.buffer_id,
+        position: LogicalPosition { line: 0, col: id },
+        anchor: LogicalPosition { line: 0, col: id },
+    };
+    let toggle = ToggleCommentParams {
+        buffer_id: open.buffer_id,
+        collapse_selection: true,
+    };
+
+    // Caret on the `w` of `world` (col 6).
+    send_request::<CursorSet>(&mut ws, 3, &set_caret(6)).await;
+
+    // First Ctrl-y wraps the line; no selection sprung, and the caret stays on `w` — the leading
+    // `<!-- ` (5 chars) shifts it to col 11, not to the end of the wrap.
+    let r1: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &toggle).await;
+    assert_eq!(
+        buffer_text(&mut ws, 5, open.buffer_id).await,
+        "<!-- hello world -->\n"
+    );
+    assert_eq!(r1.cursor.position, LogicalPosition { line: 0, col: 11 });
+    assert_eq!(r1.cursor.anchor, r1.cursor.position);
+
+    // Second Ctrl-y strips it (rather than nesting another wrap); the caret follows `w` back to col 6.
+    let r2: EditResult = send_request::<InputToggleComment>(&mut ws, 6, &toggle).await;
+    assert_eq!(buffer_text(&mut ws, 7, open.buffer_id).await, "hello world\n");
+    assert_eq!(r2.cursor.position, LogicalPosition { line: 0, col: 6 });
+    assert_eq!(r2.cursor.anchor, r2.cursor.position);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_insert_keeps_caret_on_its_character() {
+    // Insert mode: the caret stays glued to the character it was on across a line-comment toggle,
+    // even when it sits exactly at the indent (the prefix's insert column) — otherwise it would be
+    // left behind sitting on the new `// `. Round-trips back to the same character on uncomment.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "    foo\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let toggle = ToggleCommentParams {
+        buffer_id: open.buffer_id,
+        collapse_selection: true,
+    };
+
+    // Caret on `foo`'s `f` (col 4 — exactly the indent/insert column).
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 4 },
+            anchor: LogicalPosition { line: 0, col: 4 },
+        },
+    )
+    .await;
+    // Comment: `    foo` → `    // foo`; the caret follows `f` to col 7 (not left on the `//`).
+    let r1: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &toggle).await;
+    assert_eq!(buffer_text(&mut ws, 5, open.buffer_id).await, "    // foo\n");
+    assert_eq!(r1.cursor.position, LogicalPosition { line: 0, col: 7 });
+    assert_eq!(r1.cursor.anchor, r1.cursor.position);
+
+    // Uncomment: caret follows `f` back to col 4.
+    let r2: EditResult = send_request::<InputToggleComment>(&mut ws, 6, &toggle).await;
+    assert_eq!(buffer_text(&mut ws, 7, open.buffer_id).await, "    foo\n");
+    assert_eq!(r2.cursor.position, LogicalPosition { line: 0, col: 4 });
+    assert_eq!(r2.cursor.anchor, r2.cursor.position);
 
     drop(server);
 }
@@ -8109,16 +8385,87 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
         },
     )
     .await;
-    send_request::<InputToggleComment>(
+    let r: EditResult = send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "/* color: red; */\n");
+    // Normal mode selects the wrapped span (`/* color: red; */`, cols 0..=16).
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 16 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_block_wrap_collapses_in_insert_mode() {
+    // The Insert-mode repro: a block-only language (CSS) with a point caret wraps the current line
+    // in `/* */`. Normal mode selects the wrap; Insert mode must collapse to a point instead.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.css");
+    std::fs::write(&path, "color: red;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.css".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 0 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &ToggleCommentParams {
+            buffer_id: open.buffer_id,
+            collapse_selection: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 5, open.buffer_id).await,
+        "/* color: red; */\n"
+    );
+    // No selection sprung: the cursor is a point.
+    assert_eq!(r.cursor.anchor, r.cursor.position);
 
     drop(server);
 }
@@ -8164,8 +8511,9 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
     let r: EditResult = send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;
@@ -8216,8 +8564,9 @@ async fn toggle_comment_is_noop_for_json() {
     let r: EditResult = send_request::<InputToggleComment>(
         &mut ws,
         4,
-        &BufferOnlyParams {
+        &ToggleCommentParams {
             buffer_id: open.buffer_id,
+            collapse_selection: false,
         },
     )
     .await;

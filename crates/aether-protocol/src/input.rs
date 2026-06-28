@@ -173,6 +173,13 @@ pub struct InputAdjustNumberParams {
     pub buffer_id: BufferId,
     /// Signed amount to add to the number (negative decrements). Zero is a no-op.
     pub delta: i32,
+    /// Insert mode: infer the operand by scanning the caret's line for the number at/after the
+    /// cursor (Vim `Ctrl-A`) and collapse to a point afterwards — Insert has no selection to act
+    /// on and must not spring one. Normal mode (`false`) keeps the explicit-selection behaviour:
+    /// the operand is exactly the selected chars (a point being the single char under the block)
+    /// and the result stays selected so repeated presses track the number.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scan_at_cursor: bool,
 }
 
 // ---- input/newline_and_indent -------------------------------------------------------------------
@@ -220,8 +227,18 @@ pub enum LineSide {
 pub struct InputToggleComment;
 impl RpcMethod for InputToggleComment {
     const NAME: &'static str = "input/toggle_comment";
-    type Params = BufferOnlyParams;
+    type Params = ToggleCommentParams;
     type Result = EditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ToggleCommentParams {
+    pub buffer_id: BufferId,
+    /// Insert mode: collapse the result to a point. Stripping a block comment normally re-selects
+    /// the uncommented content (Normal mode), which would spring a selection in Insert mode where
+    /// none is allowed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapse_selection: bool,
 }
 
 // ---- input/move_lines ---------------------------------------------------------------------------

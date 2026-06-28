@@ -208,6 +208,20 @@ fn shift_extends_symbol_navigation() {
 }
 
 #[test]
+fn shift_arrow_in_insert_mode_does_not_extend_selection() {
+    // Insert mode never holds a selection, so Shift+Arrow must not extend one (unlike Normal mode,
+    // where Shift extends — see `shift_extends_symbol_navigation`). It just moves the caret.
+    let mut s = session();
+    key(&mut s, 'i');
+    assert_eq!(s.mode, aether_client::session::Mode::Insert);
+
+    let fx = s.on_key(KeyCode::Right, Mods::SHIFT, None, ROWS);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["extend_selection"], json!(false));
+}
+
+#[test]
 fn nav_back_into_the_same_buffer_reveals_as_a_jump() {
     use aether_client::effect::RevealStyle;
     use aether_client::update::Event;
