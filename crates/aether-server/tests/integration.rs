@@ -22267,6 +22267,31 @@ async fn workspace_session_persisted_on_activate_and_open() {
     drop(server);
 }
 
+/// `buffer/close` on an id that's neither a live buffer nor a dormant session row still errors with
+/// `buffer_not_found`. Guards the fall-through of the dormant-close branch added for `Ctrl-d` on a
+/// dormant picker row — a bogus id must not be silently swallowed. (The dormant-close *success* path
+/// is driven by cold session restore, which only happens when a workspace is loaded from on-disk
+/// config; the server harness pre-registers workspaces, so it can't be exercised over the wire here —
+/// the state-level teardown it relies on is unit-tested in `state` via `take_dormant`.)
+#[tokio::test]
+async fn buffer_close_unknown_id_errors() {
+    let (server, mut ws) = setup_buffer_picker_workspace().await;
+    let msg = send_request_expect_err::<BufferClose>(
+        &mut ws,
+        2,
+        &BufferCloseParams {
+            buffer_id: 999_999,
+            open_next: false,
+        },
+    )
+    .await;
+    assert!(
+        msg.contains("unknown buffer_id"),
+        "unknown buffer id is rejected, got: {msg}"
+    );
+    drop(server);
+}
+
 /// A transient preview (the default file-picker open) is NOT persisted; pressing `Space k` to keep
 /// it (buffer/set_transient false) promotes it to a permanent working buffer and persists it. This
 /// is the keep→persist path — without the persist hook, kept buffers never reach the session file.

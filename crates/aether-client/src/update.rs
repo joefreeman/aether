@@ -2835,8 +2835,9 @@ impl Session {
             {
                 return self.picker_stage_delete();
             }
-            // Ctrl-d in the Buffers picker closes the highlighted buffer in place (no open) —
-            // `Ctrl-w` is the obvious mnemonic but the browser swallows it, so `Ctrl-d` matches the
+            // Ctrl-d in the Buffers picker closes the highlighted row in place (no open) — a live
+            // buffer or a dormant (session-restored) one alike, the server resolves which. `Ctrl-w`
+            // is the obvious mnemonic but the browser swallows it, so `Ctrl-d` matches the
             // delete-in-picker gesture used by Files/Explorer/Workspaces above.
             KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
                 return self.picker_close_buffer();

@@ -1787,6 +1787,13 @@ async fn buffer_open_inner(
     });
     s.buffers.insert(id, buf);
     s.buffer_workspaces.insert(id, active_workspace_name.clone());
+    // Enforce the dormant invariant at materialization: a path now has a live buffer, so drop any
+    // dormant (session-restored) entry for it. The by-id open route already does this via
+    // `take_dormant`, but path opens (file picker, grep, goto-def, absolute path) reach a dormant
+    // file without ever touching its reserved id — without this they'd leave the dormant twin behind,
+    // which the picker only papers over by hiding, and a later close would un-hide. No-op when no
+    // dormant entry matches.
+    s.promote_dormant(&active_workspace_name, &canonical);
     if let Some((git_baseline, git_unstaged, git_both)) = git {
         s.git_baseline.insert(id, git_baseline);
         s.git_unstaged_hunks.insert(id, git_unstaged);
@@ -4432,6 +4439,41 @@ pub async fn buffer_close(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if !s.buffers.contains_key(&params.buffer_id) {
+        // Not a live buffer — but the Buffers picker also lists *dormant* rows (session-restored,
+        // not yet loaded), and `Ctrl-d` on one of those should drop it from the list just like
+        // closing a live buffer. A dormant buffer has only a reserved id and a session entry, so its
+        // close is much lighter: forget the entry, discard any backup it carried, refresh the picker,
+        // and rewrite the session so it isn't restored next time. Falls through to `buffer_not_found`
+        // when the id is neither live nor dormant.
+        if let Some(workspace) = s.active_workspace(client_id).map(|w| w.id.clone()) {
+            if let Some(dormant) = s.take_dormant(&workspace, params.buffer_id) {
+                if let Some(root) = s.backups_path.as_deref() {
+                    match &dormant.source {
+                        crate::state::DormantSource::File(p) => crate::backup::delete(
+                            &crate::backup::file_backup_path(root, &workspace, p),
+                        ),
+                        crate::state::DormantSource::Scratch { number } => crate::backup::delete(
+                            &crate::backup::scratch_backup_path(root, &workspace, *number),
+                        ),
+                    }
+                }
+                let pushes = refresh_buffer_pickers(&mut s);
+                drop(s);
+                for (sender, notif) in pushes {
+                    let _ = sender.send(notif).await;
+                }
+                persist_workspace_session(state, &workspace, false).await;
+                let next_buffer_id = {
+                    let s = state.lock().await;
+                    next_buffer_for_client(&s, client_id)
+                };
+                tracing::debug!(buffer_id = params.buffer_id, "dormant buffer closed");
+                return Ok(aether_protocol::buffer::BufferCloseResult {
+                    next_buffer_id,
+                    opened: None,
+                });
+            }
+        }
         return Err(RpcError::buffer_not_found(params.buffer_id));
     }
     // Any *other* client viewing this buffer is about to have it pulled out from under it — capture
@@ -10666,10 +10708,18 @@ fn dormant_candidate(
         ),
         crate::state::DormantSource::Scratch { number } => (format!("(scratch {number})"), None),
     };
+    // A dormant *file* row is Clean — its content lives safely on disk; closing it just forgets the
+    // session entry. A dormant *scratch* exists only because unsaved content survived as a backup, so
+    // it's inherently Unsaved: report that, both for an accurate dirty dot and so `Ctrl-d` routes
+    // through the discard-confirm prompt instead of silently dropping the backup.
+    let status = match &d.source {
+        crate::state::DormantSource::File(_) => BufferDirtyState::Clean,
+        crate::state::DormantSource::Scratch { .. } => BufferDirtyState::Unsaved,
+    };
     picker_state::BufferCandidate {
         buffer_id: d.id,
         display,
-        status: BufferDirtyState::Clean,
+        status,
         path,
         transient: false,
         dormant: true,
