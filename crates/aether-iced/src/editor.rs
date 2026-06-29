@@ -32,15 +32,15 @@ const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
 const CONTINUATION_MARKER: &str = "↪ ";
 
-/// The editor's text font — the bundled Fira Code (registered in `Settings.fonts`). Coding
+/// The editor's text font — the bundled JetBrains Mono (registered in `Settings.fonts`). Coding
 /// ligatures are toggled by the *shaping* mode the code-text runs use ([`text::Shaping::Advanced`]
 /// forms them, [`text::Shaping::Basic`] doesn't), keeping the same monospace metrics either way, so
 /// the cell grid never shifts. The UI chrome stays on `Font::MONOSPACE`.
-const EDITOR_FONT: Font = Font::with_name("Fira Code");
+const EDITOR_FONT: Font = Font::with_name("JetBrains Mono");
 
-/// Bold / italic Fira Code, for markdown `text.strong` / `text.emphasis` runs. Only the Regular
-/// face is bundled, so cosmic-text synthesises the weight/slant — but synthetic embolden and
-/// oblique preserve glyph advance widths, so the monospace cell grid is unaffected.
+/// Bold / italic JetBrains Mono, for markdown `text.strong` / `text.emphasis` runs. The Regular,
+/// Bold, Italic, and Bold-Italic faces are all bundled (see `app.rs`), so each weight/slant request
+/// resolves to a real face rather than a synthesized one or a non-monospace fallback family.
 const EDITOR_FONT_BOLD: Font = Font {
     weight: iced::font::Weight::Bold,
     ..EDITOR_FONT
@@ -84,7 +84,7 @@ pub struct Content<'a> {
     pub blame: Option<(u32, &'a str)>,
     pub tab_width: u32,
     /// Coding ligatures on: code-text runs shape with [`text::Shaping::Advanced`] (forming `=>`,
-    /// `!=`, … from the Fira Code font); off uses `Basic` (no ligatures, same metrics).
+    /// `!=`, … from the JetBrains Mono font); off uses `Basic` (no ligatures, same metrics).
     pub ligatures: bool,
     /// Editor font size in px (client-local zoom). Drives the cell measurement and glyph size; the
     /// cell height is `font_size * LINE_HEIGHT_FACTOR`.
@@ -166,7 +166,7 @@ struct State {
 
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer> for EditorView<'a, Message>
 where
-    // The editor draws with the bundled Fira Code (`EDITOR_FONT: iced::Font`), so the renderer's
+    // The editor draws with the bundled JetBrains Mono (`EDITOR_FONT: iced::Font`), so the renderer's
     // font type must be `iced::Font` — true for the app's real renderer.
     Renderer: text::Renderer<Font = Font>,
     // The editor draws its own scrollbar but styles it from the theme's scrollable catalog, so
@@ -375,7 +375,7 @@ where
         let draw_selection = !self.content.cursor.is_point();
         let scroll_x = self.content.scroll_x_px;
         // Code text shapes with ligatures on (`Advanced`) or off (`Basic`); markers/glyphs always
-        // use `draw_run` (Advanced). Same Fira Code metrics either way, so the grid is unaffected.
+        // use `draw_run` (Advanced). Same JetBrains Mono metrics either way, so the grid is unaffected.
         let text_shaping = if self.content.ligatures {
             text::Shaping::Advanced
         } else {

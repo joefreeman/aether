@@ -59,11 +59,36 @@ html, body, #app {
   font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
-/* Bundled editor font (the chrome above stays on the system monospace). */
+/* Bundled editor font (the chrome above stays on the system monospace). All four faces are bundled
+   so `font-weight: bold` and `font-style: italic` each resolve to a real face within the family —
+   without them the browser synthesises faux-bold/oblique or falls back to a system monospace for
+   `text.strong` / `text.emphasis` runs. */
 @font-face {
-  font-family: "Fira Code";
-  src: url("./fonts/FiraCode-Regular.woff2") format("woff2");
+  font-family: "JetBrains Mono";
+  src: url("./fonts/JetBrainsMono-Regular.woff2") format("woff2");
   font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("./fonts/JetBrainsMono-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("./fonts/JetBrainsMono-Italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("./fonts/JetBrainsMono-BoldItalic.woff2") format("woff2");
+  font-weight: 700;
+  font-style: italic;
   font-display: swap;
 }
 
@@ -76,9 +101,9 @@ html, body, #app {
   position: relative;
   user-select: none; /* the editor draws its own selection; suppress native text selection on drag */
   cursor: text;
-  /* Code-only Fira Code; falls back to the inherited system monospace. Coding ligatures ride
+  /* Code-only JetBrains Mono; falls back to the inherited system monospace. Coding ligatures ride
      `calt`/`liga` — on by default, switched off by `.ligatures-off` (the `ligatures` app setting). */
-  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   font-feature-settings: "liga" 1, "calt" 1;
 }
 #buffer.ligatures-off { font-feature-settings: "liga" 0, "calt" 0; }

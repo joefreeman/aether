@@ -4634,12 +4634,26 @@ pub fn run(bootstrap: Bootstrap) -> iced::Result {
         .theme(nord_theme)
         // The buffer's font + size (chrome sets explicit fonts/sizes): web's 14px monospace.
         .settings(iced::Settings {
-            // Bundle Fira Code for the editor (chrome stays on the default monospace). Registered
-            // here so `Font::with_name("Fira Code")` resolves; the editor toggles its ligatures via
-            // shaping mode (see `editor::EDITOR_FONT`).
-            fonts: vec![include_bytes!("../fonts/FiraCode-Regular.ttf")
-                .as_slice()
-                .into()],
+            // Bundle JetBrains Mono for the editor (chrome stays on the default monospace). Registered
+            // here so `Font::with_name("JetBrains Mono")` resolves; the editor toggles its ligatures
+            // via shaping mode (see `editor::EDITOR_FONT`). All four faces (Regular/Bold/Italic/
+            // Bold-Italic) are bundled so each weight/slant request resolves within the family —
+            // without the matching face, cosmic-text falls back to a non-monospace family for
+            // `text.strong` / `text.emphasis` runs.
+            fonts: vec![
+                include_bytes!("../fonts/JetBrainsMono-Regular.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../fonts/JetBrainsMono-Bold.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../fonts/JetBrainsMono-Italic.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../fonts/JetBrainsMono-BoldItalic.ttf")
+                    .as_slice()
+                    .into(),
+            ],
             default_font: iced::Font::MONOSPACE,
             default_text_size: iced::Pixels(14.0),
             antialiasing: true,

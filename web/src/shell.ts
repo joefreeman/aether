@@ -2256,7 +2256,7 @@ export class Shell {
     if (!v.window) return;
     this.maybeBlame(v); // fire-and-forget; updates the core + re-renders when the label lands
     this.bufferEl.classList.toggle("hscroll", v.wrap === "none");
-    // Coding ligatures: the `ligatures` app setting flips the Fira Code `calt`/`liga` features.
+    // Coding ligatures: the `ligatures` app setting flips the JetBrains Mono `calt`/`liga` features.
     this.bufferEl.classList.toggle("ligatures-off", !v.ligatures);
     renderBuffer(this.bufferEl, {
       window: v.window,
