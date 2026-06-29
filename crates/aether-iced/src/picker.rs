@@ -890,33 +890,59 @@ fn grep_header<'a>(
     path_index: u32,
     relative_path: &str,
 ) -> Element<'a, PickerMsg> {
-    let mut label = root_label(roots, path_index).unwrap_or_default();
-    label.push_str(relative_path);
-    container(text(label).size(13).font(SANS_BOLD).color(theme::NORD8))
-        .width(Length::Fill)
-        .height(ROW_H)
-        .padding([3, 12])
-        .align_y(iced::alignment::Vertical::Center)
-        .style(|_| container::Style {
-            background: Some(theme::NORD1.into()),
-            ..container::Style::default()
-        })
-        .into()
+    // Multi-root workspaces prefix the disambiguated root label as `{label}: {path}` — the same
+    // form the TUI and web clients use (and the grep filter chips / status bar). The path
+    // segment-elides via the shared `truncate_path` (like the References row and status bar); the
+    // root label is kept whole, so the budget shrinks by it just as the web client does.
+    let label = match root_label(roots, path_index) {
+        Some(label) => {
+            let budget = GREP_HEADER_MAX_CHARS.saturating_sub(label.chars().count() + 2);
+            format!(
+                "{label}: {}",
+                crate::labels::truncate_path(relative_path, budget.max(8))
+            )
+        }
+        None => crate::labels::truncate_path(relative_path, GREP_HEADER_MAX_CHARS),
+    };
+    container(
+        text(label)
+            .size(13)
+            .font(SANS_BOLD)
+            .color(theme::NORD8)
+            // One [`ROW_H`] line only — a wrapped header would spill onto the row beneath and
+            // break the sticky pinned-header overlay.
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .width(Length::Fill)
+    .height(ROW_H)
+    .padding([3, 12])
+    .align_y(iced::alignment::Vertical::Center)
+    .style(|_| container::Style {
+        background: Some(theme::NORD1.into()),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// A References-picker section label (`Definition` / `References`). Same footprint and chrome as
 /// [`grep_header`] but a fixed label rather than a file path.
 fn section_header<'a>(label: &'static str) -> Element<'a, PickerMsg> {
-    container(text(label).size(13).font(SANS_BOLD).color(theme::NORD8))
-        .width(Length::Fill)
-        .height(ROW_H)
-        .padding([3, 12])
-        .align_y(iced::alignment::Vertical::Center)
-        .style(|_| container::Style {
-            background: Some(theme::NORD1.into()),
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        text(label)
+            .size(13)
+            .font(SANS_BOLD)
+            .color(theme::NORD8)
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .width(Length::Fill)
+    .height(ROW_H)
+    .padding([3, 12])
+    .align_y(iced::alignment::Vertical::Center)
+    .style(|_| container::Style {
+        background: Some(theme::NORD1.into()),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// A fixed-width leading bullet cell, so rows with and without a status dot line up.
@@ -1011,10 +1037,11 @@ fn render_item<'a>(
             // Multi-root workspaces: the root's label, dim, after the path (web/terminal style).
             if let Some(label) = root_label(roots, *path_index) {
                 r = r.push(
-                    text(label.trim_end_matches('/').to_string())
+                    text(label)
                         .size(13)
                         .font(SANS)
-                        .color(theme::NORD3_BRIGHT),
+                        .color(theme::NORD3_BRIGHT)
+                        .wrapping(iced::widget::text::Wrapping::None),
                 );
             }
             r.into()
@@ -1339,6 +1366,10 @@ const PREVIEW_MAX_CHARS: usize = 80;
 /// smaller, and the path itself segment-elides — between them a row can't wrap.
 const REFERENCE_PREVIEW_MAX_CHARS: usize = 56;
 const REFERENCE_PATH_MAX_CHARS: usize = 24;
+/// Grep file-group header budget: the header owns the full panel width (720px) at bold sans 13,
+/// so it fits ~88 chars before the container would clip. The path segment-elides to this; in a
+/// multi-root workspace the root-label prefix is subtracted first.
+const GREP_HEADER_MAX_CHARS: usize = 88;
 
 /// `s` capped at `max` chars, with an ellipsis when something was cut.
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -1447,17 +1478,17 @@ fn explorer_prefix(state: &PickerState, roots: &[String]) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Root label prefix (`rootname/`) for multi-root workspaces; `None` with a single root.
+/// Disambiguated root label for `path_index` in a multi-root workspace (e.g. `api`, or
+/// `api (work)` when two roots share a basename) — the same labels the TUI and web clients show,
+/// via the shared `labels::root_labels`. `None` with a single root (nothing to disambiguate).
 fn root_label(roots: &[String], path_index: u32) -> Option<String> {
     if roots.len() < 2 {
         return None;
     }
-    let root = roots.get(path_index as usize)?;
-    let name = std::path::Path::new(root)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.clone());
-    Some(format!("{name}/"))
+    aether_client::labels::root_labels(roots)
+        .get(path_index as usize)
+        .filter(|l| !l.is_empty())
+        .cloned()
 }
 
 fn git_status_color(s: GitStatus) -> iced::Color {

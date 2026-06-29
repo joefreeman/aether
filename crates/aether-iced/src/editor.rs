@@ -674,7 +674,9 @@ where
                 // other syntax colour reads fine on NORD3).
                 let in_hit = |dcol: u32| {
                     hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
-                        || sneak_spans.iter().any(|&(s, e, _, _)| dcol >= s && dcol < e)
+                        || sneak_spans
+                            .iter()
+                            .any(|&(s, e, _, _)| dcol >= s && dcol < e)
                 };
                 // Only the label's first cell is blanked (the label glyph is drawn over it after);
                 // the rest of the typed prefix renders normally on its band.

@@ -29,16 +29,16 @@ use aether_protocol::picker::{
     PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerUpdate, PickerUpdateParams,
     PickerView, PickerViewParams,
 };
-use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceActivateParams, WorkspaceCreate, WorkspaceCreateParams, WorkspaceInfo,
-    WorkspaceOpenPath, WorkspaceOpenPathParams,
-};
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{
     ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams,
     ViewportScrollToRow, ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams,
     ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult,
     Window, WrapMode,
+};
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceCreate, WorkspaceCreateParams,
+    WorkspaceInfo, WorkspaceOpenPath, WorkspaceOpenPathParams,
 };
 use iced::widget::{column, container, row, text};
 use iced::{keyboard, Element, Event, Length, Size, Subscription, Task};
@@ -961,7 +961,8 @@ impl App {
         if boot.picker.selected_is_create() {
             let name = boot.picker.query.trim().to_string();
             if name.is_empty() || name.contains('/') || name.contains('\\') {
-                return self.error("Workspace name can't be empty or contain path separators".into());
+                return self
+                    .error("Workspace name can't be empty or contain path separators".into());
             }
             if let Some(b) = &mut self.boot {
                 b.opening = true;
@@ -981,7 +982,11 @@ impl App {
                             .await
                             .map_err(|e| e.to_string())?,
                     };
-                    Ok(Box::new((created.workspace, open, created.server_started_at)))
+                    Ok(Box::new((
+                        created.workspace,
+                        open,
+                        created.server_started_at,
+                    )))
                 },
                 Message::SessionReady,
             );
@@ -1448,7 +1453,9 @@ impl App {
         match &group {
             // A grouped toast replaces any existing toast with the same key, so an evolving status
             // (LSP restart → ready, the diff toggle) updates one toast in place.
-            Some(g) => self.toasts.retain(|t| t.group.as_deref() != Some(g.as_str())),
+            Some(g) => self
+                .toasts
+                .retain(|t| t.group.as_deref() != Some(g.as_str())),
             // Ungrouped: drop a repeat of the last message (incremental search re-reports "Invalid
             // regex" on every keystroke).
             None => {
@@ -1569,8 +1576,7 @@ impl App {
                 Effect::ToChooser => {
                     // Drop to the workspace chooser over the live connection (no new pump — the
                     // current one keeps delivering, now routed through `update_boot`).
-                    let (handle, notifications) =
-                        (self.handle.clone(), self.notifications.clone());
+                    let (handle, notifications) = (self.handle.clone(), self.notifications.clone());
                     tasks.push(self.raise_boot_chooser(handle, notifications));
                 }
                 Effect::ReadClipboard(kind) => tasks.push(self.read_clipboard(kind)),
@@ -3421,17 +3427,20 @@ impl App {
                     .map(|s: String| Message::OverlayInput(OverlayField::OpenPath, s));
                 column![
                     text("Open file").size(13).font(SANS).color(theme::NORD6),
-                    container(input).padding([5, 8]).width(Length::Fill).style(|_| {
-                        container::Style {
-                            background: Some(theme::NORD0.into()),
-                            border: iced::Border {
-                                color: theme::NORD3,
-                                width: 1.0,
-                                radius: 4.0.into(),
-                            },
-                            ..container::Style::default()
-                        }
-                    }),
+                    container(input)
+                        .padding([5, 8])
+                        .width(Length::Fill)
+                        .style(|_| {
+                            container::Style {
+                                background: Some(theme::NORD0.into()),
+                                border: iced::Border {
+                                    color: theme::NORD3,
+                                    width: 1.0,
+                                    radius: 4.0.into(),
+                                },
+                                ..container::Style::default()
+                            }
+                        }),
                     row![
                         iced::widget::Space::new().width(Length::Fill),
                         btn("Cancel", BtnRole::Default, PromptMsg::Cancel),
@@ -3733,17 +3742,20 @@ impl App {
         // Segment-elide long labels to roughly half the bar so the filename survives (the
         // web's `truncatePath`; chars approximate px since the bar is sans).
         let budget = ((self.view_size.width * 0.5 / 6.5) as usize).max(12);
-        let name = text(crate::labels::truncate_path(&self.session.buffer.label, budget))
-            .size(13)
-            .color(theme::NORD4)
-            .font(
-                // A transient (preview) buffer slants the file label, like the other clients.
-                if self.session.buffer.transient {
-                    SANS_ITALIC
-                } else {
-                    SANS
-                },
-            );
+        let name = text(crate::labels::truncate_path(
+            &self.session.buffer.label,
+            budget,
+        ))
+        .size(13)
+        .color(theme::NORD4)
+        .font(
+            // A transient (preview) buffer slants the file label, like the other clients.
+            if self.session.buffer.transient {
+                SANS_ITALIC
+            } else {
+                SANS
+            },
+        );
         left = left.push(name);
         // Git cluster: `⎇  branch  +u(s) ~u(s) -u(s)` — per-class counts combine unstaged with
         // the staged count in parens, each omitted when zero.
@@ -4277,7 +4289,9 @@ fn spawn_window(session: &Session) {
     };
     let mut cmd = std::process::Command::new(exe);
     // `--profile` (global) before the implicit `edit` so the sibling joins the same daemon.
-    cmd.arg("--profile").arg(crate::active_profile()).arg("--gui");
+    cmd.arg("--profile")
+        .arg(crate::active_profile())
+        .arg("--gui");
     if !aether_protocol::is_ephemeral_workspace_id(&session.workspace) {
         cmd.arg("--workspace").arg(&session.workspace);
     } else if let Some(path) = session.buffer.path.as_deref() {
