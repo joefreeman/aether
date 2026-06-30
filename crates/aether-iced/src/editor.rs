@@ -1246,6 +1246,7 @@ fn diagnostic_at(line: &LogicalLineRender, col: u32) -> Option<DiagnosticSeverit
 
 /// Draw a run of editor text with an explicit shaping mode. Code-text runs pass the ligature-driven
 /// shaping (`Advanced` forms ligatures, `Basic` doesn't); single-glyph markers use [`draw_run`].
+#[allow(clippy::too_many_arguments)]
 fn draw_text_run<Renderer: text::Renderer<Font = Font>>(
     renderer: &mut Renderer,
     content: String,

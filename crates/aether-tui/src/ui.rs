@@ -5250,6 +5250,7 @@ fn draw_toast_overlay(f: &mut Frame, state: &AppState, area: Rect) {
 ///   (or the raw red filter if it matches nothing). Then a `:` separator once the path is in play;
 /// - the **path** segment — the typed text (red if the parent dir failed to list) plus a gray
 ///   ghost suffix completing the highlighted entry (a trailing `/` only behind a directory).
+///
 /// Status-row spans for the open-from-path prompt (`Space Alt-w`): an ` open: ` prefix then the
 /// typed path. Returns the spans plus the caret's column offset so the terminal cursor lands in
 /// the input. A plain single-line field — no root chips / suggestions, unlike save-as.

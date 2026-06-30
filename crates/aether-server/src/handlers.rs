@@ -14004,7 +14004,7 @@ mod seed_reference_center_tests {
             line,
             col: start_col,
             end_line: line,
-            end_col: end_col,
+            end_col,
             preview: String::new(),
             is_definition: false,
         }

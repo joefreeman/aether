@@ -459,7 +459,7 @@ impl Shell {
                 }
                 Effect::Reconnect { attempt } => self.spawn_reconnect(attempt),
                 Effect::Exit => self.should_quit = true,
-                Effect::ToChooser => self.to_chooser(),
+                Effect::ToChooser => self.enter_chooser(),
                 Effect::ShellAction(action) => self.run_shell_action(action),
             }
         }
@@ -1327,7 +1327,7 @@ impl Shell {
     /// chooser, mirroring a no-args start. Picking a workspace (the renamed one shows under its new
     /// name) lands a buffer the usual way.
     fn reconnect_to_chooser(&mut self) {
-        self.to_chooser();
+        self.enter_chooser();
         self.status(StatusMessage::error(
             "workspace no longer exists — pick another".to_string(),
         ));
@@ -1337,7 +1337,7 @@ impl Shell {
     /// (no buffer, so nothing stale renders behind the picker) and raise the Workspaces picker.
     /// Driven by [`Effect::ToChooser`] when an ephemeral context we navigated into loses its last
     /// buffer, and reused by [`Self::reconnect_to_chooser`] for workspace-gone recovery.
-    fn to_chooser(&mut self) {
+    fn enter_chooser(&mut self) {
         use aether_protocol::picker::PickerKind;
         self.session = Session::placeholder(); // conn = Connected, so notifications resume
         let startup = self

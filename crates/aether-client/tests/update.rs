@@ -2756,7 +2756,6 @@ fn app_settings_esc_closes_the_overlay() {
 
 #[test]
 fn app_settings_toggle_persists_and_reflows() {
-    use aether_client::keymap::Action;
     use aether_protocol::viewport::WrapMode;
 
     let mut s = session();
@@ -2800,7 +2799,6 @@ fn app_settings_click_toggles_row_and_moves_focus() {
 
 #[test]
 fn settings_changed_push_applies_wrap_live() {
-    use aether_client::keymap::Action;
     use aether_client::update::Event;
     use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
     use aether_protocol::settings::SettingsChanged;
@@ -2848,7 +2846,6 @@ fn startup_fetches_persisted_settings() {
 
 #[test]
 fn app_settings_loaded_applies_persisted_wrap_only_when_it_differs() {
-    use aether_client::keymap::Action;
     use aether_client::update::Event;
     use aether_protocol::settings::AppSettings;
     use aether_protocol::viewport::WrapMode;
