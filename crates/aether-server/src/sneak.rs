@@ -209,10 +209,7 @@ mod tests {
         // start at d — otherwise pressing `a` would be both "jump to xa" and "narrow to xa".
         let t = rope("xa xb xc\n");
         let cands = compute_candidates(&t, 0, 1, "x", false);
-        assert_eq!(
-            assign_labels(&cands),
-            vec![Some('d'), Some('e'), Some('f')]
-        );
+        assert_eq!(assign_labels(&cands), vec![Some('d'), Some('e'), Some('f')]);
     }
 
     #[test]

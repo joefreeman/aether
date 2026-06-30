@@ -246,7 +246,9 @@ fn confirm_kind(k: &ConfirmKind) -> Value {
             json!({ "kind": "delete", "noun": noun, "name": name })
         }
         ConfirmKind::RemoveRoot { path } => json!({ "kind": "remove_root", "path": path }),
-        ConfirmKind::DeleteWorkspace { name } => json!({ "kind": "delete_workspace", "name": name }),
+        ConfirmKind::DeleteWorkspace { name } => {
+            json!({ "kind": "delete_workspace", "name": name })
+        }
     }
 }
 

@@ -27,16 +27,11 @@ use aether_protocol::input::{
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspDocumentHighlight, LspDocumentHighlightParams, LspFormat,
-    LspFormatResult, LspGotoDefinition,
-    LspGotoDefinitionResult, LspHover, LspHoverResult, LspLocation, LspNavigateDiagnostic,
-    LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness, LspRestartServer,
-    LspServerStatus, LspStatus, LspStatusChanged,
+    LspFormatResult, LspGotoDefinition, LspGotoDefinitionResult, LspHover, LspHoverResult,
+    LspLocation, LspNavigateDiagnostic, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult,
+    LspReadiness, LspRestartServer, LspServerStatus, LspStatus, LspStatusChanged,
 };
 use aether_protocol::picker::{CaseMode, MatchOptions};
-use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceList, WorkspaceOpenPath,
-    WorkspaceOpenPathParams, WorkspaceSummary,
-};
 use aether_protocol::search::{SearchSet, SearchSetParams};
 use aether_protocol::sneak::{
     SneakCancel, SneakSelect, SneakSelectParams, SneakTarget, SneakUpdate, SneakUpdateParams,
@@ -46,6 +41,10 @@ use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
     LogicalLineRender, VirtualRow, VirtualRowKind,
+};
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceList, WorkspaceOpenPath,
+    WorkspaceOpenPathParams, WorkspaceSummary,
 };
 use aether_protocol::LogicalPosition;
 use serde_json::{from_str, from_value, json, to_value};
@@ -734,7 +733,10 @@ fn sneak_target_shape() {
         label: Some('j'),
     })
     .unwrap();
-    assert_eq!(v, json!({"start": 4, "end": 11, "prefix_end": 6, "label": "j"}));
+    assert_eq!(
+        v,
+        json!({"start": 4, "end": 11, "prefix_end": 6, "label": "j"})
+    );
     // Unlabelled (deferred): no label, empty chip (prefix_end == start).
     let v = to_value(SneakTarget {
         start: 0,
@@ -845,7 +847,10 @@ fn input_adjust_number_methods() {
         scan_at_cursor: true,
     })
     .unwrap();
-    assert_eq!(scan, json!({"buffer_id": 3, "delta": 1, "scan_at_cursor": true}));
+    assert_eq!(
+        scan,
+        json!({"buffer_id": 3, "delta": 1, "scan_at_cursor": true})
+    );
 
     // The shared counted-edit shape omits `count` when it's 1, and carries it otherwise.
     let one = to_value(CountedEditParams {
@@ -2289,7 +2294,10 @@ fn picker_kind_explorer_is_snake_case() {
 #[test]
 fn picker_kind_workspaces_is_snake_case() {
     use aether_protocol::picker::PickerKind;
-    assert_eq!(to_value(PickerKind::Workspaces).unwrap(), json!("workspaces"));
+    assert_eq!(
+        to_value(PickerKind::Workspaces).unwrap(),
+        json!("workspaces")
+    );
     assert_eq!(
         from_value::<PickerKind>(json!("workspaces")).unwrap(),
         PickerKind::Workspaces,

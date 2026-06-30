@@ -34,7 +34,9 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
     handle_existing_runtime_file(&runtime_path)?;
 
     let listener = TcpListener::bind(&bind_addr).await.with_context(|| {
-        format!("binding {bind_addr} for profile '{profile}' — is the port in use by another process?")
+        format!(
+            "binding {bind_addr} for profile '{profile}' — is the port in use by another process?"
+        )
     })?;
     let port = listener.local_addr()?.port();
 

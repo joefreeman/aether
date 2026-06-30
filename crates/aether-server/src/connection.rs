@@ -38,15 +38,15 @@ use aether_protocol::path::PathDelete;
 use aether_protocol::picker::{
     PickerGrepNavigate, PickerHide, PickerQuery, PickerSectionJump, PickerSelect, PickerView,
 };
-use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceAddRoot, WorkspaceCreate, WorkspaceDelete, WorkspaceList, WorkspaceOpenPath,
-    WorkspaceRemoveRoot, WorkspaceRename,
-};
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
-use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
+use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
+};
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceAddRoot, WorkspaceCreate, WorkspaceDelete, WorkspaceList,
+    WorkspaceOpenPath, WorkspaceRemoveRoot, WorkspaceRename,
 };
 use aether_protocol::ClientId;
 use anyhow::Context;

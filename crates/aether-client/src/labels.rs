@@ -245,7 +245,10 @@ mod tests {
         );
         // Tighter budget, ties broken toward the tail: keeping `e/filename.rs` (no lead) beats
         // keeping `a` + `filename.rs`, since both keep two segments but the tail candidate wins.
-        assert_eq!(truncate_path("a/b/c/d/e/filename.rs", 16), "…/e/filename.rs");
+        assert_eq!(
+            truncate_path("a/b/c/d/e/filename.rs", 16),
+            "…/e/filename.rs"
+        );
         // Rung 3 (floor): no `/` to elide, so a long single segment left-cuts to the end (the `…`
         // plus the last `budget - 1` chars).
         assert_eq!(truncate_path("supercalifragilistic.rs", 10), "…listic.rs");

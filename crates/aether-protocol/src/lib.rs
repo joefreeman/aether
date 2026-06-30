@@ -15,11 +15,11 @@ pub mod lsp;
 pub mod nav;
 pub mod path;
 pub mod picker;
-pub mod workspace;
 pub mod search;
 pub mod settings;
 pub mod sneak;
 pub mod viewport;
+pub mod workspace;
 
 pub type BufferId = u64;
 pub type ViewportId = u64;

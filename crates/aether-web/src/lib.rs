@@ -10,9 +10,7 @@
 mod view;
 
 use aether_client::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
-use aether_client::keymap::{
-    hover_action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
-};
+use aether_client::keymap::{hover_action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit};
 use aether_client::session::{buffer_info, HoverText, PasteKind, Session};
 use aether_client::transport::RpcError;
 use aether_client::update::Event;
@@ -282,12 +280,16 @@ impl WasmSession {
 
     /// Replace the workspace-settings name field (native `<input>` owns editing). Returns `Effect[]`.
     pub fn workspace_settings_set_name(&mut self, text: String) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.workspace_settings_set_name(text)))
+        to_js(&effects_to_json(
+            self.inner.workspace_settings_set_name(text),
+        ))
     }
 
     /// Replace the workspace-settings add-root input (native `<input>` owns editing). Returns `Effect[]`.
     pub fn workspace_settings_set_add(&mut self, text: String) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.workspace_settings_set_add(text)))
+        to_js(&effects_to_json(
+            self.inner.workspace_settings_set_add(text),
+        ))
     }
 
     /// A root row's delete button was clicked (0-based index): open the shared confirm prompt for

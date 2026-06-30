@@ -11,8 +11,8 @@ use super::save_as::SaveAsEditor;
 use super::session::{
     buffer_info, label_for_path, min_pos, severity_label, step_font_size, strip_longest_root,
     AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
-    HoverBlock, HoverText, Mode, PasteKind, Pending, WorkspaceSettings, Prompt, ReloadTry,
-    RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, SneakState, TextField,
+    HoverBlock, HoverText, Mode, PasteKind, Pending, Prompt, ReloadTry, RepeatTarget, SaveTry,
+    SearchSnapshot, SearchState, Session, SneakState, TextField, WorkspaceSettings,
 };
 use super::transport::RpcError;
 use aether_protocol::buffer::{
@@ -53,11 +53,10 @@ use aether_protocol::input::{
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
-    LspDocumentHighlight, LspDocumentHighlightParams,
-    LspDiagnosticsChangedParams, LspFormat, LspFormatResult, LspGotoDefinition,
-    LspGotoDefinitionResult, LspHover, LspHoverResult, LspNavigateDiagnostic,
-    LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness, LspRestartServer,
-    LspRestartServerParams, LspServerStatus, LspStatusChanged,
+    LspDiagnosticsChangedParams, LspDocumentHighlight, LspDocumentHighlightParams, LspFormat,
+    LspFormatResult, LspGotoDefinition, LspGotoDefinitionResult, LspHover, LspHoverResult,
+    LspNavigateDiagnostic, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness,
+    LspRestartServer, LspRestartServerParams, LspServerStatus, LspStatusChanged,
 };
 use aether_protocol::nav::NavStepResult;
 use aether_protocol::nav::{NavStep, NavStepParams};
@@ -69,27 +68,27 @@ use aether_protocol::picker::{
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
     PickerViewParams, PickerViewResult, ScopedPath,
 };
-use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddRoot,
-    WorkspaceAddRootParams, WorkspaceCreate, WorkspaceCreateParams, WorkspaceDelete, WorkspaceDeleteParams,
-    WorkspaceInfo, WorkspaceOpenPath, WorkspaceOpenPathParams, WorkspaceRemoveRoot,
-    WorkspaceRemoveRootParams, WorkspaceRemoveRootResult, WorkspaceRename, WorkspaceRenameParams,
-    WorkspaceRenamed, WorkspaceRenamedParams,
-};
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
     SearchStateChanged, SearchStep, SearchStepParams, SearchSummary,
+};
+use aether_protocol::settings::{
+    AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
 };
 use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
 };
-use aether_protocol::settings::{
-    AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
-};
 use aether_protocol::viewport::{
     DiagnosticSeverity, ViewportLinesChanged, ViewportLinesChangedParams, ViewportSubscribeResult,
     ViewportWindowResult, Window, WrapMode,
+};
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddRoot,
+    WorkspaceAddRootParams, WorkspaceCreate, WorkspaceCreateParams, WorkspaceDelete,
+    WorkspaceDeleteParams, WorkspaceInfo, WorkspaceOpenPath, WorkspaceOpenPathParams,
+    WorkspaceRemoveRoot, WorkspaceRemoveRootParams, WorkspaceRemoveRootResult, WorkspaceRename,
+    WorkspaceRenameParams, WorkspaceRenamed, WorkspaceRenamedParams,
 };
 use aether_protocol::{BufferId, LogicalPosition};
 
@@ -782,7 +781,9 @@ impl Session {
                 }
                 fx
             }
-            Event::WorkspaceCreated(Err(e)) => Effects::error(format!("Create workspace failed: {e}")),
+            Event::WorkspaceCreated(Err(e)) => {
+                Effects::error(format!("Create workspace failed: {e}"))
+            }
 
             Event::WorkspaceRenamed(result) => {
                 let Some(s) = self.workspace_settings.as_mut() else {
@@ -797,7 +798,10 @@ impl Session {
                         s.workspace_name = info.name.clone();
                         s.name.set(info.name);
                         s.error = None;
-                        Effects::toast(format!("Renamed workspace to {new_name}"), ToastKind::Success)
+                        Effects::toast(
+                            format!("Renamed workspace to {new_name}"),
+                            ToastKind::Success,
+                        )
                     }
                     Err(e) => {
                         s.error = Some(e);
@@ -4085,9 +4089,10 @@ impl Session {
         // Drop the picker first — the create both activates the workspace and (when it has no roots)
         // opens the settings overlay, so the picker shouldn't linger underneath.
         let hide = self.close_picker();
-        hide.and(
-            self.request_str::<WorkspaceCreate>(WorkspaceCreateParams { name }, Event::WorkspaceCreated),
-        )
+        hide.and(self.request_str::<WorkspaceCreate>(
+            WorkspaceCreateParams { name },
+            Event::WorkspaceCreated,
+        ))
     }
 
     /// Adopt a `WorkspaceInfo` returned by an add/remove-root RPC: update the session's roots and,

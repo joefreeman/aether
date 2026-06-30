@@ -418,6 +418,9 @@ mod tests {
             workspace: Some("myproj".into()),
             ..Default::default()
         };
-        assert_eq!(resolve_workspace(&edit).unwrap(), Some("myproj".to_string()));
+        assert_eq!(
+            resolve_workspace(&edit).unwrap(),
+            Some("myproj".to_string())
+        );
     }
 }

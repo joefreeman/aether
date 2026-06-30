@@ -804,7 +804,8 @@ impl ServerState {
     pub fn drop_searches_for_client(&mut self, client_id: ClientId) {
         self.searches.retain(|(c, _), _| *c != client_id);
         self.symbol_highlights.retain(|(c, _), _| *c != client_id);
-        self.symbol_highlight_gen.retain(|(c, _), _| *c != client_id);
+        self.symbol_highlight_gen
+            .retain(|(c, _), _| *c != client_id);
     }
 
     /// Remove all sneak sessions for the given client. Used on disconnect.
@@ -995,7 +996,11 @@ impl ServerState {
     /// limited to one client. Used when the client switches its active workspace: the buffers
     /// themselves stay alive (other clients may have them open), but this client's viewports,
     /// cursors, history, searches, scroll, and pickers/mru are reset.
-    pub fn teardown_client_state_for_workspace(&mut self, client_id: ClientId, workspace_name: &str) {
+    pub fn teardown_client_state_for_workspace(
+        &mut self,
+        client_id: ClientId,
+        workspace_name: &str,
+    ) {
         // Snapshot the buffer ids belonging to the workspace; we'll filter all the per-(client,
         // buffer) maps against this set. Avoids borrowing `buffers` while mutating the maps.
         let workspace_buffers: std::collections::HashSet<BufferId> = self
@@ -1712,7 +1717,9 @@ mod workspace_state_tests {
         let (c2, sess2) = session("other");
         s.clients.insert(c2, sess2);
 
-        let paths = s.rename_workspace("old", "new").expect("workspace was loaded");
+        let paths = s
+            .rename_workspace("old", "new")
+            .expect("workspace was loaded");
         assert_eq!(paths, vec!["/tmp/x".to_string()]);
 
         // Workspace map re-keyed; the entry's own name field follows.
@@ -1725,7 +1732,10 @@ mod workspace_state_tests {
         assert!(s.workspaces.contains_key("other"));
 
         // The buffer is re-pointed but still present (nothing closed); the unrelated one is left.
-        assert_eq!(s.buffer_workspaces.get(&buf).map(String::as_str), Some("new"));
+        assert_eq!(
+            s.buffer_workspaces.get(&buf).map(String::as_str),
+            Some("new")
+        );
         assert_eq!(
             s.buffer_workspaces.get(&other_buf).map(String::as_str),
             Some("other")
@@ -1787,7 +1797,8 @@ mod workspace_state_tests {
         s.buffer_workspaces.insert(sc_dirty, "p".into());
         s.touch_mru(sc_dirty);
         let sc_clean = s.allocate_buffer_id();
-        s.buffers.insert(sc_clean, Buffer::scratch(sc_clean, None, 2));
+        s.buffers
+            .insert(sc_clean, Buffer::scratch(sc_clean, None, 2));
         s.buffer_workspaces.insert(sc_clean, "p".into());
         s.touch_mru(sc_clean);
 
@@ -1857,7 +1868,11 @@ mod workspace_state_tests {
         );
         assert_eq!(s.first_dormant_id("p"), Some(d2));
         s.promote_dormant("p", Path::new("/p/b.rs"));
-        assert_eq!(s.first_dormant_id("p"), None, "promotion empties the registry");
+        assert_eq!(
+            s.first_dormant_id("p"),
+            None,
+            "promotion empties the registry"
+        );
     }
 
     /// `workspace_active_anywhere` is the delete guard: true iff *some* client has the workspace

@@ -45,7 +45,10 @@ pub fn set_active_profile(name: String) {
 
 /// The active profile name (`"default"` until [`set_active_profile`] runs).
 pub fn active_profile() -> &'static str {
-    ACTIVE_PROFILE.get().map(String::as_str).unwrap_or(DEFAULT_PROFILE)
+    ACTIVE_PROFILE
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_PROFILE)
 }
 
 /// `<config>/aether` — the root holding `profiles/` (and, pre-migration, the legacy layout).
@@ -236,7 +239,6 @@ pub struct WorkspaceConfig {
     pub paths: Vec<PathBuf>,
 }
 
-
 pub fn load_workspace(name: &str) -> anyhow::Result<WorkspaceConfig> {
     let path = workspace_config_path(name)?;
     let content = std::fs::read_to_string(&path)
@@ -360,9 +362,12 @@ pub fn workspace_sessions_path() -> anyhow::Result<PathBuf> {
 pub fn load_workspace_sessions_at(path: &Path) -> anyhow::Result<WorkspaceSessions> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WorkspaceSessions::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkspaceSessions::default())
+        }
         Err(e) => {
-            return Err(e).with_context(|| format!("reading workspace sessions at {}", path.display()))
+            return Err(e)
+                .with_context(|| format!("reading workspace sessions at {}", path.display()))
         }
     };
     serde_json::from_str(&content)
@@ -370,7 +375,10 @@ pub fn load_workspace_sessions_at(path: &Path) -> anyhow::Result<WorkspaceSessio
 }
 
 /// Write (or overwrite) the workspace-session file, creating the config directory if needed.
-pub fn write_workspace_sessions_at(path: &Path, sessions: &WorkspaceSessions) -> anyhow::Result<()> {
+pub fn write_workspace_sessions_at(
+    path: &Path,
+    sessions: &WorkspaceSessions,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
@@ -434,7 +442,9 @@ pub fn list_workspace_names() -> anyhow::Result<Vec<String>> {
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading workspaces dir {}", dir.display())),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading workspaces dir {}", dir.display()))
+        }
     };
     let mut names: Vec<String> = entries
         .flatten()
@@ -692,7 +702,9 @@ pub fn delete_workspace_config(name: &str) -> anyhow::Result<()> {
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("deleting workspace config at {}", path.display())),
+        Err(e) => {
+            Err(e).with_context(|| format!("deleting workspace config at {}", path.display()))
+        }
     }
 }
 
@@ -814,7 +826,10 @@ mod tests {
 
         let got = list_profiles_at(&profiles).unwrap();
         assert_eq!(got.len(), 2);
-        assert_eq!((got[0].name.as_str(), got[0].port), ("default", SERVER_PORT));
+        assert_eq!(
+            (got[0].name.as_str(), got[0].port),
+            ("default", SERVER_PORT)
+        );
         assert_eq!((got[1].name.as_str(), got[1].port), ("dev", 2385));
     }
 
@@ -825,14 +840,20 @@ mod tests {
         let bare = dir.path().join("bare.toml");
         std::fs::write(&bare, "port = 2384\n").unwrap();
         assert_eq!(
-            read_profile_config(&bare).unwrap().unwrap().idle_timeout_secs,
+            read_profile_config(&bare)
+                .unwrap()
+                .unwrap()
+                .idle_timeout_secs,
             None
         );
         // Hand-edited override is honoured.
         let custom = dir.path().join("custom.toml");
         std::fs::write(&custom, "port = 2385\nidle_timeout_secs = 15\n").unwrap();
         assert_eq!(
-            read_profile_config(&custom).unwrap().unwrap().idle_timeout_secs,
+            read_profile_config(&custom)
+                .unwrap()
+                .unwrap()
+                .idle_timeout_secs,
             Some(15)
         );
         // Writing with None keeps the file minimal (no empty/null key).
@@ -959,7 +980,11 @@ mod tests {
         assert_eq!(names, vec!["alpha", "beta", "delta", "gamma"]);
 
         // Flip the stamps: `beta` is now the most recent.
-        sessions.workspaces.get_mut("beta").unwrap().last_activated_at = 999;
+        sessions
+            .workspaces
+            .get_mut("beta")
+            .unwrap()
+            .last_activated_at = 999;
         sort_names_by_recency(&mut names, &sessions);
         assert_eq!(names, vec!["beta", "alpha", "delta", "gamma"]);
     }

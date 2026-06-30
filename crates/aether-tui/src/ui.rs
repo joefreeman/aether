@@ -2550,7 +2550,8 @@ fn explorer_input_prefix(state: &AppState, available: usize) -> (String, String)
         // Roots mode — rows already communicate "picking a root"; no breadcrumb needed.
         return (String::new(), String::new());
     };
-    let (label_part, path_part) = match crate::app::strip_longest_root(dir, &state.workspace_paths) {
+    let (label_part, path_part) = match crate::app::strip_longest_root(dir, &state.workspace_paths)
+    {
         Some((idx, rel)) => {
             let label = state.root_labels.get(idx).map(String::as_str).unwrap_or("");
             let label_part = if label.is_empty() {
@@ -2598,7 +2599,9 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Explorer) => "Explore files…",
         Some(aether_protocol::picker::PickerKind::Workspaces) => "Select workspace…",
         Some(aether_protocol::picker::PickerKind::Diagnostics) => "Diagnostics in current file…",
-        Some(aether_protocol::picker::PickerKind::DiagnosticsWorkspace) => "Diagnostics in workspace…",
+        Some(aether_protocol::picker::PickerKind::DiagnosticsWorkspace) => {
+            "Diagnostics in workspace…"
+        }
         Some(aether_protocol::picker::PickerKind::LspServers) => "List LSPs…",
         Some(aether_protocol::picker::PickerKind::References) => "List references…",
         Some(aether_protocol::picker::PickerKind::DocumentSymbols) => "Go to symbol…",
@@ -2999,7 +3002,11 @@ fn picker_item_spans(
             let ephemeral = aether_protocol::is_ephemeral_workspace_id(name);
             (
                 workspace_label.as_str(),
-                if ephemeral { &[][..] } else { match_indices.as_slice() },
+                if ephemeral {
+                    &[][..]
+                } else {
+                    match_indices.as_slice()
+                },
                 // Frost-blue dot when the workspace has unsaved buffers, matching the unsaved
                 // buffer-dot colour; nothing when clean.
                 (*unsaved_buffers > 0).then_some(NORD9),
@@ -5081,11 +5088,12 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // painted over.
         // Persisted workspace → `[name] ` chrome; an ephemeral "(no workspace)" context (or no
         // workspace yet) shows just the file label, no bracket.
-        let workspace_prefix = if aether_client::labels::shows_workspace_chrome(&state.workspace_name) {
-            format!("[{}] ", state.workspace_name)
-        } else {
-            String::new()
-        };
+        let workspace_prefix =
+            if aether_client::labels::shows_workspace_chrome(&state.workspace_name) {
+                format!("[{}] ", state.workspace_name)
+            } else {
+                String::new()
+            };
         // Buffer-state dot just after the file label — colour-coded (unsaved / changed / deleted
         // on disk), matching the web client's favicon colours.
         let status_dot = state.buffer_status().map(|kind| {
@@ -7279,7 +7287,16 @@ mod tests {
     fn build_spans_paints_sneak_label_and_bands_the_prefix() {
         // "function", whole word [0,8), query "fu" → prefix [0,2), label 'j'.
         let sneak = [(0u32, 8u32, 2u32, Some('j'))];
-        let cells = cells_of(&build_spans("function", &[], None, &[], &[], &[], &sneak, 80));
+        let cells = cells_of(&build_spans(
+            "function",
+            &[],
+            None,
+            &[],
+            &[],
+            &[],
+            &sneak,
+            80,
+        ));
         // Col 0: the label glyph, dark-on-yellow.
         assert_eq!(cells[0].0, 'j', "label glyph painted over the first cell");
         assert_eq!(cells[0].2, Some(NORD13), "label on Aurora yellow");

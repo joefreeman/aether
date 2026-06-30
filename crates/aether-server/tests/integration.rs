@@ -24,12 +24,11 @@ use aether_protocol::git::{
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
     InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputDedent,
-    InputDelete, InputIndent,
-    InputJoinLines, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine,
-    InputOpenLineParams, InputSurround, InputSurroundParams, InputText, InputTextParams,
-    InputToggleComment, InputTransformCase, InputTransformCaseParams, InputUnsurround,
-    InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams, UndoRedoParams,
-    UndoResult,
+    InputDelete, InputIndent, InputJoinLines, InputMoveLines, InputMoveLinesParams,
+    InputNewlineAndIndent, InputOpenLine, InputOpenLineParams, InputSurround, InputSurroundParams,
+    InputText, InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
+    InputUnsurround, InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams,
+    UndoRedoParams, UndoResult,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -42,10 +41,6 @@ use aether_protocol::picker::{
     PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem,
     PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
     PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
-};
-use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceDelete,
-    WorkspaceDeleteParams, WorkspaceOpenPath, WorkspaceOpenPathParams,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -62,6 +57,10 @@ use aether_protocol::viewport::{
     ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
     ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, VirtualRowKind,
     WrapMode,
+};
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceDelete,
+    WorkspaceDeleteParams, WorkspaceOpenPath, WorkspaceOpenPathParams,
 };
 use aether_protocol::LogicalPosition;
 use aether_server::{spawn_for_test, spawn_for_test_multi};
@@ -2556,8 +2555,8 @@ async fn logical_line_first_nonblank_motion() {
     let st = step(&mut ws, 25, buffer_id, motion(Direction::Forward, 1), true).await;
     assert_eq!(st.anchor, p(2, 2));
     assert_eq!(st.position, p(3, 0)); // forward selection [2, 3]
-    // …then reverse upward *past* the anchor in one move. Rather than collapsing across the pivot
-    // to [1, 2], the anchor flips to the old cursor (3,0) so the covered span grows to [1, 3].
+                                      // …then reverse upward *past* the anchor in one move. Rather than collapsing across the pivot
+                                      // to [1, 2], the anchor flips to the old cursor (3,0) so the covered span grows to [1, 3].
     let st = step(&mut ws, 26, buffer_id, motion(Direction::Backward, 2), true).await;
     assert_eq!(st.anchor, p(3, 0));
     assert_eq!(st.position, p(1, 4));
@@ -3915,8 +3914,15 @@ async fn undo_restores_selection_unless_collapse_requested() {
     assert_ne!(st.anchor, st.position, "selection is active before delete");
 
     // Delete the selection.
-    let _: EditResult =
-        send_request::<InputDelete>(&mut ws, 10, &CountedEditParams { buffer_id, count: 1 }).await;
+    let _: EditResult = send_request::<InputDelete>(
+        &mut ws,
+        10,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
 
     // Undo without the flag: the selection comes back (Normal-mode behaviour).
     let undo: UndoResult = send_request::<EditUndo>(
@@ -3935,8 +3941,15 @@ async fn undo_restores_selection_unless_collapse_requested() {
 
     // Re-select and re-delete to set up the same undo entry again.
     let _: CursorState = send_request::<CursorSet>(&mut ws, 12, &select()).await;
-    let _: EditResult =
-        send_request::<InputDelete>(&mut ws, 13, &CountedEditParams { buffer_id, count: 1 }).await;
+    let _: EditResult = send_request::<InputDelete>(
+        &mut ws,
+        13,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
 
     // Undo with the flag: the cursor collapses to a point (no selection in Insert mode).
     let undo: UndoResult = send_request::<EditUndo>(
@@ -8260,7 +8273,10 @@ async fn toggle_comment_insert_round_trips_in_markdown() {
 
     // Second Ctrl-y strips it (rather than nesting another wrap); the caret follows `w` back to col 6.
     let r2: EditResult = send_request::<InputToggleComment>(&mut ws, 6, &toggle).await;
-    assert_eq!(buffer_text(&mut ws, 7, open.buffer_id).await, "hello world\n");
+    assert_eq!(
+        buffer_text(&mut ws, 7, open.buffer_id).await,
+        "hello world\n"
+    );
     assert_eq!(r2.cursor.position, LogicalPosition { line: 0, col: 6 });
     assert_eq!(r2.cursor.anchor, r2.cursor.position);
 
@@ -8324,7 +8340,10 @@ async fn toggle_comment_insert_keeps_caret_on_its_character() {
     .await;
     // Comment: `    foo` → `    // foo`; the caret follows `f` to col 7 (not left on the `//`).
     let r1: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &toggle).await;
-    assert_eq!(buffer_text(&mut ws, 5, open.buffer_id).await, "    // foo\n");
+    assert_eq!(
+        buffer_text(&mut ws, 5, open.buffer_id).await,
+        "    // foo\n"
+    );
     assert_eq!(r1.cursor.position, LogicalPosition { line: 0, col: 7 });
     assert_eq!(r1.cursor.anchor, r1.cursor.position);
 
@@ -12176,7 +12195,11 @@ async fn save_as_does_not_create_dirs_outside_workspace() {
         "unexpected error: {err}"
     );
     assert!(
-        !workspace_canonical.parent().unwrap().join("escape").exists(),
+        !workspace_canonical
+            .parent()
+            .unwrap()
+            .join("escape")
+            .exists(),
         "must not have created an `escape` dir alongside the workspace"
     );
     drop(server);
@@ -19531,7 +19554,8 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     let (mut ws_a, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(&mut ws_a, 1, &activate).await;
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws_a, 1, &activate).await;
     let buf_a = open(&mut ws_a, 2, "a.txt").await.buffer_id;
     subscribe(&mut ws_a, 3, buf_a).await;
     let buf_b = open(&mut ws_a, 4, "b.txt").await.buffer_id;
@@ -19540,7 +19564,8 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(&mut ws_b, 1, &activate).await;
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws_b, 1, &activate).await;
     let buf_a_b = open(&mut ws_b, 2, "a.txt").await.buffer_id;
     assert_eq!(
         buf_a_b, buf_a,
@@ -21900,9 +21925,15 @@ async fn sneak_labels_what_fits_when_matches_exceed_alphabet() {
     )
     .await;
     assert_eq!(r.match_count, 30);
-    assert!(!r.labels.is_empty(), "labels shown after one char, not deferred");
+    assert!(
+        !r.labels.is_empty(),
+        "labels shown after one char, not deferred"
+    );
     assert!(r.labels.len() < 30, "but only as many as fit");
-    assert!(!r.labels.contains(&'x'), "label never aliases the next-refinement char");
+    assert!(
+        !r.labels.contains(&'x'),
+        "label never aliases the next-refinement char"
+    );
     drop(server);
 }
 
@@ -21930,7 +21961,10 @@ async fn sneak_scopes_to_the_client_visible_range() {
         },
     )
     .await;
-    assert_eq!(r.match_count, 1, "only the in-view match, not the off-screen one");
+    assert_eq!(
+        r.match_count, 1,
+        "only the in-view match, not the off-screen one"
+    );
     drop(server);
 }
 
@@ -21987,7 +22021,10 @@ async fn sneak_big_word_selects_whole_run() {
         },
     )
     .await;
-    assert_eq!(r.match_count, 1, "the whole non-whitespace run is one target");
+    assert_eq!(
+        r.match_count, 1,
+        "the whole non-whitespace run is one target"
+    );
 
     let cursor: CursorState = send_request::<SneakSelect>(
         &mut ws,
@@ -22004,7 +22041,6 @@ async fn sneak_big_word_selects_whole_run() {
     assert_eq!(cursor.position, LogicalPosition { line: 0, col: 8 });
     drop(server);
 }
-
 
 // ---- input/change (Normal-mode `Ctrl-a`) --------------------------------------------------------
 // `Change` shares `DeleteSelection`'s range *except* over a whole-line selection (the `x` normal
@@ -22043,8 +22079,15 @@ async fn change_over_whole_line_selection_leaves_empty_line() {
     assert_eq!(sel.anchor, LogicalPosition { line: 1, col: 0 });
     assert_eq!(sel.position, LogicalPosition { line: 1, col: 4 }); // on the trailing newline
 
-    let r: EditResult =
-        send_request::<InputChange>(&mut ws, 12, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputChange>(
+        &mut ws,
+        12,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     // Empty line kept; cursor collapsed to col 0 of it.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 0 });
@@ -22080,7 +22123,15 @@ async fn delete_over_whole_line_selection_removes_the_line() {
         },
     )
     .await;
-    send_request::<InputDelete>(&mut ws, 12, &CountedEditParams { buffer_id, count: 1 }).await;
+    send_request::<InputDelete>(
+        &mut ws,
+        12,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert_eq!(buffer_text(&mut ws, 13, buffer_id).await, "alpha\n");
     drop(server);
 }
@@ -22102,8 +22153,15 @@ async fn change_over_multi_line_selection_collapses_to_one_empty_line() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputChange>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputChange>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
     assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "\ngamma\n");
     drop(server);
@@ -22126,14 +22184,29 @@ async fn change_keeps_empty_line_while_delete_removes_it() {
 
     // Change: empty line preserved, cursor stays put.
     send_request::<CursorSet>(&mut ws, 10, &on_empty_line).await;
-    let r: EditResult =
-        send_request::<InputChange>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputChange>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
     assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "alpha\n\nbeta\n");
 
     // Delete on the same empty line: it's gone.
     send_request::<CursorSet>(&mut ws, 13, &on_empty_line).await;
-    send_request::<InputDelete>(&mut ws, 14, &CountedEditParams { buffer_id, count: 1 }).await;
+    send_request::<InputDelete>(
+        &mut ws,
+        14,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert_eq!(buffer_text(&mut ws, 15, buffer_id).await, "alpha\nbeta\n");
     drop(server);
 }
@@ -22165,8 +22238,15 @@ async fn change_over_last_line_without_trailing_newline_leaves_empty_line() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputChange>(&mut ws, 12, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputChange>(
+        &mut ws,
+        12,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
     assert_eq!(buffer_text(&mut ws, 13, buffer_id).await, "alpha\n");
     drop(server);
@@ -22190,8 +22270,15 @@ async fn change_over_partial_selection_ending_on_newline_still_joins() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputChange>(&mut ws, 11, &CountedEditParams { buffer_id, count: 1 }).await;
+    let r: EditResult = send_request::<InputChange>(
+        &mut ws,
+        11,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
     assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "albeta\n");
     drop(server);
@@ -22395,7 +22482,10 @@ async fn wait_for_backup(dir: &std::path::Path) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("no backup file appeared in {} within timeout", dir.display());
+    panic!(
+        "no backup file appeared in {} within timeout",
+        dir.display()
+    );
 }
 
 /// End-to-end hot-exit: edit a file without saving, let the flush persist the unsaved content, then

@@ -331,7 +331,9 @@ impl Shell {
         }
         const MAX_TOASTS: usize = 5;
         if let Some(g) = &group {
-            self.state.toasts.retain(|t| t.group.as_deref() != Some(g.as_str()));
+            self.state
+                .toasts
+                .retain(|t| t.group.as_deref() != Some(g.as_str()));
         }
         let id = self.next_toast_id;
         self.next_toast_id = self.next_toast_id.wrapping_add(1);
@@ -1354,7 +1356,9 @@ impl Shell {
         let (cols, rows) = self.term;
         let server_url = self.server_url.clone();
         self.pending.push(Box::pin(async move {
-            Done::Booted(Box::new(boot_dial(attempt, spec, cols, rows, server_url).await))
+            Done::Booted(Box::new(
+                boot_dial(attempt, spec, cols, rows, server_url).await,
+            ))
         }));
     }
 
@@ -2127,9 +2131,9 @@ pub async fn bootstrap(
                         })
                         .await?;
                     let workspace_paths = opened.workspace.paths.clone();
-                    let open = opened.opened.ok_or_else(|| {
-                        anyhow::anyhow!("workspace/open_path returned no buffer")
-                    })?;
+                    let open = opened
+                        .opened
+                        .ok_or_else(|| anyhow::anyhow!("workspace/open_path returned no buffer"))?;
                     let mut session = Session::new(
                         opened.workspace.name.clone(),
                         workspace_paths.clone(),
@@ -2138,7 +2142,12 @@ pub async fn bootstrap(
                     // Launched to view this file in an ephemeral context: closing it should quit
                     // (see `leave_ephemeral_workspace`), not drop to the chooser.
                     session.launched_with_file = true;
-                    (session, opened.workspace.name, workspace_paths, Effects::none())
+                    (
+                        session,
+                        opened.workspace.name,
+                        workspace_paths,
+                        Effects::none(),
+                    )
                 }
                 _ => {
                     let mut session = Session::placeholder();

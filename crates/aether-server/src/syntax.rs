@@ -752,7 +752,9 @@ mod tests {
 
         let injections = compute_injections(cfg, &tree, source);
         assert!(
-            injections.iter().any(|l| l.config.name == "markdown_inline"),
+            injections
+                .iter()
+                .any(|l| l.config.name == "markdown_inline"),
             "expected a markdown_inline injection layer, got {:?}",
             injections.iter().map(|l| l.config.name).collect::<Vec<_>>()
         );

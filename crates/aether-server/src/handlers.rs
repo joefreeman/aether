@@ -44,9 +44,8 @@ use aether_protocol::input::{
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspDocumentHighlightParams, LspFormatResult,
-    LspGotoDefinitionResult, LspHoverResult,
-    LspLocation, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness,
-    LspRestartServerParams, LspStatus,
+    LspGotoDefinitionResult, LspHoverResult, LspLocation, LspNavigateDiagnosticParams,
+    LspNavigateDiagnosticResult, LspReadiness, LspRestartServerParams, LspStatus,
 };
 use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
@@ -55,12 +54,6 @@ use aether_protocol::picker::{
     PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerSectionJumpParams,
     PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
     PickerViewResult,
-};
-use aether_protocol::workspace::{
-    WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddRootParams, WorkspaceCreateParams,
-    WorkspaceDeleteParams, WorkspaceInfo, WorkspaceListParams, WorkspaceListResult, WorkspaceOpenPathParams,
-    WorkspaceRemoveRootParams, WorkspaceRemoveRootResult, WorkspaceRenameParams, WorkspaceRenamed,
-    WorkspaceRenamedParams, WorkspaceSummary,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,
@@ -75,6 +68,13 @@ use aether_protocol::viewport::{
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams,
     ViewportSubscribeResult, ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
+};
+use aether_protocol::workspace::{
+    WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddRootParams,
+    WorkspaceCreateParams, WorkspaceDeleteParams, WorkspaceInfo, WorkspaceListParams,
+    WorkspaceListResult, WorkspaceOpenPathParams, WorkspaceRemoveRootParams,
+    WorkspaceRemoveRootResult, WorkspaceRenameParams, WorkspaceRenamed, WorkspaceRenamedParams,
+    WorkspaceSummary,
 };
 use aether_protocol::LogicalPosition;
 use aether_protocol::{BufferId, ClientId, Revision};
@@ -271,15 +271,15 @@ pub async fn workspace_activate(
                     .iter()
                     .filter(|d| match &d.source {
                         crate::state::DormantSource::Scratch { .. } => true,
-                        crate::state::DormantSource::File(p) => backups_root.as_deref().is_some_and(
-                            |root| {
+                        crate::state::DormantSource::File(p) => {
+                            backups_root.as_deref().is_some_and(|root| {
                                 crate::backup::exists(&crate::backup::file_backup_path(
                                     root,
                                     &params.name,
                                     p,
                                 ))
-                            },
-                        ),
+                            })
+                        }
                     })
                     .map(|d| d.id)
                     .collect();
@@ -397,7 +397,11 @@ pub async fn workspace_activate(
 /// (`sessions_path` unset) or the workspace is ephemeral, and it logs rather than fails on I/O error.
 /// Buffer paths are gathered under the lock; the read-modify-write of the file happens after it's
 /// released.
-async fn persist_workspace_session(state: &SharedState, workspace_name: &str, touch_activation: bool) {
+async fn persist_workspace_session(
+    state: &SharedState,
+    workspace_name: &str,
+    touch_activation: bool,
+) {
     // Hold the state lock across the whole read-modify-write. It's the single server-wide
     // serialization point, so this makes concurrent persists — and the recency-sort read in
     // `workspace_candidates`, which also runs under the lock — mutually exclusive: no lost updates
@@ -417,7 +421,10 @@ async fn persist_workspace_session(state: &SharedState, workspace_name: &str, to
     }
     let buffers = s.session_buffers(workspace_name);
     let mut sessions = crate::config::load_workspace_sessions_at(&path).unwrap_or_default();
-    let entry = sessions.workspaces.entry(workspace_name.to_string()).or_default();
+    let entry = sessions
+        .workspaces
+        .entry(workspace_name.to_string())
+        .or_default();
     entry.buffers = buffers;
     if touch_activation {
         entry.last_activated_at = crate::config::now_unix_ms();
@@ -450,7 +457,11 @@ fn restore_dormant_sources(
         .filter_map(|entry| match entry {
             SessionBuffer::File { path } => {
                 let has_backup = backups_root.is_some_and(|root| {
-                    crate::backup::exists(&crate::backup::file_backup_path(root, workspace_name, path))
+                    crate::backup::exists(&crate::backup::file_backup_path(
+                        root,
+                        workspace_name,
+                        path,
+                    ))
                 });
                 (path.exists() || has_backup).then(|| DormantSource::File(path.clone()))
             }
@@ -564,7 +575,8 @@ pub(crate) async fn flush_backups(state: &SharedState) {
     if jobs.is_empty() {
         return;
     }
-    let mut stamps: Vec<(aether_protocol::BufferId, Option<aether_protocol::Revision>)> = Vec::new();
+    let mut stamps: Vec<(aether_protocol::BufferId, Option<aether_protocol::Revision>)> =
+        Vec::new();
     for job in jobs {
         match job.action {
             Action::Write(content, rev) => match crate::backup::write(&job.path, &content) {
@@ -1012,7 +1024,8 @@ pub async fn workspace_rename(
     {
         let s = state.lock().await;
         if let Some(path) = s.sessions_path.clone() {
-            if let Err(e) = crate::config::rename_workspace_session_at(&path, &old_name, &new_name) {
+            if let Err(e) = crate::config::rename_workspace_session_at(&path, &old_name, &new_name)
+            {
                 tracing::warn!(old = %old_name, new = %new_name, error = %e, "failed to rename workspace session");
             }
         }
@@ -1423,7 +1436,9 @@ async fn open_restored_scratch(
     }
     buf.transient = params.transient == Some(true);
     let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
-    let clamped_anchor = params.jump_to_anchor.map(|a| motion::clamp_position(&buf, a));
+    let clamped_anchor = params
+        .jump_to_anchor
+        .map(|a| motion::clamp_position(&buf, a));
     let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
     let scroll = open_scroll(&s, client_id, id, params.jump_to);
     let result = BufferOpenResult {
@@ -1442,7 +1457,8 @@ async fn open_restored_scratch(
         search_summary: None, // set by buffer_open's prime post-step, not here
     };
     s.buffers.insert(id, buf);
-    s.buffer_workspaces.insert(id, active_workspace_name.clone());
+    s.buffer_workspaces
+        .insert(id, active_workspace_name.clone());
     s.touch_mru(id);
     let pushes = refresh_buffer_pickers(&mut s);
     drop(s);
@@ -1594,7 +1610,8 @@ async fn buffer_open_inner(
                     search_summary: None, // set by buffer_open's prime post-step, not here
                 };
                 s.buffers.insert(id, buf);
-                s.buffer_workspaces.insert(id, active_workspace_name.clone());
+                s.buffer_workspaces
+                    .insert(id, active_workspace_name.clone());
                 s.touch_mru(id);
                 let pushes = refresh_buffer_pickers(&mut s);
                 drop(s);
@@ -1662,7 +1679,9 @@ async fn buffer_open_inner(
         // Absolute-path opens (`absolute_path`) are deliberately allowed outside the roots — they
         // become external buffers — so the boundary check only applies to the relative route.
         if params.absolute_path.is_none()
-            && !s.active_workspace_or_err(ctx.client_id)?.contains(&canonical)
+            && !s
+                .active_workspace_or_err(ctx.client_id)?
+                .contains(&canonical)
         {
             return Err(RpcError::invalid_path(format!(
                 "{} is outside the workspace's access boundary",
@@ -1786,7 +1805,8 @@ async fn buffer_open_inner(
         (git_baseline, git_unstaged, git_both)
     });
     s.buffers.insert(id, buf);
-    s.buffer_workspaces.insert(id, active_workspace_name.clone());
+    s.buffer_workspaces
+        .insert(id, active_workspace_name.clone());
     // Enforce the dormant invariant at materialization: a path now has a live buffer, so drop any
     // dormant (session-restored) entry for it. The by-id open route already does this via
     // `take_dormant`, but path opens (file picker, grep, goto-def, absolute path) reach a dormant
@@ -3794,7 +3814,9 @@ pub async fn sneak_select(
     };
 
     let tgt_lo = target.start_char;
-    let tgt_hi = motion::pos_to_char(buf, target.end_excl).saturating_sub(1).max(tgt_lo);
+    let tgt_hi = motion::pos_to_char(buf, target.end_excl)
+        .saturating_sub(1)
+        .max(tgt_lo);
 
     let (anchor_char, pos_char) = if params.extend {
         // Bounding hull of the current selection and the target word, so extend never shrinks
@@ -4376,7 +4398,11 @@ fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<Buffer
                     .map(|(id, _)| *id)
             })
         })
-        .or_else(|| workspace_name.as_deref().and_then(|name| s.first_dormant_id(name)))
+        .or_else(|| {
+            workspace_name
+                .as_deref()
+                .and_then(|name| s.first_dormant_id(name))
+        })
 }
 
 /// `(client, buffer)` pairs for every client *other than* `except` that currently has a viewport
@@ -4986,7 +5012,10 @@ pub async fn buffer_save(
             let resolved = parent_canonical.join(file_name);
 
             let s = state.lock().await;
-            if !s.active_workspace_or_err(ctx.client_id)?.contains(&resolved) {
+            if !s
+                .active_workspace_or_err(ctx.client_id)?
+                .contains(&resolved)
+            {
                 return Err(RpcError::invalid_path(format!(
                     "{} is outside the workspace's access boundary",
                     resolved.display()
@@ -8023,9 +8052,14 @@ async fn undo_redo_counted(
 ) -> Result<UndoResult, RpcError> {
     let mut last = None;
     for _ in 0..params.count.max(1) {
-        let r =
-            apply_undo_or_redo(state, ctx, params.buffer_id, direction, params.collapse_selection)
-                .await?;
+        let r = apply_undo_or_redo(
+            state,
+            ctx,
+            params.buffer_id,
+            direction,
+            params.collapse_selection,
+        )
+        .await?;
         let applied = r.applied;
         last = Some(r);
         if !applied {
@@ -9073,8 +9107,20 @@ fn resolve_number_edit(
         let line_text: String = buf.text.line(line as usize).chars().collect();
         let (s_col, e_col) = crate::number::find_number(&line_text, cursor.position.col as usize)?;
         (
-            motion::pos_to_char(buf, LogicalPosition { line, col: s_col as u32 }),
-            motion::pos_to_char(buf, LogicalPosition { line, col: e_col as u32 }),
+            motion::pos_to_char(
+                buf,
+                LogicalPosition {
+                    line,
+                    col: s_col as u32,
+                },
+            ),
+            motion::pos_to_char(
+                buf,
+                LogicalPosition {
+                    line,
+                    col: e_col as u32,
+                },
+            ),
         )
     } else {
         // Normal mode: the operand is exactly the selected chars (a point cursor being the single
@@ -9083,7 +9129,8 @@ fn resolve_number_edit(
         current_selection_char_range(buf, cursor)
     };
     let selected: String = buf.text.slice(sc..ec).chars().collect();
-    crate::number::adjust_exact(&selected, delta).map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
+    crate::number::adjust_exact(&selected, delta)
+        .map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
 }
 
 /// `Ctrl-e` / `Ctrl-Alt-e`: shift the cursor's number by `delta` in a single edit (so `3` +
@@ -10540,7 +10587,10 @@ fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) 
 /// plus every *live* ephemeral workspace currently in memory. The ephemeral entries carry their id
 /// as `name` — the client renders an ephemeral id as "(no workspace)". They appear only while they
 /// hold a buffer, since an ephemeral workspace is auto-removed once its last buffer closes.
-fn workspace_candidates(s: &ServerState, names: &[String]) -> Vec<picker_state::WorkspaceCandidate> {
+fn workspace_candidates(
+    s: &ServerState,
+    names: &[String],
+) -> Vec<picker_state::WorkspaceCandidate> {
     // Reorder the alphabetical disk listing into most-recently-activated-first using the persisted
     // session stamps. Never-activated workspaces stay at the end in alphabetical order (see
     // `sort_names_by_recency`). Disabled (left alphabetical) when sessions aren't persisted — tests
@@ -11272,7 +11322,10 @@ pub async fn directory_create(
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
     {
         let s = state.lock().await;
-        if !s.active_workspace_or_err(ctx.client_id)?.contains(&resolved) {
+        if !s
+            .active_workspace_or_err(ctx.client_id)?
+            .contains(&resolved)
+        {
             return Err(RpcError::invalid_path(format!(
                 "{} is outside the workspace's access boundary",
                 resolved.display()
@@ -12313,7 +12366,10 @@ pub async fn picker_grep_navigate(
     // buffers do.
     let current_key: Option<(u32, String)> = s.active_workspace(client_id).and_then(|workspace| {
         buffer.canonical_path.as_deref().and_then(|p| {
-            crate::workspace_index::workspace_relative_parts(std::path::Path::new(p), &workspace.paths)
+            crate::workspace_index::workspace_relative_parts(
+                std::path::Path::new(p),
+                &workspace.paths,
+            )
         })
     });
 
@@ -12611,8 +12667,10 @@ mod document_highlight_tests {
     #[test]
     fn non_array_response_yields_nothing() {
         let buf = buf_with("foo\n");
-        assert!(parse_document_highlights(&serde_json::Value::Null, &buf, PositionEncoding::Utf8)
-            .is_empty());
+        assert!(
+            parse_document_highlights(&serde_json::Value::Null, &buf, PositionEncoding::Utf8)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -12645,10 +12703,16 @@ mod document_highlight_tests {
         assert!(render_matches(&st, client, buffer).is_none());
         // Symbol set only → it renders.
         st.symbol_highlights.insert((client, buffer), entry("", 2));
-        assert_eq!(render_matches(&st, client, buffer).map(|e| e.matches.len()), Some(2));
+        assert_eq!(
+            render_matches(&st, client, buffer).map(|e| e.matches.len()),
+            Some(2)
+        );
         // A real search always wins, enforcing "symbol highlights only when no search is active".
         st.searches.insert((client, buffer), entry("needle", 5));
-        assert_eq!(render_matches(&st, client, buffer).map(|e| e.query.as_str()), Some("needle"));
+        assert_eq!(
+            render_matches(&st, client, buffer).map(|e| e.query.as_str()),
+            Some("needle")
+        );
     }
 }
 
@@ -13990,7 +14054,11 @@ mod seed_reference_center_tests {
         let refs = vec![rf("/b.rs", 4, 4, 9), rf("/a.rs", 4, 4, 9)];
         let ranked: Vec<u32> = vec![0, 1];
         let seed = seed_reference_center(&refs, &ranked, Some("/a.rs"), at(4, 6));
-        assert_eq!(seed, Some((1, 1)), "rank/index point at the /a.rs occurrence");
+        assert_eq!(
+            seed,
+            Some((1, 1)),
+            "rank/index point at the /a.rs occurrence"
+        );
     }
 
     #[test]
