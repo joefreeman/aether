@@ -5022,7 +5022,7 @@ fn lookup_exact(name: &str) -> Option<Style> {
         "number" | "boolean" | "constant" | "constant.builtin" => s.fg(NORD15),
         "function" | "function.call" => s.fg(NORD8),
         "function.macro" => s.fg(NORD12),
-        "type" | "type.builtin" => s.fg(NORD7),
+        "type" | "type.builtin" | "module" | "namespace" | "constructor" => s.fg(NORD7),
         "variable" => s,
         "variable.parameter" => s.fg(NORD4),
         "variable.builtin" => s.fg(NORD9),

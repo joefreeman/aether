@@ -145,6 +145,14 @@ pub fn server_spec(language: &str) -> Option<LspServerSpec> {
             root_markers: &["rebar.config", "rebar.lock"],
             init_options: None,
         },
+        "quiver" => LspServerSpec {
+            // `quiver-lsp` speaks LSP over stdio with no arguments. Bundles the standard
+            // library, so no project marker is needed yet — fall back to the project root.
+            command: "quiver-lsp",
+            args: &[],
+            root_markers: &[],
+            init_options: None,
+        },
         _ => return None,
     };
     Some(spec)
@@ -191,6 +199,7 @@ mod tests {
         assert_eq!(server_spec("markdown").unwrap().command, "marksman");
         assert_eq!(server_spec("elixir").unwrap().command, "elixir-ls");
         assert_eq!(server_spec("erlang").unwrap().command, "elp");
+        assert_eq!(server_spec("quiver").unwrap().command, "quiver-lsp");
         // Workspace-aware languages resolve to the workspace root, not per crate/module.
         assert_eq!(
             workspace_marker("rust"),

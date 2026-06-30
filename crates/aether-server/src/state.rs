@@ -1573,6 +1573,7 @@ fn detect_language(path: &Path) -> Option<String> {
             "html" | "htm" => "html",
             "css" => "css",
             "sh" | "bash" | "zsh" => "bash",
+            "qv" => "quiver",
             _ => return None,
         }
         .to_string(),

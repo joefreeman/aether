@@ -40,6 +40,7 @@ tree-sitter-css.workspace = true
 tree-sitter-bash.workspace = true
 tree-sitter-json.workspace = true
 tree-sitter-yaml.workspace = true
+tree-sitter-quiver.workspace = true
 streaming-iterator.workspace = true
 git2.workspace = true
 notify.workspace = true

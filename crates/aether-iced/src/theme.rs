@@ -83,7 +83,7 @@ fn lookup_exact(kind: &str) -> Option<Option<Color>> {
         "number" | "boolean" | "constant" | "constant.builtin" => Some(NORD15),
         "function" | "function.call" | "text.title" | "text.uri" | "text.reference" => Some(NORD8),
         "function.macro" | "punctuation.special" | "attribute" | "label" => Some(NORD12),
-        "type" | "type.builtin" => Some(NORD7),
+        "type" | "type.builtin" | "module" | "namespace" | "constructor" => Some(NORD7),
         "variable.parameter" | "punctuation.bracket" | "punctuation.delimiter" | "property" => {
             Some(NORD4)
         }

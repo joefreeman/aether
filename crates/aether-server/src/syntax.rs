@@ -79,6 +79,7 @@ static CSS: OnceLock<LanguageConfig> = OnceLock::new();
 static BASH: OnceLock<LanguageConfig> = OnceLock::new();
 static JSON: OnceLock<LanguageConfig> = OnceLock::new();
 static YAML: OnceLock<LanguageConfig> = OnceLock::new();
+static QUIVER: OnceLock<LanguageConfig> = OnceLock::new();
 
 /// Everything that distinguishes one injection-free language from another: the grammar, its
 /// queries, and the editing metadata copied into the resulting [`LanguageConfig`]. Named fields
@@ -371,6 +372,21 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 block_comment: None,
             },
         )),
+        "quiver" | "qv" => Some(simple(
+            &QUIVER,
+            LanguageSpec {
+                name: "quiver",
+                language: tree_sitter_quiver::LANGUAGE,
+                highlights: tree_sitter_quiver::HIGHLIGHTS_QUERY,
+                // First-party grammar: highlights and indents both ship from its crate
+                // (rather than the vendored `queries/<lang>/` copies used for third-party
+                // grammars), so they stay in lock-step with the grammar.
+                indents: Some(tree_sitter_quiver::INDENTS_QUERY),
+                default_indent: IndentStyle::Spaces(2),
+                line_comment: Some("//"),
+                block_comment: None,
+            },
+        )),
         _ => None,
     }
 }
@@ -451,10 +467,11 @@ pub fn compute_injections(
 /// `source`. The returned highlights' `start`/`end` are **relative to `range_start`** (i.e. they
 /// fall in `[0, range_end - range_start)`).
 ///
-/// More-specific (shorter) captures override longer ones at the same byte. Captures of the same
-/// length are last-writer-wins by query order. Injection layers whose range intersects the
-/// requested window are overlaid on top of the outer captures, so an embedded `rust` block in a
-/// markdown file gets rust highlighting in its content region.
+/// A `#set! "priority"` directive wins first (default 100); otherwise more-specific (shorter)
+/// captures override longer ones at the same byte, and captures of the same length are
+/// last-writer-wins by query order. Injection layers whose range intersects the requested window
+/// are overlaid on top of the outer captures, so an embedded `rust` block in a markdown file gets
+/// rust highlighting in its content region.
 pub fn highlights_for_range(
     config: &LanguageConfig,
     tree: &Tree,
@@ -528,8 +545,9 @@ pub fn highlights_for_range(
 
 /// Run `query` against `tree` over `bytes_for_query` (which the query's nodes index into),
 /// restricted to query-local byte range `query_range`. Each capture's byte interval `[s,e)` is
-/// written into `per_byte` at index `s + per_byte_offset` (and likewise for `e`). Longer
-/// captures are applied first so shorter, more-specific captures overwrite them.
+/// written into `per_byte` at index `s + per_byte_offset` (and likewise for `e`). Resolution is
+/// by `#set! "priority"` first (default 100), then — among equal priority — longer captures are
+/// applied first so shorter, more-specific captures overwrite them.
 fn overlay_captures(
     query: &Query,
     tree: &Tree,
@@ -539,6 +557,21 @@ fn overlay_captures(
     per_byte: &mut [Option<&'static str>],
 ) {
     let capture_names = query.capture_names();
+    // Per-pattern highlight priority from a `#set! "priority" <n>` directive (default 100), the
+    // standard tree-sitter escape hatch. A higher priority wins regardless of span length, letting
+    // a query keep a broad capture (e.g. a whole `%mod/path` import) from being clobbered by a
+    // narrower generic fallback (`(identifier) @variable`) nested inside it.
+    let priorities: Vec<i32> = (0..query.pattern_count())
+        .map(|i| {
+            query
+                .property_settings(i)
+                .iter()
+                .find(|p| &*p.key == "priority")
+                .and_then(|p| p.value.as_deref())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100)
+        })
+        .collect();
     // (start, end, pattern_index, name). `pattern_index` orders equal-length overlaps so the later
     // query pattern wins — the standard tree-sitter precedence query authors rely on. Match
     // *iteration* order can't stand in for it: a capture whose pattern matches on an enclosing node
@@ -565,12 +598,17 @@ fn overlay_captures(
     if captures.is_empty() {
         return;
     }
-    // Longer captures first (shorter, more-specific ones overwrite); for equal length, the
+    // Lower priority first so higher priority is written last (and wins). Within equal priority:
+    // longer captures first (shorter, more-specific ones overwrite); for equal length, the
     // later-defined pattern wins (written last); `start` is a final stable tiebreak.
     captures.sort_by(|a, b| {
         let len_a = a.1 - a.0;
         let len_b = b.1 - b.0;
-        len_b.cmp(&len_a).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0))
+        priorities[a.2]
+            .cmp(&priorities[b.2])
+            .then(len_b.cmp(&len_a))
+            .then(a.2.cmp(&b.2))
+            .then(a.0.cmp(&b.0))
     });
     for (s, e, _, name) in &captures {
         for i in *s..*e {
@@ -611,6 +649,30 @@ mod tests {
             .iter()
             .any(|h| h.start <= string_pos && h.end > string_pos && h.kind.contains("string"));
         assert!(has_string, "expected string highlight for \"hi\"");
+    }
+
+    #[test]
+    fn quiver_module_import_is_one_priority_span() {
+        // `%mathx/vec` must render as a single `module` span: the grammar's `(import) @module`
+        // carries `#set! "priority" 110`, so it beats the narrower `(identifier) @variable`
+        // fallback on each segment and the `/` operator rule that overlap inside it. Without
+        // priority support these would clobber the segments, leaving only the bare `%` coloured.
+        let cfg = get_config("quiver").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "x = %mathx/vec";
+        let tree = parser.parse(source, None).unwrap();
+        let highlights = highlights_for_range(cfg, &tree, &[], source, 0, source.len());
+
+        let import_start = source.find('%').unwrap() as u32;
+        let import_end = source.len() as u32;
+        let module = highlights
+            .iter()
+            .find(|h| h.start == import_start && h.kind.contains("module"));
+        assert!(
+            module.is_some_and(|h| h.end == import_end),
+            "expected one module span over `%mathx/vec`, got {:?}",
+            highlights
+        );
     }
 
     #[test]
@@ -692,6 +754,46 @@ mod tests {
             kind_at("className").is_some_and(|k| k.contains("attribute")),
             "className → attribute, got {:?}",
             kind_at("className")
+        );
+    }
+
+    #[test]
+    fn quiver_highlights_types_strings_and_constructors() {
+        let cfg = get_config("quiver").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "// a point\n'p = Point[x: 'int]\ngreet = #{ \"hi\" }\n";
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "Quiver sample parses cleanly"
+        );
+        let highlights = highlights_for_range(cfg, &tree, &[], source, 0, source.len());
+        let kind_at = |needle: &str| {
+            let pos = source.find(needle).unwrap() as u32;
+            highlights
+                .iter()
+                .find(|h| h.start <= pos && h.end > pos)
+                .map(|h| h.kind.clone())
+        };
+        assert!(
+            kind_at("// a point").is_some_and(|k| k.contains("comment")),
+            "line comment → comment"
+        );
+        assert!(
+            kind_at("'p").is_some_and(|k| k.contains("type")),
+            "'p type name → type"
+        );
+        assert!(
+            kind_at("Point").is_some_and(|k| k.contains("constructor")),
+            "Point → constructor"
+        );
+        assert!(
+            kind_at("'int").is_some_and(|k| k.contains("type")),
+            "'int → type"
+        );
+        assert!(
+            kind_at("\"hi\"").is_some_and(|k| k.contains("string")),
+            "string literal → string"
         );
     }
 
@@ -833,6 +935,7 @@ mod tests {
             ("bash", "echo hi\n"),
             ("json", "{\"a\": 1}"),
             ("yaml", "a: 1\n"),
+            ("quiver", "double = #'int { [~, 2] %math.mul }\n"),
         ];
         for (lang, source) in cases {
             let cfg =
@@ -870,6 +973,7 @@ mod tests {
             ("exs", "elixir"),
             ("erl", "erlang"),
             ("htm", "html"),
+            ("qv", "quiver"),
         ];
         for (alias, canonical) in pairs {
             let a = get_config(alias).unwrap_or_else(|| panic!("alias `{alias}` not registered"));

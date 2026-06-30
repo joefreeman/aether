@@ -65,6 +65,9 @@ tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
+# Quiver grammar, tracking the upstream repo's `main` branch (the crate lives in its `tree-sitter`
+# subdirectory; Cargo resolves it by package name). Cargo.lock pins the exact commit.
+tree-sitter-quiver = { git = "https://github.com/joefreeman/quiver", branch = "main" }
 streaming-iterator = "0.1"
 # Git integration (diff/blame). Local-only: default features (ssh/https/network) disabled so
 # the build doesn't pull in openssl/libssh2 — we never talk to a remote.
