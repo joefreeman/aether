@@ -686,13 +686,16 @@ impl Session {
 }
 
 /// Build the client-side buffer record from a `buffer/open` result.
-/// The display label for a saved buffer at `path`: its workspace-relative path, falling back to the
-/// absolute path when it sits outside every root. Shared by buffer-open and the save-as rename
-/// adoption so both relabel identically.
+/// The display label for a saved buffer at `path`: its workspace-relative location in the canonical
+/// `"[root]: [path]"` form (bare path for single-root workspaces), falling back to the absolute path
+/// when it sits outside every root. This is what the status bar and window title render, so it must
+/// match the buffers picker — both route through [`labels::root_relative_display`]. Shared by
+/// buffer-open and the save-as rename adoption so both relabel identically.
 pub fn label_for_path(path: &str, roots: &[String]) -> String {
-    strip_longest_root(path, roots)
-        .map(|(_, rel)| rel)
-        .unwrap_or_else(|| path.to_string())
+    match strip_longest_root(path, roots) {
+        Some((idx, rel)) => crate::labels::root_relative_display(roots, idx, &rel),
+        None => path.to_string(),
+    }
 }
 
 pub fn buffer_info(open: BufferOpenResult, roots: &[String]) -> BufferInfo {
@@ -779,5 +782,46 @@ pub fn severity_label(severity: DiagnosticSeverity) -> &'static str {
         DiagnosticSeverity::Warning => "Warning",
         DiagnosticSeverity::Information => "Info",
         DiagnosticSeverity::Hint => "Hint",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roots(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn label_for_path_single_root_is_bare_relative() {
+        // Single-root workspace: no root prefix, just the workspace-relative path — what the status
+        // bar and title show.
+        let r = roots(&["/home/joe/work/repo"]);
+        assert_eq!(
+            label_for_path("/home/joe/work/repo/src/main.rs", &r),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn label_for_path_multi_root_prefixes_disambiguated_label() {
+        // Two roots sharing a basename: the status bar / title (and picker) prefix the disambiguated
+        // root label as "[root]: [path]". This is the regression this whole change guards against.
+        let r = roots(&["/home/joe/work/api", "/home/joe/personal/api"]);
+        assert_eq!(
+            label_for_path("/home/joe/work/api/src/main.rs", &r),
+            "api (work): src/main.rs"
+        );
+        assert_eq!(
+            label_for_path("/home/joe/personal/api/lib.rs", &r),
+            "api (personal): lib.rs"
+        );
+    }
+
+    #[test]
+    fn label_for_path_outside_all_roots_falls_back_to_absolute() {
+        let r = roots(&["/home/joe/work/api", "/home/joe/personal/api"]);
+        assert_eq!(label_for_path("/etc/hosts", &r), "/etc/hosts");
     }
 }

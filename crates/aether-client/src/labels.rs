@@ -1,10 +1,124 @@
-//! Disambiguated labels for workspace roots. Default is the root's basename; when two roots share
-//! a basename, both labels grow a parenthesized parent component, then grandparent, etc., until
-//! they're unique. Lives client-side because it's a pure presentation concern — the server sends
-//! root indices, the client decides how to print them.
+//! Presentation labels for workspace roots and buffer locations. This is the client-side home for
+//! *how a path is printed*: the disambiguated root labels ([`root_labels`]), the canonical
+//! `"[root]: [path]"` form ([`root_relative_display`]) shown in the status bar and window title,
+//! plus window-title assembly and path truncation.
+//!
+//! Deliberately client-side: the server sends *root indices* (`path_index`), and the client decides
+//! how to print them — the buffers picker, Files, and Grep all ship `path_index` + `relative_path`
+//! and format their rows here. Anything that needs to show a buffer's location routes through this
+//! module (or the shells' thin per-widget wrappers over [`root_labels`]); don't reinvent the
+//! `"{label}: {path}"` join, or the status bar / title / picker will drift apart again.
+//!
+//! The label defaults to a root's basename; when two roots share a basename it grows a
+//! parenthesized parent component, then grandparent, etc., until every label is unique. Single-root
+//! workspaces have nothing to disambiguate, so the label is empty and the prefix is omitted.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Cap on disambiguation passes. Real workspaces never need more than a couple, but the loop has
+/// to terminate when two paths are literally identical (which `add_root` refuses, but defensive
+/// belt-and-braces is cheap).
+const MAX_DEPTH: usize = 16;
+
+/// One label per input path, aligned by index. Identical inputs produce identical labels (we
+/// can't disambiguate them); otherwise every label is unique within the result.
+///
+/// Single-root workspaces get an empty string — there's nothing to disambiguate against, so
+/// renderers omit the label prefix entirely (`"src/main.rs"` instead of `"repo: src/main.rs"`).
+pub fn root_labels(paths: &[String]) -> Vec<String> {
+    let n = paths.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![String::new()];
+    }
+    let bufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let mut depths = vec![0usize; n];
+    let mut labels = vec![String::new(); n];
+    for _ in 0..=MAX_DEPTH {
+        for i in 0..n {
+            labels[i] = label_at_depth(&bufs[i], depths[i]);
+        }
+        let mut by_label: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, l) in labels.iter().enumerate() {
+            by_label.entry(l.as_str()).or_default().push(i);
+        }
+        let collisions: Vec<Vec<usize>> = by_label
+            .into_values()
+            .filter(|idxs| idxs.len() > 1)
+            .collect();
+        if collisions.is_empty() {
+            return labels;
+        }
+        let mut bumped = false;
+        for idxs in collisions {
+            for i in idxs {
+                if depths[i] < MAX_DEPTH {
+                    depths[i] += 1;
+                    bumped = true;
+                }
+            }
+        }
+        if !bumped {
+            // Every colliding entry has maxed out — can't disambiguate further. Return as-is;
+            // duplicates are acceptable for this edge case (shouldn't occur in practice).
+            return labels;
+        }
+    }
+    labels
+}
+
+/// Build `{basename} ({parent1/parent2/...})` with `depth` parent components walked. `depth=0`
+/// is the bare basename; nameless ancestors (the filesystem root) are skipped rather than
+/// emitted as blanks.
+fn label_at_depth(path: &Path, depth: usize) -> String {
+    let basename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    if depth == 0 {
+        return basename;
+    }
+    let mut parents: Vec<String> = Vec::new();
+    let mut cur = path.parent();
+    while parents.len() < depth {
+        let Some(p) = cur else { break };
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            if !name.is_empty() {
+                parents.push(name.to_string());
+            }
+        }
+        cur = p.parent();
+    }
+    if parents.is_empty() {
+        basename
+    } else {
+        parents.reverse();
+        format!("{basename} ({})", parents.join("/"))
+    }
+}
+
+/// The canonical way a workspace-relative path is shown as a *single string*: `"[root]: [path]"`
+/// for a multi-root workspace (with `[root]` the disambiguated [`root_labels`] entry), or the bare
+/// `relative_path` for a single-root workspace. An empty `relative_path` — the root directory
+/// itself — renders as just the label. Used by the status bar and window title (via
+/// [`crate::session::label_for_path`]) and save-as relabelling. Picker *rows* don't call this —
+/// they render the label prefix as a separate, non-highlighted span over [`root_labels`], so the
+/// fuzzy-match highlight lands only on the path.
+pub fn root_relative_display(roots: &[String], path_index: u32, relative_path: &str) -> String {
+    let label = root_labels(roots)
+        .get(path_index as usize)
+        .filter(|l| !l.is_empty())
+        .cloned();
+    match label {
+        Some(label) if relative_path.is_empty() => label,
+        Some(label) => format!("{label}: {relative_path}"),
+        None => relative_path.to_string(),
+    }
+}
 
 /// How a workspace id is shown to the user in a *workspace list* (the switcher). A persisted workspace
 /// shows its name verbatim; an *ephemeral* one (the synthesized "no workspace" context that hosts
@@ -121,91 +235,6 @@ pub fn window_title(workspace: &str, label: &str) -> String {
     }
 }
 
-/// Cap on disambiguation passes. Real workspaces never need more than a couple, but the loop has
-/// to terminate when two paths are literally identical (which `add_root` refuses, but defensive
-/// belt-and-braces is cheap).
-const MAX_DEPTH: usize = 16;
-
-/// One label per input path, aligned by index. Identical inputs produce identical labels (we
-/// can't disambiguate them); otherwise every label is unique within the result.
-///
-/// Single-root workspaces get an empty string — there's nothing to disambiguate against, so
-/// renderers omit the label prefix entirely (`"src/main.rs"` instead of `"repo: src/main.rs"`).
-pub fn root_labels(paths: &[String]) -> Vec<String> {
-    let n = paths.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    if n == 1 {
-        return vec![String::new()];
-    }
-    let bufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let mut depths = vec![0usize; n];
-    let mut labels = vec![String::new(); n];
-    for _ in 0..=MAX_DEPTH {
-        for i in 0..n {
-            labels[i] = label_at_depth(&bufs[i], depths[i]);
-        }
-        let mut by_label: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, l) in labels.iter().enumerate() {
-            by_label.entry(l.as_str()).or_default().push(i);
-        }
-        let collisions: Vec<Vec<usize>> = by_label
-            .into_values()
-            .filter(|idxs| idxs.len() > 1)
-            .collect();
-        if collisions.is_empty() {
-            return labels;
-        }
-        let mut bumped = false;
-        for idxs in collisions {
-            for i in idxs {
-                if depths[i] < MAX_DEPTH {
-                    depths[i] += 1;
-                    bumped = true;
-                }
-            }
-        }
-        if !bumped {
-            // Every colliding entry has maxed out — can't disambiguate further. Return as-is;
-            // duplicates are acceptable for this edge case (shouldn't occur in practice).
-            return labels;
-        }
-    }
-    labels
-}
-
-/// Build `{basename} ({parent1/parent2/...})` with `depth` parent components walked. `depth=0`
-/// is the bare basename; nameless ancestors (the filesystem root) are skipped rather than
-/// emitted as blanks.
-fn label_at_depth(path: &Path, depth: usize) -> String {
-    let basename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned());
-    if depth == 0 {
-        return basename;
-    }
-    let mut parents: Vec<String> = Vec::new();
-    let mut cur = path.parent();
-    while parents.len() < depth {
-        let Some(p) = cur else { break };
-        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-            if !name.is_empty() {
-                parents.push(name.to_string());
-            }
-        }
-        cur = p.parent();
-    }
-    if parents.is_empty() {
-        basename
-    } else {
-        parents.reverse();
-        format!("{basename} ({})", parents.join("/"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +246,80 @@ mod tests {
     #[test]
     fn empty_input_returns_empty() {
         assert!(root_labels(&[]).is_empty());
+    }
+
+    #[test]
+    fn single_root_returns_empty_label() {
+        // Single-root workspaces don't need a disambiguator — renderers fall through to a label-
+        // less display when the label is empty.
+        assert_eq!(root_labels(&s(&["/home/joe/work/repo"])), vec![""]);
+    }
+
+    #[test]
+    fn no_collision_keeps_bare_basename() {
+        let labels = root_labels(&s(&["/home/joe/work/api", "/home/joe/work/cli"]));
+        assert_eq!(labels, vec!["api", "cli"]);
+    }
+
+    #[test]
+    fn collision_extends_with_parent() {
+        let labels = root_labels(&s(&["/home/joe/work/api", "/home/joe/personal/api"]));
+        assert_eq!(labels, vec!["api (work)", "api (personal)"]);
+    }
+
+    #[test]
+    fn deeper_collision_extends_further() {
+        // Both share parent "work" too — algorithm bumps both to depth 2.
+        let labels = root_labels(&s(&["/a/x/work/api", "/b/y/work/api"]));
+        assert_eq!(labels, vec!["api (x/work)", "api (y/work)"]);
+    }
+
+    #[test]
+    fn three_way_collision() {
+        let labels = root_labels(&s(&[
+            "/home/joe/work/api",
+            "/home/joe/personal/api",
+            "/srv/api",
+        ]));
+        // All three collide on "api"; each grows by one parent. All parents unique.
+        assert_eq!(labels, vec!["api (work)", "api (personal)", "api (srv)"]);
+    }
+
+    #[test]
+    fn partial_collision_only_extends_the_clash() {
+        let labels = root_labels(&s(&[
+            "/home/joe/work/api",
+            "/home/joe/personal/api",
+            "/home/joe/work/cli",
+        ]));
+        assert_eq!(labels, vec!["api (work)", "api (personal)", "cli"]);
+    }
+
+    #[test]
+    fn identical_paths_dont_loop_forever() {
+        let labels = root_labels(&s(&["/foo/bar", "/foo/bar"]));
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0], labels[1]);
+    }
+
+    #[test]
+    fn display_single_root_is_bare_path() {
+        let roots = s(&["/home/joe/work/repo"]);
+        assert_eq!(
+            root_relative_display(&roots, 0, "src/main.rs"),
+            "src/main.rs"
+        );
+        assert_eq!(root_relative_display(&roots, 0, ""), "");
+    }
+
+    #[test]
+    fn display_multi_root_prefixes_disambiguated_label() {
+        let roots = s(&["/home/joe/work/api", "/home/joe/personal/api"]);
+        assert_eq!(
+            root_relative_display(&roots, 0, "src/main.rs"),
+            "api (work): src/main.rs"
+        );
+        assert_eq!(root_relative_display(&roots, 0, ""), "api (work)");
     }
 
     #[test]
@@ -292,59 +395,5 @@ mod tests {
         assert_eq!(window_title("ephemeral/3", ""), "Aether");
         // A persisted workspace still gets the bracket.
         assert!(shows_workspace_chrome("demo"));
-    }
-
-    #[test]
-    fn single_root_returns_empty_label() {
-        // Single-root workspaces don't need a disambiguator — renderers fall through to a label-
-        // less display when the label is empty.
-        assert_eq!(root_labels(&s(&["/home/joe/work/repo"])), vec![""]);
-    }
-
-    #[test]
-    fn no_collision_keeps_bare_basename() {
-        let labels = root_labels(&s(&["/home/joe/work/api", "/home/joe/work/cli"]));
-        assert_eq!(labels, vec!["api", "cli"]);
-    }
-
-    #[test]
-    fn collision_extends_with_parent() {
-        let labels = root_labels(&s(&["/home/joe/work/api", "/home/joe/personal/api"]));
-        assert_eq!(labels, vec!["api (work)", "api (personal)"]);
-    }
-
-    #[test]
-    fn deeper_collision_extends_further() {
-        // Both share parent "work" too — algorithm bumps both to depth 2.
-        let labels = root_labels(&s(&["/a/x/work/api", "/b/y/work/api"]));
-        assert_eq!(labels, vec!["api (x/work)", "api (y/work)"]);
-    }
-
-    #[test]
-    fn three_way_collision() {
-        let labels = root_labels(&s(&[
-            "/home/joe/work/api",
-            "/home/joe/personal/api",
-            "/srv/api",
-        ]));
-        // All three collide on "api"; each grows by one parent. All parents unique.
-        assert_eq!(labels, vec!["api (work)", "api (personal)", "api (srv)"]);
-    }
-
-    #[test]
-    fn partial_collision_only_extends_the_clash() {
-        let labels = root_labels(&s(&[
-            "/home/joe/work/api",
-            "/home/joe/personal/api",
-            "/home/joe/work/cli",
-        ]));
-        assert_eq!(labels, vec!["api (work)", "api (personal)", "cli"]);
-    }
-
-    #[test]
-    fn identical_paths_dont_loop_forever() {
-        let labels = root_labels(&s(&["/foo/bar", "/foo/bar"]));
-        assert_eq!(labels.len(), 2);
-        assert_eq!(labels[0], labels[1]);
     }
 }

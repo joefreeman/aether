@@ -566,15 +566,22 @@ function describePickerItem(
         bulletStatus: item.git_status,
       };
     }
-    case "buffer":
+    case "buffer": {
+      // Multi-root: the dim, disambiguated root label after the name — same placement as the Files
+      // picker. `display` is the bare relative path (the match haystack), so highlights land on the
+      // path, not the label. `path_index` is absent for scratch/external buffers → no suffix.
+      const suffix =
+        labels.length > 1 && item.path_index != null ? labels[item.path_index] : undefined;
       return {
         primary: item.display,
         matches: item.match_indices,
+        suffix,
         italic: item.transient,
         // Dormant (session-restored, not-yet-loaded) buffers render dimmed, like the native clients.
         dim: item.dormant,
         dirty: item.status && item.status !== "clean" ? item.status : undefined,
       };
+    }
     case "grep_hit": {
       // match_indices index the untrimmed preview; shift them by the stripped leading whitespace.
       const trimmed = item.preview.trimStart();

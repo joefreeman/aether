@@ -1049,25 +1049,36 @@ fn render_item<'a>(
         PickerItem::Buffer {
             display,
             status,
+            path_index,
             match_indices,
             transient,
             dormant,
             ..
         } => {
-            // Buffer-state dot on the right, matching the web picker and the status bar. A dormant
-            // (session-restored, not-yet-loaded) buffer renders dimmed to signal it isn't live yet.
-            let mut r = row![
-                highlighted(
-                    display,
-                    match_indices,
-                    if *dormant { theme::NORD3_BRIGHT } else { theme::NORD4 },
-                    if *transient { SANS_ITALIC } else { SANS },
-                    hovered,
-                ),
-                iced::widget::Space::new().width(Length::Fill),
-            ]
+            // A dormant (session-restored, not-yet-loaded) buffer renders dimmed to signal it isn't
+            // live yet.
+            let mut r = row![highlighted(
+                display,
+                match_indices,
+                if *dormant { theme::NORD3_BRIGHT } else { theme::NORD4 },
+                if *transient { SANS_ITALIC } else { SANS },
+                hovered,
+            )]
             .spacing(6)
             .align_y(iced::Alignment::Center);
+            // Multi-root workspaces: the root's label, dim, after the name — same placement as the
+            // Files picker. `path_index` is `None` for scratch/external buffers, so those show none.
+            if let Some(label) = path_index.and_then(|i| root_label(roots, i)) {
+                r = r.push(
+                    text(label)
+                        .size(13)
+                        .font(SANS)
+                        .color(theme::NORD3_BRIGHT)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                );
+            }
+            // Buffer-state dot floats flush-right, matching the web picker and the status bar.
+            r = r.push(iced::widget::Space::new().width(Length::Fill));
             if let Some(color) = dirty_color(*status) {
                 r = r.push(text("●").size(9).color(color));
             }

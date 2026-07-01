@@ -29,23 +29,21 @@ pub fn workspace_relative_parts(abs: &Path, roots: &[PathBuf]) -> Option<(u32, S
     None
 }
 
-/// Legacy multi-root display string used by the Buffers picker (its protocol still sends a
-/// flattened `display`, unlike Files/Grep which now ferry `path_index` + `relative_path`). For
-/// multi-root workspaces, prefixes with the root's basename so two roots' `lib.rs`es don't
-/// collide visually; for single-root, returns the bare relative path. Returns `None` if `abs`
-/// is outside every root.
+/// The Buffers picker's row `display` — which is also the fuzzy-match haystack (`match_indices`
+/// index into it). This is the *bare* workspace-relative path, matching how Files/Grep ship
+/// `relative_path`: root identity is deliberately **not** part of the string, so it isn't part of
+/// the fuzzy match and the client is free to prepend a disambiguated `"[root]: "` label as a
+/// separate, non-highlighted span (see `aether_client::labels`). A file sitting *at* a root prints
+/// the root's basename (an empty relative path is no haystack). Returns `None` if `abs` is outside
+/// every root — the caller then falls back to the absolute path.
 pub fn workspace_relative_display(abs: &Path, roots: &[PathBuf]) -> Option<String> {
     let (idx, rel) = workspace_relative_parts(abs, roots)?;
-    let root = &roots[idx as usize];
-    let root_name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if rel.is_empty() {
-        return Some(root_name.to_string());
+        let root = &roots[idx as usize];
+        let basename = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        return Some(basename.to_string());
     }
-    if roots.len() > 1 && !root_name.is_empty() {
-        Some(format!("{root_name}/{rel}"))
-    } else {
-        Some(rel)
-    }
+    Some(rel)
 }
 
 /// One file found by the workspace walk. Stores the root index + relative path separately so
@@ -177,4 +175,51 @@ pub fn walk_with(
             .then_with(|| a.relative_path.cmp(&b.relative_path))
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_display_is_bare_relative_path() {
+        // The row string / match haystack is the bare relative path — no root prefix. The client
+        // adds the disambiguated "[root]: " label as a separate span, so multi-root doesn't change
+        // the haystack (root identity stays out of the fuzzy match, like Files/Grep).
+        let single = vec![PathBuf::from("/home/joe/work/repo")];
+        assert_eq!(
+            workspace_relative_display(Path::new("/home/joe/work/repo/src/main.rs"), &single)
+                .as_deref(),
+            Some("src/main.rs")
+        );
+        let multi = vec![
+            PathBuf::from("/home/joe/work/api"),
+            PathBuf::from("/home/joe/personal/api"),
+        ];
+        assert_eq!(
+            workspace_relative_display(Path::new("/home/joe/personal/api/lib.rs"), &multi)
+                .as_deref(),
+            Some("lib.rs")
+        );
+    }
+
+    #[test]
+    fn buffer_display_at_root_uses_basename() {
+        // A file whose path *is* a root has an empty relative path; the row falls back to the
+        // root's basename so there's still a haystack.
+        let roots = vec![PathBuf::from("/home/joe/work/repo")];
+        assert_eq!(
+            workspace_relative_display(Path::new("/home/joe/work/repo"), &roots).as_deref(),
+            Some("repo")
+        );
+    }
+
+    #[test]
+    fn buffer_display_outside_all_roots_is_none() {
+        let roots = vec![PathBuf::from("/home/joe/work/repo")];
+        assert_eq!(
+            workspace_relative_display(Path::new("/etc/hosts"), &roots),
+            None
+        );
+    }
 }

@@ -1154,11 +1154,17 @@ impl Session {
                 self.externally_deleted = false;
                 let note = match target {
                     Some((path_index, rel)) => {
-                        // Save-as: the buffer's identity changed — adopt the new path/label.
+                        // Save-as: the buffer's identity changed — adopt the new path/label. The
+                        // label takes the same canonical `"[root]: [path]"` form as buffer-open, so
+                        // a renamed buffer reads identically in the status bar, title, and picker.
                         let root = self.workspace_paths.get(path_index as usize);
                         self.buffer.path =
                             root.map(|r| format!("{}/{rel}", r.trim_end_matches('/')));
-                        self.buffer.label = rel.clone();
+                        self.buffer.label = crate::labels::root_relative_display(
+                            &self.workspace_paths,
+                            path_index,
+                            &rel,
+                        );
                         format!("Saved as {rel} (rev {})", result.revision)
                     }
                     None => format!("Saved (rev {})", result.revision),

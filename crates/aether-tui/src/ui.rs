@@ -2839,7 +2839,7 @@ fn picker_item_spans(
             max_width,
         );
     }
-    // File rows get a leading dim `{label}: ` prefix; everything else falls through with the
+    // File rows get a dim disambiguated-root label; everything else falls through with the
     // legacy single-string display.
     if let PickerItem::File {
         path_index,
@@ -2853,6 +2853,31 @@ fn picker_item_spans(
             relative_path,
             match_indices,
             *git_status,
+            root_labels,
+            highlighted,
+            max_width,
+        );
+    }
+    // Buffer rows get a leading dim `{label}: ` prefix for multi-root workspaces, matching the
+    // status bar / title and the other clients. `display` (the match haystack) is the bare
+    // relative path, so the highlight lands only on the path, not the prefix.
+    if let PickerItem::Buffer {
+        display,
+        status,
+        path_index,
+        match_indices,
+        transient,
+        dormant,
+        ..
+    } = item
+    {
+        return buffer_item_spans(
+            *path_index,
+            display,
+            match_indices,
+            *status,
+            *transient,
+            *dormant,
             root_labels,
             highlighted,
             max_width,
@@ -2976,22 +3001,6 @@ fn picker_item_spans(
     // (which index into the display). `None` = clean. The workspace picker reuses the same dot to
     // flag workspaces with unsaved buffers, so the two pickers read alike.
     let (display_raw, match_indices, dot_color, italic, dim) = match item {
-        PickerItem::Buffer {
-            display,
-            status,
-            match_indices,
-            transient,
-            dormant,
-            ..
-        } => (
-            display.as_str(),
-            match_indices.as_slice(),
-            buffer_dirty_dot_color(*status),
-            // Transient buffers slant, like the status-bar label.
-            *transient,
-            // Dormant (session-restored, not-yet-loaded) buffers render dimmed.
-            *dormant,
-        ),
         PickerItem::Workspace {
             name,
             unsaved_buffers,
@@ -3014,7 +3023,8 @@ fn picker_item_spans(
                 false,
             )
         }
-        PickerItem::File { .. }
+        PickerItem::Buffer { .. }
+        | PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
         | PickerItem::GitChange { .. }
         | PickerItem::DirEntry { .. }
@@ -3178,6 +3188,79 @@ fn file_item_spans(
     push_styled_with_match_indices(&mut spans, &display, &indices, base, match_style);
     if !suffix.is_empty() {
         spans.push(Span::styled(suffix, label_style));
+    }
+    spans
+}
+
+/// One Buffers-picker row: the buffer's path highlighted by `match_indices`, then (multi-root only)
+/// the disambiguated root label dim after the name — same placement as the Files picker — and a
+/// flush-right dirty dot. `display` is the bare relative path (the match haystack), so the highlight
+/// lands only on the path, never the label. Transient buffers slant; dormant (session-restored,
+/// not-yet-loaded) rows dim their foreground.
+#[allow(clippy::too_many_arguments)]
+fn buffer_item_spans(
+    path_index: Option<u32>,
+    display: &str,
+    match_indices: &[u32],
+    status: BufferDirtyState,
+    transient: bool,
+    dormant: bool,
+    root_labels: &[String],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let mut base = Style::default().fg(NORD4).bg(bg);
+    let mut match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    if transient {
+        base = base.add_modifier(Modifier::ITALIC);
+        match_style = match_style.add_modifier(Modifier::ITALIC);
+    }
+    if dormant {
+        base = base.fg(NORD3);
+        match_style = match_style.fg(NORD3);
+    }
+    let label_style = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
+
+    // Suffix (multi-root only): the dim root label after the name, like the Files picker. `None`
+    // path_index (scratch/external buffers) → no suffix.
+    let suffix = match path_index {
+        Some(i) => {
+            let label = root_label_or_blank(root_labels, i);
+            if label.is_empty() {
+                String::new()
+            } else {
+                format!("  {label}")
+            }
+        }
+        None => String::new(),
+    };
+
+    // Reserve the dot region (` • ` = 3 cols) plus the suffix from the path's truncation budget.
+    let dot_w = if buffer_dirty_dot_color(status).is_some() {
+        3
+    } else {
+        0
+    };
+    let path_budget = max_width
+        .saturating_sub(dot_w)
+        .saturating_sub(suffix.width());
+    let (path, indices) = truncate_path_with_indices(display, match_indices, path_budget);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    push_styled_with_match_indices(&mut spans, &path, &indices, base, match_style);
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix, label_style));
+    }
+
+    if let Some(color) = buffer_dirty_dot_color(status) {
+        // Float the dot flush-right, like the rich clients. Reserve a trailing space for the
+        // ambiguous-width `●` glyph. Width so far = path + suffix.
+        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        let pad = max_width.saturating_sub(used + 2).max(1);
+        spans.push(Span::styled(" ".repeat(pad), base));
+        spans.push(Span::styled(BUFFER_STATUS_DOT.to_string(), base.fg(color)));
+        spans.push(Span::styled(" ".to_string(), base));
     }
     spans
 }
