@@ -144,7 +144,7 @@ fn index_blob_bytes(repo: &git2::Repository, rel: &Path) -> Option<Vec<u8>> {
 fn current_branch(repo: &git2::Repository) -> Option<String> {
     if let Ok(head) = repo.head() {
         if head.is_branch() {
-            return head.shorthand().map(String::from);
+            return head.shorthand().ok().map(String::from);
         }
         if let Some(oid) = head.target() {
             let s = oid.to_string();
@@ -155,6 +155,8 @@ fn current_branch(repo: &git2::Repository) -> Option<String> {
     repo.find_reference("HEAD")
         .ok()?
         .symbolic_target()
+        .ok()
+        .flatten()
         .and_then(|t| t.strip_prefix("refs/heads/"))
         .map(String::from)
 }
@@ -495,7 +497,7 @@ pub fn write_index_blob(repo: &GitRepo, content: &[u8]) -> Option<()> {
             uid: 0,
             gid: 0,
             file_size: 0,
-            id: git2::Oid::zero(),
+            id: git2::Oid::ZERO_SHA1,
             flags: 0,
             flags_extended: 0,
             path: repo.rel_path.to_str()?.as_bytes().to_vec(),
@@ -643,7 +645,7 @@ pub fn dir_statuses(dir: &Path) -> HashMap<String, GitStatus> {
     };
 
     for entry in statuses.iter() {
-        let Some(path) = entry.path() else { continue };
+        let Ok(path) = entry.path() else { continue };
         // Keep only entries inside the listed directory, then bucket each under the immediate child
         // of `dir` it lives in (a file → itself; a deeper path → the top folder).
         let Ok(suffix) = Path::new(path).strip_prefix(rel_dir) else {
@@ -736,7 +738,7 @@ pub fn repo_status_for_root(root: &Path) -> Option<RepoStatus> {
 
     let mut map = HashMap::new();
     for entry in statuses.iter() {
-        if let Some(path) = entry.path() {
+        if let Ok(path) = entry.path() {
             if let Some(status) = classify_status(entry.status()) {
                 map.insert(PathBuf::from(path), status);
             }
@@ -794,7 +796,7 @@ pub fn changed_files_with_hunks(root: &Path) -> Vec<ChangedFile> {
     let index = repo.index().ok();
 
     for entry in statuses.iter() {
-        let Some(path) = entry.path() else { continue };
+        let Ok(path) = entry.path() else { continue };
         // A collapsed untracked directory (recurse off) reports with a trailing slash — not a
         // diffable file.
         if path.ends_with('/') {

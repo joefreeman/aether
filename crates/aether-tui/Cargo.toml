@@ -25,7 +25,7 @@ ratatui.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
 arboard.workspace = true
 unicode-width.workspace = true
-directories = "5"
+directories.workspace = true
 libc = "0.2"
 
 [dev-dependencies]

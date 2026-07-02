@@ -33,7 +33,7 @@ pulldown-cmark = { version = "0.12", default-features = false }
 
 # Async runtime & WebSocket transport
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "signal", "fs"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 
 # Diagnostics
@@ -45,14 +45,14 @@ clap = { version = "4", features = ["derive"] }
 
 # Error handling
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # Server-only
 ropey = "1"
 regex = "1"
 tree-sitter = "0.26"
-tree-sitter-rust = "0.23"
-tree-sitter-md = "0.3"
+tree-sitter-rust = "0.24"
+tree-sitter-md = "0.5"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-html = "0.23"
 tree-sitter-javascript = "0.25"
@@ -60,7 +60,7 @@ tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.25"
 tree-sitter-go = "0.25"
 tree-sitter-elixir = "0.3"
-tree-sitter-erlang = "0.18"
+tree-sitter-erlang = "0.19"
 tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
 tree-sitter-json = "0.24"
@@ -71,10 +71,10 @@ tree-sitter-quiver = { git = "https://github.com/joefreeman/quiver", branch = "m
 streaming-iterator = "0.1"
 # Git integration (diff/blame). Local-only: default features (ssh/https/network) disabled so
 # the build doesn't pull in openssl/libssh2 — we never talk to a remote.
-git2 = { version = "0.19", default-features = false }
-notify = "7"
-toml = "0.8"
-directories = "5"
+git2 = { version = "0.21", default-features = false }
+notify = "8"
+toml = "1"
+directories = "6"
 trash = "5"
 nucleo-matcher = "0.3"
 ignore = "0.4"
@@ -83,8 +83,8 @@ grep-regex = "0.1"
 grep-matcher = "0.1"
 
 # TUI-only
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 arboard = "3"
 unicode-width = "0.2"
 

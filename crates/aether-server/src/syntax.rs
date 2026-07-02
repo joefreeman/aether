@@ -922,6 +922,7 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             ("rust", "fn main() {}"),
             ("markdown", "# hi"),
+            ("markdown_inline", "*emphasis* and `code`\n"),
             ("toml", "x = 1\n"),
             ("html", "<p>hi</p>"),
             ("javascript", "const x = 1;"),
