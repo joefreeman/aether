@@ -753,10 +753,13 @@ fn sneak_target_shape() {
 
 #[test]
 fn input_text_params() {
+    // `replace_selection: false` is the default and stays off the wire — the typing path's
+    // shape is unchanged.
     let v = to_value(InputTextParams {
         buffer_id: 1,
         text: "hi".into(),
         select_pasted: false,
+        replace_selection: false,
         at: None,
     })
     .unwrap();
@@ -764,6 +767,27 @@ fn input_text_params() {
         v,
         json!({"buffer_id": 1, "text": "hi", "select_pasted": false})
     );
+
+    // The paste-replace path (`Ctrl-Alt-v`) sets it; it rides the wire and round-trips.
+    let v = to_value(InputTextParams {
+        buffer_id: 1,
+        text: "hi".into(),
+        select_pasted: true,
+        replace_selection: true,
+        at: None,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 1, "text": "hi", "select_pasted": true, "replace_selection": true})
+    );
+    let back: InputTextParams = from_value(v).unwrap();
+    assert!(back.replace_selection);
+
+    // Omitted on the wire → defaults to false (older clients).
+    let defaulted: InputTextParams =
+        from_value(json!({"buffer_id": 1, "text": "hi", "select_pasted": false})).unwrap();
+    assert!(!defaulted.replace_selection);
 }
 
 #[test]
@@ -802,10 +826,12 @@ fn input_transform_case_params() {
     use aether_protocol::input::{CaseKind, InputTransformCase, InputTransformCaseParams};
     assert_eq!(InputTransformCase::NAME, "input/transform_case");
 
-    // `kind` serialises snake_case.
+    // `kind` serialises snake_case; `scan_at_cursor` is omitted when false (Normal mode),
+    // matching `input/adjust_number`.
     let v = to_value(InputTransformCaseParams {
         buffer_id: 3,
         kind: CaseKind::Constant,
+        scan_at_cursor: false,
     })
     .unwrap();
     assert_eq!(v, json!({"buffer_id": 3, "kind": "constant"}));
@@ -813,6 +839,21 @@ fn input_transform_case_params() {
     let back: InputTransformCaseParams = serde_json::from_value(v).unwrap();
     assert_eq!(back.buffer_id, 3);
     assert_eq!(back.kind, CaseKind::Constant);
+    assert!(!back.scan_at_cursor);
+
+    // Insert mode sets it; it rides the wire and round-trips.
+    let v = to_value(InputTransformCaseParams {
+        buffer_id: 3,
+        kind: CaseKind::Upper,
+        scan_at_cursor: true,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 3, "kind": "upper", "scan_at_cursor": true})
+    );
+    let back: InputTransformCaseParams = serde_json::from_value(v).unwrap();
+    assert!(back.scan_at_cursor);
 
     // The mnemonic map is the single source of truth shared with the keymap.
     assert_eq!(CaseKind::from_char('i'), Some(CaseKind::Invert));

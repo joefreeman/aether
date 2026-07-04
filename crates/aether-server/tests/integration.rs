@@ -1728,6 +1728,7 @@ async fn input_text_at_selection_start_inserts_before() {
             buffer_id,
             text: "XY".into(),
             select_pasted: true,
+            replace_selection: false,
             at: Some(SelectionEdge::Start),
         },
     )
@@ -1736,6 +1737,73 @@ async fn input_text_at_selection_start_inserts_before() {
     assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "aXYbcde\n");
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 1 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
+}
+
+#[tokio::test]
+async fn input_text_replace_selection_replaces_a_single_char_selection() {
+    // Ctrl-Alt-v with a bare Normal-mode cursor: the point IS a 1-char selection, so the char
+    // under the block is replaced — not pure-inserted before.
+    let (_server, mut ws, buffer_id) = setup_with_buffer("abc\n").await;
+    // Point cursor on 'b'.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputText>(
+        &mut ws,
+        11,
+        &InputTextParams {
+            buffer_id,
+            text: "XY".into(),
+            select_pasted: true,
+            replace_selection: true,
+            at: None,
+        },
+    )
+    .await;
+    // 'b' is gone; the pasted text is selected (anchor on 'X', block on 'Y').
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "aXYc\n");
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 1 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 2 });
+}
+
+#[tokio::test]
+async fn input_text_replace_selection_replaces_a_multi_char_selection() {
+    let (_server, mut ws, buffer_id) = setup_with_buffer("abcde\n").await;
+    // Select "bcd" (anchor on 'b', cursor on 'd').
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 3 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputText>(
+        &mut ws,
+        11,
+        &InputTextParams {
+            buffer_id,
+            text: "Z".into(),
+            select_pasted: true,
+            replace_selection: true,
+            at: None,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "aZe\n");
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 1 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 1 });
 }
 
 #[tokio::test]
@@ -1857,6 +1925,7 @@ async fn git_blame_line_include_commit_info_resolves_in_one_trip() {
             buffer_id: open.buffer_id,
             text: "x".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -2198,6 +2267,7 @@ async fn transform_case_recases_selection_and_keeps_it_selected() {
         &InputTransformCaseParams {
             buffer_id,
             kind: CaseKind::Snake,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -2212,6 +2282,7 @@ async fn transform_case_recases_selection_and_keeps_it_selected() {
         &InputTransformCaseParams {
             buffer_id,
             kind: CaseKind::Constant,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -2221,11 +2292,12 @@ async fn transform_case_recases_selection_and_keeps_it_selected() {
 }
 
 #[tokio::test]
-async fn transform_case_point_cursor_targets_the_identifier_under_it() {
+async fn transform_case_scan_at_cursor_targets_the_identifier_under_the_caret() {
     let (server, mut ws, buffer_id) = setup_with_buffer("fooBar baz\n").await;
     let p = |line: u32, col: u32| LogicalPosition { line, col };
 
-    // Point cursor mid-identifier (on the first 'o'), no selection.
+    // Point caret mid-identifier (on the first 'o') — Insert mode, so the client sets
+    // `scan_at_cursor`.
     send_request::<CursorSet>(
         &mut ws,
         10,
@@ -2238,7 +2310,7 @@ async fn transform_case_point_cursor_targets_the_identifier_under_it() {
     )
     .await;
 
-    // snake recases the whole word run, not just the char under the point; the cursor collapses
+    // snake recases the whole word run, not just the char under the caret; the cursor collapses
     // past the result (no selection sprung) so Insert mode keeps anchor == position.
     let st: EditResult = send_request::<InputTransformCase>(
         &mut ws,
@@ -2246,12 +2318,50 @@ async fn transform_case_point_cursor_targets_the_identifier_under_it() {
         &InputTransformCaseParams {
             buffer_id,
             kind: CaseKind::Snake,
+            scan_at_cursor: true,
         },
     )
     .await;
     assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "foo_bar baz\n");
     assert_eq!(st.cursor.anchor, st.cursor.position);
     assert_eq!(st.cursor.position, p(0, 7)); // just past "foo_bar"
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn transform_case_point_cursor_recases_the_single_selected_char() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("fooBar baz\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Normal-mode point cursor mid-identifier (on the first 'o') — a 1-char selection, not a
+    // caret, so without `scan_at_cursor` the operand is exactly that char.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: p(0, 2),
+            anchor: p(0, 2),
+        },
+    )
+    .await;
+
+    let st: EditResult = send_request::<InputTransformCase>(
+        &mut ws,
+        11,
+        &InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Upper,
+            scan_at_cursor: false,
+        },
+    )
+    .await;
+    // Only the 'o' under the block recases, and it stays selected like any selection operand.
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "foOBar baz\n");
+    assert_eq!(st.cursor.anchor, p(0, 2));
+    assert_eq!(st.cursor.position, p(0, 2));
 
     drop(server);
 }
@@ -2281,6 +2391,7 @@ async fn transform_case_noop_leaves_the_buffer_unchanged() {
         &InputTransformCaseParams {
             buffer_id,
             kind: CaseKind::Upper,
+            scan_at_cursor: false,
         },
     )
     .await;
@@ -2294,7 +2405,7 @@ async fn transform_case_words_splits_an_identifier_into_spaced_words() {
     let (server, mut ws, buffer_id) = setup_with_buffer("getHTTPResponse\n").await;
     let p = |line: u32, col: u32| LogicalPosition { line, col };
 
-    // Point cursor anywhere in the identifier.
+    // Point caret anywhere in the identifier; `scan_at_cursor` picks up the whole word run.
     send_request::<CursorSet>(
         &mut ws,
         10,
@@ -2314,6 +2425,7 @@ async fn transform_case_words_splits_an_identifier_into_spaced_words() {
         &InputTransformCaseParams {
             buffer_id,
             kind: CaseKind::Words,
+            scan_at_cursor: true,
         },
     )
     .await;
@@ -2635,6 +2747,7 @@ async fn input_text_inserts_and_pushes_notification() {
             buffer_id,
             text: "XY".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -3364,6 +3477,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             buffer_id: open.buffer_id,
             text: "!".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -3774,6 +3888,7 @@ async fn input_text_with_select_pasted_makes_selection() {
             buffer_id,
             text: "XYZ".into(),
             select_pasted: true,
+            replace_selection: false,
             at: None,
         },
     )
@@ -3827,6 +3942,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
             buffer_id,
             text: "XY".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -4015,6 +4131,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -4291,6 +4408,7 @@ async fn input_text_with_selection_replaces_it() {
             buffer_id,
             text: "DELTA".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -5206,6 +5324,7 @@ async fn motion_undo_stack_cleared_by_mutation() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -5985,6 +6104,7 @@ async fn virtual_col_cleared_by_mutation() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -7210,6 +7330,7 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
             buffer_id,
             text: "func foo() {".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -9960,6 +10081,7 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
             buffer_id,
             text: "!".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -10047,6 +10169,7 @@ async fn git_changes_file_is_locked_to_its_buffer() {
             buffer_id,
             text: "!".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -11365,6 +11488,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             buffer_id: opened.buffer_id,
             text: "x".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -11456,6 +11580,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             buffer_id: opened.buffer_id,
             text: "a".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -11471,6 +11596,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             buffer_id: opened.buffer_id,
             text: "b".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -11540,6 +11666,7 @@ async fn buffers_picker_pushes_on_save() {
             buffer_id: opened.buffer_id,
             text: "z".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -11825,6 +11952,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             buffer_id: scratch.buffer_id,
             text: "hello world\n".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -11922,6 +12050,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
             buffer_id: scratch.buffer_id,
             text: "in B\n".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -12039,6 +12168,7 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
             buffer_id: open.buffer_id,
             text: "hello\n".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -12108,6 +12238,7 @@ async fn save_as_creates_missing_parent_directories() {
             buffer_id: scratch.buffer_id,
             text: "deep\n".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -12345,6 +12476,7 @@ async fn save_as_to_same_path_is_in_place_save() {
             buffer_id: opened.buffer_id,
             text: "y".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -12433,6 +12565,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
             buffer_id: scratch.buffer_id,
             text: "fresh\n".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -12544,6 +12677,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
             buffer_id: opened.buffer_id,
             text: "x".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -12639,6 +12773,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
             buffer_id: scratch.buffer_id,
             text: "one\n".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -12663,6 +12798,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
             buffer_id: scratch.buffer_id,
             text: "two\n".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -15646,6 +15782,7 @@ async fn watcher_flags_dirty_buffer_on_external_write() {
             buffer_id,
             text: "x".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -15876,6 +16013,7 @@ async fn save_in_one_workspace_reloads_other_workspaces_buffer() {
             buffer_id: buf_a,
             text: "from-a-".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -15932,6 +16070,7 @@ async fn buffer_reload_discards_local_changes() {
             buffer_id,
             text: "local-edit-".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -16880,6 +17019,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
             buffer_id: open.buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -17002,6 +17142,7 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
             buffer_id: open.buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -17118,6 +17259,7 @@ async fn git_status_counts_ride_the_window() {
             buffer_id: open.buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -17441,6 +17583,7 @@ async fn apply_hunk_stage_requires_clean_buffer() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -17689,6 +17832,7 @@ async fn apply_hunk_revert_works_on_dirty_buffer() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -17948,6 +18092,7 @@ async fn git_gutter_marker_present_without_diff_view() {
             buffer_id: open.buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -18011,6 +18156,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
             buffer_id,
             text: "X".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -18033,6 +18179,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
             buffer_id,
             text: "Y".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -18165,6 +18312,7 @@ async fn git_navigate_hunk_honours_count() {
                 buffer_id,
                 text: "Z".into(),
                 select_pasted: false,
+                replace_selection: false,
                 at: None,
             },
         )
@@ -18711,6 +18859,7 @@ async fn lsp_diagnostics_clear_on_undo() {
             buffer_id,
             text: "@".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -21083,6 +21232,7 @@ async fn edit_promotes_transient_buffer() {
             buffer_id: a.buffer_id,
             text: "x".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )
@@ -22536,6 +22686,7 @@ async fn unsaved_file_edits_restored_across_restart() {
                 buffer_id: open.buffer_id,
                 text: "X".into(),
                 select_pasted: false,
+                replace_selection: false,
                 at: None,
             },
         )
@@ -22641,6 +22792,7 @@ async fn restore_flags_externally_modified_when_disk_changed() {
                 buffer_id: open.buffer_id,
                 text: "edited ".into(),
                 select_pasted: false,
+                replace_selection: false,
                 at: None,
             },
         )
@@ -22758,6 +22910,7 @@ async fn saving_clears_the_backup() {
             buffer_id: open.buffer_id,
             text: "Y".into(),
             select_pasted: false,
+            replace_selection: false,
             at: None,
         },
     )

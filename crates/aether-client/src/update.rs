@@ -1324,6 +1324,7 @@ impl Session {
                 buffer_id,
                 text: text.repeat(count.max(1) as usize),
                 select_pasted: true,
+                replace_selection: false,
                 // Insert at the selection start — the collapse rides the edit
                 // (docs/protocol-composites.md, D) instead of a prior cursor/set.
                 at: Some(SelectionEdge::Start),
@@ -1332,12 +1333,17 @@ impl Session {
                 buffer_id,
                 text: text.repeat(count.max(1) as usize),
                 select_pasted: true,
+                // A point cursor is the 1-char selection under the Normal-mode block, so
+                // replace-paste must swallow it too — without this the server treats the
+                // point as a caret and pure-inserts before the char.
+                replace_selection: true,
                 at: None,
             }),
             PasteKind::AtCursor => self.edit::<InputText>(InputTextParams {
                 buffer_id,
                 text,
                 select_pasted: false,
+                replace_selection: false,
                 at: None,
             }),
             PasteKind::Line => {
@@ -1361,6 +1367,7 @@ impl Session {
             buffer_id: self.buffer.buffer_id,
             text,
             select_pasted: false,
+            replace_selection: false,
             at: None,
         })
     }
@@ -4854,6 +4861,10 @@ impl Session {
                 return self.edit::<InputTransformCase>(InputTransformCaseParams {
                     buffer_id: self.buffer.buffer_id,
                     kind,
+                    // Insert mode has no selection, so the server scans for the identifier
+                    // under the caret; Normal mode recases exactly the selection (a point
+                    // being the single char under the block).
+                    scan_at_cursor: self.mode == Mode::Insert,
                 });
             }
             Pending::Leader => {
@@ -4905,6 +4916,7 @@ impl Session {
                         buffer_id: self.buffer.buffer_id,
                         text: typed,
                         select_pasted: false,
+                        replace_selection: false,
                         at: None,
                     });
                 }
@@ -5201,6 +5213,7 @@ impl Session {
                 buffer_id,
                 text: "\t".into(),
                 select_pasted: false,
+                replace_selection: false,
                 at: None,
             }),
             A::DeletePoint => self.edit::<InputDelete>(CountedEditParams {

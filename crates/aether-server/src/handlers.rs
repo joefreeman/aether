@@ -7696,7 +7696,7 @@ fn current_selection_char_range(buf: &Buffer, cursor: &CursorState) -> (usize, u
 }
 
 /// The resolved operand for a case transform: the char range `[start_char, end_char)` to replace,
-/// its line span, the replacement text, and whether the operand came from a point cursor (which
+/// its line span, the replacement text, and whether the operand was scanned from the caret (which
 /// decides whether the post-edit cursor collapses or re-selects).
 struct TransformEdit {
     start_char: usize,
@@ -7704,21 +7704,22 @@ struct TransformEdit {
     first_line: u32,
     last_line: u32,
     new_text: String,
-    was_point: bool,
+    scanned: bool,
 }
 
 /// Resolve a case transform against the current cursor, or `None` for a no-op (empty operand, or
-/// a transform that leaves the text unchanged — e.g. no letters in range). For a point cursor the
-/// operand is the identifier (word run of alphanumeric/`_`) under the cursor; otherwise it's the
-/// selection. Shared by the no-op precheck and `apply_edit`, so the two always agree.
+/// a transform that leaves the text unchanged — e.g. no letters in range). With `scan` (Insert
+/// mode) the operand is the identifier (word run of alphanumeric/`_`) under the caret; otherwise
+/// (Normal mode) it's exactly the selection — a point cursor being the single char under the
+/// block. Shared by the no-op precheck and `apply_edit`, so the two always agree.
 fn resolve_transform_case(
     buf: &Buffer,
     cursor: &CursorState,
     kind: CaseKind,
+    scan: bool,
 ) -> Option<TransformEdit> {
-    let was_point = cursor.is_point();
     let total = buf.text.len_chars();
-    let (start_char, end_char, first_line, last_line) = if was_point {
+    let (start_char, end_char, first_line, last_line) = if scan {
         let (start_pos, end_pos) = motion::word_run(buf, cursor.position);
         let sc = motion::pos_to_char(buf, start_pos);
         let ec = motion::pos_to_char(buf, end_pos)
@@ -7745,7 +7746,7 @@ fn resolve_transform_case(
         first_line,
         last_line,
         new_text,
-        was_point,
+        scanned: scan,
     })
 }
 
@@ -7844,6 +7845,7 @@ pub async fn input_text(
         EditKind::ReplaceWith {
             text: params.text,
             select_pasted: params.select_pasted,
+            replace_selection: params.replace_selection,
         },
     )
     .await
@@ -8012,7 +8014,7 @@ pub async fn input_transform_case(
             .get(&(client_id, params.buffer_id))
             .copied()
             .unwrap_or_default();
-        resolve_transform_case(buf, &cursor, params.kind).is_none()
+        resolve_transform_case(buf, &cursor, params.kind, params.scan_at_cursor).is_none()
     };
     if is_noop {
         return current_edit_result(state, client_id, params.buffer_id).await;
@@ -8021,7 +8023,10 @@ pub async fn input_transform_case(
         state,
         client_id,
         params.buffer_id,
-        EditKind::TransformCase { kind: params.kind },
+        EditKind::TransformCase {
+            kind: params.kind,
+            scan: params.scan_at_cursor,
+        },
     )
     .await
 }
@@ -8134,6 +8139,7 @@ pub async fn input_open_line(
                     buffer_id: params.buffer_id,
                     text: "\n".into(),
                     select_pasted: false,
+                    replace_selection: false,
                     at: None,
                 },
             )
@@ -8189,6 +8195,7 @@ pub async fn input_newline_and_indent(
         EditKind::ReplaceWith {
             text,
             select_pasted: false,
+            replace_selection: false,
         },
     )
     .await
@@ -10030,12 +10037,17 @@ fn wrap_for_response(
 }
 
 enum EditKind {
-    /// Insert `text` at the cursor. For a point cursor (Insert-mode typing, paste-before)
-    /// this is a pure insert at `position` — no chars are replaced. For a range (paste-
-    /// replace, Ctrl-c after delete), the selection is replaced with `text`. When
-    /// `select_pasted` is true and the inserted text is non-empty, the post-edit cursor
-    /// selects the inserted text.
-    ReplaceWith { text: String, select_pasted: bool },
+    /// Insert `text` at the cursor. With `replace_selection` the selection is replaced with
+    /// `text` — a point cursor being the 1-char selection under the Normal-mode block, matching
+    /// `DeleteSelection`. Without it, a point cursor (Insert-mode typing, paste-before) is a
+    /// pure insert at `position` — no chars are replaced — and a range still replaces the
+    /// selection (legacy paste-replace behaviour). When `select_pasted` is true and the
+    /// inserted text is non-empty, the post-edit cursor selects the inserted text.
+    ReplaceWith {
+        text: String,
+        select_pasted: bool,
+        replace_selection: bool,
+    },
     /// Delete the current inclusive selection. For a point cursor this deletes the 1 char at
     /// `position`. Used by Normal-mode `Ctrl-d` / `Delete` / `Ctrl-c`, and by Insert-mode
     /// `Delete` (forward).
@@ -10071,10 +10083,12 @@ enum EditKind {
     /// exists before issuing this — the no-op case never reaches here.
     AdjustNumber { delta: i64, scan: bool },
     /// Recase the operand (`Ctrl-r <key>`). The operand range + replacement text are resolved by
-    /// `resolve_transform_case`: a point cursor recases the identifier under it (post-edit cursor
-    /// collapses past the result); a selection recases its text (and stays selected, so transforms
-    /// can be chained). `input_transform_case` prechecks for a no-op, so this is `Some` in practice.
-    TransformCase { kind: CaseKind },
+    /// `resolve_transform_case`: with `scan` (Insert mode) it recases the identifier under the
+    /// caret (post-edit cursor collapses past the result); otherwise it recases exactly the
+    /// selection — a point being the single char under the block — which stays selected, so
+    /// transforms can be chained. `input_transform_case` prechecks for a no-op, so this is `Some`
+    /// in practice.
+    TransformCase { kind: CaseKind, scan: bool },
 }
 
 /// Where the cursor lands after an edit.
@@ -10123,7 +10137,9 @@ async fn apply_edit(
     // `input_transform_case` prechecks for a no-op, so this is `Some` in practice; the `None`
     // arms below are a defensive no-op (matching `AdjustNumber`).
     let transform_edit = match &edit {
-        EditKind::TransformCase { kind } => resolve_transform_case(buf, &cursor, *kind),
+        EditKind::TransformCase { kind, scan } => {
+            resolve_transform_case(buf, &cursor, *kind, *scan)
+        }
         _ => None,
     };
 
@@ -10136,8 +10152,13 @@ async fn apply_edit(
         last_line: u32,
     }
     let range: EditRange = match &edit {
-        EditKind::ReplaceWith { .. } => {
-            if cursor.is_point() {
+        EditKind::ReplaceWith {
+            replace_selection, ..
+        } => {
+            // Without `replace_selection`, a point cursor is a genuine caret (Insert-mode
+            // typing, paste-before) — pure insert. With it, the point is the 1-char selection
+            // under the Normal-mode block and falls through to the selection-replace path.
+            if cursor.is_point() && !replace_selection {
                 // Pure insert at the point — no chars replaced.
                 let c = motion::pos_to_char(buf, cursor.position);
                 EditRange {
@@ -10345,6 +10366,7 @@ async fn apply_edit(
         EditKind::ReplaceWith {
             text,
             select_pasted,
+            ..
         } => (
             Cow::Borrowed(text.as_str()),
             if *select_pasted {
@@ -10414,11 +10436,11 @@ async fn apply_edit(
             None => (Cow::Borrowed(""), PostEdit::PointAfter),
         },
         EditKind::TransformCase { .. } => match &transform_edit {
-            // A selection operand stays selected (chain transforms / see what changed); a point
-            // operand collapses past the result so Insert mode keeps its `anchor == position`
-            // invariant rather than springing a selection.
+            // A selection operand stays selected (chain transforms / see what changed); a
+            // scanned operand collapses past the result so Insert mode keeps its `anchor ==
+            // position` invariant rather than springing a selection.
             Some(te) => {
-                let post = if te.was_point {
+                let post = if te.scanned {
                     PostEdit::PointAfter
                 } else {
                     PostEdit::Select { lead: 0, trail: 0 }

@@ -42,6 +42,12 @@ pub struct InputTextParams {
     /// chain's `cursor/set` folded into the edit (docs/protocol-composites.md, D).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<crate::cursor::SelectionEdge>,
+    /// Replace the current selection with `text` rather than inserting at the cursor. A point
+    /// cursor is the 1-char selection under the Normal-mode block, so it replaces that char too
+    /// — Insert-mode typing leaves this `false` (there a point is a genuine caret and nothing is
+    /// replaced). Set by the paste-replace gesture (Normal-mode `Ctrl-Alt-v`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_selection: bool,
 }
 
 // ---- input/delete -------------------------------------------------------------------------------
@@ -378,11 +384,12 @@ impl CaseKind {
     }
 }
 
-/// Recase the operand (`Ctrl-r <key>`). The operand is the selection when one is active; for a
-/// point cursor (Insert mode, or a Normal-mode block cursor with no selection) it's the
-/// identifier under the cursor — the word run of alphanumeric/`_` chars. A selection operand
-/// stays selected so transforms can be re-applied; a point operand collapses past the result. A
-/// transform that would change nothing (no letters in range) is a no-op.
+/// Recase the operand (`Ctrl-r <key>`). Normal mode (`scan_at_cursor: false`): the operand is
+/// exactly the selected chars — a point cursor being the single char under the block — and the
+/// result stays selected so transforms can be chained. Insert mode (`scan_at_cursor: true`): the
+/// operand is the identifier under the caret — the word run of alphanumeric/`_` chars — and the
+/// cursor collapses past the result. A transform that would change nothing (no letters in range)
+/// is a no-op.
 pub struct InputTransformCase;
 impl RpcMethod for InputTransformCase {
     const NAME: &'static str = "input/transform_case";
@@ -394,6 +401,13 @@ impl RpcMethod for InputTransformCase {
 pub struct InputTransformCaseParams {
     pub buffer_id: BufferId,
     pub kind: CaseKind,
+    /// Insert mode: infer the operand by scanning for the identifier under the caret and collapse
+    /// past the result — Insert has no selection to act on and must not spring one. Normal mode
+    /// (`false`) keeps the explicit-selection behaviour: the operand is exactly the selected chars
+    /// (a point being the single char under the block) and the result stays selected. Mirrors
+    /// [`InputAdjustNumberParams::scan_at_cursor`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scan_at_cursor: bool,
 }
 
 // ---- edit/undo, edit/redo -----------------------------------------------------------------------
