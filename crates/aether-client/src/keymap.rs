@@ -12,7 +12,7 @@
 //! time, and tables are scanned in order so more-specific chords precede catch-alls.
 
 use aether_protocol::cursor::{Direction, VerticalDirection, WordBoundary};
-use aether_protocol::input::SurroundTarget;
+use aether_protocol::input::{CommentStyle, SurroundTarget};
 use aether_protocol::picker::PickerKind;
 
 /// Layout-resolved key identity, normalised from the platform's key event: letters lowercase
@@ -249,7 +249,9 @@ pub enum Action {
     Dedent,
     IncrementNumber,
     DecrementNumber,
-    ToggleComment,
+    /// `Ctrl-y` (line) / `Ctrl-Alt-y` (block). The style is explicit per chord; the target is
+    /// `Selection` in Normal mode and `Line` in Insert, mirroring surround/unsurround.
+    ToggleComment(CommentStyle, SurroundTarget),
     OpenLineBelow,
     OpenLineAbove,
     // Selection-scoped (Normal) vs line-scoped (Insert) clipboard/edit pairs.
@@ -716,6 +718,8 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Selection), "Edit", "Unsurround selection"),
     bind!(N, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Selection), "Edit", "Surround selection"),
     bind!(N, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform case (u/l/i/c/p/s/k/w/t/n/d/x)"),
+    bind!(N, ch('y'), Exact(Mods::CTRL), A::ToggleComment(CommentStyle::Line, SurroundTarget::Selection), "Edit", "Toggle line comment"),
+    bind!(N, ch('y'), Exact(Mods::CTRL_ALT), A::ToggleComment(CommentStyle::Block, SurroundTarget::Selection), "Edit", "Toggle block comment"),
 
     // ---- reveal ----
     bind!(N, KeyCode::Tab, Exact(Mods::NONE), A::Hover, "Code", "Hover (type & docs)"),
@@ -740,7 +744,6 @@ static GLOBAL: &[Binding] = &[
     bind!(G, ch('o'), Exact(Mods::CTRL_ALT), A::OpenLineAbove, "Edit", "Open line above"),
     // Mode-agnostic edits (same action in Normal and Insert) live here rather than being split
     // line-vs-selection, so one binding serves both modes.
-    bind!(G, ch('y'), Exact(Mods::CTRL), A::ToggleComment, "Edit", "Toggle comment"),
     bind!(G, ch('f'), Exact(Mods::CTRL), A::Format, "Code", "Format document"),
 ];
 
@@ -756,7 +759,7 @@ static INSERT: &[Binding] = &[
     bind!(I, KeyCode::Up, Any, A::MoveVisualLine(VerticalDirection::Up), "Motion", "Cursor up"),
     bind!(I, KeyCode::Down, Any, A::MoveVisualLine(VerticalDirection::Down), "Motion", "Cursor down"),
     // Line-scoped editing mirrors Normal's selection-scoped Ctrl column on the same keys (Insert
-    // has no selection to act on); the mode-agnostic Ctrl-y/Ctrl-f come from GLOBAL.
+    // has no selection to act on); the mode-agnostic Ctrl-f comes from GLOBAL.
     bind!(I, ch('a'), Exact(Mods::CTRL), A::ChangeLine, "Edit", "Change line"),
     bind!(I, ch('d'), Exact(Mods::CTRL), A::DeleteLine, "Edit", "Delete line"),
     bind!(I, ch('c'), Exact(Mods::CTRL), A::CopyLine, "Clipboard", "Copy line"),
@@ -766,6 +769,8 @@ static INSERT: &[Binding] = &[
     bind!(I, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Line), "Edit", "Unsurround line"),
     bind!(I, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Line), "Edit", "Surround line"),
     bind!(I, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform identifier case (u/l/i/c/p/s/k/w/t/n/d/x)"),
+    bind!(I, ch('y'), Exact(Mods::CTRL), A::ToggleComment(CommentStyle::Line, SurroundTarget::Line), "Edit", "Toggle line comment"),
+    bind!(I, ch('y'), Exact(Mods::CTRL_ALT), A::ToggleComment(CommentStyle::Block, SurroundTarget::Line), "Edit", "Toggle block comment on line"),
 ];
 
 #[rustfmt::skip]

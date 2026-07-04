@@ -261,30 +261,39 @@ impl Session {
     }
 
     /// Snapshot of the inputs that decide whether a step should re-request symbol highlights: the
-    /// cursor position, whether a search is active, and the mode.
-    fn highlight_trigger_state(&self) -> (LogicalPosition, bool, Mode) {
-        (self.buffer.cursor.position, self.search.active, self.mode)
+    /// cursor position, the buffer revision, whether a search is active, and the mode.
+    fn highlight_trigger_state(&self) -> (LogicalPosition, u64, bool, Mode) {
+        (
+            self.buffer.cursor.position,
+            self.buffer.revision,
+            self.search.active,
+            self.mode,
+        )
     }
 
     /// After a reducer step, keep the symbol highlight set in sync with the cursor and mode. Leaving
     /// Normal mode (into Insert or the search prompt) clears the set so a stale highlight can't
-    /// linger; otherwise the set is re-requested when the cursor landed somewhere new, a search just
-    /// ended (its highlights were dropped and the symbol set should return), or we just came back to
-    /// Normal mode. One trigger shared by both reducer entry points so every such transition is
-    /// covered exactly once; the server debounces and only paints when no search is active.
+    /// linger; otherwise the set is re-requested when the cursor landed somewhere new, the buffer
+    /// was edited (the server drops the now-stale set on every mutation, so it needs re-resolving
+    /// even when the cursor stayed put — e.g. a line-comment toggle with the cursor in the indent),
+    /// a search just ended (its highlights were dropped and the symbol set should return), or we
+    /// just came back to Normal mode. One trigger shared by both reducer entry points so every such
+    /// transition is covered exactly once; the server debounces and only paints when no search is
+    /// active.
     fn after_step_highlight(
         &mut self,
         fx: Effects,
-        before: (LogicalPosition, bool, Mode),
+        before: (LogicalPosition, u64, bool, Mode),
     ) -> Effects {
-        let (before_pos, before_search, before_mode) = before;
+        let (before_pos, before_rev, before_search, before_mode) = before;
         if before_mode == Mode::Normal && self.mode != Mode::Normal {
             return fx.and(self.set_document_highlight(false));
         }
         let moved = self.buffer.cursor.position != before_pos;
+        let edited = self.buffer.revision != before_rev;
         let search_ended = before_search && !self.search.active;
         let entered_normal = before_mode != Mode::Normal && self.mode == Mode::Normal;
-        if moved || search_ended || entered_normal {
+        if moved || edited || search_ended || entered_normal {
             fx.and(self.set_document_highlight(true))
         } else {
             fx
@@ -5253,10 +5262,13 @@ impl Session {
                 delta: -(count as i32),
                 scan_at_cursor: self.mode == Mode::Insert,
             }),
-            A::ToggleComment => self.edit::<InputToggleComment>(ToggleCommentParams {
-                buffer_id,
-                collapse_selection: self.mode == Mode::Insert,
-            }),
+            A::ToggleComment(style, target) => {
+                self.edit::<InputToggleComment>(ToggleCommentParams {
+                    buffer_id,
+                    style,
+                    target,
+                })
+            }
             A::OpenLineBelow | A::OpenLineAbove => {
                 // Vim's `o`/`O` as one server-side edit (park, open, land — smart indent
                 // below, unindented above); stay in Insert (TUI semantics).

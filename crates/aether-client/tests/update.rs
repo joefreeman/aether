@@ -1659,6 +1659,33 @@ fn undo_result_updates_revision_and_cursor() {
 }
 
 #[test]
+fn edit_without_cursor_motion_still_rerequests_symbol_highlights() {
+    use aether_protocol::lsp::LspServerRef;
+    let mut s = session();
+    s.buffer.lsp_server = Some(LspServerRef {
+        language: "rust".into(),
+        workspace_root: "/p".into(),
+    });
+
+    // A comment toggle with the caret in the indent edits the buffer but leaves the cursor
+    // where it was. The server drops the (now stale) symbol-highlight set on every mutation,
+    // so the client must re-request it on the revision bump even though nothing moved.
+    let fx = ctrl(&mut s, 'y');
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "input/toggle_comment");
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "revision": 3,
+            "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
+        })),
+    );
+    let params =
+        find_request(&fx, "lsp/document_highlight").expect("edit re-requests symbol highlights");
+    assert_eq!(params["active"], true);
+}
+
+#[test]
 fn rpc_error_surfaces_as_an_error_toast() {
     let mut s = session();
     let fx = ctrl(&mut s, 'z');

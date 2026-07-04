@@ -22,7 +22,7 @@ use aether_protocol::git::{
     GitNavigateHunkResult, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
+    BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
     InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputDedent,
     InputDelete, InputIndent, InputJoinLines, InputMoveLines, InputMoveLinesParams,
     InputNewlineAndIndent, InputOpenLine, InputOpenLineParams, InputSurround, InputSurroundParams,
@@ -7426,7 +7426,8 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -7488,7 +7489,8 @@ async fn toggle_comment_strips_when_already_commented() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -7554,7 +7556,8 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -7566,8 +7569,8 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
 
 #[tokio::test]
 async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
-    // Markdown has no line-comment form; cursor-only should fall back to block-wrapping the
-    // current line in `<!-- ... -->`.
+    // Markdown has no line-comment form; `Line` style falls back to block-wrapping the covered
+    // line in `<!-- ... -->`, so the primary key still works.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.md");
     std::fs::write(&path, "# Heading\n").unwrap();
@@ -7618,7 +7621,8 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -7630,7 +7634,8 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
 
 #[tokio::test]
 async fn toggle_comment_partial_selection_in_js_block_wraps() {
-    // JS has both forms. A mid-line selection (not whole-line) should route to block.
+    // Block style wraps exactly the selection — a mid-line span in a language that also has
+    // line comments (the style is explicit; nothing routes on selection shape).
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = foo + bar;\n").unwrap();
@@ -7682,7 +7687,8 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -7746,7 +7752,8 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -7812,7 +7819,8 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -7825,10 +7833,9 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
 }
 
 #[tokio::test]
-async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
-    // Selecting `foo` and toggling should leave the selection covering the whole `/* foo */`,
-    // not just the inner `foo`. Matches the line-comment behaviour where the selection grows
-    // to include the inserted prefix.
+async fn toggle_comment_block_wrap_reselects_the_wrapped_content() {
+    // Selecting `foo` and toggling leaves the selection on the inner `foo` — the wrap tokens
+    // stay outside, mirroring surround, and a second toggle strips its own wrap back off.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = foo + bar;\n").unwrap();
@@ -7880,14 +7887,15 @@ async fn toggle_comment_block_wrap_extends_selection_to_cover_wrappers() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
-    // Selection now covers the entire `/* foo */` — anchor on the first `/`, cursor on the
-    // last `/`. The wrap is 9 chars (`/* foo */`), so cols 10..=18.
-    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 10 });
-    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 18 });
+    // The selection stays on `foo`, shifted right by the `/* ` prefix: cols 13..=15 of
+    // `const x = /* foo */ + bar;`.
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 13 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 15 });
 
     drop(server);
 }
@@ -7949,16 +7957,18 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     // The closing `*/` sits on line 1 (after the original `\n`).
     assert_eq!(text, "let a/*  = 1;\n */let b = 2;\n");
-    // Anchor stays on the original start; cursor follows the `*/` onto line 1 at col 2.
-    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 5 });
-    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 2 });
+    // The selection stays on the wrapped content: anchor shifted right by `/* ` to col 8,
+    // cursor on the selection's trailing `\n` (col 13, the end of line 0 post-wrap).
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 8 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 13 });
 
     // Toggle again to uncomment. Round-trip must restore the original buffer *and* the
     // original selection — cursor back on the `\n` at line 0 col 10, not on line 1 col 0.
@@ -7967,7 +7977,8 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
         6,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -8035,22 +8046,23 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
-    // Anchor stays at (0, 4) — the opening `/` of `/*` lives there post-edit. Cursor lands
-    // on the last `/` of `*/`, which is at col 7 of line 1 (`let b */ = 2;`).
-    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 4 });
-    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 7 });
+    // The selection stays on the wrapped content: anchor shifted right by `/* ` to col 7 of
+    // line 0, cursor still on the `b` at col 4 of line 1 (later lines keep their columns).
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 7 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
 
     drop(server);
 }
 
 #[tokio::test]
-async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
-    // Multi-line selection that *doesn't* cover complete lines (cursor stops mid-line on the
-    // last line) should route to block-comment, not line-comment.
+async fn toggle_comment_block_style_wraps_multi_line_partial_selection() {
+    // Block style over a multi-line selection wraps exactly the selected span, mid-line
+    // endpoints included.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
@@ -8103,7 +8115,8 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -8115,8 +8128,8 @@ async fn toggle_comment_multi_line_partial_selection_routes_to_block() {
 
 #[tokio::test]
 async fn toggle_comment_round_trip_partial_selection() {
-    // Real-world toggle gesture: select `foo`, Ctrl-b to wrap, Ctrl-b again to unwrap. The
-    // second toggle works because tree-sitter sees the cursor inside a comment node — the
+    // Real-world toggle gesture: select `foo`, Ctrl-Alt-y to wrap, Ctrl-Alt-y again to unwrap.
+    // The second toggle works because tree-sitter sees the cursor inside a comment node — the
     // post-wrap selection sits on the inner content, not around the wrappers.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
@@ -8169,7 +8182,8 @@ async fn toggle_comment_round_trip_partial_selection() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -8183,7 +8197,8 @@ async fn toggle_comment_round_trip_partial_selection() {
         6,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -8248,7 +8263,8 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -8263,8 +8279,8 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
 
 #[tokio::test]
 async fn toggle_comment_block_unwrap_collapses_in_insert_mode() {
-    // Same as above but `collapse_selection` (Insert mode): stripping the block must not spring a
-    // selection — the caret collapses onto the uncommented content instead.
+    // Same as above but with the `Line` target (Insert mode): stripping the block must not spring
+    // a selection — the caret collapses onto the uncommented content instead.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.js");
     std::fs::write(&path, "const x = /* foo */ + bar;\n").unwrap();
@@ -8314,7 +8330,8 @@ async fn toggle_comment_block_unwrap_collapses_in_insert_mode() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: true,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Line,
         },
     )
     .await;
@@ -8376,7 +8393,8 @@ async fn toggle_comment_insert_round_trips_in_markdown() {
     };
     let toggle = ToggleCommentParams {
         buffer_id: open.buffer_id,
-        collapse_selection: true,
+        style: CommentStyle::Line,
+        target: SurroundTarget::Line,
     };
 
     // Caret on the `w` of `world` (col 6).
@@ -8444,7 +8462,8 @@ async fn toggle_comment_insert_keeps_caret_on_its_character() {
     .await;
     let toggle = ToggleCommentParams {
         buffer_id: open.buffer_id,
-        collapse_selection: true,
+        style: CommentStyle::Line,
+        target: SurroundTarget::Line,
     };
 
     // Caret on `foo`'s `f` (col 4 — exactly the indent/insert column).
@@ -8530,15 +8549,16 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "/* color: red; */\n");
-    // Normal mode selects the wrapped span (`/* color: red; */`, cols 0..=16).
-    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 0 });
-    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 16 });
+    // Normal mode selects the wrapped content (`color: red;`, cols 3..=13).
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 3 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 13 });
 
     drop(server);
 }
@@ -8596,7 +8616,8 @@ async fn toggle_comment_block_wrap_collapses_in_insert_mode() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: true,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Line,
         },
     )
     .await;
@@ -8653,7 +8674,8 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -8706,7 +8728,8 @@ async fn toggle_comment_is_noop_for_json() {
         4,
         &ToggleCommentParams {
             buffer_id: open.buffer_id,
-            collapse_selection: false,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
         },
     )
     .await;
@@ -8714,6 +8737,502 @@ async fn toggle_comment_is_noop_for_json() {
     assert_eq!(r.revision, open.revision);
     let text = buffer_text(&mut ws, 5, open.buffer_id).await;
     assert_eq!(text, "{}\n");
+
+    drop(server);
+}
+
+/// Boilerplate for the comment-toggle tests that need a language: write `content` to
+/// `file_name` in a fresh workspace, open it, return the connection and the open result.
+async fn setup_with_named_file(
+    file_name: &str,
+    content: &str,
+) -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    BufferOpenResult,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(file_name), content).unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some(file_name.into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    (server, ws, open)
+}
+
+/// Two block toggles (`Ctrl-Alt-y` twice) must be a no-op overall: wrap then unwrap restores
+/// both the text and the cursor, without re-setting the cursor between presses (press 2 acts
+/// on whatever selection press 1 left behind — exactly the double-tap gesture).
+async fn assert_block_double_press_reverts(
+    file_name: &str,
+    content: &str,
+    cursor: CursorSetParams,
+    target: SurroundTarget,
+) {
+    let (server, mut ws, open) = setup_with_named_file(file_name, content).await;
+    let cursor = CursorSetParams {
+        buffer_id: open.buffer_id,
+        ..cursor
+    };
+    let before: CursorState = send_request::<CursorSet>(&mut ws, 3, &cursor).await;
+    let toggle = ToggleCommentParams {
+        buffer_id: open.buffer_id,
+        style: CommentStyle::Block,
+        target,
+    };
+    let r1: EditResult = send_request::<InputToggleComment>(&mut ws, 4, &toggle).await;
+    assert_ne!(
+        buffer_text(&mut ws, 5, open.buffer_id).await,
+        content,
+        "{file_name}: press 1 should wrap"
+    );
+    let r2: EditResult = send_request::<InputToggleComment>(&mut ws, 6, &toggle).await;
+    assert_ne!(r1.revision, r2.revision, "{file_name}: press 2 should edit");
+    assert_eq!(
+        buffer_text(&mut ws, 7, open.buffer_id).await,
+        content,
+        "{file_name}: press 2 should restore the text"
+    );
+    assert_eq!(
+        (r2.cursor.anchor, r2.cursor.position),
+        (before.anchor, before.position),
+        "{file_name}: press 2 should restore the cursor"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_block_double_press_reverts() {
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    let caret = |pos| CursorSetParams {
+        granularity: Granularity::Char,
+        buffer_id: 0,
+        position: pos,
+        anchor: pos,
+    };
+    let sel = |anchor, pos| CursorSetParams {
+        granularity: Granularity::Char,
+        buffer_id: 0,
+        position: pos,
+        anchor,
+    };
+
+    // Bare cursor (1-char selection); unwrap detection via the tree-sitter comment node.
+    assert_block_double_press_reverts(
+        "a.js",
+        "let a = 1;\n",
+        caret(p(0, 4)),
+        SurroundTarget::Selection,
+    )
+    .await;
+    // Mid-line selection in markdown — no tree-sitter comment node for inline HTML comments,
+    // so press 2 relies on the exact-span fallback over the post-wrap selection.
+    assert_block_double_press_reverts(
+        "a.md",
+        "hello world today\n",
+        sel(p(0, 6), p(0, 10)),
+        SurroundTarget::Selection,
+    )
+    .await;
+    // Bare cursor in markdown: 1-char wrap, fallback-based unwrap.
+    assert_block_double_press_reverts(
+        "a.md",
+        "hello world\n",
+        caret(p(0, 6)),
+        SurroundTarget::Selection,
+    )
+    .await;
+    // Multi-line partial selection.
+    assert_block_double_press_reverts(
+        "a.ts",
+        "let a = 1;\nlet b = 2;\n",
+        sel(p(0, 4), p(1, 4)),
+        SurroundTarget::Selection,
+    )
+    .await;
+    // Insert mode (`Line` target): the caret line's content, caret glued to its character.
+    assert_block_double_press_reverts(
+        "a.css",
+        "color: red;\n",
+        caret(p(0, 3)),
+        SurroundTarget::Line,
+    )
+    .await;
+    // Insert mode in markdown: fallback-based unwrap at line scope.
+    assert_block_double_press_reverts(
+        "a.md",
+        "hello world\n",
+        caret(p(0, 6)),
+        SurroundTarget::Line,
+    )
+    .await;
+    // Whole-line selection (the line-oriented normal form): cursor on the trailing newline.
+    assert_block_double_press_reverts(
+        "b.js",
+        "let a = 1;\nlet b = 2;\n",
+        sel(p(0, 0), p(0, 10)),
+        SurroundTarget::Selection,
+    )
+    .await;
+    // Backward selection (anchor after cursor): the orientation survives the round trip too.
+    assert_block_double_press_reverts(
+        "a2.js",
+        "const x = foo + bar;\n",
+        sel(p(0, 12), p(0, 10)),
+        SurroundTarget::Selection,
+    )
+    .await;
+    // Point sitting on a newline char (col == line_end).
+    assert_block_double_press_reverts(
+        "e.js",
+        "let a = 1;\nlet b = 2;\n",
+        caret(p(0, 10)),
+        SurroundTarget::Selection,
+    )
+    .await;
+    // Bare cursor on an empty line between rules.
+    assert_block_double_press_reverts(
+        "c.css",
+        "a { }\n\nb { }\n",
+        caret(p(1, 0)),
+        SurroundTarget::Selection,
+    )
+    .await;
+    // Multi-byte chars *before* the comment: tree-sitter reports byte offsets and the edit
+    // machinery works in chars — press 2's unwrap must convert or the strip range shifts
+    // and corrupts the buffer.
+    assert_block_double_press_reverts(
+        "m.rs",
+        "let s = \"héllo wörld\";\nlet answer = 42;\n",
+        sel(p(1, 4), p(1, 9)),
+        SurroundTarget::Selection,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn toggle_comment_block_unwrap_after_multibyte_chars() {
+    // Regression: `find_enclosing_block_comment` returns byte offsets; using them as char
+    // offsets shifted the strip range right by the number of extra UTF-8 bytes earlier in the
+    // buffer — leaving `/*` plus the word's head in place and eating `*/` plus following text.
+    let (server, mut ws, open) =
+        setup_with_named_file("a.rs", "let s = \"héllo\";\nlet /* answer */ x = 42;\n").await;
+    // Cursor inside the comment, on the `n` of `answer`.
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 1, col: 8 },
+            anchor: LogicalPosition { line: 1, col: 8 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &ToggleCommentParams {
+            buffer_id: open.buffer_id,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 5, open.buffer_id).await,
+        "let s = \"héllo\";\nlet answer x = 42;\n"
+    );
+    // The uncommented `answer` is re-selected (cols 4..=9 of line 1).
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 4 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 9 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_strips_the_whole_doc_comment_marker() {
+    // `/// docs` is all comment syntax: uncommenting strips the full marker run (not just the
+    // configured `//`, which would leave `/ docs` behind). Re-commenting adds the plain token,
+    // so a second toggle yields a regular `// docs` comment rather than restoring the `///`.
+    let (server, mut ws, open) = setup_with_named_file("a.rs", "    /// Frobs the widget.\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 4 },
+            anchor: LogicalPosition { line: 0, col: 4 },
+        },
+    )
+    .await;
+    let toggle = ToggleCommentParams {
+        buffer_id: open.buffer_id,
+        style: CommentStyle::Line,
+        target: SurroundTarget::Selection,
+    };
+    send_request::<InputToggleComment>(&mut ws, 4, &toggle).await;
+    assert_eq!(
+        buffer_text(&mut ws, 5, open.buffer_id).await,
+        "    Frobs the widget.\n"
+    );
+    send_request::<InputToggleComment>(&mut ws, 6, &toggle).await;
+    assert_eq!(
+        buffer_text(&mut ws, 7, open.buffer_id).await,
+        "    // Frobs the widget.\n"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_uncomments_mixed_plain_and_doc_comments() {
+    // A selection mixing `//` and `///` lines is all-commented; each line loses its whole
+    // marker run.
+    let (server, mut ws, open) =
+        setup_with_named_file("a.rs", "// plain\n/// docs\n//// banner\n").await;
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 2, col: 0 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &ToggleCommentParams {
+            buffer_id: open.buffer_id,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 5, open.buffer_id).await,
+        "plain\ndocs\nbanner\n"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_block_style_wraps_single_char_selection() {
+    // A bare Normal-mode cursor is a 1-char selection: block style wraps exactly that char —
+    // it must not widen to the line (the scope is never inferred from the selection's shape).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.js");
+    std::fs::write(&path, "let a = 1;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.js".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Point cursor on the `a` (col 4).
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 0, col: 4 },
+            anchor: LogicalPosition { line: 0, col: 4 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &ToggleCommentParams {
+            buffer_id: open.buffer_id,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "let /* a */ = 1;\n");
+    // The selection stays on the `a` (now at col 7, past the `/* ` prefix), so a second
+    // toggle strips the wrap straight back off.
+    assert_eq!(r.cursor.anchor, LogicalPosition { line: 0, col: 7 });
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 7 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_block_style_is_noop_without_block_tokens() {
+    // Python has only a line form. Block style stays an honest no-op — falling back to line
+    // comments would reintroduce the scope guessing the line/block split removes.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.py");
+    std::fs::write(&path, "x = 1\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.py".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let r: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &ToggleCommentParams {
+            buffer_id: open.buffer_id,
+            style: CommentStyle::Block,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    assert_eq!(r.revision, open.revision);
+    assert_eq!(buffer_text(&mut ws, 5, open.buffer_id).await, "x = 1\n");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_comment_line_style_comments_lines_of_partial_selection() {
+    // Line style operates on the lines the selection *touches* — a multi-line partial
+    // selection line-comments both lines (it no longer routes to block on selection shape).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.js");
+    std::fs::write(&path, "let a = 1;\nlet b = 2;\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.js".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Mid-line to mid-line: (0, 4) through (1, 4).
+    send_request::<CursorSet>(
+        &mut ws,
+        3,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 1, col: 4 },
+            anchor: LogicalPosition { line: 0, col: 4 },
+        },
+    )
+    .await;
+    send_request::<InputToggleComment>(
+        &mut ws,
+        4,
+        &ToggleCommentParams {
+            buffer_id: open.buffer_id,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    let text = buffer_text(&mut ws, 5, open.buffer_id).await;
+    assert_eq!(text, "// let a = 1;\n// let b = 2;\n");
 
     drop(server);
 }
@@ -18886,6 +19405,61 @@ async fn lsp_diagnostics_clear_on_undo() {
     assert!(
         cleared,
         "diagnostics did not clear after undo (didChange not sent on undo?)"
+    );
+}
+
+/// Regression test: toggle-comment edits the buffer directly (not via the shared `apply_edit`)
+/// and must send `didChange` like every other mutation — otherwise the language server keeps
+/// analyzing the pre-toggle text and everything position-based (document highlights, hover,
+/// diagnostics) goes stale.
+#[tokio::test]
+#[ignore = "needs rust-analyzer"]
+async fn lsp_diagnostics_clear_when_error_line_is_commented_out() {
+    require_server_on_path("rust-analyzer");
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
+        ("main.rs", "@\nfn main() {}\n"),
+    ]);
+    let (server, mut ws) = open_and_subscribe("toggle-rust", dir.path(), "main.rs").await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    assert!(
+        wait_for_diag_state(&mut ws, true, 90).await,
+        "expected a diagnostic for the stray token"
+    );
+
+    // Comment out the offending line — the fix must send didChange so the language server
+    // re-analyzes and drops the diagnostic.
+    set_cursor(&mut ws, 11, buffer_id, 0, 0).await;
+    let _: EditResult = send_request::<InputToggleComment>(
+        &mut ws,
+        12,
+        &ToggleCommentParams {
+            buffer_id,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Selection,
+        },
+    )
+    .await;
+    let cleared = wait_for_diag_state(&mut ws, false, 90).await;
+    drop(server);
+    assert!(
+        cleared,
+        "diagnostics did not clear after toggle-comment (didChange not sent?)"
     );
 }
 

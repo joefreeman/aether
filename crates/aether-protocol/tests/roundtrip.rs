@@ -862,6 +862,47 @@ fn input_transform_case_params() {
 }
 
 #[test]
+fn toggle_comment_params() {
+    use aether_protocol::envelope::RpcMethod;
+    use aether_protocol::input::{
+        CommentStyle, InputToggleComment, SurroundTarget, ToggleCommentParams,
+    };
+    assert_eq!(InputToggleComment::NAME, "input/toggle_comment");
+
+    // `style` is required and snake_case; `target` defaults to `selection` and is emitted
+    // when set (Insert mode sends `line`).
+    let v = to_value(ToggleCommentParams {
+        buffer_id: 4,
+        style: CommentStyle::Line,
+        target: SurroundTarget::Selection,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 4, "style": "line", "target": "selection"})
+    );
+
+    let v = to_value(ToggleCommentParams {
+        buffer_id: 4,
+        style: CommentStyle::Block,
+        target: SurroundTarget::Line,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 4, "style": "block", "target": "line"})
+    );
+    let back: ToggleCommentParams = from_value(v).unwrap();
+    assert_eq!(back.style, CommentStyle::Block);
+    assert_eq!(back.target, SurroundTarget::Line);
+
+    // `target` omitted on the wire → Selection.
+    let defaulted: ToggleCommentParams =
+        from_value(json!({"buffer_id": 1, "style": "line"})).unwrap();
+    assert_eq!(defaulted.target, SurroundTarget::Selection);
+}
+
+#[test]
 fn input_adjust_number_methods() {
     use aether_protocol::envelope::RpcMethod;
     assert_eq!(InputAdjustNumber::NAME, "input/adjust_number");

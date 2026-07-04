@@ -6308,8 +6308,13 @@ mod tests {
         assert!(row(&insert, "Ctrl-a", "Change line"));
         assert!(row(&insert, "Ctrl-d", "Delete line"));
         assert!(row(&insert, "Ctrl-c", "Copy line"));
+        // The comment toggles are bound per mode (line style on Ctrl-y, block on Ctrl-Alt-y)
+        // and show on both tabs.
+        assert!(row(&normal, "Ctrl-y", "Toggle line comment"));
+        assert!(row(&normal, "Ctrl-Alt-y", "Toggle block comment"));
+        assert!(row(&insert, "Ctrl-y", "Toggle line comment"));
         // Mode-agnostic Ctrl keys (from GLOBAL) appear on the Insert tab too.
-        assert!(row(&insert, "Ctrl-y", "Toggle comment"));
+        assert!(row(&insert, "Ctrl-f", "Format document"));
 
         // Normal collapses the two keys for "delete selection" (the Delete key and Ctrl-d) into one
         // aliased row, comma-separated; Insert keeps them apart (different commands there).

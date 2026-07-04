@@ -36,10 +36,10 @@ use aether_protocol::git::{
     GitNavigateHunkResult, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CaseKind, CountedEditParams, EditResult, InputAdjustNumberParams,
-    InputMoveLinesParams, InputOpenLineParams, InputSurroundParams, InputTextParams,
-    InputTransformCaseParams, InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams,
-    UndoRedoParams, UndoResult,
+    BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditResult,
+    InputAdjustNumberParams, InputMoveLinesParams, InputOpenLineParams, InputSurroundParams,
+    InputTextParams, InputTransformCaseParams, InputUnsurroundParams, LineSide, SurroundTarget,
+    ToggleCommentParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -4880,6 +4880,8 @@ pub async fn buffer_cut(
     }
 
     let picker_pushes = maybe_refresh_dirty(&mut s, params.buffer_id, was_dirty);
+    // LSP: full-document sync.
+    notify_lsp_change(&mut s, params.buffer_id);
 
     drop(s);
     for (sender, notif) in pushes {
@@ -8303,27 +8305,33 @@ pub async fn input_toggle_comment(
     ctx: &mut ConnectionCtx,
     params: ToggleCommentParams,
 ) -> Result<EditResult, RpcError> {
-    apply_toggle_comment(state, ctx, params.buffer_id, params.collapse_selection).await
+    apply_toggle_comment(state, ctx, params.buffer_id, params.style, params.target).await
 }
 
-/// Toggle comment status on the cursor/selection.
+/// Toggle comment status on the operand. The style is explicit — the scope is never inferred
+/// from the selection's shape (a point cursor is just a 1-char selection):
 ///
-/// Decision tree (closest to what users expect from `Ctrl-/` in modern editors):
-///   1. If the language has a *line* token and every non-blank line in the affected range
-///      already starts with it → strip it.
-///   2. Else if the language has *block* tokens and the cursor sits inside a block-comment
-///      node (via tree-sitter) or the selection exactly wraps a `start…end` span → strip
-///      them.
-///   3. Else if the selection is *partial-line* and the language has block tokens → wrap.
-///   4. Else if the language has a line token → add the line prefix on each line, aligned to
-///      the smallest indent so prefixes line up.
-///   5. Else if the language has block tokens → wrap (for languages with no line form).
-///   6. Else → no-op.
+/// - `Line` (`Ctrl-y`): toggle the language's line prefix on every line the selection touches —
+///   strip it when every non-blank covered line already starts with it, add it (aligned to the
+///   smallest indent so prefixes line up) otherwise. Languages without a line form (markdown,
+///   html, css) fall back to a block toggle over the covered lines' content, so the primary
+///   key still works there.
+/// - `Block` (`Ctrl-Alt-y`): wrap exactly the operand in the language's block tokens — the
+///   selection for `SurroundTarget::Selection`, the caret line's content for
+///   `SurroundTarget::Line` (Insert mode has no selection). Languages without a block form
+///   make this a no-op: falling back to line comments would reintroduce the scope guessing
+///   this split removes.
+///
+/// The block paths *unwrap* instead of wrapping when the cursor sits inside an existing
+/// block-comment node (via tree-sitter), when the operand's text exactly equals a wrapped
+/// span, or when the wrap tokens hug the operand on either side. A wrap re-selects the wrapped
+/// content, which is exactly the state unwrap restores — so toggling twice is a no-op.
 async fn apply_toggle_comment(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     buffer_id: BufferId,
-    collapse_selection: bool,
+    style: CommentStyle,
+    target: SurroundTarget,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -8354,56 +8362,32 @@ async fn apply_toggle_comment(
     // Selection / line range.
     let (start, end) = motion::ordered(cursor.position, cursor.anchor);
     let (a, b) = (start.line, end.line);
-    let is_partial = is_partial_line_selection(buf, &cursor);
+    // Insert mode (`Line` target): post-edit cursors collapse to a point — there's no
+    // selection to keep and the edit must not spring one.
+    let collapse_selection = target == SurroundTarget::Line;
+    // Preserve the selection's orientation across the block paths: a backward selection
+    // (cursor before anchor) re-selects backward, so a double toggle (wrap then unwrap)
+    // restores the exact pre-toggle cursor state, orientation included.
+    let backward =
+        (cursor.position.line, cursor.position.col) < (cursor.anchor.line, cursor.anchor.col);
+    let oriented = |start_pos: LogicalPosition, end_pos: LogicalPosition| {
+        let (anchor, position) = if backward {
+            (end_pos, start_pos)
+        } else {
+            (start_pos, end_pos)
+        };
+        CursorState {
+            position,
+            anchor,
+            match_bracket: None,
+            grep_position: None,
+        }
+    };
 
     // Phase 1: decide the action.
     let line_strings: Vec<String> = (a..=b)
         .map(|i| buf.text.line(i as usize).chunks().collect())
         .collect();
-    let line_classify = classify_line_range(&line_strings, line_tok);
-
-    let sel_block_unwrap = block_tok.and_then(|(open, close)| {
-        // Primary detector: tree-sitter `comment` ancestor containing the cursor. Handles the
-        // natural "wrap, then re-toggle to unwrap" gesture where the selection sits on the
-        // inner content rather than around the wrappers.
-        if let Some(syntax) = buf.syntax.as_ref() {
-            let cursor_byte = buf
-                .text
-                .char_to_byte(motion::pos_to_char(buf, cursor.position));
-            let source: String = buf.text.chunks().collect();
-            if let Some((s, e)) = find_enclosing_block_comment(
-                &syntax.tree,
-                source.as_bytes(),
-                cursor_byte,
-                open,
-                close,
-            ) {
-                let span = source[s..e].to_string();
-                return Some((s, e, span, open, close));
-            }
-        }
-        // Fallback: the operand's text *exactly* equals a wrapped span. Catches cases the
-        // tree-sitter detector misses — incomplete parses (an opener typed without a closer), or
-        // grammars that don't expose a `comment` node for the wrap (e.g. markdown's embedded HTML
-        // comments). The operand is the selection in Normal mode; in Insert mode there's none, and
-        // a point caret wraps the whole line, so detect a wrap on the whole line to round-trip.
-        let (start_pos, end_pos) = if collapse_selection && cursor.is_point() {
-            current_line_content_endpoints(buf, cursor.position.line)?
-        } else {
-            ordered_selection_or_cursor_line(&cursor)
-        };
-        let start_char = motion::pos_to_char(buf, start_pos);
-        let end_char_excl = motion::pos_to_char(buf, end_pos)
-            .saturating_add(1)
-            .min(buf.text.len_chars());
-        let span: String = buf.text.slice(start_char..end_char_excl).chunks().collect();
-        if span.starts_with(open) && span.ends_with(close) && span.len() >= open.len() + close.len()
-        {
-            Some((start_char, end_char_excl, span, open, close))
-        } else {
-            None
-        }
-    });
 
     enum Plan {
         Noop,
@@ -8429,55 +8413,87 @@ async fn apply_toggle_comment(
         },
     }
 
-    let plan = if let (Some(prefix), Some(c)) = (line_tok, &line_classify) {
-        if c.all_commented {
-            Plan::LineUncomment { prefix }
-        } else if let Some((sc, ec, span, open, close)) = sel_block_unwrap {
-            Plan::BlockUnwrap {
+    // Unwrap detection for the block paths, given the operand's inclusive endpoints. Primary
+    // detector: tree-sitter `comment` ancestor containing the cursor — handles the natural
+    // "wrap, then re-toggle to unwrap" gesture. Fallbacks for grammars the detector misses
+    // (incomplete parses, or no `comment` node for the wrap — e.g. markdown's embedded HTML
+    // comments): the operand's text *exactly* equals a wrapped span, or the operand is the
+    // *inner* content of a wrap (the tokens hug it on either side — what a wrap leaves
+    // selected, so a double toggle strips its own wrap).
+    let detect_block_unwrap = |operand: Option<(LogicalPosition, LogicalPosition)>,
+                               open: &'static str,
+                               close: &'static str|
+     -> Option<(usize, usize, String)> {
+        let text_at =
+            |from: usize, to: usize| -> String { buf.text.slice(from..to).chunks().collect() };
+        if let Some(syntax) = buf.syntax.as_ref() {
+            let cursor_byte = buf
+                .text
+                .char_to_byte(motion::pos_to_char(buf, cursor.position));
+            let source: String = buf.text.chunks().collect();
+            if let Some((s, e)) = find_enclosing_block_comment(
+                &syntax.tree,
+                source.as_bytes(),
+                cursor_byte,
+                open,
+                close,
+            ) {
+                // `find_enclosing_block_comment` works in bytes; the edit machinery below
+                // works in chars. Convert, or any multi-byte char earlier in the buffer
+                // shifts the strip range and corrupts the text.
+                return Some((
+                    buf.text.byte_to_char(s),
+                    buf.text.byte_to_char(e),
+                    source[s..e].to_string(),
+                ));
+            }
+        }
+        let (start_pos, end_pos) = operand?;
+        let start_char = motion::pos_to_char(buf, start_pos);
+        let end_char_excl = motion::pos_to_char(buf, end_pos)
+            .saturating_add(1)
+            .min(buf.text.len_chars());
+        let span = text_at(start_char, end_char_excl);
+        if span.starts_with(open) && span.ends_with(close) && span.len() >= open.len() + close.len()
+        {
+            return Some((start_char, end_char_excl, span));
+        }
+        // Hugging check — padded form first so the wrap's own `open + " "` wins over a bare
+        // `open`. The comment tokens are ASCII, so char counts equal byte lengths.
+        let lead = [format!("{open} "), open.to_string()]
+            .into_iter()
+            .find_map(|cand| {
+                let n = cand.chars().count();
+                (start_char >= n && text_at(start_char - n, start_char) == cand).then_some(n)
+            })?;
+        let trail = [format!(" {close}"), close.to_string()]
+            .into_iter()
+            .find_map(|cand| {
+                let n = cand.chars().count();
+                (end_char_excl + n <= buf.text.len_chars()
+                    && text_at(end_char_excl, end_char_excl + n) == cand)
+                    .then_some(n)
+            })?;
+        let (s, e) = (start_char - lead, end_char_excl + trail);
+        Some((s, e, text_at(s, e)))
+    };
+
+    // A block toggle over `operand` (inclusive endpoints; `None` = nothing to wrap): unwrap
+    // when the detector fires, wrap otherwise.
+    let plan_block = |operand: Option<(LogicalPosition, LogicalPosition)>,
+                      open: &'static str,
+                      close: &'static str|
+     -> Plan {
+        if let Some((sc, ec, span)) = detect_block_unwrap(operand, open, close) {
+            return Plan::BlockUnwrap {
                 start_char: sc,
                 end_char_excl: ec,
                 span,
                 open,
                 close,
-            }
-        } else if let (true, Some((open, close))) = (is_partial, block_tok) {
-            let (start_pos, end_pos) = ordered_selection_or_cursor_line(&cursor);
-            let sc = motion::pos_to_char(buf, start_pos);
-            let ec = motion::pos_to_char(buf, end_pos)
-                .saturating_add(1)
-                .min(buf.text.len_chars());
-            Plan::BlockWrap {
-                start_char: sc,
-                end_char_excl: ec,
-                open,
-                close,
-            }
-        } else if c.any_nonblank {
-            Plan::LineComment {
-                prefix,
-                min_indent: c.min_indent,
-            }
-        } else {
-            Plan::Noop
+            };
         }
-    } else if let Some((sc, ec, span, open, close)) = sel_block_unwrap {
-        Plan::BlockUnwrap {
-            start_char: sc,
-            end_char_excl: ec,
-            span,
-            open,
-            close,
-        }
-    } else if let Some((open, close)) = block_tok {
-        // No line tokens at all (markdown, html, css): everything routes to block.
-        let endpoints = if !cursor.is_point() {
-            Some(ordered_selection_or_cursor_line(&cursor))
-        } else {
-            // Cursor-only: wrap the current line's content. Skip empty lines entirely —
-            // otherwise the wrap would swallow the line's `\n` and merge it with the next.
-            current_line_content_endpoints(buf, cursor.position.line)
-        };
-        match endpoints {
+        match operand {
             None => Plan::Noop,
             Some((start_pos, end_pos)) => {
                 let sc = motion::pos_to_char(buf, start_pos);
@@ -8496,8 +8512,44 @@ async fn apply_toggle_comment(
                 }
             }
         }
-    } else {
-        Plan::Noop
+    };
+
+    let plan = match style {
+        CommentStyle::Line => {
+            if let (Some(prefix), Some(c)) =
+                (line_tok, classify_line_range(&line_strings, line_tok))
+            {
+                if c.all_commented {
+                    Plan::LineUncomment { prefix }
+                } else if c.any_nonblank {
+                    Plan::LineComment {
+                        prefix,
+                        min_indent: c.min_indent,
+                    }
+                } else {
+                    Plan::Noop
+                }
+            } else if let Some((open, close)) = block_tok {
+                // No line form: block toggle at line granularity — the covered lines'
+                // content, blank edge lines trimmed (wrapping a bare `\n` would merge lines).
+                plan_block(lines_content_endpoints(buf, a, b), open, close)
+            } else {
+                Plan::Noop
+            }
+        }
+        CommentStyle::Block => match block_tok {
+            None => Plan::Noop,
+            Some((open, close)) => {
+                let operand = if target == SurroundTarget::Line {
+                    // Insert mode: no selection — the caret line's content, skipping empty
+                    // lines (wrapping a bare `\n` would merge the line with the next).
+                    current_line_content_endpoints(buf, cursor.position.line)
+                } else {
+                    Some(motion::ordered(cursor.position, cursor.anchor))
+                };
+                plan_block(operand, open, close)
+            }
+        },
     };
 
     // Phase 2: materialize the edit. Each variant produces (edit_start_char, edit_end_char,
@@ -8591,20 +8643,8 @@ async fn apply_toggle_comment(
                     match_bracket: None,
                     grep_position: None,
                 }
-            } else if start_pos == new_position {
-                CursorState {
-                    position: new_position,
-                    anchor: new_position,
-                    match_bracket: None,
-                    grep_position: None,
-                }
             } else {
-                CursorState {
-                    position: new_position,
-                    anchor: start_pos,
-                    match_bracket: None,
-                    grep_position: None,
-                }
+                oriented(start_pos, new_position)
             };
             let last_line = motion::char_to_pos(buf, end_char_excl.saturating_sub(1)).line;
             Some((
@@ -8630,29 +8670,34 @@ async fn apply_toggle_comment(
             // start_pos.line == end_pos.line: a selection ending exactly on the `\n` of its
             // line counts as single-line in (line, col) terms but produces multi-line output.
             let start_pos = motion::char_to_pos(buf, start_char);
-            let end_pos = motion::char_to_pos(buf, end_char_excl.saturating_sub(1));
             let newlines = selected.matches('\n').count() as u32;
-            let new_position = if newlines == 0 {
-                aether_protocol::LogicalPosition {
-                    line: end_pos.line,
-                    col: end_pos.col + open.len() as u32 + close.len() as u32 + 2,
-                }
-            } else {
-                // The wrap's last line consists of whatever followed the last newline in the
-                // selected text, plus the inserted ` close`.
-                let last_nl_byte = selected.rfind('\n').unwrap();
-                let bytes_after_last_nl = (selected.len() - last_nl_byte - 1) as u32;
-                let last_line_bytes = bytes_after_last_nl + 1 + close.len() as u32;
-                aether_protocol::LogicalPosition {
-                    line: start_pos.line + newlines,
-                    col: last_line_bytes.saturating_sub(1),
+            // Re-select the wrapped *content* (Normal mode), leaving the tokens outside the
+            // selection — mirroring surround, and the exact state a following unwrap restores,
+            // so a double toggle is a no-op. The `open + " "` prefix shifts the content right
+            // on its first line; later lines keep their columns.
+            let inner_start = aether_protocol::LogicalPosition {
+                line: start_pos.line,
+                col: start_pos.col + open.len() as u32 + 1,
+            };
+            let inner_end = {
+                let last_byte_idx = selected.len() - 1;
+                let prefix = &selected[..last_byte_idx];
+                match prefix.rfind('\n') {
+                    Some(last_nl) => aether_protocol::LogicalPosition {
+                        line: start_pos.line + prefix.matches('\n').count() as u32,
+                        col: (last_byte_idx - last_nl - 1) as u32,
+                    },
+                    None => aether_protocol::LogicalPosition {
+                        line: start_pos.line,
+                        col: inner_start.col + last_byte_idx as u32,
+                    },
                 }
             };
-            // Select the wrapped span (Normal mode). In Insert mode (`collapse_selection`) there's
-            // no selection to spring — a point caret wraps its current line — so keep the caret on
-            // the character it was on: the leading `open + " "` shifts everything after the wrap's
-            // start rightward, so the caret moves right by that prefix. Single-line is the only
-            // Insert-mode case; a multi-line wrap falls back to the content end.
+            // In Insert mode (`collapse_selection`) there's no selection to spring — a point
+            // caret wraps its current line — so keep the caret on the character it was on:
+            // the leading `open + " "` shifts everything after the wrap's start rightward, so
+            // the caret moves right by that prefix. Single-line is the only Insert-mode case;
+            // a multi-line wrap falls back to the content end.
             let nc = if collapse_selection {
                 let pos = if newlines == 0 {
                     aether_protocol::LogicalPosition {
@@ -8660,7 +8705,7 @@ async fn apply_toggle_comment(
                         col: cursor.position.col + open.len() as u32 + 1,
                     }
                 } else {
-                    new_position
+                    inner_end
                 };
                 CursorState {
                     position: pos,
@@ -8668,20 +8713,8 @@ async fn apply_toggle_comment(
                     match_bracket: None,
                     grep_position: None,
                 }
-            } else if start_pos == new_position {
-                CursorState {
-                    position: new_position,
-                    anchor: new_position,
-                    match_bracket: None,
-                    grep_position: None,
-                }
             } else {
-                CursorState {
-                    position: new_position,
-                    anchor: start_pos,
-                    match_bracket: None,
-                    grep_position: None,
-                }
+                oriented(inner_start, inner_end)
             };
             let last_touched_line = start_pos.line + newlines;
             Some((
@@ -8782,6 +8815,8 @@ async fn apply_toggle_comment(
     }
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+    // LSP: full-document sync.
+    notify_lsp_change(&mut s, buffer_id);
 
     let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
     drop(s);
@@ -8867,35 +8902,32 @@ fn classify_line_range(lines: &[String], prefix: Option<&str>) -> Option<LineCla
     })
 }
 
-/// `true` when the selection doesn't cover a contiguous run of *complete* lines (lower
-/// endpoint at col 0 of its line, upper endpoint at the line end of its line). Cursor-only
-/// counts as non-partial. Partial selections — single mid-line, or multi-line where one of
-/// the boundary lines isn't fully covered — route to block-comment when the language has it.
-fn is_partial_line_selection(buf: &Buffer, cursor: &CursorState) -> bool {
-    if cursor.is_point() {
-        // A point cursor is a 1-char selection — single-line, definitionally non-partial
-        // for the comment-toggle decision.
-        return false;
-    }
-    let (lo, hi) = motion::ordered(cursor.position, cursor.anchor);
-    let line_end_hi = motion::line_byte_len_excl_newline(buf, hi.line);
-    let lo_at_start = lo.col == 0;
-    // Accept either exclusive end (col == line_end) or inclusive last byte (col + 1 ==
-    // line_end). Aether's selections are inclusive on both endpoints, so the natural
-    // "whole-line" form has the cursor on the last byte.
-    let hi_at_end = hi.col == line_end_hi || hi.col + 1 == line_end_hi;
-    !(lo_at_start && hi_at_end)
-}
-
-/// `(start_pos, end_pos)` of the selection, both inclusive, ordered. For a point cursor both
-/// endpoints land on the cursor's position.
-fn ordered_selection_or_cursor_line(
-    cursor: &CursorState,
-) -> (
+/// Inclusive endpoints covering the content of lines `a..=b`: col 0 of the first non-blank
+/// covered line through the last content char of the last non-blank one. Blank edge lines are
+/// trimmed so a wrap never swallows a bare `\n` (which would merge lines); `None` when every
+/// covered line is blank. A single-line range reduces to [`current_line_content_endpoints`].
+fn lines_content_endpoints(
+    buf: &Buffer,
+    a: u32,
+    b: u32,
+) -> Option<(
     aether_protocol::LogicalPosition,
     aether_protocol::LogicalPosition,
-) {
-    motion::ordered(cursor.position, cursor.anchor)
+)> {
+    let first = (a..=b).find(|&l| motion::line_byte_len_excl_newline(buf, l) > 0)?;
+    let last = (a..=b)
+        .rev()
+        .find(|&l| motion::line_byte_len_excl_newline(buf, l) > 0)?;
+    Some((
+        aether_protocol::LogicalPosition {
+            line: first,
+            col: 0,
+        },
+        aether_protocol::LogicalPosition {
+            line: last,
+            col: motion::line_byte_len_excl_newline(buf, last) - 1,
+        },
+    ))
 }
 
 /// Endpoints `(line_start, line_end_inclusive)` for the content of `line_idx`, excluding the
@@ -9007,10 +9039,25 @@ fn build_line_uncomment(
         }
         // We've already classified the range as `all_commented` so this strip is safe.
         let after_prefix = rest.strip_prefix(prefix).unwrap_or(rest);
-        let (stripped_tail, removed) = if let Some(after_space) = after_prefix.strip_prefix(' ') {
-            (after_space, prefix.len() + 1)
+        // Consume the *whole* marker run, not just the bare token: doc comments and banners
+        // repeat the token's final char (`///`, `////`, `##`, `%%`), and leaving the surplus
+        // behind turns `/// docs` into `/ docs`. Re-commenting adds the plain token back, so
+        // a doc comment round-trips to a regular comment — that's the intent (the marker is
+        // *all* comment syntax, none of it content). The tokens are ASCII, so byte counts
+        // equal char counts.
+        let marker_char = prefix
+            .chars()
+            .next_back()
+            .expect("line-comment tokens are non-empty");
+        let extra = after_prefix
+            .chars()
+            .take_while(|&c| c == marker_char)
+            .count();
+        let after_marker = &after_prefix[extra..];
+        let (stripped_tail, removed) = if let Some(after_space) = after_marker.strip_prefix(' ') {
+            (after_space, prefix.len() + extra + 1)
         } else {
-            (after_prefix, prefix.len())
+            (after_marker, prefix.len() + extra)
         };
         text.push_str(&content[..leading]);
         text.push_str(stripped_tail);
@@ -9340,6 +9387,8 @@ async fn apply_indent_or_dedent(
     }
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+    // LSP: full-document sync.
+    notify_lsp_change(&mut s, buffer_id);
 
     let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
     drop(s);
@@ -9542,6 +9591,8 @@ async fn input_move_lines_once(
     }
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+    // LSP: full-document sync.
+    notify_lsp_change(&mut s, buffer_id);
 
     let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
     drop(s);
@@ -9756,6 +9807,8 @@ async fn input_join_lines_once(
             ));
         }
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+        // LSP: full-document sync.
+        notify_lsp_change(&mut s, buffer_id);
         let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
         (pushes, search_summary_pushes, picker_pushes, new_cursor)
     };

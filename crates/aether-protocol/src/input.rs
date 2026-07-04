@@ -226,10 +226,26 @@ pub enum LineSide {
 
 // ---- input/toggle_comment -----------------------------------------------------------------------
 
-/// Toggle line-comment status on the cursor's line, or — when there's a selection — on every
-/// line the selection touches. The server uses the buffer language's `line_comment` prefix
-/// (`"//"`, `"#"`, `"%"`, etc.). Languages without a single-line comment form (markdown, html,
-/// css, json) make this a no-op.
+/// Which comment form [`InputToggleComment`] toggles. The style is always explicit — the scope
+/// is never inferred from the selection's shape (a point cursor is just a 1-char selection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentStyle {
+    /// Toggle the language's line-comment prefix (`"//"`, `"#"`, `"%"`, …) on every line the
+    /// operand touches (`Ctrl-y`). Languages without a line form (markdown, html, css) fall
+    /// back to a block toggle over those lines' content, so the primary key still works there.
+    Line,
+    /// Toggle the language's block/inline comment (`/* */`, `<!-- -->`, …) around exactly the
+    /// operand (`Ctrl-Alt-y`). Languages without a block form make this a no-op.
+    Block,
+}
+
+/// Toggle comment status on the operand. `Line` style operates on the lines the operand
+/// touches; `Block` style wraps/strips exactly the operand's chars. A block wrap re-selects the
+/// wrapped *content* (tokens outside the selection, like surround). The block paths unwrap
+/// instead of wrapping when the cursor sits inside an existing block comment (tree-sitter),
+/// when the operand text exactly equals a wrapped span, or when the wrap tokens hug the operand
+/// on either side — so toggling twice restores the original buffer and selection.
 pub struct InputToggleComment;
 impl RpcMethod for InputToggleComment {
     const NAME: &'static str = "input/toggle_comment";
@@ -240,11 +256,14 @@ impl RpcMethod for InputToggleComment {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ToggleCommentParams {
     pub buffer_id: BufferId,
-    /// Insert mode: collapse the result to a point. Stripping a block comment normally re-selects
-    /// the uncommented content (Normal mode), which would spring a selection in Insert mode where
-    /// none is allowed.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub collapse_selection: bool,
+    /// Which comment form to toggle.
+    pub style: CommentStyle,
+    /// The operand, mirroring `input/surround`: `Selection` (Normal mode) toggles around the
+    /// selection — a point being the single char under the block — and keeps/re-selects the
+    /// result; `Line` (Insert mode) targets the caret line's content and never springs a
+    /// selection.
+    #[serde(default)]
+    pub target: SurroundTarget,
 }
 
 // ---- input/move_lines ---------------------------------------------------------------------------
